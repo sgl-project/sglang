@@ -800,6 +800,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         else hidden_states.dtype
     )
     topk_output = dispatch_output.topk_output
+    materialized_topk = not use_routed_topk and TopKOutputChecker.format_is_standard(
+        topk_output
+    )
+    use_routed_topk |= materialized_topk
     if TopKOutputChecker.format_is_bypassed(topk_output):
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
@@ -809,7 +813,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         topk_config = None
         correction_bias = None
 
-    routing_method_type = quant_info.routing_method_type
+    routing_method_type = (
+        RoutingMethodType.TopK if materialized_topk else quant_info.routing_method_type
+    )
     fp8_quantization_type = (
         Fp8QuantizationType.MxFp8
         if quant_info.use_mxfp8
@@ -1622,6 +1628,10 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
+    materialized_topk = not use_routed_topk and TopKOutputChecker.format_is_standard(
+        dispatch_output.topk_output
+    )
+    use_routed_topk |= materialized_topk
     trtllm_bf16_routed_moe = None
     trtllm_bf16_moe = None
     if use_routed_topk:
@@ -1676,7 +1686,11 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
             assert runner_config.top_k is not None, (
                 "runner_config.top_k is required for flashinfer_trtllm_routed."
             )
-            routing_method_type = runner_config.routing_method_type
+            routing_method_type = (
+                RoutingMethodType.TopK
+                if materialized_topk
+                else runner_config.routing_method_type
+            )
             if routing_method_type is None:
                 routing_method_type = RoutingMethodType.Default
             elif routing_method_type == RoutingMethodType.DeepSeekV3:

@@ -253,6 +253,10 @@ def commit_kv_proj_fused(
                 weight_scale_ue8m0=stacked.mxfp8_scale,
                 input_scale=None,
                 bias=None,
+                # whole 16-row tiles: the row-stacked preshuffled weights stay preshuffled
+                weight_preshuffled=getattr(
+                    wkv_linears[0], "mxfp8_aiter_preshuffled", False
+                ),
             )
         else:
             kv_all = quant_method.w8a8_mxfp8_linear(

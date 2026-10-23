@@ -383,14 +383,17 @@ __global__ void Marlin(
 
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   int parallel = num_tokens_past_padded / moe_block_size;
-  int num_valid_blocks = parallel;
-  if constexpr (kIsEP) {
-    for (int i = 0; i < parallel; i++) {
-      if (expert_ids_ptr[i] == -1) num_valid_blocks--;
-    }
+  // Every warp counts the same inactive blocks without a serial per-thread scan.
+  int num_invalid_blocks = 0;
+  for (int i = threadIdx.x % 32; i < parallel; i += 32) {
+    num_invalid_blocks += expert_ids_ptr[i] == -1;
   }
-  int num_invalid_blocks = parallel - num_valid_blocks;
-  parallel = num_valid_blocks;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2) {
+    num_invalid_blocks += __shfl_xor_sync(0xffffffff, num_invalid_blocks, offset);
+  }
+  parallel -= num_invalid_blocks;
+  if (parallel == 0) return;
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
@@ -518,23 +521,18 @@ __global__ void Marlin(
     if (par_id >= parallel) return;
 
     old_expert_id = expert_id;
-    if constexpr (kIsEP) {
-      if (num_invalid_blocks > 0) {
-        int skip_count = block_id == -1 ? par_id : 0;
-        block_id++;
-        for (int i = block_id; i < num_tokens_past_padded / moe_block_size; i++) {
-          expert_id = expert_ids_ptr[i];
-          if (expert_id != -1) {
-            if (skip_count == 0) {
-              block_id = i;
-              break;
-            };
-            skip_count--;
+    if (num_invalid_blocks > 0) {
+      int skip_count = block_id == -1 ? par_id : 0;
+      block_id++;
+      for (int i = block_id; i < num_tokens_past_padded / moe_block_size; i++) {
+        expert_id = expert_ids_ptr[i];
+        if (expert_id != -1) {
+          if (skip_count == 0) {
+            block_id = i;
+            break;
           };
-        }
-      } else {
-        block_id = par_id;
-        expert_id = expert_ids_ptr[block_id];
+          skip_count--;
+        };
       }
     } else {
       block_id = par_id;

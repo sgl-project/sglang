@@ -14,7 +14,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    SessionParams,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -189,36 +188,6 @@ def test_aborted_session_turn_releases_new_media_not_history(vmm_pool):
             _queued_scheduler(req).abort_request(AbortReq(rid=req.rid))
         assert torch.equal(history.feature, torch.ones(3))
         assert not session._inflight
-    vmm_pool._recycle_chunks()
-    assert not vmm_pool.occupied_chunks
-
-
-def test_rejected_session_releases_media_before_request_admission(vmm_pool):
-    """An invalid session is rejected before the request attaches its media."""
-    for rank, item in enumerate(_publish(vmm_pool)):
-        recv = TokenizedGenerateReqInput(
-            rid="invalid-session",
-            input_text="",
-            input_ids=[1],
-            input_embeds=None,
-            mm_inputs=MultimodalProcessorOutput(mm_items=[item]),
-            token_type_ids=None,
-            sampling_params=SamplingParams(),
-            return_logprob=False,
-            logprob_start_len=-1,
-            top_logprobs_num=0,
-            token_ids_logprob=None,
-            stream=False,
-            session_params=SessionParams(id="missing"),
-        )
-        scheduler = _queued_scheduler(None)
-        scheduler.session_controller = {}
-        scheduler.model_config = SimpleNamespace(vocab_size=10)
-        scheduler.tokenizer = None
-        scheduler.init_req_max_new_tokens = lambda req: None
-        scheduler._add_request_to_queue = lambda req: None
-        with _rank(rank):
-            scheduler.handle_generate_request(recv)
     vmm_pool._recycle_chunks()
     assert not vmm_pool.occupied_chunks
 

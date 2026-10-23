@@ -17,25 +17,47 @@ logical grouping and remove the old `_jit_` filename prefix.
   The `sgl_kernel` wheel retains its own public API and packaging tests.
 - Group by computation, not model or GPU: GEMM and GEMV in `gemm`, expert
   routing in `moe`, attention index selection in `attention`, sampling in
-  `sampling`, normalization in `layernorm`. A quantized GEMM is still a GEMM;
-  quantization alone belongs in `quantization`.
+  `sampling`, normalization in `layernorm`.
+- Classify a fused operator by its complete contract; do not split a fused
+  kernel into separate launches just to separate its parts. Split unrelated
+  public entry points that happen to share a source file. Decided rules:
+  - Any cross-rank collective or peer-memory access (all-reduce, all-gather,
+    reduce-scatter, a2a, multicast/NVLS) puts the op in `communication`,
+    whatever compute it fuses.
+  - Producer + output quantization stays with the producer (norm + quant in
+    `layernorm`, activation + quant in `activation`, GEMM with a quant epilogue
+    in `gemm`, MoE dispatch/permute + quant in `moe`). `quantization` holds only
+    pure format conversion: quant, dequant, scale-layout conversion, repack.
+  - RoPE stays in `attention` (standalone RoPE, position ids, QK-norm + RoPE).
+  - `kvcache` owns ops that read/write KV-cache contents; `attention` owns the
+    index/shape/schedule tables (page tables, `cu_seqlens`, `kv_indices`, split
+    metadata) and index selection. A fused compute + store stays with its
+    compute group.
 - Model-specific files/subpackages and tuning data are allowed **inside** a
   logical group. Do not add a model bundle or an implementation file directly
   under `ops/`. Propose a new logical group only for a distinct responsibility,
-  and update `ops._GROUPS`, documentation, and tests together.
-- Classify a fused operator by its complete contract. Do not split a fused
-  kernel into separate launches just to separate norm, RoPE, or quantization.
-  Split unrelated public entry points that happen to share a source file.
-- Keep shared CUDA build/runtime infrastructure in `kernels/jit`; operator
-  wrappers call it from their logical group. Keep process groups, communicator
-  state, model dispatch, and buffer ownership in `srt`. K3-specific adapters in
-  `srt/layers/communication/` need not pretend to be generic interfaces.
+  and update `ops._GROUPS`, the README group list, and tests together
+  (`test_kernels_namespace.py` checks the README against `_GROUPS` and the
+  README layout against the directories under `kernels/`).
+- Agent-generated implementations live in `kernels/kda_kernels/` (Kernel Design
+  Agents, `KernelBackend.KDA`) and `kernels/cake_kernels/` (Cake adapters over
+  FlashInfer). They are backends, not groups: register their public ops in the
+  logical group with a `KernelSpec` whose target points into them, and do not
+  reorganize those directories.
+- Keep shared build/runtime infrastructure (including the Helion runtime
+  helper) in `kernels/jit`; operator wrappers call it from their logical group.
+  Keep process groups, communicator state, workspace classes, model dispatch,
+  and buffer ownership in `srt` (`srt/layers/communication/` for the K3 and Muse
+  Spark adapters); kernels must not import srt runtime modules to inspect
+  model objects, so pass flags in. Adapters there need not pretend to be generic
+  interfaces.
 
 ## Register the public entry point
 
 Add lazy `KernelSpec` metadata in the owning group's `__init__.py`, or use the
 existing `BaseFusedOp` registration when the operation has interchangeable
-backends. Group imports must not import GPU implementations or compile kernels.
+backends (a `BaseFusedOp` built per layer registers `module:Class.forward_<backend>`
+targets). Group imports must not import GPU implementations or compile kernels.
 
 Use `<group>.<name>` for the op id and `module:callable` for the target. Preserve
 existing backend dispatch and describe actual device/architecture restrictions
@@ -53,8 +75,9 @@ factories, reference helpers, and runtime classes are not separate kernel APIs.
   runtime module. A CUDA allocation does not make a runtime test a kernel test.
 - Non-CI smoke scripts and benchmarks: `test/manual/kernels/`; do not leave
   standalone test/benchmark entry points in production operator modules.
-- Shared test helpers: `sglang.test.kernels`. Preserve vendored upstream trees
-  and AOT wheel packaging boundaries instead of reorganizing them incidentally.
+- Shared test helpers and reference oracles: `sglang.test.kernels`. Preserve
+  vendored upstream trees and AOT wheel packaging boundaries instead of
+  reorganizing them incidentally.
 
 For a move/split, preserve assertions, parametrization, fixtures, platform skips,
 execution entry points, and CI stages/runners. Apportion existing time estimates

@@ -113,6 +113,16 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ):
         raise NotImplementedError
 
+    def get_moe_runner_backend(
+        self, layer: torch.nn.Module
+    ) -> MoeRunnerBackendLike | None:
+        """Return the execution contract after create_moe_runner.
+
+        None declares a direct kernel consuming standard TopK with local IDs.
+        Override when apply uses a different path from the owned runner.
+        """
+        return self.runner.runner_backend if self.runner is not None else None
+
     @abstractmethod
     def apply(
         self,

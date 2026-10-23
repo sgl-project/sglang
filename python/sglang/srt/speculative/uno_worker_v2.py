@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -32,7 +33,6 @@ from sglang.srt.speculative.uno_cuda_graph_runner import (
     UnoDecodeCudaGraphRunner,
 )
 from sglang.srt.speculative.uno_info import UnoDraftInput, UnoForwardInput
-from sglang.srt.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.speculative.uno_utils import (
     build_uno_draft_input,
     pack_uno_tree_result,
@@ -814,7 +814,10 @@ class UnoWorkerV2(BaseSpecWorker):
             else contextlib.nullcontext()
         )
         attn_context = (
-            forward_context(ForwardContext(attn_backend=self._uno_draft_attn_backend))
+            forward_context(
+                ForwardContext(attn_backend=self._uno_draft_attn_backend),
+                forward_batch=forward_batch,
+            )
             if self.tree_mode
             else contextlib.nullcontext()
         )

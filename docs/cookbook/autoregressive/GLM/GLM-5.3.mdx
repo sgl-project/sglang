@@ -1,6 +1,6 @@
 ---
 title: GLM-5.3
-description: "Deploy GLM-5.3 with SGLang — Z.ai's DeepSeek-Sparse-Attention (DSA) Mixture-of-Experts model with MTP speculative decoding and 1M context, on H200, B200, B300, GB300, and AMD MI300X/MI325X/MI355X."
+description: "Deploy GLM-5.3 with SGLang — Z.ai's DeepSeek-Sparse-Attention (DSA) Mixture-of-Experts model with MTP speculative decoding and 1M context, on H200, B200, B300, GB300, and AMD MI300X/MI325X/MI355X, plus Ascend NPU recipes."
 tag: NEW
 ---
 
@@ -40,6 +40,60 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
+<Accordion title="Install and prepare Ascend NPUs">
+
+Use a Linux host with the Ascend driver and a compatible CANN / TorchNPU environment. Follow the
+[Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) and the
+[GLM-5.3 deployment tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3#installation) to start a container with the NPU devices, driver mounts, and checkpoint directory. Run the setup and the generated **Python** command inside that container.
+
+<Tabs>
+<Tab title="A3">
+
+```bash Command
+docker pull quay.io/ascend/sglang:cann9.1.0-a3-B080
+```
+
+This CANN 9.1.0 image requires a compatible SGLang build, TorchNPU, ATB, and custom operators before serving. Set `SGLANG_ROOT` to that source checkout.
+
+Run the following setup before copying the generated command (CANN 9.1.0). CPU tuning requires host privileges.
+
+```bash Command
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+SGLANG_ROOT=/path/to/sglang
+export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
+export LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/op_api/lib:${LD_LIBRARY_PATH:-}"
+```
+
+</Tab>
+<Tab title="950PR/DT series">
+
+Use the compatible 950PR/DT series SGLang checkout, CANN environment, and custom operators used for your deployment. Set `SGLANG_ROOT` to that checkout; these recipes do not prescribe an image tag.
+
+```bash Command
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
+unset HCCL_IF_IP HCCL_SOCKET_FAMILY RANK_TABLE_FILE
+SGLANG_ROOT=/path/to/sglang
+export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
+```
+
+</Tab>
+</Tabs>
+
+Replace the model path in the generated command with your mounted ModelSlim checkpoint directory. Include its configuration, tokenizer, quantization metadata, and MTP weights.
+
+Use a locally prepared **W8A8** checkpoint for A3. On 950PR/DT series, both unified serving and PD disaggregation use the same **W8A8C8_MXFP8** checkpoint. Both 950PR/DT series recipes explicitly use FP8 E4M3 KV cache and BF16 draft KV cache.
+
+Replace network placeholders such as `<network-interface>`, `<prefill-head-ip>`, and `<decode-head-ip>` in the generated NPU command with your cluster settings.
+
+</Accordion>
+
 Pick your hardware + recipe to generate the launch command. The three serving strategies cover the common operating points:
 
 - **Low-Latency** — fastest reply for a single user. Pick for chat.
@@ -50,7 +104,7 @@ import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config }     from "/src/snippets/configs/zai-org/glm-5.3.jsx";
 import { benchmarks } from "/src/snippets/configs/zai-org/glm-5.3-benchmarks.jsx";
 
-<Deployment config={config} benchmarks={benchmarks} />
+<Deployment config={config} benchmarks={benchmarks} agenticLink="agentic-long-context-deployment" />
 
 <Warning>
   All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.3.
@@ -63,6 +117,19 @@ The Playground is where you experiment with **SGLang features beyond the deploym
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
+
+## Agentic Long-Context Deployment
+
+Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
+
+- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
+- **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
+- **Container image.** Run the commands inside the image listed for each configuration. Several are SGLang nightly images, so flag names follow that image.
+
+import { AgentX } from "/src/snippets/_agentx.jsx";
+import { agentx } from "/src/snippets/agentx/zai-org/glm-5.3.jsx";
+
+<AgentX data={agentx} />
 
 ## 1. Model Introduction
 

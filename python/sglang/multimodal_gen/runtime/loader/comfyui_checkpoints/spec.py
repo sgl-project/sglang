@@ -14,8 +14,9 @@ offload -- goes through the regular transformer load path.
 from __future__ import annotations
 
 import os
+from collections import defaultdict
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -27,6 +28,7 @@ from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
     inspect_minimax_h3_safetensors,
     resolve_minimax_h3_checkpoint_quantization,
 )
+from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
@@ -77,6 +79,9 @@ class ComfyUICheckpointSpec:
     checkpoint_key_filter: Callable[[str], bool] | None = None
 
 
+# Methods whose no-arg config quantizes BF16 weights after loading.
+_ONLINE_QUANTIZATIONS = frozenset({"fp8", "mxfp4", "convrot_int8"})
+
 _SPEC_REGISTRY: dict[str, ComfyUICheckpointSpec] = {}
 _SPECS_DISCOVERED = False
 
@@ -112,8 +117,78 @@ def get_registered_comfyui_pipeline_names() -> list[str]:
 
 
 def is_comfyui_single_file(model_path: str) -> bool:
-    """ComfyUI ships DiTs as one safetensors file with no model_index.json."""
-    return os.path.isfile(model_path) and model_path.endswith(".safetensors")
+    """ComfyUI ships DiTs as one safetensors or GGUF file with no model_index.json."""
+    return os.path.isfile(model_path) and model_path.endswith((".safetensors", ".gguf"))
+
+
+def _gguf_runtime_layout(tensor_meta: dict, mapping: dict) -> tuple[dict, dict]:
+    """Key GGUF metadata by runtime names; return it with the fused-shard plan.
+
+    Shards of one fused runtime layer (Z-Image w1/w3 -> w13) keep their own
+    entries and are concatenated on load, under the fused name quant lookup uses.
+    """
+    from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+        remap_gguf_tensor_meta,
+    )
+
+    map_name = get_param_names_mapping(mapping)
+    plain, fused = {}, defaultdict(dict)
+    for name, meta in tensor_meta.items():
+        target, index, _ = map_name(name)
+        if index is None:
+            plain[name] = meta
+        else:
+            fused[target][index] = (name, meta)
+
+    layout = remap_gguf_tensor_meta(plain, lambda name: map_name(name)[0])
+    shard_plan = {}
+    for target, parts in fused.items():
+        metas = [parts[i][1] for i in sorted(parts)]
+        first = metas[0]
+        if len({(m.ggml_type, m.is_packed, m.logical_shape[1:]) for m in metas}) > 1:
+            raise ValueError(f"GGUF shards of {target} differ in type or width")
+        param_name = (
+            f"{target.removesuffix('.weight')}.qweight" if first.is_packed else target
+        )
+        layout[target] = replace(
+            first,
+            logical_shape=(
+                sum(m.logical_shape[0] for m in metas),
+                *first.logical_shape[1:],
+            ),
+            stored_shape=(
+                sum(m.stored_shape[0] for m in metas),
+                *first.stored_shape[1:],
+            ),
+            param_name=param_name,
+        )
+        for index, (name, meta) in parts.items():
+            layout[name] = meta
+            shard_plan[meta.param_name] = (param_name, index, len(parts))
+    return layout, shard_plan
+
+
+def _runtime_gguf_weights(weights, layout: dict, shard_plan: dict, quant_config):
+    """Fuse planned shards; dequantize packed tensors whose layer built without
+    GGUF (e.g. Z-Image adaLN ReplicatedLinear). Runs after model construction,
+    so quant_config.selected is final."""
+    import gguf
+
+    packed_types = {m.param_name: m.weight_type for m in layout.values() if m.is_packed}
+    pending = defaultdict(dict)
+    for name, tensor in weights:
+        if name in shard_plan:
+            name, index, total = shard_plan[name]
+            pending[name][index] = tensor
+            if len(pending[name]) < total:
+                continue
+            parts = pending.pop(name)
+            tensor = torch.cat([parts[i] for i in range(total)])
+        prefix = name.removesuffix(".qweight")
+        if name in packed_types and prefix not in quant_config.selected:
+            value = gguf.dequantize(tensor.numpy(), packed_types[name])
+            name, tensor = f"{prefix}.weight", torch.from_numpy(value).bfloat16()
+        yield name, tensor
 
 
 def _load_comfyui_gguf_transformer(
@@ -143,7 +218,10 @@ def _load_comfyui_gguf_transformer(
             [gguf_file], str(server_args.model_variant or "fl2va")
         )
 
-    tensor_meta = read_gguf_tensor_meta(gguf_file)
+    # Quant lookup and weight loading must both see runtime names.
+    tensor_meta, shard_plan = _gguf_runtime_layout(
+        read_gguf_tensor_meta(gguf_file), mapping
+    )
     curve = tensor_meta.get("adaln_t_table")
     if curve is not None:
         if curve.is_quantized or len(curve.logical_shape) != 2:
@@ -185,10 +263,60 @@ def _load_comfyui_gguf_transformer(
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
-            weights_iterator=gguf_weights_iterator(gguf_file, tensor_meta),
+            weights_iterator=_runtime_gguf_weights(
+                gguf_weights_iterator(gguf_file, tensor_meta),
+                tensor_meta,
+                shard_plan,
+                quant_config,
+            ),
         )
     finally:
         model_cls.param_names_mapping = original_mapping
+
+
+def _resolve_online_quant_spec(
+    *,
+    server_args: ServerArgs,
+    model_cls,
+    cls_name: str,
+    model_path: str,
+    dit_config,
+):
+    from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+        resolve_transformer_quant_load_spec,
+    )
+
+    if server_args.quantization not in _ONLINE_QUANTIZATIONS:
+        raise ValueError(
+            f"--quantization {server_args.quantization} needs a pre-quantized "
+            "checkpoint; a BF16 ComfyUI file can only be quantized online with "
+            f"one of {sorted(_ONLINE_QUANTIZATIONS)}"
+        )
+    return resolve_transformer_quant_load_spec(
+        hf_config={},
+        server_args=server_args,
+        safetensors_list=[model_path],
+        component_model_path=os.path.dirname(model_path) or ".",
+        model_cls=model_cls,
+        cls_name=cls_name,
+        component_name="transformer",
+        arch_config=dit_config.arch_config,
+    )
+
+
+def _online_quant_load_plan(*, server_args: ServerArgs, quant_spec) -> WeightLoadPlan:
+    starts_on_cpu = server_args.should_start_component_on_cpu("transformer")
+    # Matches the native loader: only ConvRot INT8 quantizes from host weights.
+    checkpoint_load_device = (
+        torch.device("cpu")
+        if starts_on_cpu and quant_spec.is_convrot_int8
+        else get_local_torch_device()
+    )
+    return WeightLoadPlan.for_component(
+        checkpoint_load_device=checkpoint_load_device,
+        needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
+        component_starts_on_cpu=starts_on_cpu,
+    )
 
 
 def load_comfyui_transformer(
@@ -235,6 +363,9 @@ def load_comfyui_transformer(
     )
 
     gguf_file = resolve_transformer_gguf_to_load(server_args, "transformer")
+    if gguf_file is None and model_path.endswith(".gguf"):
+        # A GGUF unet picked in ComfyUI is the model path itself.
+        gguf_file = model_path
     if gguf_file is not None:
         model = _load_comfyui_gguf_transformer(
             model_cls=model_cls,
@@ -312,6 +443,23 @@ def load_comfyui_transformer(
                     adaln_curve_shape,
                 )
 
+        post_load_hooks = []
+        if quant_config is None and server_args.quantization is not None:
+            # A BF16 file has no markers; quantize it online like a native directory.
+            quant_spec = _resolve_online_quant_spec(
+                server_args=server_args,
+                model_cls=model_cls,
+                cls_name=spec.dit_cls_name,
+                model_path=model_path,
+                dit_config=dit_config,
+            )
+            quant_config = quant_spec.quant_config
+            param_dtype = quant_spec.param_dtype
+            post_load_hooks = quant_spec.post_load_hooks
+            weight_load_plan = _online_quant_load_plan(
+                server_args=server_args, quant_spec=quant_spec
+            )
+
         logger.info(
             "Loading %s from ComfyUI checkpoint %s, param_dtype: %s",
             spec.dit_cls_name,
@@ -349,6 +497,8 @@ def load_comfyui_transformer(
             )
         finally:
             model_cls.param_names_mapping = original_mapping
+        for post_load_hook in post_load_hooks:
+            post_load_hook(model)
 
     for param in model.parameters():
         param.requires_grad = False

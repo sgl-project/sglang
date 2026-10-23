@@ -381,6 +381,7 @@ fn swa_only_release_spares_another_holders_mamba_lock() {
         &holder_params,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     )
     .expect("live test node");
 
@@ -740,6 +741,7 @@ fn evict_component_device_frees_and_tombstones_the_slot() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!((freed, host_freed), (1, 0));
@@ -764,6 +766,7 @@ fn evict_component_device_moves_a_host_backed_node_into_the_host_lru() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert!(tc.arena.node(a).has_host_value(MAMBA));
@@ -783,6 +786,7 @@ fn evict_component_host_frees_and_leaves_the_host_lru() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!((freed, host_freed), (0, 1));
@@ -804,6 +808,7 @@ fn evict_component_all_frees_both_tiers_without_the_host_lru() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::All,
     );
     assert_eq!((freed, host_freed), (1, 1));
@@ -1295,6 +1300,7 @@ fn host_eviction_tombstones_internal_host_values() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
     assert!(!tc.arena.node(a).has_host_value(MAMBA));
     assert!(!tc.host_lru_list(MAMBA).in_list(Some(a)));
@@ -1334,6 +1340,7 @@ fn host_eviction_takes_a_host_leaf_atomically() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
     // The atomic host-leaf eviction frees both components and the node.
     assert_eq!(tracker[&MAMBA], 1);
@@ -1358,6 +1365,7 @@ fn host_drive_panics_on_an_lru_member_without_a_mamba_host_value() {
         &mut tracker,
         &mut HashMap::new(),
         &mut HashMap::new(),
+        &mut Vec::new(),
     );
 }
 
@@ -1384,6 +1392,7 @@ fn swa_triggered_cascade_takes_the_mamba_slot() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert!(!tc.arena.node(a).has_device_value(MAMBA));
@@ -1415,6 +1424,7 @@ fn mamba_triggered_cascade_spares_the_higher_tiers() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     // FULL (2) and SWA (1) both outrank the mamba trigger (0).

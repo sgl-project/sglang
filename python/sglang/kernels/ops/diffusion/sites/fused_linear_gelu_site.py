@@ -11,10 +11,9 @@ reference only at bf16/fp16 rounding-order level -- close, but not bit-exact.
 
 Because it is not bit-exact, the fused path is **mounted only for
 ``quality="high"`` requests** (see ``SamplingParams.quality``): model code marks
-its GELU up-projection sites with :func:`mark_fused_gelu_site` (default: off,
-reference path, bit-exact), and the denoising stage calls
-:func:`mount_fused_linear_gelu` / :func:`unmount_fused_linear_gelu` at batch
-boundaries. Mounting is all-or-nothing per transformer: if any marked site
+its GELU up-projection sites with ``FUSED_LINEAR_GELU.mark`` (default: off,
+reference path, bit-exact), and the denoising stage mounts / unmounts
+``FUSED_LINEAR_GELU`` at batch boundaries. Mounting is all-or-nothing per transformer: if any marked site
 fails the static guards (quantized weights, missing bias, non-half dtype, ...)
 no site on that transformer is fused.
 
@@ -25,7 +24,6 @@ single opaque op under ``torch.compile`` -- no graph break.
 
 from __future__ import annotations
 
-import logging
 import weakref
 from typing import Any
 
@@ -36,21 +34,10 @@ from sglang.kernels.jit.utils import get_jit_cuda_arch
 from sglang.kernels.ops.diffusion.sites.quality_gate import QualityGatedFusion
 from sglang.srt.utils.custom_op import register_custom_op
 
-logger = logging.getLogger(__name__)
-
 # ``torch._addmm_activation`` is the (private but stable) entry point to the
 # cublasLt GEMM+bias+activation epilogue. Guard for builds where it is absent
 # so the reference path is always available.
 _HAS_ADDMM_ACTIVATION = hasattr(torch, "_addmm_activation")
-
-# Attributes of the site protocol (set by ``mark_fused_gelu_site``).
-_SITE_LINEAR_ATTR = "_sgl_fused_gelu_linear_attr"
-_SITE_ENABLED_ATTR = "_sgl_fused_gelu_enabled"
-_FUSION = QualityGatedFusion(
-    name="fused linear+GELU",
-    marker_attr=_SITE_LINEAR_ATTR,
-    enabled_attr=_SITE_ENABLED_ATTR,
-)
 
 
 def _fused_linear_gelu_tanh_fake(
@@ -157,39 +144,26 @@ def can_use_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
     return verdict
 
 
-def mark_fused_gelu_site(module: nn.Module, linear_attr: str) -> None:
-    """Declare ``module`` as a tanh-GELU up-projection fusion site.
-
-    ``getattr(module, linear_attr)`` must be the up-projection linear whose
-    output feeds ``F.gelu(..., approximate="tanh")``. The site starts unmounted
-    (``_sgl_fused_gelu_enabled = False``): the module's forward must keep the
-    reference path bit-exact until :func:`mount_fused_linear_gelu` enables it.
-    """
-    _FUSION.mark(module, linear_attr)
-
-
-def fused_gelu_active(module: nn.Module) -> bool:
-    """Whether the quality-gated fused path is mounted on ``module``."""
-    return _FUSION.is_enabled(module)
-
-
 def _site_reject_reason(site: nn.Module) -> str | None:
-    linear = getattr(site, _FUSION.metadata(site), None)
+    linear = getattr(site, FUSED_LINEAR_GELU.metadata(site), None)
     return "missing linear" if linear is None else _static_reject_reason(linear)
 
 
-def mount_fused_linear_gelu(root: nn.Module) -> bool:
-    """Enable the fused epilogue on every marked site under ``root``.
+class _LinearGeluFusion(QualityGatedFusion):
+    def mount(self, root: nn.Module) -> bool:
+        _VERDICTS.clear()
+        return super().mount(root)
 
-    All-or-nothing: if any marked site fails the static guards, every site is
-    left (or reset) on the reference path and False is returned. Returns False
-    as well when ``root`` has no marked sites.
-    """
-    _VERDICTS.clear()
-    return _FUSION.mount(root, reject_reason=_site_reject_reason, logger=logger)
+    def unmount(self, root: nn.Module) -> None:
+        _VERDICTS.clear()
+        super().unmount(root)
 
 
-def unmount_fused_linear_gelu(root: nn.Module) -> None:
-    """Reset every marked site under ``root`` to the bit-exact reference path."""
-    _VERDICTS.clear()
-    _FUSION.unmount(root)
+# A site's marker metadata names its up-projection linear, whose output feeds
+# ``F.gelu(..., approximate="tanh")``.
+FUSED_LINEAR_GELU = _LinearGeluFusion(
+    name="fused linear+GELU",
+    marker_attr="_sgl_fused_gelu_linear_attr",
+    enabled_attr="_sgl_fused_gelu_enabled",
+    reject_reason=_site_reject_reason,
+)

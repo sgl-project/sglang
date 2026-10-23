@@ -71,8 +71,8 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-        topk_weights = topk_output.topk_weights
         topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights.masked_fill(topk_ids < 0, 0.0)
 
         assert runner_config.activation == "silu", "Only SiLU activation is supported."
         assert torch.cuda.get_device_capability(hidden_states.device)[0] >= 9, (
@@ -119,9 +119,13 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         )
 
         # Stage 1: Gate/Up (Marlin)
-        intermediate_cache1 = torch.empty(
-            (M * topk, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
+        projection_cache = torch.zeros(
+            (M * topk * (2 * N + K),),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
         )
+        intermediate_cache1 = projection_cache[: M * topk * 2 * N].view(-1, 2 * N)
+        intermediate_cache3 = projection_cache[M * topk * 2 * N :].view(-1, K)
         intermediate_cache1 = moe_wna16_marlin_gemm(
             hidden_states,
             intermediate_cache1,
@@ -165,11 +169,6 @@ class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
         silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
         # Stage 3: Down (Marlin)
-        intermediate_cache3 = torch.empty(
-            (M * topk, K), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        if quant_info.expert_map is not None:
-            intermediate_cache3.zero_()
 
         intermediate_cache3 = moe_wna16_marlin_gemm(
             intermediate_cache2,

@@ -39,7 +39,7 @@ __device__ __forceinline__ float dot16_fp8_f32(const float4 wv, const float4 xv)
   return acc;
 }
 
-template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps>
+template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps, bool kUsePDL>
 __global__ void __launch_bounds__(kNumWarps * 32) sm120_fp8_gemv_kernel(
     bf16_t* __restrict__ out,
     const uint8_t* __restrict__ x,
@@ -47,7 +47,9 @@ __global__ void __launch_bounds__(kNumWarps * 32) sm120_fp8_gemv_kernel(
     const float* __restrict__ alpha) {
   __shared__ uint8_t sx[K];
 
+  PDLTriggerSecondary<kUsePDL>();
   const uint32_t tid = threadIdx.x;
+  PDLWaitPrimary<kUsePDL>();
   for (uint32_t i = tid * kFp8VecSize; i < K; i += kNumWarps * 32 * kFp8VecSize) {
     *reinterpret_cast<float4*>(sx + i) = *reinterpret_cast<const float4*>(x + i);
   }
@@ -123,9 +125,11 @@ __global__ void __launch_bounds__(kNumWarps * 32) sm120_fp8_gemv_kernel(
   }
 }
 
-template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps>
+template <uint32_t N, uint32_t K, uint32_t kRows, uint32_t kUnroll, uint32_t kNumWarps, bool kUsePDL>
 struct Sm120Fp8GemvKernel {
-  static_assert(K % (32 * kFp8VecSize * kUnroll) == 0, "K must cover full unrolled warp strides");
+  static_assert(
+      kUnroll == 1 ? (K % kFp8VecSize == 0) : (K % (32 * kFp8VecSize * kUnroll) == 0),
+      "K must be 16B-aligned (kUnroll==1) or cover full unrolled warp strides");
   static_assert(K <= 48 * 1024, "activation row must fit static shared memory");
 
   static void
@@ -144,12 +148,13 @@ struct Sm120Fp8GemvKernel {
 
     constexpr uint32_t kRowsPerBlock = kRows * kNumWarps;
     constexpr uint32_t kNumBlocks = (N + kRowsPerBlock - 1) / kRowsPerBlock;
-    LaunchKernel(kNumBlocks, kNumWarps * 32, device.unwrap())(
-        sm120_fp8_gemv_kernel<N, K, kRows, kUnroll, kNumWarps>,
-        static_cast<bf16_t*>(out.data_ptr()),
-        static_cast<const uint8_t*>(x.data_ptr()),
-        static_cast<const uint8_t*>(w.data_ptr()),
-        static_cast<const float*>(alpha.data_ptr()));
+    LaunchKernel(kNumBlocks, kNumWarps * 32, device.unwrap())
+        .enable_pdl(kUsePDL)(
+            sm120_fp8_gemv_kernel<N, K, kRows, kUnroll, kNumWarps, kUsePDL>,
+            static_cast<bf16_t*>(out.data_ptr()),
+            static_cast<const uint8_t*>(x.data_ptr()),
+            static_cast<const uint8_t*>(w.data_ptr()),
+            static_cast<const float*>(alpha.data_ptr()));
   }
 };
 

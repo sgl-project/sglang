@@ -52,17 +52,6 @@ class XpuPlatform(Platform):
         return props.total_memory
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        """Check if async output is supported on Intel XPU."""
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, disable enforce-eager. "
-                "Since enforce-eager is enabled, async output processor cannot be used"
-            )
-            return False
-        return True
-
-    @classmethod
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:

@@ -290,6 +290,10 @@ class ReLU2(BaseFusedOp):
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         return relu2(x)
 
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # The JIT relu2 kernel is CUDA-only and not imported on ROCm.
+        return self.forward_native(x)
+
 
 class QuickGELU(BaseFusedOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:

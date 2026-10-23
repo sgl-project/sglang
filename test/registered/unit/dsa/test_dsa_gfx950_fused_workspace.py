@@ -5,7 +5,7 @@ double stands in for _Workspace, so only the bookkeeping is under test."""
 import unittest
 from unittest import mock
 
-from sglang.kernels.ops.attention.dsa.hip_gfx950 import fused_decode as fd
+from sglang.srt.layers.attention.dsa import gfx950_fused_indexer as fd
 from sglang.test.ci.ci_register import register_cpu_ci
 
 # GLM-5.2: 78 target layers + 1 draft layer, each with its own Indexer.

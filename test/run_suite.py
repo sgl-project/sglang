@@ -92,6 +92,7 @@ PER_COMMIT_SUITES = {
         "base-b-test-diffusion-unit-1-gpu-h100",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
+        "base-c-test-2-gpu-gb300",
         "base-c-test-4-gpu-gb300",
         "base-c-test-8-gpu-h20",
         "base-c-test-8-gpu-h200",
@@ -132,14 +133,9 @@ PER_COMMIT_SUITES = {
         # stage-b needs a self-hosted Apple Silicon runner; dispatched manually.
         "stage-b-e2e-mps",
     ],
-    # PPU has no suite in any of the three dicts yet: pr-test-ppu.yml only runs
-    # the runner preflight until the PPU SRT platform and AOT kernels land.
-    # Declaring a name here before a workflow dispatches it would let a test
-    # register, validate, and count as covered while never running, so each PPU
-    # suite name arrives with the job that runs it. Until then PPU is in
-    # _SUITE_CHECKED_BACKENDS with no valid suite, so validate_all_suites()
-    # rejects any register_ppu_ci() outright.
-    HWBackend.PPU: [],
+    HWBackend.PPU: [
+        "stage-a-test-1-gpu-ppu",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -377,6 +373,22 @@ def load_live_est(
     return merged or None
 
 
+def load_only_file_list(list_path: str, repo_root: str) -> set:
+    """Read repo-relative test paths (one per line, optional ::case suffix)
+    and normalize them to the absolute-path form CIRegistry.filename uses."""
+    with open(list_path) as f:
+        entries = [line.strip() for line in f if line.strip()]
+    if not entries:
+        print(f"Warning: empty only-file list: {list_path}")
+    out = set()
+    for entry in entries:
+        file_part = entry.split("::", 1)[0].replace("\\", "/").removeprefix("./")
+        if not os.path.isabs(file_part):
+            file_part = os.path.join(repo_root, file_part)
+        out.add(os.path.normpath(file_part))
+    return out
+
+
 def run_a_suite(args):
     hw = HW_MAPPING[args.hw]
     # --suite accepts a comma-separated list; the matched tests are unioned
@@ -409,6 +421,19 @@ def run_a_suite(args):
     all_tests = collect_tests(files, sanity_check=sanity_check)
     validate_all_suites(all_tests)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suites, nightly)
+
+    # Precision-test mode: keep only the coverage-recommended files before
+    # partitioning, so matrix jobs shard the filtered pool (balanced and
+    # disjoint across partitions). An empty intersection yields no tests,
+    # which run_unittest_files treats as success.
+    if args.only_file_list:
+        only_files = load_only_file_list(args.only_file_list, repo_root)
+        before = len(ci_tests)
+        ci_tests = [t for t in ci_tests if t.filename in only_files]
+        print(
+            f"Precision filter (--only-file-list {args.only_file_list}): "
+            f"{before} -> {len(ci_tests)} test file(s)"
+        )
 
     if auto_partition_size:
         live_est = load_live_est(args.partition_model_file, suites, repo_root)
@@ -554,6 +579,17 @@ def main():
         type=str,
         default=None,
         help="Path to sglang-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
+    )
+    parser.add_argument(
+        "--only-file-list",
+        type=str,
+        default=None,
+        help=(
+            "File with one test path per line (repo-relative, optional ::case "
+            "suffix); restrict the run to files in this list. Used by the "
+            "coverage-based precision test mode; partitioning shards the "
+            "filtered pool, so matrix jobs stay balanced and disjoint."
+        ),
     )
     parser.add_argument(
         "--fork-worker-batch-size",

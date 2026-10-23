@@ -3,7 +3,7 @@
 Fuses the per-head absorbed-q bmm (q_nope [T, H, K] bf16 x w_kc [H, K, N]
 bf16, fp32 accumulate), the nope/rope concat, and the bf16 -> fp8_e4m3 cast
 into one hand-written WGMMA kernel.  CUDA replacement for the Triton
-``absorbed_bmm_concat_cast_q_fp8`` (triton_ops/cache_ops.py) with the
+``absorbed_bmm_concat_cast_q_fp8`` (attention/mla_qk_prep.py) with the
 identical fp32 -> bf16 -> fp8 epilogue rounding chain; the rope half is
 bit-exact vs ``concat_and_cast_q_fp8_pad``.
 """

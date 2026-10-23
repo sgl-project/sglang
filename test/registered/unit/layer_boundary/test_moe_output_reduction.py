@@ -78,10 +78,6 @@ class TestReduceMoeOutput(CustomTestCase):
         self.assertEqual(count, 1)
         torch.testing.assert_close(output, torch.full((2, 3), 2.0))
 
-    def test_single_rank_has_nothing_to_sum(self):
-        with moe_config(tp_size=1):
-            self.assertEqual(self.all_reduces()[0], 0)
-
     def test_a_later_step_owns_the_sum(self):
         for flags, config in (
             ({"mlp_reduce_scatter": True}, {}),

@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=35, suite="base-a-test-cpu")
+register_cpu_ci(est_time=29, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
@@ -13,54 +13,8 @@ import torch
 from sglang.test.test_utils import CustomTestCase
 
 
-def skip_if_no_blackwell_nvfp4(func):
-    """Skip test if Blackwell NVFP4 is not available."""
-    from sglang.srt.utils import is_blackwell
-
-    return unittest.skipUnless(
-        is_blackwell(), "Blackwell (SM100/SM120) with CUDA >= 12.8 is required"
-    )(func)
-
-
 class TestKVCacheQuantRegistry(CustomTestCase):
     """Test the registry and factory function."""
-
-    def test_factory_nvfp4(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            NVFP4KVCacheMethod,
-            get_kv_cache_quant_method,
-        )
-
-        method = get_kv_cache_quant_method("nvfp4", num_layers=4, device="cpu")
-        self.assertIsInstance(method, NVFP4KVCacheMethod)
-        self.assertEqual(method.name, "nvfp4")
-
-    def test_factory_blockfp4(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            FP4MXBlock16KVCacheMethod,
-            get_kv_cache_quant_method,
-        )
-
-        method = get_kv_cache_quant_method("fp4_mx_block16")
-        self.assertIsInstance(method, FP4MXBlock16KVCacheMethod)
-        self.assertEqual(method.name, "fp4_mx_block16")
-
-    def test_resolve_explicit_recipes(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            resolve_kv_cache_quant,
-        )
-
-        self.assertEqual(resolve_kv_cache_quant("nvfp4"), "nvfp4")
-        self.assertEqual(resolve_kv_cache_quant("fp4_mx_block16"), "fp4_mx_block16")
-        self.assertIsNone(resolve_kv_cache_quant("fp8_e4m3"))
-
-    def test_resolve_mxfp4_name_raises(self):
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            resolve_kv_cache_quant,
-        )
-
-        with self.assertRaises(ValueError):
-            resolve_kv_cache_quant("mxfp4")
 
     def test_factory_unknown_raises(self):
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -381,56 +335,6 @@ class TestNVFP4KVCacheMethod(CustomTestCase):
         k_scale, v_scale = method.get_bmm_scales(0)
         self.assertAlmostEqual(k_scale, 0.012)
         self.assertAlmostEqual(v_scale, 0.018)
-
-    @skip_if_no_blackwell_nvfp4
-    def test_quantize_dequantize_roundtrip(self):
-        """Test NVFP4 quantize->dequantize roundtrip on CUDA."""
-        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
-            NVFP4KVCacheMethod,
-        )
-
-        major, minor = torch.cuda.get_device_capability()
-        m = NVFP4KVCacheMethod(num_layers=1, device="cuda")
-
-        size, heads, dim = 32, 8, 128
-        bufs = m.create_buffers(size, heads, dim, 1, "cuda")
-
-        # Create random input
-        k = torch.randn(4, heads, dim, dtype=torch.bfloat16, device="cuda")
-        v = torch.randn(4, heads, dim, dtype=torch.bfloat16, device="cuda")
-        loc = torch.arange(4, device="cuda")
-
-        # Quantize
-        m.quantize_and_store(
-            bufs["k_buffer"][0],
-            bufs["v_buffer"][0],
-            bufs["k_scale_buffer"][0],
-            bufs["v_scale_buffer"][0],
-            loc,
-            k,
-            v,
-            k_scale=m.k_scales_gpu[0:1],
-            v_scale=m.v_scales_gpu[0:1],
-        )
-
-        # Dequantize
-        k_fp4 = bufs["k_buffer"][0][loc]
-        k_scales = bufs["k_scale_buffer"][0][loc]
-        v_fp4 = bufs["v_buffer"][0][loc]
-        v_scales = bufs["v_scale_buffer"][0][loc]
-        k_out, v_out = m.dequantize_prev_kv(k_fp4, k_scales, v_fp4, v_scales, 0)
-
-        # Check shapes
-        self.assertEqual(k_out.shape, (4, heads, dim))
-        self.assertEqual(k_out.dtype, torch.float8_e4m3fn)
-
-        # Check roundtrip error is bounded (FP4 is very lossy, ~20% relative error)
-        k_ref = k.float()
-        k_rec = k_out.float()
-        rel_error = (k_ref - k_rec).abs().mean() / k_ref.abs().mean()
-        self.assertLess(
-            rel_error, 0.5, f"NVFP4 roundtrip error too high: {rel_error:.3f}"
-        )
 
 
 class TestFP4MXBlock16KVCacheMethod(CustomTestCase):

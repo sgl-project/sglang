@@ -216,12 +216,18 @@ def column_parallel_g_matmul(
     num_tokens = sp_num_tokens()
     if sp_fused_matmul_eligible(linear):
         if getattr(linear, "_sp_use_cutlass", False):
-            from sglang.kernels.ops.gemm.sp_collective_gemm import all_gather_matmul
+            from sglang.kernels.ops.communication.sp_collective_gemm import (
+                all_gather_matmul,
+            )
+            from sglang.srt.layers.communication.sp_collective_gemm_workspace import (
+                sp_collective_gemm_workspace,
+            )
 
             return all_gather_matmul(
                 input_parallel.contiguous(),
                 linear.weight,
                 get_parallel().tp_group.device_group,
+                workspace=sp_collective_gemm_workspace,
             )[:num_tokens]
         group_name = get_parallel().tp_group.device_group.group_name
         _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
@@ -252,10 +258,18 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
         x = torch.nn.functional.pad(x, (0, 0, 0, padded - num_tokens))
     if sp_fused_matmul_eligible(linear):
         if getattr(linear, "_sp_use_cutlass", False):
-            from sglang.kernels.ops.gemm.sp_collective_gemm import matmul_reduce_scatter
+            from sglang.kernels.ops.communication.sp_collective_gemm import (
+                matmul_reduce_scatter,
+            )
+            from sglang.srt.layers.communication.sp_collective_gemm_workspace import (
+                sp_collective_gemm_workspace,
+            )
 
             return matmul_reduce_scatter(
-                x, linear.weight, get_parallel().tp_group.device_group
+                x,
+                linear.weight,
+                get_parallel().tp_group.device_group,
+                workspace=sp_collective_gemm_workspace,
             )
         group_name = get_parallel().tp_group.device_group.group_name
         return torch.ops.symm_mem.fused_matmul_reduce_scatter(

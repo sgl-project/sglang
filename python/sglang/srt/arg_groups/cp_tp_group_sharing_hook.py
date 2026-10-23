@@ -47,21 +47,21 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         raise ValueError(f"CP-TP group sharing requires --cp-strategy {strategy}.")
 
     # This hook runs before speculative defaults and NEXTN alias resolution.
-    # Native MTP keeps the target's CP/TP placement; other draft architectures
-    # have their own topology and model-boundary contracts. Only GLM-5.3-Flash
-    # has its MTP ported.
+    # Native MTP keeps the target's CP/TP placement. DFLASH consumes the
+    # target's gathered hidden states and runs its draft with ordinary TP.
+    # Only GLM-5.3-Flash has these speculative paths ported.
     if cfg.speculative_algorithm is not None:
         if model.hf_config.architectures[0] != "Glm5NextForConditionalGeneration":
             raise ValueError(
                 "--speculative-algorithm is not supported with CP-TP group sharing."
             )
-        if (
+        if cfg.speculative_algorithm != "DFLASH" and (
             cfg.speculative_algorithm.upper() not in ("EAGLE", "NEXTN")
             or cfg.speculative_draft_model_path not in (None, cfg.model_path)
             or cfg.speculative_eagle_topk not in (None, 1)
         ):
             raise ValueError(
-                "CP/TP group sharing only supports native MTP with top-k 1."
+                "CP/TP group sharing only supports DFLASH or native MTP with top-k 1."
             )
 
     unsupported = {
@@ -108,12 +108,10 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
                 f"{name}={count} must be divisible by --tp-size={cfg.tp_size}."
             )
 
-    declare_resolution(
-        server_args,
-        "resolve_cp_tp_group_sharing",
-        enable_cp_tp_group_sharing=True,
-        # The sequence collectives have batch-dependent sizes.
-        cuda_graph_config=with_phase(
+    fields = {"enable_cp_tp_group_sharing": True}
+    if model.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration":
+        # Qwen's sequence collectives still have batch-dependent sizes.
+        fields["cuda_graph_config"] = with_phase(
             cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-        ),
-    )
+        )
+    declare_resolution(server_args, "resolve_cp_tp_group_sharing", **fields)

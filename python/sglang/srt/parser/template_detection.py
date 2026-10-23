@@ -718,6 +718,17 @@ def detect_tool_call_parser(
     return match_rules(ctx, TOOL_CALL_PARSER_RULES, "tool-call parser")
 
 
+def is_glm53_template(template: Optional[str]) -> bool:
+    """True if ``template`` is a GLM-5.3 family chat template."""
+    if not template:
+        return False
+    return _is_glm53(
+        TemplateDetectionContext(
+            template=template, reasoning_config=None, force_reasoning=False, vocab=set()
+        )
+    )
+
+
 def detect_inline_system_support(chat_template: Optional[str]) -> bool:
     """True if mid-conversation ``role: "system"`` renders inline; False if the
     template raises or silently drops it (then merge into the leading block).
@@ -782,6 +793,48 @@ def _log_undetected_parser(attr: str, label: str) -> None:
         f"--{attr.replace('_', '-')}=auto specified but could not detect "
         f"{label} from chat template. Disabling {label}."
     )
+
+
+def _declare_python_template_parsers(server_args, template, needs) -> None:
+    """Resolve the ``auto`` parsers to the ones a Python chat template declares."""
+    detected = {attr: getattr(template, attr) for attr in needs}
+    for attr, value in detected.items():
+        logger.info(
+            f"Auto-detected --{attr.replace('_', '-')} as '{value}' from "
+            f"Python chat template '{template.name}'"
+        )
+    declare_resolution(server_args, "template-detection", **detected)
+
+
+def _checkpoint_python_chat_template(server_args, template):
+    """The Python chat template replacing the checkpoint's ``template``, if any.
+
+    Mirrors TemplateManager's selection when ``--chat-template`` is not set.
+    """
+    from sglang.srt.parser.python_chat_template import (
+        may_replace_jinja_template,
+        resolve_python_chat_template,
+    )
+
+    if not may_replace_jinja_template(template):
+        return None
+
+    cfg = resolving_view(server_args)
+    try:
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        config = get_config(
+            cfg.model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=getattr(cfg, "revision", None),
+            model_config_parser=getattr(cfg, "model_config_parser", "auto"),
+        )
+    except Exception as e:
+        logger.warning(
+            "Failed to load model config to resolve a Python chat template: %s", e
+        )
+        return None
+    return resolve_python_chat_template(config, template)
 
 
 def _architecture_auto_parsers(server_args, needs: Tuple[str, ...]) -> Dict[str, str]:
@@ -904,9 +957,19 @@ def resolve_auto_parsers(server_args) -> None:
     if not needs:
         return
 
+    chat_template_arg = getattr(cfg, "chat_template", None)
+    if isinstance(chat_template_arg, str):
+        from sglang.srt.parser.python_chat_template import get_python_chat_template
+
+        # A built-in Python chat template declares its parsers, so neither the
+        # tokenizer nor a Jinja source needs loading.
+        python_template = get_python_chat_template(chat_template_arg)
+        if python_template is not None:
+            _declare_python_template_parsers(server_args, python_template, needs)
+            return
+
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
-    chat_template_arg = getattr(cfg, "chat_template", None)
     try:
         explicit_jinja_template = _load_explicit_jinja_template(chat_template_arg)
     except Exception as e:
@@ -928,6 +991,14 @@ def resolve_auto_parsers(server_args) -> None:
     template = explicit_jinja_template
     if template is None and tokenizer is not None:
         template = getattr(tokenizer, "chat_template", None)
+
+    # A Python chat template replacing the checkpoint's renders this model's
+    # prompts, so its declared parsers decide; the Jinja source is not consulted.
+    if chat_template_arg is None:
+        python_template = _checkpoint_python_chat_template(server_args, template)
+        if python_template is not None:
+            _declare_python_template_parsers(server_args, python_template, needs)
+            return
 
     force_reasoning, reasoning_config = detect_reasoning_pattern(template)
     ctx = build_detection_context(

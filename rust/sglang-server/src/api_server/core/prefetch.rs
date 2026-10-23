@@ -9,12 +9,11 @@
 //! [`crate::message::request::MmData::prefetched`], which
 //! [`crate::multi_modality::payload::to_mm_input`] swaps back in.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted, fetch_local_file_budgeted};
-use sglang_mm::driver::{MAX_ITEMS_PER_REQUEST, MAX_REQUEST_BYTES};
+use sglang_mm::driver::MAX_REQUEST_BYTES;
 use tokio::sync::Semaphore;
 
 use crate::message::request::{GenerateRequest, MmData};
@@ -22,20 +21,25 @@ use crate::multi_modality::payload::io_sources;
 
 /// Global bound on concurrent media fetches across all in-flight requests;
 /// excess acquisitions queue on the semaphore without holding a thread.
-static PERMITS: Semaphore = Semaphore::const_new(32);
+static PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(32)));
 
 /// Fill [`MmData::prefetched`] for every request, all fetches across the batch
 /// concurrent. Any failure rejects the call (a 400, as on the Python path).
 ///
-/// The driver's budgets ([`MAX_ITEMS_PER_REQUEST`], [`MAX_REQUEST_BYTES`]) are
-/// enforced *here* rather than in `sglang_mm::driver::process`, where 64 sources
-/// of 64 MiB would already be resident. The driver keeps its own checks as the
-/// backstop for callers without a prefetch layer.
+/// `modality_limits` is `--limit-mm-data-per-request`, checked before a single
+/// byte is fetched, in its configured order and with Python's message
+/// (`TokenizerManager._validate_mm_limits`). Unset means no per-modality limit,
+/// as in Python. Python has no fixed item cap, and neither does this.
+///
+/// [`MAX_REQUEST_BYTES`] is enforced while fetching, here rather than in
+/// `sglang_mm::driver::process`, where every source would already be resident.
+/// It bounds buffered media bytes regardless of the item count. The driver
+/// keeps its own byte check as the backstop for callers without a prefetch
+/// layer.
 pub async fn prefetch_all(
     requests: &mut [GenerateRequest],
-    modality_limits: &BTreeMap<String, usize>,
+    modality_limits: &[(String, usize)],
 ) -> Result<(), String> {
-    // The item budget rejects before a single byte is fetched.
     let plan = |mm: &Option<Box<MmData>>| -> Result<Vec<String>, String> {
         let Some(mm) = mm.as_deref() else {
             return Ok(Vec::new());
@@ -45,21 +49,13 @@ pub async fn prefetch_all(
             ("video", &mm.video_data),
             ("audio", &mm.audio_data),
         ];
-        let items = modalities
-            .iter()
-            .map(|(_, items)| items.len())
-            .sum::<usize>();
-        if items > MAX_ITEMS_PER_REQUEST {
-            return Err(format!(
-                "multimodal request exceeds {MAX_ITEMS_PER_REQUEST} media items"
-            ));
-        }
-        for (modality, items) in modalities {
+        for (modality, limit) in modality_limits {
+            let Some((name, items)) = modalities.iter().find(|(name, _)| name == modality) else {
+                continue;
+            };
             let count = items.len();
-            if let Some(limit) = modality_limits.get(modality)
-                && count > *limit
-            {
-                let display = modality[..1].to_uppercase() + &modality[1..];
+            if count > *limit {
+                let display = name[..1].to_uppercase() + &name[1..];
                 return Err(format!(
                     "{display} count {count} exceeds limit {limit} per request."
                 ));
@@ -96,24 +92,41 @@ async fn fetch_ordered(sources: Vec<String>, total_bytes: u64) -> Result<Vec<Byt
     futures::future::try_join_all(sources.into_iter().map(|src| {
         let budget = Arc::clone(&budget);
         async move {
-            let _permit = PERMITS.acquire().await.expect("semaphore never closed");
             // Blocking I/O: parks a lazily-spawned blocking-pool thread, never
             // an API worker. Those threads are pinned round-robin over the api
             // core set (see `on_thread_start` in `runtime::start`) — off the
             // CPU-bound stages, and mostly I/O-parked, so sharing is fine.
-            tokio::task::spawn_blocking(move || {
+            run_blocking_bounded(Arc::clone(&PERMITS), move || {
                 if src.starts_with('/') || src.starts_with("file://") {
                     fetch_local_file_budgeted(&src, &budget)
                 } else {
                     fetch_bytes_budgeted(&src, &budget)
                 }
             })
-            .await
-            .map_err(|e| format!("media prefetch: {e}"))?
+            .await?
             .map(Bytes::from)
         }
     }))
     .await
+}
+
+async fn run_blocking_bounded<F, T>(permits: Arc<Semaphore>, work: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = permits
+        .acquire_owned()
+        .await
+        .expect("semaphore never closed");
+    tokio::task::spawn_blocking(move || {
+        // Keep the permit with the blocking operation: dropping the async
+        // caller cannot make uncancellable work disappear from the bound.
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| format!("media prefetch: {e}"))
 }
 
 #[cfg(test)]
@@ -181,7 +194,7 @@ mod tests {
             })),
             ..Default::default()
         }];
-        prefetch_all(&mut requests, &BTreeMap::new()).await.unwrap();
+        prefetch_all(&mut requests, &[]).await.unwrap();
         std::fs::remove_dir_all(base).ok();
         let fetched = &requests[0].mm.as_ref().unwrap().prefetched;
         assert_eq!(
@@ -206,7 +219,7 @@ mod tests {
             ]),
             GenerateRequest::default(),
         ];
-        prefetch_all(&mut requests, &BTreeMap::new()).await.unwrap();
+        prefetch_all(&mut requests, &[]).await.unwrap();
         std::fs::remove_file(&path).ok();
         let fetched = &requests[0].mm.as_ref().unwrap().prefetched;
         // The one-shot server answers in accept order, so contents may swap
@@ -220,49 +233,72 @@ mod tests {
     #[tokio::test]
     async fn failed_download_rejects() {
         let mut requests = vec![mm_request(vec![src("http://127.0.0.1:1/nope.png")])];
-        let err = prefetch_all(&mut requests, &BTreeMap::new())
-            .await
-            .err()
-            .unwrap();
+        let err = prefetch_all(&mut requests, &[]).await.err().unwrap();
         assert!(err.contains("media fetch"), "{err}");
     }
 
-    /// The item budget rejects before any source is touched: all of these would
-    /// fail to fetch, so a fetch error would prove fetching started.
+    /// Without `--limit-mm-data-per-request`, a request with far more items
+    /// than the old fixed cap (64) is fetched in full, as Python serves it.
     #[tokio::test]
-    async fn item_budget_rejects_before_fetching() {
-        let sources: Vec<MmItem> = (0..=MAX_ITEMS_PER_REQUEST)
-            .map(|i| src(format!("/definitely/not/here-{i}.png")))
-            .collect();
-        let mut requests = vec![mm_request(sources)];
-        let err = prefetch_all(&mut requests, &BTreeMap::new())
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(
-            err,
-            format!("multimodal request exceeds {MAX_ITEMS_PER_REQUEST} media items")
-        );
-        assert!(requests[0].mm.as_ref().unwrap().prefetched.is_empty());
+    async fn items_beyond_the_old_cap_are_fetched_without_a_limit() {
+        let n = 200;
+        let path =
+            std::env::temp_dir().join(format!("sglang-prefetch-many-{}", std::process::id()));
+        std::fs::write(&path, b"img").unwrap();
+        let mut requests = vec![mm_request(
+            (0..n).map(|_| src(path.display().to_string())).collect(),
+        )];
+        let fetched = prefetch_all(&mut requests, &[]).await;
+        std::fs::remove_file(&path).ok();
+        fetched.unwrap();
+        assert_eq!(requests[0].mm.as_ref().unwrap().prefetched.len(), n);
     }
 
+    /// `--limit-mm-data-per-request` matches Python `_validate_mm_limits`: a
+    /// count at the limit passes, the first over-limit modality in configured
+    /// order is reported with Python's message, and nothing is fetched.
     #[tokio::test]
-    async fn per_modality_budget_rejects_before_fetching() {
-        let mut requests = vec![GenerateRequest {
+    async fn per_modality_limits_match_python_before_fetching() {
+        let request = || GenerateRequest {
             mm: Some(Box::new(MmData {
                 image_data: vec![
                     src("/definitely/not/here-0.png"),
                     src("/definitely/not/here-1.png"),
                 ],
-                video_data: vec![src("/definitely/not/here.mp4")],
+                video_data: vec![
+                    src("/definitely/not/here-0.mp4"),
+                    src("/definitely/not/here-1.mp4"),
+                ],
                 ..Default::default()
             })),
             ..Default::default()
-        }];
-        let limits = BTreeMap::from([("image".to_owned(), 1), ("video".to_owned(), 1)]);
-        let err = prefetch_all(&mut requests, &limits).await.err().unwrap();
-        assert_eq!(err, "Image count 2 exceeds limit 1 per request.");
-        assert!(requests[0].mm.as_ref().unwrap().prefetched.is_empty());
+        };
+        let owned = |pairs: &[(&str, usize)]| -> Vec<(String, usize)> {
+            pairs.iter().map(|(m, n)| ((*m).to_owned(), *n)).collect()
+        };
+        for (limits, expected) in [
+            (
+                owned(&[("video", 1), ("image", 1)]),
+                "Video count 2 exceeds limit 1 per request.",
+            ),
+            (
+                owned(&[("audio", 0), ("image", 1), ("video", 1)]),
+                "Image count 2 exceeds limit 1 per request.",
+            ),
+        ] {
+            let mut requests = vec![request()];
+            let err = prefetch_all(&mut requests, &limits).await.err().unwrap();
+            assert_eq!(err, expected);
+            assert!(requests[0].mm.as_ref().unwrap().prefetched.is_empty());
+        }
+
+        // At the limit the request passes the count check and reaches fetching.
+        let mut requests = vec![request()];
+        let err = prefetch_all(&mut requests, &owned(&[("image", 2)]))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("media fetch"), "{err}");
     }
 
     /// Sources legal alone but collectively over the limit are rejected while
@@ -309,5 +345,41 @@ mod tests {
         std::fs::remove_dir_all(base).ok();
         assert_eq!(fetched.len(), 2);
         assert!(error.contains("request media byte budget"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_does_not_release_blocking_permit_early() {
+        let permits = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let task_permits = Arc::clone(&permits);
+        let task = tokio::spawn(async move {
+            run_blocking_bounded(task_permits, move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+            .await
+        });
+
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        task.abort();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            permits.available_permits(),
+            0,
+            "the blocking operation must retain its permit after caller cancellation"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while permits.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(permits.available_permits(), 1);
     }
 }

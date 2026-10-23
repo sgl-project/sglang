@@ -36,7 +36,6 @@ request.
 from __future__ import annotations
 
 import math
-import os
 from typing import Any
 
 import msgspec
@@ -48,15 +47,14 @@ from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fp8_rowwise,
     can_use_fused_inplace_qknorm_rope,
-    can_use_fused_layernorm_modulate,
     fp8_rowwise,
     fused_inplace_qknorm_rope,
-    fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
-    is_plain_layer_norm,
+    fused_packed_swiglu_fp8_rowwise,
     residual_gate_add,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.flux3 import (
     Flux3ArchConfig,
     Flux3DiTConfig,
@@ -88,6 +86,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.dits.common import (
+    layernorm_modulate_bitexact,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -139,71 +140,46 @@ def _fast_path_allowed(x: torch.Tensor) -> bool:
     return x.is_cuda and x.dtype is torch.bfloat16 and not torch.compiler.is_compiling()
 
 
-def _can_verify() -> bool:
-    # First-sight verification runs the eager chain and a host sync.
-    return not torch.cuda.is_current_stream_capturing()
-
-
 def _norm_modulate(
     norm: nn.LayerNorm, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
     """``(1 + scale) * LN(x) + shift`` with ``(B, 1, D)`` modulation."""
-    scale_row, shift_row = scale[:, 0], shift[:, 0]
-    if (
-        _LN_MODULATE.disabled
-        or not _fast_path_allowed(x)
-        or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
-    ):
+
+    def reference():
         return (1 + scale) * norm(x) + shift
-    sig = (x.device, x.shape[0], x.shape[-1], norm.eps)
-    if not _LN_MODULATE.is_verified(sig) and not _can_verify():
-        return (1 + scale) * norm(x) + shift
-    try:
-        out = fused_layernorm_modulate_raw(x, scale_row, shift_row, norm.eps)
-    except Exception as exc:
-        _LN_MODULATE.on_exception(exc, logger=logger)
-        return (1 + scale) * norm(x) + shift
-    if _LN_MODULATE.is_verified(sig):
-        return out
-    return _LN_MODULATE.accept_or_fallback(
-        out,
-        (1 + scale) * norm(x) + shift,
-        sig=sig,
-        logger=logger,
-        mismatch_msg="FLUX 3 fused LN+modulate is not bit-exact here; using eager",
+
+    if not _fast_path_allowed(x):
+        return reference()
+    return layernorm_modulate_bitexact(
+        _LN_MODULATE,
+        norm,
+        x,
+        scale[:, 0],
+        shift[:, 0],
+        reference,
+        sig=(x.device, x.shape[0], x.shape[-1], norm.eps),
     )
 
 
 def _swiglu(packed: torch.Tensor) -> torch.Tensor:
     """``silu(gate) * value`` of a packed ``[gate | value]`` projection."""
     gate, value = packed.chunk(2, dim=-1)
-    if _SWIGLU.disabled or not _fast_path_allowed(packed):
+    if not _fast_path_allowed(packed):
         return F.silu(gate) * value
-    sig = (packed.device, packed.shape[-1], packed.stride(-2))
-    if not _SWIGLU.is_verified(sig) and not _can_verify():
-        return F.silu(gate) * value
-    try:
-        out = fused_packed_silu_mul_bitexact(packed)
-    except Exception as exc:
-        _SWIGLU.on_exception(exc, logger=logger)
-        return F.silu(gate) * value
-    if _SWIGLU.is_verified(sig):
-        return out
-    return _SWIGLU.accept_or_fallback(
-        out,
-        F.silu(gate) * value,
-        sig=sig,
+    return _SWIGLU.run(
+        lambda: fused_packed_silu_mul_bitexact(packed),
+        lambda: F.silu(gate) * value,
+        sig=(packed.device, packed.shape[-1], packed.stride(-2)),
         logger=logger,
-        mismatch_msg="FLUX 3 fused SwiGLU is not bit-exact here; using eager",
     )
 
 
+# Not apply_qk_norm_rope: Flux3RMSNorm has neither RMSNorm's weight nor its eps,
+# and the eager fallback is Flux3's own fp32 pair rotation.
 def _fused_qknorm_rope_enabled(q: torch.Tensor, head_dim: int) -> bool:
     return (
         _fast_path_allowed(q)
-        and os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
-        not in ("0", "false", "off", "no")
+        and envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
         and can_use_fused_inplace_qknorm_rope(
             head_dim=head_dim,
             rope_dim=head_dim,
@@ -298,7 +274,7 @@ class Flux3Fp8RowwiseLinear(nn.Module):
     parallel linears so the module can replace either kind.
     """
 
-    # _scaled_mm needs M padded to a multiple of 16.
+    # Preserve the checkpoint inference path's row padding convention.
     ROW_ALIGNMENT = 16
 
     def __init__(
@@ -350,6 +326,35 @@ class Flux3Fp8RowwiseLinear(nn.Module):
                 activation, activation_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                     activation, activation_scale
                 )
+        return self._forward_quantized(activation, activation_scale, leading)
+
+    def forward_swiglu(self, packed: torch.Tensor):
+        """Fuse packed BF16 SwiGLU with this layer's activation quantization."""
+        if not (
+            packed.is_cuda
+            and torch.version.hip is None
+            and packed.dtype == torch.bfloat16
+            and packed.ndim == 3
+            and packed.shape[-1] == 2 * self.in_features
+            and 0 < self.in_features <= 16384
+            and packed.stride(-1) == 1
+            and packed.stride(1) >= packed.shape[-1]
+            and (
+                packed.shape[0] <= 1
+                or packed.stride(0) == packed.shape[1] * packed.stride(1)
+            )
+            and self.weight.dtype == torch.float8_e4m3fn
+            and torch.cuda.get_device_capability(packed.device) >= (8, 9)
+            and not torch.compiler.is_compiling()
+        ):
+            return self(_swiglu(packed))
+        activation, activation_scale = fused_packed_swiglu_fp8_rowwise(
+            packed, self.ROW_ALIGNMENT
+        )
+        return self._forward_quantized(activation, activation_scale, packed.shape[:-1])
+
+    def _forward_quantized(self, activation, activation_scale, leading):
+        rows = math.prod(leading)
         out = torch._scaled_mm(
             activation,
             self.weight.T,
@@ -553,7 +558,11 @@ class Flux3Block(nn.Module):
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
             attended = self.attn(q, k, v, attn_mask_meta=sp.attn_mask_meta)
         attended = attended.reshape(batch, length, self.local_hidden)
-        out = self.attn_out(attended)[0] + self.mlp_out(_swiglu(mlp))[0]
+        if isinstance(self.mlp_out, Flux3Fp8RowwiseLinear):
+            mlp_out = self.mlp_out.forward_swiglu(mlp)[0]
+        else:
+            mlp_out = self.mlp_out(_swiglu(mlp))[0]
+        out = self.attn_out(attended)[0] + mlp_out
         if self.tp_size > 1:
             # One reduce of the summed partials, not one per branch (the order
             # the FLUX 3 reference TP uses).

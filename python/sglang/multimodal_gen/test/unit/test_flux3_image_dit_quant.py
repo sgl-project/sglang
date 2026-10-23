@@ -2,6 +2,7 @@
 """CPU-safe FLUX.3 tests for the rowwise-FP8 and ModelOpt NVFP4 DiT paths."""
 
 import contextlib
+import importlib.util
 import json
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -37,6 +39,14 @@ from sglang.multimodal_gen.runtime.pipelines.flux3_image_weights import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
+
+# Building the DiT constructs attention layers, which read the SP group size.
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
+
+_requires_flashinfer = unittest.skipUnless(
+    importlib.util.find_spec("flashinfer"),
+    "the PrimsTS weight pack ships with flashinfer (CUDA-only)",
+)
 
 _LEAVES = ("to_qkv", "mlp_in", "attn_out", "mlp_out")
 _ALL_ROLES = {
@@ -207,6 +217,7 @@ def _roles(block):
 
 
 class TestFlux3Fp8Construction(unittest.TestCase):
+    @_requires_flashinfer
     def test_process_weights_prepares_prims_ts_weights(self):
         from sglang.kernels.ops.diffusion import pack_flux3_mlp_weight
 
@@ -258,6 +269,7 @@ class TestFlux3Fp8Construction(unittest.TestCase):
         self.assertEqual(block.to_qkv.output_size_per_partition, 768)
         self.assertEqual(_roles(block), {**_ALL_ROLES, "to_qkv": None})
 
+    @_requires_flashinfer
     def test_swiglu_layout_rejects_generic_apply(self):
         layer = _tiny_native_model(_flux3_fp8_config()).single_blocks[0].mlp_in
         layer.quant_method.process_weights_after_loading(layer)
@@ -270,6 +282,7 @@ class TestFlux3Fp8Construction(unittest.TestCase):
         self.assertIsInstance(block.to_qkv.quant_method, Flux3Fp8LinearMethod)
         self.assertIsInstance(block.mlp_in.quant_method, UnquantizedLinearMethod)
 
+    @_requires_flashinfer
     def test_fused_mlp_weight_pack_reverses_each_gate_value_pair(self):
         from sglang.kernels.ops.diffusion import pack_flux3_mlp_weight
 

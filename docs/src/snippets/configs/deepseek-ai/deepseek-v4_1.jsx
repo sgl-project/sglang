@@ -58,7 +58,7 @@ export const config = {
     b200:  "lmsysorg/sglang:dev-dsv41",
     b300:  "lmsysorg/sglang:dev-dsv41",
     gb300: "lmsysorg/sglang:dev-dsv41",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261016",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261021",
   },
 
   github: {
@@ -349,9 +349,6 @@ export const config = {
       nnodes: 1,
       verified: true,
       env: [
-        // Required until ROCm/aiter#5802 is in the aiter pin: below 256 tokens aiter
-        // routes these fp4 experts to a bf16-activation MoE path the pin cannot run.
-        "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
@@ -359,7 +356,6 @@ export const config = {
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
         "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
         "SGLANG_HIP_FP4_INDEXER_ROWGROUP=1",
-        "SGLANG_HIP_DSV41_INDEX_K_PAGE8=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -369,12 +365,13 @@ export const config = {
         "--mem-fraction-static 0.85",
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
-        // AMD monokernel path: shared-expert fusion must stay off.
+        // The monokernel refuses SGLANG_HIP_DSV41_INDEX_K_PAGE8.
         "--monokernel-backend amd",
-        "--disable-shared-experts-fusion",
+        "--enforce-shared-experts-fusion",
         // The one backend worth naming on gfx950: aiter's fp8 GEMM beats what the
         // automatic selection resolves to for this model's 32-wide ue8m0 blocks.
         "--fp8-gemm-backend aiter",
+        "--enable-decoder-swa-bounded-replay",
         // Decode CUDA graphs: the derived batch list does not fit here; a cap of 64
         // fits and keeps 64-request decode batches on the graph.
         "--cuda-graph-max-bs-decode 64",
@@ -390,7 +387,6 @@ export const config = {
       nnodes: 1,
       verified: true,
       env: [
-        "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
@@ -398,6 +394,7 @@ export const config = {
         "SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true",
         "SGLANG_OPT_HIP_FLYDSL_MXFP8=1",
         "SGLANG_HIP_FP4_INDEXER_ROWGROUP=1",
+        // Non-monokernel point. The monokernel refuses this layout.
         "SGLANG_HIP_DSV41_INDEX_K_PAGE8=1",
       ],
       flags: [
@@ -412,6 +409,7 @@ export const config = {
         "--speculative-dspark-block-size 5",
         "--enforce-shared-experts-fusion",
         "--fp8-gemm-backend aiter",
+        "--enable-decoder-swa-bounded-replay",
         "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 128",
         "--cuda-graph-backend-prefill disabled",
@@ -583,9 +581,6 @@ export const config = {
       nnodes: 1,
       verified: false,
       env: [
-        // Required until ROCm/aiter#5802 is in the aiter pin: below 256 tokens aiter
-        // routes these fp4 experts to a bf16-activation MoE path the pin cannot run.
-        "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",
@@ -623,7 +618,6 @@ export const config = {
       nnodes: 1,
       verified: false,
       env: [
-        "AITER_BF16_FP8_MOE_BOUND=0",
         "SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1",
         "SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank",
         "SGLANG_USE_ROCM700A=0",

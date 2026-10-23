@@ -11,6 +11,7 @@ import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
+from sglang.test.muse_spark_utils import try_cached_muse_spark_model
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -18,18 +19,12 @@ from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     _wait_for_gpu_idle_in_ci,
     is_in_ci,
-    try_cached_model,
     write_github_step_summary,
 )
 
 # ci-cost-override: the 816B checkpoint needs two TP4 replicas; one full GSM8K
 # pass covers both NVLink PD transfer and the DFlash2 acceptance regression gate.
-register_cuda_ci(
-    est_time=900,
-    stage="base-c",
-    runner_config="8-gpu-b300",
-    disabled="HF cache cleanup race (#44666); until 2026-11-01",
-)
+register_cuda_ci(est_time=800, stage="base-c", runner_config="8-gpu-b300")
 
 MODEL_PATH = "meta-models/Muse-Spark-Open-816B-A42B-NVFP4"
 DRAFT_MODEL_PATH = "RadixArk/Muse-Spark-Open-DFlash2"
@@ -58,12 +53,12 @@ class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # Use the gated-model credential only in this test and its server children.
-        if token := os.environ.get("HF_MUSE_SPARK_TOKEN"):
+        cls.model = try_cached_muse_spark_model(MODEL_PATH)
+        # A complete local checkpoint needs no gated-model credential.
+        if cls.model == MODEL_PATH and (token := os.environ.get("HF_MUSE_SPARK_TOKEN")):
             token_env = patch.dict(os.environ, {"HF_TOKEN": token})
             token_env.start()
             cls.addClassCleanup(token_env.stop)
-        cls.model = try_cached_model(MODEL_PATH)
         cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
         common_args = [
             "--quantization",
@@ -85,7 +80,7 @@ class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
             "--speculative-algorithm",
             "DFLASH",
             "--speculative-draft-model-path",
-            try_cached_model(DRAFT_MODEL_PATH),
+            try_cached_muse_spark_model(DRAFT_MODEL_PATH, draft=True),
             "--speculative-draft-attention-backend",
             "fa4",
             "--speculative-num-draft-tokens",

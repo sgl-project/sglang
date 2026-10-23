@@ -168,7 +168,7 @@ export const AgentX = ({ data }) => {
     if (b.kind === "worker") {
       const n = b.nodes_per_worker || 1;
       const parts = [];
-      if (b.workers > 1) parts.push(`Start ${b.workers} ${b.role} workers${n > 1 ? `, each spanning ${n} nodes` : ", one per node"}.`);
+      if (b.workers > 1) parts.push(`Start ${b.workers} ${b.role} workers${n > 1 ? `, each spanning ${n} nodes` : b.gpu_pinning ? " across the shared nodes" : ", one per node"}.`);
       if (n > 1) parts.push(`Run on every node of a worker with NODE_RANK=0..${n - 1}; ${ROLE_HEAD[b.role]} is that worker's first node.`);
       if (b.gpu_pinning) parts.push(`Workers share nodes: pin GPUs per worker with CUDA_VISIBLE_DEVICES = ${b.gpu_pinning.map((w, i) => `worker ${i}: ${w.filter(Boolean).join(" / ") || "all"}`).join(" · ")}.`);
       if (router === "sglang" && workerCount === 1 && b.role === "agg" && n === 1) parts.push("Serves the OpenAI API on port 30000.");
@@ -214,6 +214,7 @@ export const AgentX = ({ data }) => {
   };
   const PLACEHOLDERS = {
     NODE_RANK: "rank of this node within its worker (0 on the worker's first node)",
+    LOCAL_WORKER_RANK: "prefill worker index on this node (0 or 1; selects GPUs and distinct ports)",
     NODE_IP: "IP of the node the command runs on",
     ETCD_IP: "node running etcd",
     NATS_IP: "node running NATS",
@@ -581,7 +582,7 @@ export const AgentX = ({ data }) => {
         )}
         <ul style={S.list}>
           {cell.disclosures.includes("synthetic-acceptance") && point.goldenAL && (
-            <li>SemiAnalysis measured this point with a synthetic speculative-decoding acceptance length of {point.goldenAL} (InferenceX golden AL via <code style={S.code}>SGLANG_SIMULATE_ACC_LEN</code>), which is not part of these commands. Real speed depends on your workload's acceptance.</li>
+            <li>{point.status === "in-progress" ? "The pending submission specifies" : "SemiAnalysis measured this point with"} a synthetic speculative-decoding acceptance length of {point.goldenAL} (InferenceX golden AL via <code style={S.code}>SGLANG_SIMULATE_ACC_LEN</code>), which is not part of these commands. Real speed depends on your workload's acceptance.</li>
           )}
           {cell.disclosures.includes("chat-template") && (
             <li>The SA run passed InferenceX's thinking-only chat template (<code style={S.code}>deepseek_v4_thinking.jinja</code>, which drops tool definitions). These commands keep SGLang's built-in DeepSeek-V4 encoding, which supports tool calling.</li>

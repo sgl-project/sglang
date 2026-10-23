@@ -320,7 +320,7 @@ Copy `python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion` into ComfyUI
 Pruned BF16 / FP8 files from [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3/tree/main/diffusion_models)
 are the usual loader inputs. GGUF goes in `SGLDOptions.transformer_weights_path`.
 On a 24 GB card put the 32B CLIP on CPU and enable DiT layerwise offload; use
-`kitchen_int8` or GGUF rather than the full unpruned BF16 DiT.
+`convrot_int8` or GGUF rather than the full unpruned BF16 DiT.
 
 ### Singularity hybrid weights
 
@@ -945,6 +945,63 @@ Quality gaps versus base H3 on hard motion and fine detail are properties of
 the released distillation, not of the SGLang port. Use base MiniMax-H3 when
 output quality matters more than latency.
 </Note>
+
+### FastH3 Omni: Ref2VA, 8-step PDD
+
+[FastVideo/FastVideo-FastH3-Omni-8-Step-V1](https://huggingface.co/FastVideo/FastVideo-FastH3-Omni-8-Step-V1)
+is a Parallel Decoding Distillation (PDD) student of the MiniMax-H3 Ref2VA
+partition: eight denoiser evaluations over a 32-interval grid, with VSA at 0.9
+sparsity on 128-token (4, 4, 8) tiles and each reference video keeping 0.1 of
+its tiles. Only `task: "ref2va"` is served, with up to 9 images, 3 videos and 3
+audio clips as ordered references (12 in total), at least one of them visual.
+
+Pass the repository directly to `--model-path`. Its registered model overlay
+maps `transformer_ref/` into the base-H3 layout, fuses the 32 interval output
+heads into 8 per-step heads (the math of `tools/fuse_minimax_h3_pdd_heads.py`)
+and links the text encoder and VAEs from the `MiniMaxAI/MiniMax-H3` Ref2VA
+partition pinned by the release. The served model is the native H3 pipeline:
+the release's `pdd_fused_heads` load through the same path as the PDD LoRA
+recipe above, and the PDD grid is the 8-step shifted grid scaled to the
+release's `sigma_max` of 0.999 (FastGen's `max_t`).
+
+```bash 2×H200
+sglang serve \
+  --model-path FastVideo/FastVideo-FastH3-Omni-8-Step-V1 \
+  --num-gpus 2 --ulysses-degree 2 \
+  --dit-cpu-offload true --text-encoder-cpu-offload true --vae-cpu-offload true \
+  --port 30010
+```
+
+```json Request
+{
+  "model": "FastVideo/FastVideo-FastH3-Omni-8-Step-V1",
+  "prompt": "<Picture 1> is the appearance reference for <Subject 1>. [reference generation] ...",
+  "task": "ref2va",
+  "conditions": [{"type": "image", "role": "reference", "uri": "/path/to/subject.png"}],
+  "target": {"short_edge": 480, "aspect_ratio": "16:9", "duration_seconds": 5.0},
+  "seed": 0
+}
+```
+
+Requests default to `num_inference_steps: 8` and clean references
+(`imgvid_cond_noise_aug_for_inference` and `audio_cond_noise_aug_for_inference`
+of 1.0, the release's target-only flow). On CUDA the transformer selects VSA-H3
+when no backend is given; Ref2VA layouts tile every reference video as its own
+region and take a per-region top-k, while text, reference images and audio
+rows stay dense. `--attention-backend-config` keys `vsa_tile_size`,
+`vsa_ref_keep_rate` and `VSA_sparsity` override the trained values.
+
+Warm request latency on 2× H200 (Ulysses 2, DiT / text encoder / VAE CPU
+offload; median of three requests after one full warmup, 124 frames at 24 FPS
+with audio, until the MP4 is saved):
+
+| References | Short edge | Latency |
+| --- | --- | --- |
+| Image | 480 | 26.9 s |
+| Image + audio | 480 | 27.8 s |
+| Video with audio | 480 | 23.2 s |
+| Image | 768 | 46.6 s |
+| Video with audio | 768 | 37.1 s |
 
 ## 7. VDN-H3: hybrid attention, 8-step distill
 
@@ -1690,9 +1747,12 @@ pays 2 to 3 s of allocator growth and kernel setup. "Steady
 s/NFE" is the mean of forwards 2 to 8. The OpenVDN reference rows ran the released
 inference stack (`8nfe_tuned_fp8.yaml`, `infer_ulysses.py`) on the same host
 and the same clip length, with its Ulysses layout (`parallel.softmax_ranks`)
-swept at every GPU count rather than assumed. Every row below comes from one
-campaign, one arm at a time on an otherwise idle node; a repeated arm moves by
-about 3% across nodes, so treat smaller differences as noise:
+swept at every GPU count rather than assumed. The SGLang rows were re-measured
+in one campaign at `f1a2ee763d`, one arm at a time on an otherwise idle node,
+each with the [8×B200 recipe](#7-vdn-h3-hybrid-attention-8-step-distill) and
+only `--num-gpus` and `--quantization` changed; the OpenVDN reference rows come
+from an earlier campaign on the same host type. A repeated arm moves by about
+3% across nodes, so treat smaller differences as noise:
 
 | Config | Steady s/NFE | Denoise (8 forwards) | Decode | Peak/GPU |
 | --- | ---: | ---: | ---: | ---: |
@@ -1702,18 +1762,18 @@ about 3% across nodes, so treat smaller differences as noise:
 | OpenVDN reference, FP8, 2× B200 Ulysses (standard / 1+1 branch-parallel) | 4.87 / 5.04 | 39.0 / 40.3 s | — | — |
 | OpenVDN reference, FP8, 4× B200 Ulysses (3+1 branch-parallel) | 2.59 | 20.7 s | — | — |
 | OpenVDN reference, FP8, 8× B200 Ulysses (5+3 / 4+4 / standard) | 1.40 / 1.47 / 1.52 | 11.2 / 11.7 / 12.2 s | — | — |
-| SGLang, `--quantization bf16`, 1× B200 | 7.45 | 58.8 s | 8.8 s | 156,298 MB |
-| SGLang, `--quantization fp8` (→ online `mxfp8` on SM100+), 1× B200 | 6.03 | 47.6 s | 8.7 s | 128,418 MB |
-| SGLang default (online `mxfp8`), 2× B200 Ulysses2, `--performance-mode speed`, served-shape warmup | **3.30** | **25.9 s** | 4.7 s | 106,738 MB |
-| SGLang, `--quantization bf16`, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | 2.06 | 16.2 s | 2.3 s | 108,434 MB |
-| SGLang default (online `mxfp8`), 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **1.67** | **13.1 s** | 2.4 s | 85,244 MB |
-| SGLang default (online `mxfp8`), 8× B200 Ulysses8, `--performance-mode speed`, served-shape warmup | **0.88** | **6.9 s** | 1.5 s | 79,972 MB |
-| SGLang, per-channel fp8 weight scales (the online `fp8` path of other models; on SM100+ `--quantization fp8` resolves to `mxfp8`, so this arm selects the per-channel path explicitly), 8× B200 Ulysses8 | 0.98 | 7.7 s | 1.5 s | 79,504 MB |
+| SGLang, `--quantization bf16`, 1× B200, `--performance-mode speed`, served-shape warmup | 7.27 | 58.2 s | 7.0 s | 156,298 MB |
+| SGLang, `--quantization fp8` (→ online `mxfp8` on SM100+), 1× B200, `--performance-mode speed`, served-shape warmup | 5.93 | 47.4 s | 7.0 s | 128,420 MB |
+| SGLang default (online `mxfp8`), 2× B200 Ulysses2, `--performance-mode speed`, served-shape warmup | **3.25** | **26.0 s** | 3.7 s | 102,664 MB |
+| SGLang, `--quantization bf16`, 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | 2.05 | 16.4 s | 2.1 s | 104,358 MB |
+| SGLang default (online `mxfp8`), 4× B200 Ulysses4, `--performance-mode speed`, served-shape warmup | **1.67** | **13.3 s** | 2.1 s | 81,168 MB |
+| SGLang default (online `mxfp8`), 8× B200 Ulysses8, `--performance-mode speed`, served-shape warmup | **0.85** | **6.8 s** | 1.4 s | 76,918 MB |
+| SGLang, per-channel fp8 weight scales (the online `fp8` path of other models; on SM100+ `--quantization fp8` resolves to `mxfp8` and no flag selects the per-channel path, so this arm forces it), 8× B200 Ulysses8 | 0.91 | 7.3 s | 1.4 s | 76,450 MB |
 
-On 8× B200 the SGLang Ulysses8 path runs the paper workload at 0.88 s/NFE
-(7.0 GPU-seconds per NFE) against the published 1.40 s/NFE of OpenVDN's 5+3
+On 8× B200 the SGLang Ulysses8 path runs the paper workload at 0.85 s/NFE
+(6.8 GPU-seconds per NFE) against the published 1.40 s/NFE of OpenVDN's 5+3
 branch-parallel layout; the whole request (text encoding, 8 forwards, joint
-decode) completes in about 8.7 s after warmup. At this GPU count the step is
+decode) completes in about 8.2 s after warmup. At this GPU count the step is
 launch- and copy-bound in the linear branch rather than FLOP-bound, and the
 transformer runs online `mxfp8` by default (e4m3 with one E8M0 scale per 32
 elements into cuBLASLt's block-scaled GEMM, with the activation quant fused
@@ -1722,11 +1782,11 @@ into the adaLN and SwiGLU producers).
 Against the published 8× B200 headline (1.40 s/NFE, 11.2
 GPU-seconds per NFE), the SGLang 4× B200 run spends 6.7 GPU-seconds per
 NFE, with half the GPUs and half the all-to-all fan-out. At equal GPU count
-SGLang is 1.48× faster at two cards (3.30 vs 4.87 s/NFE), 1.55× at four
-(1.67 vs 2.59) and 1.60× at eight (0.88 vs 1.40), while on one card the two
-stacks are within 4% of each other (6.03 vs 6.25 s/NFE quantized, 7.45 vs 7.66
+SGLang is 1.50× faster at two cards (3.25 vs 4.87 s/NFE), 1.56× at four
+(1.67 vs 2.59) and 1.66× at eight (0.85 vs 1.40), while on one card the two
+stacks are within 5% of each other (5.93 vs 6.25 s/NFE quantized, 7.27 vs 7.66
 in BF16). The advantage is therefore parallel scaling rather than per-GPU
-kernel work: SGLang holds 86-91% parallel efficiency from 2 to 8 cards against
+kernel work: SGLang holds 88-91% parallel efficiency from 2 to 8 cards against
 the reference stack's 56-64%, and sweeping the reference stack's own layout
 does not close it (its best split is 8% better than standard Ulysses at eight
 cards, 1.40 against 1.52 s/NFE).
@@ -2186,10 +2246,10 @@ Same card, 50-step run. Speedup is vs BF16+FA. PSNR is vs same-tree INT8+FA (Spe
 | Config | e2e | vs BF16+FA | PSNR mean / min |
 | --- | ---: | ---: | ---: |
 | BF16 + FlashAttention | 1008.6 s | 1.00× | — |
-| `kitchen_int8` + FA | 718.5 s | 1.40× | — |
-| `kitchen_int8` + FA + Spectrum `11 / 5 / 1.0` | **285.3 s** | **3.53×** | **27.4 / 25.3** |
-| `kitchen_int8` + `sage_attn` + Spectrum `15 / 5 / 0` | 245.3 s | 4.11× | 23.6 / 21.0 |
-| `kitchen_int8` + Sage→Sol hybrid + Spectrum `15 / 5 / 0.5` | **219.0 s** | **4.61×** | 20.6 / 17.8 |
+| `convrot_int8` + FA | 718.5 s | 1.40× | — |
+| `convrot_int8` + FA + Spectrum `11 / 5 / 1.0` | **285.3 s** | **3.53×** | **27.4 / 25.3** |
+| `convrot_int8` + `sage_attn` + Spectrum `15 / 5 / 0` | 245.3 s | 4.11× | 23.6 / 21.0 |
+| `convrot_int8` + Sage→Sol hybrid + Spectrum `15 / 5 / 0.5` | **219.0 s** | **4.61×** | 20.6 / 17.8 |
 
 Prefer FA + `11 / 5 / 1.0` when the bar is FA-like. Sage / hybrid + Spectrum is faster; quality then follows the attention backend, not the skip schedule.
 

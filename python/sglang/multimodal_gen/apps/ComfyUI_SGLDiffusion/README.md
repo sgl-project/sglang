@@ -59,7 +59,7 @@ extension, which only changes the presentation.
 | --- | --- |
 | Parallel | `parallel_mode` auto or manual; manual sets `tp_size`, `ulysses_degree`, `ring_degree`, whose product must equal `num_gpus` |
 | Attention | `attention_backend`: auto (model default), flash_attention, torch_sdpa, sage_attention2, sage_attention3, sol_attention (H3; needs the `sol-attn` package; picking it fills `attention_backend_config` with its defaults), and the H3 sparse backends; `attention_backend_config` |
-| Quantization | `quantization` (online, native directories only); `int8_gemm`: GEMM implementation for INT8 ConvRot weights, auto / sglang_jit / comfy_kitchen |
+| Quantization | `quantization` (online: native directories, or `convrot_int8` on a BF16 Qwen-Image-2.1 file); `int8_gemm`: GEMM implementation for INT8 ConvRot weights, auto / sglang_jit / comfy_kitchen |
 | Cache | `cache_mode`: off, cache_dit, teacache, spectrum (lossy). For cache_dit, `cache_dit_tuning` auto keeps the defaults; manual sets warmup steps, residual threshold, max consecutive cached steps and Fn compute blocks |
 | Execution | `execution_mode`: eager, torch_compile, cuda_graph (breakable CUDA graph); `regional_compile` |
 | Memory | `memory_mode`: resident or DiT layerwise offload; `resident_layers`, `prefetch_layers` |
@@ -72,7 +72,7 @@ worker and raises instead of dropping a setting. Current limits in integrated mo
 | cuda_graph | MiniMax H3, with `cache_mode` off and no layerwise offload |
 | torch_compile | all but FastH3 and VDN-H3 |
 | ring_degree > 1 | not FastH3 / VDN-H3; MiniMax H3 needs `fa` |
-| quantization | native model directories; ComfyUI files carry their own format |
+| quantization | native model directories; BF16 Qwen-Image-2.1 files with `convrot_int8`. Other ComfyUI files carry their own format |
 | cache_dit, spectrum | MiniMax H3 family (spectrum: sequence-parallel degree 1); other models send each sampler step as its own request, so a step cache needs per-run state first |
 | teacache | none yet |
 
@@ -117,6 +117,7 @@ Reference workflow files are provided in the `workflows/` directory:
 
 - **`flux_sgld_sp.json`**: Multi-GPU (Sequence Parallelism) workflow for FLUX models. High-performance inference across multiple cards.
 - **`qwen_image_sgld.json`**: Qwen-Image generation with LoRA support. Optimized for multi-modal image tasks.
+- **`flux_controlnet_sgld.json`**: Flux.1-dev with an InstantX canny ControlNet in integrated mode (`instantx_flux_canny.safetensors` in `models/controlnet`, any image as `example.png` in `input/`).
 - **`z-image_sgld.json`**: High-speed image generation using Z-Image.
 - **`sgld_text2img.json`**: Server-mode text-to-image generation with LoRA support.
 - **`sgld_image2video.json`**: Server-mode image-to-video generation.
@@ -137,6 +138,8 @@ To use these workflows:
 
 SGLang's optimized kernels and parallelism (TP / SP, compile, cache) run on the
 DiT only. Text encoding and VAE stay in ComfyUI.
+
+Start ComfyUI with `--disable-cuda-malloc` for integrated mode. ComfyUI's default `cudaMallocAsync` pool cannot export CUDA IPC handles, so per-step tensors (latents, ControlNet residuals) then go through a host copy; with the flag they are shared on the GPU. Flux + ControlNet at 1024x1024 on an H100 drops from 13.1s to 4.7s for 25 steps.
 
 ## Architecture
 

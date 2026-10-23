@@ -1350,24 +1350,6 @@ class SpatialImagePipelineConfig(ImagePipelineConfig):
         return self._gather_sp_tensor(latents, dim=2)
 
 
-@dataclass
-class SlidingTileAttnConfig(PipelineConfig):
-    """Configuration for sliding tile attention."""
-
-    # Override any BaseConfig defaults as needed
-    # Add sliding tile specific parameters
-    window_size: int = 16
-    stride: int = 8
-
-    # You can provide custom defaults for inherited fields
-    height: int = 576
-    width: int = 1024
-
-    # Additional configuration specific to sliding tile attention
-    pad_to_square: bool = False
-    use_overlap_optimization: bool = True
-
-
 def parse_int_list(value: str) -> list[int]:
     """Parse a comma-separated string of integers into a list."""
     if not value:

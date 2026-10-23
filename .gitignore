@@ -73,7 +73,8 @@ instance/
 
 # PyBuilder
 .pybuilder/
-target/
+# `**/` because .dockerignore links here and Docker anchors bare patterns at the context root.
+**/target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -232,7 +233,7 @@ work_dirs/
 Cargo.lock
 !rust/Cargo.lock
 !rust/sglang-radix-tree/Cargo.lock
-!experimental/sgl-router/Cargo.lock
+!sgl-router/Cargo.lock
 
 # Other repos
 lmms-eval

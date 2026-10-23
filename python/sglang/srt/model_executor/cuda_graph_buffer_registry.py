@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.input_buffers import (
     INDEX_SEMANTIC_BUFFERS,
     share_input_buffer,
@@ -58,6 +59,12 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
                 dst.copy_(src)
 
     if dsts and dsts[0].is_cuda:
+        fast_path = envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.get()
+        if fast_path and _has_foreach_copy and _one_dense_int_pair(dsts, srcs):
+            # One foreach launch already writes what the small copy would; that kernel
+            # pays off only across dtype pairs, and costs per-pair host checks.
+            torch._foreach_copy_(dsts, srcs)
+            return
         from sglang.kernels.ops.memory.small_copy import try_small_copy
 
         if try_small_copy(dsts, srcs):
@@ -72,6 +79,28 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         groups[key][1].append(src)
     for group_dsts, group_srcs in groups.values():
         _foreach_copy(group_dsts, group_srcs)
+
+
+def _one_dense_int_pair(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> bool:
+    # One integer / bool (dst, src) dtype pair over contiguous tensors.
+    pair = (dsts[0].dtype, srcs[0].dtype)
+    if any(dtype.is_floating_point or dtype.is_complex for dtype in pair):
+        return False
+    return all(
+        (dst.dtype, src.dtype) == pair and dst.is_contiguous() and src.is_contiguous()
+        for dst, src in zip(dsts, srcs)
+    )
+
+
+def same_tensor_view(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether ``a`` and ``b`` view the same elements of the same storage."""
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.device == b.device
+        and a.dtype == b.dtype
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+    )
 
 
 class PaddingPolicy(Enum):
@@ -394,8 +423,10 @@ class CudaGraphBufferRegistry:
         raw_num_tokens: int,
         padded_num_tokens: int,
         pp_proxy_tensors: Optional[Any] = None,
+        skip_slots: frozenset = frozenset(),
     ) -> None:
-        """Copy FB → registry buffers.
+        """Copy FB → registry buffers; ``skip_slots`` are left untouched (their
+        content was staged by ``copy_slots``).
 
         Phase 1 — reset the padded tail per slot ``padding_policy``.
         Phase 2 — grouped D2D copy of all enabled slots from FB (or from a
@@ -419,13 +450,19 @@ class CudaGraphBufferRegistry:
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        # Phase 1: reset padded regions where it matters.
-        for slot in self._slots.values():
-            if not slot.enabled or slot.buffer is None:
-                continue
-            raw_n = slot._raw_n(raw_bs, raw_num_tokens)
-            padded_n = slot._padded_n(padded_bs, padded_num_tokens)
-            slot.reset_padding(raw_n, padded_n)
+        # Phase 1: reset padded regions where it matters (none when neither
+        # axis is padded: reset_padding is then a no-op for every slot).
+        if (
+            not envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.get()
+            or raw_bs < padded_bs
+            or raw_num_tokens < padded_num_tokens
+        ):
+            for slot in self._slots.values():
+                if not slot.enabled or slot.buffer is None or slot.name in skip_slots:
+                    continue
+                raw_n = slot._raw_n(raw_bs, raw_num_tokens)
+                padded_n = slot._padded_n(padded_bs, padded_num_tokens)
+                slot.reset_padding(raw_n, padded_n)
 
         # Phase 2: collect (dst, src) pairs and dispatch a grouped copy.
         gpu_dsts: List[torch.Tensor] = []
@@ -433,7 +470,12 @@ class CudaGraphBufferRegistry:
         cpu_dsts: List[torch.Tensor] = []
         cpu_srcs: List[torch.Tensor] = []
         for slot in self._slots.values():
-            if not slot.enabled or slot.buffer is None or not slot.copy_from_fb:
+            if (
+                not slot.enabled
+                or slot.buffer is None
+                or not slot.copy_from_fb
+                or slot.name in skip_slots
+            ):
                 continue
             if slot.source_fn is not None:
                 # Structured / side-sourced slot: source comes from a nested FB
@@ -473,9 +515,27 @@ class CudaGraphBufferRegistry:
 
         # Phase 3: post-fill hooks (compute-then-write slots).
         for slot in self._slots.values():
-            if not slot.enabled or slot.buffer is None or slot.post_fill is None:
+            if (
+                not slot.enabled
+                or slot.buffer is None
+                or slot.post_fill is None
+                or slot.name in skip_slots
+            ):
                 continue
             slot.post_fill(slot.buffer, forward_batch, ctx)
+
+    def copy_slots(self, sources: Dict[str, torch.Tensor]) -> None:
+        """``fill_from`` for an unpadded batch, by slot name: no padding reset or hooks,
+        and no copy for a source that already is the slot's view."""
+        dsts: List[torch.Tensor] = []
+        srcs: List[torch.Tensor] = []
+        for name, src in sources.items():
+            dst = self._slots[name].buffer[: src.shape[0]]
+            if not same_tensor_view(dst, src):
+                dsts.append(dst)
+                srcs.append(src)
+        if dsts:
+            _grouped_foreach_copy_(dsts, srcs)
 
     def extract_buffer(
         self,

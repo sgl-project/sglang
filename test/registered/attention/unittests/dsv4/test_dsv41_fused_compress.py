@@ -190,7 +190,7 @@ def _reference(t, ratio: int):
     from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
         index_k_rope_pack,
     )
-    from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_compressed_kv
+    from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_compressed_kv
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
 
     if ratio == 1:
@@ -254,7 +254,7 @@ def _reference(t, ratio: int):
     )
     index_cache = tuple(torch.zeros_like(buf) for buf in t.index_cache)
     if t.index_k_split:
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache_hip import (
             store_fp4_index_k_cache_split,
         )
         from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4

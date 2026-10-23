@@ -210,21 +210,25 @@ def _get_host_id() -> str:
 def process_tracing_init(
     otlp_endpoint, server_name, trace_modules: Optional[str] = None
 ):
+    """Initialize OpenTelemetry for this process. Idempotent."""
     global opentelemetry_initialized
     global get_cur_time_ns
     global tracer
     global global_trace_modules
-
-    if trace_modules is not None:
-        global_trace_modules = [
-            module.strip() for module in trace_modules.split(",") if module.strip()
-        ]
 
     if not opentelemetry_imported:
         opentelemetry_initialized = False
         raise RuntimeError(
             "opentelemetry package is not installed!!! Please not enable tracing or install opentelemetry"
         )
+
+    if opentelemetry_initialized:
+        return
+
+    if trace_modules is not None:
+        global_trace_modules = [
+            module.strip() for module in trace_modules.split(",") if module.strip()
+        ]
 
     try:
         # Priority: explicit server_name > OTEL_SERVICE_NAME > "sglang"

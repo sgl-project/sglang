@@ -321,9 +321,16 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         let cfg = cfg.clone();
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let shutdown_rx = shutdown_rx.clone();
+        let hicache_manager = Arc::new(api_server::core::HiCacheManager::new(
+            core.clone(),
+            &cfg.server_args,
+        ));
         let grpc_server = grpc_listener.map(|listener| {
-            let service =
-                api_server::grpc::service::GrpcService::new(core.clone(), &cfg.server_args);
+            let service = api_server::grpc::service::GrpcService::new(
+                core.clone(),
+                &cfg.server_args,
+                hicache_manager.clone(),
+            );
             (listener, service)
         });
         let handle = std::thread::Builder::new()
@@ -351,6 +358,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         cfg.rust_server_args.metrics_listener,
                         http_layer,
                         shutdown_rx.clone(),
+                        hicache_manager,
                     );
                     if let Some((listener, service)) = grpc_server {
                         tokio::join!(
@@ -808,6 +816,76 @@ mod tests {
         rt.request_shutdown();
         assert!(std::net::TcpStream::connect(http_addr).is_err());
         assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+    }
+
+    /// An HTTP attach reaches the scheduler ring; after a successful reply,
+    /// gRPC returns the updated HiCache configuration, verifying that both
+    /// transports share the same state.
+    #[test]
+    fn hicache_state_is_shared_between_http_and_grpc() {
+        use std::io::{Read, Write};
+        use std::time::Duration;
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        let request = std::thread::spawn(move || {
+            let mut conn = std::net::TcpStream::connect(http_addr).unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let body =
+                r#"{"hicache_storage_backend":"file","hicache_write_policy":"write_through"}"#;
+            write!(conn,
+                "PUT /hicache/storage-backend HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+            ).unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            response
+        });
+        assert!(rt.to_scheduler_rx.wait(Duration::from_secs(5)));
+        let requests = rt.to_scheduler_rx.drain(1);
+        assert_eq!(requests.len(), 1);
+        let rid = scheduler_rid(&requests[0].header);
+        let payload = rmp_serde::to_vec_named(&serde_json::json!({
+            "success": true, "message": "attached",
+        }))
+        .unwrap();
+        assert!(
+            rt.from_scheduler_tx
+                .push(crate::message::response::frame_control_result(
+                    &rid, &payload
+                ))
+        );
+        let response = request.join().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({"success": true, "message": "attached"})
+        );
+
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let status = client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                client.get_hi_cache_storage(proto::GetHiCacheStorageRequest {}),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .into_inner()
+        });
+        assert_eq!(
+            status,
+            proto::HiCacheStatus {
+                hicache_storage_backend: Some("file".into()),
+                hicache_write_policy: Some("write_through".into()),
+                ..Default::default()
+            }
+        );
+        rt.request_shutdown();
     }
 
     /// The Python-backed gRPC listener accepts bodies above Tonic's 4 MiB

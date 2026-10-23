@@ -120,9 +120,10 @@ pub(super) fn validate_input_ids(g: &GenerateRequest, vocab_size: u64) -> Result
 
 /// The context-window checks that need the tokenized length, mirroring Python
 /// `TokenizerManager._validate_one_request`: the input alone must fit, and then
-/// input + `max_new_tokens` must fit. Without them the scheduler silently clamps
-/// and the client gets a 200 with a truncated completion instead of an actionable
-/// 400.
+/// input + the client's own `max_new_tokens` must fit. Without them the
+/// scheduler silently clamps and the client gets a 200 with a truncated
+/// completion instead of an actionable 400. A defaulted `max_new_tokens` (see
+/// [`GenerateRequest::max_new_tokens_defaulted`]) is left to that clamp.
 ///
 /// Under `allow_auto_truncate` both clamp instead of rejecting — the launch flag
 /// opted into that.
@@ -150,6 +151,9 @@ pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Re
     let input_len =
         g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
 
+    if g.max_new_tokens_defaulted {
+        return Ok(()); // not the client's value → the scheduler clamps it
+    }
     let Some(max_new_tokens) = g.sampling_params.max_new_tokens else {
         return Ok(()); // no cap requested → nothing to add to the input length
     };

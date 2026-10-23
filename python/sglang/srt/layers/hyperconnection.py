@@ -261,7 +261,7 @@ class GatedResidual(HyperConnectionBase):
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
             and hyper_input_normed.shape[0] <= 24
         ):
-            from sglang.kernels.ops.elementwise.hc_mix import (
+            from sglang.kernels.ops.gemm.hc_mix_splitk import (
                 hc_mix,
                 permute_pad_up_weight,
             )

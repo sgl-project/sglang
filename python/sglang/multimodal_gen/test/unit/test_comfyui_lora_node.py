@@ -3,6 +3,7 @@
 
 import copy
 import functools
+import os
 import sys
 import types
 from contextlib import nullcontext
@@ -40,6 +41,29 @@ def _load_nodes():
     with mock.patch.dict(sys.modules, stubs):
         from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion import nodes
     return nodes
+
+
+def test_sgld_unet_list_adds_nested_gguf_without_registering_it(monkeypatch) -> None:
+    """Adding .gguf to the global registry made ComfyUI's stock loader offer
+    files it cannot load."""
+    nodes = _load_nodes()
+    registry = {"diffusion_models": (["/models"], {".safetensors"})}
+    files = ["dit.safetensors", "flux/dit-Q4_K_M.gguf", "notes.txt"]
+    for name, value in {
+        "folder_names_and_paths": registry,
+        "get_filename_list": lambda folder: ["dit.safetensors"],
+        "get_folder_paths": lambda folder: registry[folder][0],
+        "recursive_search": lambda folder: (files, {}),
+        "filter_files_extensions": lambda names, exts: [
+            n for n in names if os.path.splitext(n)[1] in exts
+        ],
+    }.items():
+        monkeypatch.setattr(nodes.folder_paths, name, value, raising=False)
+    assert nodes._list_unet_names_including_gguf() == [
+        "dit.safetensors",
+        "flux/dit-Q4_K_M.gguf",
+    ]
+    assert registry["diffusion_models"][1] == {".safetensors"}
 
 
 class _Model:

@@ -162,7 +162,7 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
     }
   }
 
-  if constexpr (kLayout == KVLayout::V41_FP4) {
+  if constexpr (deepseek_v4::kv_encoding(kLayout) == KVLayout::V41_FP4) {
     // The fp4 cache takes the rotated bf16 value as is: its row quantizer is the fake quant, minus the dequant.
     if (out_loc <= 0) return;
     const auto kv_row = Paged::row(params.kvcache, out_loc);
@@ -191,7 +191,7 @@ __global__ __launch_bounds__(kHeadDim / kC1VecSize) void flash_c1_decode_kernel(
   if (out_loc <= 0) return;
   const auto kv_row = Paged::row(params.kvcache, out_loc);
 
-  if constexpr (kLayout == KVLayout::V41 || kLayout == KVLayout::UNIFORM_FP8) {
+  if constexpr (deepseek_v4::kv_encoding(kLayout) == KVLayout::V41 || kLayout == KVLayout::UNIFORM_FP8) {
     // FP8 over the whole row, RoPE included; the layout selects the scaling.
     return deepseek_v4::v41::store_row<kLayout>(kv_row.data, kv_row.scale, tx, data);
   }

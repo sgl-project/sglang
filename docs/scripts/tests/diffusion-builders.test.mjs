@@ -19,7 +19,7 @@ for (const page of pages) {
   const source = readFileSync(join(docs, path), "utf8");
   configs.set(page, (await import("data:text/javascript," + encodeURIComponent(source))).config);
 }
-const get = (suffix) => [...configs].find(([path]) => path.endsWith(suffix))[1];
+const get = (suffix) => [...configs].find(([path]) => path.endsWith(join(...suffix.split("/"))))[1];
 const selection = (config, overrides = {}) => ({
   ...config.commandBuilder.defaultSelection,
   ...Object.fromEntries(config.overlayDims.map((dim) => [dim.id, dim.default])),

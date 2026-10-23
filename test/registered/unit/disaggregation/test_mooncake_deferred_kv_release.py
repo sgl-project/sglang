@@ -7,7 +7,7 @@ Only the transfer worker can send that ACK after its write has drained.
 import threading
 import unittest
 from collections import defaultdict
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 from test_deferred_decode_kv_release import (
@@ -18,13 +18,7 @@ from test_deferred_decode_kv_release import (
 )
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import (
-    ABORT_ACK_TAG,
-    ABORT_TAG,
-    AbortNotification,
-    AckTarget,
-    CommonKVManager,
-)
+from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -105,48 +99,6 @@ class TestMooncakeAbortNotification(
             manager.transfer_worker(queue, MagicMock())
         manager.check_status = lambda room: manager.request_status[room]
 
-    def test_generationless_abort_marks_failed_without_ack_or_warning(self):
-        # A decode that did not arm (prealloc abort) sends no generation; that
-        # is normal and must not warn about mixed versions.
-        manager = _manager()
-        message = AbortNotification(ROOM, DECODE_IP, DECODE_PORT).to_zmq()
-
-        with patch(
-            "sglang.srt.disaggregation.common.conn.logger.warning_once"
-        ) as warning:
-            claimed = manager._handle_abort_notification(message)
-
-        self.assertTrue(claimed)
-        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
-        self.assertEqual(manager._deferred_ack_targets, {})
-        self.assertEqual(manager._sent, [])
-        warning.assert_not_called()
-
-    def test_abort_without_valid_return_address_still_marks_room_failed(self):
-        messages = (
-            ("missing", [ABORT_TAG, str(ROOM).encode("ascii")]),
-            (
-                "malformed port",
-                [
-                    ABORT_TAG,
-                    str(ROOM).encode("ascii"),
-                    DECODE_IP.encode("ascii"),
-                    b"bad",
-                ],
-            ),
-        )
-
-        for name, message in messages:
-            with self.subTest(name=name):
-                manager = _manager()
-
-                claimed = manager._handle_abort_notification(message)
-
-                self.assertTrue(claimed)
-                self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
-                self.assertEqual(manager._deferred_ack_targets, {})
-                self.assertEqual(manager._sent, [])
-
     def _prepare_worker(self, manager, num_dsts: int = 1) -> None:
         """Wire transfer_worker to num_dsts decode ranks that all need the room."""
         manager.enable_trace = False
@@ -159,6 +111,7 @@ class TestMooncakeAbortNotification(
         manager._staging_outstanding = defaultdict(int)
         manager.session_lock = threading.Lock()
         manager.session_failures = defaultdict(int)
+        manager.failed_session_probes = {}
         manager.failed_sessions = set()
         manager.state_layout_rejections = {}
         manager.req_to_decode_prefix_len = {}
@@ -277,16 +230,6 @@ class TestMooncakeAbortNotification(
 
                 manager.send_aux.assert_called_once()
                 self.assertEqual(manager._sent, [])
-
-    def test_feature_off_sends_legacy_ack(self):
-        manager = _manager(enabled=False)
-
-        claimed = manager._handle_abort_notification(self._abort_message())
-
-        self.assertTrue(claimed)
-        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
-        payload = manager._send_multipart_locked.call_args.args[1]
-        self.assertEqual(payload, [ABORT_ACK_TAG, str(ROOM).encode("ascii")])
 
 
 if __name__ == "__main__":

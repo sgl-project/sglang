@@ -20,6 +20,12 @@ static __global__ void moe_vec_q(
   if (row >= nrows) {
     return;
   }
+  if (expert < 0) {
+    if (threadIdx.x == 0) {
+      dst[blockIdx.z * nrows + row] = scalar_t(0.0f);
+    }
+    return;
+  }
 
   const int blocks_per_row = ncols / qk;
   const int blocks_per_warp = vdr * WARP_SIZE / qi;

@@ -34,12 +34,11 @@ from diffusers.models.normalization import (
 
 from sglang.kernels.ops import diffusion as diffusion_ops
 from sglang.kernels.ops.diffusion import (
+    FUSED_LINEAR_GELU,
     BitExactFusionGate,
     can_use_fused_inplace_qknorm_rope,
     can_use_linear_gelu,
-    fused_gelu_active,
     fused_linear_gelu_tanh,
-    mark_fused_gelu_site,
     residual_gate_add,
     tensors_equal,
 )
@@ -58,6 +57,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.dits.common import (
+    layernorm_modulate_bitexact,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -76,24 +78,17 @@ def _longcat_gelu_cat(
     if (
         type(activation) is nn.GELU
         and activation.approximate == "tanh"
-        and _LONGCAT_GELU_CAT.can_attempt_once()
         and _is_cuda
         and attn.is_cuda
         and attn.dtype is torch.bfloat16
         and not torch.is_grad_enabled()
         and not torch.compiler.is_compiling()
     ):
-        try:
-            output = diffusion_ops.fused_gelu_tanh_cat(attn, mlp)
-        except Exception as exc:
-            _LONGCAT_GELU_CAT.on_exception(exc, logger=logger)
-        else:
-            if _LONGCAT_GELU_CAT.verified:
-                return output
-            reference = torch.cat((attn, activation(mlp)), dim=-1)
-            return _LONGCAT_GELU_CAT.accept_or_fallback(
-                output, reference, logger=logger
-            )
+        return _LONGCAT_GELU_CAT.run(
+            lambda: diffusion_ops.fused_gelu_tanh_cat(attn, mlp),
+            lambda: torch.cat((attn, activation(mlp)), dim=-1),
+            logger=logger,
+        )
     return torch.cat((attn, activation(mlp)), dim=-1)
 
 
@@ -103,17 +98,22 @@ def _longcat_norm_modulate(
     scale: torch.Tensor,
     shift: torch.Tensor,
 ) -> torch.Tensor:
-    if torch.is_grad_enabled() or torch.compiler.is_compiling():
+
+    def reference():
         return norm(x) * (1 + scale[:, None]) + shift[:, None]
-    # LayerNorm's reduction depends on the live aten dispatch. Verify each
-    # shape/stride before using the bit-exact fused kernel, outside capture.
-    if (
-        not _LONGCAT_LN_MOD.disabled
-        and x.is_cuda
-        and diffusion_ops.is_plain_layer_norm(norm, x.shape[-1])
-        and diffusion_ops.can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
-    ):
-        sig = (
+
+    if torch.is_grad_enabled() or torch.compiler.is_compiling():
+        return reference()
+    # LayerNorm's reduction depends on the live aten dispatch, so each
+    # shape/stride is verified separately.
+    return layernorm_modulate_bitexact(
+        _LONGCAT_LN_MOD,
+        norm,
+        x,
+        scale,
+        shift,
+        reference,
+        sig=(
             x.shape,
             x.stride(),
             scale.shape,
@@ -123,21 +123,8 @@ def _longcat_norm_modulate(
             norm.eps,
             x.dtype,
             x.device,
-        )
-        verified = _LONGCAT_LN_MOD.is_verified(sig)
-        if verified or not torch.cuda.is_current_stream_capturing():
-            try:
-                out = diffusion_ops.fused_layernorm_modulate(x, scale, shift, norm.eps)
-            except Exception as exc:
-                _LONGCAT_LN_MOD.on_exception(exc, logger=logger)
-            else:
-                if verified:
-                    return out
-                reference = norm(x) * (1 + scale[:, None]) + shift[:, None]
-                return _LONGCAT_LN_MOD.accept_or_fallback(
-                    out, reference, sig=sig, logger=logger
-                )
-    return norm(x) * (1 + scale[:, None]) + shift[:, None]
+        ),
+    )
 
 
 class _LongCatAdaLayerNormZero(AdaLayerNormZero):
@@ -266,10 +253,6 @@ def _apply_longcat_qknorm_rope(
                 ref,
                 equal=tensors_equal,
                 logger=logger,
-                mismatch_msg=(
-                    "LongCat fused QKNorm+RoPE is not bit-exact on this "
-                    "platform; falling back to the Diffusers chain"
-                ),
             )
 
     return _longcat_qknorm_rope_reference(
@@ -327,11 +310,13 @@ class _LongCatFFN(nn.Module):
         # lossless/high site: up-proj GEMM + tanh-GELU epilogue. Off by
         # default; the denoising stage mounts it per batch. The ModuleDict holds
         # `proj` in _modules, so getattr resolves it for the fusion helper.
-        mark_fused_gelu_site(self.net[0], "proj")
+        FUSED_LINEAR_GELU.mark(self.net[0], "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         proj = self.net[0]["proj"]
-        if fused_gelu_active(self.net[0]) and can_use_linear_gelu(proj, hidden_states):
+        if FUSED_LINEAR_GELU.is_enabled(self.net[0]) and can_use_linear_gelu(
+            proj, hidden_states
+        ):
             hidden_states = fused_linear_gelu_tanh(
                 hidden_states, proj.weight, proj.bias
             )
@@ -615,7 +600,7 @@ class _SingleTransformerBlock(nn.Module):
         self.act_mlp = nn.GELU(approximate="tanh")
         # lossless/high site: proj_mlp GEMM + tanh-GELU epilogue,
         # mounted per batch by the denoising stage; off (bit-exact) by default.
-        mark_fused_gelu_site(self, "proj_mlp")
+        FUSED_LINEAR_GELU.mark(self, "proj_mlp")
         # proj_out: RowParallelLinear reduces sharded [attn | mlp] concat via
         # all-reduce, matching Flux2SingleTransformerBlockAttention.to_out.
         self.proj_out = RowParallelLinear(
@@ -680,7 +665,7 @@ class _SingleTransformerBlock(nn.Module):
 
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        gelu_in_projection = fused_gelu_active(self) and can_use_linear_gelu(
+        gelu_in_projection = FUSED_LINEAR_GELU.is_enabled(self) and can_use_linear_gelu(
             self.proj_mlp, norm_hidden_states
         )
         if gelu_in_projection:

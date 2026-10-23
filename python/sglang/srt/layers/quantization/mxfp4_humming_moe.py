@@ -35,6 +35,9 @@ class Mxfp4HummingMoEMethod:
 
         self.runner = MoeRunner(MoeRunnerBackend.HUMMING, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return self.runner.runner_backend
+
     def create_weights(
         self,
         layer: Module,

@@ -255,9 +255,12 @@ class StreamingSession:
             mamba_allocator.free(slot.kv.mamba_pool_idx.unsqueeze(0))
             slot.kv.mamba_pool_idx = None
         if slot.kv.mamba_ping_pong_track_buffer is not None:
-            indices = slot.kv.mamba_ping_pong_track_buffer
-            mamba_allocator.free(indices[indices != -1])
+            buffer = slot.kv.mamba_ping_pong_track_buffer
+            for position, empty in enumerate(slot.kv.mamba_ping_pong_empty):
+                if not empty:
+                    mamba_allocator.free(buffer[position : position + 1])
             slot.kv.mamba_ping_pong_track_buffer = None
+            slot.kv.mamba_ping_pong_empty = None
 
     # -- Internal helpers (streaming body bits) --
 

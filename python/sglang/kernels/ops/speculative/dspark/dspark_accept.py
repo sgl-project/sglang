@@ -8,12 +8,14 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.speculative.dflash import (
+    compute_dflash_correct_drafts_and_bonus,
+)
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     build_speculative_verify_target_probs,
-    compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.srt.utils import is_npu
 
@@ -272,6 +274,7 @@ except ImportError:
     _flashinfer_softmax = None
 
 
+# Not sampling.softmax: the FlashInfer and Triton paths are not bitwise torch.softmax(x / t).
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:

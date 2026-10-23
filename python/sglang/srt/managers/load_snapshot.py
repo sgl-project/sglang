@@ -53,7 +53,11 @@ import msgspec.structs
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_serving
-from sglang.srt.utils.network import is_zmq_endpoint_ipv6
+from sglang.srt.utils.network import (
+    is_zmq_endpoint_ipv6,
+    restrict_zmq_peers,
+    zmq_connect,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -401,7 +405,7 @@ class ZmqLoadSnapshotWriter:
             self._socket.setsockopt(_zmq.IPV6, 1)
         self._socket.setsockopt(_zmq.LINGER, 0)
         self._socket.setsockopt(_zmq.CONFLATE, 1)
-        self._socket.connect(endpoint)
+        zmq_connect(self._socket, endpoint)
 
     def write(self, snapshot: LoadSnapshot) -> None:
         if snapshot.dp_rank != self.dp_rank:
@@ -541,6 +545,8 @@ class ZmqShmLoadSnapshotReader:
             self._socket.setsockopt(_zmq.IPV6, 1)
         self._socket.setsockopt(_zmq.LINGER, 0)
         self._socket.setsockopt(_zmq.CONFLATE, 1)
+        if endpoint.startswith("tcp://"):
+            restrict_zmq_peers(self._ctx, self._socket)
         self._socket.bind(endpoint)
 
         self._endpoint = endpoint

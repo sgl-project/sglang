@@ -114,7 +114,7 @@ class RayDataParallelController(DataParallelController):
         worker_ports = []
         for dp_rank in range(get_parallel().num_dp_ranks):
             worker_port, worker_socket = get_zmq_socket_on_host(
-                self.context, zmq.PUSH, host=self.rank0_node_ip
+                self.context, zmq.PUSH, host=self.rank0_node_ip, restrict_peers=True
             )
             worker_ports.append(worker_port)
             self.workers[dp_rank] = worker_socket

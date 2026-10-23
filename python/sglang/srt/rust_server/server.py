@@ -35,6 +35,7 @@ from sglang.srt.rust_server.multimodal import (
     RustMmSpec,
     settle_shm_buffers,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -79,6 +80,14 @@ class RustServer:
         """Headers a healthy ``/health_generate`` carries; a deployment's
         router may read its metadata off the deep health probe."""
         return {}
+
+    @classmethod
+    def _default_max_new_tokens(cls, scheduler: Scheduler) -> Optional[int]:
+        """What a ``/generate`` request that omits ``max_new_tokens`` asks for:
+        ``SamplingParams``'s default, as the Python ``TokenizerManager`` leaves
+        it. A subclass may return ``None``, no limit, which the scheduler
+        clamps to what the context window leaves after the prompt."""
+        return SamplingParams().max_new_tokens
 
     @classmethod
     def _load_extension(cls) -> ModuleType:
@@ -183,6 +192,7 @@ class RustServer:
                 scheduler,
                 extension=extension,
                 health_generate_headers=cls._health_generate_headers(scheduler),
+                default_max_new_tokens=cls._default_max_new_tokens(scheduler),
             ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
@@ -372,6 +382,10 @@ class RustServer:
         encoded = msgspec.msgpack.encode(payload, enc_hook=str)
 
         self.server.push_control_result(recv_req.rid, encoded)
+
+    def push_health_ack(self) -> None:
+        """Acknowledge the health probes skipped while the scheduler was busy."""
+        self.server.push_health_ack()
 
     def push_generation(self, payload: BatchTokenIDOutput) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).

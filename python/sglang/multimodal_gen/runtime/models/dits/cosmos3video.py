@@ -289,6 +289,8 @@ def _apply_qwen3_qk_norm_rope(
     )
 
 
+# Also writes K/V into one packed buffer in the same launch, which
+# apply_qk_norm_rope cannot.
 def _apply_qwen3_qk_norm_rope_pack_kv(
     q: torch.Tensor,
     k: torch.Tensor,

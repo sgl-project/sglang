@@ -203,7 +203,8 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         return ShapeKey(size=bs)
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        with self.model_context():
+            return self.backend.replay(shape_key, forward_batch)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Uniform-width replay invariant: the batch's actual per-request width
@@ -356,7 +357,10 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         saved_backend_pool = self.draft_attn_backend.token_to_kv_pool
         self.draft_attn_backend.token_to_kv_pool = target_pool
         try:
-            with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
+            with forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend),
+                forward_batch=forward_batch,
+            ):
                 self.frozen_kv_mtp_worker._init_frozen_kv_metadata_capture_cuda_graph(
                     forward_batch
                 )

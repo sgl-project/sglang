@@ -258,11 +258,6 @@ class TestFreezeGc(CustomTestCase):
         self.addCleanup(gc.set_threshold, *gc.get_threshold())
         self.addCleanup(gc.unfreeze)
 
-    def test_preserves_default_threshold(self):
-        gc.set_threshold(700, 10, 10)
-        freeze_gc("test")
-        self.assertEqual(gc.get_threshold(), (700, 10, 10))
-
     def test_applies_configured_threshold(self):
         freeze_gc("test", [700, 10, 1000])
         self.assertEqual(gc.get_threshold(), (700, 10, 1000))

@@ -68,6 +68,10 @@ class Serving(msgspec.Struct):
         str,
         "App is behind a path based routing proxy.",
     ] = ""
+    enable_http_worker_reuseport: A[
+        bool,
+        "Give each Uvicorn HTTP worker its own SO_REUSEPORT listener.",
+    ] = False
     smg_grpc_mode: A[
         bool,
         "Use the legacy SMG gRPC server (smg-grpc-servicer) instead of the HTTP "

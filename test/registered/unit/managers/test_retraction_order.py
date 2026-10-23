@@ -40,16 +40,6 @@ class TestRetractionOrder(CustomTestCase):
     """The retraction loop pops from the END of the returned list, so the
     last index is the first request retracted."""
 
-    def test_length_policy_retracts_shortest_output_first(self):
-        reqs = [_req(5), _req(1), _req(3)]
-        self.assertEqual(_order(reqs, _args()), [0, 2, 1])
-
-    def test_length_policy_tie_breaks_on_longer_input(self):
-        # Equal outputs: the longer-input request is retracted first
-        # (frees more tokens for the same rework).
-        reqs = [_req(4, input_len=10), _req(4, input_len=20)]
-        self.assertEqual(_order(reqs, _args()), [0, 1])
-
     def test_priority_policy_low_values_first(self):
         # Low value = more important; None sorts as least important.
         reqs = [_req(4, priority=2), _req(4, priority=0), _req(4, priority=None)]

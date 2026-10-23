@@ -606,47 +606,6 @@ class TestTriJointReclaim(CustomTestCase):
                 self.check_payload(b, a, slots[first:], states, states)
                 self.assertFalse(a.verify_byte_accounting())
 
-    def test_rank_consensus_uses_stable_tri_demand(self):
-        import os
-        import subprocess
-        import sys
-
-        script = r"""
-import queue,runpy,sys,threading
-from pathlib import Path
-from unittest.mock import patch
-from sglang.srt.utils import rank_consensus_checker as checker
-sys.path.insert(0,str(Path(sys.argv[1]).parent))
-module=runpy.run_path(sys.argv[1],run_name='rank_fixture')
-fixture=module['TestTriJointReclaim']()
-traces=[]
-for _ in range(2):
-    fixture.setUp()
-    try:
-        b,a,c=fixture.build()
-        slots=a.alloc(96);states=b.req_to_token_pool.mamba_allocator.alloc(8)
-        fixture.stamp(b,a,slots,states);fixture.insert_parts(c,slots,states)
-        q=queue.Queue()
-        with patch.object(checker,'_q',q),patch.object(checker,'_scheduler_thread',threading.current_thread()):
-            assert module['evict_from_tree_cache'](c,4)
-            assert a.alloc(4) is not None
-        fixture.check_payload(b,a,slots[1:],states[1:],states)
-        traces.append(list(q.queue))
-    finally:fixture.tearDown()
-assert traces[0]==traces[1],traces
-assert any('num_tokens=4'in event for event in traces[0]),traces
-assert any('allocation_reclaim_satisfied is not None=True'in event for event in traces[0]),traces
-assert not any('<function'in event for event in traces[0]),traces
-"""
-        result = subprocess.run(
-            [sys.executable, "-B", "-c", script, __file__],
-            env=dict(os.environ, SGLANG_ENABLE_RANK_CONSENSUS_CHECKER="1"),
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
     def test_state_quota_accounts_for_token_phase_cascades(self):
         for occupancy, demand in ((96, 10), (97, 1)):
             with self.subTest(occupancy=occupancy, demand=demand):

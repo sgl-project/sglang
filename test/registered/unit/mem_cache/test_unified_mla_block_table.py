@@ -24,7 +24,7 @@ page ids:
 ONE builder computes that formula for every family -- the iteration plan's
 read table (`KVLocPlan.read_table`) -- and the backends only differ in how
 they consume it:
-  - trtllm_mla / cutedsl_mla / tokenspeed_mla / flashmla: the plan's rows
+  - trtllm_mla / cutedsl_mla / flashmla: the plan's rows
     copied into their padded block tables (`KVIndexTranslator.copy_page_table`);
   - the flashinfer updaters: token ids reconstructed from the table by
     `create_flashinfer_kv_indices_triton[ENTRY_PAGE_SIZE=ps]`;
@@ -81,7 +81,7 @@ def _fill_block_table(req_to_token, req_pool_indices, seq_lens, page_size, *, v2
 
 def _fill_block_table_static(req_to_token, req_pool_indices, seq_lens, page_size):
     """The static-pool route: the stripped flashmla kernel, token//ps verbatim."""
-    from sglang.kernels.ops.kvcache.kv_indices import (
+    from sglang.kernels.ops.attention.kv_indices import (
         create_flashmla_kv_indices_triton,
         get_num_kv_index_blocks_flashmla,
     )

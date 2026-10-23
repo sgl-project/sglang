@@ -22,7 +22,7 @@ pip3 install sglang-kernel --upgrade
 ## Building from Source
 Requires
 - CMake ≥3.31,
-- Python ≥3.10
+- Python ≥3.11
 - scikit-build-core
 - ninja(optional)
 

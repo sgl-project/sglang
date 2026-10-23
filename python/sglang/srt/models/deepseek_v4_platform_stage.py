@@ -224,6 +224,7 @@ class NonCudaDecoderMixin:
                 self._next_layer.input_layernorm,
                 accepts_mxfp8=self._next_layer.self_attn.accepts_mxfp8_swizzled_input(),
                 hc=self._next_layer.attn_hc,
+                accepts_mxfp8_deepgemm=self._next_layer.self_attn.accepts_deepgemm_mxfp8_input(),
             )
 
     def forward(
@@ -637,6 +638,27 @@ def forward_layer_fused_boundary(
         hidden_states if pending_post is None else HcPending(*pending_post),
         prev_pre,
     )
+
+
+def fused_boundary_attn_input(layer, state: mhc.HcState) -> torch.Tensor:
+    """
+    Compute the previous layer's mHC post and this layer's attention input for every
+    row, with the kernel that starts forward_hc_pre_from_prev_fused_boundary.
+    """
+    if isinstance(state.streams, mhc.HcPending):
+        pending_post = tuple(state.streams)
+    else:
+        pending_post = (None, state.streams, None, None)
+    _, x, coefficients = make_amd_hc_boundary(
+        layer,
+        *pending_post,
+        state.pre,
+        layer.hc_attn_fn,
+        layer.hc_attn_scale,
+        layer.hc_attn_base,
+    )
+    x, _ = layer._input_norm(x, allow_aiter_quant=False, coefficients=coefficients)
+    return x
 
 
 def forward_hc_pre_from_prev_fused_boundary(

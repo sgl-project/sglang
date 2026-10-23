@@ -24,21 +24,26 @@ from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=600, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
-if not (is_hip() and is_gfx95_supported()):
-    pytest.skip("FlyDSL v4 nm decode is gfx950-only", allow_module_level=True)
+_skip_reason = "FlyDSL v4 nm decode is gfx950-only"
+if is_hip() and is_gfx95_supported():
+    try:
+        from sglang.kernels.ops.attention.dsv4 import flydsl_v4nm
+        from sglang.kernels.ops.attention.dsv4.flydsl_v4nm import (
+            mla_v4_decode as fly_v4,
+        )
+    except ImportError as e:  # no flydsl, or an aiter before ROCm/aiter#6377
+        _skip_reason = f"in-tree FlyDSL v4 nm decode unavailable: {e}"
+    else:
+        _skip_reason = None
+        flydsl_mla_decode_fwd_v4_nm = flydsl_v4nm.flydsl_mla_decode_fwd_v4_nm
+        flydsl_mla_v4_decode_fused = flydsl_v4nm.flydsl_mla_v4_decode_fused
+        flydsl_mla_v4_decode_supported = flydsl_v4nm.flydsl_mla_v4_decode_supported
+        flydsl_mla_v4_grouped_verify_meta = (
+            flydsl_v4nm.flydsl_mla_v4_grouped_verify_meta
+        )
 
-try:
-    from sglang.kernels.ops.attention.dsv4 import flydsl_v4nm
-    from sglang.kernels.ops.attention.dsv4.flydsl_v4nm import mla_v4_decode as fly_v4
-except ImportError as e:  # no flydsl, or an aiter before ROCm/aiter#6377
-    pytest.skip(
-        f"in-tree FlyDSL v4 nm decode unavailable: {e}", allow_module_level=True
-    )
-
-flydsl_mla_decode_fwd_v4_nm = flydsl_v4nm.flydsl_mla_decode_fwd_v4_nm
-flydsl_mla_v4_decode_fused = flydsl_v4nm.flydsl_mla_v4_decode_fused
-flydsl_mla_v4_decode_supported = flydsl_v4nm.flydsl_mla_v4_decode_supported
-flydsl_mla_v4_grouped_verify_meta = flydsl_v4nm.flydsl_mla_v4_grouped_verify_meta
+# CI runs this file as a script; module-level pytest.skip would escape __main__.
+pytestmark = pytest.mark.skipif(_skip_reason is not None, reason=_skip_reason or "")
 
 FP8, BF16, I32 = torch.float8_e4m3fn, torch.bfloat16, torch.int32
 NOPE, ROPE, DV, ROW, QB = 448, 64, 512, 512, 128

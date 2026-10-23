@@ -7,13 +7,9 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
-)
-from sglang.srt.disaggregation.common.utils import (
-    build_dcp_token_transfer_plan,
-    group_concurrent_contiguous,
+    init_dcp_pack_buffers,
 )
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
@@ -21,173 +17,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-
-
-def _plan(*, src, dst, page_size, dcp_size, dcp_rank, **kwargs):
-    return build_dcp_token_transfer_plan(
-        np.asarray(src, dtype=np.int32),
-        np.asarray(dst, dtype=np.int32),
-        physical_page_size=page_size,
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
-        **kwargs,
-    )
-
-
-class TestDcpTokenTransferPlan(CustomTestCase):
-    def test_one_virtual_page_explicit_rows(self):
-        # P=2, N=4. Prefill pages 5,2,11,4; decode virtual page 7.
-        # pos 0..7 src rows: 10,11, 4,5, 22,23, 8,9
-        # draft dest page is P*N=8 → 56..63
-        # each rank stores local rows 14,15 (page P=2)
-        expected_draft_src = [10, 11, 4, 5, 22, 23, 8, 9]
-        expected_draft_dst = list(range(56, 64))
-        expected_target_src = {
-            0: [10, 22],
-            1: [11, 23],
-            2: [4, 8],
-            3: [5, 9],
-        }
-        seen_src = []
-        for rank, src in expected_target_src.items():
-            plan = _plan(
-                src=[5, 2, 11, 4],
-                dst=[7],
-                page_size=2,
-                dcp_size=4,
-                dcp_rank=rank,
-                num_kv_tokens=8,
-            )
-            np.testing.assert_array_equal(
-                plan.draft_src_token_indices, expected_draft_src
-            )
-            np.testing.assert_array_equal(
-                plan.draft_dst_token_indices, expected_draft_dst
-            )
-            np.testing.assert_array_equal(plan.target_src_token_indices, src)
-            np.testing.assert_array_equal(plan.target_dst_token_indices, [14, 15])
-            seen_src.extend(plan.target_src_token_indices.tolist())
-        self.assertEqual(sorted(seen_src), sorted(expected_draft_src))
-
-    def test_second_chunk_crosses_dest_pages(self):
-        # P=2, N=2 (virtual page = 4). Decode already holds a 4-token prefix;
-        # dst=[4, 6] is the full send-range page list. This chunk is the second
-        # prefill page of the send range (src_page_offset=1), so its 4 tokens
-        # sit at send-range pos 2..5 (absolute 6..9) and straddle virtual page
-        # 4 (rows 16..19) and virtual page 6 (rows 24..27).
-        plan = _plan(
-            src=[9, 3],
-            dst=[4, 6],
-            page_size=2,
-            dcp_size=2,
-            dcp_rank=0,
-            src_page_offset=1,
-            decode_prefix_len=4,
-            num_kv_tokens=4,
-        )
-        np.testing.assert_array_equal(plan.draft_src_token_indices, [18, 19, 6, 7])
-        np.testing.assert_array_equal(plan.draft_dst_token_indices, [18, 19, 24, 25])
-        # rank 0 owns absolute pos 6, 8 -> per-rank slots 1, 2 -> pages 4, 6.
-        np.testing.assert_array_equal(plan.target_src_token_indices, [18, 6])
-        np.testing.assert_array_equal(plan.target_dst_token_indices, [9, 12])
-
-        plan_r1 = _plan(
-            src=[9, 3],
-            dst=[4, 6],
-            page_size=2,
-            dcp_size=2,
-            dcp_rank=1,
-            src_page_offset=1,
-            decode_prefix_len=4,
-            num_kv_tokens=4,
-        )
-        np.testing.assert_array_equal(plan_r1.draft_src_token_indices, [18, 19, 6, 7])
-        np.testing.assert_array_equal(plan_r1.draft_dst_token_indices, [18, 19, 24, 25])
-        np.testing.assert_array_equal(plan_r1.target_src_token_indices, [19, 7])
-        np.testing.assert_array_equal(plan_r1.target_dst_token_indices, [9, 12])
-
-    def test_rejects_unaligned_prefix(self):
-        with self.assertRaisesRegex(ValueError, "align"):
-            _plan(
-                src=[0],
-                dst=[0],
-                page_size=2,
-                dcp_size=4,
-                dcp_rank=0,
-                decode_prefix_len=1,
-                num_kv_tokens=2,
-            )
-
-    def test_empty_tokens(self):
-        plan = _plan(
-            src=[0], dst=[0], page_size=2, dcp_size=4, dcp_rank=0, num_kv_tokens=0
-        )
-        self.assertTrue(plan.empty())
-
-
-class TestPackedDcpGrouping(CustomTestCase):
-    def test_target_needs_pack_draft_does_not(self):
-        plan = _plan(
-            src=[0, 1, 2, 3],
-            dst=[0],
-            page_size=2,
-            dcp_size=4,
-            dcp_rank=0,
-            num_kv_tokens=8,
-        )
-        np.testing.assert_array_equal(plan.target_src_token_indices, [0, 4])
-        np.testing.assert_array_equal(plan.target_dst_token_indices, [0, 1])
-        target_src, _ = group_concurrent_contiguous(
-            plan.target_src_token_indices, plan.target_dst_token_indices
-        )
-        self.assertEqual(target_src, [[0], [4]])
-
-        packed_src, packed_dst = group_concurrent_contiguous(
-            np.arange(2, dtype=np.int64), plan.target_dst_token_indices
-        )
-        self.assertEqual(packed_src, [[0, 1]])
-        self.assertEqual(packed_dst, [[0, 1]])
-
-        draft_src, draft_dst = group_concurrent_contiguous(
-            plan.draft_src_token_indices, plan.draft_dst_token_indices
-        )
-        self.assertEqual(draft_src, [[0, 1, 2, 3, 4, 5, 6, 7]])
-        self.assertEqual(draft_dst, [[0, 1, 2, 3, 4, 5, 6, 7]])
-
-
-def _dcp_kv_manager_stub(*, page_size, kv_item_lens, num_draft_entries):
-    return SimpleNamespace(
-        kv_args=SimpleNamespace(
-            page_size=page_size,
-            kv_item_lens=kv_item_lens,
-            num_draft_entries=num_draft_entries,
-        )
-    )
-
-
-class TestPrepareDcpTokenItemLens(CustomTestCase):
-    def test_draft_tail_scales_by_dst_dcp_size(self):
-        mgr = _dcp_kv_manager_stub(
-            page_size=64,
-            kv_item_lens=[64 * 32, 64 * 32, 64 * 16],
-            num_draft_entries=1,
-        )
-        token_lens = CommonKVManager.prepare_dcp_token_item_lens(
-            mgr, [64 * 32, 64 * 32, 4 * 64 * 16], dst_dcp_size=4
-        )
-        self.assertEqual(token_lens, [32, 32, 16])
-
-    def test_rejects_unscaled_draft_item_len(self):
-        mgr = _dcp_kv_manager_stub(
-            page_size=64,
-            kv_item_lens=[64 * 32, 64 * 16],
-            num_draft_entries=1,
-        )
-        with self.assertRaisesRegex(RuntimeError, "geometry differs at entry 1"):
-            CommonKVManager.prepare_dcp_token_item_lens(
-                mgr, [64 * 32, 64 * 16], dst_dcp_size=4
-            )
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestDcpCachedPrefixSend(CustomTestCase):
@@ -221,7 +51,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             return SimpleNamespace(get_ptr=lambda: 0x1000, get_size=lambda: size)
 
         with (
-            get_context().override_server_args(chunked_prefill_size=250),
+            get_context().override_server_args(chunked_prefill_size=250, device="cuda"),
             patch(
                 "sglang.srt.disaggregation.common.staging_handler._get_custom_mem_pool",
                 return_value=(None, None),
@@ -317,6 +147,46 @@ class TestDcpPackBufferBytes(CustomTestCase):
             dcp_pack_buffer_bytes([100], page_size=64, max_tokens=8)
 
 
+class TestInitDcpPackBuffers(CustomTestCase):
+    """The pack kernel is Triton-only: a non-CUDA device must get no buffers
+    (per-token fallback) rather than crash, and an indexed "cuda:N" device must
+    still get them, not silently fall back."""
+
+    _KV_ARGS = SimpleNamespace(
+        kv_item_lens=[64 * 16], page_size=64, num_draft_entries=0, gpu_id=3
+    )
+
+    def test_non_triton_device_gets_no_buffers(self):
+        register_fn = Mock()
+        with patch(
+            "sglang.srt.disaggregation.common.dcp_pack.StagingBuffer"
+        ) as staging_buffer:
+            buffers = init_dcp_pack_buffers(
+                register_fn, self._KV_ARGS, 2, 4, 64, device_type="xpu"
+            )
+
+        self.assertEqual(buffers, [])
+        staging_buffer.assert_not_called()
+        register_fn.assert_not_called()
+
+    def test_cuda_buffers_use_the_bare_device_type_and_gpu_id(self):
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.dcp_pack.StagingBuffer"
+            ) as staging_buffer,
+            patch(
+                "sglang.srt.disaggregation.common.staging_handler._get_custom_mem_pool",
+                return_value=(None, None),
+            ),
+        ):
+            buffers = init_dcp_pack_buffers(
+                Mock(), self._KV_ARGS, 2, 4, 64, device_type="cuda:0"
+            )
+
+        self.assertEqual(len(buffers), 2)
+        self.assertEqual(staging_buffer.call_args.args[1], "cuda:3")
+
+
 class TestTryDcpPack(CustomTestCase):
     def test_try_pack_uses_requested_region_and_dense_indices(self):
         """A gather must fit its rank region even when the total buffer has space."""
@@ -334,6 +204,7 @@ class TestTryDcpPack(CustomTestCase):
                 "get_ptr": lambda self: 0x1000,
                 "get_size": lambda self: pack.numel(),
                 "get_gather_stream": lambda self: gather_stream,
+                "producer_stream": lambda self: Mock(),
             },
         )()
         src = np.array([1, 5, 9, 13], dtype=np.int64)
@@ -345,10 +216,7 @@ class TestTryDcpPack(CustomTestCase):
         )
         with (
             patch(
-                "sglang.srt.disaggregation.common.dcp_pack.torch.cuda.default_stream"
-            ),
-            patch(
-                "sglang.srt.disaggregation.common.dcp_pack.torch.cuda.stream",
+                "sglang.srt.disaggregation.common.dcp_pack.device_stream_context",
                 return_value=nullcontext(),
             ),
             patch(

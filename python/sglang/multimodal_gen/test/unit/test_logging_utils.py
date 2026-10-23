@@ -6,9 +6,19 @@ import unittest
 import weakref
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    _sanitize_for_logging,
     globally_suppress_loggers,
     init_logger,
 )
+from sglang.test.test_utils import CustomTestCase
+
+
+class TestInlineMediaLogging(CustomTestCase):
+    def test_uploaded_images_do_not_enter_logs(self):
+        inline = "data:image/png;base64,private-image-content"
+        result = _sanitize_for_logging([inline, "/data/reference.png"])
+        self.assertNotIn("private-image-content", str(result))
+        self.assertEqual(result[1], "/data/reference.png")
 
 
 class TestSuppressNoisyDependencyLogs(unittest.TestCase):

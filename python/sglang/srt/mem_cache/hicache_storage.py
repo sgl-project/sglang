@@ -188,6 +188,16 @@ class HiCacheStorage(ABC):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
 
+    def on_host_pools_registered(self) -> None:
+        """The initial host-pool registration burst is over: the anchor pool
+        (``register_mem_pool_host``) and every host pool group entry
+        (``register_mem_host_pool_v2``). Fires once per attach; pools
+        registered later (dynamic sidecars) arrive through v2 alone and do
+        not re-fire it. Backends that must finalize once the pool set is
+        known -- e.g. register with a remote cache manager whose spec cannot
+        be amended -- should do so here; raising fails the attach.
+        """
+
     def batch_exists_v2(
         self,
         keys: List[str],

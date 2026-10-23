@@ -22,7 +22,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     compress_norm_rope_store,
@@ -36,10 +35,6 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
     with_candidate_page8_table,
 )
 from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-    _fp4_e2m1_code_rne,
-    quantize_fp4_indexer_tensor,
-)
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     LOW_RATIO_PAGE_TABLE_BUCKET,
     FP4KWriteMetadata,
@@ -54,18 +49,15 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     index_k_page8_views,
     index_q_rope_pack_flydsl,
     index_q_rope_pack_weights_flydsl,
-    indexer_head_weights,
     pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
     prepare_fp4_k_write_metadata,
     prepare_fp4_prefill_workspace,
     prepare_fp4_rowgroup_decode_workspace,
     prepare_fp4_rowgroup_prefill_workspace,
-    read_fp4_index_k_split,
     rowgroup_paged_mqa_logits,
     rowgroup_prefill_query_start_loc,
     rowgroup_table_columns,
-    store_fp4_index_k_cache_split,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
@@ -76,13 +68,29 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
 from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     rope_tail_fake_quant_fp4,
 )
+from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.kernels.ops.gemm.dsv4_indexer_head_weights_hip import indexer_head_weights
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
+from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache_hip import (
+    store_fp4_index_k_cache_split,
+)
+from sglang.kernels.ops.quantization.fp4_indexer_quant import (
+    _fp4_e2m1_code_rne,
+    quantize_fp4_indexer_tensor,
+)
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.kernels.deepseek_v4.common import (
+    ceil_ue8m0_exp_ref,
+    fp4_e2m1_code_ref,
+)
+from sglang.test.kernels.deepseek_v4.fp4_index_k_reference import (
+    read_fp4_index_k_split,
+)
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
@@ -112,23 +120,6 @@ SCALE_SHUFFLE_TILE = 16
 _E2M1_GRID = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 
 
-def _ceil_ue8m0_exp_ref(x: torch.Tensor) -> torch.Tensor:
-    bits = x.to(torch.float32).contiguous().view(torch.int32)
-    exp = (bits >> 23) & 0xFF
-    mantissa = bits & 0x7FFFFF
-    exp = exp + (mantissa != 0).to(torch.int32)
-    return exp.clamp(1, 254)
-
-
-def _fp4_e2m1_code_ref(x: torch.Tensor) -> torch.Tensor:
-    ax = torch.minimum(x.abs(), torch.tensor(E2M1_MAX, device=x.device))
-    idx = torch.zeros_like(ax, dtype=torch.uint8)
-    for threshold in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
-        idx += (ax > threshold).to(torch.uint8)
-    sign = ((x < 0) & (idx != 0)).to(torch.uint8) * 8
-    return idx | sign
-
-
 def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Nibble-packed E2M1 payload and per-group UE8M0 exponents.
 
@@ -139,11 +130,11 @@ def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     x = x.contiguous().view(-1, HEAD_DIM).float()
     groups = x.view(-1, SCALE_GROUPS, GROUP_SIZE)
     scale_raw = (groups.abs().amax(dim=-1) / E2M1_MAX).clamp_min(1.0e-4)
-    scale_exp = _ceil_ue8m0_exp_ref(scale_raw)
+    scale_exp = ceil_ue8m0_exp_ref(scale_raw)
     scale = (scale_exp << 23).contiguous().view(torch.float32)
 
     scaled = (groups / scale.unsqueeze(-1)).view(-1, HEAD_DIM)
-    code = _fp4_e2m1_code_ref(scaled)
+    code = fp4_e2m1_code_ref(scaled)
     packed = (code[:, 0::2].to(torch.int16) | (code[:, 1::2].to(torch.int16) << 4)).to(
         torch.uint8
     )

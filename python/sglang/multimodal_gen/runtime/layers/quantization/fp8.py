@@ -7,6 +7,11 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.gemm.fp8_gfx1250 import (
+    gfx1250_fp8_scaled_mm,
+    gfx1250_fp8_scaled_mm_supported,
+    per_token_quant_fp8_gfx1250,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
@@ -38,6 +43,7 @@ from sglang.multimodal_gen.runtime.utils.common import (
     use_intel_amx_backend,
 )
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.quantization.fp8 import Fp8Config as SRTFp8Config
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -58,6 +64,7 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     requantize_with_max_scale,
 )
+from sglang.srt.utils.common import is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.quantization.rowwise_fp8 import (
@@ -78,6 +85,30 @@ if USE_AITER or _use_hip_int4:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_gfx1250_triton_fp8(
+    *,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Per-token FP8 linear through the gfx1250 Triton tile.
+
+    ``weight`` is ``[K, N]`` float8_e4m3fn and ``weight_scale`` holds one scale
+    per output channel. Returns ``None`` when the tile does not cover the shape,
+    leaving the caller on its existing path.
+    """
+    x_2d = x.view(-1, x.shape[-1])
+    K, N = weight.shape
+    if not gfx1250_fp8_scaled_mm_supported(M=x_2d.shape[0], N=N, K=K):
+        return None
+    qx, x_scale = per_token_quant_fp8_gfx1250(x_2d)
+    output = gfx1250_fp8_scaled_mm(
+        qx, weight, x_scale, weight_scale, out_dtype=x.dtype, bias=bias
+    )
+    return output.view(*x.shape[:-1], weight.shape[1])
 
 
 class Fp8Config(SRTFp8Config, QuantizationConfig):
@@ -141,6 +172,16 @@ class Fp8LinearMethod(LinearMethodBase):
             self.use_marlin = False
 
         self.block_quant = self.quant_config.weight_block_size is not None
+
+        # gfx1250 has no tuned hipBLASLt FP8 kernel, so the library GEMM this
+        # method would otherwise dispatch to is slower than the BF16 path it
+        # replaces; route to the Triton tile instead.
+        self.use_gfx1250_triton_fp8 = (
+            not self.block_quant
+            and not self.quant_config.is_checkpoint_fp8_serialized
+            and is_gfx1250_supported()
+            and not envs.SGLANG_DISABLE_GFX1250_FP8_GEMM.get()
+        )
 
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
@@ -335,7 +376,15 @@ class Fp8LinearMethod(LinearMethodBase):
 
             # If checkpoint not serialized fp8, quantize the weights.
             if not self.quant_config.is_checkpoint_fp8_serialized:
-                if self.cutlass_fp8_supported or self.use_marlin:
+                if self.use_gfx1250_triton_fp8:
+                    # The gfx1250 tile dequantizes with one scale per output
+                    # channel; a per-tensor scale would lose the per-channel
+                    # range that keeps a BF16 checkpoint usable at FP8.
+                    qweight, weight_scale = per_token_group_quant_fp8(
+                        layer.weight, layer.weight.shape[-1]
+                    )
+                    weight_scale = weight_scale.t().contiguous()
+                elif self.cutlass_fp8_supported or self.use_marlin:
                     # apply per-channel quantization default as
                     # cutlass sgl-kernel and marlin only support per-channel scale
                     qweight, weight_scale = per_token_group_quant_fp8(
@@ -346,8 +395,14 @@ class Fp8LinearMethod(LinearMethodBase):
                     # per-tensor quantization
                     qweight, weight_scale = input_to_float8(layer.weight)
 
-                # Update the layer with the new values.
-                layer.weight = Parameter(qweight.t(), requires_grad=False)
+                # Update the layer with the new values. The gfx1250 tile wants
+                # [K, N] contiguous along N rather than the usual transposed
+                # view of a [N, K] weight; at these shapes that is worth
+                # 1.05-1.33x, paid once here as a transpose at load.
+                qweight_kn = qweight.t()
+                if self.use_gfx1250_triton_fp8:
+                    qweight_kn = qweight_kn.contiguous()
+                layer.weight = Parameter(qweight_kn, requires_grad=False)
                 layer.weight_scale = Parameter(weight_scale, requires_grad=False)
                 layer.input_scale = None
 
@@ -431,6 +486,13 @@ class Fp8LinearMethod(LinearMethodBase):
         # changing which GEMM kernel it picks. No-op when already contiguous.
         if not x.is_contiguous():
             x = x.contiguous()
+
+        if self.use_gfx1250_triton_fp8:
+            output = _apply_gfx1250_triton_fp8(
+                x=x, weight=layer.weight, weight_scale=layer.weight_scale, bias=bias
+            )
+            if output is not None:
+                return output
 
         if self.per_channel_serialized:
             input_scale = layer.input_scale

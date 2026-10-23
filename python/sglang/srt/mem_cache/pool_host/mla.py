@@ -21,6 +21,10 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    MLA_KVCACHEIO_OPS,
+    require_kvcacheio_ops,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -47,8 +51,18 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip or _is_xpu:
+if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_all_layer_mla,
+        transfer_kv_all_layer_mla_lf_pf,
+        transfer_kv_direct,
+        transfer_kv_per_layer_direct_pf_lf,
+        transfer_kv_per_layer_mla,
+        transfer_kv_per_layer_mla_pf_lf,
+    )
+elif _is_xpu:
+    from sglang.srt.mem_cache.pool_host._kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
@@ -106,6 +120,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
         self.override_kv_cache_dim = override_kv_cache_dim
+        if _is_xpu and not self._is_dummy:
+            require_kvcacheio_ops(
+                pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+            )
         self.dtype = buffer_info.dtype
         self.layout = layout
         self.kv_lora_rank = buffer_info.kv_lora_rank
@@ -668,6 +686,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         if ret != 0:
             raise RuntimeError(f"offload.kv_exchange_copy failed with code {ret}")
 
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+        # checked at construction; keep in step with their branches.
+        _kvcacheio_ops = MLA_KVCACHEIO_OPS
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -786,20 +809,27 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 # work on subsequent per-layer iterations.
                 if device_layer_id != 0:
                     return
-                transfer_kv_dim_exchange(
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    device_k=native.k,
-                    host_k=self.k_buffer,
-                    device_v=native.v,
-                    host_v=self.v_buffer,
-                    device_index_k=native.index_k,
-                    host_index_k=self.index_k_buffer,
-                    device_index_k_scale=native.index_scales,
-                    host_index_k_scale=self.index_k_scale_buffer,
-                    page_size=self.page_size,
-                    direction=TransferDirection.H2D,
-                )
+                for (
+                    native,
+                    host_k,
+                    host_v,
+                    host_index_k,
+                    host_index_k_scale,
+                ) in self._npu_transfer_pool_slices():
+                    transfer_kv_dim_exchange(
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        device_k=native.k,
+                        host_k=host_k,
+                        device_v=native.v,
+                        host_v=host_v,
+                        device_index_k=native.index_k,
+                        host_index_k=host_index_k,
+                        device_index_k_scale=native.index_scales,
+                        host_index_k_scale=host_index_k_scale,
+                        page_size=self.page_size,
+                        direction=TransferDirection.H2D,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
@@ -878,6 +908,88 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     "Layer-sharded direct HiCache backup only supports "
                     f"layer_first layout, got {self.layout}"
                 )
+
+    def _npu_transfer_pool_slices(self):
+        """Per-pool host tensor slices for transfer_kv_dim_exchange.
+
+        The exchange op requires device dim0 == host dim1, and the target and
+        MTP draft device pools are separate allocations, so each pool must be
+        exchanged against its own [layer_start, layer_end) slice of the packed
+        host layer dim (mirrors the MHA host pool's _npu_transfer_buffers).
+        Indexer buffers exist only for the target pool: the host index_k_buffer
+        is sized by the target's num_indexer_layers, so drafts transfer K/V
+        only.  Draft pools whose component width/dtype does not match the host
+        mirror (e.g. an unquantized NEXTN draft beside an FP8 DSA target) are
+        skipped: the memcpy2d row width is derived from the device operand and
+        would silently corrupt the packed host rows.
+        """
+        layer_start = 0
+        for i, info in enumerate(self._native_infos):
+            native = info.native_buffers()
+            layer_end = layer_start + native.k.shape[0]
+            is_target = i == 0
+            if not is_target:
+                if native.index_k is not None:
+                    self._warn_draft_indexer_skipped(native)
+                if not self._npu_draft_pool_compatible(native):
+                    layer_start = layer_end
+                    continue
+            yield (
+                native,
+                self.k_buffer[:, layer_start:layer_end],
+                self.v_buffer[:, layer_start:layer_end],
+                self.index_k_buffer if is_target else None,
+                self.index_k_scale_buffer if is_target else None,
+            )
+            layer_start = layer_end
+
+    def _warn_draft_indexer_skipped(self, native):
+        if getattr(self, "_draft_indexer_skip_warned", False):
+            return
+        self._draft_indexer_skip_warned = True
+        logger.warning(
+            "NPU HiCache kernel_ascend IO: MTP draft pool %s carries an "
+            "index_k_buffer but the host MLA pool allocates indexer rows "
+            "only for the target pool; draft indexer KV is not backed up.",
+            type(native).__name__,
+        )
+
+    def _npu_draft_pool_compatible(self, native) -> bool:
+        device_k = native.k
+        device_v = native.v
+        mismatch = None
+        if (
+            device_k.shape[-1] != self.k_buffer.shape[-1]
+            or device_k.dtype != self.k_buffer.dtype
+        ):
+            mismatch = ("k_buffer", device_k, self.k_buffer)
+        elif (
+            device_v is not None
+            and device_v.numel() > 0
+            and self.v_buffer.numel() > 0
+            and (
+                device_v.shape[-1] != self.v_buffer.shape[-1]
+                or device_v.dtype != self.v_buffer.dtype
+            )
+        ):
+            mismatch = ("v_buffer", device_v, self.v_buffer)
+        if mismatch is None:
+            return True
+        name, dev_t, host_t = mismatch
+        if not getattr(self, "_draft_kv_skip_warned", False):
+            self._draft_kv_skip_warned = True
+            logger.warning(
+                "NPU HiCache kernel_ascend IO: skipping MTP draft pool whose "
+                "%s (%s, %s) does not match the host %s (%s, %s); "
+                "its KV is not transferred.",
+                name,
+                tuple(dev_t.shape),
+                dev_t.dtype,
+                name,
+                tuple(host_t.shape),
+                host_t.dtype,
+            )
+        return False
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -1002,20 +1114,27 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         TransferDirection.D2H,
                     )
                     return
-                transfer_kv_dim_exchange(
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    device_k=native.k,
-                    host_k=self.k_buffer,
-                    device_v=native.v,
-                    host_v=self.v_buffer,
-                    device_index_k=native.index_k,
-                    host_index_k=self.index_k_buffer,
-                    device_index_k_scale=native.index_scales,
-                    host_index_k_scale=self.index_k_scale_buffer,
-                    page_size=self.page_size,
-                    direction=TransferDirection.D2H,
-                )
+                for (
+                    native,
+                    host_k,
+                    host_v,
+                    host_index_k,
+                    host_index_k_scale,
+                ) in self._npu_transfer_pool_slices():
+                    transfer_kv_dim_exchange(
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        device_k=native.k,
+                        host_k=host_k,
+                        device_v=native.v,
+                        host_v=host_v,
+                        device_index_k=native.index_k,
+                        host_index_k=host_index_k,
+                        device_index_k_scale=native.index_scales,
+                        host_index_k_scale=host_index_k_scale,
+                        page_size=self.page_size,
+                        direction=TransferDirection.D2H,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:

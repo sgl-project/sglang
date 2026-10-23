@@ -1456,9 +1456,13 @@ jobs:
         run: |
           docker exec ci_sglang rocm-smi --showtopotype || true
           docker exec ci_sglang bash -c 'strings $(python3 -c "import mooncake,os;print(os.path.dirname(mooncake.__file__))")/engine*.so | grep -iE "rdma,hip|Unsupported multi-protocol"' || true
+          # With Mooncake v0.3.14-rc1, registering the KV cache through HIP dmabuf
+          # leaves the server's next HIP stream creation failing (out of memory on
+          # rocm10, segfault on rocm720). Register through ibv_reg_mr instead.
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
             -e MC_LOG_LEVEL=TRACE \
+            -e MOONCAKE_DISABLE_HIP_DMABUF=1 \
             -e GLOG_logtostderr=1 \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 

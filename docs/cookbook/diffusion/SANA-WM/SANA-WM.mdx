@@ -331,14 +331,13 @@ Header fields:
 | `type` | `"frame_batch"` (always) |
 | `request_id` | Generation id |
 | `chunk_index` | Chunk index |
-| `content_type` | `application/x-raw-rgb`, `application/x-raw-rgb-delta-gzip`, `image/webp`, or `image/jpeg` |
+| `content_type` | `application/x-raw-rgb`, `image/webp`, or `image/jpeg` |
 | `num_frames` | Frames in this batch |
-| `total_size` | Payload size in bytes (`len(payload)` — the compressed size for delta-gzip) |
+| `total_size` | Payload size in bytes (`len(payload)`) |
 | `width`, `height`, `channels` | Frame geometry (`channels: 3`) |
-| `bytes_per_frame` | Bytes per uncompressed frame (`width*height*3`) |
+| `bytes_per_frame` | Bytes per raw frame (`width*height*3`) |
 | `format` | `rgb24` for raw |
-| `encoding` | `raw`, `delta-gzip`, `webp`, or `jpeg` |
-| `delta_reference` | `previous-frame` (present for delta-gzip) |
+| `encoding` | `raw`, `webp`, or `jpeg` |
 | `event_id` | Echoes the steering event id; **omitted** from the header for INIT-only chunks |
 | `frame_batch_index`, `num_frame_batches` | Sequence multiple batches within a chunk |
 | `is_final_frame_batch` | `true` ends the chunk |
@@ -348,29 +347,24 @@ Header fields:
   "type": "frame_batch",
   "request_id": "uuid-string",
   "chunk_index": 0,
-  "content_type": "application/x-raw-rgb-delta-gzip",
+  "content_type": "application/x-raw-rgb",
   "num_frames": 3,
-  "total_size": 1048576,
+  "total_size": 8110080,
   "width": 1280,
   "height": 704,
   "channels": 3,
   "bytes_per_frame": 2703360,
   "format": "rgb24",
-  "encoding": "delta-gzip",
-  "delta_reference": "previous-frame",
+  "encoding": "raw",
   "event_id": 1,
   "frame_batch_index": 0,
   "num_frame_batches": 1,
   "is_final_frame_batch": true,
-  "payload": "<gzip-compressed bytes>"
+  "payload": "<raw RGB24 bytes>"
 }
 ```
 
-**Encodings.** `application/x-raw-rgb` is uncompressed RGB24 (3 × uint8, `bytes_per_frame = width*height*3`). `application/x-raw-rgb-delta-gzip` is the zlib-compressed **per-frame XOR delta** against the preceding frame (each frame in the batch is XOR'd against the previous one; sent by default). `realtime_output_format: "raw"` forces uncompressed RGB; `"webp"` / `"jpeg"` send preview-encoded frames.
-
-<Note>
-delta-gzip must be restored **frame-by-frame**: decompress the payload, then for each frame XOR it against the already-restored previous frame (the first frame of a batch references the last frame of the previous batch). See `restore_delta_gzip_raw_rgb_payload` in `runtime/realtime/video.py`. The `"raw"` format below avoids this.
-</Note>
+**Encodings.** `application/x-raw-rgb` is uncompressed RGB24 (3 × uint8, `bytes_per_frame = width*height*3`), sent by default or with `realtime_output_format: "raw"`; `"webp"` / `"jpeg"` send preview-encoded frames.
 
 ### Minimal client example
 

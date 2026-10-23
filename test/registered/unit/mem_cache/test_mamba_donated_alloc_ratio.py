@@ -217,7 +217,7 @@ class _RecordingComp:
         self.released.append(params)
 
     def release_window_lock(  # SWA only
-        self, node, swa_uuid_for_lock, device_frees, host_frees
+        self, node, swa_uuid_for_lock, device_frees, host_frees, cache_actions
     ):
         pass
 

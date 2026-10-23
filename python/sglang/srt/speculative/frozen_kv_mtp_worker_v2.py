@@ -373,7 +373,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def _capture_cuda_graphs(self) -> None:
-        if cuda_graph_fully_disabled() or self.speculative_num_steps <= 1:
+        # Even a one-step frozen draft runs the assistant seed forward.
+        if cuda_graph_fully_disabled() or self.speculative_num_steps <= 0:
             return
         if self.target_worker.device != "cuda":
             logger.info(
@@ -565,7 +566,10 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         with (
             self._target_kv_pool_view(forward_batch),
-            forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+            forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend),
+                forward_batch=forward_batch,
+            ),
         ):
             seed_output = self.draft_model_runner.forward(forward_batch).logits_output
 
@@ -608,7 +612,10 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
             with (
                 self._target_kv_pool_view(forward_batch),
-                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
+                forward_context(
+                    ForwardContext(attn_backend=self.draft_attn_backend),
+                    forward_batch=forward_batch,
+                ),
             ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch

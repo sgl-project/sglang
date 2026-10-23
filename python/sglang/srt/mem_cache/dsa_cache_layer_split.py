@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.dsa import index_buf_accessor
+from sglang.kernels.ops.kvcache import dsa_index_k_cache
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
@@ -106,7 +106,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
     ):
         buf = self.get_buffer(layer_id)
         self.pool.prefetch_kv_buffer(layer_id)
-        return index_buf_accessor.GetKAndS.execute(
+        return dsa_index_k_cache.GetKAndS.execute(
             self.pool,
             buf,
             page_indices=page_indices,

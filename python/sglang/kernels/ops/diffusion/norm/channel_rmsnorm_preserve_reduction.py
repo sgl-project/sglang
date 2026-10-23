@@ -20,7 +20,7 @@ def _channel_rmsnorm_finish_kernel(
     SCALE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = index < N
     channel = index // SPATIAL % CHANNELS
     norm_index = index // (CHANNELS * SPATIAL) * SPATIAL + index % SPATIAL

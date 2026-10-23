@@ -486,6 +486,23 @@ def linear_attn_tp_size() -> int:
     return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
 
 
+def draft_attn_parallel_group() -> str:
+    """The group an attention-owning draft uses, resolved in the target scope.
+
+    With CP and no attention DP, the draft runs on full TP without CP.
+    Otherwise it stays within attention TP, preserving independent DP drafts.
+    """
+    parallel = get_parallel()
+    return (
+        "tp" if parallel.attn_cp_size > 1 and parallel.attn_dp_size == 1 else "attn_tp"
+    )
+
+
+def draft_attn_tp_size() -> int:
+    """The width of ``draft_attn_parallel_group()`` in the target scope."""
+    return getattr(get_parallel(), f"{draft_attn_parallel_group()}_size")
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -557,19 +574,7 @@ class MoeFlags(_FlagGroupBase):
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
-    # The shared-experts-fusion decision, per runner — the runner_backend /
-    # speculative_runner_backend shape. Both leaves are seeded from the config
-    # intent by ``initialize_moe_config``; each MoE model's gate
-    # (determine_num_fused_shared_experts) refines the ACTIVE leaf, both ways,
-    # before its layers build and read it. ``speculative_moe_backend_context``
-    # brackets a draft's build: on exit the draft's effective decision is
-    # persisted onto the speculative leaf (inspectable afterwards) and the
-    # target's ACTIVE value returns.
-    disable_shared_experts_fusion: bool | None = None
-    speculative_disable_shared_experts_fusion: bool | None = None
-    # Lifecycle marker (the capture.disable_dispose_tensor family): set while
-    # speculative_moe_backend_context is active, so a draft gate's write also
-    # lands on the speculative leaf.
+    # True while draft construction/backend scopes are active.
     in_speculative_scope: bool = False
     # Draft construction/execution uses a separate one-sided A2A workspace from
     # the target model's concurrently live CUDA graphs.
@@ -592,6 +597,9 @@ class DpFlags(_FlagGroupBase):
     # gather/scatter helpers, whose captured geometry needs one shared bucket.
     capturing_prefill_graph: bool = False
     prefill_graph_has_dp_gather: bool = False
+    # Set during prefill-graph capture by breaks that capture graphs of their own
+    # behind TP-group barriers; every DP rank must then take the same path.
+    prefill_graph_has_rank_barrier: bool = False
     # This process's slot in the target's DP sync while a draft scope narrows
     # attention; dp_gather_width() also reads it as the in-scope marker.
     scoped_gather_slot: Optional[int] = None

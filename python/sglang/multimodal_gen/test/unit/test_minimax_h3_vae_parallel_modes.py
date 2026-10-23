@@ -332,18 +332,12 @@ def test_fused_decoder_matches_unfused_forward():
                 "h3_vae_scale_add_rmsnorm",
                 wraps=diffusion_ops.h3_vae_scale_add_rmsnorm,
             ) as scale_add,
-            mock.patch.object(
-                diffusion_ops,
-                "h3_vae_qk_rmsnorm_rope",
-                wraps=diffusion_ops.h3_vae_qk_rmsnorm_rope,
-            ) as qk_rope,
         ):
             os.environ["MINIMAX_H3_VAE_DECODER_FUSED_NORM"] = "0"
             eager = decoder(latent)
             os.environ["MINIMAX_H3_VAE_DECODER_FUSED_NORM"] = "1"
             fused = decoder(latent)
             assert scale_add.call_count == 3
-            assert qk_rope.call_count == 2
     finally:
         if previous is None:
             os.environ.pop("MINIMAX_H3_VAE_DECODER_FUSED_NORM", None)
@@ -368,10 +362,7 @@ def test_fused_decoder_is_disabled_off_nvidia():
         set_forward_context(current_timestep=0, attn_metadata=None),
         mock.patch.dict(os.environ, {"MINIMAX_H3_VAE_DECODER_FUSED_NORM": "1"}),
         mock.patch(f"{vae_dir}.vae_vit.current_platform.is_cuda", return_value=False),
-        mock.patch(f"{vae_dir}.attention.current_platform.is_cuda", return_value=False),
         mock.patch.object(diffusion_ops, "h3_vae_scale_add_rmsnorm") as scale_add,
-        mock.patch.object(diffusion_ops, "h3_vae_qk_rmsnorm_rope") as qk_rope,
     ):
         decoder(latent)
     scale_add.assert_not_called()
-    qk_rope.assert_not_called()

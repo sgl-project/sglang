@@ -51,6 +51,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_flags,
+    get_model,
     get_parallel,
 )
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
@@ -243,7 +244,17 @@ class BaseRunner(ABC):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
+    def model_context(self):
+        """Select the layout owned by this runner's current model."""
+        return get_model().override(
+            shared_experts=self.model_runner.model.shared_experts_config
+        )
+
     def warmup(self) -> None:
+        with self.model_context():
+            self._warmup()
+
+    def _warmup(self) -> None:
         """Run kernel warmup + autotune once, gated by mr._kernel_warmed_up."""
         mr = self.model_runner
         if getattr(mr, "_kernel_warmed_up", False):
@@ -751,7 +762,9 @@ class BaseRunner(ABC):
 
         torch.get_device_module(mr.device).synchronize()
         get_parallel().tp_group.barrier()
-        with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
+        with forward_context(
+            ForwardContext(attn_backend=mr.attn_backend), forward_batch=forward_batch
+        ):
             with run_ctx or empty_context():
                 run_once()
 

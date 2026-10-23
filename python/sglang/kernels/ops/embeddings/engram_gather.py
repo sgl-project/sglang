@@ -19,15 +19,18 @@ def _engram_gather_kernel(
     w_ptr,
     s_ptr,
     ids_ptr,
+    dst_ptr,
     out_ptr,
     row_lo,
     row_hi,
     DIM: tl.constexpr,
     BLK: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
+    HAS_DST: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     idx = tl.load(ids_ptr + row).to(tl.int64)
+    dst = tl.load(dst_ptr + row).to(tl.int64) if HAS_DST else row
     # The table holds rows [row_lo, row_hi); an id outside it is not read and
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
@@ -43,7 +46,7 @@ def _engram_gather_kernel(
     scale = (exps << 23).to(tl.float32, bitcast=True)
     scale = tl.where(exps == 0, E8M0_ZERO, scale)
     out = tl.where(owned, vals * scale, 0.0)
-    tl.store(out_ptr + row * DIM + offs, out.to(tl.bfloat16))
+    tl.store(out_ptr + dst * DIM + offs, out.to(tl.bfloat16))
 
 
 def engram_gather(
@@ -55,12 +58,17 @@ def engram_gather(
     block_size: int,
     row_lo: int = 0,
     row_hi: int = 2**62,
+    sort_ids: bool = False,
 ) -> torch.Tensor:
     """Gather rows ``ids`` ([N] int) into ``out`` ([N, dim] bf16, contiguous).
 
     ``weight_ptr`` addresses [rows, dim] fp8 e4m3 bytes and ``scale_ptr``
     [rows, dim // block_size] e8m0 bytes for global rows [row_lo, row_hi); both
     may live in device or host memory. Ids outside the range produce zero rows.
+
+    ``sort_ids`` reads the rows in address order and writes each to its original
+    position. Random rows of a host table larger than the GPU's translation reach
+    miss on nearly every row; sorted, neighbouring programs share a page.
     """
     assert dim > 0 and dim & (dim - 1) == 0 and block_size > 0, (dim, block_size)
     assert dim % block_size == 0, (dim, block_size)
@@ -71,15 +79,20 @@ def engram_gather(
     assert out.device == ids.device and out.shape == (ids.numel(), dim), out.shape
     n = ids.numel()
     if n:
+        dst = None
+        if sort_ids:
+            ids, dst = torch.sort(ids)
         _engram_gather_kernel[(n,)](
             weight_ptr,
             scale_ptr,
             ids,
+            dst if dst is not None else ids,
             out,
             row_lo,
             row_hi,
             DIM=dim,
             BLK=block_size,
             E8M0_ZERO=_E8M0_ZERO,
+            HAS_DST=dst is not None,
         )
     return out

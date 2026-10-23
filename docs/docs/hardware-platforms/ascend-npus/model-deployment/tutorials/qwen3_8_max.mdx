@@ -62,12 +62,13 @@ Before downloading model weights, check the model size to reserve enough disk sp
 For multi-node deployment, download the weights to a shared directory accessible to all nodes.
 
 - [Qwen/Qwen3.8-2.4T-A95B](https://www.modelscope.cn/models/Qwen/Qwen3.8-2.4T-A95B) (BF16, approximately 4.8TB)
-- You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize a W4A8 variant from the BF16 checkpoint.
+- [Eco-Tech/Qwen3.8-2.4T-A95B-w4a8](https://www.modelscope.cn/models/Eco-Tech/Qwen3.8-2.4T-A95B-w4a8) (W4A8 quantized version, approximately 1.33TB)
+- You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize `Qwen3.8-2.4T-A95B-w4a8` from `Qwen3.8-2.4T-A95B`.
 
 <Info>
 We recommend deploying the W4A8 variant for reduced resource usage and higher throughput.
-The validated configuration in this tutorial deploys the W4A8 variant on 4 Ascend A3 Series nodes (`--tp-size 64`, 64 dies
-in total). The BF16 checkpoint alone weighs approximately 4.8TB and requires additional nodes.
+The validated configuration in this tutorial deploys the W4A8 variant (approximately 1.33TB) on 4 Ascend A3 Series
+nodes (`--tp-size 64`, 64 dies in total). The BF16 checkpoint alone weighs approximately 4.8TB and requires additional nodes.
 </Info>
 
 For the hardware specifications (memory per die, dies per card),

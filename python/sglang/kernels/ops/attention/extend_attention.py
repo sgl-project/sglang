@@ -24,7 +24,6 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
-from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_gfx1250_supported, is_hip
@@ -82,12 +81,11 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
             # late-prefill kernel from ~12.57 ms to ~5.24 ms.
             BLOCK_M, BLOCK_N = (64, 32)
             num_warps = 4
-        elif _is_gfx95 and 128 < Lq <= 256:
-            # gfx950 (CDNA4), 128 < head_dim <= 256: a larger query tile halves KV bytes
-            # streamed per call (each workgroup reads the whole prefix); 8 warps
-            # hide the loads. Measured on MI350X head_dim 256: -36% kernel time,
-            # 28% -> 44% MFU, numerically equivalent (BLOCK_N reduction order
-            # unchanged). Other AMD archs / head dims keep the default below.
+        elif _is_gfx95 and Lq <= 256:
+            # gfx950 (CDNA4), head_dim <= 256: every workgroup streams the whole
+            # prefix, so a larger query tile halves the KV bytes read per call;
+            # BLOCK_M / num_warps = 16 rows per warp is exactly one MFMA tile at
+            # matrix_instr_nonkdim=16. Measured on MI350X at head_dim 64, 128, 256.
             BLOCK_M, BLOCK_N = (128, 64)
             num_warps = 8
         else:
@@ -1170,43 +1168,6 @@ def extend_attention_fwd(
     )
 
 
-def redundant_attention(
-    q_extend,
-    o_extend,
-    k_buffer,
-    v_buffer,
-    b_req_idx,
-    b_start_loc,
-    b_seq_len,
-    b_seq_len_prefix,
-    max_len_in_batch,
-):
-    total_token_num = k_buffer.shape[0]
-    B, H_Q, D = b_req_idx.shape[0], q_extend.shape[-2], q_extend.shape[-1]
-    q_buffer = torch.empty(
-        (total_token_num, H_Q, D), dtype=q_extend.dtype, device=q_extend.device
-    )
-
-    pt = 0
-    for i in range(B):
-        cur_seq_len_extend = b_seq_len[i] - b_seq_len_prefix[i]
-        pl, pr = b_start_loc[i] + b_seq_len_prefix[i], b_start_loc[i] + b_seq_len[i]
-        q_buffer[pl:pr] = q_extend[pt : pt + cur_seq_len_extend]
-        pt += cur_seq_len_extend
-
-    o_buffer = torch.empty_like(q_buffer)
-    context_attention_fwd(
-        q_buffer, k_buffer, v_buffer, o_buffer, b_start_loc, b_seq_len, max_len_in_batch
-    )
-
-    pt = 0
-    for i in range(B):
-        cur_seq_len_extend = b_seq_len[i] - b_seq_len_prefix[i]
-        pl, pr = b_start_loc[i] + b_seq_len_prefix[i], b_start_loc[i] + b_seq_len[i]
-        o_extend[pt : pt + cur_seq_len_extend] = o_buffer[pl:pr]
-        pt += cur_seq_len_extend
-
-
 @triton.jit
 def _fwd_kernel_unified(
     Q,
@@ -1599,6 +1560,12 @@ def extend_attention_fwd_unified(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    if _is_gfx95 and Lq <= 128 and Lv <= 128 and BLOCK_N == 64:
+        # gfx950, head_dim <= 128: each workgroup streams the whole prefix, so a 256-row query tile
+        # cuts the KV bytes read per query row 4x. BLOCK_N, and so the reduction order, is unchanged:
+        # outputs are bitwise identical. Measured on MI350X (head_dim 128 and 64, 8k-token chunks after
+        # 0-56k-token prefixes): 2.0-2.6x kernel speed.
+        BLOCK_M, num_warps = 256, 8
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]

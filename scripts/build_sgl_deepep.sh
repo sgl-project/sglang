@@ -13,7 +13,7 @@ usage() {
     cat <<'EOF'
 Usage: build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> [architecture]
 
-  python-version:     3.10, 3.11, 3.12, or 3.13
+  python-version:     3.11, 3.12, or 3.13
   cuda-version:       13.0
   deepep-source:      DeepEP checkout containing the sgl_deep_ep package
   architecture:       x86_64 or aarch64 (defaults to the current machine)
@@ -37,7 +37,7 @@ if [[ "${ARCHITECTURE}" == arm64 ]]; then
 fi
 
 case "${PYTHON_VERSION}" in
-    3.10|3.11|3.12|3.13) ;;
+    3.11|3.12|3.13) ;;
     *)
         echo "Unsupported Python version: ${PYTHON_VERSION}" >&2
         exit 2

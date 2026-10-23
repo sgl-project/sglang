@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton
+from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
 from sglang.srt.layers.dcp import all_gather_kv_cache_for_mha_extend
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_utils import (

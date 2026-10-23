@@ -16,7 +16,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     gather_cast_kv_fp8_pad_paged,
 )
-from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
+from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_q_fp8_pad
 from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 

@@ -1019,6 +1019,7 @@ export const Playground = ({ config }) => {
               // server warns it away (only EAGLE/EAGLE3 honor it).
               || head === "--speculative-adaptive"
               || head === "--speculative-dspark-block-size"
+              || head === "--speculative-use-block-verification"
               || head === "--enable-linear-replayssm-spec"
               || head === "--linear-replayssm-cache-len"
               || head === "--speculative-ngram-max-bfs-breadth";
@@ -1488,6 +1489,12 @@ export const Playground = ({ config }) => {
           }
           const backendOption = backendOptions.find((o) => o.id === backend);
           adds.push(...(backendOption?.flags || []), ...(fc.requiredFlags || []));
+          // A decode server disables its radix cache unless this flag is set, and
+          // sglang rejects --enable-hierarchical-cache with the radix cache off.
+          if (pdMode === "decode"
+            && !h.hasFlag(flags, "--disaggregation-decode-enable-radix-cache")) {
+            adds.push("--disaggregation-decode-enable-radix-cache");
+          }
           flags = h.insertBeforeTail(flags, adds);
           env = [
             ...env,

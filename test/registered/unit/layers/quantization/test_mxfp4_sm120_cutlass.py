@@ -224,7 +224,8 @@ def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch, stated_tp_group):
     topk = StandardTopKOutput(topk_weights, topk_ids.to(torch.int32), logits)
     dispatch_output = StandardDispatchOutput(x, None, topk)
 
-    actual = method.apply(layer, dispatch_output).hidden_states
+    with get_context().override_server_args():
+        actual = method.apply(layer, dispatch_output).hidden_states
 
     x_quant, x_scale = mxfp8_quantize(
         x,
@@ -280,6 +281,7 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch, stated_tp_group):
     from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+    from sglang.srt.runtime_context import get_context
 
     monkeypatch.setattr(
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
@@ -412,7 +414,8 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch, stated_tp_group):
         None,
         StandardTopKOutput(topk_weights, topk_ids.to(torch.int32), logits),
     )
-    actual = method._apply_sm120_cutlass(layer, dispatch_output).hidden_states
+    with get_context().override_server_args():
+        actual = method._apply_sm120_cutlass(layer, dispatch_output).hidden_states
 
     x_padded = torch.nn.functional.pad(x, (0, padded_hidden - hidden))
     x_quant, x_scale = mxfp8_quantize(

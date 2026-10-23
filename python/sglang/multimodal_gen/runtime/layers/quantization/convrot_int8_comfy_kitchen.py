@@ -35,16 +35,11 @@ __all__ = ["ConvRotInt8ComfyKitchenLinearMethod", "comfy_kitchen_swiglu_mlp"]
 # comfy_kitchen's dtype codes for the fused op's output.
 _OUT_DTYPE_CODE = {torch.float32: 0, torch.float16: 1, torch.bfloat16: 2}
 
-# comfy_kitchen picks its CUTLASS tile configuration from a threshold tree
-# (select_fused_int8_config in cutlass_gemm_int8.cu). Shapes whose N falls under
-# its 24832 cutoff but whose M is large get a Stream-K schedule, which exists to
-# balance load when there are too few tiles to fill the GPU. At H3's 32700 tokens
-# qkv_proj already launches ~21k CTAs over the 4090's 128 SMs, so Stream-K's
-# workspace and fixup reduction are pure overhead: 26.5 ms against 17.9 ms for
-# the identical tile without it. Capping rows per call keeps the plain
-# data-parallel config, and is bit-exact because splitting rows does not change
-# any single row's arithmetic.
-_MAX_ROWS_PER_CALL = int(os.environ.get("SGLANG_KITCHEN_INT8_MAX_ROWS", "8192"))
+# Rows per comfy_kitchen int8_linear call; 0 issues one call. Splitting keeps tall,
+# narrow-N GEMMs off comfy_kitchen's Stream-K schedule, but every extra call also
+# copies its slice of the output, and whole-model MiniMax-H3 runs (comfy-kitchen
+# 0.2.37, pruned INT8) are 1.3-3.9% faster unsplit on RTX 4090, RTX 5090 and H200.
+_MAX_ROWS_PER_CALL = int(os.environ.get("SGLANG_KITCHEN_INT8_MAX_ROWS", "0"))
 # Narrow outputs do not recover the cost of writing results back through a
 # preallocated buffer; H3's out_proj and fc2 (N=5376) both measure slower split.
 _MIN_SPLIT_OUTPUT = int(os.environ.get("SGLANG_KITCHEN_INT8_MIN_SPLIT_N", "8192"))

@@ -102,7 +102,29 @@ impl SglangService for Mock {
             max_total_num_tokens: Some(8192),
             version: "test".into(),
             internal_states: vec![r#"{"avg_spec_accept_length": 2.5}"#.into()],
+            ..Default::default()
         }))
+    }
+
+    async fn list_models(
+        &self,
+        _: Request<api::ListModelsRequest>,
+    ) -> Result<Response<api::ListModelsResponse>, Status> {
+        Err(Status::unimplemented("list_models"))
+    }
+
+    async fn detokenize(
+        &self,
+        _: Request<api::DetokenizeRequest>,
+    ) -> Result<Response<api::DetokenizeResponse>, Status> {
+        Err(Status::unimplemented("detokenize"))
+    }
+
+    async fn abort(
+        &self,
+        _: Request<api::AbortRequest>,
+    ) -> Result<Response<api::AbortResponse>, Status> {
+        Err(Status::unimplemented("abort"))
     }
 }
 
