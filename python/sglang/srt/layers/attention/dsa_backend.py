@@ -3958,6 +3958,10 @@ class DeepseekSparseAttnBackend(
         kv = kv_cache.view(-1, 1, self.physical_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+        if is_prefill:
+            # CP graph metadata includes the physical shard's padding; its
+            # eager attention bridge can narrow Q to the live local rows.
+            seq_lens = seq_lens[:batch_size]
 
         attention_kwargs = dict(
             kv_cache=kv,
