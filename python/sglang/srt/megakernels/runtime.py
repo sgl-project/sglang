@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.megakernels.binding import MegakernelBinding
+from sglang.srt.megakernels.binding import MegakernelBinding, PreparationView
 from sglang.srt.megakernels.guards import deadline_s, device_isa
 from sglang.srt.megakernels.spec import (
     FLAG,
@@ -38,11 +38,18 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
 
 logger = logging.getLogger(__name__)
+
+
+class _InstalledMegakernel(msgspec.Struct, frozen=True):
+    built: BuiltMegakernel
+    binding: MegakernelBinding
+    prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]]
 
 
 def megakernel_enabled() -> bool:
@@ -82,8 +89,10 @@ def install_megakernel(
     )
     start, free_before = time.perf_counter(), torch.cuda.mem_get_info()[0]
     built = spec.build(model, hf_config, context)
-    # not setattr: a built object that is an nn.Module must not join the state dict
-    model.__dict__["_megakernel"] = built
+    # Keep plugin resources outside the model's module/state tree.
+    model.__dict__["_megakernel"] = _InstalledMegakernel(
+        built=built, binding=binding, prepare=spec.prepare
+    )
     # Different widths would leave ranks waiting in different collectives.
     megakernel_agree(tuple(built.widths), what=f"widths {spec.name} built")
     if spec.max_rows > 0 and not built.widths:
@@ -92,7 +101,6 @@ def install_megakernel(
     model._derived_weight_cache_error = (
         f"Online weight updates are not supported with {FLAG} ({spec.name})"
     )
-    _install_preparation_bridge(model=model, built=built, binding=binding)
     built_s = time.perf_counter() - start
     used_mib = (free_before - torch.cuda.mem_get_info()[0]) / 2**20
     if not built.widths:
@@ -124,7 +132,19 @@ def install_megakernel(
 
 def built_megakernel(model: torch.nn.Module) -> Optional[BuiltMegakernel]:
     """The object the spec built for this model, or None."""
-    return model.__dict__.get("_megakernel")
+    installed: Optional[_InstalledMegakernel] = model.__dict__.get("_megakernel")
+    return None if installed is None else installed.built
+
+
+def prepare_megakernel(model_runner: ModelRunner) -> None:
+    """Prepare installed plugin resources after model preparation, before capture."""
+    installed: Optional[_InstalledMegakernel] = model_runner.model.__dict__.get(
+        "_megakernel"
+    )
+    if installed is not None and installed.prepare is not None:
+        installed.prepare(
+            installed.built, installed.binding.preparation_view(model_runner)
+        )
 
 
 def megakernel_agree(value: Any, *, what: str, group: Any = None) -> None:
@@ -270,26 +290,6 @@ class _Dispatch:
             )
 
         return forward
-
-
-def _install_preparation_bridge(
-    *, model: torch.nn.Module, built: BuiltMegakernel, binding: MegakernelBinding
-) -> None:
-    """Chain a built object's optional post-pool preparation into the model hook."""
-    prepare = getattr(built, "prepare_before_cuda_graph_capture", None)
-    if prepare is None:
-        return
-    original_prepare = getattr(model, "prepare_before_cuda_graph_capture", None)
-
-    def prepare_before_cuda_graph_capture(model_runner: Any) -> None:
-        if original_prepare is not None:
-            original_prepare(model_runner)
-        prepare(binding.preparation_view(model_runner))
-
-    # An nn.Module callback belongs to this instance, not its module/state tree.
-    model.__dict__["prepare_before_cuda_graph_capture"] = (
-        prepare_before_cuda_graph_capture
-    )
 
 
 class _CaptureCheck:
