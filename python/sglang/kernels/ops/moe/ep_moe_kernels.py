@@ -2466,8 +2466,13 @@ def expand_to_masked_slab(
     num_local_experts: int,
     max_m: int,
     expert_alignment: int,
+    check_overflow: Optional[bool] = None,
 ):
-    """expanded [total, hidden] -> ([E_local, max_m, hidden], [E_local, max_m, sh] or None, masked_m[E_local])."""
+    """expanded [total, hidden] -> ([E_local, max_m, hidden], [E_local, max_m, sh] or None, masked_m[E_local]).
+
+    check_overflow=None checks unless a CUDA graph is being captured; False
+    skips the host-synchronizing check for callers whose counts fit max_m.
+    """
     hidden = recv_x.shape[1]
     is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
     output_tensor = torch.empty(
@@ -2476,7 +2481,8 @@ def expand_to_masked_slab(
     masked_m = torch.empty(
         (num_local_experts,), device=recv_x.device, dtype=torch.int32
     )
-    check_overflow = not torch.cuda.is_current_stream_capturing()
+    if check_overflow is None:
+        check_overflow = not torch.cuda.is_current_stream_capturing()
     # Dummy pointer under capture; CHECK_OVERFLOW compiles out every store to it.
     overflow = (
         torch.zeros((1,), device=recv_x.device, dtype=torch.int32)
