@@ -5348,29 +5348,28 @@ class Scheduler(
             mb is None or mb.is_empty() for mb in self.mbs
         )
 
-    def _admin_busy_message(self, action: str) -> Optional[str]:
-        if self.is_fully_idle():
-            return None
-        return (
-            f"Reject {action}: scheduler is not idle. "
-            f"#queue-req={len(self.waiting_queue)} "
-            f"#running-req={len(self.running_batch.reqs)}"
-        )
-
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
     ) -> AttachHiCacheStorageReqOutput:
-        if self.enable_unified_cache_external_linker:
-            return self._attach_cache_linker(recv_req)
-
-        if not self.enable_hierarchical_cache:
+        if not (
+            self.enable_hierarchical_cache or self.enable_unified_cache_external_linker
+        ):
             return AttachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        busy = self._admin_busy_message("attach")
-        if busy is not None:
-            return AttachHiCacheStorageReqOutput(success=False, message=busy)
+        if not self.is_fully_idle():
+            return AttachHiCacheStorageReqOutput(
+                success=False,
+                message=(
+                    "Reject attach: scheduler is not idle. "
+                    f"#queue-req={len(self.waiting_queue)} "
+                    f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+
+        if self.enable_unified_cache_external_linker:
+            return self._attach_cache_linker(recv_req)
 
         if not hasattr(self.tree_cache, "attach_storage_backend"):
             return AttachHiCacheStorageReqOutput(
@@ -5413,17 +5412,25 @@ class Scheduler(
     def detach_hicache_storage_wrapped(
         self, recv_req: DetachHiCacheStorageReqInput
     ) -> DetachHiCacheStorageReqOutput:
-        if self.enable_unified_cache_external_linker:
-            return self._detach_cache_linker()
-
-        if not self.enable_hierarchical_cache:
+        if not (
+            self.enable_hierarchical_cache or self.enable_unified_cache_external_linker
+        ):
             return DetachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
             )
 
-        busy = self._admin_busy_message("detach")
-        if busy is not None:
-            return DetachHiCacheStorageReqOutput(success=False, message=busy)
+        if not self.is_fully_idle():
+            return DetachHiCacheStorageReqOutput(
+                success=False,
+                message=(
+                    "Reject detach: scheduler is not idle. "
+                    f"#queue-req={len(self.waiting_queue)} "
+                    f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+
+        if self.enable_unified_cache_external_linker:
+            return self._detach_cache_linker()
 
         if not hasattr(self.tree_cache, "detach_storage_backend"):
             return DetachHiCacheStorageReqOutput(
@@ -5457,14 +5464,10 @@ class Scheduler(
     def _attach_cache_linker(
         self, recv_req: AttachHiCacheStorageReqInput
     ) -> AttachHiCacheStorageReqOutput:
-        rejection = runtime_change_rejection()
-        if rejection is None and (
-            recv_req.hicache_storage_prefetch_policy is not None
-            or recv_req.hicache_write_policy is not None
-        ):
-            rejection = "The external linker takes no prefetch or write policy."
-        if rejection is None:
-            rejection = self._admin_busy_message("attach")
+        rejection = runtime_change_rejection(
+            prefetch_policy=recv_req.hicache_storage_prefetch_policy,
+            write_policy=recv_req.hicache_write_policy,
+        )
         if rejection is not None:
             return AttachHiCacheStorageReqOutput(success=False, message=rejection)
 
@@ -5486,7 +5489,7 @@ class Scheduler(
         return AttachHiCacheStorageReqOutput(success=True, message=message)
 
     def _detach_cache_linker(self) -> DetachHiCacheStorageReqOutput:
-        rejection = runtime_change_rejection() or self._admin_busy_message("detach")
+        rejection = runtime_change_rejection()
         if rejection is not None:
             return DetachHiCacheStorageReqOutput(success=False, message=rejection)
 

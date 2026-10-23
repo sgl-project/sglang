@@ -89,6 +89,7 @@ class TestSchedulerCacheLinkerAttach(CustomTestCase):
         self.addCleanup(override.restore)
 
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hierarchical_cache = False
         scheduler.enable_unified_cache_external_linker = True
         scheduler.is_fully_idle = lambda: True
         scheduler.tree_cache = SimpleNamespace(
@@ -141,6 +142,23 @@ class TestSchedulerCacheLinkerAttach(CustomTestCase):
         for out in (attach, detach):
             self.assertFalse(out.success)
             self.assertIn("--enable-linker-mla-dedup", out.message)
+        scheduler.tree_cache.attach_cache_linker.assert_not_called()
+        scheduler.tree_cache.detach_cache_linker.assert_not_called()
+
+    def test_rejects_changes_while_the_scheduler_is_busy(self):
+        scheduler = self._scheduler()
+        scheduler.is_fully_idle = lambda: False
+        scheduler.waiting_queue = [object()]
+        scheduler.running_batch = SimpleNamespace(reqs=[])
+        attach = scheduler.attach_hicache_storage_wrapped(
+            AttachHiCacheStorageReqInput(hicache_storage_backend="mooncake")
+        )
+        detach = scheduler.detach_hicache_storage_wrapped(
+            DetachHiCacheStorageReqInput()
+        )
+        for out in (attach, detach):
+            self.assertFalse(out.success)
+            self.assertIn("scheduler is not idle", out.message)
         scheduler.tree_cache.attach_cache_linker.assert_not_called()
         scheduler.tree_cache.detach_cache_linker.assert_not_called()
 

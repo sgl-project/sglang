@@ -42,13 +42,17 @@ def _linker_class(storage_backend: str) -> type[UnifiedCacheLinker]:
     )
 
 
-def runtime_change_rejection() -> Optional[str]:
+def runtime_change_rejection(
+    *, prefetch_policy: Optional[str] = None, write_policy: Optional[str] = None
+) -> Optional[str]:
     """Why the linker cannot be attached or detached after startup, if it cannot."""
     if get_memory().enable_linker_mla_dedup:
         return (
             "--enable-linker-mla-dedup does not support runtime attach or detach "
             "of the external linker."
         )
+    if prefetch_policy is not None or write_policy is not None:
+        return "The external linker takes no prefetch or write policy."
     return None
 
 
