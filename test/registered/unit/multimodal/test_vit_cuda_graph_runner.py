@@ -96,13 +96,13 @@ def test_vit_graph_keeps_rotary_workspace_address_after_growth():
     runner.vit.device = torch.device("cpu")
     runner.vit.dtype = torch.float32
 
-    small = runner._get_sin_cos_ws("small", seq_len=4, head_dim=2)
+    small = runner._get_sin_cos_ws("small", seq_len=4, head_dim=2, dtype=torch.float32)
     small_address = small[0].data_ptr()
-    runner._get_sin_cos_ws("large", seq_len=16, head_dim=2)
+    runner._get_sin_cos_ws("large", seq_len=16, head_dim=2, dtype=torch.float32)
 
-    assert runner._get_sin_cos_ws("small", seq_len=4, head_dim=2)[0].data_ptr() == (
-        small_address
-    )
+    assert runner._get_sin_cos_ws("small", seq_len=4, head_dim=2, dtype=torch.float32)[
+        0
+    ].data_ptr() == (small_address)
     assert len(runner._retired_sin_cos_ws) == 1
 
 
@@ -117,6 +117,30 @@ def test_internvl_graph_runner_caches_resolved_backend_name():
     runner = InternViTCudaGraphRunner(encoder)
 
     assert runner._attn_backend == "triton_attn"
+
+
+def test_vit_graph_rotary_workspace_keeps_the_model_cos_sin_dtype():
+    """The graph must rotate with the cos/sin values eager mode uses: fp32
+    rotary inputs must not be rounded to the ViT dtype on their way in."""
+    runner = _runner(use_data_parallel=True)
+    runner.vit.device = torch.device("cpu")
+    runner.vit.dtype = torch.bfloat16
+    runner.block_input["key"] = torch.empty(4, 1, 2, dtype=torch.bfloat16)
+    runner.block_output["key"] = torch.empty(4, 1, 2, dtype=torch.bfloat16)
+    runner.block_graphs["key"] = SimpleNamespace(replay=lambda: None)
+    # 1 + 2**-10 is not representable in bf16.
+    cos = torch.full((4, 2), 1 + 2**-10, dtype=torch.float32)
+    sin = torch.full((4, 2), 2**-10, dtype=torch.float32)
+
+    runner.replay(
+        graph_key="key",
+        x_3d=torch.ones(4, 1, 2, dtype=torch.bfloat16),
+        rotary_pos_emb_cos=cos,
+        rotary_pos_emb_sin=sin,
+    )
+
+    used_cos, used_sin = runner._sin_cos_ws_by_graph["key"]
+    assert torch.equal(used_cos, cos) and torch.equal(used_sin, sin)
 
 
 if __name__ == "__main__":
