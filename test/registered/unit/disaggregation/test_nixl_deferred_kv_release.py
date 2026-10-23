@@ -21,7 +21,7 @@ from test_deferred_decode_kv_release import (
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import AckTarget
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
-from sglang.srt.disaggregation.nixl.conn import NixlKVManager, _NixlErrReport
+from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -153,29 +153,65 @@ class TestNixlAbortNotification(
         )
         self.assertEqual(manager._deferred_ack_targets, {})
 
-    def test_settled_worker_failure_with_err_never_acks(self):
-        """A handle NIXL reported as ERR, at post or while polling, may still
-        write into decode's pages, so its room is poisoned instead of ACKed."""
-        cases = {
-            "polled_err": (RuntimeError("worker error"), (True, True)),
-            "post_err": (_NixlErrReport("failed to post"), (True, False)),
+    def _prepare_worker(self, manager) -> None:
+        """Wire transfer_worker to one MLA decode peer over the prepped path."""
+        manager.enable_staging = False
+        manager._staging_ctx = None
+        manager._staging_outstanding = defaultdict(int)
+        manager.exceptions = {}
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.attn_tp_size = 1
+        manager.transfer_source_rank = 0
+        manager.src_mem_kind = "VRAM"
+        manager._num_slots_src = 4
+        manager.kv_args = SimpleNamespace(kv_data_ptrs=[0x1000], kv_item_lens=[16])
+        manager.prep_handles = {"": "src-prep", "decode": "dst-prep"}
+        manager.decode_kv_args_table = {
+            "decode": SimpleNamespace(
+                decode_tp_size=1,
+                requires_dcp_relayout=False,
+                kv_xfer_segments=None,
+                dst_homogeneous_mem_kind="VRAM",
+                dst_kv_ptrs=[0x2000],
+                dst_num_slots=None,
+                gpu_id=0,
+            )
         }
-        for name, (error, await_result) in cases.items():
-            with self.subTest(name):
-                manager = _manager()
-                manager.enable_staging = False
-                manager._staging_ctx = None
-                manager._staging_outstanding = defaultdict(int)
-                manager.transfer_infos = {ROOM: {}}
-                manager.exceptions = {}
-                manager.check_status = MagicMock(side_effect=error)
-                manager._await_handles = MagicMock(return_value=await_result)
+        manager.transfer_infos = {
+            ROOM: {
+                (DECODE_IP, DECODE_PORT): SimpleNamespace(
+                    room=ROOM,
+                    is_dummy=False,
+                    agent_name="decode",
+                    dst_kv_indices=np.array([1], dtype=np.int32),
+                )
+            }
+        }
+        manager.conclude_failure = MagicMock(
+            side_effect=lambda **kw: manager.update_status(
+                kw["bootstrap_room"], KVPoll.Failed
+            )
+        )
+        manager._reload_invalidated_peers = MagicMock()
+        manager.agent = MagicMock()
+        manager.agent.make_prepped_xfer.return_value = "xfer-handle"
 
-                def notify_decode(**kwargs):
-                    manager.check_status = lambda room: manager.request_status[room]
+    def test_err_write_never_acks(self):
+        """A write NIXL reported as ERR, at post or while polling, may still land
+        in decode's pages, so neither an ABORT that arrived mid-transfer nor a
+        later one may be ACKed."""
+        for name, post_state in (("post_err", "ERR"), ("polled_err", "PROC")):
+            with self.subTest(name=name):
+                manager = _manager(status=KVPoll.Transferring)
+                self._prepare_worker(manager)
+
+                def post(handle, state=post_state, manager=manager):
                     self._dispatch_abort(manager)
+                    return state
 
-                manager.conclude_failure = MagicMock(side_effect=notify_decode)
+                manager.agent.transfer.side_effect = post
+                manager.agent.check_xfer_state.return_value = "ERR"
                 queue = SimpleNamespace(
                     get=MagicMock(side_effect=(_chunk(), KeyboardInterrupt()))
                 )
@@ -185,9 +221,8 @@ class TestNixlAbortNotification(
                         manager.transfer_worker(queue)
                 self._dispatch_abort(manager)
 
-                manager.conclude_failure.assert_called_once()
+                manager.agent.transfer.assert_called_once()
                 self.assertEqual(manager._staging_outstanding[ROOM], 0)
-                self.assertIn(ROOM, manager._deferred_ack_poisoned_rooms)
                 self.assertEqual(manager._sent, [])
 
 
