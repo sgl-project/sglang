@@ -625,6 +625,110 @@ class TestSharedMoeProductionLoad(unittest.TestCase):
                 )
 
 
+class TestMoeSlotRankReuse(unittest.TestCase):
+    def test_smaller_rank_reuse_zeroes_the_previous_tails(self):
+        """MoE LoRA kernels read every physical-rank row and column, so a rank-2
+        adapter reusing a rank-4 slot must leave zeros past its rank: in A after
+        both the gate block and the up block (each at its max-rank offset), and
+        in B."""
+        hidden, inter, max_rank, experts = 3, 5, 4, 2
+        pool = _make_pool(
+            num_experts_global=experts,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_use_local_expert_ids=False,
+        )
+        pool.num_layer = 1
+        pool.max_lora_rank = max_rank
+        pool.target_modules = {"gate_up_proj", "down_proj"}
+        pool.experts_shared_outer_loras = False
+        pool.strict_loading = True
+        pool.lora_added_tokens_size = 0
+        pool.pin_memory_available = False
+        pool.enable_lora_overlap_loading = False
+        pool.base_model = object()
+        pool.A_buffer = {
+            "gate_up_proj_moe": [torch.zeros(1, experts, 2 * max_rank, hidden)],
+            "down_proj_moe": [torch.zeros(1, experts, max_rank, inter)],
+        }
+        pool.B_buffer = {
+            "gate_up_proj_moe": [torch.zeros(1, experts, 2 * inter, max_rank)],
+            "down_proj_moe": [torch.zeros(1, experts, hidden, max_rank)],
+        }
+        pool.embedding_A_buffer = {}
+        pool.embedding_B_buffer = {}
+        pool.lm_head_A_buffer = {}
+        pool.lm_head_B_buffer = {}
+        pool.new_embeddings_buffer = {}
+
+        def adapter(rank, start):
+            def ramp(*shape):
+                return (
+                    torch.arange(start, start + torch.Size(shape).numel())
+                    .reshape(shape)
+                    .float()
+                )
+
+            prefix = "model.layers.0.mlp.experts"
+            weights = {}
+            for expert in range(experts):
+                for name, shape in (
+                    ("gate_up_proj.lora_A", (2 * rank, hidden)),
+                    ("gate_up_proj.lora_B", (2 * inter, rank)),
+                    ("down_proj.lora_A", (rank, inter)),
+                    ("down_proj.lora_B", (hidden, rank)),
+                ):
+                    weights[f"{prefix}.{expert}.{name}.weight"] = ramp(*shape)
+            return types.SimpleNamespace(
+                config=types.SimpleNamespace(r=rank),
+                scaling=2.0,
+                layers=[types.SimpleNamespace(weights=weights, pinned_weights={})],
+                embedding_layers={},
+                added_tokens_embeddings={},
+            )
+
+        small = adapter(rank=2, start=1000)
+        for uid, lora in (("rank4", adapter(rank=4, start=1)), ("rank2", small)):
+            _load_lora_weight_to_buffer(
+                pool,
+                uid=uid,
+                buffer_id=0,
+                lora_adapter=lora,
+                lora_modules=[{"experts": _FakeRoutedMoeLayer()}],
+                lora_embed_tokens_module=None,
+                lora_lm_head_module=None,
+            )
+
+        weights = small.layers[0].weights
+        gate_up_a = pool.A_buffer["gate_up_proj_moe"][0][0]
+        down_a = pool.A_buffer["down_proj_moe"][0][0]
+        gate_up_b = pool.B_buffer["gate_up_proj_moe"][0][0]
+        down_b = pool.B_buffer["down_proj_moe"][0][0]
+        for expert in range(experts):
+            with self.subTest(expert=expert):
+                prefix = f"model.layers.0.mlp.experts.{expert}"
+                stacked_a = weights[f"{prefix}.gate_up_proj.lora_A.weight"]
+                for block in range(2):  # gate, then up, each at block * max_rank
+                    rows = gate_up_a[expert, block * max_rank : (block + 1) * max_rank]
+                    torch.testing.assert_close(
+                        rows[:2], stacked_a[block * 2 : (block + 1) * 2]
+                    )
+                    self.assertEqual(torch.count_nonzero(rows[2:]), 0)
+                torch.testing.assert_close(
+                    down_a[expert, :2], weights[f"{prefix}.down_proj.lora_A.weight"]
+                )
+                self.assertEqual(torch.count_nonzero(down_a[expert, 2:]), 0)
+                for buffer, name in (
+                    (gate_up_b, "gate_up_proj"),
+                    (down_b, "down_proj"),
+                ):
+                    torch.testing.assert_close(
+                        buffer[expert, :, :2],
+                        weights[f"{prefix}.{name}.lora_B.weight"] * small.scaling,
+                    )
+                    self.assertEqual(torch.count_nonzero(buffer[expert, :, 2:]), 0)
+
+
 class TestModuleLevelHelpers(unittest.TestCase):
     """The pool's `_moe_runner_keeps_global_expert_ids` must agree with
     `StandardDispatcher` on which runners keep global expert ids: a runner on
