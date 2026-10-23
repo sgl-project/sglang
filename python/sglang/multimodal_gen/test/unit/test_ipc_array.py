@@ -165,6 +165,18 @@ def test_retired_request_cannot_leave_files(monkeypatch, tmp_path):
     assert not list(tmp_path.iterdir())
 
 
+def test_request_cleanup_does_not_remove_another_reply(monkeypatch, tmp_path):
+    monkeypatch.setattr(ipc_array, "_array_ipc_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(ipc_array, "_MIN_FILE_REF_BYTES", 16)
+    array = np.arange(16, dtype=np.uint8)
+    with array_ipc_request("ipc://test") as first:
+        pending = spill_large_arrays_to_file_refs(array, first)
+        with array_ipc_request("ipc://test") as second:
+            spill_large_arrays_to_file_refs(array, second)
+        assert np.array_equal(materialize_file_refs(pending), array)
+    assert not list(tmp_path.iterdir())
+
+
 def test_cleanup_during_write_and_between_arrays(monkeypatch, tmp_path):
     monkeypatch.setattr(ipc_array, "_array_ipc_dir", lambda: str(tmp_path))
     monkeypatch.setattr(ipc_array, "_MIN_FILE_REF_BYTES", 16)

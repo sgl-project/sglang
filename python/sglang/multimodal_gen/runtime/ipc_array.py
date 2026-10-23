@@ -105,7 +105,7 @@ def _spill_large_arrays_to_file_refs(value: Any, directory: str) -> Any:
             return value
         except OSError:
             logger.warning_once(
-                f"Spilling an array to {directory} failed; sending it inline."
+                "Spilling an array to shared memory failed; sending it inline."
             )
             return value
     if _is_large_tensor(value):
@@ -115,7 +115,7 @@ def _spill_large_arrays_to_file_refs(value: Any, directory: str) -> Any:
             return value
         except OSError:
             logger.warning_once(
-                f"Spilling a tensor to {directory} failed; sending it inline."
+                "Spilling a tensor to shared memory failed; sending it inline."
             )
             return value
     if isinstance(value, list):
