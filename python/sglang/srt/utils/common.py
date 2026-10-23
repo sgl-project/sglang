@@ -362,9 +362,6 @@ def _is_intel_amx_backend_available():
         return False
 
 
-is_intel_amx_backend_available = _is_intel_amx_backend_available()
-
-
 try:
     # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
@@ -374,7 +371,7 @@ except:
 
 
 def cpu_has_amx_support():
-    return is_amx_tile_supported and is_intel_amx_backend_available
+    return is_amx_tile_supported and _is_intel_amx_backend_available()
 
 
 def use_intel_amx_backend(layer):
