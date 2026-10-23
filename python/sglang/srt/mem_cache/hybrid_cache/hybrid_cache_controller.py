@@ -1439,8 +1439,11 @@ class HybridCacheController(BaseHiCacheController):
                     # Backends without sparse-boundary results keep their
                     # contiguous-prefix contract. File and Mooncake return a set.
                     pages = range(1, storage_hit_count // self.page_size + 1)
+                # Callers may cap the hit to allocated host space after the
+                # query; a checkpoint past that cap has nowhere to load.
                 for page in pages:
-                    hits[page] = 1
+                    if 0 < page <= storage_hit_count // self.page_size:
+                        hits[page] = 1
         else:
             hits = [storage_hit_count]
         pools = list(PoolName)
