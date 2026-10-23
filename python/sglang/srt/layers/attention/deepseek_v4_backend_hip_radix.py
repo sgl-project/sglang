@@ -102,7 +102,10 @@ from sglang.srt.layers.attention.hip_flash_mla import (
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.dsv41_request_window import window_layout
+from sglang.srt.mem_cache.dsv41_request_window import (
+    direct_window_layout,
+    window_layout,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.monokernels.runtime import is_metadata_unread
 from sglang.srt.monokernels.spec import StepMetadata
@@ -884,6 +887,10 @@ class DeepseekV4HipRadixBackend(
 
     forward = DeepseekV4AttnBackend.forward
 
+    @property
+    def folds_encoder_swa_replay(self) -> bool:
+        return envs.SGLANG_HIP_FOLD_ENCODER_SWA_REPLAY.get()
+
     # the ratio-1/2 compressor and indexer orchestration is the CUDA backend's, taken
     # unbound; HIP differs only in the paged top-k (_low_ratio_index_topk below)
     forward_low_ratio_sources = DeepseekV4AttnBackend.forward_low_ratio_sources
@@ -992,6 +999,7 @@ class DeepseekV4HipRadixBackend(
         # exit_late_layer_tail.
         self.tail_source_kv_layer_id: Optional[int] = None
         self.encoder_replay = False
+        self.encoder_row_floor = None
         self.topk = get_spec().speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
         self.mtp_enabled = self.topk > 0
@@ -1019,6 +1027,10 @@ class DeepseekV4HipRadixBackend(
             # DSpark draft workers verify gamma rows; the server arg keeps the
             # CUDA-side convention gamma + 1.
             self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens - 1
+        if self.token_to_kv_pool.swa_valid_from is not None:
+            assert self._uses_dspark_draft_window(), (
+                "the draft SWA ring is addressed only by the V4.1 DSpark block window"
+            )
         self._fp8_decode_num_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
@@ -1219,6 +1231,7 @@ class DeepseekV4HipRadixBackend(
             num_tokens=num_tokens if cp_active else None,
             swa_replay_start=swa_replay_start,
             num_groups=len(req_pool_indices),
+            direct_window=attach_decode_streams,
         )
         # Normal prefill starts with a conservative exact_num_tokens=False.
         # Its CPU length mirror proves the exact query count without a D2H sync.
@@ -1522,6 +1535,7 @@ class DeepseekV4HipRadixBackend(
             out_loc=out_cache_loc,
             need_compress=need_compress,
             num_groups=bs,
+            direct_window=True,
         )
         # extend_seq_lens is uniform here (seq_lens already carries the draft
         # block, so the minimum above cannot trim it), hence an exact token count.
@@ -1596,6 +1610,7 @@ class DeepseekV4HipRadixBackend(
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=need_compress,
+            direct_window=True,
         )
         self._attach_unified_kv_decode_streams(core_attn_metadata, req_pool_indices)
         indexer_metadata = (
@@ -1706,6 +1721,7 @@ class DeepseekV4HipRadixBackend(
             isinstance(metadata, DSV4Metadata)
             and forward_batch.out_cache_loc is not None
             and window is None
+            and self.token_to_kv_pool.swa_valid_from is None
         ):
             out_cache_loc = forward_batch.out_cache_loc
             if (
@@ -2095,6 +2111,7 @@ class DeepseekV4HipRadixBackend(
         use_prefill_cuda_graph: bool = False,
     ):
         self.encoder_replay = forward_batch.encoder_swa_replay
+        self.encoder_row_floor = forward_batch.encoder_swa_row_floor
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -2257,6 +2274,14 @@ class DeepseekV4HipRadixBackend(
             device=device,
             whole_extend=late_layer_whole_extend(forward_batch, dspark=self.is_dspark),
         )
+        if self.encoder_row_floor is not None:
+            # Folded hits: a tail row never reads below its request's replay start.
+            row_floor = _cuda_backend._pad_rows(
+                self.encoder_row_floor, num_rows=forward_batch.out_cache_loc.shape[0]
+            )
+            swa_replay_start = torch.maximum(
+                swa_replay_start, row_floor[token_indices].to(swa_replay_start.dtype)
+            )
         contiguous_start = (
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
         )
@@ -3534,12 +3559,16 @@ class DeepseekV4HipRadixBackend(
         dspark_block_size: Optional[int] = None,
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
+        direct_window: bool = False,
     ) -> DSV4AttnMetadata:
-        """swa_replay_start floors every row's window at that absolute position."""
+        """swa_replay_start floors every row's window at that absolute position.
+        direct_window: the rows are each request's newest positions (decode,
+        target-verify), so a request window addresses its ring in place."""
         seq_lens_casual = seq_lens_casual.to(torch.int32)
         raw_positions = seq_lens_casual - 1
 
         request_layout = None
+        swa_out_cache_loc = None
         window = self.token_to_kv_pool.request_window
         if window is not None:
             if self.encoder_replay:
@@ -3552,14 +3581,38 @@ class DeepseekV4HipRadixBackend(
                 )
                 group_first = torch.cummax(torch.where(starts, offset, 0), dim=0).values
                 swa_replay_start = raw_positions - (offset - group_first)
-            request_layout = window_layout(
-                req_pool_indices_repeated,
-                raw_positions,
-                zero_row=window.zero_row,
-                capacity=window.capacity,
-                floor=swa_replay_start,
-                num_groups=num_groups,
-            )
+            elif swa_replay_start is None and self.encoder_row_floor is not None:
+                # Folded replay: hits floor every row at their replay start;
+                # MLP-sync padding rows follow the real ones with floor 0.
+                swa_replay_start = _cuda_backend._pad_rows(
+                    self.encoder_row_floor, num_rows=raw_positions.shape[0]
+                )
+            if (
+                direct_window
+                and not self.encoder_replay
+                and envs.SGLANG_HIP_REQUEST_WINDOW_DIRECT.get()
+            ):
+                rows_per_request = max(1, self.target_verify_num_draft_tokens or 1)
+                assert window.capacity >= SWA_WINDOW + rows_per_request - 1, (
+                    f"ring capacity {window.capacity} cannot hold a {SWA_WINDOW}-row "
+                    f"window plus {rows_per_request} rows written in place"
+                )
+                request_layout = direct_window_layout(
+                    req_pool_indices_repeated,
+                    raw_positions,
+                    capacity=window.capacity,
+                    window=SWA_WINDOW,
+                    floor=swa_replay_start,
+                )
+            else:
+                request_layout = window_layout(
+                    req_pool_indices_repeated,
+                    raw_positions,
+                    zero_row=window.zero_row,
+                    capacity=window.capacity,
+                    floor=swa_replay_start,
+                    num_groups=num_groups,
+                )
             swa_page_indices = _pad_last_dim(
                 request_layout.indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
             )
@@ -3578,6 +3631,11 @@ class DeepseekV4HipRadixBackend(
                 out_loc=out_loc,
                 block_size=dspark_block_size,
             )
+            if self.token_to_kv_pool.swa_valid_from is not None:
+                swa_out_cache_loc = self._dspark_swa_ring_out_cache_loc(
+                    seq_lens_casual=seq_lens_casual,
+                    req_pool_indices_repeated=req_pool_indices_repeated,
+                )
         elif swa_replay_start is None:
             swa_page_indices = self.get_swa_page_indices(
                 seq_lens_casual=seq_lens_casual,
@@ -3620,6 +3678,7 @@ class DeepseekV4HipRadixBackend(
             index_topk=self.index_topk,
             low_ratios=self.low_ratios,
             request_window_layout=request_layout,
+            swa_out_cache_loc=swa_out_cache_loc,
         )
 
         if need_compress:
@@ -3660,6 +3719,9 @@ class DeepseekV4HipRadixBackend(
         return swa_indices.to(torch.int32)
 
     get_dspark_swa_page_indices = DeepseekV4AttnBackend.get_dspark_swa_page_indices
+    _dspark_swa_ring_out_cache_loc = (
+        DeepseekV4AttnBackend._dspark_swa_ring_out_cache_loc
+    )
 
 
 class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):

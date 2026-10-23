@@ -1818,6 +1818,12 @@ class Envs:
     SGLANG_HIP_DSV41_INDEX_K_PAGE8 = EnvBool(False)
     # DeepSeek-V4.1 mHC boundary (HIP): the 32-row Triton tile from _HC_BOUNDARY_WIDE_MIN_M rows (bitwise the same).
     SGLANG_HIP_MHC_BOUNDARY_WIDE_TILE = EnvBool(True)
+    # Encoder SWA replay on HIP: fold each hit's replay rows into its extend
+    # instead of running a separate replay forward first.
+    SGLANG_HIP_FOLD_ENCODER_SWA_REPLAY = EnvBool(True)
+    # Encoder SWA replay on HIP: decode and target-verify read and write the
+    # per-request SWA ring in place; only prefill/extend stage it in the workspace.
+    SGLANG_HIP_REQUEST_WINDOW_DIRECT = EnvBool(True)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
