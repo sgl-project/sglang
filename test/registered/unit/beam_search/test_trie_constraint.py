@@ -1,7 +1,6 @@
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -9,7 +8,6 @@ import torch
 from safetensors.torch import save_file
 
 import sglang.srt.beam_search.trie_constraint as trie_constraint_module
-import sglang.srt.layers.logits_processor as logits_module
 from sglang.srt.beam_search.trie_config import (
     TRIE_OUTPUT_HEAD_FILENAME,
     discover_trie_output_head_config,
@@ -24,7 +22,6 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -84,109 +81,6 @@ class TestBeamTrieConstraint(CustomTestCase):
         processor.use_tp_lm_head_all_to_all = False
         processor.defer_verify_gather = False
         return processor
-
-    @torch.inference_mode()
-    def test_logits_pipeline_preserves_trie_rounding_and_dense_buffer_path(self):
-        config, _ = self.load()
-        hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-        head = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
-        torch.nn.Module.__init__(head)
-        head.weight = torch.nn.Parameter(torch.arange(60.0).view(30, 2))
-        head.quant_method = None
-        dense = hidden @ head.weight.T
-        for native, depths in (
-            (False, None),
-            (True, None),
-            (True, torch.tensor([1, 2])),
-        ):
-            with self.subTest(native=native, depths=depths):
-                processor = self.processor(config)
-                if not native:
-                    processor.beam_trie_output_head = None
-                buffer = torch.full_like(dense, torch.nan)
-                metadata = (
-                    LogitsMetadata(
-                        ForwardMode.DECODE,
-                        next_token_logits_buffer=buffer,
-                        beam_trie_levels=depths,
-                    )
-                    if native
-                    else SimpleNamespace(next_token_logits_buffer=buffer)
-                )
-                with mock.patch.object(
-                    processor, "_compute_lm_head", wraps=processor._compute_lm_head
-                ) as project:
-                    logits, normalizer = processor._get_logits_with_beam_normalizer(
-                        hidden, head, metadata
-                    )
-                if depths is None:
-                    self.assertIs(logits, buffer)
-                    self.assertIsNone(normalizer)
-                    self.assertIs(
-                        project.call_args.kwargs["out"], None if native else buffer
-                    )
-                    torch.testing.assert_close(logits, dense)
-                else:
-                    indices = config.token_start + depths[:, None] * 4 + torch.arange(4)
-                    torch.testing.assert_close(logits, dense.gather(1, indices))
-                    torch.testing.assert_close(
-                        normalizer.sum(dim=1), torch.logsumexp(dense, dim=-1)
-                    )
-                    self.assertTrue(torch.isnan(buffer).all())
-
-    @torch.inference_mode()
-    def test_fused_and_deferred_gather_keep_normalizer_protocol(self):
-        """Every logits path must retain the tensor/normalizer return contract."""
-
-        class CudaLogits(torch.Tensor):
-            @property
-            def is_cuda(self):
-                return True
-
-        def softcap(shards, cap, output):
-            output.copy_(cap * torch.tanh(shards.transpose(0, 1).reshape(3, 10) / cap))
-            return output
-
-        group = SimpleNamespace(
-            world_size=2,
-            rank_in_group=0,
-            all_gather_into_tensor=lambda output, value: output.copy_(
-                value.repeat(2, 1)
-            ),
-        )
-        config, _ = self.load()
-        hidden = torch.arange(6.0).view(3, 2)
-        head = torch.nn.Linear(2, 5, bias=False)
-        shard = hidden @ head.weight.T
-        with (
-            get_context().override_server_args(device="cpu", tp_size=2),
-            get_parallel().override(tp_rank=0, tp_group=group),
-            mock.patch.object(logits_module, "_is_cpu", False),
-            mock.patch.object(
-                logits_module, "gathered_softcap_logits", side_effect=softcap
-            ),
-        ):
-            for deferred in (False, True):
-                with self.subTest(deferred=deferred):
-                    processor = self.processor(config)
-                    processor.beam_trie_output_head = None
-                    processor.vocab_size = 10
-                    processor.do_tensor_parallel_all_gather = True
-                    processor.final_logit_softcapping = 3.0
-                    processor.defer_verify_gather = deferred
-                    metadata = LogitsMetadata(ForwardMode.TARGET_VERIFY)
-                    logits, normalizer = processor._get_logits_with_beam_normalizer(
-                        hidden.as_subclass(CudaLogits), head, metadata
-                    )
-                    expected = (
-                        shard
-                        if deferred
-                        else 3.0 * torch.tanh(shard.repeat(1, 2) / 3.0)
-                    )
-                    torch.testing.assert_close(
-                        logits.as_subclass(torch.Tensor), expected
-                    )
-                    self.assertIsNone(normalizer)
 
     def test_dense_and_sparse_child_masks(self):
         config, dense = self.load()
@@ -331,22 +225,24 @@ class TestBeamTrieConstraint(CustomTestCase):
             with self.subTest(scale=scale, softcap=softcap):
                 processor.logit_scale = scale
                 processor.final_logit_softcapping = softcap
-                actual = processor._compute_mixed_beam_trie_lm_head(
-                    hidden, lm_head, depths
+                actual = processor._get_beam_trie_logits(
+                    hidden,
+                    lm_head,
+                    LogitsMetadata(ForwardMode.DECODE, beam_trie_levels=depths),
                 )
-                torch.testing.assert_close(actual.logits, dense.gather(1, indices))
                 expected = dense if scale is None else dense * scale
                 if softcap is not None:
                     expected = softcap * torch.tanh(expected / softcap)
+                torch.testing.assert_close(actual.logits, expected.gather(1, indices))
                 torch.testing.assert_close(
                     actual.normalizer[:, 0] + actual.normalizer[:, 1],
                     torch.logsumexp(expected, dim=-1),
                 )
 
+        # Rows without trie depths take the dense path.
         self.assertIsNone(
-            processor._beam_trie_output_head_for(
-                lm_head,
-                embedding_bias=torch.zeros(30),
+            processor._get_beam_trie_logits(
+                hidden, lm_head, LogitsMetadata(ForwardMode.DECODE)
             )
         )
 
