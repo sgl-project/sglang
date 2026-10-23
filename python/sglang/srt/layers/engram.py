@@ -1015,9 +1015,12 @@ def engram_gate(
     k_weight: torch.Tensor,
     eps: float,
     clamp_value: float,
+    input_ids: Optional[torch.Tensor] = None,
+    image_token_id: Optional[int] = None,
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
-    followed by the shared value. Adds the gated value to every copy."""
+    followed by the shared value. Adds the gated value to every copy, except in rows
+    whose ``input_ids`` entry is ``image_token_id``, which keep ``x``."""
     # ``kv`` is the wkv projection of the same tokens, so a shape mismatch is a
     # caller bug that ``fused_engram_gate`` asserts on, not a reason to fall back.
     if (
@@ -1029,7 +1032,9 @@ def engram_gate(
         and k_weight.dtype in (torch.bfloat16, torch.float32)
         and all(t.is_contiguous() for t in (x, kv, q_weight, k_weight))
     ):
-        return fused_engram_gate(x, kv, q_weight, k_weight, eps, clamp_value)
+        return fused_engram_gate(
+            x, kv, q_weight, k_weight, eps, clamp_value, input_ids, image_token_id
+        )
     hc_mult, dim = x.shape[-2:]
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
@@ -1042,7 +1047,10 @@ def engram_gate(
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
     # Signed square root before the sigmoid, matching the training kernel.
     gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
-    return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    out = (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    if input_ids is not None:
+        out = torch.where((input_ids == image_token_id)[:, None, None], x, out)
+    return out
 
 
 class Engram(nn.Module):
@@ -1053,9 +1061,12 @@ class Engram(nn.Module):
         layout: EngramLayout,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        image_token_id: Optional[int] = None,
     ):
         super().__init__()
         self.layer_hash_index = layout.layer_ids.index(layer_id)
+        self.image_token_id = image_token_id
         self.eps = config.rms_norm_eps
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
@@ -1082,9 +1093,11 @@ class Engram(nn.Module):
         hash_ids: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         *,
+        input_ids: torch.Tensor,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
-        """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
+        """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] and input_ids [T] for this
+        layer."""
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
         emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
@@ -1093,6 +1106,14 @@ class Engram(nn.Module):
             # empty M.
             return x
         kv, _ = self.wkv(emb.flatten(-2))
+        image_ids = input_ids if self.image_token_id is not None else None
         return engram_gate(
-            x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
+            x,
+            kv,
+            self.q_weight,
+            self.k_weight,
+            self.eps,
+            self.clamp_value,
+            image_ids,
+            self.image_token_id,
         )

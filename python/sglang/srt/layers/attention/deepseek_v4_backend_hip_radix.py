@@ -91,7 +91,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
-    SparsePrefillWorkspace,
+    SparsePrefillKVBuffer,
 )
 from sglang.srt.layers.attention.hip_flash_mla import (
     _apply_inverse_rope,
@@ -1075,9 +1075,9 @@ class DeepseekV4HipRadixBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
-        self.opus_prefill_workspace = SparsePrefillWorkspace(self.device)
+        self.opus_prefill_workspace = SparsePrefillKVBuffer(self.device)
         self.opus_compressed_workspaces = {
-            ratio: SparsePrefillWorkspace(self.device) for ratio in (1, 2)
+            ratio: SparsePrefillKVBuffer(self.device) for ratio in (1, 2)
         }
         # Reset with the metadata: its inputs belong to one prefill forward.
         self._opus_prefill_state: Optional[_OpusPrefillState] = None

@@ -75,7 +75,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
-    SparsePrefillWorkspace,
+    SparsePrefillKVBuffer,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer import (
@@ -1302,7 +1302,7 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self.online_c128_mtp = OnlineC128MTPController(self)
-        self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
+        self.sparse_prefill_kv_buffer = SparsePrefillKVBuffer(self.device)
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
             not _is_cuda or self.online_c128_mtp.enabled()
@@ -1950,15 +1950,16 @@ class DeepseekV4AttnBackend(
     ) -> None:
         """Write every row's compressed KV for the source layer the tail starts at,
         before enter_late_layer_tail; the layer's own pass inside the tail then
-        skips its compressor."""
-        self.forward_low_ratio_sources(
-            layer=layer,
-            x=x,
-            q_lora=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            run_indexer=False,
-        )
+        skips its compressor, also on a rank with no rows to write."""
+        if x.shape[0] > 0:
+            self.forward_low_ratio_sources(
+                layer=layer,
+                x=x,
+                q_lora=None,
+                positions=positions,
+                forward_batch=forward_batch,
+                run_indexer=False,
+            )
         self.tail_source_kv_layer_id = layer.layer_id
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
@@ -2758,6 +2759,7 @@ class DeepseekV4AttnBackend(
         *,
         num_qo_tokens: int,
     ) -> SparsePrefillChunkCache:
+        self.sparse_prefill_kv_buffer.forget_head()
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
         # Decoder tails require explicit SWA indices to exclude unwritten history.
@@ -3210,23 +3212,18 @@ class DeepseekV4AttnBackend(
             return
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
-        if hoisted_pos is not None and hoisted_pos.shape[0] < positions.shape[0]:
-            # DP attention pads an eager extend past the rows extend_seq_lens cover.
-            num_real = hoisted_pos.shape[0]
-            x, positions = x[:num_real], positions[:num_real]
-            if q_lora is not None:
-                q_lora = q_lora[:num_real]
-        if (
-            hoisted_req is not None
-            and hoisted_pos is not None
-            and hoisted_pos.shape[0] == positions.shape[0]
-        ):
-            # Bucket-sized under the prefill graph; an eager break sees the
-            # live rows only and falls through.
-            req, pos = hoisted_req, hoisted_pos
-        else:
+        if hoisted_pos is None:
             req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
             pos = positions
+        else:
+            # The hoisted rows list the live rows first. DP attention pads an eager
+            # extend past them; an eager break in the late-layer tail sees fewer, and
+            # there extend_seq_lens still spans the whole extend.
+            n = min(hoisted_pos.shape[0], positions.shape[0])
+            x, positions = x[:n], positions[:n]
+            if q_lora is not None:
+                q_lora = q_lora[:n]
+            req, pos = hoisted_req[:n], hoisted_pos[:n]
         if (
             forward_batch.forward_mode.is_extend()
             and self._low_ratio_in_prefill_graph()
@@ -4198,7 +4195,7 @@ class DeepseekV4AttnBackend(
         extra_page_size = None
         flat_token_ids = None
         if compress_ratio == 0:
-            workspace = self.sparse_prefill_workspace.get(cache.swa_token_ids.shape[0])
+            workspace = self.sparse_prefill_kv_buffer.get(cache.swa_token_ids.shape[0])
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
@@ -4209,10 +4206,18 @@ class DeepseekV4AttnBackend(
                 compress_ratio, core_attn_metadata, extra_page_size
             )
             n_compressed = flat_token_ids.shape[0]
-            workspace = self.sparse_prefill_workspace.get(
-                n_compressed + cache.swa_token_ids.shape[0]
+            # Layers sharing a kv_source reuse its dequant: no later layer writes
+            # that cache, and graph replay keeps the layer order.
+            workspace, compressed_filled = self.sparse_prefill_kv_buffer.get_with_head(
+                n_compressed + cache.swa_token_ids.shape[0],
+                head_source=(
+                    extra_k_cache.data_ptr(),
+                    flat_token_ids.data_ptr(),
+                    n_compressed,
+                ),
             )
-            compressed_slice = workspace[:n_compressed]
+            if not compressed_filled:
+                compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
@@ -4369,7 +4374,7 @@ class DeepseekV4AttnBackend(
         flat_token_ids = None
 
         if compress_ratio == 0:
-            workspace = self.sparse_prefill_workspace.get(
+            workspace = self.sparse_prefill_kv_buffer.get(
                 cache.swa_token_ids.shape[0] + 1,
                 dtype=fp8_dtype,
             )
@@ -4384,7 +4389,7 @@ class DeepseekV4AttnBackend(
             )
 
             n_compressed = flat_token_ids.shape[0]
-            workspace = self.sparse_prefill_workspace.get(
+            workspace = self.sparse_prefill_kv_buffer.get(
                 n_compressed + cache.swa_token_ids.shape[0] + 1,
                 dtype=fp8_dtype,
             )
