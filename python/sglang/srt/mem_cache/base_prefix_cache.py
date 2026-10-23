@@ -670,6 +670,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         pass
 
+    def has_pending_cache_operations(self) -> bool:
+        return False
+
     def take_events(self):
         return [] if self.kv_events is None else self.kv_events.take()
 
