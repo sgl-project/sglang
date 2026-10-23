@@ -568,59 +568,6 @@ class AscendAttnBackend(AttentionBackend):
             origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         )
 
-    def _init_mla_dcp_forward_metadata(self, forward_batch: ForwardBatch):
-        """Build eager MLA DCP metadata from prepared global CPU lengths."""
-        metadata = self.forward_metadata
-        global_kv_lens_cpu = metadata.seq_lens_cpu_int
-        global_kv_lens = forward_batch.seq_lens
-        if forward_batch.forward_mode.is_target_verify():
-            query_len = int(forward_batch.spec_info.draft_token_num)
-            global_kv_lens = global_kv_lens.to(torch.int64) + query_len
-            spec_algorithm = forward_batch.spec_algorithm
-            if spec_algorithm is not None and spec_algorithm.is_dflash_family():
-                # Active Host lengths already include verify tokens; Ascend's
-                # zero-filled DP padding rows still need the verify block.
-                global_kv_lens_cpu = torch.where(
-                    global_kv_lens_cpu == 0, query_len, global_kv_lens_cpu
-                )
-        elif forward_batch.spec_info is not None:
-            step_offset = self.speculative_step_id + 1
-            global_kv_lens = global_kv_lens + step_offset
-
-        # Size the table from FIA's Host bound, which can lead device lengths.
-        metadata.seq_lens_cpu_int, metadata.block_tables = (
-            self._get_kv_lens_and_block_tables(
-                global_kv_lens_cpu, forward_batch.req_pool_indices
-            )
-        )
-        if metadata.block_tables.shape[1] == 0:
-            # Keep FIA's eager table nonempty without changing the KV lengths.
-            metadata.block_tables = (
-                self.req_to_token[forward_batch.req_pool_indices, :1]
-                // (self.page_size * self.dcp_size)
-            ).to(torch.int32)
-        metadata.seq_lens = get_dcp_lens(
-            global_kv_lens,
-            self.dcp_size,
-            self.dcp_rank,
-            interleave_size=self.page_size,
-        ).int()
-        if forward_batch.forward_mode.is_target_verify():
-            metadata.dcp_spec_seq_lens = get_dcp_chain_spec_lens(
-                global_kv_lens,
-                query_len,
-                self.dcp_size,
-                self.dcp_rank,
-                interleave_size=self.page_size,
-            )
-            # FIA checks S2 against the full paged capacity, not just valid KV.
-            required_mask_width = metadata.block_tables.shape[1] * self.page_size
-            metadata.dcp_mtp_attn_mask = build_mla_dcp_mtp_mask(
-                metadata.dcp_spec_seq_lens,
-                query_len,
-                required_mask_width,
-            )
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
@@ -759,7 +706,56 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if dense_mla_dcp_partial:
-            self._init_mla_dcp_forward_metadata(forward_batch)
+            metadata = self.forward_metadata
+            global_kv_lens_cpu = metadata.seq_lens_cpu_int
+            global_kv_lens = forward_batch.seq_lens
+            if forward_batch.forward_mode.is_target_verify():
+                query_len = int(forward_batch.spec_info.draft_token_num)
+                global_kv_lens = global_kv_lens.to(torch.int64) + query_len
+                spec_algorithm = forward_batch.spec_algorithm
+                if spec_algorithm is not None and spec_algorithm.is_dflash_family():
+                    # Active Host lengths already include verify tokens; Ascend's
+                    # zero-filled DP padding rows still need the verify block.
+                    global_kv_lens_cpu = torch.where(
+                        global_kv_lens_cpu == 0, query_len, global_kv_lens_cpu
+                    )
+            elif forward_batch.spec_info is not None:
+                step_offset = self.speculative_step_id + 1
+                global_kv_lens = global_kv_lens + step_offset
+
+            # Size the table from FIA's Host bound, which can lead device lengths.
+            metadata.seq_lens_cpu_int, metadata.block_tables = (
+                self._get_kv_lens_and_block_tables(
+                    global_kv_lens_cpu, forward_batch.req_pool_indices
+                )
+            )
+            if metadata.block_tables.shape[1] == 0:
+                # Keep FIA's eager table nonempty without changing the KV lengths.
+                metadata.block_tables = (
+                    self.req_to_token[forward_batch.req_pool_indices, :1]
+                    // (self.page_size * self.dcp_size)
+                ).to(torch.int32)
+            metadata.seq_lens = get_dcp_lens(
+                global_kv_lens,
+                self.dcp_size,
+                self.dcp_rank,
+                interleave_size=self.page_size,
+            ).int()
+            if forward_batch.forward_mode.is_target_verify():
+                metadata.dcp_spec_seq_lens = get_dcp_chain_spec_lens(
+                    global_kv_lens,
+                    query_len,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    interleave_size=self.page_size,
+                )
+                # FIA checks S2 against the full paged capacity, not just valid KV.
+                required_mask_width = metadata.block_tables.shape[1] * self.page_size
+                metadata.dcp_mtp_attn_mask = build_mla_dcp_mtp_mask(
+                    metadata.dcp_spec_seq_lens,
+                    query_len,
+                    required_mask_width,
+                )
 
         if self.dsa_dcp_target:
             # Draft workers retain allocator-global cache slots and use the non-DCP
@@ -1135,16 +1131,15 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 metadata.swa_mask[:bs, 0, :].copy_(mask)
                 metadata.swa_mask[bs:, :, :].fill_(True)
+        effective_seq_lens = seq_lens[:bs]
         if self.dense_mla_dcp_target:
-            effective_seq_lens = seq_lens[:bs].to(torch.int64)
-            if forward_mode.is_target_verify():
-                effective_seq_lens = (
-                    effective_seq_lens + self.speculative_num_draft_tokens
-                )
-            elif forward_mode.is_decode_or_idle() and spec_info is not None:
-                effective_seq_lens = (
-                    effective_seq_lens + self.speculative_step_offset_npu
-                )
+            effective_seq_lens = effective_seq_lens.to(torch.int64)
+        if forward_mode.is_target_verify():
+            effective_seq_lens = effective_seq_lens + self.speculative_num_draft_tokens
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            effective_seq_lens = effective_seq_lens + self.speculative_step_offset_npu
+
+        if self.dense_mla_dcp_target:
             active_num_pages = min(
                 metadata.block_tables.shape[1],
                 max(
@@ -1272,7 +1267,6 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens + self.speculative_num_draft_tokens
             # For DFlash, seq_lens_cpu (= prefix + block_size) is the true KV
             # length; refresh the graph-bound list from that CPU tensor.
             # Other spec algorithms keep the capture-time list (graph_runner
@@ -1283,11 +1277,9 @@ class AscendAttnBackend(AttentionBackend):
                 if seq_lens_cpu is not None:
                     kv_lens = seq_lens_cpu[:bs]
                 else:
-                    kv_lens = seq_lens[:bs]
+                    kv_lens = effective_seq_lens
                 metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
-        elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            seq_lens = seq_lens + self.speculative_step_offset_npu
-        metadata.seq_lens[:bs].copy_(seq_lens[:bs])
+        metadata.seq_lens[:bs].copy_(effective_seq_lens)
 
         self.forward_metadata = metadata
 
@@ -2794,75 +2786,17 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        if self.dense_mla_dcp_target and forward_batch.forward_mode.is_target_verify():
-            # Keep the full query shape, including graph padding rows.
-            num_tokens = q.shape[0]
-            query_len = forward_batch.spec_info.draft_token_num
-            batch_size = num_tokens // query_len
-            num_heads = layer.tp_q_head_num
-            if num_tokens == 0:
-                # DSpark makes idle DP ranks execute a zero-token verify pass so
-                # they can participate in model-wide collectives.  There is no
-                # local DCP attention work on those ranks; skip FIA.
-                return (
-                    q.new_zeros((num_tokens, num_heads * self.kv_lora_rank)),
-                    q.new_zeros((num_tokens, num_heads), dtype=torch.float32),
-                )
-            block_table = self.forward_metadata.block_tables[:batch_size]
-            if self.forward_metadata.seq_lens_cpu_int is None:
-                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list[
-                    :batch_size
-                ]
-            else:
-                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int[
-                    :batch_size
-                ].tolist()
-            attn_mask = self.forward_metadata.dcp_mtp_attn_mask[:batch_size]
-
-            c_kv, k_rope_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            if is_fia_nz():
-                k_rope_cache = _reshape_kv_for_fia_nz(
-                    k_rope_cache,
-                    layer.tp_k_head_num,
-                    self.qk_rope_head_dim,
-                    self.page_size,
-                )
-                c_kv = _reshape_kv_for_fia_nz(
-                    c_kv,
-                    layer.tp_v_head_num,
-                    self.kv_lora_rank,
-                    self.page_size,
-                )
-            else:
-                k_rope_cache = k_rope_cache.view(
-                    -1,
-                    layer.tp_k_head_num,
-                    self.page_size,
-                    self.qk_rope_head_dim,
-                )
-                c_kv = c_kv.view(
-                    -1,
-                    layer.tp_v_head_num,
-                    self.page_size,
-                    self.kv_lora_rank,
-                )
-
-            attn_output, softmax_lse = self._forward_mla_fia(
-                q,
-                q_rope,
-                c_kv,
-                k_rope_cache,
-                layer,
-                batch_size=batch_size,
-                query_len=query_len,
-                block_table=block_table,
-                actual_seq_lengths=[query_len] * batch_size,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                attn_mask=attn_mask,
-                return_softmax_lse=True,
+        dense_mla_dcp_verify = (
+            self.dense_mla_dcp_target and forward_batch.forward_mode.is_target_verify()
+        )
+        if dense_mla_dcp_verify and q.shape[0] == 0:
+            # DSpark makes idle DP ranks execute a zero-token verify pass so
+            # they can participate in model-wide collectives.  There is no
+            # local DCP attention work on those ranks; skip FIA.
+            return (
+                q.new_zeros((0, layer.tp_q_head_num * self.kv_lora_rank)),
+                q.new_zeros((0, layer.tp_q_head_num), dtype=torch.float32),
             )
-
-            return attn_output, softmax_lse
 
         if not self.use_mla:
             k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
@@ -3012,6 +2946,34 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 c_kv_cache = c_kv.view(
                     -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
+                )
+
+            if dense_mla_dcp_verify:
+                # Keep the full query shape, including graph padding rows.
+                query_len = forward_batch.spec_info.draft_token_num
+                batch_size = q.shape[0] // query_len
+                block_table = self.forward_metadata.block_tables[:batch_size]
+                if self.forward_metadata.seq_lens_cpu_int is None:
+                    actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list[
+                        :batch_size
+                    ]
+                else:
+                    actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int[
+                        :batch_size
+                    ].tolist()
+                return self._forward_mla_fia(
+                    q,
+                    q_rope,
+                    c_kv_cache,
+                    k_rope_cache,
+                    layer,
+                    batch_size=batch_size,
+                    query_len=query_len,
+                    block_table=block_table,
+                    actual_seq_lengths=[query_len] * batch_size,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    attn_mask=self.forward_metadata.dcp_mtp_attn_mask[:batch_size],
+                    return_softmax_lse=True,
                 )
 
             q_nope = q.view(-1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
