@@ -390,10 +390,20 @@ def run_moe_lora_tp_generation(
 
 
 def kl_v2(a, b):
-    """Mean of 0.5 * (a - b) ** 2 over two logprob sequences."""
-    a = torch.tensor(a) if not torch.is_tensor(a) else a
-    b = torch.tensor(b) if not torch.is_tensor(b) else b
+    """Mean of 0.5 * (a - b) ** 2 over two logprob sequences of equal length."""
     return (((a - b) ** 2) * 0.5).mean().item()
+
+
+def _single_sequence(test_case, values, name, length):
+    """One nonempty, finite logprob sequence of `length` positions as a 1-D
+    tensor; a leading batch dimension of one is dropped."""
+    values = torch.as_tensor(values, dtype=torch.float64)
+    if values.dim() == 2 and values.shape[0] == 1:
+        values = values[0]
+    test_case.assertEqual(values.dim(), 1, f"{name}: shape {tuple(values.shape)}")
+    test_case.assertEqual(values.numel(), length, f"{name}: positions")
+    test_case.assertTrue(torch.isfinite(values).all(), f"{name}: non-finite values")
+    return values
 
 
 def get_prompt_logprobs(engine, input_ids, lora_path):
@@ -426,11 +436,21 @@ def assert_lora_matches_trainer_logprobs(
         weights_only=False,
     )
 
-    base_logprobs = get_prompt_logprobs(engine, cdata["tokens"], lora_path=None)
-    logprobs = get_prompt_logprobs(engine, cdata["tokens"], lora_path=lora_path)
-
-    base_t = torch.tensor(base_logprobs)
-    lora_t = torch.tensor(logprobs)
+    # Every token after the first is scored. Without these checks a
+    # one-position result broadcast against the trainer's sequence and could
+    # pass (the per-file copies had the same gap before they were merged).
+    tokens = torch.as_tensor(cdata["tokens"]).flatten()
+    length = tokens.numel() - 1
+    test_case.assertGreater(length, 0, "the recorded sample has one token")
+    base_t, lora_t, training, sampling = (
+        _single_sequence(test_case, values, name, length)
+        for values, name in (
+            (get_prompt_logprobs(engine, cdata["tokens"], None), "base logprobs"),
+            (get_prompt_logprobs(engine, cdata["tokens"], lora_path), "lora logprobs"),
+            (cdata["training_logprobs"], "training_logprobs"),
+            (cdata["sampling_logprobs"], "sampling_logprobs"),
+        )
+    )
     diff = (base_t - lora_t).abs()
     print(
         f"[VERIFY] base vs lora: mean_diff={diff.mean().item():.6f}, "
@@ -443,9 +463,9 @@ def assert_lora_matches_trainer_logprobs(
         "LoRA logprobs should differ from base model logprobs",
     )
 
-    kl_sglang_trainer = kl_v2(cdata["training_logprobs"], logprobs)
-    kl_orig_trainer = kl_v2(cdata["training_logprobs"], cdata["sampling_logprobs"])
-    kl_sglang_orig = kl_v2(logprobs, cdata["sampling_logprobs"])
+    kl_sglang_trainer = kl_v2(training, lora_t)
+    kl_orig_trainer = kl_v2(training, sampling)
+    kl_sglang_orig = kl_v2(lora_t, sampling)
 
     print(f"KL(orig_sampler, trainer) = {kl_orig_trainer:.6e}")
     print(f"KL(sglang, trainer)       = {kl_sglang_trainer:.6e}")
@@ -1206,9 +1226,16 @@ def assert_lora_routes_match_hf(
     max_new_tokens = 32
     rouge_l_tolerance = 0.9
     a, b = [adaptor.name for adaptor in model_case.adaptors]
+    for i, (prompts, lora_paths) in enumerate(batches):
+        test_case.assertEqual(
+            len(lora_paths), len(prompts), f"batch {i + 1}: one route per prompt"
+        )
 
+    # SRT shuts down before HF loads: the two models never share the GPU, and
+    # a failed HF start cannot leave the server running.
     ensure_reproducibility()
-    srt_runner = SRTRunner(
+    srt_outputs = []
+    with SRTRunner(
         model_case.base,
         torch_dtype=torch_dtype,
         model_type="generation",
@@ -1221,35 +1248,43 @@ def assert_lora_routes_match_hf(
         disable_cuda_graph=True,
         disable_radix_cache=True,
         **srt_kwargs,
-    )
+    ) as srt_runner:
+        for i, (prompts, lora_paths) in enumerate(batches):
+            srt_strs = srt_runner.batch_forward(
+                prompts, max_new_tokens=max_new_tokens, lora_paths=lora_paths
+            ).output_strs
+            test_case.assertEqual(
+                len(srt_strs), len(prompts), f"batch {i + 1}: SRT outputs"
+            )
+            srt_outputs.append(srt_strs)
+
+    # HF generates one row at a time, so a (prompt, route) reference does
+    # not depend on the batch that asked for it.
     ensure_reproducibility()
-    hf_runner = HFRunner(
+    hf_cache = {}
+    with HFRunner(
         model_case.base,
         torch_dtype=torch_dtype,
         model_type="generation",
         patch_model_do_sample_false=True,
-    )
-    # HF generates one row at a time, so a (prompt, route) reference does
-    # not depend on the batch that asked for it.
-    hf_cache = {}
-    with srt_runner, hf_runner:
-        for i, (prompts, lora_paths) in enumerate(batches):
-            print(f"\n--- Batch {i + 1} --- lora_paths: {lora_paths}")
-            srt_strs = srt_runner.batch_forward(
-                prompts, max_new_tokens=max_new_tokens, lora_paths=lora_paths
-            ).output_strs
-            for prompt, route, srt_str in zip(prompts, lora_paths, srt_strs):
+    ) as hf_runner:
+        for prompts, lora_paths in batches:
+            for prompt, route in zip(prompts, lora_paths):
                 if (prompt, route) not in hf_cache:
                     hf_cache[prompt, route] = hf_runner.forward(
                         [prompt], max_new_tokens=max_new_tokens, lora_paths=[route]
                     ).output_strs[0]
-                hf_str = hf_cache[prompt, route]
-                rouge = calculate_rouge_l([srt_str.strip()], [hf_str.strip()])[0]
-                print(f"route={route} rouge_l={rouge:.3f}")
-                print(f"  SRT: {srt_str.strip()!r}")
-                print(f"  HF:  {hf_str.strip()!r}")
-                test_case.assertGreaterEqual(
-                    rouge,
-                    rouge_l_tolerance,
-                    f"batch {i + 1}, route {route}: SRT output diverges from HF",
-                )
+
+    for i, ((prompts, lora_paths), srt_strs) in enumerate(zip(batches, srt_outputs)):
+        print(f"\n--- Batch {i + 1} --- lora_paths: {lora_paths}")
+        for prompt, route, srt_str in zip(prompts, lora_paths, srt_strs):
+            hf_str = hf_cache[prompt, route]
+            rouge = calculate_rouge_l([srt_str.strip()], [hf_str.strip()])[0]
+            print(f"route={route} rouge_l={rouge:.3f}")
+            print(f"  SRT: {srt_str.strip()!r}")
+            print(f"  HF:  {hf_str.strip()!r}")
+            test_case.assertGreaterEqual(
+                rouge,
+                rouge_l_tolerance,
+                f"batch {i + 1}, route {route}: SRT output diverges from HF",
+            )
