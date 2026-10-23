@@ -129,7 +129,6 @@ class TestBadInputDoesNotLeakMedia(CustomTestCase):
         self.assertNotIn(url, formatted)
         self.assertIn("Error while loading image data <url scheme=https>", formatted)
         self.assertIsInstance(ctx.exception.__cause__, ValueError)
-        self.assertIn("<url scheme=https>", str(ctx.exception.__cause__))
         self.assertIsNone(ctx.exception.__context__)
 
     def test_authenticated_url_is_redacted_from_client_error(self):

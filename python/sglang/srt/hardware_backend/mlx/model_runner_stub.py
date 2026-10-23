@@ -10,6 +10,7 @@ from typing import Tuple
 import torch
 
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
     MlxAuxiliaryStateReqToTokenPool,
 )
@@ -19,7 +20,13 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
 )
-from sglang.srt.runtime_context import get_exec, get_memory, get_model, get_schedule
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_model,
+    get_parallel,
+    get_schedule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +85,10 @@ class _DummyModel:
     """Minimal stand-in so that `inspect.signature(model.forward)` and
     `getattr(model, ...)` calls in ModelRunner.__init__ don't crash."""
 
+    # The model loader sets this on every Torch model, and the graph runners
+    # read it during warmup. No Torch MoE layers exist here, so nothing is fused.
+    shared_experts_config = SharedExpertsConfig()
+
     @staticmethod
     def forward():
         pass
@@ -106,6 +117,13 @@ class MlxModelRunnerStub(ModelRunner):
     # admitting a prefill batch, so default to False as a class attribute to keep
     # that path working instead of raising AttributeError.
     prefill_aware_swa = False
+
+    @property
+    def logical_max_total_num_tokens(self) -> int:
+        """MLX pool slots already count logical tokens; no DCP expansion applies."""
+        return self.req_to_token_pool.schedulable_token_capacity(
+            self.max_total_num_tokens
+        )
 
     @property
     def preloaded_weights_bytes(self) -> int:
@@ -172,7 +190,7 @@ class MlxModelRunnerStub(ModelRunner):
         aux_state_size = get_schedule().max_mamba_cache_size
         if aux_state_size is None:
             return None
-        return aux_state_size // self.ps.attn_dp_size
+        return aux_state_size // get_parallel().attn_dp_size
 
     def _resolve_max_running_requests(self) -> int:
         """Concurrency cap handed to the scheduler.
@@ -197,7 +215,7 @@ class MlxModelRunnerStub(ModelRunner):
             requested_per_worker = None
             resolved = min(capacity_cap, 4096)
         else:
-            requested_per_worker = requested // self.ps.attn_dp_size
+            requested_per_worker = max(1, requested // get_parallel().attn_dp_size)
             resolved = min(requested_per_worker, capacity_cap)
 
         aux_state_size = self._explicit_aux_state_size_per_worker()
@@ -209,7 +227,7 @@ class MlxModelRunnerStub(ModelRunner):
             resolved = min(resolved, aux_state_size // ratio)
             if resolved <= 0:
                 global_aux_state_size = get_schedule().max_mamba_cache_size
-                min_global_aux_state_size = ratio * self.ps.attn_dp_size
+                min_global_aux_state_size = ratio * get_parallel().attn_dp_size
                 raise RuntimeError(
                     f"MLX auxiliary-state cache is too small to serve any "
                     f"requests: max_mamba_cache_size={global_aux_state_size} "
@@ -283,10 +301,6 @@ class MlxModelRunnerStub(ModelRunner):
                 device="cpu",
                 enable_memory_saver=False,
                 auxiliary_state_size=auxiliary_state_size,
-                # With the radix cache disabled no tree component exists to
-                # release auxiliary slots, so the pool owns their release
-                # (see MlxAuxiliaryStateReqToTokenPool docstring).
-                owns_auxiliary_state_release=get_memory().disable_radix_cache,
             )
         else:
             self.req_to_token_pool = ReqToTokenPool(

@@ -245,8 +245,8 @@ def triton_ernie45_rope_fused_inplace(
     section_h, section_w, section_t = mrope_section
     assert section_h == section_w, "Ernie4.5 layout assumes section_h == section_w"
     assert section_h + section_w + section_t == rd // 2
-    if cos_sin_cache.dtype != q.dtype or cos_sin_cache.device != q.device:
-        cos_sin_cache = cos_sin_cache.to(device=q.device, dtype=q.dtype)
+    if cos_sin_cache.device != q.device:
+        cos_sin_cache = cos_sin_cache.to(device=q.device)
     pad_n_qh = triton.next_power_of_2(n_qh)
     pad_n_kh = triton.next_power_of_2(n_kh)
     pad_hd = triton.next_power_of_2(head_size)

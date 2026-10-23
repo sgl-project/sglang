@@ -65,7 +65,7 @@ def set_offloader(instance: BaseOffloader):
     _instance = instance
 
 
-def create_offloader(dp_rank: int):
+def create_offloader():
     if get_exec().offload.cpu_offload_gb > 0:
         return OffloaderV1(
             cpu_offload_max_bytes=int(get_exec().offload.cpu_offload_gb * 1024**3)
@@ -79,10 +79,53 @@ def create_offloader(dp_rank: int):
             num_in_group=get_exec().offload.offload_num_in_group,
             prefetch_step=get_exec().offload.offload_prefetch_step,
             mode=get_exec().offload.offload_mode,
-            dp_rank=dp_rank,
-            dp_size=get_parallel().dp_size,
         )
     return NoopOffloader()
+
+
+def _get_offloaded_device_state(module: torch.nn.Module, device: torch.device):
+    transferred = {}
+    device_state = {}
+    for name, value in module.state_dict(keep_vars=True).items():
+        key = id(value)
+        if key not in transferred:
+            transferred[key] = value.detach().to(device, non_blocking=True)
+        device_state[name] = transferred[key]
+    return device_state
+
+
+def _get_resident_parameter_ids(module: torch.nn.Module):
+    # functional_call only replaces registered parameters and buffers, so cached
+    # tensors held as ordinary attributes need their backing weights to stay put.
+    resident = set()
+    cached_storages = set()
+    for owner in module.modules():
+        for value in vars(owner).values():
+            if (
+                isinstance(value, torch.Tensor)
+                and not isinstance(value, torch.nn.Parameter)
+                and not value.is_meta
+                and value.numel() > 0
+            ):
+                cached_storages.add((value.device, value.untyped_storage().data_ptr()))
+        # MLA post_load_weights derives w_kc/w_vc from kv_b_proj weights on
+        # their current device. These attributes already exist before loading.
+        projection = getattr(owner, "kv_b_proj", None)
+        if (
+            isinstance(projection, torch.nn.Module)
+            and hasattr(owner, "w_kc")
+            and hasattr(owner, "w_vc")
+        ):
+            resident.update(id(parameter) for parameter in projection.parameters())
+    for parameter in module.parameters():
+        if (
+            not parameter.is_meta
+            and parameter.numel() > 0
+            and (parameter.device, parameter.untyped_storage().data_ptr())
+            in cached_storages
+        ):
+            resident.add(id(parameter))
+    return resident
 
 
 class OffloaderV1(BaseOffloader):
@@ -114,7 +157,10 @@ class OffloaderV1(BaseOffloader):
         # offload parameters to CPU
         # use pin_memory if possible, which helps cudagraph capture speed
         offloaded_parameters = False
+        resident_parameter_ids = _get_resident_parameter_ids(module)
         for p in module.parameters():
+            if id(p) in resident_parameter_ids:
+                continue
             if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
                 # we use per-parameter offloading
                 # one module might have some parameters offloaded and some not
@@ -139,12 +185,7 @@ class OffloaderV1(BaseOffloader):
 
             def forward(*args, **kwargs):
                 module.forward = original_forward
-                device_state = {
-                    # here we blindly call `to(device)`
-                    # if the parameter is already on the device, it will be a no-op
-                    k: v.to(device, non_blocking=True)
-                    for k, v in module.state_dict().items()
-                }
+                device_state = _get_offloaded_device_state(module, device)
                 output = functional_call(module, device_state, args=args, kwargs=kwargs)
                 module.forward = forward
                 return output
@@ -161,9 +202,9 @@ class OffloaderV2(BaseOffloader):
         num_in_group: int,
         prefetch_step: int,
         mode: str,
-        dp_rank: int,
-        dp_size: int,
     ):
+        parallel = get_parallel()
+        dp_rank, num_dp_ranks = parallel.dp_rank, parallel.num_dp_ranks
         self.group_size = group_size
         self.num_in_group = num_in_group
         self.prefetch_step = prefetch_step
@@ -177,7 +218,7 @@ class OffloaderV2(BaseOffloader):
             set_naive_distributed(
                 NaiveDistributed(
                     rank=dp_rank,
-                    world_size=dp_size,
+                    world_size=num_dp_ranks,
                     rendezvous=f"/tmp/{run_id}",
                 )
             )
@@ -220,6 +261,7 @@ class OffloaderV2(BaseOffloader):
                         module=submodule,
                         alt_stream=alt_stream,
                         whitelist_param_names=whitelist_param_names,
+                        resident_parameter_ids=_get_resident_parameter_ids(module),
                     )
                 )
 
@@ -281,6 +323,7 @@ class _ModuleOffloader(ABC):
         module: torch.nn.Module,
         alt_stream: torch.cuda.Stream,
         whitelist_param_names: List[str],
+        resident_parameter_ids: set[int],
     ):
         self.mode = mode
         self.module = module
@@ -302,6 +345,7 @@ class _ModuleOffloader(ABC):
         self._param_offloaders = {
             name: _BaseParamOffloader.create(mode, module=module, param_name=name)
             for name in whitelist_param_names
+            if id(param_dict[name]) not in resident_parameter_ids
         }
 
     def post_init(self):

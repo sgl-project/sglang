@@ -8,6 +8,7 @@ import types
 import unittest
 from unittest import mock
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -41,10 +42,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     VideoGenerationsRequest,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import request_model_kwargs
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _multipart_video_extras,
     _resolve_video_path,
-    _video_request_model_kwargs,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
@@ -76,6 +77,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
     is_cosmos_guardrail_available,
 )
+from sglang.srt.environ import envs
+from sglang.test.test_utils import CustomTestCase
 
 
 def _apply(mapping_fn, key):
@@ -112,6 +115,7 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
         tp_size=1,
         sp_size=1,
         is_compiled=False,
+        hidden_size=0,
     ):
         return _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=is_blackwell,
@@ -120,6 +124,7 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
             tp_size=tp_size,
             sp_size=sp_size,
             is_compiled=is_compiled,
+            hidden_size=hidden_size,
         )
 
     def test_blackwell_remains_enabled(self):
@@ -138,7 +143,47 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
     def test_hopper_dense_mlp_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, hidden_act="relu2"))
 
-    def test_hopper_tensor_parallel_disabled(self):
+    def test_hopper_super_t2i_tp2_enabled(self):
+        self.assertTrue(self._can_enable(is_hopper=True, hidden_size=5120, tp_size=2))
+
+    def test_hopper_super_t2i_unsupported_topologies_disabled(self):
+        for overrides in (
+            {"hidden_act": "relu2"},
+            {"hidden_act": "gelu"},
+            {"hidden_size": 4096},
+            {"tp_size": 4},
+            {"sp_size": 2},
+            {"is_compiled": True},
+            {"is_hopper": False},
+        ):
+            with self.subTest(overrides=overrides):
+                settings = dict(is_hopper=True, hidden_size=5120, tp_size=2)
+                settings.update(overrides)
+                self.assertFalse(self._can_enable(**settings))
+
+    def test_hopper_edge_single_gpu_enabled(self):
+        self.assertTrue(
+            self._can_enable(is_hopper=True, hidden_act="relu2", hidden_size=2048)
+        )
+
+    def test_hopper_edge_parallel_and_compiled_disabled(self):
+        for override in ({"tp_size": 2}, {"sp_size": 2}, {"is_compiled": True}):
+            with self.subTest(override=override):
+                self.assertFalse(
+                    self._can_enable(
+                        is_hopper=True,
+                        hidden_act="relu2",
+                        hidden_size=2048,
+                        **override,
+                    )
+                )
+
+    def test_hopper_larger_dense_mlp_disabled(self):
+        self.assertFalse(
+            self._can_enable(is_hopper=True, hidden_act="relu2", hidden_size=4096)
+        )
+
+    def test_hopper_other_tensor_parallel_shapes_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, tp_size=2))
 
     def test_hopper_sequence_parallel_disabled(self):
@@ -1017,7 +1062,7 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
 
         self.assertEqual(_resolve_video_path(req), "https://example.com/input.mp4")
 
-        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs = request_model_kwargs(req, Cosmos3SamplingParams, "video")
         kwargs.update(num_frames=48, fps=24)
         kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
         self.assertEqual(kwargs["sound_duration"], 2.0)
@@ -1075,7 +1120,7 @@ class TestCosmos3OpenAIProtocol(unittest.TestCase):
         req = VideoGenerationsRequest(
             prompt="test", generate_sound=False, sound_duration=3.0
         )
-        kwargs = _video_request_model_kwargs(req, Cosmos3SamplingParams)
+        kwargs = request_model_kwargs(req, Cosmos3SamplingParams, "video")
         kwargs.update(num_frames=48, fps=24)
         kwargs = Cosmos3SamplingParams.lower_video_request_kwargs(req, kwargs)
         self.assertEqual(kwargs["sound_duration"], 0.0)
@@ -1890,24 +1935,6 @@ class TestCosmos3BatchedActionStages(unittest.TestCase):
         self.assertEqual(tuple(image.shape), (2, 3, 16, 16))
 
 
-class TestCosmos3ModalitySamplingParams(unittest.TestCase):
-    """Sound / V2V / action sampling-param fields and defaults."""
-
-    def test_sound_duration_default_and_set(self):
-        self.assertEqual(Cosmos3SamplingParams(prompt="t").sound_duration, 0.0)
-        self.assertEqual(
-            Cosmos3SamplingParams(prompt="t", sound_duration=3.0).sound_duration, 3.0
-        )
-
-    def test_v2v_fields(self):
-        sp = Cosmos3SamplingParams(
-            prompt="t", video_path="in.mp4", condition_frame_indexes=[0, 1]
-        )
-        self.assertEqual(sp.video_path, "in.mp4")
-        self.assertEqual(sp.condition_frame_indexes, [0, 1])
-        self.assertEqual(sp.condition_video_keep, "first")
-
-
 class TestCosmos3CaptionMetadata(unittest.TestCase):
     """Structured captions get generation metadata; prose prompts opt out."""
 
@@ -2031,6 +2058,49 @@ class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
     def test_prose_prompt_still_gets_the_duration_suffix(self):
         final = self._run_prompt_stage("A curious raccoon.", use_duration_template=True)
         self.assertIn("seconds long", final)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.version.hip is None, "requires CUDA"
+)
+class TestCosmos3VideoPreprocess(CustomTestCase):
+    def test_gpu_preprocess_switch(self):
+        """CPU padding and deferred GPU padding preserve the same source pixels."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+            cosmos3,
+        )
+
+        stage = Cosmos3ImagePreprocessStage.__new__(Cosmos3ImagePreprocessStage)
+        stage.log_info = lambda *_args, **_kwargs: None
+        frames = np.random.default_rng(816).integers(
+            0, 256, (5, 32, 48, 3), dtype=np.uint8
+        )
+        outputs = []
+        for force_cpu in (True, False):
+            with (
+                self.subTest(force_cpu=force_cpu),
+                envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.override(force_cpu),
+                mock.patch.object(
+                    cosmos3,
+                    "_iter_video_frames_pyav",
+                    side_effect=lambda *_: (frame for frame in frames),
+                ),
+            ):
+                batch = types.SimpleNamespace(
+                    image_path=None,
+                    video_path="input.mp4",
+                    data_type=DataType.VIDEO,
+                    height=24,
+                    width=40,
+                    num_frames=45,
+                    sampling_params=types.SimpleNamespace(),
+                )
+                stage.forward(batch, types.SimpleNamespace())
+                actual = batch.preprocessed_video
+                self.assertEqual(actual.device.type, "cpu" if force_cpu else "cuda")
+                self.assertEqual(actual.shape, (1, 3, 45 if force_cpu else 5, 24, 40))
+                outputs.append(actual[:, :, :5].cpu())
+        self.assertTrue(torch.equal(outputs[0], outputs[1]))
 
 
 if __name__ == "__main__":

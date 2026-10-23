@@ -1,15 +1,10 @@
-"""Enumerated choices shared by the config field declarations.
-
-These lived in ``server_args.py`` beside the fields that name them. The fields
-moved to ``arg_groups/fields/``, and ``server_args`` imports the field modules,
-so the lists cannot stay there without a cycle. ``server_args`` re-exports them
-for the handful of modules that import them from their old home.
-"""
+"""Shared config choices, re-exported by server_args for plugin compatibility."""
 
 LOAD_FORMAT_CHOICES = [
     "auto",
     "pt",
     "safetensors",
+    "instanttensor",
     "npcache",
     "dummy",
     "sharded_state",
@@ -78,19 +73,19 @@ ATTENTION_BACKEND_CHOICES = [
     "flex_attention",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
+    "qsa",
     "dsv4",
     "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
-    "cutlass_mla",
     "fa3",
     "fa4",
     "flashinfer",
+    "llada2_cfg_flashinfer",
     "flashmla",
     "trtllm_mla",
     "cutedsl_mla",
-    "tokenspeed_mla",
+    "tokenspeed_mla",  # Deprecated alias for "cutedsl_mla"
     "trtllm_mha",
-    "dual_chunk_flash_attn",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), Hopper (SM90) only, requires --page-size 64
     "minicpm_flashattn",
     "minicpm_flashinfer",
@@ -112,6 +107,7 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "triton",
     "ascend",
     "trtllm_mha",
+    "intel_xpu",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
@@ -134,7 +130,8 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
-SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+BUILT_IN_SAMPLING_BACKENDS = frozenset({"flashinfer", "pytorch", "ascend", "intel_xpu"})
+SAMPLING_BACKEND_CHOICES = set(BUILT_IN_SAMPLING_BACKENDS)
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -147,11 +144,15 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "flashinfer_megamoe",
     "cutlass",
     "aiter",
     "marlin",
     "humming",
     "experimental_sgl_marlin",
+    "lora_cutedsl",
+    "lora_triton",
+    "lora_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
     "megamoe",
     "intel_xpu",
@@ -160,6 +161,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
 MXFP8_MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "deep_gemm",
+    "flashinfer_megamoe",
     "flashinfer_trtllm",
     "flashinfer_trtllm_routed",
 ]
@@ -185,7 +187,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -234,9 +236,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "fa4",
     "flashmla",
     "cutedsl_mla",
-    "cutlass_mla",
     "trtllm_mla",
-    "tokenspeed_mla",
 ]
 add_chunked_prefix_cache_attention_backend = (
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append

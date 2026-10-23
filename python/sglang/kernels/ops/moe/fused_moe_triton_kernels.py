@@ -20,10 +20,10 @@ from sglang.kernels.ops.quantization.int8_kernel import (
     sglang_per_token_group_quant_int8,
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -41,7 +41,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _is_cuda:
     pass
@@ -136,7 +136,6 @@ def fused_moe_kernel_gptq_awq(
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
-    filter_expert: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -190,10 +189,8 @@ def fused_moe_kernel_gptq_awq(
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    if filter_expert and off_experts == -1:
-        # -----------------------------------------------------------
-        # Write back zeros to the output when the expert is not
-        # in the current expert parallel rank.
+    if off_experts == -1:
+        # Padding and nonlocal routes both use -1, including without EP.
         write_zeros_to_output(
             c_ptr,
             stride_cm,
@@ -377,12 +374,10 @@ def fused_moe_kernel(
     per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
     c_sorted: tl.constexpr,
-    filter_expert: tl.constexpr,
     swap_ab: tl.constexpr,
     FUSE_ADD_TO_OUTPUT: tl.constexpr,
     MASK_OUTPUT: tl.constexpr,
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
-    LORA_PRESERVE_BASE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
     FUSE_SWIGLU: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
@@ -450,16 +445,10 @@ def fused_moe_kernel(
     off_experts_i32 = tl.load(expert_ids_ptr + pid_m)
     off_experts = off_experts_i32.to(tl.int64)
 
-    if filter_expert and off_experts == -1:
-        if FUSE_SWIGLU:
-            # C is the half-width post-activation buffer here. Rows owned by a
-            # filtered expert are never read (the down-GEMM CTA for this block
-            # early-exits before loading A), and an N-wide zero store would run
-            # past the row end into a neighboring token's data.
-            return
-        if not FUSE_ADD_TO_OUTPUT and not (FUSE_SUM_ALL_REDUCE and LORA_PRESERVE_BASE):
-            # Write zeros only when this kernel owns the full output; the experimental LoRA
-            # add path (LORA_PRESERVE_BASE) keeps the base output from the prior MoE kernel.
+    if off_experts == -1:
+        # The down GEMM never reads inactive sorted or half-width intermediates.
+        # Add/reduce outputs already hold their initial value and must stay intact.
+        if not (c_sorted or FUSE_SWIGLU or FUSE_ADD_TO_OUTPUT or FUSE_SUM_ALL_REDUCE):
             write_zeros_to_output(
                 c_ptr,
                 stride_cm,
@@ -744,12 +733,19 @@ _B_DESC_CACHE_MAX = 64
 _B_DESC_CACHE: OrderedDict[tuple, TensorDescriptor] = OrderedDict()
 
 
+def clear_b_tma_desc_cache() -> None:
+    """Drop all cached B TensorDescriptors, releasing the weights they pin."""
+    _B_DESC_CACHE.clear()
+
+
 def _get_b_tma_desc_cached(B: torch.Tensor, block_n: int, block_k: int):
     """
     Cache TensorDescriptor for constant weight B.
-    Keyed by storage ptr + shape/stride/dtype + tile shape.
+    Keyed by tensor identity + storage ptr + shape/stride/dtype + tile shape.
     """
     key = (
+        # offload can rebind a Parameter while another tensor reuses its address
+        id(B),
         int(B.data_ptr()),
         tuple(B.shape),
         tuple(B.stride()),
@@ -815,6 +811,7 @@ def invoke_fused_moe_kernel(
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
 ) -> None:
+    """Inactive expert IDs are always skipped, including with filter_expert=False."""
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
@@ -967,7 +964,6 @@ def invoke_fused_moe_kernel(
             use_int4_w4a16=use_int4_w4a16,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
-            filter_expert=filter_expert,
             **config,
         )
 
@@ -1039,11 +1035,9 @@ def invoke_fused_moe_kernel(
             per_channel_quant=per_channel_quant,
             even_Ks=even_Ks,
             c_sorted=c_sorted,
-            filter_expert=filter_expert,
             swap_ab=swap_ab,
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             MASK_OUTPUT=mask_output,
-            LORA_PRESERVE_BASE=lora_preserve_base,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             FUSE_SWIGLU=fuse_swiglu,
@@ -1177,102 +1171,6 @@ def act_and_mul_triton(
     )
 
 
-# ============================================================
-# Fused silu_and_mul + per_token_group_quant_fp8 kernel
-# ============================================================
-
-_fp8_type = torch.float8_e4m3fnuz if is_hip() else torch.float8_e4m3fn
-_FP8_MAX = torch.finfo(_fp8_type).max
-
-
-@triton.jit
-def _fused_silu_mul_quant_fp8_kernel(
-    input_ptr,
-    output_ptr,
-    scale_ptr,
-    num_tokens,
-    hidden_dim,
-    FP8_MAX: tl.constexpr,
-    EPS: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    SWIGLU_LIMIT: tl.constexpr = 0.0,
-    HAS_SWIGLU_LIMIT: tl.constexpr = False,
-):
-    """Fused kernel: silu(gate) * up -> fp8 quantize with block-wise scales."""
-    pid_m = tl.program_id(0)
-    pid_g = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_k = pid_g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-    mask_m = offs_m < num_tokens
-    mask_k = offs_k < hidden_dim
-    mask = mask_m[:, None] & mask_k[None, :]
-    two_d = hidden_dim * 2
-    base_ptrs = input_ptr + offs_m[:, None] * two_d + offs_k[None, :]
-    gate = tl.load(base_ptrs, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(base_ptrs + hidden_dim, mask=mask, other=0.0).to(tl.float32)
-    # DeepSeek-V4 SwiGLU clamp: gate clamped to [-inf, L], up clamped to [-L, L]
-    if HAS_SWIGLU_LIMIT:
-        gate = tl.minimum(gate, SWIGLU_LIMIT)
-        up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-    result = (gate * tl.sigmoid(gate)) * up
-    group_max = tl.max(tl.abs(result), axis=1)
-    scale = group_max / FP8_MAX
-    scale = tl.where(scale > EPS, scale, EPS)
-    result_scaled = result / scale[:, None]
-    result_fp8 = tl.clamp(result_scaled, -FP8_MAX, FP8_MAX).to(
-        output_ptr.dtype.element_ty
-    )
-    out_ptrs = output_ptr + offs_m[:, None] * hidden_dim + offs_k[None, :]
-    tl.store(out_ptrs, result_fp8, mask=mask)
-    num_groups = hidden_dim // GROUP_SIZE
-    scale_mask = mask_m & (pid_g < num_groups)
-    scale_ptrs = scale_ptr + offs_m * num_groups + pid_g
-    tl.store(scale_ptrs, scale, mask=scale_mask)
-
-
-def fused_silu_mul_quant_fp8(x, group_size, swiglu_limit=0.0):
-    """Fused Triton kernel: silu_and_mul + per_token_group_quant_fp8 in one launch.
-
-    Args:
-        x: [num_tokens, 2 * hidden_dim], bf16/fp16, contiguous row-major
-        group_size: quantization group size (e.g. 128 for DeepSeek-V4 block-wise FP8)
-        swiglu_limit: SwiGLU clamp limit (0 = no clamp, 10.0 for DeepSeek-V4).
-            When > 0, gate is clamped to [-inf, L] and up to [-L, L] before
-            silu(gate) * up, matching the DeepSeek-V4 activation contract.
-
-    Returns:
-        (x_fp8, x_scale):
-            x_fp8: [num_tokens, hidden_dim], fp8
-            x_scale: [num_tokens, hidden_dim // group_size], float32, row-major
-    """
-    assert x.is_contiguous(), "Input must be contiguous"
-    num_tokens = x.shape[0]
-    hidden_dim = x.shape[1] // 2
-    num_groups = hidden_dim // group_size
-    assert hidden_dim % group_size == 0
-    x_fp8 = torch.empty(num_tokens, hidden_dim, device=x.device, dtype=_fp8_type)
-    x_scale = torch.empty(num_tokens, num_groups, device=x.device, dtype=torch.float32)
-    BLOCK_M = 128
-    grid = (triton.cdiv(num_tokens, BLOCK_M), num_groups)
-    has_swiglu_limit = swiglu_limit is not None and swiglu_limit > 0
-    _fused_silu_mul_quant_fp8_kernel[grid](
-        x,
-        x_fp8,
-        x_scale,
-        num_tokens,
-        hidden_dim,
-        FP8_MAX=_FP8_MAX,
-        EPS=1e-10,
-        GROUP_SIZE=group_size,
-        BLOCK_M=BLOCK_M,
-        SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
-        HAS_SWIGLU_LIMIT=has_swiglu_limit,
-        num_warps=4,
-    )
-    return x_fp8, x_scale
-
-
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
 @triton.jit
 def _moe_sum_reduce_kernel(
@@ -1377,10 +1275,12 @@ def _fused_append_shared_experts_kernel(
     out_weights_ptr,
     N_BASE,  # runtime scalar
     scale_factor,  # runtime scalar
+    num_token_non_padded_ptr,  # 1-elem int tensor; only read when HAS_PADDING
     K: tl.constexpr,
     S: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
 ):
     """
     for m in range(M):
@@ -1406,22 +1306,35 @@ def _fused_append_shared_experts_kernel(
     ids = tl.load(topk_ids_ptr + ids_row_ptr + offs_k, mask=mask_k)
     ws = tl.load(topk_weights_ptr + w_row_ptr + offs_k, mask=mask_k)
 
-    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
-    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
-
     offs_s = tl.arange(0, BLOCK_S)
     mask_s = offs_s < S
 
     shared_ids = tl.cast(N_BASE + offs_s, ids.dtype)
     shared_ws = tl.full([BLOCK_S], scale_factor, dtype=ws.dtype)
 
+    if HAS_PADDING:
+        # Padded rows zero routed ids and all weights.
+        if pid >= tl.load(num_token_non_padded_ptr):
+            ids = tl.zeros([BLOCK_K], dtype=ids.dtype)
+            ws = tl.zeros([BLOCK_K], dtype=ws.dtype)
+            shared_ws = tl.zeros([BLOCK_S], dtype=ws.dtype)
+
+    tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
+    tl.store(out_weights_ptr + out_w_row_ptr + offs_k, ws, mask=mask_k)
+
     tl.store(out_ids_ptr + out_ids_row_ptr + K + offs_s, shared_ids, mask=mask_s)
     tl.store(out_weights_ptr + out_w_row_ptr + K + offs_s, shared_ws, mask=mask_s)
 
 
 def fused_append_shared_experts(
-    topk_ids, topk_weights, num_fused_shared_experts, scale_factor, N=None
+    topk_ids,
+    topk_weights,
+    num_fused_shared_experts,
+    scale_factor,
+    N=None,
+    num_token_non_padded=None,
 ):
+    """Append shared experts and optionally materialize padded rows."""
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
     s = int(num_fused_shared_experts)
@@ -1433,6 +1346,8 @@ def fused_append_shared_experts(
         (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
     )
 
+    has_padding = num_token_non_padded is not None
+    ntnp_ptr = num_token_non_padded if has_padding else topk_ids
     _fused_append_shared_experts_kernel[(m,)](
         topk_ids,
         topk_weights,
@@ -1440,10 +1355,12 @@ def fused_append_shared_experts(
         out_weights,
         N_BASE=N,
         scale_factor=scale_factor,
+        num_token_non_padded_ptr=ntnp_ptr,
         K=k,
         S=s,
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_S=triton.next_power_of_2(s),
+        HAS_PADDING=has_padding,
         num_warps=1,
     )
     return out_ids, out_weights
@@ -1468,8 +1385,8 @@ def _fused_append_remap_shared_experts_deepep_kernel(
 ):
     """Append shared experts AND apply the DeepEP interleaved remap in one pass.
 
-    Equivalent to fused_append_shared_experts() immediately followed by
-    topk._remap_topk_for_deepep(), but the remap math runs on the rows already
+    Equivalent to topk.remap_topk_for_per_rank_shared_slots() on the same
+    routed columns, but the remap math runs on the rows already
     loaded into registers, so it costs a few ALU ops instead of ~6 extra eager
     kernel launches (div_floor / add / arange / fill / copy) per MoE layer.
 
@@ -1534,7 +1451,7 @@ def fused_append_remap_shared_experts_deepep(
 ):
     """Fused append + DeepEP remap (see kernel docstring).
 
-    Replaces the fused_append_shared_experts() + _remap_topk_for_deepep() pair on
+    Fused form of topk.remap_topk_for_per_rank_shared_slots() for
     the aiter/DeepEP-class path. Host computes the scalar remap params so the
     kernel stays branch-free.
     """
