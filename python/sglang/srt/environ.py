@@ -564,6 +564,32 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Static verify graphs with bs in [MIN_BS, MAX_BS] (MAX_BS 0: unbounded) run the
+    # greedy accept and its bookkeeping as one kernel.
+    SGLANG_DSPARK_FUSED_ACCEPT_TAIL = EnvBool(False)
+    SGLANG_DSPARK_ACCEPT_TAIL_MIN_BS = EnvInt(1)
+    SGLANG_DSPARK_ACCEPT_TAIL_MAX_BS = EnvInt(0)
+    # Static verify graphs stage the draft context-KV commit; the next draft graph
+    # writes it on a side stream forked at its head, joined at its first KV store.
+    SGLANG_DSPARK_DEFER_CONTEXT_KV = EnvBool(False)
+    # DSpark draft graph: its in-graph attention-metadata prep runs on a side stream
+    # and joins at the first draft KV store, overlapping the embedding.
+    SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK = EnvBool(False)
+    # DSpark static verify: the verify graph scatters new seq lens and the bonus into
+    # the FutureMap's slots; the host skips those scatters for folded accepts.
+    SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(False)
+    # DSpark target verify: a pre-planned replay skips re-copying input_ids / positions
+    # the plan-time load already copied from the same tensors.
+    SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS = EnvBool(False)
+    # DSpark: draw the simulated acceptance length (and the sim bonus seed) before the
+    # draft launch instead of between the draft and the target verify.
+    SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD = EnvBool(False)
+    # Sampled DSpark verify accepts draw with block-wise rejection (blockwise_rejection.py:
+    # exact in law, counter-based draws agree across TP ranks) instead of the classic kernel.
+    SGLANG_OPT_DSV41_BLOCKWISE_REJECTION = EnvBool(False)
+    # The deferred commit's staging (hidden, write locations, positions, commit lengths)
+    # in one Triton launch instead of four copies and a fill.
+    SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -900,6 +926,9 @@ class Envs:
     # Hand AITER only ceil32(sum of per-rank DP tokens) rows of the MORI EP receive
     # buffer; unproved layouts or metadata keep the full view. Forces DP-synced buckets.
     SGLANG_MORI_RECV_BOUND = EnvBool(False)
+    # MXFP4 trtllm-gen MoE: deferred-finalize calls above 32 rows pass the finalized
+    # output shape, so they hit FlashInfer's tuned tactics (off: only 97-384 rows do).
+    SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE = EnvBool(False)
     # Manual MoE input row limit (EPv1 and EPv2); 0 leaves it to SGLANG_MORI_RECV_BOUND.
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
@@ -1403,6 +1432,7 @@ class Envs:
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
+    SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
@@ -1573,6 +1603,9 @@ class Envs:
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
+    # Graph-input fill fast paths: skip the padding reset of an unpadded replay and copy
+    # one dense integer dtype pair with a single foreach launch.
+    SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH = EnvBool(False)
     # Reuse wholly-free graph-pool segments for step-local eager allocations.
     SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
     # Mint capture's measured footprint as one span so the graph pool is carved
@@ -1802,6 +1835,27 @@ class Envs:
     SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
+    # DSpark decode: build the verify window and the draft anchor column in one
+    # launch instead of two adds, assign_extend_cache_locs and a copy.
+    SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(False)
+    # DSpark folded draft: the draft graph's tail writes [anchor | draft tokens]
+    # into the sampler's own buffer, so the step skips its eager concat.
+    SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(False)
+    # DSpark static verify: run the target verify runner's metadata prep through the
+    # metadata glue graph where its backend declares the prep host-free.
+    SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(False)
+    # DSpark static verify: build the target verify metadata on a side stream beside the
+    # draft graph, for requests up to the candidate span (needs the glue switch above).
+    SGLANG_OPT_DSV41_TARGET_METADATA_EARLY = EnvBool(False)
+    # Decode / verify graph replays whose metadata glue graph is captured skip the
+    # replay ForwardBatch view (the graph reads slots and buffers by address).
+    SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW = EnvBool(False)
+    # DSpark static verify: record the post-verify engram history commit in the
+    # target-verify CUDA graph (epilogue) instead of launching it after the replay.
+    SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH = EnvBool(False)
+    # DSpark static verify: an all-sampled step (no top-k / top-p) replays its
+    # sampling accept and commits as a CUDA graph right after the verify graph.
+    SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================
