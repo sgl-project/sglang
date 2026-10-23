@@ -36,7 +36,11 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.kvcache import dsa_index_k_cache
-from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
+from sglang.srt.layers.cp.utils import (
+    get_layer_owner,
+    get_layer_shard_range,
+    validate_layer_shard_chunk,
+)
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
     GPU_MEMORY_TYPE_KV_CACHE,
@@ -199,6 +203,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         *args,
         layer_shard_rank: int,
         layer_shard_size: int,
+        layer_shard_chunk: int = 1,
         **kwargs,
     ):
         assert layer_shard_rank is not None and layer_shard_size > 1, (
@@ -206,13 +211,15 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         )
         self.layer_shard_rank = layer_shard_rank
         self.layer_shard_size = layer_shard_size
+        self.layer_shard_chunk = layer_shard_chunk
         self.layer_shard_enabled = True
         self.layer_broadcast_comm = None
         super().__init__(*args, **kwargs)
-        # First global layer index owned by this rank (used by PD transfer to
-        # label the contiguous owned-buffer range).
-        my_start, _ = self._owned_local_layer_range()
+        # Global ``[start, end)`` layers owned by this rank (PD transfer labels
+        # the contiguous owned-buffer range with the start).
+        my_start, my_end = self._owned_local_layer_range()
         self.layer_shard_start = self.start_layer + my_start
+        self.layer_shard_end = self.start_layer + my_end
 
     # ---- layer ownership helpers ------------------------------------------
 
@@ -221,7 +228,10 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     def _owned_local_layer_range(self) -> tuple[int, int]:
         return get_layer_shard_range(
-            self.layer_shard_rank, self.layer_shard_size, self.layer_num
+            self.layer_shard_rank,
+            self.layer_shard_size,
+            self.layer_num,
+            self.layer_shard_chunk,
         )
 
     def _is_layer_owned(self, layer_id: int) -> bool:
@@ -231,18 +241,24 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     def _get_layer_owner_rank(self, layer_id: int) -> int:
         return get_layer_owner(
-            self._local_layer_idx(layer_id), self.layer_shard_size, self.layer_num
+            self._local_layer_idx(layer_id),
+            self.layer_shard_size,
+            self.layer_num,
+            self.layer_shard_chunk,
         )
 
     def _log_layer_shard_plan(self) -> None:
         partitions = []
         for rank in range(self.layer_shard_size):
-            st, ed = get_layer_shard_range(rank, self.layer_shard_size, self.layer_num)
+            st, ed = get_layer_shard_range(
+                rank, self.layer_shard_size, self.layer_num, self.layer_shard_chunk
+            )
             partitions.append(f"r{rank}:[{st},{ed})")
         my_start, my_end = self._owned_local_layer_range()
         logger.info(
             "Layer shard plan (continuous): "
             f"layer_num={self.layer_num}, shard_size={self.layer_shard_size}, "
+            f"chunk={self.layer_shard_chunk}, "
             f"rank={self.layer_shard_rank}, local=[{my_start},{my_end}), "
             f"global=[{self.start_layer + my_start},{self.start_layer + my_end}), "
             f"partitions={'; '.join(partitions)}"
@@ -304,6 +320,9 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     # ---- buffer allocation (owned-only + remote scratch) ------------------
 
     def _create_buffers(self):
+        validate_layer_shard_chunk(
+            self.layer_shard_size, self.layer_num, self.layer_shard_chunk
+        )
         self._log_layer_shard_plan()
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
