@@ -306,6 +306,7 @@ def _handle_output_by_index(output, i):
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
             rids=[output.rids[i]],
+            detokenize_duration=output.detokenize_duration,
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
             spec_num_correct_drafts=_extract_field_by_index(
                 output, "spec_num_correct_drafts", i
@@ -490,6 +491,8 @@ _UNCHECKED_LENGTH_FIELDS = frozenset(
 _NOT_SPLIT_FIELDS = frozenset(
     {"rids", "http_worker_ipcs", "placeholder_tokens_idx", "placeholder_tokens_val"}
 )
+# Per-batch values that every sub-batch keeps whole.
+_PER_BATCH_FIELDS = frozenset({"detokenize_duration"})
 
 
 def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
@@ -499,11 +502,15 @@ def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
         raise _CannotSplitBatch(f"Cannot split {type(output)}")
 
     split_fields = {
-        field.name: _extract_field_by_indices(
-            output,
-            field.name,
-            indices,
-            check_length=field.name not in _UNCHECKED_LENGTH_FIELDS,
+        field.name: (
+            object.__getattribute__(output, field.name)
+            if field.name in _PER_BATCH_FIELDS
+            else _extract_field_by_indices(
+                output,
+                field.name,
+                indices,
+                check_length=field.name not in _UNCHECKED_LENGTH_FIELDS,
+            )
         )
         for field in _cached_output_fields(type(output))
         if field.name not in _NOT_SPLIT_FIELDS
