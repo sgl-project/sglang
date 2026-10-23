@@ -1038,6 +1038,7 @@ class SWAComponent(TreeComponent):
             req_to_token_pool=self.cache.req_to_token_pool,
             token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
             retain_floor=self.cache.swa_retain_floor(req),
+            reprefill_tail_tokens=self.cache.swa_reprefill_tail_tokens(req),
         )
 
     def free_out_of_window_slots(

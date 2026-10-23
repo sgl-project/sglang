@@ -703,6 +703,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             supports_prefix_sharing=self.supports_prefix_sharing(),
             retain_floor=self.swa_retain_floor(req),
             eviction_interval=eviction_interval,
+            reprefill_tail_tokens=self.swa_reprefill_tail_tokens(req),
         )
 
     def swa_retain_floor(self, req) -> int | None:
