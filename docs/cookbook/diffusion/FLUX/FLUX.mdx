@@ -231,6 +231,24 @@ Use `--lora-path` at startup or the [LoRA management API](/docs/sglang-diffusion
 - [`XLabs-AI/flux-furry-lora`](https://huggingface.co/XLabs-AI/flux-furry-lora)
 - [`XLabs-AI/flux-RealismLora`](https://huggingface.co/XLabs-AI/flux-RealismLora)
 
+#### 4.2.4 Negative prompts (true CFG)
+
+FLUX.1-dev is guidance-distilled: its guidance embedding comes from the server's `--embedded-cfg-scale` (3.5 for FLUX.1), and the requests above run one DiT forward per step. A negative prompt turns on classifier-free guidance, which adds an unconditional forward per step:
+
+- `--true-cfg-scale` sets the CFG weight, as in diffusers `FluxPipeline`.
+- Without `--true-cfg-scale`, the negative prompt uses `--guidance-scale` as the CFG weight.
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --prompt "A red bicycle leaning against a stone wall beside a quiet lake at sunset" \
+  --negative-prompt "blurry, distorted, low quality" \
+  --true-cfg-scale 2.0 \
+  --width 1024 --height 1024 --num-inference-steps 50 --seed 42
+```
+
+Keep the weight moderate. On top of the distilled guidance, CFG over-exposes FLUX.1-dev in diffusers as well as in SGLang: at 1024x1024 and 28 steps, about 45% of pixels clip to 0 or 255 at a weight of 4, and 8-15% at 1.5-2.
+
 ## 5. Benchmark
 
 ### 5.1 Speedup Benchmark

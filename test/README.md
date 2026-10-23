@@ -15,6 +15,9 @@ The CI pipeline runs in three sequential stages: **A** (pre-flight, ~3 min) → 
 - `manual/`: Non-CI tests for local debugging or special setups.
 - `run_suite.py`: CI runner — scans `registered/` recursively.
 
+`test/srt/` is retired. Put CI tests under `registered/` and local-only tests
+under `manual/`; lint rejects files in the retired directory.
+
 The system supports both [unittest](https://docs.python.org/3/library/unittest.html) and [pytest](https://docs.pytest.org/en/stable/). The launcher runs `python filename.py -f` with **failfast enabled by default**.
 
 Make sure your file ends with **exactly** one of:
