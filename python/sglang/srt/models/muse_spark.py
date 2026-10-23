@@ -30,6 +30,10 @@ from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import
 from sglang.kernels.ops.gemm.muse_spark_router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
+from sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl import (
+    router_gemv_cute,
+    router_gemv_cute_eligible,
+)
 from sglang.kernels.ops.layernorm.muse_spark_norm_gate import FusedRMSNormGate
 from sglang.kernels.ops.layernorm.muse_spark_norm_residual import (
     FusedPostNormResidualPreNorm,
@@ -241,6 +245,9 @@ class MuseSpark1xRouter(nn.Module):
         return acc
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Decode-sized FP32 logits: one CuTe GEMV instead of cuBLAS split-K + reduce.
+        if router_gemv_cute_eligible(hidden_states, self.weight):
+            return router_gemv_cute(hidden_states, self.weight)
         return F.linear(hidden_states, self.weight)
 
 

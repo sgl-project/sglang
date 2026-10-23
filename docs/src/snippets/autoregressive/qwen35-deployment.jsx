@@ -578,7 +578,7 @@ export const Qwen35Deployment = () => {
     if (model === '397b' && hardware === 'mi355x' && quantization === 'fp8' && kvOffload === 'hicache') {
       cmd += ' \\\n  --enable-hierarchical-cache';
       cmd += ' \\\n  --hicache-ratio 1.5';
-      cmd += ' \\\n  --hicache-write-policy write_through_selective';
+      cmd += ' \\\n  --hicache-write-policy write_through';
       cmd += ' \\\n  --hicache-io-backend kernel';
       cmd += ' \\\n  --hicache-mem-layout page_first';
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
