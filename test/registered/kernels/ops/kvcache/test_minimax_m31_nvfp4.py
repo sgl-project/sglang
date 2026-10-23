@@ -1,5 +1,6 @@
 """Packed M3.1 KV writes and relocations preserve payloads and block scales."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -138,3 +139,7 @@ def test_disabled_fused_store_builds_no_kernel(monkeypatch):
 
     payload, scales = pool.index_k_pool.get_raw_k_buffers(0)
     assert payload[0, :9].any() and scales[0, :9].any()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

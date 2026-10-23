@@ -1,5 +1,6 @@
 """Exercise M3.1 NVFP4 HiCache through the asynchronous L2 transfer engine."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -121,3 +122,7 @@ def test_nvfp4_async_hicache_round_trip(layout, backend):
         torch.cuda.synchronize()
         for entry in group.entries:
             entry.host_pool.destroy()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

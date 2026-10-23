@@ -1,5 +1,6 @@
 """Push-plane provider selection, fallback, and terminal residual ownership."""
 
+import sys
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -251,3 +252,7 @@ def test_final_norm_capture_owns_the_updated_residual(provider):
     torch.testing.assert_close(captures[0], updated)
     updated.zero_()
     torch.testing.assert_close(captures[0], torch.full_like(updated, 3))
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

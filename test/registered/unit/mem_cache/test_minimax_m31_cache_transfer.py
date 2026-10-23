@@ -1,6 +1,7 @@
 """NVFP4 cache transport preserves every payload byte, block scale and cached prefix."""
 
 import ctypes
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -689,3 +690,7 @@ def test_dspark_default_hicache_auto_size_fits_all_pools(cpu_host_allocation):
         finally:
             for entry in group.entries:
                 entry.host_pool.destroy()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

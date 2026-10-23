@@ -1,5 +1,7 @@
 """MiniMax checkpoints use the generic DFlash2 layers with different math."""
 
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -252,3 +254,7 @@ def test_legacy_architecture_name_loads_the_generic_dflash2_state():
         legacy.layers[0].mlp(hidden), generic.layers[0].mlp(hidden)
     )
     assert dflash.MiniMaxDFlash2DraftModel in dflash.EntryClass
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

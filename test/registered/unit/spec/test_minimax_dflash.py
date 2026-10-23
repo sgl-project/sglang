@@ -1,5 +1,6 @@
 """MiniMax DFLASH admission, draft backend selection and target feature taps."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -240,3 +241,7 @@ def test_dflash_rejects_invalid_taps_without_changing_capture(ids):
         True,
         False,
     ]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
