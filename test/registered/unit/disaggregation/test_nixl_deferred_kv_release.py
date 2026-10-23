@@ -21,6 +21,7 @@ from test_deferred_decode_kv_release import (
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import AckTarget
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.nixl import conn as nixl_conn
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -153,8 +154,8 @@ class TestNixlAbortNotification(
         )
         self.assertEqual(manager._deferred_ack_targets, {})
 
-    def _prepare_worker(self, manager) -> None:
-        """Wire transfer_worker to one MLA decode peer over the prepped path."""
+    def _prepare_worker(self, manager, num_peers: int) -> None:
+        """Wire transfer_worker to MLA decode peers over the prepped path."""
         manager.enable_staging = False
         manager._staging_ctx = None
         manager._staging_outstanding = defaultdict(int)
@@ -166,9 +167,13 @@ class TestNixlAbortNotification(
         manager.src_mem_kind = "VRAM"
         manager._num_slots_src = 4
         manager.kv_args = SimpleNamespace(kv_data_ptrs=[0x1000], kv_item_lens=[16])
-        manager.prep_handles = {"": "src-prep", "decode": "dst-prep"}
-        manager.decode_kv_args_table = {
-            "decode": SimpleNamespace(
+        manager.prep_handles = {"": "src-prep"}
+        manager.decode_kv_args_table = {}
+        manager.transfer_infos = {ROOM: {}}
+        for i in range(num_peers):
+            agent_name = f"decode-{i}"
+            manager.prep_handles[agent_name] = f"dst-prep-{i}"
+            manager.decode_kv_args_table[agent_name] = SimpleNamespace(
                 decode_tp_size=1,
                 requires_dcp_relayout=False,
                 kv_xfer_segments=None,
@@ -177,17 +182,12 @@ class TestNixlAbortNotification(
                 dst_num_slots=None,
                 gpu_id=0,
             )
-        }
-        manager.transfer_infos = {
-            ROOM: {
-                (DECODE_IP, DECODE_PORT): SimpleNamespace(
-                    room=ROOM,
-                    is_dummy=False,
-                    agent_name="decode",
-                    dst_kv_indices=np.array([1], dtype=np.int32),
-                )
-            }
-        }
+            manager.transfer_infos[ROOM][agent_name] = SimpleNamespace(
+                room=ROOM,
+                is_dummy=False,
+                agent_name=agent_name,
+                dst_kv_indices=np.array([1], dtype=np.int32),
+            )
         manager.conclude_failure = MagicMock(
             side_effect=lambda **kw: manager.update_status(
                 kw["bootstrap_room"], KVPoll.Failed
@@ -195,35 +195,38 @@ class TestNixlAbortNotification(
         )
         manager._reload_invalidated_peers = MagicMock()
         manager.agent = MagicMock()
-        manager.agent.make_prepped_xfer.return_value = "xfer-handle"
+        manager.agent.make_prepped_xfer.side_effect = lambda *args: object()
 
-    def test_err_write_never_acks(self):
-        """A write NIXL reported as ERR, at post or while polling, may still land
-        in decode's pages, so neither an ABORT that arrived mid-transfer nor a
-        later one may be ACKed."""
-        for name, post_state in (("post_err", "ERR"), ("polled_err", "PROC")):
-            with self.subTest(name=name):
-                manager = _manager(status=KVPoll.Transferring)
-                self._prepare_worker(manager)
+    def test_rejected_post_never_acks(self):
+        """NIXL raises when it rejects a post and does not wait for writes it
+        already put on the wire, so after the first decode peer's write is DONE
+        and the second peer's post raises, neither an ABORT that arrived
+        mid-transfer nor a later one may be ACKed."""
+        manager = _manager(status=KVPoll.Transferring)
+        self._prepare_worker(manager, num_peers=2)
+        posts = iter(("PROC", nixl_conn._NIXL_TRANSPORT_ERRORS[0]("NIXL_ERR_BACKEND")))
 
-                def post(handle, state=post_state, manager=manager):
-                    self._dispatch_abort(manager)
-                    return state
-
-                manager.agent.transfer.side_effect = post
-                manager.agent.check_xfer_state.return_value = "ERR"
-                queue = SimpleNamespace(
-                    get=MagicMock(side_effect=(_chunk(), KeyboardInterrupt()))
-                )
-
-                with patch("sglang.srt.disaggregation.nixl.conn.logger.exception"):
-                    with self.assertRaises(KeyboardInterrupt):
-                        manager.transfer_worker(queue)
+        def post(handle):
+            result = next(posts)
+            if isinstance(result, Exception):
                 self._dispatch_abort(manager)
+                raise result
+            return result
 
-                manager.agent.transfer.assert_called_once()
-                self.assertEqual(manager._staging_outstanding[ROOM], 0)
-                self.assertEqual(manager._sent, [])
+        manager.agent.transfer.side_effect = post
+        manager.agent.check_xfer_state.return_value = "DONE"
+        queue = SimpleNamespace(
+            get=MagicMock(side_effect=(_chunk(), KeyboardInterrupt()))
+        )
+
+        with self.assertRaises(KeyboardInterrupt):
+            manager.transfer_worker(queue)
+        self._dispatch_abort(manager)
+
+        self.assertEqual(manager.agent.transfer.call_count, 2)
+        manager.conclude_failure.assert_called_once()
+        self.assertEqual(manager._staging_outstanding[ROOM], 0)
+        self.assertEqual(manager._sent, [])
 
 
 if __name__ == "__main__":
