@@ -1608,6 +1608,9 @@ class Envs:
     # instead of breaking at every GDN layer (layers/attention/linear/
     # gdn_prefill_graph.py).
     SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND = EnvBool(False)
+    # Sequences a captured GDN extend bucket accepts (at most the request pool); a
+    # larger prefill batch runs the step eagerly. Bounds the padded grids and scratch.
+    SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls

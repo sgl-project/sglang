@@ -572,8 +572,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
-        # Every prefill batch fits: it never holds more requests than the pool.
-        self.prefill_graph_max_seqs = self.req_to_token_pool.size
+        # A prefill batch never holds more requests than the pool.
+        self.prefill_graph_max_seqs = min(
+            self.req_to_token_pool.size, envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get()
+        )
 
     def supports_prefill_graph_extend(self) -> bool:
         # Read here, not in __init__: the support check reads model_config.
