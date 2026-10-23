@@ -11,7 +11,7 @@ register_cuda_ci(
     est_time=2280,
     stage="nightly",
     runner_config="4-gpu-gb300",
-    disabled="4-gpu-gb300 suite removed; pending 2-gpu-gb300 runners",
+    disabled="4-gpu-gb300 suite removed; to move to an 8-gpu-b300 nightly once B300 capacity allows",
 )
 
 MODEL_PATH = "nvidia/GLM-5.2-NVFP4"
