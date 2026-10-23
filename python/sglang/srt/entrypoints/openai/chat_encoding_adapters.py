@@ -86,8 +86,11 @@ class ChatEncodingAdapter(Protocol):
         request: ChatCompletionRequest,
         tools: Optional[list[dict]],
         thinking: bool,
+        image_data: list,
     ) -> list[int]:
-        """``thinking`` is the handler's thinking decision for ``request``."""
+        """``thinking`` is the handler's thinking decision for ``request``. An
+        encoding that collects media itself appends the prompt's images to
+        ``image_data`` in placeholder order."""
         ...
 
 

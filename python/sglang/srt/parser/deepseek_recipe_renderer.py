@@ -142,9 +142,10 @@ class RecipeEncoder:
         *,
         task: Optional[str] = None,
         effort_budget: Optional[int] = None,
+        image_urls: Optional[list[str]] = None,
     ) -> list[int]:
         """Prompt ids for `body` (see `pre_normalize`); a request recipe rejects
-        raises ValueError."""
+        raises ValueError. `image_urls` receives the images in placeholder order."""
         recipe = load_deepseek_recipe()
         normalized = pre_normalize(body)
         normalized["model"] = self.model
@@ -155,6 +156,11 @@ class RecipeEncoder:
         except recipe.ConversionError as error:
             raise ValueError(_error_message(error.body)) from error
         prompt_ids = self._encoding.encode(converted.conversation)
+        if image_urls is not None:
+            rendered = self._encoding.render_conversation(converted.conversation)
+            image_urls.extend(
+                source.url or source.data_url for source in rendered.image_sources
+            )
         if effort_budget is not None and body["thinking"]:
             prompt_ids = self._replace_effort_budget(prompt_ids, effort_budget)
         if task is not None:

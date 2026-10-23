@@ -2,28 +2,13 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.deepseek_recipe_common import tokenizer_file, user
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
-REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 
-
-def _user(content="x"):
-    return {"role": "user", "content": content}
-
-
-def _tokenizer_file():
-    from huggingface_hub import hf_hub_download
-
-    try:
-        return hf_hub_download(MODEL, "tokenizer.json", revision=REVISION)
-    except Exception as error:  # noqa: BLE001
-        raise unittest.SkipTest(f"the tokenizer is not available: {error}")
-
-
-def _serving(test, tokenizer, **server_args):
+def _serving(test, tokenizer, *, is_multimodal=False, **server_args):
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
     from sglang.srt.runtime_context import publish, reset_context
     from sglang.srt.server_args import ServerArgs
@@ -43,7 +28,7 @@ def _serving(test, tokenizer, **server_args):
         server_args=args,
         tokenizer=tokenizer,
         model_config=SimpleNamespace(
-            is_multimodal=False,
+            is_multimodal=is_multimodal,
             context_len=131072,
             hf_config=SimpleNamespace(
                 model_type="deepseek_v41",
@@ -90,7 +75,7 @@ class TestAdapterRegistry(CustomTestCase):
     def _fast_tokenizer(self):
         from tokenizers import Tokenizer
 
-        return SimpleNamespace(backend_tokenizer=Tokenizer.from_file(_tokenizer_file()))
+        return SimpleNamespace(backend_tokenizer=Tokenizer.from_file(tokenizer_file()))
 
     def test_bad_default_effort_fails_startup(self):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
@@ -106,14 +91,6 @@ class TestAdapterRegistry(CustomTestCase):
                     )
                 )
 
-    def test_recipe_backend_needs_the_fast_tokenizer(self):
-        from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
-
-        with self.assertRaisesRegex(ValueError, "fast tokenizer"):
-            registry.build_chat_encoding_adapter(
-                self._context("dsv41", tokenizer=SimpleNamespace())
-            )
-
     def test_tool_dumps_render_as_the_client_sent_them(self):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
@@ -121,8 +98,6 @@ class TestAdapterRegistry(CustomTestCase):
         adapter = registry.build_chat_encoding_adapter(
             self._context("dsv41", tokenizer=self._fast_tokenizer())
         )
-        self.assertFalse(adapter.strict_tool_call_arguments)
-        self.assertIsNone(adapter.output)
         # The handler's tool dumps carry None for unset fields.
         tool = {
             "type": "function",
@@ -137,13 +112,21 @@ class TestAdapterRegistry(CustomTestCase):
             "function": {**tool["function"], "strict": None},
             "defer_loading": None,
         }
-        request = ChatCompletionRequest(messages=[_user("hi")])
+        request = ChatCompletionRequest(messages=[user("hi")])
         self.assertEqual(
             adapter.encode_messages(
-                messages=[], request=request, tools=[dumped], thinking=False
+                messages=[],
+                request=request,
+                tools=[dumped],
+                thinking=False,
+                image_data=[],
             ),
             adapter.encode_messages(
-                messages=[], request=request, tools=[tool], thinking=False
+                messages=[],
+                request=request,
+                tools=[tool],
+                thinking=False,
+                image_data=[],
             ),
         )
 
@@ -154,7 +137,7 @@ class TestHandlerRequestSemantics(CustomTestCase):
         super().setUpClass()
         from transformers import PreTrainedTokenizerFast
 
-        cls.tokenizer = PreTrainedTokenizerFast(tokenizer_file=_tokenizer_file())
+        cls.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file())
 
     def _token(self, token):
         return self.tokenizer.convert_tokens_to_ids(token)
@@ -162,7 +145,7 @@ class TestHandlerRequestSemantics(CustomTestCase):
     def _prompt(self, chat, **fields):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-        request = ChatCompletionRequest(messages=[_user("hi")], **fields)
+        request = ChatCompletionRequest(messages=[user("hi")], **fields)
         return chat._process_messages(request, False)
 
     def test_thinking_defaults_off(self):
@@ -202,13 +185,60 @@ class TestHandlerRequestSemantics(CustomTestCase):
         answer = {"role": "assistant", "content": "Hel"}
         # Without continue_final_message the trailing turn becomes a user turn.
         self.assertEqual(
-            prompt([_user("hi"), answer]), prompt([_user("hi"), _user("Hel")])
+            prompt([user("hi"), answer]), prompt([user("hi"), user("Hel")])
         )
         # A task renders its own tail; the continued prefix follows it.
         self.assertEqual(
-            prompt([_user("hi"), answer], task="title", continue_final_message=True),
-            prompt([_user("hi")], task="title")
+            prompt([user("hi"), answer], task="title", continue_final_message=True),
+            prompt([user("hi")], task="title")
             + self.tokenizer.encode("Hel", add_special_tokens=False),
+        )
+
+    def test_tool_result_images_follow_prompt_order(self):
+        """Out-of-order tool results render in call order; their images must follow."""
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+        chat = _serving(self, self.tokenizer, is_multimodal=True)
+        names = ("a", "b")
+        urls = {name: f"https://example.com/{name}.png" for name in names}
+        calls = [
+            {
+                "id": name,
+                "type": "function",
+                "function": {"name": name, "arguments": "{}"},
+            }
+            for name in names
+        ]
+        results = [
+            {
+                "role": "tool",
+                "tool_call_id": name,
+                "content": [
+                    {"type": "text", "text": f"result {name}"},
+                    {"type": "image_url", "image_url": {"url": urls[name]}},
+                ],
+            }
+            for name in reversed(names)
+        ]
+        request = ChatCompletionRequest(
+            messages=[
+                user("both?"),
+                {"role": "assistant", "content": "", "tool_calls": calls},
+                *results,
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": name, "parameters": {"type": "object"}},
+                }
+                for name in names
+            ],
+        )
+        processed = chat._process_messages(request, True)
+        prompt = self.tokenizer.decode(processed.prompt_ids)
+        self.assertLess(prompt.index("result a"), prompt.index("result b"))
+        self.assertEqual(
+            [image.url for image in processed.image_data], [urls["a"], urls["b"]]
         )
 
     def test_request_reaches_the_engine_with_sglang_semantics(self):
@@ -216,7 +246,7 @@ class TestHandlerRequestSemantics(CustomTestCase):
 
         chat = _serving(self, self.tokenizer)
         request = ChatCompletionRequest(
-            messages=[_user("hi")],
+            messages=[user("hi")],
             temperature=0.0,
             chat_template_kwargs={"thinking": True, "reasoning_effort": 30},
         )

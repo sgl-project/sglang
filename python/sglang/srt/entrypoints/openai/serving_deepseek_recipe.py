@@ -10,6 +10,7 @@ from sglang.srt.parser.deepseek_recipe_renderer import (
     RecipeEncoder,
     parse_effort_budget,
 )
+from sglang.srt.utils import ImageData
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
@@ -22,7 +23,8 @@ DEFAULT_EFFORT_ENVS = {
 
 
 class DeepSeekRecipeChatEncodingAdapter:
-    collects_openai_media = True
+    # recipe sorts tool results by call order, so images come from its render.
+    collects_openai_media = False
     output = None
     strict_tool_call_arguments = False  # recipe serializes object arguments itself.
 
@@ -53,6 +55,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         request: ChatCompletionRequest,
         tools: Optional[list[dict]],
         thinking: bool,
+        image_data: list,
     ) -> list[int]:
         # The wire request: the handler's message dumps carry None for unset fields.
         wire = request.model_dump(exclude_unset=True, by_alias=True, mode="json")
@@ -91,9 +94,14 @@ class DeepSeekRecipeChatEncodingAdapter:
             ]
             body["tool_choice"] = wire.get("tool_choice")
         body = {key: value for key, value in body.items() if value is not None}
+        image_urls = []
         prompt_ids = self._encode(
-            body, effort=request.reasoning_effort, task=request.task
+            body,
+            effort=request.reasoning_effort,
+            task=request.task,
+            image_urls=image_urls,
         )
+        image_data.extend(ImageData(url=url) for url in image_urls)
         if task_prefix:
             prompt_ids += self.encoder.encode_text(task_prefix)
         return prompt_ids
@@ -104,6 +112,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         *,
         effort: Union[str, int, float, None],
         task: Optional[str] = None,
+        image_urls: Optional[list[str]] = None,
     ) -> list[int]:
         if effort is None or effort == "none":
             effort = self._default_effort
@@ -116,4 +125,6 @@ class DeepSeekRecipeChatEncodingAdapter:
             budget = parse_effort_budget(effort)
         elif effort is not None:
             body["reasoning_effort"] = effort
-        return self.encoder.encode(body, task=task, effort_budget=budget)
+        return self.encoder.encode(
+            body, task=task, effort_budget=budget, image_urls=image_urls
+        )

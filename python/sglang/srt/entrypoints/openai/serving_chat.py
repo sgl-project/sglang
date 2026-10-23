@@ -589,6 +589,8 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         thinking_mode: ThinkingMode,
         tools: list[dict] | None = None,
+        *,
+        image_data: list,
     ) -> list[int] | None:
         """Encode messages for custom chat_encoding_spec values.
 
@@ -600,6 +602,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request=request,
                 tools=tools,
                 thinking=thinking_mode == ThinkingMode.THINKING,
+                image_data=image_data,
             )
         if self.chat_encoding_spec == "kimi_k3":
             messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
@@ -1465,9 +1468,12 @@ class OpenAIServingChat(OpenAIServingBase):
             request,
             thinking_mode,
             tools=tools,
+            image_data=image_data,
         )
 
         if prompt_ids is not None:
+            if image_data and not is_multimodal:
+                raise ValueError("image input is not supported for this model")
             collects_openai_media = (
                 self._encoding_adapter.collects_openai_media
                 if self._encoding_adapter is not None

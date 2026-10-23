@@ -1536,25 +1536,21 @@ class ServingChatTestCase(CustomTestCase):
             },
         }
 
-        for chat_encoding_spec in ("dsv32",):
-            for tool_choice, expects_tools in (("none", False), ("auto", True)):
-                with self.subTest(
-                    chat_encoding_spec=chat_encoding_spec,
+        self.chat.chat_encoding_spec = "dsv32"
+        for tool_choice, expects_tools in (("none", False), ("auto", True)):
+            with self.subTest(tool_choice=tool_choice):
+                self.tm.tokenizer.encode.reset_mock()
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Solve 100 / 7."}],
+                    tools=[tool],
                     tool_choice=tool_choice,
-                ):
-                    self.chat.chat_encoding_spec = chat_encoding_spec
-                    self.tm.tokenizer.encode.reset_mock()
-                    request = ChatCompletionRequest(
-                        model="x",
-                        messages=[{"role": "user", "content": "Solve 100 / 7."}],
-                        tools=[tool],
-                        tool_choice=tool_choice,
-                    )
+                )
 
-                    self.chat._process_messages(request, is_multimodal=False)
+                self.chat._process_messages(request, is_multimodal=False)
 
-                    prompt = self.tm.tokenizer.encode.call_args.args[0]
-                    self.assertEqual("calculator" in prompt, expects_tools)
+                prompt = self.tm.tokenizer.encode.call_args.args[0]
+                self.assertEqual("calculator" in prompt, expects_tools)
 
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
@@ -1813,73 +1809,69 @@ class ServingChatTestCase(CustomTestCase):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
 
-        for chat_encoding_spec in ("dsv32",):
-            with self.subTest(chat_encoding_spec=chat_encoding_spec):
-                self.chat.chat_encoding_spec = chat_encoding_spec
-                req = ChatCompletionRequest(
-                    model="x",
-                    messages=[
-                        {"role": "user", "content": "Where is it raining?"},
+        self.chat.chat_encoding_spec = "dsv32"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Where is it raining?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
                         {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": "call_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "get_weather",
-                                        "arguments": '"Beijing"',
-                                    },
-                                }
-                            ],
-                        },
-                        {
-                            "role": "tool",
-                            "tool_call_id": "call_1",
-                            "content": "sunny",
-                        },
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '"Beijing"',
+                            },
+                        }
                     ],
-                )
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "sunny",
+                },
+            ],
+        )
 
-                with self.assertRaisesRegex(ValueError, "must be a JSON object"):
-                    self.chat._process_messages(req, is_multimodal=False)
+        with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+            self.chat._process_messages(req, is_multimodal=False)
 
     def test_dsv_encoders_accept_object_tool_call_arguments_string(self):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
 
-        for chat_encoding_spec in ("dsv32",):
-            with self.subTest(chat_encoding_spec=chat_encoding_spec):
-                self.chat.chat_encoding_spec = chat_encoding_spec
-                req = ChatCompletionRequest(
-                    model="x",
-                    messages=[
-                        {"role": "user", "content": "Where is it raining?"},
+        self.chat.chat_encoding_spec = "dsv32"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Where is it raining?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
                         {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": "call_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "get_weather",
-                                        "arguments": '{"city": "Beijing"}',
-                                    },
-                                }
-                            ],
-                        },
-                        {
-                            "role": "tool",
-                            "tool_call_id": "call_1",
-                            "content": "sunny",
-                        },
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Beijing"}',
+                            },
+                        }
                     ],
-                )
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "sunny",
+                },
+            ],
+        )
 
-                self.chat._process_messages(req, is_multimodal=False)
+        self.chat._process_messages(req, is_multimodal=False)
 
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
@@ -4646,7 +4638,7 @@ class ServingChatTestCase(CustomTestCase):
     # ------------- hook method tests -------------
     def test_encode_messages_returns_none_by_default(self):
         """Default _encode_messages returns None (use standard encoding)."""
-        result = self.chat._encode_messages([], Mock(), False)
+        result = self.chat._encode_messages([], Mock(), False, image_data=[])
         self.assertIsNone(result)
 
 

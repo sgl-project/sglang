@@ -111,6 +111,7 @@ class InklingPromptTest(unittest.TestCase):
             [message.model_dump() for message in request.messages],
             request,
             thinking_mode=None,
+            image_data=[],
         )
 
     def test_prompt_tail(self):
@@ -627,6 +628,7 @@ class InklingTokenOutputTest(CustomTestCase):
             request=request,
             tools=None,
             thinking=False,
+            image_data=[],
         )
         key = reasoner.get_request_grammar_key(
             ("regex", "yes"), input_ids=prompt_ids, thinking_budget=None

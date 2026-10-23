@@ -75,8 +75,10 @@ class InklingChatEncodingAdapter:
         request: ChatCompletionRequest,
         tools: list[dict] | None,
         thinking: bool,
+        image_data: list,
     ) -> list[int]:
-        # Inkling's thinking is effort-conditioned, so `thinking` is not read.
+        # Inkling's thinking is effort-conditioned and the handler collects its
+        # media, so `thinking` and `image_data` are not read.
         reasoning_effort = parse_reasoning_effort(request.reasoning_effort)
         if reasoning_effort is None:
             reasoning_effort = self._default_reasoning_effort
