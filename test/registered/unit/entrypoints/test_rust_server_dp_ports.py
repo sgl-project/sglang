@@ -44,6 +44,18 @@ def _scheduler_for_typed_config():
     "overrides,kwarg,expected",
     [
         ({}, "grpc_port", 50051),
+        ({"hicache_storage_backend": "file"}, "hicache_storage_backend", "file"),
+        (
+            {"hicache_storage_backend_extra_config": "{}"},
+            "hicache_storage_backend_extra_config",
+            "{}",
+        ),
+        (
+            {"hicache_storage_prefetch_policy": "timeout"},
+            "hicache_storage_prefetch_policy",
+            "timeout",
+        ),
+        ({"hicache_write_policy": "write_back"}, "hicache_write_policy", "write_back"),
         ({"smg_grpc_mode": True}, "grpc_port", None),
         ({"grpc_mode": True}, "grpc_port", None),
         ({"default_priority_value": 5}, "default_priority_value", None),
@@ -61,6 +73,10 @@ def _scheduler_for_typed_config():
     ],
     ids=[
         "native-grpc",
+        "hicache_storage_backend",
+        "hicache_storage_backend_extra_config",
+        "hicache_storage_prefetch_policy",
+        "hicache_write_policy",
         "legacy-smg",
         "deprecated-legacy-smg",
         "priority-off",
@@ -86,9 +102,13 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
         patch.object(rust_config, "_launch_server_info", return_value="{}"),
     ):
-        assert rust_config._build_server_args(scheduler) == "server-args"
+        assert (
+            rust_config._build_server_args(scheduler, default_max_new_tokens=None)
+            == "server-args"
+        )
 
     assert extension.ServerArgs.call_args.kwargs[kwarg] == expected
+    assert extension.ServerArgs.call_args.kwargs["default_max_new_tokens"] is None
     scheduler.get_init_info.assert_not_called()
     scheduler.kv_events_publisher.local_kv_event_sources.assert_called_once_with(16)
     deployment_info = json.loads(
@@ -143,7 +163,9 @@ def test_typed_config_points_metrics_at_the_multiproc_dir(enable_metrics):
         patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
         patch.object(rust_config, "_launch_server_info", return_value="{}"),
     ):
-        rust_config._build_server_args(_scheduler_for_typed_config())
+        rust_config._build_server_args(
+            _scheduler_for_typed_config(), default_max_new_tokens=None
+        )
 
     metrics = extension.ServerArgs.call_args.kwargs["metrics"]
     if enable_metrics:

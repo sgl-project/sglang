@@ -18,7 +18,11 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.sampling.watermarking.core import (
+    WATERMARK_CONTAINER_FIELD_NAMES,
+    WATERMARK_SECRET_FIELD_NAMES,
+    redact_watermark_secrets,
+)
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 if TYPE_CHECKING:
@@ -238,6 +242,16 @@ class RequestLogger:
             target.info(msg)
 
 
+def _redact_field(name: str, value: Any) -> Any:
+    # Redact by name instead of walking the whole object: requests carry
+    # ~100k-entry token-id lists, and the recursive walk costs tens of ms.
+    if name in WATERMARK_SECRET_FIELD_NAMES:
+        return "<redacted>"
+    if name in WATERMARK_CONTAINER_FIELD_NAMES:
+        return redact_watermark_secrets(value, in_watermark_config=name == "watermark")
+    return value
+
+
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
 def _dataclass_to_string_truncated(
     data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
@@ -261,32 +275,25 @@ def _dataclass_to_string_truncated(
         else:
             return str(redact_watermark_secrets(data))
     elif isinstance(data, dict):
-        data = redact_watermark_secrets(data)
-        return (
-            "{"
-            + ", ".join(
-                f"'{k}': {_dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-                if k not in skip_names
-            )
-            + "}"
-        )
+        parts = []
+        for k, v in data.items():
+            if k in skip_names:
+                continue
+            rendered = _dataclass_to_string_truncated(_redact_field(k, v), max_length)
+            parts.append(f"'{k}': {rendered}")
+        return "{" + ", ".join(parts) + "}"
     elif dataclasses.is_dataclass(data):
-        fields = dataclasses.fields(data)
-        values = redact_watermark_secrets(
-            {f.name: getattr(data, f.name) for f in fields}
-        )
-        return (
-            f"{data.__class__.__name__}("
-            + ", ".join(
-                f"{f.name}={_dataclass_to_string_truncated(values[f.name], max_length)}"
-                for f in fields
-                if f.name not in skip_names
+        parts = []
+        for f in dataclasses.fields(data):
+            if f.name in skip_names:
+                continue
+            value = _redact_field(f.name, getattr(data, f.name))
+            parts.append(
+                f"{f.name}={_dataclass_to_string_truncated(value, max_length)}"
             )
-            + ")"
-        )
+        return f"{data.__class__.__name__}(" + ", ".join(parts) + ")"
     else:
-        return str(data)
+        return str(redact_watermark_secrets(data))
 
 
 def _transform_data_for_logging(
@@ -302,26 +309,30 @@ def _transform_data_for_logging(
     elif isinstance(data, (list, tuple)):
         if len(data) > max_length:
             half_length = max_length // 2
-            return list(data[:half_length]) + ["..."] + list(data[-half_length:])
+            return (
+                [_transform_data_for_logging(v, max_length) for v in data[:half_length]]
+                + ["..."]
+                + [
+                    _transform_data_for_logging(v, max_length)
+                    for v in data[-half_length:]
+                ]
+            )
         return [_transform_data_for_logging(v, max_length) for v in data]
     elif isinstance(data, dict):
-        data = redact_watermark_secrets(data)
         return {
-            k: _transform_data_for_logging(v, max_length)
+            k: _transform_data_for_logging(_redact_field(k, v), max_length)
             for k, v in data.items()
             if k not in skip_names
         }
     elif dataclasses.is_dataclass(data):
-        fields = dataclasses.fields(data)
-        values = redact_watermark_secrets(
-            {f.name: getattr(data, f.name) for f in fields}
-        )
         return {
-            f.name: _transform_data_for_logging(values[f.name], max_length)
-            for f in fields
+            f.name: _transform_data_for_logging(
+                _redact_field(f.name, getattr(data, f.name)), max_length
+            )
+            for f in dataclasses.fields(data)
             if f.name not in skip_names
         }
     elif isinstance(data, (int, float, bool, type(None))):
         return data
     else:
-        return str(data)
+        return str(redact_watermark_secrets(data))
