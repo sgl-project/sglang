@@ -132,8 +132,7 @@ def _full_attn_kv_split_sm_count(
 
 @contextlib.contextmanager
 def _trtllm_decode_sm_count(sm_count: int):
-    # Workaround: trtllm_batch_decode_with_kv_cache takes no split count and reads
-    # get_device_sm_count once per call; drop once FlashInfer exposes the split.
+    # FlashInfer has no per-call KV split yet; it reads get_device_sm_count per call.
     original = flashinfer.decode.get_device_sm_count
     flashinfer.decode.get_device_sm_count = lambda device: sm_count
     try:
