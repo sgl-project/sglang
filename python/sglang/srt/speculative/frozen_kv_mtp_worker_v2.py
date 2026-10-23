@@ -227,10 +227,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             return
         if backend._swa_kv_pool is None or self.kv_context is None:
             return
-        assert backend._swa_kv_pool is self.kv_context.target_token_to_kv_pool, (
-            "Frozen-KV draft translates SWA ids on a different pool than the "
-            "target pool it reads."
-        )
+        if backend._swa_kv_pool is not self.kv_context.target_token_to_kv_pool:
+            raise RuntimeError(
+                "Frozen-KV draft translates SWA ids on a different pool than the "
+                "target pool it reads."
+            )
 
     def init_cuda_graphs(self):
         with (
