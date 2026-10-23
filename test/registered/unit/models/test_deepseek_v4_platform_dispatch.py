@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.models import deepseek_v4
 from sglang.srt.models import deepseek_v4_dspark as dspark
+from sglang.srt.models import deepseek_v4_mhc as mhc
 from sglang.srt.models import deepseek_v4_nextn as nextn
 from sglang.srt.models import deepseek_v4_platform_stage as platform_stage
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -244,6 +245,195 @@ class TestStageLifecycle(unittest.TestCase):
             patch.object(platform_stage.mhc, "can_fuse_post", return_value=True),
         ):
             self.assertFalse(layer._can_fuse_attn_mhc)
+
+
+class TestNpuMhcSeam(unittest.TestCase):
+    """V4.1 (lagged pre-mix) mHC on NPU: two CANN ops plus a plain collapse."""
+
+    MULT, HIDDEN = 4, 8
+
+    def _sub_layer(self, *, pre_from_prev=True):
+        return mhc.HcSubLayer(
+            cfg=mhc.HcConfig(
+                mult=self.MULT,
+                sinkhorn_iters=20,
+                eps=1e-6,
+                rms_eps=1e-6,
+                hidden=self.HIDDEN,
+                pre_from_prev=pre_from_prev,
+                cp_prefill=False,
+            ),
+            fn=torch.zeros((2 + self.MULT) * self.MULT, self.MULT * self.HIDDEN),
+            scale=torch.zeros(3),
+            base=torch.zeros((2 + self.MULT) * self.MULT),
+            norm=torch.nn.Identity(),
+        )
+
+    def _residual(self, rows=2):
+        return torch.arange(
+            rows * self.MULT * self.HIDDEN, dtype=torch.float32
+        ).reshape(rows, self.MULT, self.HIDDEN)
+
+    def test_npu_combine_folds_the_previous_premix_and_stashes_the_triplet(self):
+        hc = self._sub_layer()
+        x = self._residual()
+        pre_prev = torch.full((2, self.MULT), 0.25)
+        state = mhc.HcState(x, pre_prev)
+        seen = {}
+
+        def fake_pre_v2(**kwargs):
+            seen.update(kwargs)
+            return (
+                x.float().mean(1),
+                torch.ones(2, self.MULT),
+                torch.ones(2, self.MULT, self.MULT),
+                torch.full((2, self.MULT), 0.5),
+            )
+
+        with (
+            patch.object(mhc, "_is_npu", True),
+            patch.object(
+                torch,
+                "ops",
+                SimpleNamespace(custom=SimpleNamespace(npu_hc_pre_v2=fake_pre_v2)),
+            ),
+        ):
+            out = mhc.combine(hc, state)
+
+        torch.testing.assert_close(out, x.float().mean(1))
+        # The op gets the residual, the previous pre-mix and the layer's weights.
+        self.assertIs(seen["x"], x)
+        self.assertIs(seen["pre_mix"], pre_prev)
+        self.assertIs(seen["hc_fn"], hc.fn)
+        self.assertIs(seen["hc_scale"], hc.scale)
+        self.assertIs(seen["hc_base"], hc.base)
+        self.assertEqual(seen["hc_mult"], self.MULT)
+        self.assertEqual(seen["hc_sinkhorn_iters"], 20)
+        self.assertEqual(seen["norm_eps"], 1e-6)
+        self.assertEqual(seen["hc_eps"], 1e-6)
+        # ``mix_stats`` is skipped: the post reads the stashed coefficients.
+        pre, post_mix, comb = state.stats
+        torch.testing.assert_close(pre, torch.full((2, self.MULT), 0.5))
+        torch.testing.assert_close(post_mix, torch.ones(2, self.MULT))
+        torch.testing.assert_close(comb, torch.ones(2, self.MULT, self.MULT))
+
+    def test_npu_first_sublayer_seeds_the_identity_one_hot(self):
+        hc = self._sub_layer()
+        x = self._residual()
+        state = mhc.HcState(x)  # no previous pre-mix
+        seen = {}
+
+        def fake_pre_v2(**kwargs):
+            seen.update(kwargs)
+            return (
+                x.float()[:, 0, :],
+                torch.ones(2, self.MULT),
+                torch.ones(2, self.MULT, self.MULT),
+                torch.full((2, self.MULT), 0.5),
+            )
+
+        with (
+            patch.object(mhc, "_is_npu", True),
+            patch.object(
+                torch,
+                "ops",
+                SimpleNamespace(custom=SimpleNamespace(npu_hc_pre_v2=fake_pre_v2)),
+            ),
+        ):
+            out = mhc.combine(hc, state)
+
+        torch.testing.assert_close(out, x[:, 0, :])
+        # Recipes seeds the first sublayer with the identity one-hot, i.e. the
+        # plain ``norm(x[:, 0, :])`` of the device-agnostic path.
+        expected = torch.zeros(2, self.MULT)
+        expected[:, 0] = 1.0
+        self.assertEqual(seen["pre_mix"].dtype, torch.float32)
+        torch.testing.assert_close(seen["pre_mix"], expected)
+
+    def test_npu_empty_batch_skips_the_kernel(self):
+        hc = self._sub_layer()
+        x = self._residual()[:0]
+        state = mhc.HcState(x)
+
+        def boom(**kwargs):
+            raise AssertionError("the kernel must not run without rows")
+
+        with (
+            patch.object(mhc, "_is_npu", True),
+            patch.object(
+                torch,
+                "ops",
+                SimpleNamespace(custom=SimpleNamespace(npu_hc_pre_v2=boom)),
+            ),
+        ):
+            out = mhc.combine(hc, state)
+
+        self.assertEqual(out.shape, (0, self.HIDDEN))
+        self.assertEqual(state.stats[0].shape, (0, self.MULT))
+        self.assertEqual(state.stats[2].shape, (0, self.MULT, self.MULT))
+
+    def test_npu_v41_post_uses_the_cann_mhc_post_argument_order(self):
+        cfg = self._sub_layer().cfg
+        x = torch.zeros(2, self.HIDDEN)
+        residual = self._residual()
+        post_mix = torch.ones(2, self.MULT)
+        comb = torch.ones(2, self.MULT, self.MULT)
+        seen = {}
+
+        def fake_mhc_post(a, b, c, d):
+            seen["args"] = (a, b, c, d)
+            return residual + 1.0
+
+        with (
+            patch.object(mhc, "_is_npu", True),
+            patch.object(
+                torch,
+                "ops",
+                SimpleNamespace(
+                    cann_ops_transformer=SimpleNamespace(mhc_post=fake_mhc_post)
+                ),
+            ),
+        ):
+            out = mhc.post(cfg, x, residual, post_mix, comb)
+
+        # Schema mhc_post(x, hRes, hOut, hPost).
+        self.assertEqual(seen["args"], (residual, comb, x, post_mix))
+        torch.testing.assert_close(out, residual + 1.0)
+
+    def test_npu_v4_post_keeps_the_legacy_kernel(self):
+        cfg = self._sub_layer(pre_from_prev=False).cfg
+        x = torch.zeros(2, self.HIDDEN)
+        residual = self._residual()
+        post_mix = torch.ones(2, self.MULT)
+        comb = torch.ones(2, self.MULT, self.MULT)
+        shapes = []
+
+        def fake_hc_post(a, b, c, d):
+            shapes.append(a.shape)
+            return residual
+
+        with (
+            patch.object(mhc, "_is_npu", True),
+            patch.object(mhc, "is_npu_arch35", return_value=True),
+            patch.object(
+                torch,
+                "ops",
+                SimpleNamespace(custom=SimpleNamespace(npu_hc_post=fake_hc_post)),
+            ),
+        ):
+            mhc.post(cfg, x, residual, post_mix, comb)
+
+        # arch35's npu_hc_post is batched: a leading batch axis on every operand.
+        self.assertEqual(shapes, [(1, 2, self.HIDDEN)])
+
+    def test_combine_premix_is_the_fp32_weighted_sum(self):
+        x = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+        pre = torch.tensor(
+            [[0.0, 0.5, 0.25, 0.25], [1.0, 0.0, 0.0, 0.0]], dtype=torch.float32
+        )
+        out = mhc.combine_premix(x, pre)
+        self.assertEqual(out.shape, (2, 3))
+        torch.testing.assert_close(out, (pre.unsqueeze(-1) * x).sum(1))
 
 
 if __name__ == "__main__":
