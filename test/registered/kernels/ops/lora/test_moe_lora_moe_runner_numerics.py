@@ -446,8 +446,9 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
 
 
 _FP8_EXPERTS = 4
-# SM100 matches the staged reference bit for bit. CPU emulation of Hopper's
-# ~14-bit FP8 accumulators moves the output by at most a quarter of this gate.
+# GB300 matched the staged reference bit for bit. A CPU sensitivity check
+# that adds 2^-14 |W||x| noise to both base GEMMs used at most a quarter of
+# this gate; it is not a model of Hopper rounding or a bound.
 _FP8_ATOL = 6e-3
 _FP8_RTOL = 3e-2
 

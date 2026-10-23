@@ -244,10 +244,11 @@ class TestAlignBlockSizeJitSentinelBucket(_AlignBlockSizeSentinelBucketBase):
         return sorted_token_ids, expert_ids, num_tokens_post_padded
 
     def _invalid_ids(self, num_experts):
-        # Production hands this path EP's -1 and in-range virtual IDs only
-        # (_fused_virtual_topk_ids keeps sentinels negative). Its sort kernel
-        # indexes the bucket offsets by id + 1 without a bound, so IDs
-        # >= num_experts are outside its contract.
+        # Valid inputs are -1 or an expert ID in [0, num_experts). The sort
+        # uses id + 1 as an unchecked bucket index and the count it reads
+        # there as a write offset, so an ID >= num_experts or < -1 can touch
+        # invalid memory (seen at 1,500 experts on GB300); hardening that is
+        # a production change, not this test's.
         return [-1]
 
 
