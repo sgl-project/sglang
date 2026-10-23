@@ -370,8 +370,8 @@ class HiCacheController:
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
-        # Set by the scheduler to the forward stream; gates load-back H2D
-        # behind in-flight forwards (see start_loading).
+        # Set by the scheduler to the forward stream; gate load-back H2D and
+        # write D2H behind in-flight forwards (see start_loading, start_writing).
         self.load_fence_stream = None
         self.write_fence_stream = None
         self.ack_write_queue: List[HiCacheAck] = []
@@ -838,7 +838,7 @@ class HiCacheController:
         self.start_writing()
         return host_indices
 
-    def start_writing(self, *, wait_for_forward: bool = False) -> None:
+    def start_writing(self) -> None:
         if len(self.write_queue) == 0:
             return
 
@@ -846,8 +846,11 @@ class HiCacheController:
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
-        if wait_for_forward and self.write_fence_stream is not None:
-            # An evicted SWA page can belong to an unfinished checkpoint.
+        if self.write_fence_stream is not None:
+            # The copy may read KV a forward is still writing: under overlap
+            # scheduling a finished request is cached while the next forward
+            # writes its last token, and an evicted SWA page can belong to an
+            # unfinished checkpoint. Later forwards still overlap with the copy.
             self.l2_transfer_engine.device_to_host_stream.wait_stream(
                 self.write_fence_stream
             )

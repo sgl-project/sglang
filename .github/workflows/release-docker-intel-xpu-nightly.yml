@@ -57,6 +57,7 @@ jobs:
             kernel_source=wheel
             kernel_ref=main
             latest_tag=latest
+            image_tag="${image_tag}-main-whl"
           else
             # Pin the kernel commit so the tag names exactly what was built.
             kernel_ref=$(git ls-remote https://github.com/sgl-project/sgl-kernel-xpu.git refs/heads/main | cut -f1)
@@ -66,7 +67,7 @@ jobs:
             fi
             kernel_source=source
             latest_tag=latest-kernel-main
-            image_tag="${image_tag}-kernel-main-${kernel_ref:0:7}"
+            image_tag="${image_tag}-main-main-${kernel_ref:0:7}"
           fi
           echo "DATE=${date_tag}" >> $GITHUB_ENV
           echo "commit_hash=${commit_hash}" >> $GITHUB_OUTPUT
