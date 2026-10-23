@@ -1687,6 +1687,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_routed_experts=obj.return_routed_experts,
                 routed_experts_start_len=obj.routed_experts_start_len,
                 return_indexer_topk=obj.return_indexer_topk,
+                routed_experts_session_key=obj.routed_experts_session_key,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
@@ -2780,6 +2781,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
                         i
                     ]
+                if recv_obj.routed_experts_forcing is not None and (
+                    forcing := recv_obj.routed_experts_forcing[i]
+                ):
+                    meta_info["routed_experts_forcing"] = forcing
                 if customized_info is not None:
                     self.update_request_meta_info(
                         meta_info,

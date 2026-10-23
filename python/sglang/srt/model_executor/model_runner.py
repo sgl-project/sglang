@@ -225,6 +225,11 @@ from sglang.srt.state_capturer.routed_experts import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
+from sglang.srt.state_capturer.routed_experts_forcing import (
+    RoutedExpertsForcing,
+    forcing_forward,
+    set_global_routed_experts_forcing,
+)
 from sglang.srt.true_on_policy import is_tp_invariant_target
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -1013,6 +1018,7 @@ class ModelRunner:
         if not self.is_draft_worker:
             self.init_routed_experts_capturer()
         self.init_indexer_capturer()
+        self.maybe_init_routed_experts_forcing()
 
         self.graph_shared_output = None
         # Set once real decode CUDA graphs are captured (makes on-flip role-switch
@@ -1233,6 +1239,20 @@ class ModelRunner:
                 ),
                 max_running_requests=self.max_running_requests,
                 device=self.device,
+            )
+        )
+
+    def maybe_init_routed_experts_forcing(self):
+        if (
+            not get_exec().features.enable_routed_experts_forcing
+            or self.is_draft_worker
+        ):
+            return
+        set_global_routed_experts_forcing(
+            RoutedExpertsForcing.create(
+                model=self.model,
+                capturer=get_global_experts_capturer(),
+                expert_location=get_global_expert_location_metadata(),
             )
         )
 
@@ -1966,7 +1986,12 @@ class ModelRunner:
             ctx_mgr = contextlib.nullcontext()
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
-        with ctx_mgr:
+        forcing_ctx = (
+            contextlib.nullcontext()
+            if forward_batch.forced_routes is None
+            else forcing_forward(forward_batch.forced_routes, device=self.device)
+        )
+        with ctx_mgr, forcing_ctx:
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"
@@ -2030,6 +2055,8 @@ class ModelRunner:
                 and self.prefill_cuda_graph_runner is not None
                 and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
                 and forward_batch.token_indices_to_pool is None
+                # A prefill graph replays the gates' own top-k: forced extends run eagerly.
+                and forward_batch.forced_routes is None
                 and _prefill_cuda_graph_allows_context_parallel(
                     self.prefill_cuda_graph_runner, forward_batch
                 )

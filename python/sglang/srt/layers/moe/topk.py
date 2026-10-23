@@ -2881,6 +2881,18 @@ def select_experts(
         # The override rewrote every row, including the router-masked ones.
         padded_rows_masked = False
 
+    # Routed-experts forcing: before capture, which records the forced experts,
+    # and before the EPLB remap, which takes logical ids.
+    if (forced := get_forward().routed_experts_forced) is not None:
+        topk_ids, topk_weights = forced.force_routing(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            router_logits=router_logits,
+            layer_id=layer_id,
+            topk_config=topk_config,
+            packed=packed_topk is not None,
+        )
+
     topk_ids, topk_weights, recorder_topk_ids = _post_process_topk_ids(
         topk_ids=topk_ids,
         topk_weights=topk_weights,

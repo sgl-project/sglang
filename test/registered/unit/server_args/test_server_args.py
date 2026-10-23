@@ -3795,6 +3795,66 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         check_two_batch_overlap(args)
 
 
+class TestRoutedExpertsForcingArgs(CustomTestCase):
+    def _check(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.enable_routed_experts_forcing = True
+        args.enable_return_routed_experts = True
+        args.moe_runner_backend = "triton"
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        validation_hook.check_routed_experts_forcing_server_args(args)
+
+    def test_supported_options_start(self):
+        for runner in ("flashinfer_cutlass", "flashinfer_trtllm_routed"):
+            self._check(moe_runner_backend=runner)
+        self._check(tp_size=2, ep_size=2)
+        # With attention TP 1, an all-to-all backend still routes whole batches.
+        self._check(moe_a2a_backend="deepep")
+        self._check(enable_routed_experts_forcing=False, dp_size=2)
+
+    def test_conflicts_are_refused(self):
+        split = "tokens split across ranks"
+        conflicts = [
+            (
+                "requires --enable-return-routed-experts",
+                {"enable_return_routed_experts": False},
+            ),
+            (
+                "requires --moe-runner-backend .*, got 'auto'",
+                {"moe_runner_backend": "auto"},
+            ),
+            ("--enable-return-indexer-topk", {"enable_return_indexer_topk": True}),
+            ("DP attention", {"tp_size": 2, "attn_dp_size": 2}),
+            ("--dp-size > 1", {"dp_size": 2}),
+            ("pipeline parallelism", {"pp_size": 2}),
+            ("context parallelism", {"tp_size": 2, "attn_cp_size": 2}),
+            ("decode context parallelism", {"dcp_size": 2}),
+            ("speculative decoding", {"speculative_algorithm": "EAGLE"}),
+            ("batch overlap", {"enable_single_batch_overlap": True}),
+            ("PD disaggregation", {"disaggregation_mode": "prefill"}),
+            (split, {"tp_size": 2, "moe_a2a_backend": "deepep"}),
+            (split, {"tp_size": 2, "enable_attn_tp_input_scattered": True}),
+            (split, {"tp_size": 2, "moe_dense_tp_size": 1}),
+        ]
+        for conflict, overrides in conflicts:
+            with self.subTest(**overrides):
+                with self.assertRaisesRegex(ValueError, conflict):
+                    self._check(**overrides)
+        with self.assertRaisesRegex(ValueError, "--dp-size > 1; pipeline"):
+            self._check(dp_size=2, pp_size=2)
+        with patch.object(
+            validation_hook.envs.SGLANG_RUST_SERVER, "get", return_value=True
+        ):
+            with self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"):
+                self._check()
+        with patch.object(
+            validation_hook.envs.SGLANG_EXPERIMENTAL_LORA_OPTI, "get", return_value=True
+        ):
+            with self.assertRaisesRegex(ValueError, "SGLANG_OPT_LORA_FUSED_TOPK_PACK"):
+                self._check()
+
+
 class TestKvCacheShardingCompatibility(CustomTestCase):
     def setUp(self):
         super().setUp()

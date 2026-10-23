@@ -114,6 +114,11 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`int = 0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>If `return_routed_experts`, the absolute start position for returned routed-experts rows. `0` preserves the default full sequence; set it to an accumulated prefix length to return only `[routed_experts_start_len, seqlen - 1)`. For example, in multi-turn RL rollouts, routed experts for tokens from previous turns have already been collected, so setting this value avoids unnecessary transfer that cause bottlenecks. Must be in `[0, prompt_tokens]`.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>routed_experts_session_key</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[str] = None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>With `--enable-routed-experts-forcing`, the session this request continues; requires `return_routed_experts`. When the engine recomputes any of the first `routed_experts_start_len` tokens (after a retract, a cache flush or a radix miss), it reuses the experts it first computed for them. A request that cannot be forced is aborted before it runs (`finish_reason` `abort`); the message starts with `routed_experts_missing` (routes no longer held), `routed_experts_forcing_requires_return_routed_experts` or `routed_experts_forcing_disabled` (server flag off). Not supported with batches or `n > 1`. With the flag on, the final `meta_info["routed_experts_forcing"]` reports `held_tokens` (held at admission), `forced_tokens` (recomputed tokens that reused held experts, summed over forwards), `unforced_tokens` (recomputed without them; 0 once admitted) and `retract_snapshots` (retracts that added held tokens), plus `refused` (the code) on a refusal. A keyed request shares radix-cache KV only with requests of the same key. `/server_info` then reports `routed_experts_forcing: {"version": 1, "max_tokens": N}`.</td>
+    </tr>
   </tbody>
 </table>
 

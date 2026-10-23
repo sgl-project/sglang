@@ -81,6 +81,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "return_prompt_token_ids",
         "return_routed_experts",
         "return_sampling_mask",
+        "routed_experts_session_key",
         "routed_experts_start_len",
         "routing_key",
         "sampling_logprobs_mode",

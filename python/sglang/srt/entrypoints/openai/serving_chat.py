@@ -1324,6 +1324,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
+            routed_experts_session_key=request.routed_experts_session_key,
             return_indexer_topk=request.return_indexer_topk,
             return_outputs_via_store=request.return_outputs_via_store,
             rid=request.rid,
