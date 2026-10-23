@@ -2181,7 +2181,7 @@ def init_model_parallel_group(
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     if use_pynccl is None:
         platform = platforms.current_platform
-        if platform.is_out_of_tree() and not platform.use_pynccl_by_default():
+        if platform.is_out_of_tree() and not platform.capabilities.supports_pynccl:
             use_pynccl = False
         else:
             use_pynccl = not (_is_npu or _is_xpu or backend == "mooncake")

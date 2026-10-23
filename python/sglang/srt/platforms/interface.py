@@ -61,12 +61,16 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     ``hicache_device_kernels``: the sgl_kernel HiCache transfer / write-back
     kernels are available; otherwise the host pools skip their staging
     buffers.
+    ``supports_pynccl``: model-parallel groups create a PyNccl communicator
+    when the caller does not choose. Read for out-of-tree platforms; in-tree
+    devices decide in ``parallel_state``.
     """
 
     supports_triton: bool = False
     graph_capture: bool = False
     piecewise_graph: bool = False
     hicache_device_kernels: bool = False
+    supports_pynccl: bool = False
 
 
 class SRTPlatform(DeviceMixin):
@@ -222,15 +226,6 @@ class SRTPlatform(DeviceMixin):
         import torch
 
         return torch.device("cpu")
-
-    def use_pynccl_by_default(self) -> bool:
-        """Whether model-parallel groups create a PyNccl communicator when the
-        caller does not choose.
-
-        Consulted only for out-of-tree platforms. The default keeps the
-        previous behavior; a platform without NCCL should return False.
-        """
-        return True
 
     # ------------------------------------------------------------------
     # Initialization

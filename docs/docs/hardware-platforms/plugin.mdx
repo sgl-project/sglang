@@ -576,6 +576,11 @@ field defaults to the conservative answer.
       <td><code>False</code></td>
       <td>The sgl_kernel HiCache transfer / write-back kernels are available; otherwise host pools skip their staging buffers.</td>
     </tr>
+    <tr>
+      <td><code>supports_pynccl</code></td>
+      <td><code>False</code></td>
+      <td>Model-parallel groups create a PyNccl communicator when the caller does not choose. Set it to True only if the device runs NCCL (or an NCCL-compatible library PyNccl loads).</td>
+    </tr>
   </tbody>
 </table>
 
@@ -634,11 +639,6 @@ field defaults to the conservative answer.
       <td><code>get_group_coordinator_device(local_rank)</code></td>
       <td><code>torch.device("cpu")</code></td>
       <td>Device each <code>GroupCoordinator</code> binds to on this rank (e.g. <code>torch.device(f"mydev:{local_rank}")</code>). Without it, device collectives on an out-of-tree platform run against a CPU device.</td>
-    </tr>
-    <tr>
-      <td><code>use_pynccl_by_default()</code></td>
-      <td><code>True</code></td>
-      <td>Whether model-parallel groups create a PyNccl communicator when the caller does not choose. Return <code>False</code> on hardware without NCCL.</td>
     </tr>
   </tbody>
 </table>

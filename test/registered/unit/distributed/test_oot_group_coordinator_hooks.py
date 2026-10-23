@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -12,13 +12,13 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
 
 
-def _platform(out_of_tree: bool, device: str = "cpu", pynccl: bool = True) -> Mock:
+def _platform(out_of_tree: bool, device: str = "cpu", pynccl: bool = False) -> Mock:
     platform = Mock(spec=SRTPlatform)
     platform.is_out_of_tree.return_value = out_of_tree
     platform.get_group_coordinator_device.side_effect = lambda local_rank: torch.device(
         device
     )
-    platform.use_pynccl_by_default.return_value = pynccl
+    platform.capabilities = PlatformCapabilities(supports_pynccl=pynccl)
     return platform
 
 
@@ -55,10 +55,10 @@ def test_in_tree_unknown_device_falls_back_to_cpu():
     platform.get_group_coordinator_device.assert_not_called()
 
 
-def test_base_platform_defaults_keep_previous_behavior():
+def test_base_platform_defaults():
     platform = SRTPlatform()
     assert platform.get_group_coordinator_device(0) == torch.device("cpu")
-    assert platform.use_pynccl_by_default() is True
+    assert platform.capabilities.supports_pynccl is False
 
 
 @pytest.mark.parametrize(
