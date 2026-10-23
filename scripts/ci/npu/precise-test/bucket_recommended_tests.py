@@ -26,32 +26,19 @@ callers treat as "run the full suite".
 
 Decision model (precision vs full)
 ----------------------------------
-Precision mode is driven by whether the PR is JUDGEABLE, not by whether some
-bucket happens to be non-empty. Every changed path from --changed-files is
-classified:
+A full run is triggered by only three signals:
 
-    product     python/sglang/** (minus the registered test files below) ->
-                the coverage baseline decides which tests are affected. The
-                coverage include is */python/sglang/*, so test helpers and
-                case configs under python/sglang are judged too.
-    test_case   a registered / NPU-regression test file -> recommended as a
-                whole file (any touched test is worth running)
-    ci_infra    only _FULL_RUN_PATHS (pr-test-npu.yml, pyproject_npu.toml,
-                npu_ci_install_dependency.sh): the non-test paths that trigger
-                this workflow and shape its environment/selection logic
-    ignored     docs/examples/test helpers outside python/sglang/... ->
-                invisible to the coverage baseline, cannot recommend anything
+  - a changed path in _FULL_RUN_PATHS (the pipeline configuration files),
+  - a missing changed-file list (test_selector.py failed),
+  - the multimodal baseline safety gate described below.
 
-Precision mode stays ON for judgeable PRs even when EVERY bucket is empty.
-A recommended test that no scheduled suite contains (a base-a CPU unit test, a
-nightly-only test, a deleted test file) is not runnable in this workflow, and
-running the full suites would not run it either — so an empty bucket list is
-not evidence that the suites must run in full. This is what keeps a PR that
-only edits a CPU unit test from re-running the whole a3 matrix.
-
-A full run is reserved for signals that genuinely defeat the baseline:
-the ci_infra paths above, a missing changed-file list (test_selector.py
-failed), and the multimodal baseline safety gate.
+Everything else is decided by the recommendation: an empty one skips every
+suite, a non-empty one runs only the buckets. Precision mode is therefore not
+keyed off "is any bucket non-empty" — a recommendation that no scheduled suite
+contains (a base-a CPU unit test, a nightly-only test, a deleted test file) is
+not runnable in this workflow, and a full run would not run it either. This is
+what keeps a PR that only edits a CPU unit test from re-running the whole a3
+matrix.
 
 Diffusion (multimodal_gen) suites are enumerated from the NPU diffusion case
 config instead of test/registered, and they recommend at test-case
@@ -148,17 +135,6 @@ def normalize_rel(path: str) -> str:
     return p
 
 
-# A changed test file that test_selector.py recommends unconditionally. Kept
-# in sync with its _get_test_files_from_pr_diff() patterns; used here to tell
-# "test case" changes apart from test infrastructure.
-_TEST_CASE_RE = re.compile(
-    r"^(?:"
-    r"test/registered(?:/.+)?/test_\w+\.py"
-    r"|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py"
-    r"|python/sglang/multimodal_gen/test/(?:.*/)?test_\w+\.py"
-    r")$"
-)
-
 # The only changes that force a full run. They are exactly the non-test paths
 # that trigger this workflow's paths filter and shape its environment or its
 # selection logic, so their effect cannot be judged from the coverage baseline
@@ -170,22 +146,9 @@ _FULL_RUN_PATHS = {
 }
 
 
-def classify_changed_path(path: str) -> str:
-    """Classify one changed repo-relative path (see the module docstring).
-
-    product     : coverage baseline judges which tests are affected
-    test_case   : touched test file, recommended as a whole file
-    ci_infra    : one of _FULL_RUN_PATHS -> full run
-    ignored     : docs, examples, test helpers outside python/sglang/ ...
-    """
-    p = path.strip().replace("\\", "/").removeprefix("./")
-    if p in _FULL_RUN_PATHS:
-        return "ci_infra"
-    if _TEST_CASE_RE.match(p):
-        return "test_case"
-    if p.startswith("python/sglang/"):
-        return "product"
-    return "ignored"
+def needs_full_run(path: str) -> bool:
+    """True when this changed path must not be judged by the recommendation."""
+    return path.strip().replace("\\", "/").removeprefix("./") in _FULL_RUN_PATHS
 
 
 def enumerate_suite_files(suite: str, work_dir: Path) -> list:
@@ -426,12 +389,12 @@ def write_github_summary(
     skip_all_suites: bool = False,
     decision: str = "",
     decision_reason: str = "",
-    non_judgeable: list | None = None,
+    full_run_paths: list | None = None,
     unknown_recommended: list | None = None,
 ) -> None:
     """Append a markdown section with the recommendation results to every
     target file: $GITHUB_STEP_SUMMARY and/or a plain report file."""
-    non_judgeable = non_judgeable or []
+    full_run_paths = full_run_paths or []
     unknown_recommended = unknown_recommended or []
     lines = []
     lines.append("### Recommended tests from coverage")
@@ -447,14 +410,14 @@ def write_github_summary(
         lines.append("**All suites skipped**: the judgeable changes affect no test.")
     else:
         lines.append("Precision mode **off** — suites run in full.")
-    if non_judgeable:
+    if full_run_paths:
         lines.append("")
         lines.append(
             "**Full run forced — pipeline configuration changed** "
             "(not judgeable from coverage):"
         )
         lines.append("")
-        lines.extend(f"- `{p}`" for p in non_judgeable)
+        lines.extend(f"- `{p}`" for p in full_run_paths)
     lines.append("")
     lines.append(
         f"Recommended **{len(raw_entries)}** test cases "
@@ -567,11 +530,11 @@ def main():
         "--changed-files",
         type=str,
         default="",
-        help="pr_changed_files.txt written by test_selector.py. Every path is "
-        "classified (product / test_case / test_infra / ci_infra / ignored); "
-        "only the ci_infra paths (pr-test-npu.yml, pyproject_npu.toml, "
-        "npu_ci_install_dependency.sh) force a full run, and a missing or "
-        "empty file also forces a full run",
+        help="pr_changed_files.txt written by test_selector.py. A path listed "
+        "in _FULL_RUN_PATHS (pr-test-npu.yml, pyproject_npu.toml, "
+        "npu_ci_install_dependency.sh) forces a full run; a missing or empty "
+        "file forces it too, and everything else is decided by the "
+        "recommendation",
     )
     parser.add_argument(
         "--github-output",
@@ -611,8 +574,8 @@ def main():
         print(f"::warning::Recommended file not found: {rec_file}")
     print(f"Recommended test entries: {len(raw_entries)} ({len(recommended)} files)")
 
-    # Classify every changed path. Only the three ci_infra paths force a full
-    # run; everything else is decided by the coverage recommendation.
+    # Only the pipeline configuration paths force a full run; everything else
+    # is decided by the coverage recommendation (or the missing-list fallback).
     changed_files: list[str] = []
     if args.changed_files:
         cf = Path(args.changed_files)
@@ -620,10 +583,7 @@ def main():
             changed_files = [
                 ln.strip() for ln in cf.read_text().splitlines() if ln.strip()
             ]
-    changed_classes = {p: classify_changed_path(p) for p in changed_files}
-    non_judgeable = sorted(
-        p for p, kind in changed_classes.items() if kind == "ci_infra"
-    )
+    full_run_paths = sorted(p for p in changed_files if needs_full_run(p))
 
     suites = [s.strip() for s in args.suites.split(",") if s.strip()]
     diffusion_suites = {}
@@ -721,9 +681,9 @@ def main():
         # means it failed, so there is no evidence to narrow anything down.
         decision = "full"
         decision_reason = "changed-file list unavailable (test_selector.py did not run)"
-    elif non_judgeable:
+    elif full_run_paths:
         decision = "full"
-        decision_reason = "non-judgeable change(s): " + ", ".join(non_judgeable)
+        decision_reason = "pipeline configuration changed: " + ", ".join(full_run_paths)
     elif not raw_entries:
         decision = "skip_all"
         decision_reason = "judgeable changes recommend no test"
@@ -733,7 +693,7 @@ def main():
     skip_all_suites = decision == "skip_all"
     print(
         f"Decision: {decision} ({decision_reason}); "
-        f"{len(changed_files)} changed path(s), {len(non_judgeable)} non-judgeable"
+        f"{len(changed_files)} changed path(s), {len(full_run_paths)} full-run path(s)"
     )
 
     total_count = sum(len(b) for b in buckets.values())
@@ -809,7 +769,7 @@ def main():
             skip_all_suites,
             decision=decision,
             decision_reason=decision_reason,
-            non_judgeable=non_judgeable,
+            full_run_paths=full_run_paths,
             unknown_recommended=unknown_recommended,
         )
 
