@@ -26,7 +26,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBacken
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     CompressedGather,
     SparsePrefillChunkCache,
-    SparsePrefillWorkspace,
+    SparsePrefillKVBuffer,
     use_dsv4_q8kv8_sparse_prefill,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -184,7 +184,7 @@ def _make_backend(
         sparse_prefill_cache=None, late_layer_tail=None
     )
     backend.req_to_token = req_to_token
-    backend.sparse_prefill_workspace = SparsePrefillWorkspace(device)
+    backend.sparse_prefill_kv_buffer = SparsePrefillKVBuffer(device)
     backend.softmax_scale = 512**-0.5
     backend.head_dim_v = 512
     backend.dsv4_prefill_backend = dsv4_prefill_backend
@@ -754,7 +754,8 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
         floor = torch.cat(
             [torch.full((n,), s, device=device) for s, n in zip(starts, lens)]
         )
-    layout = window_layout(req, pos, floor=floor, num_groups=2)
+    # Only the query-side indices matter here; no window history is copied.
+    layout = window_layout(req, pos, zero_row=0, floor=floor, num_groups=2)
     seq = torch.tensor(
         [s + n for s, n in zip(starts, lens)], device=device, dtype=torch.int32
     )
