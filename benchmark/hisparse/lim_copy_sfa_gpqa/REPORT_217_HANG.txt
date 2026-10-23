@@ -2,11 +2,13 @@ GLM-5.2 W4A8, native LIM + Copy-SFA: hang investigation on 217
 2026-10-23
 
 STATUS
-The corrected communication configuration passed 10 alternating short/long
-rounds on the full 78-layer model: 160/160 requests, 5,120 generated tokens,
-zero request errors or timeouts. This completed run disabled overlap scheduling
-and PrefillDelayer. Rechecking the launcher's default overlap scheduling and
-PrefillDelayer is pending access to all 16 NPUs. No GPQA accuracy score was run.
+The corrected communication configuration passed with overlap scheduling both
+disabled and enabled on the full 78-layer model. Each run completed 10 alternating
+short/long rounds: 160/160 requests and 5,120 generated tokens, with zero request
+errors or timeouts. The default launcher passed with overlap scheduling and
+PrefillDelayer enabled (max_delay_passes=100). Total: 320 completed requests and
+10,240 generated tokens. Both runs used production source without probes.
+No GPQA accuracy score was run.
 
 CONFIGURATION CHANGE
 Keep DeepEP auto. On the installed Ascend DeepEP runtime, use:
@@ -53,6 +55,13 @@ EVIDENCE AND LIMITS
     Overlap scheduling and PrefillDelayer disabled. Ten short/long rounds,
     160 completed requests, exactly 32 generated tokens each. Server logs show
     short eager decode and long NPU graph replay.
+  hang-auto-overlap-final-07:
+    The repository's default launcher and check_liveness.py: PASS.
+    Same hybrid layout, capacity32 and HCCL1000. server_info confirms overlap
+    scheduling enabled, PrefillDelayer enabled with max_delay_passes=100,
+    DeepEP auto and no speculative algorithm. Ten short/long rounds,
+    160 completed requests, exactly 32 generated tokens each, zero errors.
+    Eager decode and NPU graph replay are both present in the server log.
 
 COMMON FULL-MODEL SETTINGS
 Model: /models/GLM-5.2-w4a8; modelslim W4A8; BF16 KV/index keys.
@@ -75,10 +84,11 @@ maximum serving concurrency, or a throughput improvement.
 
 REPRODUCTION IN THE EXISTING /task CONTAINER
 First prepare the frozen seed42 fixture with prepare_gpqa.py. The validated
-217 container launcher is /task/launch_server.sh (the exact clean06 script,
-overlap disabled). The repository launch_server.sh keeps overlap enabled;
-its corresponding verification is pending. Start the selected launcher with
-LIM_EVAL_MODE=lim_copy_sfa and a new LIM_EVAL_TAG.
+217 container launcher is /task/launch_server.sh (the exact final07 script,
+overlap enabled), matching the repository launch_server.sh. Start it with
+LIM_EVAL_MODE=lim_copy_sfa and a new LIM_EVAL_TAG. The separate
+/task/hang-auto-hybrid-dispatch-clean-06.launch.sh preserves the verified
+overlap-disabled configuration.
 The following sends requests only to that server at127.0.0.1:8810:
   python3 /task/src/benchmark/hisparse/lim_copy_sfa_gpqa/check_liveness.py \
     --tag NEW_UNIQUE_TAG --rounds 10
