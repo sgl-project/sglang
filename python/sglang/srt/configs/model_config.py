@@ -879,20 +879,9 @@ class ModelConfig:
             None
             if self.is_draft_model
             else discover_trie_output_head_config(
-                self.hf_config, self.model_path, revision
+                self.hf_config, self.model_path, self.vocab_size, revision
             )
         )
-        if self.beam_trie_config is not None:
-            if self.beam_trie_config.token_end > self.vocab_size:
-                raise ValueError(
-                    "The model-bundled beam trie SID token range exceeds the "
-                    f"model vocabulary: end={self.beam_trie_config.token_end}, "
-                    f"vocab_size={self.vocab_size}"
-                )
-            logger.info(
-                "Discovered model-native trie output head at %s",
-                self.beam_trie_config.tensor_path,
-            )
 
         # Update hybrid model
         self._derive_hybrid_model()

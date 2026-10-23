@@ -705,7 +705,6 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
-        self.beam_trie_compact_enabled = False
         self.load_model()
         prepare_moe_topk(model=self.model, model_config=self.model_config)
 

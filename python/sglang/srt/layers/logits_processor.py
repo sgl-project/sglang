@@ -1036,8 +1036,6 @@ class LogitsProcessor(nn.Module):
             or depths is None
             or not isinstance(lm_head, VocabParallelEmbedding)
             or should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
-            or use_intel_amx_backend(lm_head)
-            or self.rl_on_policy_target is not None
         ):
             return None
         if depths.ndim != 1 or depths.shape[0] != hidden_states.shape[0]:
