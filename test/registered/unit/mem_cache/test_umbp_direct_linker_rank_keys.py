@@ -5,9 +5,15 @@ from queue import Queue
 from types import SimpleNamespace
 from unittest import mock
 
-import sglang.srt.mem_cache.storage.umbp.umbp_direct_linker as umbp_direct_linker
+import torch
+
+import sglang.srt.mem_cache.unified_cache.unified_cache_linker as unified_cache_linker
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
+    _ordered_layers,
+    _PoolRangePlan,
     _storage_suffix,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -50,6 +56,49 @@ class TestStorageSuffix(CustomTestCase):
         )
 
 
+class TestPackedDraftRanges(CustomTestCase):
+    def test_target_and_draft_share_a_transfer_layer(self):
+        buffers = [torch.zeros((4, width), dtype=torch.uint8) for width in (3, 5, 7)]
+        entry = DevicePoolEntry(
+            name=PoolName.SWA,
+            indices_from_pool=PoolName.SWA,
+            device_pool=None,
+            components=[buffers],
+            layer_mapping={3: (0, 2), 5: 1},
+            page_size=2,
+            rows_are_pages=True,
+        )
+        self.assertEqual(_ordered_layers(entry), [3, 5])
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker.pools = {PoolName.SWA: entry}
+        plan = _PoolRangePlan(PoolName.SWA, ["page"], [1], 1)
+        self.assertEqual(
+            linker._layer_group_ranges(plan, [3]),
+            (
+                [[buffers[0][1].data_ptr(), buffers[2][1].data_ptr()]],
+                [[3, 7]],
+                [[0, 8]],
+            ),
+        )
+        self.assertEqual(
+            linker._layer_group_ranges(plan, [3, 5]),
+            (
+                [
+                    [
+                        buffers[0][1].data_ptr(),
+                        buffers[2][1].data_ptr(),
+                        buffers[1][1].data_ptr(),
+                    ]
+                ],
+                [[3, 7, 5]],
+                [[0, 8, 3]],
+            ),
+        )
+        entry.layer_mapping = {3: (0, 1), 5: 1}
+        with self.assertRaisesRegex(ValueError, "maps buffer 1 more than once"):
+            _ordered_layers(entry)
+
+
 class TestEveryRankWrites(CustomTestCase):
     """Collapsing the key must not also elide the write on non-zero ranks.
 
@@ -71,7 +120,7 @@ class TestEveryRankWrites(CustomTestCase):
         fake_device = SimpleNamespace(
             Event=lambda: SimpleNamespace(record=lambda: None)
         )
-        with mock.patch.object(umbp_direct_linker, "device_module", fake_device):
+        with mock.patch.object(unified_cache_linker, "device_module", fake_device):
             self.assertTrue(linker.offload(["t"]))
         self.assertEqual(linker._offload_queue.qsize(), 1)
         # The result comes from the offload thread once the write lands, so

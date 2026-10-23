@@ -15,6 +15,7 @@ HIP-graph-capture safe (no host sync).
 """
 
 import ctypes
+import logging
 import os
 import re
 import subprocess
@@ -23,6 +24,8 @@ import tempfile
 import torch
 
 from sglang.srt.distributed.device_communicators.cuda_wrapper import find_loaded_library
+
+logger = logging.getLogger(__name__)
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _LOG2E = 1.4426950408889634
@@ -205,10 +208,9 @@ def asm_kernel_available() -> bool:
 def _disable(reason):
     global _disabled_reason
     _disabled_reason = reason
-    print(
+    logger.warning(
         f"[vattn_asm] disabling the gfx950 asm attention kernel, falling back to "
-        f"the Triton path: {reason}",
-        flush=True,
+        f"the Triton path: {reason}"
     )
     raise AsmKernelUnavailable(reason)
 
@@ -264,10 +266,9 @@ def _get_kernel(hq):
         except RuntimeError as e:
             _disable(f"loading {co} failed: {e}")
         _kernels[hq] = kern
-        print(
+        logger.info(
             f"[vattn_asm] gfx950 asm verify-attention kernel active "
-            f"(in-tree loader, GQA ratio {hq}, built {co})",
-            flush=True,
+            f"(in-tree loader, GQA ratio {hq}, built {co})"
         )
     return kern
 
