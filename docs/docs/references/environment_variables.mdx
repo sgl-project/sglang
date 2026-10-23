@@ -2084,8 +2084,8 @@ MPS and does not read them.
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_VIT_CUDA_GRAPH_CACHE_CAPACITY</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum number of ViT CUDA graphs (one per attention layout) to capture. Later layouts run the same code without a graph. Unset keeps every layout.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum number of ViT CUDA graphs (one per attention layout) to capture. Later layouts run the same code without a graph. Default 32 (three image sizes with up to 8 images per ViT call need 18 per rank).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>32</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_CUDA_IPC_TRANSPORT</code></td>

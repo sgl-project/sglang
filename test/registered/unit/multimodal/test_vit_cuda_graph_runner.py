@@ -216,12 +216,13 @@ def test_vit_graph_cache_capacity_still_replays_captured_layouts():
     assert not block.cu_seqlens_calls
 
 
-def test_vit_graph_cache_is_unbounded_by_default():
-    runner, _ = _capacity_runner(capacity=None)
+def test_vit_graph_cache_capacity_defaults_to_32():
+    assert envs.SGLANG_VIT_CUDA_GRAPH_CACHE_CAPACITY.get() == 32
+    runner, _ = _capacity_runner(capacity=32)
     captured = []
     runner.create_graph = lambda **kwargs: captured.append(kwargs)
     runner.replay = lambda **kwargs: None
-    for i in range(3):
+    for i in range(31):
         runner.block_graphs[f"other{i}"] = object()
 
     _run(runner, [0, 4, 6])

@@ -64,10 +64,8 @@ class ViTCudaGraphRunner:
         self._graph_pool = None
         # Graphs are keyed on the exact attention layout, so batch compositions can
         # add new keys indefinitely; past this many, layouts run uncaptured.
-        self._max_graphs: Optional[int] = (
-            envs.SGLANG_VIT_CUDA_GRAPH_CACHE_CAPACITY.get()
-        )
-        if self._max_graphs is not None and self._max_graphs < 0:
+        self._max_graphs: int = envs.SGLANG_VIT_CUDA_GRAPH_CACHE_CAPACITY.get()
+        if self._max_graphs < 0:
             raise ValueError(
                 "SGLANG_VIT_CUDA_GRAPH_CACHE_CAPACITY must be >= 0, "
                 f"got {self._max_graphs}"
@@ -551,7 +549,7 @@ class ViTCudaGraphRunner:
         )
 
     def _cache_is_full(self) -> bool:
-        if self._max_graphs is None or len(self.block_graphs) < self._max_graphs:
+        if len(self.block_graphs) < self._max_graphs:
             return False
         if not self._capacity_logged:
             logger.warning(
