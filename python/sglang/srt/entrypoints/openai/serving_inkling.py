@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 class InklingChatEncodingAdapter:
     collects_openai_media = True
+    strict_tool_call_arguments = True
 
     def __init__(
         self,
@@ -70,6 +71,16 @@ class InklingChatEncodingAdapter:
     def thinking_enabled(self, *, request: ChatCompletionRequest) -> Optional[bool]:
         """Inkling leaves the decision to the handler's rule."""
         return None
+
+    def apply_sampling(
+        self,
+        *,
+        request: ChatCompletionRequest,
+        sampling_params: dict[str, Any],
+        prompt_tokens: int,
+        context_length: int,
+    ) -> None:
+        """Inkling resolves no sampling of its own."""
 
     def encode_messages(
         self,
