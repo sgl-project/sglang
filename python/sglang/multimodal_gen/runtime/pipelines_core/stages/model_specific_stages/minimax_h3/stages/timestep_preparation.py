@@ -63,6 +63,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             )
         self._generate_sigmas_from_plan(batch, plan)
         self._apply_pdd_schedule(batch)
+        self._truncate_rollout_schedule(batch)
         self._publish_native_timestep_state(batch)
         return batch
 
@@ -85,6 +86,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             plan.default_flow_shift,
             plan.default_audio_flow_shift,
             self.freeze_for_dedup(self.sigma_shift_scales),
+            batch.rollout_stop_step_index,
         )
 
     def _apply_pdd_schedule(self, batch: Req) -> None:
@@ -116,6 +118,21 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                     f"{config['num_inference_steps']} and {modality} shift="
                     f"{config[f'{modality}_shift']} to match the fused heads"
                 )
+
+    @staticmethod
+    def _truncate_rollout_schedule(batch: Req) -> None:
+        stop_step_index = batch.rollout_stop_step_index
+        if not batch.rollout or stop_step_index is None:
+            return
+        sigmas = batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY]
+        num_steps = len(sigmas["video"]) - 1
+        if not 0 <= stop_step_index < num_steps:
+            raise ValueError(
+                f"rollout_stop_step_index must be in [0, {num_steps}), got {stop_step_index}"
+            )
+        end = stop_step_index + 1
+        for modality in ("video", "audio"):
+            sigmas[modality] = sigmas[modality][:end] + sigmas[modality][-1:]
 
     @staticmethod
     def _publish_native_timestep_state(batch: Req) -> None:
