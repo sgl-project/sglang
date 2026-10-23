@@ -1,4 +1,4 @@
-"""B300 1P1D coverage for Beam 1.0 NVFP4 with DFlash2."""
+"""B200 1P1D coverage for Beam 1.0 NVFP4 with DFlash2."""
 
 import json
 import unittest
@@ -20,9 +20,9 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-# ci-cost-override: the 501B checkpoint needs two TP4 replicas; one full GSM8K
-# pass covers both NVLink PD transfer and the DFlash2 acceptance regression gate.
-register_cuda_ci(est_time=800, stage="base-c", runner_config="8-gpu-b300")
+# The 501B checkpoint needs two TP4 replicas; one full GSM8K pass covers both
+# NVLink PD transfer and the DFlash2 acceptance regression gate.
+register_cuda_ci(est_time=800, stage="nightly", runner_config="8-gpu-b200")
 
 MODEL_PATH = "reflection/Beam-1.0-501B-A23B-NVFP4"
 DRAFT_MODEL_PATH = "reflection/Beam-1.0-501B-A23B-DFlash2"
@@ -34,7 +34,7 @@ MOONCAKE_ENV = {
 }
 
 
-class TestBeam10B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
+class TestBeam10B200PD(SpecDecodingMixin, PDDisaggregationServerBase):
     gsm8k_accuracy_thres = 0.94
     gsm8k_accept_length_thres = 4.0
     accept_length_thres = 4.4
