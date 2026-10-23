@@ -280,6 +280,77 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(req.extend_end)
 
+    def test_longest_accepted_prompt_fits_an_empty_paged_pool(self):
+        """The longest prompt intake accepts (also the auto-truncation target) must
+        be admittable on an empty pool. Admission rounds the prompt up to whole
+        pages and reserves one more page, so with page_size > 1 a limit derived
+        from kv_capacity - 1 accepted prompts that could never be scheduled; they
+        sat at the head of the waiting queue forever."""
+        import functools
+
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.tp_worker import TpModelWorker
+        from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+
+        for page_size, kv_capacity in ((1, 256), (16, 256), (64, 512), (64, 4096)):
+            with self.subTest(page_size=page_size, kv_capacity=kv_capacity):
+                allocator = self.create_token_allocator(
+                    available_size=kv_capacity, full_available_size=kv_capacity
+                )
+                allocator.page_size = page_size
+                allocator.max_new_tokens_for_memory = functools.partial(
+                    BaseTokenToKVPoolAllocator.max_new_tokens_for_memory, allocator
+                )
+                worker = SimpleNamespace(
+                    model_runner=SimpleNamespace(
+                        effective_logical_max_total_num_tokens=kv_capacity,
+                        logical_max_total_num_tokens=kv_capacity,
+                        token_to_kv_pool_allocator=allocator,
+                        max_running_requests=4,
+                        forward_stream=None,
+                        req_to_token_pool=SimpleNamespace(size=4, max_context_len=8192),
+                        token_to_kv_pool=SimpleNamespace(size=kv_capacity),
+                    ),
+                    model_config=SimpleNamespace(context_len=1 << 20),
+                    dllm_algorithm=None,
+                    random_seed=0,
+                    device="cpu",
+                )
+                info = TpModelWorker.get_worker_info(worker)
+                max_req_len, max_req_input_len = info[4], info[5]
+
+                req = self.create_shared_req("longest", max_new_tokens=None)
+                req.origin_input_ids = [0] * max_req_input_len
+                req.full_untruncated_fill_ids = list(range(max_req_input_len))
+                scheduler = SimpleNamespace(
+                    max_new_tokens_limit=None,
+                    max_req_len=max_req_len,
+                    max_total_num_tokens=kv_capacity,
+                    kv_shard_widening=1,
+                    page_size=page_size,
+                    token_to_kv_pool_allocator=allocator,
+                    sliding_window_size=None,
+                    chunked_prefill_size=None,
+                )
+                req.sampling_params.min_new_tokens = 0
+                req.set_finish_with_abort.side_effect = AssertionError(
+                    "intake must not abort an accepted prompt"
+                )
+                Scheduler.init_req_max_new_tokens(scheduler, req)
+
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    page_size=page_size,
+                    token_to_kv_pool_allocator=allocator,
+                    rem_input_tokens=1 << 20,
+                )
+                # Admission may report the pass budget as spent (NO_TOKEN) once
+                # this request fills the pool; what matters is that it runs.
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(adder.can_run_list, [req])
+
     def test_shortest_prefill_preserves_memory_admission(self):
         adder = self.create_shortest_prefill_adder()
         self.mock_token_allocator.available_size.return_value = 256
