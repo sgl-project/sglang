@@ -15,25 +15,13 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE, is_in_ci
+from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE
 
 register_cuda_ci(est_time=365, stage="extra-b", runner_config="8-gpu-h200")
 
 SWA_SERVER_ARGS = ["--page-size", "64", "--attention-backend", "triton"]
 
 
-def _has_mooncake():
-    try:
-        import mooncake.engine  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-@unittest.skipUnless(
-    is_in_ci() or _has_mooncake(),
-    "Mooncake is required for decode radix cache disaggregation coverage.",
-)
 class TestDisaggregationDecodeRadixCacheSWAMooncake(
     DisaggregationDecodeRadixCacheTestMixin, PDDisaggregationServerBase
 ):
