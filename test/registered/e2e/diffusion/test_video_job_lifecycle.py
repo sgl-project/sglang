@@ -77,7 +77,7 @@ def _paused(workers):
                 worker.resume()
 
 
-def test_video_jobs_survive_concurrency_timeouts_and_deletion(server):
+def test_video_jobs_survive_concurrency_timeouts_and_deletion(server, tmp_path):
     ctx, mode, num_gpus = server
     base = f"http://127.0.0.1:{ctx.port}"
 
@@ -86,7 +86,7 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(server):
         assert response.status_code == expected, (route, response.text, ctx.log_tail())
         return response
 
-    def submit(**overrides):
+    def submit(expected=200, **overrides):
         body = dict(
             prompt="A small sailboat on a calm blue lake in daylight.",
             size="512x320",
@@ -97,7 +97,8 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(server):
             n=1,
         )
         body.update(overrides)
-        return call("POST", "/v1/videos", json=body).json()["id"]
+        response = call("POST", "/v1/videos", expected=expected, json=body)
+        return response.json()["id"] if expected == 200 else None
 
     def wait(job_ids, expected="completed"):
         pending = set(job_ids)
@@ -146,11 +147,18 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(server):
     workers = [
         child
         for child in children
-        if "multiprocessing.spawn" in " ".join(child.cmdline())
+        if child.cmdline()[0].startswith("sgl_diffusion::scheduler")
     ]
     assert len(workers) == num_gpus, [(p.pid, p.cmdline()) for p in children]
 
     with _paused(workers):
+        for invalid in (
+            {"n": -1},
+            {"seed": -1},
+            {"num_inference_steps": 0},
+            {"guidance_scale": -1},
+        ):
+            submit(expected=400, **invalid)
         # a deterministic queue barrier avoids racing deletion against a fast model
         deleted = submit()
         call("DELETE", f"/v1/videos/{deleted}")
@@ -172,11 +180,26 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(server):
         "GET", f"/v1/videos/{baseline}/content", params={"variant": "99"}, expected=404
     )
 
+    # fail output persistence after admission, not input validation or GPU compute
+    bad_output = tmp_path / "unwritable-output"
+    bad_output.mkdir()
+    with _paused(workers):
+        failed_save = submit(output_path=str(bad_output))
+        bad_output.rmdir()
+        bad_output.touch()
+    try:
+        wait([failed_save], expected="failed")
+        call("GET", f"/v1/videos/{failed_save}/content", expected=404)
+    finally:
+        bad_output.unlink()
+
     with _paused(workers):
         timed_out = [submit() for _ in range(num_gpus if mode == "dp2" else 1)]
         wait(timed_out, expected="failed")
         for job_id in timed_out:
             call("GET", f"/v1/videos/{job_id}/content", expected=404)
+            job = call("GET", f"/v1/videos/{job_id}").json()
+            assert "Scheduler did not respond in time" in job["error"]["message"], job
 
     # timeout ends the RPC, not GPU work: drain every replica and reject late progress
     for _ in range(num_gpus if mode == "dp2" else 1):
