@@ -525,9 +525,6 @@ class AscendAttnBackend(AttentionBackend):
             ).int()
         page_stride = self.page_size * parallel.attn_dcp_size
         max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0
-        if self.dense_mla_dcp_target:
-            # Keep at least one page-table column for empty MLA lengths.
-            max_len = max(1, max_len)
         block_tables = (
             self.req_to_token[req_pool_indices, :max_len:page_stride] // page_stride
         ).to(torch.int32)
@@ -619,6 +616,12 @@ class AscendAttnBackend(AttentionBackend):
                     effective_seq_lens_cpu, forward_batch.req_pool_indices
                 )
             )
+            if metadata.block_tables.shape[1] == 0:
+                # Keep FIA's eager table nonempty without changing the KV lengths.
+                metadata.block_tables = (
+                    self.req_to_token[forward_batch.req_pool_indices, :1]
+                    // (self.page_size * self.dcp_size)
+                ).to(torch.int32)
         elif self.needs_cpu_seq_lens:
             seq_lens_max = forward_batch.seq_lens.max()
             if forward_batch.forward_mode.is_target_verify():
@@ -1132,10 +1135,11 @@ class AscendAttnBackend(AttentionBackend):
                 attention_kv_lens_cpu,
                 req_pool_indices[:bs],
             )
-            metadata.block_tables[:, :active_num_pages].copy_(
-                block_tables[:, :active_num_pages]
+            copy_num_pages = min(active_num_pages, block_tables.shape[1])
+            metadata.block_tables[:, :copy_num_pages].copy_(
+                block_tables[:, :copy_num_pages]
             )
-            metadata.block_tables[:, active_num_pages:].zero_()
+            metadata.block_tables[:, copy_num_pages:].zero_()
             local_seq_lens = get_dcp_lens(
                 effective_seq_lens,
                 self.dcp_size,
