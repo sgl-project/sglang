@@ -441,7 +441,7 @@ class Req:
      embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
                     n_tokens: {self.n_tokens}
                   flow_shift: {effective_flow_shift}
-                  image_path: {self.image_path}
+                  image_path: {_sanitize_for_logging(self.image_path)}
                  save_output: {self.save_output}
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]

@@ -277,8 +277,14 @@ class TestV41KVStore(CustomTestCase):
         fused_store_cache: exact-norm rows bitwise against the torch quantizer, and
         general rows bitwise against the unfused kernel chain."""
 
+        # 300 tokens take the block-per-token kernel, 4096 the warp-per-token one.
+        for n, num_pages in ((300, 3), (4096, 20)):
+            with self.subTest(tokens=n):
+                self._check_fused_k_norm_rope_store(n, num_pages)
+
+    def _check_fused_k_norm_rope_store(self, n, num_pages):
         g = torch.Generator(device="cuda").manual_seed(2)
-        page_size, num_pages, n = 256, 3, 300
+        page_size = 256
         angles = torch.randn(1024, 32, generator=g, device="cuda")
         freqs_table = torch.polar(torch.ones_like(angles), angles)
         pos = torch.randint(
