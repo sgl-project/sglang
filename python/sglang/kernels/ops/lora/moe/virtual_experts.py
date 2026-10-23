@@ -20,22 +20,21 @@ def _fused_virtual_topk_ids_kernel(
     token_lora_mapping_ptr,
     virtual_topk_ids_ptr,
     token_lora_mask_ptr,
+    adapter_enabled_ptr,
+    stride_enabled,
     num_experts_for_weight: tl.constexpr,
+    SHARED_OUTER: tl.constexpr,
+    NUM_SLOTS: tl.constexpr,
+    HAS_ADAPTER_ENABLED: tl.constexpr,
     M,
     top_k: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Fuses _get_virtual_topk_ids: comparison + clamp + arithmetic into one kernel.
+    Map active slots and valid base experts to virtual weight indices.
 
-    For each (m, k):
-        lora_id = token_lora_mapping[m]
-        mask[m] = (lora_id >= 0)
-        safe_lora = max(lora_id, 0)
-        if shared_outer:  (handled by num_experts_for_weight == 0 sentinel)
-            virtual_topk_ids[m, k] = safe_lora * 1  (= safe_lora)
-        else:
-            virtual_topk_ids[m, k] = topk_ids[m, k] + safe_lora * num_experts_for_weight
+    Invalid slots or base experts map to -1. Shared weights accept any
+    nonnegative base expert and use the adapter slot as the weight index.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -46,16 +45,29 @@ def _fused_virtual_topk_ids_kernel(
     # k = offs % top_k  # not needed directly
 
     lora_id = tl.load(token_lora_mapping_ptr + m, mask=valid, other=0)
-    mask_val = lora_id >= 0
-    safe_lora = tl.maximum(lora_id, 0)
+    mask_val = (lora_id >= 0) & (lora_id < NUM_SLOTS)
+    if HAS_ADAPTER_ENABLED:
+        if NUM_SLOTS == 1:
+            mask_val = mask_val & (tl.load(adapter_enabled_ptr) != 0)
+        else:
+            mask_val = mask_val & (
+                tl.load(
+                    adapter_enabled_ptr + lora_id * stride_enabled,
+                    mask=valid & mask_val,
+                    other=0,
+                )
+                != 0
+            )
+    safe_lora = tl.where(mask_val, lora_id, 0)
 
     base = tl.load(topk_ids_ptr + offs, mask=valid, other=0)
-    # Preserve negative sentinel topk_ids (e.g. -1 for non-local experts after
-    # EP dispatch). Without this, `-1 + safe_lora * num_experts` would land on
-    # a real virtual-expert slot belonging to another adapter and trigger OOB
-    # loads in downstream LoRA kernels.
-    shifted = base + safe_lora * num_experts_for_weight
-    result = tl.where(base < 0, base, shifted)
+    valid_base = base >= 0
+    if not SHARED_OUTER:
+        valid_base = valid_base & (base < num_experts_for_weight)
+    expert = 0 if SHARED_OUTER else tl.where(valid_base, base, 0)
+    shifted = expert + safe_lora * num_experts_for_weight
+    # All align providers use one sentinel bucket; borrowed route IDs stay intact.
+    result = tl.where(mask_val & valid_base, shifted, -1)
     tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
 
     # Write mask once per row (at first k position)
@@ -70,6 +82,7 @@ def _fused_virtual_topk_ids(
     num_experts: int,
     shared_outer: bool,
     max_loras: int,
+    adapter_enabled: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """
     Returns virtual topk_ids, token_lora_mask, and virtual_num_experts.
@@ -77,27 +90,27 @@ def _fused_virtual_topk_ids(
     M, top_k = topk_ids.shape
     device = topk_ids.device
 
-    if shared_outer:
-        num_experts_for_weight = 1
-        # For shared_outer, we need topk_ids to be zeros
-        zero_topk = torch.zeros_like(topk_ids)
-        input_topk = zero_topk
-    else:
-        num_experts_for_weight = num_experts
-        input_topk = topk_ids
+    num_experts_for_weight = 1 if shared_outer else num_experts
 
     virtual_topk_ids = torch.empty_like(topk_ids)
     token_lora_mask = torch.empty(M, dtype=torch.bool, device=device)
+    if M * top_k == 0:
+        return virtual_topk_ids, token_lora_mask, num_experts_for_weight * max_loras
 
     BLOCK_SIZE = 1024
     grid = ((M * top_k + BLOCK_SIZE - 1) // BLOCK_SIZE,)
 
     _fused_virtual_topk_ids_kernel[grid](
-        input_topk,
+        topk_ids,
         token_lora_mapping,
         virtual_topk_ids,
         token_lora_mask,
+        adapter_enabled,
+        adapter_enabled.stride(0) if adapter_enabled is not None else 0,
         num_experts_for_weight,
+        shared_outer,
+        max_loras,
+        adapter_enabled is not None,
         M,
         top_k,
         BLOCK_SIZE,
@@ -105,48 +118,6 @@ def _fused_virtual_topk_ids(
 
     virtual_num_experts = num_experts_for_weight * max_loras
     return virtual_topk_ids, token_lora_mask, virtual_num_experts
-
-
-@triton.jit
-def _fused_sanitize_expert_ids_kernel(
-    expert_ids_ptr,
-    output_ptr,
-    num_virtual_experts,
-    N,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    valid = offs < N
-
-    eid = tl.load(expert_ids_ptr + offs, mask=valid, other=0)
-    result = tl.where(eid < num_virtual_experts, eid, -1)
-    tl.store(output_ptr + offs, result, mask=valid)
-
-
-def fused_sanitize_expert_ids(
-    expert_ids: torch.Tensor,
-    num_virtual_experts: int,
-) -> torch.Tensor:
-    """
-    Sanitize expert_ids by replacing values >= num_virtual_experts with -1.
-
-    Returns a new tensor with expert_ids >= num_virtual_experts replaced by -1.
-    """
-    N = expert_ids.numel()
-    output = torch.empty_like(expert_ids)
-
-    BLOCK_SIZE = 1024
-    grid = ((N + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-
-    _fused_sanitize_expert_ids_kernel[grid](
-        expert_ids,
-        output,
-        num_virtual_experts,
-        N,
-        BLOCK_SIZE,
-    )
-    return output
 
 
 @triton.jit
@@ -187,15 +158,15 @@ def _moe_lora_shrink_splitk_kernel(
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
+    if pid_mn >= num_pid_m * num_pid_n:
+        return
+
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid_mn // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid_mn % num_pid_in_group) % group_size_m)
     pid_n = (pid_mn % num_pid_in_group) // group_size_m
-
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
 
     # Token routing (same pattern as fused_moe_triton_kernels)
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
@@ -309,7 +280,7 @@ def _align_block_size_jit(
     scratch=None,
     *,
     return_inactive_prefix_count: bool = False,
-    map_invalid_experts_to_sentinel: bool = False,
+    map_invalid_experts_to_sentinel: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """CUDA JIT align_block_size for num_experts > 1024 (up to 8191).
 
@@ -319,8 +290,8 @@ def _align_block_size_jit(
 
     ``scratch(numel)`` returns the int32 scratch buffer (default: a fresh
     allocation); a caller under CUDA graphs passes a persistent buffer.
-    IDs must be certified in [-1, num_experts) unless
-    ``map_invalid_experts_to_sentinel`` maps other signed IDs to bucket zero.
+    Out-of-range signed IDs share the sentinel bucket; opt out only for IDs
+    certified in [-1, num_experts).
     """
     assert num_experts <= 8191, (
         f"_align_block_size_jit supports at most 8191 experts "
@@ -544,6 +515,9 @@ def _merged_experts_fused_moe_lora_add_impl(
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
     routing_cache: dict | None = None,
+    adapter_enabled: torch.Tensor | None = None,
+    *,
+    a_output_slices: int = 1,
 ) -> None:
     """
     1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
@@ -551,8 +525,21 @@ def _merged_experts_fused_moe_lora_add_impl(
     3. Run regular SGLang fused-MoE kernels for LoRA A and LoRA B.
     4. Mask out tokens with token_lora_mapping == -1 on the add path.
     """
+    assert a_output_slices in (1, 2)
+    if a_output_slices == 2:
+        assert lora_a.shape[2] == 2 * lora_b.shape[3]
+        assert lora_b.shape[2] > 0 and lora_b.shape[2] % 2 == 0
+        assert output.shape[-1] == lora_b.shape[2]
     max_loras, _, max_lora_rank, _ = lora_a.shape
-    input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
+    num_routes = topk_ids.numel()
+    input_top_k = 1 if hidden_states.shape[0] == num_routes else topk_ids.shape[1]
+    if adapter_enabled is not None:
+        assert adapter_enabled.shape == (max_loras,)
+        assert adapter_enabled.device == topk_ids.device
+        assert adapter_enabled.dtype == torch.int32
+
+    if num_routes == 0:
+        return
 
     def _merge_lora_expert_weight(t: torch.Tensor) -> torch.Tensor:
         # [max_loras, num_experts, x, y] -> [max_loras * num_experts, x, y]
@@ -619,7 +606,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         block_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Check routing_cache for cross-call reuse (gate_up and down share routing)
-        cache_key = (num_experts, shared_outer, block_size)
+        cache_key = (num_experts, shared_outer, block_size, id(adapter_enabled))
         if routing_cache is not None:
             cached = routing_cache.get(cache_key)
             if cached is not None:
@@ -627,7 +614,12 @@ def _merged_experts_fused_moe_lora_add_impl(
 
         virtual_topk_ids, token_lora_mask, virtual_num_experts = (
             _fused_virtual_topk_ids(
-                topk_ids, token_lora_mapping, num_experts, shared_outer, max_loras
+                topk_ids,
+                token_lora_mapping,
+                num_experts,
+                shared_outer,
+                max_loras,
+                adapter_enabled=adapter_enabled,
             )
         )
         sorted_token_ids, expert_ids, num_tokens_post_padded = _align_block_size(
@@ -645,7 +637,6 @@ def _merged_experts_fused_moe_lora_add_impl(
         )
         sorted_token_ids = sorted_token_ids[:tight_padded]
         expert_ids = expert_ids[: tight_padded // block_size]
-        expert_ids = fused_sanitize_expert_ids(expert_ids, virtual_num_experts)
         result = (
             sorted_token_ids,
             expert_ids,
@@ -739,6 +730,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         fuse_add_to_output=True,
         add_output_mask=token_lora_mask,
         router_topk=topk_ids.shape[1],
+        a_output_slices=a_output_slices,
     )
 
 
@@ -790,8 +782,11 @@ def merged_experts_fused_moe_lora_add(
     experts_shared_outer_loras_a: bool,
     experts_shared_outer_loras_b: bool,
     routing_cache: dict | None = None,
+    adapter_enabled: torch.Tensor | None = None,
+    *,
+    a_output_slices: int = 1,
 ) -> None:
-    """Public API: wraps the registered op with routing_cache support."""
+    """Add virtual-expert LoRA deltas, optionally pairing A rank/output halves."""
     _merged_experts_fused_moe_lora_add_impl(
         output,
         hidden_states,
@@ -804,4 +799,6 @@ def merged_experts_fused_moe_lora_add(
         experts_shared_outer_loras_a,
         experts_shared_outer_loras_b,
         routing_cache,
+        adapter_enabled=adapter_enabled,
+        a_output_slices=a_output_slices,
     )
