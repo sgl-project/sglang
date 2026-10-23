@@ -4061,7 +4061,8 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
 class TestKvCacheShardingCompatibility(CustomTestCase):
     def setUp(self):
         super().setUp()
-        # Sharding currently requires Python, independent of the default backend.
+        # Sharding requires a rotation-aware backend, independent of the
+        # default backend selection.
         enter_scope(
             self, envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python")
         )
@@ -4109,6 +4110,23 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
             )
         ]
         return args
+
+    def test_sharding_defaults_to_python_when_backend_is_unset(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        with patch.dict(os.environ), envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+            handle_kv_cache_sharding(args, 80 * 1024)
+            self.assertEqual(
+                envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "python"
+            )
+
+    def test_unsharded_launch_keeps_the_general_backend_default(self):
+        args = self._args(enable_kv_cache_sharding=False)
+        with patch.dict(os.environ):
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+            handle_kv_cache_sharding(args, 80 * 1024)
+            self.assertFalse(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set())
+            self.assertEqual(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "rust")
 
     def test_encoder_decoder_is_rejected_before_backend_setup(self):
         args = self._args(model_config=SimpleNamespace(is_encoder_decoder=True))
@@ -4218,26 +4236,20 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     handle_kv_cache_sharding(self._args(**overrides))
 
-    def test_sharding_defaults_to_python_when_backend_is_unset(self):
+    def test_rust_unified_tree_core_is_accepted(self):
         args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
-        with patch.dict(os.environ), envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+        with (
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"),
+            envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+        ):
             handle_kv_cache_sharding(args, 80 * 1024)
-            self.assertEqual(
-                envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "python"
-            )
-
-    def test_unsharded_launch_keeps_the_general_backend_default(self):
-        args = self._args(enable_kv_cache_sharding=False)
-        with patch.dict(os.environ):
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
-            handle_kv_cache_sharding(args, 80 * 1024)
-            self.assertFalse(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set())
             self.assertEqual(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "rust")
 
-    def test_rust_unified_tree_core_is_rejected(self):
-        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
-            with self.assertRaisesRegex(ValueError, "requires the Python"):
+    def test_unsupported_unified_tree_core_is_rejected(self):
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("cpp"):
+            with self.assertRaisesRegex(
+                ValueError, "requires a rotation-aware UnifiedTreeCore"
+            ):
                 handle_kv_cache_sharding(self._args())
 
     def test_rust_tree_core_is_allowed_with_radix_disabled(self):
