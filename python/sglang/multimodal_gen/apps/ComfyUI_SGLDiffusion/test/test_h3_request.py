@@ -159,6 +159,25 @@ def _remove_tmp_files():
             os.remove(path)
 
 
+_TMP_FILES = []
+
+
+def _tmp_file(suffix):
+    """A temp file path that the autouse fixture below deletes afterwards."""
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
+        _TMP_FILES.append(fh.name)
+        return fh.name
+
+
+@pytest.fixture(autouse=True)
+def _remove_tmp_files():
+    yield
+    while _TMP_FILES:
+        path = _TMP_FILES.pop()
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def _run_node(**node_kwargs):
     """Drive the node through the real client and capture the POST payload."""
     client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:30010")

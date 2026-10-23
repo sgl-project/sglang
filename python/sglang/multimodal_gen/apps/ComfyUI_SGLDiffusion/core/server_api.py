@@ -96,6 +96,7 @@ class SGLDiffusionServerAPI:
         background: Optional[str] = "auto",
         output_format: Optional[str] = None,
         generator_device: Optional[str] = "cuda",
+        enhance_prompt: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate or edit an image using SGLang Diffusion API.
@@ -121,6 +122,7 @@ class SGLDiffusionServerAPI:
             background: Background type ("auto", "transparent", "opaque")
             output_format: Output format ("png", "jpeg", "webp")
             generator_device: Device for random generator ("cuda" or "cpu")
+            enhance_prompt: Rewrite the prompt on the server first
 
         Returns:
             Dictionary containing the API response with generated/edited image data
@@ -149,6 +151,7 @@ class SGLDiffusionServerAPI:
             background=background,
             output_format=output_format,
             generator_device=generator_device,
+            enhance_prompt=enhance_prompt,
         )
 
         # If image_path is provided, use edit endpoint
@@ -497,6 +500,7 @@ class SGLDiffusionServerAPI:
         background: Optional[str] = None,
         output_format: Optional[str] = None,
         generator_device: Optional[str] = None,
+        enhance_prompt: bool = False,
     ) -> Dict[str, Any]:
         """
         Build common parameters for both image generation and editing.
@@ -528,6 +532,8 @@ class SGLDiffusionServerAPI:
             params["output_format"] = output_format
         if generator_device:
             params["generator_device"] = generator_device
+        if enhance_prompt:
+            params["enhance_prompt"] = True
 
         return params
 

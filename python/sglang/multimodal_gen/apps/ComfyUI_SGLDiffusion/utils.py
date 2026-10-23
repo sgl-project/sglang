@@ -1,5 +1,6 @@
 import base64
 import io
+import logging
 import os
 import shutil
 import subprocess
@@ -12,6 +13,8 @@ import requests
 import torch
 from comfy_api.input import VideoInput
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_dir(path: str) -> None:
@@ -82,7 +85,16 @@ def is_empty_image(image: torch.Tensor, tolerance: float = 1e-6) -> bool:
 def get_image_path(image: torch.Tensor) -> str:
     """
     Save tensor image to ComfyUI temp directory as PNG and return the path.
+
+    This input only has a single image slot, so a batch keeps its first
+    image (as before) and logs a warning that the rest are dropped.
     """
+    if image.dim() == 4 and image.shape[0] > 1:
+        logger.warning(
+            "get_image_path received a batch of %d images but this input only "
+            "accepts one; using the first. Use 'Image From Batch' to pick another.",
+            image.shape[0],
+        )
     temp_dir = folder_paths.get_temp_directory()
 
     # Build file name

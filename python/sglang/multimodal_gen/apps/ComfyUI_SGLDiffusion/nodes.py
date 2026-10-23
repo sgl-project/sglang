@@ -19,14 +19,19 @@ from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
 from .options import SGLDOptions
 
 
-def _enable_gguf_in_diffusion_models() -> None:
-    """Let SGLDUNETLoader list ``.gguf`` DiTs. Quantization lives in the file."""
-    entry = folder_paths.folder_names_and_paths.get("diffusion_models")
-    if entry is not None and len(entry) >= 2 and isinstance(entry[1], set):
-        entry[1].add(".gguf")
+def _list_unet_names_including_gguf() -> list[str]:
+    """SGLDUNETLoader's file list plus ``.gguf`` DiTs.
+
+    Kept local: registering ``.gguf`` in ``folder_paths`` would make ComfyUI's
+    stock loader offer files it cannot load.
+    """
+    names = set(folder_paths.get_filename_list("diffusion_models"))
+    for folder in folder_paths.get_folder_paths("diffusion_models"):
+        files, _ = folder_paths.recursive_search(folder)
+        names.update(folder_paths.filter_files_extensions(files, {".gguf"}))
+    return sorted(names)
 
 
-_enable_gguf_in_diffusion_models()
 from .utils import (
     convert_b64_to_tensor_image,
     convert_video_to_comfy_video,
@@ -153,7 +158,7 @@ class SGLDUNETLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
+                "unet_name": (_list_unet_names_including_gguf(),),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e5m2"],),
             },
             "optional": {
@@ -353,11 +358,19 @@ class SGLDiffusionGenerateImage:
                         "one IMAGE batch. Image i uses seed + i.",
                     },
                 ),
+                "enhance_prompt": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Rewrite the prompt on the server (needs "
+                        "--prompt-enhancer-config); returned as revised_prompt",
+                    },
+                ),
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "revised_prompt")
     FUNCTION = "generate_image"
     CATEGORY = "SGLDiffusion"
     OUTPUT_NODE = False
@@ -375,6 +388,7 @@ class SGLDiffusionGenerateImage:
         height: int = 1024,
         enable_teacache: bool = False,
         num_images: int = 1,
+        enhance_prompt: bool = False,
     ):
         """Generate image using SGLang Diffusion API."""
         if not positive_prompt:
@@ -405,6 +419,8 @@ class SGLDiffusionGenerateImage:
             request_params["seed"] = seed
         if enable_teacache:
             request_params["enable_teacache"] = True
+        if enhance_prompt:
+            request_params["enhance_prompt"] = True
         if image is not None:
             # If the image is empty, use the size of the image to generate the image
             if is_empty_image(image):
@@ -420,7 +436,9 @@ class SGLDiffusionGenerateImage:
         except Exception as e:
             raise RuntimeError(f"Failed to generate image: {str(e)}")
 
-        return (_decode_image_batch(response, num_images),)
+        images = _decode_image_batch(response, num_images)
+        revised_prompt = response["data"][0].get("revised_prompt") or positive_prompt
+        return (images, revised_prompt)
 
 
 class SGLDiffusionGenerateVideo:
@@ -453,6 +471,10 @@ class SGLDiffusionGenerateVideo:
                         "default": None,
                         "tooltip": "input image to use for image-to-video",
                     },
+                ),
+                "video": (
+                    "VIDEO",
+                    {"tooltip": "source clip for video-to-video"},
                 ),
                 "seed": (
                     "INT",
@@ -531,11 +553,19 @@ class SGLDiffusionGenerateVideo:
                         "default": False,
                     },
                 ),
+                "enhance_prompt": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Rewrite the prompt on the server (needs "
+                        "--prompt-enhancer-config); returned as revised_prompt",
+                    },
+                ),
             },
         }
 
-    RETURN_TYPES = ("VIDEO", "STRING")
-    RETURN_NAMES = ("video", "video_path")
+    RETURN_TYPES = ("VIDEO", "STRING", "STRING")
+    RETURN_NAMES = ("video", "video_path", "revised_prompt")
     FUNCTION = "generate_video"
     CATEGORY = "SGLDiffusion"
     OUTPUT_NODE = False
@@ -555,6 +585,8 @@ class SGLDiffusionGenerateVideo:
         fps: int = 24,
         seconds: int = 5,
         enable_teacache: bool = False,
+        video=None,
+        enhance_prompt: bool = False,
     ):
         """Generate video using SGLang Diffusion API."""
         if not positive_prompt:
@@ -593,6 +625,13 @@ class SGLDiffusionGenerateVideo:
                 request_params["size"] = size
             else:
                 request_params["input_reference"] = get_image_path(image)
+        if video is not None:
+            request_params["video_path"] = os.path.join(
+                output_dir, f"sgl_input_{uuid.uuid4().hex[:8]}.mp4"
+            )
+            video.save_to(request_params["video_path"])
+        if enhance_prompt:
+            request_params["extra_fields"] = {"enhance_prompt": True}
 
         # Call API
         try:
@@ -612,7 +651,8 @@ class SGLDiffusionGenerateVideo:
         except Exception as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
 
-        return (video, video_path)
+        revised_prompt = response.get("revised_prompt") or positive_prompt
+        return (video, video_path, revised_prompt)
 
 
 class SGLDiffusionGenerateH3:

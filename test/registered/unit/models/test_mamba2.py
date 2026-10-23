@@ -11,7 +11,7 @@ constructing the full model or requiring a GPU:
   - ``lm_head.weight``  kept as-is
   - ``*inv_freq``       entries skipped
 
-Run: python3 test/srt/models/test_mamba2.py
+Run: python3 test/registered/unit/models/test_mamba2.py
 """
 
 import unittest
@@ -19,6 +19,10 @@ import unittest
 import torch
 
 from sglang.srt.models.mamba2 import Mamba2ForCausalLM
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _param(like: torch.Tensor) -> torch.nn.Parameter:
@@ -41,7 +45,7 @@ class _FakeMamba2:
     load_weights = Mamba2ForCausalLM.load_weights
 
 
-class TestMamba2WeightRemap(unittest.TestCase):
+class TestMamba2WeightRemap(CustomTestCase):
     def test_backbone_names_are_remapped_and_loaded(self):
         # SGLang-side parameters (load targets).
         sgl = {
