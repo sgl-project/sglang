@@ -182,20 +182,20 @@ pub trait TreeComponent<K: ChildKeyType> {
         result
     }
 
-    /// Called per-node when an insert's key overlaps an existing node.
+    /// Called per-node when an insert's key overlaps an existing node; the
+    /// node's slice of the request is `params.value[total_prefix_len..][..prefix_len]`.
     /// `preserve_full_ids` keeps canonical FULL IDs during auxiliary recovery.
-    /// Returns the index within `value_slice` from which this component
+    /// Returns the index within that slice from which this component
     /// consumed (took ownership of) the underlying KV pool slots.
     /// Returns `prefix_len` if nothing was consumed (default).
     /// The insert walk uses this to free only the non-consumed duplicate
-    /// portion: `value_slice[dup_start..consumed_from]`.
+    /// portion: `slice[dup_start..consumed_from]`.
     fn update_component_on_insert_overlap(
         &self,
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
         prefix_len: usize,
         total_prefix_len: usize,
-        value_slice: Tensor,
         params: &InsertParams<'_, K>,
         preserve_full_ids: bool,
         result: &mut InsertResult,

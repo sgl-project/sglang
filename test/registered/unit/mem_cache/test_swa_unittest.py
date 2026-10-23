@@ -482,6 +482,46 @@ class TestFreeKvRow(CustomTestCase):
 
         self.assertEqual(allocator.full_available_size(), after_alloc + 12)
 
+    def _free_rows_in_one_group(self, batched: bool):
+        allocator, _ = _build_swa_allocator(page_size=4, kv_size=64, kv_size_swa=64)
+        rows = [_swa_alloc(allocator, 12) for _ in range(3)]
+        # The second row's window already released its first page's SWA peers.
+        allocator.free_swa(rows[1][:4])
+        with patch.object(
+            type(allocator), "_batches_row_segments", return_value=batched
+        ):
+            allocator.free_group_begin()
+            free_kv_row_segments(allocator, [(rows[0], 0)], swa_evicted_seqlen=0)
+            free_kv_row_segments(allocator, [(rows[1], 0)], swa_evicted_seqlen=4)
+            free_kv_row_segments(
+                allocator, [(rows[2][:4], 0), (rows[2][8:], 8)], swa_evicted_seqlen=0
+            )
+            in_group = (
+                allocator.full_available_size(),
+                allocator.swa_available_size(),
+            )
+            allocator.free_group_end()
+        return allocator, rows, in_group
+
+    def test_grouped_rows_free_in_one_pass_like_one_segment_at_a_time(self):
+        batched, rows, batched_in_group = self._free_rows_in_one_group(batched=True)
+        reference, _, reference_in_group = self._free_rows_in_one_group(batched=False)
+
+        self.assertEqual(batched_in_group, reference_in_group)
+        for side in ("full_attn_allocator", "swa_attn_allocator"):
+            self.assertEqual(
+                sorted(getattr(batched, side).get_all_free_pages().tolist()),
+                sorted(getattr(reference, side).get_all_free_pages().tolist()),
+                side,
+            )
+        torch.testing.assert_close(
+            batched.full_to_swa_index_mapping, reference.full_to_swa_index_mapping
+        )
+        # Row three's middle page was never freed, so it keeps its SWA peer.
+        self.assertTrue(
+            (batched.full_to_swa_index_mapping[rows[2][4:8]] > 0).all().item()
+        )
+
     def test_free_kv_row_reads_the_record_row_and_its_floor(self):
         indices = _swa_alloc(self.allocator, 8)
         cache = _RowCache(self.allocator, indices)

@@ -1138,7 +1138,6 @@ fn insert_overlap_can_preserve_unlocked_full_ids() {
             leaf,
             4,
             0,
-            params.value.shallow_clone(),
             &params,
             true,
             &mut result,

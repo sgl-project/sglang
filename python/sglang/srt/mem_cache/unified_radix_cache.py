@@ -1277,18 +1277,32 @@ class UnifiedRadixCache(BasePrefixCache):
         # With PD decode radix caching, SWA matching can stop short of the inserted path.
         # Repoint from that path to protect all tree-owned KV.
         new_last_node = result.last_device_node
-        new_indices = self.path_device_indices(new_last_node)
+        # A finished request's row is released right after: only the free from
+        # the new protected length reads it, so it needs no rewrite.
+        rewrite_row = not is_finished or self.enable_session_radix_cache
+        if rewrite_row:
+            new_indices = self.path_device_indices(new_last_node)
+            new_protected_len = len(new_indices)
+        else:
+            new_protected_len = self.tree_core.full_device_path_len(
+                new_last_node, self.root_node_handle()
+            )
         new_prefix_len = result.prefix_len
-        assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
-            f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        assert req.kv.cache_protected_len <= new_protected_len + self.page_size - 1, (
+            f"{req.kv.cache_protected_len=}, {new_protected_len=}, {page_aligned_len=}"
         )
         assert (
-            new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
-        ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        self.req_to_token_pool.write(
-            (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
-            new_indices[req.kv.cache_protected_len :],
-        )
+            new_prefix_len <= new_protected_len
+            and new_protected_len == page_aligned_len
+        ), f"{new_prefix_len=}, {new_protected_len=}, {page_aligned_len=}"
+        if rewrite_row:
+            self.req_to_token_pool.write(
+                (
+                    req.kv.req_pool_idx,
+                    slice(req.kv.cache_protected_len, new_protected_len),
+                ),
+                new_indices[req.kv.cache_protected_len :],
+            )
 
         self.unlock(req.lock)
         # Opt-in: leave the matched-prefix mamba evictable during decode (it is
@@ -1307,7 +1321,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Update req fields
-        req.kv.cache_protected_len = len(new_indices)
+        req.kv.cache_protected_len = new_protected_len
         req.last_node = new_last_node
 
         # cleanup
