@@ -70,6 +70,7 @@ if _is_hip:
     from sglang.kernels.ops.attention.fused_qk_rope_reshape_and_cache import (
         fused_qk_rope_reshape_and_cache,
     )
+    from sglang.srt.layers.rotary_embedding import base_hip as _hip
 
 if _is_xpu:
     try:
@@ -163,6 +164,7 @@ class RotaryEmbedding(BaseFusedOp):
                 disable=_is_npu,
             )(apply_rotary_emb)
         self.position_cos, self.position_sin = None, None
+        self._hip_fallback_cache = None
 
     def try_bf16_rope_store(
         self,
@@ -511,16 +513,18 @@ class RotaryEmbedding(BaseFusedOp):
                 )
                 if _is_hip:
                     self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                    cos_sin_cache = _hip.fallback_cos_sin_cache(self, query)
                 else:
                     self.cos_sin_cache = self.cos_sin_cache.to(
                         query.device, dtype=query.dtype
                     )
+                    cos_sin_cache = self.cos_sin_cache
                 self.fallback_rotary_embedding(
                     positions,
                     query,
                     key,
                     self.head_size,
-                    self.cos_sin_cache,
+                    cos_sin_cache,
                     self.is_neox_style,
                 )
         return query, key
