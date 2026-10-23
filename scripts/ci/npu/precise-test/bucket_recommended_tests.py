@@ -623,9 +623,10 @@ def main():
         print(f"::warning::Recommended file not found: {rec_file}")
     print(f"Recommended test entries: {len(raw_entries)} ({len(recommended)} files)")
 
-    # Classify every changed path before any decision. A change the coverage
-    # baseline cannot judge (test/CI infrastructure) forces the full suites;
-    # everything else lets precision mode decide per suite.
+    # Classify every changed path. Test/CI infrastructure cannot be judged by
+    # the coverage baseline; the decision itself is taken after pool
+    # enumeration, because the multimodal test tree needs the case config to
+    # tell a runnable case file from shared fixtures (see diffusion_infra).
     changed_files: list[str] = []
     if args.changed_files:
         cf = Path(args.changed_files)
@@ -636,26 +637,6 @@ def main():
     changed_classes = {p: classify_changed_path(p) for p in changed_files}
     non_judgeable = sorted(
         p for p, kind in changed_classes.items() if kind in ("test_infra", "ci_infra")
-    )
-
-    if not changed_files:
-        # test_selector.py writes this file on every PR run; missing/empty
-        # means it failed, so there is no evidence to narrow anything down.
-        decision = "full"
-        decision_reason = "changed-file list unavailable (test_selector.py did not run)"
-    elif non_judgeable:
-        decision = "full"
-        decision_reason = "non-judgeable change(s): " + ", ".join(non_judgeable)
-    elif not raw_entries:
-        decision = "skip_all"
-        decision_reason = "judgeable changes recommend no test"
-    else:
-        decision = "precision"
-        decision_reason = f"{len(raw_entries)} recommended test(s)"
-    skip_all_suites = decision == "skip_all"
-    print(
-        f"Decision: {decision} ({decision_reason}); "
-        f"{len(changed_files)} changed path(s), {len(non_judgeable)} non-judgeable"
     )
 
     suites = [s.strip() for s in args.suites.split(",") if s.strip()]
@@ -748,6 +729,40 @@ def main():
                 f"Suite {job} (diffusion {suite}): {pool.size} cases, "
                 f"{len(tokens)} recommended"
             )
+
+        # A test_*.py under the multimodal test tree that the NPU case config
+        # does not list is shared infrastructure (fixtures, helpers such as
+        # test_server_common.py), not a runnable case. It can change every
+        # diffusion case, so it must not be mistaken for a touched test file.
+        diffusion_infra = sorted(
+            p
+            for p in changed_files
+            if changed_classes.get(p) == "test_case"
+            and p.startswith(DIFFUSION_TEST_PREFIX)
+            and p not in all_pool
+        )
+        if diffusion_infra:
+            non_judgeable = sorted(set(non_judgeable) | set(diffusion_infra))
+
+    if not changed_files:
+        # test_selector.py writes this file on every PR run; missing/empty
+        # means it failed, so there is no evidence to narrow anything down.
+        decision = "full"
+        decision_reason = "changed-file list unavailable (test_selector.py did not run)"
+    elif non_judgeable:
+        decision = "full"
+        decision_reason = "non-judgeable change(s): " + ", ".join(non_judgeable)
+    elif not raw_entries:
+        decision = "skip_all"
+        decision_reason = "judgeable changes recommend no test"
+    else:
+        decision = "precision"
+        decision_reason = f"{len(raw_entries)} recommended test(s)"
+    skip_all_suites = decision == "skip_all"
+    print(
+        f"Decision: {decision} ({decision_reason}); "
+        f"{len(changed_files)} changed path(s), {len(non_judgeable)} non-judgeable"
+    )
 
     total_count = sum(len(b) for b in buckets.values())
     # Recommendations no suite here contains: base-a / CPU / nightly tests run
