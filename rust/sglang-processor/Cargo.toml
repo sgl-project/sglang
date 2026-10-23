@@ -14,7 +14,7 @@ tokenizer = ["dep:dynamo-tokenizers"]
 openai = ["dep:regex", "dep:uuid", "dep:sglang-api-types"]
 
 [dependencies]
-sglang-api-types = { path = "../sglang-api-types", optional = true }
+sglang-api-types = { version = "0.1.0", path = "../sglang-api-types", optional = true }
 async-stream = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
