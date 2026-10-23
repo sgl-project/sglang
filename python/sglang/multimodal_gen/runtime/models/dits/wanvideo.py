@@ -610,6 +610,13 @@ class WanTransformerBlock(nn.Module):
             quant_config=quant_config,
         )
         self.mlp_residual = MulAdd()
+        # norm1 that first adds the previous block's gated FFN output (its MulAdd)
+        self.ffn_residual_norm1 = ScaleResidualLayerNormScaleShift(
+            dim,
+            eps=eps,
+            elementwise_affine=False,
+            dtype=torch.float32,
+        )
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         # [3 * dim, dim] weight / [3 * dim] bias whose row blocks back to_q, to_k, to_v
@@ -728,7 +735,8 @@ class WanTransformerBlock(nn.Module):
         c_scale_msa: torch.Tensor,
         c_gate_msa: torch.Tensor,
         orig_dtype: torch.dtype,
-    ) -> torch.Tensor:
+        defer_ffn_residual: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
         null_shift = null_scale = torch.zeros(
@@ -748,7 +756,18 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states = norm_hidden_states.to(orig_dtype)
         hidden_states = hidden_states.to(orig_dtype)
         ff_output = self.ffn(norm_hidden_states)
+        if defer_ffn_residual:
+            return hidden_states, (ff_output, c_gate_msa)
         return self.mlp_residual(ff_output, c_gate_msa, hidden_states).to(orig_dtype)
+
+    @property
+    def chains_ffn_residual(self) -> bool:
+        """Whether the FFN residual (MulAdd) and the next norm1 run as one kernel with
+        the same bits: both sides on their CUDA kernels"""
+        return all(
+            op._forward_method == op.forward_cuda
+            for op in (self.mlp_residual, self.norm1, self.ffn_residual_norm1)
+        )
 
     def forward(
         self,
@@ -757,7 +776,11 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        ffn_residual: tuple[torch.Tensor, torch.Tensor] | None = None,
+        defer_ffn_residual: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """``ffn_residual`` is the previous block's (ff_output, gate), still to be added
+        to ``hidden_states``; ``defer_ffn_residual`` hands this block's back the same way."""
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
@@ -787,7 +810,13 @@ class WanTransformerBlock(nn.Module):
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        if ffn_residual is None:
+            norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        else:
+            ff_output, ff_gate = ffn_residual
+            norm_hidden_states, hidden_states = self.ffn_residual_norm1(
+                hidden_states, ff_output, ff_gate, shift_msa, scale_msa
+            )
         query, key, value, roped = self._qkv_rope(
             norm_hidden_states, self.local_num_heads, rope_cos_sin_cache
         )
@@ -859,6 +888,7 @@ class WanTransformerBlock(nn.Module):
             c_scale_msa,
             c_gate_msa,
             orig_dtype,
+            defer_ffn_residual,
         )
 
 
@@ -1206,6 +1236,20 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         self.layer_names = ["blocks"]
 
+    def _chains_ffn_residuals(self) -> bool:
+        # plain Wan blocks in a plain list (a cache adapter or another block type keeps the
+        # one-block-at-a-time contract)
+        return (
+            type(self.blocks) is nn.ModuleList
+            and len(self.blocks) > 1
+            and all(
+                type(block) is WanTransformerBlock
+                and "forward" not in vars(block)
+                and block.chains_ffn_residual
+                for block in self.blocks
+            )
+        )
+
     def post_load_weights(self) -> None:
         super().post_load_weights()
         for block in self.blocks:
@@ -1439,14 +1483,36 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     ],
                     dim=-1,
                 )
-            for block in self.blocks:
-                hidden_states = block(
+            if self._chains_ffn_residuals():
+                # each block's FFN residual is added by the next block's norm1
+                ffn_residual = None
+                for block in self.blocks[:-1]:
+                    hidden_states, ffn_residual = block(
+                        hidden_states,
+                        encoder_hidden_states,
+                        timestep_proj,
+                        freqs_cis,
+                        rope_cos_sin_cache=rope_cos_sin_cache,
+                        ffn_residual=ffn_residual,
+                        defer_ffn_residual=True,
+                    )
+                hidden_states = self.blocks[-1](
                     hidden_states,
                     encoder_hidden_states,
                     timestep_proj,
                     freqs_cis,
                     rope_cos_sin_cache=rope_cos_sin_cache,
+                    ffn_residual=ffn_residual,
                 )
+            else:
+                for block in self.blocks:
+                    hidden_states = block(
+                        hidden_states,
+                        encoder_hidden_states,
+                        timestep_proj,
+                        freqs_cis,
+                        rope_cos_sin_cache=rope_cos_sin_cache,
+                    )
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
