@@ -13,10 +13,8 @@ ARG TORCHAUDIO_VERSION=${TORCHAUDIO_NIGHTLY_VERSION}
 # source: build sglang-kernel / sgl-deep-gemm / sgl-deep-ep from source; pypi: download released wheels.
 ARG SGL_WHEELS_SOURCE=source
 ARG SGL_KERNEL_VERSION=0.4.10
-# MSA has no versioned release yet; the M3.1 backend needs the multi-head q8kv4
-# indexer and strided cache views (2913dfd or later). 1e7bf76 (nv_dev) adds the
-# TP4 MegaAttention + token-parallel MoE kernels, the DSpark draft backbone and their
-# SGLang monokernel plugin.
+# MSA has no versioned release yet; pin a commit with the multi-head q8kv4 indexer,
+# strided cache views, and the SGLang monokernel plugin.
 ARG MSA_COMMIT=1e7bf76f26a5f53cfc2d4d297e1ec2e40955e431
 # Wheel build args
 ARG MANYLINUX_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.4
