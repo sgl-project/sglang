@@ -831,8 +831,7 @@ def shard_range(
 
 
 def engram_rows_stageable(forward_mode: ForwardMode) -> bool:
-    """Whether the scheduler stages the engram rows of a batch in this mode
-    (EngramRowStager); decode and target verify gather them in the forward."""
+    """Whether EngramRowStager stages a batch in this mode."""
     return forward_mode.is_extend_without_speculative()
 
 
@@ -918,8 +917,7 @@ class EngramEmbedding(nn.Module):
 
     @property
     def shared_host_table_without_ats(self) -> bool:
-        """The shared host layout, which maps every row in this process, on a GPU
-        without ATS, where the forward reads random host rows slowly."""
+        """The shared host layout (every row mapped here) on a GPU without ATS."""
         return self._shared and self._sort_host_reads
 
     def enable_scheduler_staging(self) -> None:
@@ -989,9 +987,8 @@ class EngramEmbedding(nn.Module):
         copied: torch.cuda.Event,
         hash_shape: torch.Size,
     ) -> torch.Tensor:
-        """Dequantize the staged rows of this layer's hash ids, in their order, into
-        [*hash_shape, dim]. Rows past the staged ones (prefill graph padding) are
-        zero."""
+        """Dequantize this layer's staged rows into [*hash_shape, dim]; rows past the
+        staged ones (prefill graph padding) are zero."""
         stream = torch.cuda.current_stream()
         stream.wait_event(copied)
         rows.record_stream(stream)

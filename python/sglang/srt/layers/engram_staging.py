@@ -1,12 +1,9 @@
 """Scheduler-side staging of DeepSeek-V4.1 engram rows from the shared host table.
 
-Without ATS the GPU maps the host table in its own page tables, and a gather of
-random rows from a table far larger than its translation reach runs at a fraction
-of PCIe bandwidth, on the forward stream. The scheduler knows every token of an
-extend batch before its forward, so it hashes the n-grams on the CPU, gathers
-each engram layer's fp8 rows and e8m0 scales into pinned memory, and copies them
-to the GPU on a side stream while the previous forward runs. The layer then only
-dequantizes contiguous device rows (EngramEmbedding.dequant_staged).
+Without ATS the forward's gather of random host rows is slow (_sorted_host_reads).
+The scheduler knows an extend batch's tokens before its forward, so it hashes them
+on the CPU, gathers each layer's rows into pinned memory, and copies them to the GPU
+on a side stream while the previous forward runs; the layer only dequantizes them.
 """
 
 from __future__ import annotations
@@ -59,9 +56,7 @@ class EngramRowStager:
     def from_model(
         cls, model: torch.nn.Module, hasher: EngramHasher, device: torch.device
     ) -> Optional[EngramRowStager]:
-        """A stager when every engram table is the shared host layout on a GPU
-        without ATS: only that layout maps every row in this process, and with
-        ATS the forward-stream gather already runs at full speed."""
+        """A stager when every engram table is shared_host_table_without_ats."""
         if not envs.SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING.get():
             return None
         engrams = sorted(

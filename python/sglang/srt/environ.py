@@ -1730,9 +1730,8 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
-    # Opt-in: the scheduler stages each extend batch's rows of the shared table
-    # on GPUs without ATS, where the forward's own gather of random host rows is
-    # slow. Pays off for large prefill batches.
+    # Scheduler-side staging of shared host-table rows on GPUs without ATS
+    # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
 
     # Kernels and indexer
