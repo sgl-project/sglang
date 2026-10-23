@@ -809,8 +809,8 @@ jobs:
 
       # Bucket the recommended tests per suite. Downstream jobs consume two
       # outputs per suite: should_run_<suite> ('false' -> skip the job, e.g.
-      # empty bucket/recommendation) and only_tests_<suite> (non-empty only in
-      # precision mode, gated inside the script). On failure outputs stay
+      # empty bucket in precision mode) and only_tests_<suite> (non-empty only
+      # in precision mode, gated inside the script). On failure outputs stay
       # empty -> callers run full suites.
       - name: Bucket recommended tests per suite
         id: bucket-tests
