@@ -560,6 +560,7 @@ def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
         req_pool_indices=torch.arange(2, dtype=torch.int64),
         seq_lens=torch.ones(2, dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
+        ragged_verify_layout=None,
         spec_info=None,
         positions=torch.arange(2, dtype=torch.int64),
         out_cache_loc=torch.arange(2, dtype=torch.int64),
@@ -598,6 +599,7 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
         req_pool_indices=torch.arange(2, dtype=torch.int64),
         seq_lens=torch.ones(2, dtype=torch.int32),
         forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        ragged_verify_layout=None,
         spec_info=SimpleNamespace(
             num_tokens_per_req=4,
             num_accept_tokens=ExplodingAcceptTokens(),
@@ -854,7 +856,7 @@ def test_unified_ragged_verify_reads_only_this_replays_pages(monkeypatch):
     "forward_mode,spec_info,step_id,tokens_per_req",
     [
         (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
-        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(), 0, 4),
     ],
     ids=["draft_decode", "target_verify"],
 )
@@ -944,6 +946,7 @@ def test_metadata_update_records_inside_cuda_graph():
         req_pool_indices=torch.arange(2, dtype=torch.int64, device=DEVICE),
         seq_lens=torch.tensor([3, 4], dtype=torch.int32, device=DEVICE),
         forward_mode=ForwardMode.DECODE,
+        ragged_verify_layout=None,
         spec_info=None,
         positions=torch.arange(2, dtype=torch.int64, device=DEVICE),
         out_cache_loc=torch.arange(2, dtype=torch.int64, device=DEVICE),
@@ -991,6 +994,7 @@ def test_graph_read_done_event_fences_slot_mutation():
         req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
         seq_lens=torch.tensor([4], dtype=torch.int32, device=DEVICE),
         forward_mode=ForwardMode.DECODE,
+        ragged_verify_layout=None,
         spec_info=None,
         positions=torch.tensor([0], dtype=torch.int64, device=DEVICE),
         out_cache_loc=torch.tensor([3], dtype=torch.int64, device=DEVICE),
