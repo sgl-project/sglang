@@ -208,7 +208,9 @@ class Memory(msgspec.Struct):
     # -------------------------------------------------------------------------
     enable_unified_cache_external_linker: A[
         bool,
-        "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
+        "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier. "
+        "With --pp-size > 1 it needs the Mooncake backend, whose master's --default_kv_lease_ttl "
+        "must outlast a request's pass through the pipeline.",
     ] = False
     unified_cache_external_linker_backend: A[
         str,

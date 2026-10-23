@@ -17,7 +17,8 @@ The tree only needs a handful of guarded hooks:
 
 A load lands in device slots private to the loading request and joins the tree
 only when that request inserts it like any computed KV. A failed load therefore
-reaches nothing but its own requests, which the scheduler aborts.
+reaches nothing but its own requests, which the scheduler aborts; under pipeline
+parallelism it raises instead, since only the failing stage would abort them.
 """
 
 from __future__ import annotations
@@ -169,6 +170,20 @@ class UnifiedCacheLinker(ABC):
         Local to this rank; the tree intersects the sets across ranks.
         """
 
+    def lookup_pipeline_stages(
+        self, rid: str, transfers: list[PoolTransfer], pp_size: int
+    ) -> list[int]:
+        """Return the prefix lengths (in pages) that every pipeline stage can
+        restore, as :meth:`lookup` does for this stage alone.
+
+        Called on PP0 only. Each stage stores its own layers, and the stages
+        must restore the same prefix to keep their batches identical, so PP0
+        answers for all of them and hands the result down the pipeline.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support pipeline parallelism."
+        )
+
     @abstractmethod
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         """Queue a load into the given device indices.
@@ -199,8 +214,9 @@ class UnifiedCacheLinker(ABC):
         """Return the number of completed offloads waiting to be consumed."""
 
     @abstractmethod
-    def pop_completed_offload(self) -> bool:
-        """Consume the oldest completed offload and return its result."""
+    def pop_completed_offload(self, block: bool = False) -> bool:
+        """Consume the oldest completed offload and return its result; with
+        ``block``, wait for it to complete first."""
 
     @abstractmethod
     def reset(self) -> None:
@@ -303,7 +319,7 @@ class UnifiedCacheLinkerWrapper:
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
         hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
+            self._lookup(req.rid, lookup_transfers),
             num_pages=len(tail_hashes),
             device_hit_pages=0,
         )
@@ -333,6 +349,16 @@ class UnifiedCacheLinkerWrapper:
             ),
         )
 
+    def _lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        cache = self.cache
+        if cache.pp_size == 1:
+            return self.cache_linker.lookup(rid, transfers)
+        # PP0 answers for every stage; the others receive its verdict in
+        # _sync_restorable_prefix.
+        if cache.pp_rank > 0:
+            return []
+        return self.cache_linker.lookup_pipeline_stages(rid, transfers, cache.pp_size)
+
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
     ) -> int:
@@ -341,13 +367,17 @@ class UnifiedCacheLinkerWrapper:
 
         A rank's set is sparse, so reducing per-rank maxima could land on a
         length that only some ranks can restore. On a 0/1 mask MIN is AND, which
-        makes the reduction an intersection.
+        makes the reduction an intersection. Under pipeline parallelism PP0's
+        sets already cover every stage, and the later stages receive its result.
         """
         mask = torch.zeros(num_pages + 1, dtype=torch.int)
         for pages in restorable:
             if device_hit_pages < pages <= num_pages:
                 mask[pages] = 1
-        self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
+        if self.cache.pp_size > 1:
+            self.cache._all_reduce(mask, torch.distributed.ReduceOp.MIN)
+        else:
+            self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
         common = mask.nonzero()
         if common.numel() == 0:
             return 0
@@ -533,9 +563,13 @@ class UnifiedCacheLinkerWrapper:
             self.cache_linker.num_completed_offloads(), len(self.pending_offloads)
         )
 
-    def take_completed_offloads(self, finish_count: int) -> list[bool]:
+    def take_completed_offloads(
+        self, finish_count: int, block: bool = False
+    ) -> list[bool]:
         assert finish_count <= len(self.pending_offloads)
-        return [self.cache_linker.pop_completed_offload() for _ in range(finish_count)]
+        pop = self.cache_linker.pop_completed_offload
+        # Only PP passes block, so a linker with the zero-argument pop still works.
+        return [pop(block=True) if block else pop() for _ in range(finish_count)]
 
     def commit_completed_offloads(self, successes: Sequence[bool]) -> None:
         assert len(successes) <= len(self.pending_offloads)
@@ -552,7 +586,8 @@ class UnifiedCacheLinkerWrapper:
 
     def finish_loads(self) -> list[str]:
         """Wait for the loads of the batch that just ran; return the rids whose
-        KV did not land, identically on every rank.
+        KV did not land, identically on every rank. Under pipeline parallelism a
+        failure raises instead.
 
         Runs after that batch's forward, so no slot it wrote to has been freed
         or inserted yet. Every rank holds the same ``inflight_load_rids``
@@ -573,6 +608,14 @@ class UnifiedCacheLinkerWrapper:
             self.private_load_indices.pop(rid, None)
         if landed.item():
             return []
+        if self.cache.pp_size > 1:
+            # Only this stage sees its failure; aborting the requests here alone
+            # would split the pipeline's batches.
+            raise RuntimeError(
+                "External linker load failed under pipeline parallelism; a later "
+                "stage relies on the store's lease from PP0's lookup (Mooncake "
+                f"master --default_kv_lease_ttl) to keep its pages: {rids}"
+            )
         logger.error(
             "External linker load failed; aborting %d request(s): %s", len(rids), rids
         )

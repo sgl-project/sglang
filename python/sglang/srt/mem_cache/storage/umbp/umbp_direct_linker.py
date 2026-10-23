@@ -990,8 +990,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         # The tree agrees on the drain count across ranks before calling pop.
         return self._offload_results.qsize()
 
-    def pop_completed_offload(self) -> bool:
-        return self._offload_results.get_nowait()
+    def pop_completed_offload(self, block: bool = False) -> bool:
+        return self._offload_results.get(block=block)
 
     def reset(self) -> None:
         self._pending.clear()

@@ -39,6 +39,11 @@ def handle_hicache(server_args: Any):
                 "--enable-unified-cache-external-linker does not use "
                 "--hicache-storage-backend."
             )
+        if cfg.pp_size > 1 and cfg.unified_cache_external_linker_backend != "mooncake":
+            raise ValueError(
+                "--enable-unified-cache-external-linker with --pp-size > 1 "
+                "requires the Mooncake linker backend."
+            )
         return
 
     # Skip all normalization when neither hicache nor decode-offload path is active.
