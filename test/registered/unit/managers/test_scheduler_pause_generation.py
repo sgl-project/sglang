@@ -90,7 +90,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler._engine_paused = False
         scheduler._pause_started_at = None
         scheduler._pause_intervals = deque()
-        scheduler._pending_abort_pause = False 2a1b01d15d ([Fix] scheduler: Never schedule a late request after an abort-mode pause with multiple tokenizer workers)
+        scheduler._pending_abort_pause = False
         scheduler.enable_overlap = False
         scheduler.enable_skip_finishing_decode = False
         scheduler.enable_overlap_mlx = False

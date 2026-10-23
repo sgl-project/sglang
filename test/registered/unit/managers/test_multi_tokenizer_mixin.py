@@ -32,8 +32,6 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     RequestOutputStats,
     TokenizerWorkerRegistrationReq,
-    unwrap_from_pickle,
-    wrap_as_pickle, 2a1b01d15d ([Fix] scheduler: Never schedule a late request after an abort-mode pause with multiple tokenizer workers)
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
@@ -560,9 +558,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
         broadcast = []
         forwarded = []
         router.socket_mapping = SimpleNamespace(
-            send_output=lambda ipc_name, obj: broadcast.append(
-                (ipc_name, obj.is_pause)
-            )
+            send_output=lambda ipc_name, obj: broadcast.append((ipc_name, obj.is_pause))
         )
 
         inbox = [
