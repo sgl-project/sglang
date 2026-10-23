@@ -702,27 +702,19 @@ class AscendAttnBackend(AttentionBackend):
         if dense_mla_dcp_partial:
             metadata = self.forward_metadata
             global_kv_lens_cpu = metadata.seq_lens_cpu_int
-            if forward_batch.forward_mode.is_target_verify():
-                query_len = int(forward_batch.spec_info.draft_token_num)
-                spec_algorithm = forward_batch.spec_algorithm
-                if spec_algorithm is not None and spec_algorithm.is_dflash_family():
-                    # Active Host lengths already include verify tokens; Ascend's
-                    # zero-filled DP padding rows still need the verify block.
-                    global_kv_lens_cpu = torch.where(
-                        global_kv_lens_cpu == 0, query_len, global_kv_lens_cpu
-                    )
             metadata.seq_lens_cpu_int, metadata.block_tables = (
                 self._get_kv_lens_and_block_tables(
                     global_kv_lens_cpu, forward_batch.req_pool_indices
                 )
             )
             if metadata.block_tables.shape[1] == 0:
-                # Keep FIA's eager table nonempty without changing the KV lengths.
+                # FIA rejects zero-column tables when queries are nonempty.
                 metadata.block_tables = (
                     self.req_to_token[forward_batch.req_pool_indices, :1]
                     // (self.page_size * self.dcp_size)
                 ).to(torch.int32)
             if forward_batch.forward_mode.is_target_verify():
+                query_len = int(forward_batch.spec_info.draft_token_num)
                 metadata.dcp_spec_seq_lens = get_dcp_chain_spec_lens(
                     global_kv_lens_cpu,
                     query_len,
