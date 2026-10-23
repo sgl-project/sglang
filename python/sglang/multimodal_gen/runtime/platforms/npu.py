@@ -115,6 +115,7 @@ class NPUPlatformBase(Platform):
     ) -> str:
         if selected_backend == AttentionBackendEnum.FA:
             logger.info("Using Ascend Flash Attention backend.")
+            print("==Coverage==")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa.AscendFABackend"
 
         elif selected_backend == AttentionBackendEnum.LASER_ATTN:
