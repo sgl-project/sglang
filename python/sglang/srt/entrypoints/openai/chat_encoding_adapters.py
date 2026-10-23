@@ -95,14 +95,13 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
     """Everything a builder may read; a builder takes only what its encoding needs.
 
     Consumers:
-      tokenizer: prompt encoding (Inkling).
+      tokenizer: prompt encoding (Inkling, DeepSeek-V4 / V4.1).
       reasoning_parser, tool_call_parser, chat_hooks: adapter-owned output parsing.
       hf_config: config-dependent encoding (DeepSeek V4.1 image_token_id).
-      model_path, revision: checkpoint files (DeepSeek tokenizer.json and the
-        encoder file for effort-profile detection).
+      model_path, revision: checkpoint files.
       default_chat_template_kwargs: the workers' --default-chat-template-kwargs
         (deepseek-recipe validates the default effort at startup).
-      backend: selects the builder; "recipe" is an explicit opt-in.
+      backend: selects the builder; every spec has a "builtin" one.
     """
 
     chat_encoding_spec: str
@@ -154,20 +153,13 @@ _BUILDERS: dict[
     dict[EncodingBackend, Callable[[ChatEncodingAdapterContext], ChatEncodingAdapter]],
 ] = {
     "inkling": {"builtin": _build_inkling},
-    # The builtin DeepSeek-V4 / V4.1 encoders stay inline in serving_chat.
-    "dsv4": {"recipe": _build_deepseek_recipe},
-    "dsv41": {"recipe": _build_deepseek_recipe},
+    "dsv4": {"builtin": _build_deepseek_recipe},
+    "dsv41": {"builtin": _build_deepseek_recipe},
 }
 
 
 def has_chat_encoding_adapter(chat_encoding_spec: Optional[str]) -> bool:
     return chat_encoding_spec in _BUILDERS
-
-
-def has_chat_encoding_backend(
-    chat_encoding_spec: Optional[str], backend: EncodingBackend
-) -> bool:
-    return backend in _BUILDERS.get(chat_encoding_spec, {})
 
 
 def build_chat_encoding_adapter(

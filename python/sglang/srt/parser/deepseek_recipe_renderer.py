@@ -11,9 +11,9 @@ from types import ModuleType
 from typing import Any, Optional, Union
 
 DEEPSEEK_RECIPE_INSTALL_HINT = (
-    "Serving DeepSeek-V4 / V4.1 with --chat-encoding-backend recipe requires the "
-    "`deepseek-recipe` package (DeepSeek's reference encoder and parser; wheels for "
-    "Linux and macOS). Install it with `pip install deepseek-recipe`."
+    "Serving DeepSeek-V4 / V4.1 requires the `deepseek-recipe` package (DeepSeek's "
+    "reference encoder and parser; wheels for Linux and macOS). Install it with "
+    "`pip install deepseek-recipe`."
 )
 
 MODEL_NAMES = {"v4": "DeepSeek-V4-Pro", "v41": "DeepSeek-V4.1-Flash"}

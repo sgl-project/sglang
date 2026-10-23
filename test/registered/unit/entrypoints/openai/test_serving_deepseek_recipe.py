@@ -1,5 +1,5 @@
-"""The deepseek-recipe chat encoding backend: the adapter registration and the
-prompt path under SGLang's request semantics."""
+"""DeepSeek-V4 / V4.1 chat encoding through deepseek-recipe: the adapter
+registration and the prompt path under SGLang's request semantics."""
 
 import unittest
 from types import SimpleNamespace
@@ -28,7 +28,7 @@ def _tokenizer_file():
 
 
 def _serving(test, tokenizer, **server_args):
-    """A chat handler on the recipe backend, configured like a V4.1 server."""
+    """A chat handler configured like a V4.1 server."""
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
     from sglang.srt.runtime_context import publish, reset_context
     from sglang.srt.server_args import ServerArgs
@@ -37,7 +37,6 @@ def _serving(test, tokenizer, **server_args):
     test.addCleanup(reset_context)
     args = ServerArgs(
         model_path="dummy",
-        chat_encoding_backend="recipe",
         reasoning_parser="deepseek-v41",
         tool_call_parser="deepseekv41",
         **server_args,
@@ -72,9 +71,9 @@ def _serving(test, tokenizer, **server_args):
 
 
 class TestAdapterRegistry(CustomTestCase):
-    """The recipe backend is the `recipe` builder of the dsv4 / dsv41 specs."""
+    """deepseek-recipe is the builder of the dsv4 / dsv41 specs."""
 
-    def _context(self, spec, backend, tokenizer=None, default_kwargs=None):
+    def _context(self, spec, tokenizer=None, default_kwargs=None):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
 
         return registry.ChatEncodingAdapterContext(
@@ -93,28 +92,12 @@ class TestAdapterRegistry(CustomTestCase):
             model_path="",
             revision=None,
             default_chat_template_kwargs=default_kwargs,
-            backend=backend,
         )
 
     def _fast_tokenizer(self):
         from tokenizers import Tokenizer
 
         return SimpleNamespace(backend_tokenizer=Tokenizer.from_file(_tokenizer_file()))
-
-    def test_builtin_backend_keeps_the_inline_deepseek_encoders(self):
-        from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
-
-        self.assertTrue(registry.has_chat_encoding_adapter("dsv41"))
-        self.assertTrue(registry.has_chat_encoding_adapter("dsv4"))
-        self.assertIsNone(
-            registry.build_chat_encoding_adapter(self._context("dsv41", "builtin"))
-        )
-
-    def test_recipe_backend_is_deepseek_only(self):
-        from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
-
-        with self.assertRaises(ValueError):
-            registry.build_chat_encoding_adapter(self._context("kimi_k3", "recipe"))
 
     def test_bad_default_effort_fails_startup(self):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
@@ -125,7 +108,6 @@ class TestAdapterRegistry(CustomTestCase):
                 registry.build_chat_encoding_adapter(
                     self._context(
                         spec,
-                        "recipe",
                         tokenizer=tokenizer,
                         default_kwargs={"reasoning_effort": effort},
                     )
@@ -136,7 +118,7 @@ class TestAdapterRegistry(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "fast tokenizer"):
             registry.build_chat_encoding_adapter(
-                self._context("dsv41", "recipe", tokenizer=SimpleNamespace())
+                self._context("dsv41", tokenizer=SimpleNamespace())
             )
 
     def test_tool_dumps_render_as_the_client_sent_them(self):
@@ -144,7 +126,7 @@ class TestAdapterRegistry(CustomTestCase):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
         adapter = registry.build_chat_encoding_adapter(
-            self._context("dsv41", "recipe", tokenizer=self._fast_tokenizer())
+            self._context("dsv41", tokenizer=self._fast_tokenizer())
         )
         self.assertFalse(adapter.strict_tool_call_arguments)
         self.assertIsNone(adapter.output)

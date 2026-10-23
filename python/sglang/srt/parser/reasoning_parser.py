@@ -4,14 +4,6 @@ from typing import Dict, List, Optional, Tuple, Type
 
 from transformers import PreTrainedTokenizerBase
 
-from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
-from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
-from sglang.srt.entrypoints.openai.encoding_dsv4 import (
-    thinking_end_token as dsv4_thinking_end_token,
-)
-from sglang.srt.entrypoints.openai.encoding_dsv4 import (
-    thinking_start_token as dsv4_thinking_start_token,
-)
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.function_call.kimik3_format import (
@@ -1521,6 +1513,13 @@ class _DeepSeekV3Detector(Qwen3Detector):
         self.reasoning_default = "explicit_thinking"
 
 
+# DeepSeek-V4 / V4.1 output tokens.
+DSV4_EOS_TOKEN = "<｜end▁of▁sentence｜>"
+DSV4_THINK_START_TOKEN = "<think>"
+DSV4_THINK_END_TOKEN = "</think>"
+DSV4_DSML_TOKEN = "｜DSML｜"
+
+
 class DeepSeekV4Detector(BaseReasoningFormatDetector):
     def __init__(
         self,
@@ -1531,13 +1530,13 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         force_nonempty_content: bool = False,
     ):
         super().__init__(
-            dsv4_thinking_start_token,
-            dsv4_thinking_end_token,
-            think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
+            DSV4_THINK_START_TOKEN,
+            DSV4_THINK_END_TOKEN,
+            think_excluded_tokens=[DSV4_EOS_TOKEN, DSV4_DSML_TOKEN],
             # The reference parser splits reasoning at `\n\n<｜DSML｜tool_calls`;
             # anchoring on the full tag at a line start keeps a mid-sentence
             # mention of the tag inside reasoning from ending the block.
-            tool_start_token=f"<{dsv4_dsml_token}tool_calls>",
+            tool_start_token=f"<{DSV4_DSML_TOKEN}tool_calls>",
             tool_start_at_line_start=True,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
@@ -1555,7 +1554,7 @@ class DeepSeekV41ReasoningDetector(DeepSeekV4Detector):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.tool_start_token = f"<{dsv4_dsml_token} calls>"
+        self.tool_start_token = f"<{DSV4_DSML_TOKEN} calls>"
 
 
 class _MimoDetector(Qwen3Detector):

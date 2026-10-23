@@ -1,6 +1,5 @@
-"""DeepSeek-V4 / V4.1 serving glue for the ``recipe`` backend of the ``dsv4`` /
-``dsv41`` chat encoding specs (``--chat-encoding-backend recipe``): prompt encoding
-through deepseek-recipe under SGLang's request semantics."""
+"""DeepSeek-V4 / V4.1 serving glue for the ``dsv4`` / ``dsv41`` chat encoding
+specs: prompt encoding through deepseek-recipe under SGLang's request semantics."""
 
 from __future__ import annotations
 
