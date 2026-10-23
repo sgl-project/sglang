@@ -123,6 +123,7 @@ class DeepseekMLAForwardMixin:
         return (
             mode.is_decode()
             or mode.is_target_verify()
+            or mode.is_draft_extend_v2()
             or (self.use_dsa and mode.is_extend())
         )
 
@@ -132,7 +133,7 @@ class DeepseekMLAForwardMixin:
         if not get_parallel().dcp_replicate_q_proj or self.dcp_size == 1:
             return False
         mode = forward_batch.forward_mode
-        return mode.is_decode() or mode.is_target_verify()
+        return mode.is_decode() or mode.is_target_verify() or mode.is_draft_extend_v2()
 
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (

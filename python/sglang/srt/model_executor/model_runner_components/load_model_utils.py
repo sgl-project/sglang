@@ -219,10 +219,19 @@ def build_load_config(
         quantize_and_serve=get_model().quantize_and_serve,
     )
 
+    resolved_load_format = load_format or get_model().load_format
+    # --model-loader-extra-config is keyed to --load-format: DefaultModelLoader
+    # rejects runai keys and vice versa, so a draft loaded with another format
+    # must not inherit it.
+    model_loader_extra_config = (
+        get_model().model_loader_extra_config
+        if resolved_load_format == get_model().load_format
+        else {}
+    )
     return LoadConfig(
-        load_format=load_format or get_model().load_format,
+        load_format=resolved_load_format,
         download_dir=get_model().download_dir,
-        model_loader_extra_config=get_model().model_loader_extra_config,
+        model_loader_extra_config=model_loader_extra_config,
         tp_rank=tp_rank,
         remote_instance_weight_loader_seed_instance_ip=get_model().remote_instance_weight_loader_seed_instance_ip,
         remote_instance_weight_loader_seed_instance_service_port=get_model().remote_instance_weight_loader_seed_instance_service_port,

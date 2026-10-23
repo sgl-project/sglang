@@ -8,6 +8,7 @@ into the draft's own embedding parameter, touching only the shard that holds it.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -168,6 +169,14 @@ def prepare_checkpoint_files(
     so ModelScope resolution, ``--download-dir`` and ``load_format`` are honored."""
     from sglang.srt.model_loader.loader import DefaultModelLoader
 
+    if load_config.load_format == LoadFormat.RUNAI_STREAMER and os.path.isdir(
+        model_path
+    ):
+        # runai streams the same safetensors the default loader can read; its
+        # loader-specific extra config must not reach DefaultModelLoader.
+        load_config = dataclasses.replace(
+            load_config, load_format=LoadFormat.AUTO, model_loader_extra_config={}
+        )
     if load_config.load_format not in _REOPENABLE_LOAD_FORMATS:
         raise ValueError(
             "Pipeline-parallel speculative decoding needs to re-open the target "

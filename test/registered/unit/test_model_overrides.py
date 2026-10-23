@@ -4036,5 +4036,40 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
 
 
+class TestKimiK3DcpSpeculativeAttentionMode(CustomTestCase):
+    """Under DCP only cutedsl_mla (the decode backend) can serve target-verify /
+    draft-extend; the default "prefill" mode would route them to trtllm_mla,
+    which refuses DCP with q_len > 1."""
+
+    @staticmethod
+    def _overrides(**fields):
+        from sglang.srt.arg_groups.model_overrides import kimi_k3 as kimi_k3_module
+
+        args = SimpleNamespace(
+            dcp_size=8,
+            dcp_comm_backend="fi_a2a",
+            dcp_replicate_q_proj=None,
+            enable_symm_mem=False,
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            kv_cache_dtype="auto",
+            speculative_algorithm=None,
+        )
+        for name, value in fields.items():
+            setattr(args, name, value)
+        # Only the DCP provider; the MoE-runner provider reads unrelated fields.
+        with patch.object(kimi_k3_module, "_require_kimi_k3_cutedsl_dcp_support"):
+            return kimi_k3_module._kimi_k3_overrides(
+                args,
+                SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
+            )
+
+    def test_eagle3_under_dcp_verifies_on_the_decode_backend(self):
+        overrides = self._overrides(speculative_algorithm="EAGLE3")
+        self.assertEqual(overrides["speculative_attention_mode"], "decode")
+        self.assertEqual(overrides["decode_attention_backend"], "cutedsl_mla")
+
+
 if __name__ == "__main__":
     unittest.main()

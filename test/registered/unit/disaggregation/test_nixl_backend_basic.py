@@ -467,6 +467,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 requires_dcp_relayout=True,
                 dst_dcp_size=2,
                 dst_dcp_rank=dcp_rank,
+                dst_draft_rows_dcp_collapsed=False,
                 dcp_dst_region_indices=[0],
                 dcp_token_item_lens=[4],
             )
