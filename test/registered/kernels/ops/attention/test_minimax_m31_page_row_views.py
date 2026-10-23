@@ -5,6 +5,7 @@ from a dedicated tensor only in its page stride. Every kernel touching the cache
 must produce identical bytes for both.
 """
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -258,3 +259,7 @@ def test_prefill_indexer_and_attention_match(caches, prefer_qmul4):
         results.append((topk.clone(), out.clone()))
     for a, b in zip(*results):
         assert torch.equal(a, b)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

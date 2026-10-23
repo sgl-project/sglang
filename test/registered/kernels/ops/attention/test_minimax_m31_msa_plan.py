@@ -1,5 +1,6 @@
 """MSA-v1 NVFP4 plans: decode top-k, multi-token verify, and prefill indexing."""
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -560,3 +561,7 @@ def test_full_page_dequant_writes_only_live_tokens(global_scale):
             packed.view(-1, 64)[rows], scale.view(-1, 8)[rows], global_scale
         ).view(torch.uint8)
         torch.testing.assert_close(out.view(-1, 128), expected, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
