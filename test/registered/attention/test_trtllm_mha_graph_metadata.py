@@ -862,6 +862,51 @@ def test_unified_eager_spec_table_covers_every_page_read(
     _assert_reads_only_current_pages(backend, v2p)
 
 
+@pytest.mark.parametrize("path", ["eager", "graph"])
+@pytest.mark.parametrize("reads_swa", [True, False])
+def test_encoder_only_verify_rows_read_the_draft_page_table(
+    monkeypatch, path, reads_swa
+):
+    """SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA: a draft whose ENCODER_ONLY layers sit in
+    the SWA sub-pool expands its verify rows from swa_page_table, eagerly and in
+    the recorded graph refresh; reading the full table there is a wrong row, with
+    no crash. Any other runner keeps the full table."""
+    draft_tokens, seq_lens = 4, [5, 9]
+
+    def fill(page_table, swa_page_table):
+        rows = torch.arange(page_table.shape[0], dtype=torch.int32)[:, None]
+        page_table.copy_((100 + rows).expand_as(page_table))
+        swa_page_table.copy_((200 + rows).expand_as(swa_page_table))
+
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=draft_tokens)
+    backend._swa_kv_pool = SimpleNamespace()
+    backend.expand_encoder_only_verify = True
+    backend._encoder_only_reads_swa = reads_swa
+    backend.init_cuda_graph_state(max_bs=4, max_num_tokens=16)
+    spec_info = SimpleNamespace(ragged_verify_layout=None)
+    if path == "graph":
+        monkeypatch.setattr(
+            trtllm_mha_backend,
+            "update_trtllm_mha_graph_metadata",
+            lambda **kw: fill(kw["page_table"], kw["swa_page_table"]),
+        )
+        fb = _graph_batch(seq_lens, ForwardMode.TARGET_VERIFY, spec_info, draft_tokens)
+        backend.init_forward_metadata_out_graph(fb, in_capture=True)
+        backend.init_forward_metadata_in_graph(fb)
+    else:
+        backend._fill_page_table_device = lambda metadata, *_: fill(
+            metadata.page_table, metadata.swa_page_table
+        )
+        fb = _eager_batch(seq_lens, ForwardMode.TARGET_VERIFY, spec_info, draft_tokens)
+        fb.kv_loc_plan = SimpleNamespace(req_pool_indices=fb.req_pool_indices)
+        backend.init_forward_metadata(fb)
+
+    request = torch.arange(len(seq_lens) * draft_tokens, dtype=torch.int32)
+    expected = (200 if reads_swa else 100) + request // draft_tokens
+    encoder_rows = backend.forward_metadata.encoder_page_table
+    assert torch.equal(encoder_rows, expected[:, None].expand_as(encoder_rows))
+
+
 def test_hybrid_wrappers_forward_in_graph_hook():
     # The hybrid backend reads the mode from the published configuration.
     from sglang.srt.runtime_context import get_context
