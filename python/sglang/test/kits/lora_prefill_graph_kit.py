@@ -1,4 +1,5 @@
-"""MoE LoRA prefill graphs must replay adapters and match eager prefill.
+"""MoE LoRA prefill graphs must replay adapters and match eager prefill, and
+the same engines' decode graphs must match eager decode.
 
 Shared by the per-PR and the extra-tier e2e files. Each file passes its own
 configuration list and starts with the eager reference, because results never
@@ -23,13 +24,54 @@ MAX_NEW_TOKENS = 8
 PREFILL_GRAPH_BATCH_SIZES = [512, 1024, 2048, 4096]
 # (lora_backend, prefill graph backend, moe_runner_backend)
 EAGER_REFERENCE = ("triton", "disabled", None)
+# No more requests than cuda_graph_max_bs_decode, so every decode step can
+# replay a graph; adapter rows next to a base row.
+DECODE_PROMPTS = MOE_LORA_TEST_PROMPTS[:4]
+DECODE_LORA_PATHS = ["moe_lora", None, "moe_lora", "moe_lora"]
+# Decode positions after token 0 compared on a shared prefix, summed over
+# DECODE_PROMPTS; the eager reference decodes 20 (two prompts stop early).
+MIN_DECODE_POSITIONS = 14
+
+
+def _graph_passes(engine, *modes):
+    """The engine's CUDA graph pass counters for `modes`."""
+    from prometheus_client import CollectorRegistry, multiprocess
+
+    # Wait for scheduler metric reporting after the response.
+    engine.get_server_info()
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    samples = [
+        sample
+        for metric in registry.collect()
+        for sample in metric.samples
+        if sample.name == "sglang:cuda_graph_passes_total"
+    ]
+    return {
+        mode: sum(
+            sample.value for sample in samples if sample.labels.get("mode") == mode
+        )
+        for mode in modes
+    }
+
+
+def _scores_per_position(output):
+    """[(chosen token, {top-5 token: logprob})] for every generated position."""
+    meta = output["meta_info"]
+    return [
+        (token, {top_token: lp for lp, top_token, _ in top})
+        for (_, token, _), top in zip(
+            meta["output_token_logprobs"], meta["output_top_logprobs"]
+        )
+    ]
 
 
 def run_prefill_graph_matrix(case, configs):
     """Run every (lora_backend, prefill graph backend, moe_runner_backend)
     config and compare each graph arm with the first, which must be the eager
-    reference. Every graph arm must also report two graph prefills and no
-    eager fallback, so a silent fallback cannot make the comparison pass."""
+    reference (decode included). Every graph arm must also report two graph
+    prefills, and decode graphs for every DECODE_PROMPTS step, with no eager
+    fallback, so a silent fallback cannot make the comparison pass."""
     from prometheus_client import REGISTRY
 
     assert configs[0] == EAGER_REFERENCE, "the first config is the eager reference"
@@ -63,6 +105,8 @@ def run_prefill_graph_matrix(case, configs):
         )
         if prefill_graph:
             kwargs["cuda_graph_bs_prefill"] = PREFILL_GRAPH_BATCH_SIZES
+        else:
+            kwargs["cuda_graph_backend_decode"] = "disabled"
         if backend == "full":
             kwargs["cuda_graph_config"] = {
                 "prefill": {"full_prefill_max_req": len(prompts)}
@@ -99,32 +143,32 @@ def run_prefill_graph_matrix(case, configs):
                 logprob_start_len=-1,
                 top_logprobs_num=5,
             )
+            decode_modes = ("decode_cuda_graph", "decode_none")
             if prefill_graph:
-                from prometheus_client import CollectorRegistry, multiprocess
-
-                # Wait for scheduler metric reporting after the response.
-                engine.get_server_info()
-                registry = CollectorRegistry()
-                multiprocess.MultiProcessCollector(registry)
-                samples = [
-                    sample
-                    for metric in registry.collect()
-                    for sample in metric.samples
-                    if sample.name == "sglang:cuda_graph_passes_total"
-                ]
-                passes = {
-                    mode: sum(
-                        sample.value
-                        for sample in samples
-                        if sample.labels.get("mode") == mode
-                    )
-                    for mode in ("prefill_cuda_graph", "prefill_none")
-                }
                 case.assertEqual(
-                    passes,
+                    _graph_passes(engine, "prefill_cuda_graph", "prefill_none"),
                     {"prefill_cuda_graph": 2, "prefill_none": 0},
                     f"{label}: expected two 64-request graph prefills",
                 )
+                decode_before = _graph_passes(engine, *decode_modes)
+            decode_out = engine.generate(
+                DECODE_PROMPTS,
+                sampling_params={
+                    "max_new_tokens": MAX_NEW_TOKENS,
+                    "temperature": 0.0,
+                },
+                lora_path=DECODE_LORA_PATHS,
+                return_logprob=True,
+                logprob_start_len=-1,
+                top_logprobs_num=5,
+            )
+            if prefill_graph:
+                decode_after = _graph_passes(engine, *decode_modes)
+                graph_steps, eager_steps = (
+                    decode_after[mode] - decode_before[mode] for mode in decode_modes
+                )
+                case.assertGreater(graph_steps, 0, f"{label}: no decode graph replay")
+                case.assertEqual(eager_steps, 0, f"{label}: eager decode steps")
             results[label] = {
                 "prompt_logprobs": prompt_logprobs,
                 "next_token_scores": [
@@ -137,6 +181,7 @@ def run_prefill_graph_matrix(case, configs):
                     )
                     for o in gen_out
                 ],
+                "decode_scores": [_scores_per_position(o) for o in decode_out],
             }
         finally:
             if engine is not None:
@@ -168,3 +213,28 @@ def run_prefill_graph_matrix(case, configs):
                     LOGPROB_THRESHOLD,
                     f"{backend}, prompt {i}: first-token logprob drift",
                 )
+
+        compared = 0
+        for i, (e_steps, g_steps) in enumerate(
+            zip(eager["decode_scores"], graph["decode_scores"])
+        ):
+            for position, ((e_token, e_top), (g_token, g_top)) in enumerate(
+                zip(e_steps, g_steps)
+            ):
+                where = f"{backend}, decode prompt {i}, position {position}"
+                for token in {e_token, g_token}:
+                    case.assertIn(token, e_top, f"{where}: eager top-5")
+                    case.assertIn(token, g_top, f"{where}: graph top-5")
+                    case.assertLess(
+                        abs(e_top[token] - g_top[token]),
+                        LOGPROB_THRESHOLD,
+                        f"{where}: logprob drift",
+                    )
+                compared += position > 0
+                if e_token != g_token:
+                    break  # Later positions condition on different prefixes.
+        case.assertGreaterEqual(
+            compared,
+            MIN_DECODE_POSITIONS,
+            f"{backend}: decode positions compared on a shared prefix",
+        )
