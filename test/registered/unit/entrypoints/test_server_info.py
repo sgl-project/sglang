@@ -132,9 +132,11 @@ def _call_server_info_with(
         return internal_states or [{"max_req_input_len": 1024}]
 
     tokenizer_manager = _stub_tokenizer_manager(server_args, _fake_internal_state)
+    if scheduler_info is None:
+        scheduler_info = {"max_req_input_len": 1024}
     stub_state = SimpleNamespace(
         tokenizer_manager=tokenizer_manager,
-        scheduler_info=scheduler_info or {"max_req_input_len": 1024},
+        scheduler_info=scheduler_info,
     )
     prior_state = http_server.get_global_state()
     http_server.set_global_state(stub_state)
