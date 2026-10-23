@@ -2645,6 +2645,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     @property
+    def num_tokens_pending_prealloc(self):
+        return sum(
+            pre_alloc_fill_len(decode_req.req) for decode_req in self.queue
+        ) + sum(pre_alloc_fill_len(req) for req in self.retracted_queue)
+
+    @property
     def num_tokens_pre_allocated(self):
         return sum(
             decode_req.req.extend_end
