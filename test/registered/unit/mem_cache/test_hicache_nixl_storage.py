@@ -288,6 +288,7 @@ class TestNixlUnified(CustomTestCase):
             extra_config={
                 "plugin": {"posix": {"active": True}},
                 "use_direct_io": False,
+                "l3_cleaner_enabled": False,
             },
         )
 
