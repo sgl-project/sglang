@@ -2962,6 +2962,12 @@ class OpenAIServingChat(OpenAIServingBase):
             }
             return
 
+        if self.reasoning_parser == "llama_nemotron":
+            # Thinking is carried by the caller's system prompt, not a kwarg the
+            # server can write, and the parser splits a self-opened <think>
+            # either way -- so accept both modes instead of rejecting the request.
+            return
+
         if self.reasoning_parser == "inkling":
             # Effort-conditioned, not toggled: "none" (0.0) is the off switch.
             if not enabled:

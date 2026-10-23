@@ -4914,6 +4914,92 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
 
+    def test_fallback_llama_nemotron_never_forces_reasoning(self):
+        """Llama-Nemotron picks thinking through a "detailed thinking on" system
+        prompt and its chat template never reads enable_thinking, so reasoning
+        must not be forced even when a request passes enable_thinking=True --
+        forcing it filed a "thinking off" answer as reasoning_content and left
+        content empty."""
+        self._setup_fallback("llama_nemotron")
+        req_default = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        self.assertFalse(self.chat._get_reasoning_from_request(req_default))
+
+        req_enabled = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        self.assertFalse(self.chat._get_reasoning_from_request(req_enabled))
+
+    def test_llama_nemotron_thinking_off_answer_stays_in_content(self):
+        """A "detailed thinking off" answer carries no <think>, so it must come
+        back as content even when the request sets enable_thinking=True. That
+        kwarg cannot change what the model emits, and honoring it returned the
+        whole answer as reasoning_content with content empty."""
+        self._setup_fallback("llama_nemotron")
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is the capital of France?"}],
+            stream=False,
+            separate_reasoning=True,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        ret = [
+            {
+                "text": "The capital of France is Paris.",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 8,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "test",
+                },
+                "index": 0,
+            }
+        ]
+
+        message = (
+            self.chat._build_chat_response(req, ret, created=123).choices[0].message
+        )
+
+        self.assertEqual(message.content, "The capital of France is Paris.")
+        self.assertFalse(message.reasoning_content)
+
+    def test_llama_nemotron_thinking_on_answer_splits_reasoning(self):
+        """With "detailed thinking on" the model opens <think> itself, so the
+        block is still split out of content without any forcing."""
+        self._setup_fallback("llama_nemotron")
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "60 km in 45 min, speed?"}],
+            stream=False,
+            separate_reasoning=True,
+        )
+        ret = [
+            {
+                "text": "<think>\n45 min is 0.75 h.\n</think>\n\n80 km/h.",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 8,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "test",
+                },
+                "index": 0,
+            }
+        ]
+
+        message = (
+            self.chat._build_chat_response(req, ret, created=123).choices[0].message
+        )
+
+        self.assertEqual(message.reasoning_content, "\n45 min is 0.75 h.\n")
+        self.assertEqual(message.content, "\n\n80 km/h.")
+
     def test_fallback_ling3_default_on(self):
         """Ling3 public checkpoints default `thinking_option='on'` in the chat
         template when `enable_thinking` is omitted, and the template detector
@@ -5227,6 +5313,24 @@ class InklingReasoningEffortTest(unittest.TestCase):
         request.reasoning_effort = "low"
         serving.apply_reasoning_enabled(request, True)
         self.assertEqual(request.reasoning_effort, "low")
+
+    def test_llama_nemotron_anthropic_thinking_is_accepted(self):
+        """Bug regression: llama_nemotron exposes no reasoning toggle, so
+        Anthropic thinking enabled (and 4.7 "adaptive") raised and surfaced as
+        400 from /v1/messages. Thinking rides the caller's system prompt, so
+        both modes must pass through without rewriting the request."""
+        serving = object.__new__(OpenAIServingChat)
+        serving.reasoning_parser = "llama_nemotron"
+        serving.template_manager = Mock(reasoning_config=None)
+        serving._reasoning_detector = Mock(reasoning_default=None)
+        request = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}]
+        )
+
+        for enabled in (True, False):
+            serving.apply_reasoning_enabled(request, enabled)
+            self.assertIsNone(request.reasoning_effort)
+            self.assertIsNone(request.chat_template_kwargs)
 
     def test_serving_does_not_prefill_model_message(self):
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS

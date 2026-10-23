@@ -1123,6 +1123,14 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
         )
 
 
+class _LlamaNemotronDetector(Nemotron3Detector):
+    """Thinking follows the system prompt, so enable_thinking never forces reasoning."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reasoning_default = None
+
+
 class GraniteThinkingDetector(BaseReasoningFormatDetector):
     """Detector for Granite 4.2 thinking models (ibm-granite/granite-4.2-*).
 
@@ -2292,6 +2300,7 @@ class ReasoningParser:
         "step3p5": DeepSeekR1Detector,
         "mistral": MistralDetector,
         "nemotron_3": Nemotron3Detector,
+        "llama_nemotron": _LlamaNemotronDetector,
         "granite_thinking_parser": GraniteThinkingDetector,
         "interns1": Qwen3Detector,
         "gemma4": Gemma4Detector,
