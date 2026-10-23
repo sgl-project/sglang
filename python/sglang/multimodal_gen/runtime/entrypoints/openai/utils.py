@@ -489,7 +489,6 @@ async def _save_url_image_to_path(
 
     max_attempts = 3
     backoff_seconds = 0.2
-    last_error: Exception | None = None
 
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -546,7 +545,6 @@ async def _save_url_image_to_path(
 
                     return target_path
                 except Exception as e:
-                    last_error = e
                     if attempt == max_attempts or not _is_retryable_download_error(e):
                         raise
                     wait_s = backoff_seconds * (2 ** (attempt - 1))
@@ -564,10 +562,7 @@ async def _save_url_image_to_path(
                         with suppress(FileNotFoundError):
                             os.remove(part_path)
     except Exception as e:
-        final_error = last_error or e
-        raise Exception(
-            f"Failed to download image from URL {image_url}: {str(final_error)}"
-        )
+        raise Exception(f"Failed to download image from URL {image_url}: {e}")
 
 
 async def process_generation_batch(
