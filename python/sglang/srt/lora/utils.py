@@ -341,7 +341,16 @@ def get_normalized_target_modules(
             base_model, "get_lora_target_module_name"
         ):
             name = base_model.get_lora_target_module_name(name)
-        base_name = name.split(".")[-1]
+        parent, _, base_name = name.rpartition(".")
+        # a bare DSA leaf means the indexer's; under another parent it is that
+        # parent's own projection (DeepSeek-V4's attn.wq_b)
+        if (
+            f"indexer.{base_name}" in DSA_INDEXER_LORA_NAMES
+            and parent
+            and not parent.endswith("indexer")
+        ):
+            result.add(base_name)
+            continue
         normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
     return result
@@ -397,6 +406,7 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
     "down_proj_moe",
     "down_proj_shared_moe",
     "wo_ud",
+    "wo_b",
 ]
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
@@ -407,6 +417,8 @@ REPLICATED_LINEAR_LORA_NAMES = [
     "fc2_latent_proj",
     "f_a_proj",
     "g_a_proj",
+    "wq_a",
+    "wkv",
     *DSA_INDEXER_LORA_NAMES,
 ]
 # Attention-projection LoRA modules shard on the attention-TP group, which
@@ -428,6 +440,9 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
         "b_proj",
         "f_b_proj",
         "g_b_proj",
+        "wq_b",
+        "wo_a",
+        "wo_b",
     }
 )
 
@@ -458,6 +473,11 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "fused_qkv_a_proj_with_mqa",
         "q_b_proj",
         "kv_b_proj",
+        "wq_a",
+        "wq_b",
+        "wkv",
+        "wo_a",
+        "wo_b",
     }
     | DSA_INDEXER_LORA_NAMES
 )

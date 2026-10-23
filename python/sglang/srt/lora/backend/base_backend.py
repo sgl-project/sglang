@@ -133,6 +133,14 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """
         raise NotImplementedError
 
+    def grouped_sgemm_batch_infos(
+        self, num_groups: int, num_tokens: int
+    ) -> Tuple[LoRABatchInfo, LoRABatchInfo]:
+        """A/B segment routing for a grouped projection; see ``TritonLoRABackend``."""
+        raise NotImplementedError(
+            f"grouped LoRA projections (DeepSeek-V4 wo_a) need --lora-backend triton, not {self.name!r}"
+        )
+
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
     ) -> torch.Tensor:

@@ -501,6 +501,37 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         if self.lora_backend.supports_lora_a_overlap:
             self.lora_backend.start_lora_a_overlap(x, self.A_buffer)
 
+    def apply_grouped_lora(
+        self, base_output: torch.Tensor, x: torch.Tensor
+    ) -> torch.Tensor:
+        """LoRA of a grouped projection, ``[tokens, groups, in]`` -> ``[tokens, groups, out]``.
+
+        Group ``g`` meets only row block ``g`` of the weight (DeepSeek-V4's ``wo_a``),
+        so its delta is ``B_g @ A @ x_g``: one ``A`` for every group, ``B`` split by group.
+        """
+        if not self.lora_active:
+            return base_output
+        num_tokens, num_groups, _ = x.shape
+        a_info, b_info = self.lora_backend.grouped_sgemm_batch_infos(
+            num_groups, num_tokens
+        )
+        # group-major rows keep each group's tokens contiguous, as the segments expect;
+        # with one local group reshape would keep the sliced rows' stride
+        lora_a_output = self.lora_backend.run_lora_a_sgemm(
+            x.transpose(0, 1).contiguous().view(num_groups * num_tokens, -1),
+            self.A_buffer,
+            pruned_batch_info=a_info,
+        )
+        num_loras, _, rank = self.B_buffer.shape
+        lora_output = self.lora_backend.run_lora_b_sgemm(
+            lora_a_output,
+            self.B_buffer.view(num_loras * num_groups, -1, rank),
+            pruned_batch_info=b_info,
+        )
+        return base_output + lora_output.view(num_groups, num_tokens, -1).transpose(
+            0, 1
+        )
+
     def forward(self, input_: torch.Tensor):
         # duplicate the logic in ColumnParallelLinear
         lora_active = self.lora_active
