@@ -1,30 +1,30 @@
 """DeepSeek-V4 / V4.1 serving glue for the ``recipe`` backend of the ``dsv4`` /
-``dsv41`` chat encoding specs (``--chat-encoding-backend recipe``): prompt encoding,
-the thinking decision and the sampling overlay through deepseek-recipe."""
+``dsv41`` chat encoding specs (``--chat-encoding-backend recipe``): prompt encoding
+through deepseek-recipe under SGLang's request semantics."""
 
 from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 
+from sglang.srt.environ import envs
 from sglang.srt.parser.deepseek_recipe_renderer import (
-    REASONING_EFFORTS,
     RecipeEncoder,
-    RecipeRender,
-    overlay_sampling,
+    parse_effort_budget,
 )
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-logger = logging.getLogger(__name__)
-
 MODEL_VERSIONS = {"dsv4": "v4", "dsv41": "v41"}
+DEFAULT_EFFORT_ENVS = {
+    "dsv4": envs.SGLANG_DSV4_REASONING_EFFORT,
+    "dsv41": envs.SGLANG_DSV41_REASONING_EFFORT,
+}
 
 
 class DeepSeekRecipeChatEncodingAdapter:
-    """recipe renders and tokenizes the prompt, decides thinking and resolves the
-    API's sampling defaults; output stays with the registered DeepSeek parsers."""
+    """recipe renders and tokenizes the prompt; thinking, effort and sampling follow
+    SGLang's request rules, and output stays with the registered DeepSeek parsers."""
 
     collects_openai_media = True
     output = None
@@ -37,33 +37,36 @@ class DeepSeekRecipeChatEncodingAdapter:
         tokenizer: Any,
         default_chat_template_kwargs: Optional[dict[str, Any]],
     ):
-        # Resolved at boot: a bad server default fails startup, not requests.
-        defaults = default_chat_template_kwargs or {}
-        effort = defaults.get("reasoning_effort")
-        if effort is not None and effort not in REASONING_EFFORTS:
-            raise ValueError(
-                f"--default-chat-template-kwargs reasoning_effort={effort!r} is not "
-                f"a deepseek-recipe effort ({', '.join(REASONING_EFFORTS)})"
-            )
+        self._spec = chat_encoding_spec
         self.encoder = RecipeEncoder.from_hf_tokenizer(
             MODEL_VERSIONS[chat_encoding_spec], tokenizer
         )
-        self._default_kwargs = dict(defaults)
+        raw = (DEFAULT_EFFORT_ENVS[chat_encoding_spec].get() or "").strip()
+        self._default_effort = int(raw) if raw.isdigit() else raw or None
+        # Encoded at boot, so a bad server default fails startup, not requests.
+        defaults = default_chat_template_kwargs or {}
+        self._encode(
+            {"messages": [{"role": "user", "content": ""}], "thinking": True},
+            effort=defaults.get("reasoning_effort"),
+        )
 
-    def render(
+    def encode_messages(
         self,
         *,
+        messages: list[dict[str, Any]],
         request: ChatCompletionRequest,
         tools: Optional[list[dict]],
-        encode: bool = True,
-    ) -> RecipeRender:
-        """recipe's view of the request; `tools` is the handler's effective list."""
-        # The wire request, not the handler's normalized messages.
-        body = request.model_dump(exclude_unset=True, by_alias=True, mode="json")
-        if tools is None:
-            body.pop("tools", None)
-            body.pop("tool_choice", None)
-        else:
+        thinking: bool,
+    ) -> list[int]:
+        # The wire request: the handler's message dumps carry None for unset fields.
+        wire = request.model_dump(exclude_unset=True, by_alias=True, mode="json")
+        body = {
+            "messages": wire["messages"],
+            "thinking": thinking,
+            "continue_final_message": request.continue_final_message,
+            "response_format": wire.get("response_format"),
+        }
+        if tools is not None:
             # `model_dump` adds None for unset fields, which recipe renders as values.
             body["tools"] = [
                 {k: v for k, v in tool.items() if v is not None}
@@ -74,49 +77,26 @@ class DeepSeekRecipeChatEncodingAdapter:
                 }
                 for tool in tools
             ]
-        return self.encoder.convert(body, self._default_kwargs, encode=encode)
+            body["tool_choice"] = wire.get("tool_choice")
+        body = {key: value for key, value in body.items() if value is not None}
+        return self._encode(body, effort=request.reasoning_effort, task=request.task)
 
-    def encode_messages(
+    def _encode(
         self,
+        body: dict[str, Any],
         *,
-        messages: list[dict[str, Any]],
-        request: ChatCompletionRequest,
-        tools: Optional[list[dict]],
+        effort: Union[str, int, float, None],
+        task: Optional[str] = None,
     ) -> list[int]:
-        return self.render(request=request, tools=tools).prompt_ids
-
-    def thinking_enabled(self, *, request: ChatCompletionRequest) -> Optional[bool]:
-        # The API defaults thinking on and reads its own `thinking` field, which
-        # the handler's rule does not; tools do not change the decision.
-        try:
-            return self.render(request=request, tools=None, encode=False).thinking
-        except ValueError as error:
-            logger.debug("deepseek-recipe thinking decision skipped: %s", error)
-            return None
-
-    def apply_sampling(
-        self,
-        *,
-        request: ChatCompletionRequest,
-        sampling_params: dict[str, Any],
-        prompt_tokens: int,
-        context_length: int,
-    ) -> None:
-        # Resolved from the request again: the adapter is shared, and a request
-        # forwarded with input_ids never went through encode_messages.
-        tools = (
-            [tool.model_dump() for tool in request.tools]
-            if request.tools and request.tool_choice != "none"
-            else None
-        )
-        try:
-            render = self.render(request=request, tools=tools, encode=False)
-        except ValueError as error:
-            logger.debug("deepseek-recipe sampling overlay skipped: %s", error)
-            return
-        overlay_sampling(
-            sampling_params,
-            render,
-            prompt_tokens=prompt_tokens,
-            context_length=context_length,
-        )
+        if effort is None or effort == "none":
+            effort = self._default_effort
+        budget = None
+        if effort is not None and not isinstance(effort, str):
+            if self._spec != "dsv41":
+                raise ValueError(
+                    f"DeepSeek-V4 reasoning_effort must be a named tier, got {effort!r}"
+                )
+            budget = parse_effort_budget(effort)
+        elif effort is not None:
+            body["reasoning_effort"] = effort
+        return self.encoder.encode(body, task=task, effort_budget=budget)

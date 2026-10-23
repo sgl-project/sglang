@@ -228,8 +228,8 @@ class Serving(msgspec.Struct):
         Arg(
             help="Which encoder renders DeepSeek-V4 / V4.1 chat prompts. 'builtin' is "
             "SGLang's copy of the checkpoint encoder; 'recipe' is deepseek-recipe, "
-            "which matches the official API (reasoning_effort takes the API's names "
-            "only) and requires the deepseek-recipe package. Other models ignore it.",
+            "DeepSeek's official encoder library, and requires the deepseek-recipe "
+            "package. Other models ignore it.",
             choices=["builtin", "recipe"],
         ),
     ] = "builtin"

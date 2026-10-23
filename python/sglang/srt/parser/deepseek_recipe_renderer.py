@@ -1,6 +1,6 @@
 """DeepSeek-V4 / V4.1 prompts through deepseek-recipe, the library behind the official
-API: request translation, conversion, rendering and tokenization.
-``rust/sglang-processor/src/render/models/deepseek_recipe.rs`` mirrors `pre_normalize`."""
+API: request translation, conversion, rendering and tokenization, plus the SGLang
+extensions recipe does not model (quick instruction tasks, V4.1 integer effort)."""
 
 from __future__ import annotations
 
@@ -8,9 +8,7 @@ import copy
 import functools
 import json
 from types import ModuleType
-from typing import Any, Optional
-
-import msgspec
+from typing import Any, Optional, Union
 
 DEEPSEEK_RECIPE_INSTALL_HINT = (
     "Serving DeepSeek-V4 / V4.1 with --chat-encoding-backend recipe requires the "
@@ -21,16 +19,20 @@ DEEPSEEK_RECIPE_INSTALL_HINT = (
 MODEL_NAMES = {"v4": "DeepSeek-V4-Pro", "v41": "DeepSeek-V4.1-Flash"}
 # The checkpoint tokenizer's image token; recipe's bundled tokenizer spells it <｜image｜>.
 IMAGE_TOKEN = "<｜deepseek_image｜>"
-REASONING_EFFORTS = (
-    "none",
-    "minimal",
-    "low",
-    "medium",
-    "high",
-    "xhigh",
-    "ultra",
-    "max",
-)
+ASSISTANT_TOKEN = "<｜Assistant｜>"
+THINK_START_TOKEN = "<think>"
+THINK_END_TOKEN = "</think>"
+TASK_TOKENS = {
+    "action": "<｜action｜>",
+    "query": "<｜query｜>",
+    "authority": "<｜authority｜>",
+    "domain": "<｜domain｜>",
+    "title": "<｜title｜>",
+    "read_url": "<｜read_url｜>",
+}
+# V4.1 renders an integer budget as this line; recipe's "high" tier is budget 75.
+BUDGET_TIER, BUDGET_TIER_VALUE = "high", 75
+BUDGET_LINE = "Reasoning Effort: {budget}"
 
 
 @functools.cache
@@ -42,66 +44,29 @@ def load_deepseek_recipe() -> ModuleType:
     return deepseek_recipe
 
 
-class RecipeRender(msgspec.Struct, kw_only=True):
-    """A rendered request plus the sampling recipe resolved for it."""
+def parse_effort_budget(value: Union[int, float]) -> int:
+    """A V4.1 integer budget in [1, 100], or a float in [0, 0.99] scaled to it."""
+    if isinstance(value, bool):
+        raise ValueError("reasoning_effort must not be a boolean")
+    if isinstance(value, int) and 1 <= value <= 100:
+        return value
+    if isinstance(value, float) and 0.0 <= value <= 0.99:
+        return max(1, round(value * 100))
+    raise ValueError(
+        f"reasoning_effort={value!r} is outside the integer budget [1, 100] "
+        "and the float range [0, 0.99]"
+    )
 
-    prompt: str
-    prompt_ids: Optional[list[int]]  # None when the caller skipped tokenization.
-    temperature: Optional[float]
-    top_p: Optional[float]
-    thinking: bool
-    request: Any = None  # recipe's ConversationRequest: max_tokens, parsing, chunks.
 
-
-def pre_normalize(
-    body: dict[str, Any], defaults: Optional[dict[str, Any]] = None
-) -> dict[str, Any]:
+def pre_normalize(body: dict[str, Any]) -> dict[str, Any]:
     """Rewrite an SGLang chat request body for recipe's Chat Completions adapter.
 
-    Only SGLang's own extensions are translated; recipe validates and renders the
-    rest. The Rust hosts pass the wire body, so the `reasoning` fold and the
-    kwargs-effort / default-kwargs steps the Python handler already ran repeat here.
+    `body` carries only what the prompt depends on: messages, thinking and, when
+    set, tools, tool_choice, response_format, continue_final_message and a named
+    reasoning_effort.
     """
-    defaults = defaults or {}
     request = copy.deepcopy(body)
-    if request.get("task") is not None:
-        raise ValueError(
-            "task is not supported by the deepseek-recipe chat encoding backend"
-        )
-
-    kwargs = dict(request.pop("chat_template_kwargs", None) or {})
-    reasoning = request.pop("reasoning", None)
-    thinking = None
-    if reasoning is not None and isinstance(reasoning, dict):
-        effort = reasoning.get("effort")
-        if effort is None:
-            effort = reasoning.get("reasoning_effort")
-        if effort is not None:
-            request["reasoning_effort"] = effort
-        enabled = (
-            reasoning.get("enabled")
-            if reasoning.get("enabled") is not None
-            else reasoning.get("enable", False)
-        )
-        if isinstance(enabled, str):
-            enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
-        if enabled:
-            thinking = True
-    effort = request.get("reasoning_effort")
-    if effort is not None:
-        thinking = effort != "none"
-    if thinking is not None:
-        kwargs.setdefault("thinking", thinking)
-    effort = kwargs.pop("reasoning_effort", None)
-    if effort is not None:
-        request["reasoning_effort"] = effort
-    for key, value in defaults.items():
-        kwargs.setdefault(key, value)
-    if request.get("reasoning_effort") is None and "reasoning_effort" in kwargs:
-        request["reasoning_effort"] = kwargs["reasoning_effort"]
-    if request.get("thinking") is None and "thinking" in kwargs:
-        request["thinking"] = {"type": "enabled" if kwargs["thinking"] else "disabled"}
-
+    request["thinking"] = {"type": "enabled" if request["thinking"] else "disabled"}
     # The host enforces structural_tag with its grammar.
     response_format = request.get("response_format")
     if response_format and response_format.get("type") == "structural_tag":
@@ -150,7 +115,7 @@ class RecipeEncoder:
     """recipe's conversion options, prompt encoding and tokenizer for one served model.
 
     `tokenizer` is the checkpoint's `tokenizers.Tokenizer`; recipe encodes prompts with
-    its own copy of it and the output parser decodes with the original."""
+    its own copy of it, and the SGLang extensions splice ids from the original."""
 
     def __init__(self, model_version: str, tokenizer: Any):
         recipe = load_deepseek_recipe()
@@ -178,49 +143,65 @@ class RecipeEncoder:
             )
         return cls(model_version, backend)
 
-    def convert(
+    def encode(
         self,
         body: dict[str, Any],
-        defaults: Optional[dict[str, Any]] = None,
         *,
-        encode: bool = True,
-    ) -> RecipeRender:
-        """Render one request; `encode=False` skips tokenization. Raises ValueError."""
+        task: Optional[str] = None,
+        effort_budget: Optional[int] = None,
+    ) -> list[int]:
+        """Prompt ids for one request (see `pre_normalize`). Raises ValueError.
+
+        `effort_budget` (V4.1) renders recipe's "high" tier, then rewrites its budget.
+        """
         recipe = load_deepseek_recipe()
-        normalized = pre_normalize(body, defaults)
+        normalized = pre_normalize(body)
         normalized["model"] = self.model
+        if effort_budget is not None:
+            normalized["reasoning_effort"] = BUDGET_TIER
         try:
             converted = recipe.ChatCompletionRequest(normalized).convert(self._options)
         except recipe.ConversionError as error:
             raise ValueError(_error_message(error.body)) from error
-        conversation = converted.conversation
-        return RecipeRender(
-            prompt=self._encoding.render_conversation(conversation).prompt,
-            prompt_ids=self._encoding.encode(conversation) if encode else None,
-            temperature=converted.inference_options.temperature,
-            top_p=converted.inference_options.top_p,
-            thinking=conversation.thinking_mode,
-            request=converted,
-        )
+        prompt_ids = self._encoding.encode(converted.conversation)
+        if effort_budget is not None and body["thinking"]:
+            prompt_ids = self._replace_effort_budget(prompt_ids, effort_budget)
+        if task is not None:
+            prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
+        return prompt_ids
 
+    def _ids(self, text: str) -> list[int]:
+        return self.hf_tokenizer.encode(text, add_special_tokens=False).ids
 
-def overlay_sampling(
-    sampling_params: dict[str, Any],
-    render: RecipeRender,
-    *,
-    prompt_tokens: int,
-    context_length: int,
-) -> None:
-    """Overlay the temperature, top_p and default max_tokens recipe resolved;
-    grammar stays SGLang's (`to_sampling_params`)."""
-    if render.temperature is not None:
-        sampling_params["temperature"] = render.temperature
-    if render.top_p is not None:
-        sampling_params["top_p"] = render.top_p
-    if sampling_params.get("max_new_tokens") is None and render.request is not None:
-        try:
-            sampling_params["max_new_tokens"] = render.request.resolve_max_tokens(
-                prompt_tokens, context_length
+    def _replace_effort_budget(self, prompt_ids: list[int], budget: int) -> list[int]:
+        # The effort line opens the prompt, so its first match is the line itself.
+        rendered = self._ids(BUDGET_LINE.format(budget=BUDGET_TIER_VALUE))
+        for start in range(len(prompt_ids) - len(rendered) + 1):
+            if prompt_ids[start : start + len(rendered)] == rendered:
+                end = start + len(rendered)
+                return (
+                    prompt_ids[:start]
+                    + self._ids(BUDGET_LINE.format(budget=budget))
+                    + prompt_ids[end:]
+                )
+        raise ValueError("deepseek-recipe rendered no reasoning effort line")
+
+    def _attach_task(
+        self, prompt_ids: list[int], task: str, thinking: bool
+    ) -> list[int]:
+        """Quick instruction task on the last user turn, as the V4 encoder renders it:
+        `action` follows the generation header, other tasks replace it."""
+        header = [
+            self.hf_tokenizer.token_to_id(ASSISTANT_TOKEN),
+            self.hf_tokenizer.token_to_id(
+                THINK_START_TOKEN if thinking else THINK_END_TOKEN
+            ),
+        ]
+        if prompt_ids[-len(header) :] != header:
+            raise ValueError(
+                "task requires the conversation to end with a user message"
             )
-        except load_deepseek_recipe().ConversionError:
-            pass  # The prompt alone exceeds the context; SGLang's own check reports it.
+        task_id = self.hf_tokenizer.token_to_id(TASK_TOKENS[task])
+        if task == "action":
+            return prompt_ids + [task_id]
+        return prompt_ids[: -len(header)] + [task_id]

@@ -1,5 +1,5 @@
-"""The deepseek-recipe chat encoding backend: the adapter registration, the
-prompt path and the handler's thinking decision."""
+"""The deepseek-recipe chat encoding backend: the adapter registration and the
+prompt path under SGLang's request semantics."""
 
 import unittest
 from types import SimpleNamespace
@@ -17,17 +17,17 @@ def _user(content="x"):
     return {"role": "user", "content": content}
 
 
-def _tokenizer_file(test):
+def _tokenizer_file():
     """The V4.1 tokenizer from the Hub cache or the Hub; skip when neither answers."""
     from huggingface_hub import hf_hub_download
 
     try:
         return hf_hub_download(MODEL, "tokenizer.json", revision=REVISION)
     except Exception as error:  # noqa: BLE001
-        test.skipTest(f"the tokenizer is not available: {error}")
+        raise unittest.SkipTest(f"the tokenizer is not available: {error}")
 
 
-def _serving(test, tokenizer):
+def _serving(test, tokenizer, **server_args):
     """A chat handler on the recipe backend, configured like a V4.1 server."""
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
     from sglang.srt.runtime_context import publish, reset_context
@@ -40,6 +40,7 @@ def _serving(test, tokenizer):
         chat_encoding_backend="recipe",
         reasoning_parser="deepseek-v41",
         tool_call_parser="deepseekv41",
+        **server_args,
     )
     publish(args, role="tokenizer")
     manager = SimpleNamespace(
@@ -95,6 +96,11 @@ class TestAdapterRegistry(CustomTestCase):
             backend=backend,
         )
 
+    def _fast_tokenizer(self):
+        from tokenizers import Tokenizer
+
+        return SimpleNamespace(backend_tokenizer=Tokenizer.from_file(_tokenizer_file()))
+
     def test_builtin_backend_keeps_the_inline_deepseek_encoders(self):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
 
@@ -110,18 +116,20 @@ class TestAdapterRegistry(CustomTestCase):
         with self.assertRaises(ValueError):
             registry.build_chat_encoding_adapter(self._context("kimi_k3", "recipe"))
 
-    def test_default_effort_must_be_a_recipe_effort(self):
+    def test_bad_default_effort_fails_startup(self):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
 
-        with self.assertRaisesRegex(ValueError, "reasoning_effort=60"):
-            registry.build_chat_encoding_adapter(
-                self._context(
-                    "dsv41",
-                    "recipe",
-                    tokenizer=SimpleNamespace(backend_tokenizer=None),
-                    default_kwargs={"reasoning_effort": 60},
+        tokenizer = self._fast_tokenizer()
+        for spec, effort in (("dsv41", "extreme"), ("dsv4", 60)):
+            with self.subTest(spec=spec, effort=effort), self.assertRaises(ValueError):
+                registry.build_chat_encoding_adapter(
+                    self._context(
+                        spec,
+                        "recipe",
+                        tokenizer=tokenizer,
+                        default_kwargs={"reasoning_effort": effort},
+                    )
                 )
-            )
 
     def test_recipe_backend_needs_the_fast_tokenizer(self):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
@@ -131,50 +139,16 @@ class TestAdapterRegistry(CustomTestCase):
                 self._context("dsv41", "recipe", tokenizer=SimpleNamespace())
             )
 
-    def test_recipe_adapter_encodes_and_overlays_sampling(self):
-        from tokenizers import Tokenizer
-
+    def test_tool_dumps_render_as_the_client_sent_them(self):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-        tokenizer = Tokenizer.from_file(_tokenizer_file(self))
         adapter = registry.build_chat_encoding_adapter(
-            self._context(
-                "dsv41",
-                "recipe",
-                tokenizer=SimpleNamespace(backend_tokenizer=tokenizer),
-            )
+            self._context("dsv41", "recipe", tokenizer=self._fast_tokenizer())
         )
         self.assertFalse(adapter.strict_tool_call_arguments)
         self.assertIsNone(adapter.output)
-        # The client's model name is SGLang's business; recipe sees its own.
-        request = ChatCompletionRequest(
-            model="anything",
-            messages=[{"role": "user", "content": ""}],
-            thinking={"type": "disabled"},
-        )
-        self.assertEqual(
-            adapter.encode_messages(messages=[], request=request, tools=None),
-            [
-                tokenizer.token_to_id(token)
-                for token in (
-                    "<｜begin▁of▁sentence｜>",
-                    "<｜User｜>",
-                    "<｜Assistant｜>",
-                    "</think>",
-                )
-            ],
-        )
-        params = {"max_new_tokens": None}
-        adapter.apply_sampling(
-            request=request,
-            sampling_params=params,
-            prompt_tokens=4,
-            context_length=100_000,
-        )
-        self.assertEqual(params["max_new_tokens"], 8192)
-        # The handler's tool dumps carry None for unset fields; recipe must see the
-        # tool as the client sent it.
+        # The handler's tool dumps carry None for unset fields.
         tool = {
             "type": "function",
             "function": {
@@ -188,74 +162,79 @@ class TestAdapterRegistry(CustomTestCase):
             "function": {**tool["function"], "strict": None},
             "defer_loading": None,
         }
-        with_tools = ChatCompletionRequest(
-            messages=[{"role": "user", "content": "hi"}],
-            thinking={"type": "disabled"},
-        )
+        request = ChatCompletionRequest(messages=[_user("hi")])
         self.assertEqual(
-            adapter.encode_messages(messages=[], request=with_tools, tools=[dumped]),
-            adapter.encode_messages(messages=[], request=with_tools, tools=[tool]),
+            adapter.encode_messages(
+                messages=[], request=request, tools=[dumped], thinking=False
+            ),
+            adapter.encode_messages(
+                messages=[], request=request, tools=[tool], thinking=False
+            ),
         )
 
 
-class TestHandlerThinking(CustomTestCase):
-    """The handler takes its thinking decision from recipe, whose default is on,
-    so the engine counts reasoning tokens and the parsers split the output."""
+class TestHandlerRequestSemantics(CustomTestCase):
+    """Thinking, effort and sampling follow SGLang's rules; recipe only renders."""
 
-    def test_thinking_follows_recipe(self):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
         from transformers import PreTrainedTokenizerFast
 
+        cls.tokenizer = PreTrainedTokenizerFast(tokenizer_file=_tokenizer_file())
+
+    def _token(self, token):
+        return self.tokenizer.convert_tokens_to_ids(token)
+
+    def _prompt(self, chat, **fields):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-        tokenizer = PreTrainedTokenizerFast(tokenizer_file=_tokenizer_file(self))
-        chat = _serving(self, tokenizer)
-        think_start = tokenizer.convert_tokens_to_ids("<think>")
-        think_end = tokenizer.convert_tokens_to_ids("</think>")
-        output = "I think.</think>Hello"
+        request = ChatCompletionRequest(messages=[_user("hi")], **fields)
+        return chat._process_messages(request, False)
 
-        def respond(**fields):
-            request = ChatCompletionRequest(messages=[_user("hi")], **fields)
-            processed = chat._process_messages(request, False)
-            ret = [
-                {
-                    "text": output,
-                    "output_ids": tokenizer.encode(output, add_special_tokens=False)
-                    + [1],
-                    "index": 0,
-                    "meta_info": {
-                        "id": "chatcmpl-1",
-                        "prompt_tokens": len(processed.prompt_ids),
-                        "completion_tokens": 7,
-                        "cached_tokens": 0,
-                        "weight_version": "v",
-                        "finish_reason": {"type": "stop", "matched": 1},
-                        "output_token_logprobs": [],
-                        "output_top_logprobs": None,
-                    },
-                }
-            ]
-            message = chat._build_chat_response(request, ret, 0).choices[0].message
-            return (
-                processed.prompt_ids[-1],
-                processed.require_reasoning,
-                message.reasoning_content,
-                message.content,
-            )
+    def test_thinking_defaults_off(self):
+        chat = _serving(self, self.tokenizer)
+        default = self._prompt(chat)
+        self.assertEqual(default.prompt_ids[-1], self._token("</think>"))
+        self.assertFalse(default.require_reasoning)
+        thinking = self._prompt(chat, chat_template_kwargs={"thinking": True})
+        self.assertEqual(thinking.prompt_ids[-1], self._token("<think>"))
+        self.assertTrue(thinking.require_reasoning)
 
-        # The API's default and its `thinking` field, which SGLang's rule never read.
-        for fields in (
-            {},
-            {"thinking": {"type": "enabled"}},
-            {"reasoning_effort": "high"},
-        ):
-            self.assertEqual(
-                respond(**fields), (think_start, True, "I think.", "Hello"), fields
-            )
-        for fields in (
-            {"thinking": {"type": "disabled"}},
-            {"reasoning_effort": "none"},
-        ):
-            self.assertEqual(respond(**fields)[:2], (think_end, False), fields)
+    def test_request_effort_wins_over_the_server_default(self):
+        thinking = {"chat_template_kwargs": {"thinking": True}}
+        plain = _serving(self, self.tokenizer)
+        low = self._prompt(plain, reasoning_effort="low", **thinking).prompt_ids
+        self.assertNotEqual(
+            low, self._prompt(plain, reasoning_effort="max", **thinking).prompt_ids
+        )
+        chat = _serving(
+            self,
+            self.tokenizer,
+            default_chat_template_kwargs={"reasoning_effort": "max"},
+        )
+        self.assertEqual(
+            self._prompt(chat, reasoning_effort="low", **thinking).prompt_ids, low
+        )
+
+    def test_request_reaches_the_engine_with_sglang_semantics(self):
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+        chat = _serving(self, self.tokenizer)
+        request = ChatCompletionRequest(
+            messages=[_user("hi")],
+            temperature=0.0,
+            chat_template_kwargs={"thinking": True, "reasoning_effort": 30},
+        )
+        adapted, _ = chat._convert_to_internal_request(request)
+        self.assertEqual(adapted.sampling_params["temperature"], 0.0)
+        self.assertIsNone(adapted.sampling_params["max_new_tokens"])
+        self.assertIn(
+            "Reasoning Effort: 30 (range 1-100",
+            self.tokenizer.decode(adapted.input_ids),
+        )
+        titled = self._prompt(chat, task="title").prompt_ids
+        self.assertEqual(titled[-1], self._token("<｜title｜>"))
 
 
 if __name__ == "__main__":

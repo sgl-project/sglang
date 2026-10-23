@@ -79,29 +79,15 @@ class ChatEncodingAdapter(Protocol):
         """None when the configured parsers leave output to the text parsers."""
         ...
 
-    def thinking_enabled(self, *, request: ChatCompletionRequest) -> Optional[bool]:
-        """The encoding's own thinking decision for ``request``; None leaves the
-        handler's rule in place."""
-        ...
-
     def encode_messages(
         self,
         *,
         messages: list[dict[str, Any]],
         request: ChatCompletionRequest,
         tools: Optional[list[dict]],
-    ) -> list[int]: ...
-
-    def apply_sampling(
-        self,
-        *,
-        request: ChatCompletionRequest,
-        sampling_params: dict[str, Any],
-        prompt_tokens: int,
-        context_length: int,
-    ) -> None:
-        """Overlay what the encoding resolved for sampling on the params
-        ``to_sampling_params`` built; most encodings resolve nothing."""
+        thinking: bool,
+    ) -> list[int]:
+        """``thinking`` is the handler's thinking decision for ``request``."""
         ...
 
 
@@ -115,7 +101,7 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
       model_path, revision: checkpoint files (DeepSeek tokenizer.json and the
         encoder file for effort-profile detection).
       default_chat_template_kwargs: the workers' --default-chat-template-kwargs
-        (deepseek-recipe's thinking and effort defaults).
+        (deepseek-recipe validates the default effort at startup).
       backend: selects the builder; "recipe" is an explicit opt-in.
     """
 

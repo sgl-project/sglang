@@ -68,27 +68,15 @@ class InklingChatEncodingAdapter:
     def output(self) -> Optional[InklingChatEncodingAdapter]:
         return self if self._token_output else None
 
-    def thinking_enabled(self, *, request: ChatCompletionRequest) -> Optional[bool]:
-        """Inkling leaves the decision to the handler's rule."""
-        return None
-
-    def apply_sampling(
-        self,
-        *,
-        request: ChatCompletionRequest,
-        sampling_params: dict[str, Any],
-        prompt_tokens: int,
-        context_length: int,
-    ) -> None:
-        """Inkling resolves no sampling of its own."""
-
     def encode_messages(
         self,
         *,
         messages: list[dict[str, Any]],
         request: ChatCompletionRequest,
         tools: list[dict] | None,
+        thinking: bool,
     ) -> list[int]:
+        # Inkling's thinking is effort-conditioned, so `thinking` is not read.
         reasoning_effort = parse_reasoning_effort(request.reasoning_effort)
         if reasoning_effort is None:
             reasoning_effort = self._default_reasoning_effort

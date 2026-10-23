@@ -626,6 +626,7 @@ class InklingTokenOutputTest(CustomTestCase):
             messages=[message.model_dump() for message in request.messages],
             request=request,
             tools=None,
+            thinking=False,
         )
         key = reasoner.get_request_grammar_key(
             ("regex", "yes"), input_ids=prompt_ids, thinking_budget=None

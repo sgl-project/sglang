@@ -1,8 +1,7 @@
 """deepseek-recipe as the DeepSeek-V4 / V4.1 prompt renderer: the request
-translation, the encoder and the sampling overlay."""
+translation, the encoder and the SGLang extensions (tasks, V4.1 integer effort)."""
 
 import unittest
-from types import SimpleNamespace
 
 from sglang.srt.parser import deepseek_recipe_renderer as renderer
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -18,76 +17,30 @@ def _user(content="x"):
     return {"role": "user", "content": content}
 
 
-def _tokenizer_file(test):
+def _tokenizer_file():
     """The V4.1 tokenizer from the Hub cache or the Hub; skip when neither answers."""
     from huggingface_hub import hf_hub_download
 
     try:
         return hf_hub_download(MODEL, "tokenizer.json", revision=REVISION)
     except Exception as error:  # noqa: BLE001
-        test.skipTest(f"the tokenizer is not available: {error}")
+        raise unittest.SkipTest(f"the tokenizer is not available: {error}")
 
 
 class TestPreNormalize(CustomTestCase):
-    def test_task_is_rejected(self):
-        with self.assertRaises(ValueError):
-            renderer.pre_normalize({"messages": [_user()], "task": "title"})
+    def test_thinking_becomes_the_api_field(self):
+        for thinking, kind in ((True, "enabled"), (False, "disabled")):
+            body = renderer.pre_normalize({"messages": [_user()], "thinking": thinking})
+            self.assertEqual(body["thinking"], {"type": kind})
 
     def test_developer_becomes_system(self):
         body = renderer.pre_normalize(
-            {"messages": [{"role": "developer", "content": "Be terse."}, _user()]}
+            {
+                "messages": [{"role": "developer", "content": "Be terse."}, _user()],
+                "thinking": False,
+            }
         )
         self.assertEqual(body["messages"][0]["role"], "system")
-
-    def test_thinking_toggle_sources(self):
-        kwargs = renderer.pre_normalize(
-            {"messages": [_user()], "chat_template_kwargs": {"thinking": False}}
-        )
-        self.assertEqual(kwargs["thinking"], {"type": "disabled"})
-        self.assertNotIn("chat_template_kwargs", kwargs)
-        reasoning = renderer.pre_normalize(
-            {"messages": [_user()], "reasoning": {"effort": "low", "enabled": True}}
-        )
-        self.assertEqual(reasoning["thinking"], {"type": "enabled"})
-        self.assertEqual(reasoning["reasoning_effort"], "low")
-        self.assertNotIn("reasoning", reasoning)
-        none = renderer.pre_normalize(
-            {"messages": [_user()], "reasoning_effort": "none"}
-        )
-        self.assertEqual(none["thinking"], {"type": "disabled"})
-        overridden = renderer.pre_normalize(
-            {
-                "messages": [_user()],
-                "reasoning_effort": "high",
-                "chat_template_kwargs": {"thinking": False},
-            }
-        )
-        self.assertEqual(overridden["thinking"], {"type": "disabled"})
-        explicit = renderer.pre_normalize(
-            {
-                "messages": [_user()],
-                "thinking": {"type": "enabled"},
-                "chat_template_kwargs": {"thinking": False},
-            }
-        )
-        self.assertEqual(explicit["thinking"], {"type": "enabled"})
-        default = renderer.pre_normalize({"messages": [_user()]}, {"thinking": False})
-        self.assertEqual(default["thinking"], {"type": "disabled"})
-        self.assertNotIn("thinking", renderer.pre_normalize({"messages": [_user()]}))
-
-    def test_effort_sources(self):
-        body = renderer.pre_normalize(
-            {
-                "messages": [_user()],
-                "reasoning_effort": "high",
-                "chat_template_kwargs": {"reasoning_effort": 30},
-            }
-        )
-        self.assertEqual(body["reasoning_effort"], 30)
-        default = renderer.pre_normalize(
-            {"messages": [_user()]}, {"reasoning_effort": "max"}
-        )
-        self.assertEqual(default["reasoning_effort"], "max")
 
     def test_tool_choice_renders_as_auto(self):
         tools = [
@@ -97,6 +50,7 @@ class TestPreNormalize(CustomTestCase):
         named = renderer.pre_normalize(
             {
                 "messages": [_user()],
+                "thinking": False,
                 "tools": tools,
                 "tool_choice": {"type": "function", "function": {"name": "b"}},
             }
@@ -104,18 +58,27 @@ class TestPreNormalize(CustomTestCase):
         self.assertEqual(named["tool_choice"], "auto")
         self.assertEqual(len(named["tools"]), 2)
         required = renderer.pre_normalize(
-            {"messages": [_user()], "tools": tools, "tool_choice": "required"}
+            {
+                "messages": [_user()],
+                "thinking": False,
+                "tools": tools,
+                "tool_choice": "required",
+            }
         )
         self.assertEqual(required["tool_choice"], "auto")
-        for body in (
-            {"messages": [_user()], "tools": tools, "tool_choice": "none"},
-            {"messages": [_user()], "tools": [], "tool_choice": "auto"},
-        ):
-            off = renderer.pre_normalize(body)
+        for tools_field, choice in ((tools, "none"), ([], "auto")):
+            off = renderer.pre_normalize(
+                {
+                    "messages": [_user()],
+                    "thinking": False,
+                    "tools": tools_field,
+                    "tool_choice": choice,
+                }
+            )
             self.assertNotIn("tools", off)
             self.assertNotIn("tool_choice", off)
 
-    def test_history_translation_and_host_fields(self):
+    def test_history_translation(self):
         body = renderer.pre_normalize(
             {
                 "messages": [
@@ -137,8 +100,8 @@ class TestPreNormalize(CustomTestCase):
                     {"role": "tool", "tool_call_id": "call_0", "content": "sunny"},
                     {"role": "assistant", "content": "It is"},
                 ],
+                "thinking": False,
                 "continue_final_message": True,
-                "n": 2,
                 "response_format": {"type": "structural_tag", "structures": []},
             }
         )
@@ -149,83 +112,96 @@ class TestPreNormalize(CustomTestCase):
         self.assertTrue(body["messages"][3]["prefix"])
         self.assertNotIn("continue_final_message", body)
         self.assertNotIn("response_format", body)
-        self.assertEqual(body["n"], 2)
-        unpaired = renderer.pre_normalize(
-            {"messages": [_user(), {"role": "tool", "content": "sunny"}]}
-        )
-        self.assertNotIn("tool_call_id", unpaired["messages"][1])
 
     def test_input_is_not_mutated(self):
-        original = {"messages": [{"role": "developer", "content": "x"}], "n": 3}
+        original = {
+            "messages": [{"role": "developer", "content": "x"}],
+            "thinking": True,
+        }
         renderer.pre_normalize(original)
         self.assertEqual(original["messages"][0]["role"], "developer")
-        self.assertEqual(original["n"], 3)
+        self.assertIs(original["thinking"], True)
 
 
-class TestOverlaySampling(CustomTestCase):
-    def _render(self, **overrides):
-        values = dict(
-            prompt="",
-            prompt_ids=[0, 1, 2],
-            temperature=1.0,
-            top_p=0.95,
-            thinking=True,
-            request=SimpleNamespace(resolve_max_tokens=lambda prompt, limit: 65536),
-        )
-        values.update(overrides)
-        return renderer.RecipeRender(**values)
-
-    def test_recipe_sampling_and_default_max_tokens(self):
-        params = {"temperature": 0.0, "top_p": 0.1, "max_new_tokens": None}
-        renderer.overlay_sampling(
-            params, self._render(), prompt_tokens=100, context_length=1_000_000
-        )
-        self.assertEqual(params["temperature"], 1.0)
-        self.assertEqual(params["top_p"], 0.95)
-        self.assertEqual(params["max_new_tokens"], 65536)
-        params = {"max_new_tokens": 5}
-        renderer.overlay_sampling(
-            params, self._render(), prompt_tokens=1, context_length=10
-        )
-        self.assertEqual(params["max_new_tokens"], 5)
-        self.assertNotIn("json_schema", params)
+class TestEffortBudget(CustomTestCase):
+    def test_integer_and_float_budgets(self):
+        self.assertEqual(renderer.parse_effort_budget(30), 30)
+        self.assertEqual(renderer.parse_effort_budget(0.5), 50)
+        self.assertEqual(renderer.parse_effort_budget(0.0), 1)
+        for value in (0, 101, 1.0, True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                renderer.parse_effort_budget(value)
 
 
 class TestRecipeEncoder(CustomTestCase):
-    def test_renders_and_encodes_with_the_served_vocabulary(self):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
         from tokenizers import Tokenizer
 
-        tokenizer = Tokenizer.from_file(_tokenizer_file(self))
-        encoder = renderer.RecipeEncoder("v41", tokenizer)
-        render = encoder.convert(
-            {"messages": [_user("")], "thinking": {"type": "disabled"}}
-        )
+        cls.tokenizer = Tokenizer.from_file(_tokenizer_file())
+        cls.encoder = renderer.RecipeEncoder("v41", cls.tokenizer)
+
+    def _ids(self, *tokens):
+        return [self.tokenizer.token_to_id(token) for token in tokens]
+
+    def test_encodes_with_the_served_vocabulary(self):
         self.assertEqual(
-            render.prompt, "<｜begin▁of▁sentence｜><｜User｜><｜Assistant｜></think>"
+            self.encoder.encode({"messages": [_user("")], "thinking": False}),
+            self._ids(
+                "<｜begin▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>", "</think>"
+            ),
         )
-        self.assertEqual(
-            render.prompt_ids,
-            [
-                tokenizer.token_to_id(token)
-                for token in (
-                    "<｜begin▁of▁sentence｜>",
-                    "<｜User｜>",
-                    "<｜Assistant｜>",
-                    "</think>",
+        thinking = self.encoder.encode({"messages": [_user("hi")], "thinking": True})
+        self.assertEqual(thinking[-2:], self._ids("<｜Assistant｜>", "<think>"))
+
+    def test_tasks_replace_or_follow_the_generation_header(self):
+        for thinking in (False, True):
+            body = {"messages": [_user("hello")], "thinking": thinking}
+            plain = self.encoder.encode(body)
+            for task, token in renderer.TASK_TOKENS.items():
+                with self.subTest(thinking=thinking, task=task):
+                    expected = (
+                        plain + self._ids(token)
+                        if task == "action"
+                        else plain[:-2] + self._ids(token)
+                    )
+                    self.assertEqual(self.encoder.encode(body, task=task), expected)
+        continued = {
+            "messages": [_user("count"), {"role": "assistant", "content": "1, 2,"}],
+            "thinking": False,
+            "continue_final_message": True,
+        }
+        with self.assertRaisesRegex(ValueError, "end with a user message"):
+            self.encoder.encode(continued, task="query")
+
+    def test_effort_budget_rewrites_the_effort_line(self):
+        body = {"messages": [_user("hi")], "thinking": True}
+        high = self.tokenizer.decode(
+            self.encoder.encode({**body, "reasoning_effort": "high"}),
+            skip_special_tokens=False,
+        )
+        self.assertIn("Reasoning Effort: 75 (range 1-100", high)
+        for budget in (1, 30, 100):
+            with self.subTest(budget=budget):
+                expected = high.replace(
+                    "Reasoning Effort: 75 ", f"Reasoning Effort: {budget} ", 1
                 )
-            ],
+                self.assertEqual(
+                    self.encoder.encode(body, effort_budget=budget),
+                    self.tokenizer.encode(expected, add_special_tokens=False).ids,
+                )
+        # Chat mode renders no effort line, so the budget changes nothing.
+        chat = {"messages": [_user("hi")], "thinking": False}
+        self.assertEqual(
+            self.encoder.encode(chat, effort_budget=30), self.encoder.encode(chat)
         )
-        self.assertFalse(render.thinking)
-        self.assertEqual(render.temperature, 1.0)
-        self.assertEqual(render.top_p, 1.0)
-        # The API's default: thinking on, with recipe's sampling for it.
-        default = encoder.convert({"messages": [_user("hi")]}, encode=False)
-        self.assertTrue(default.thinking)
-        self.assertIsNone(default.prompt_ids)
-        self.assertTrue(default.prompt.endswith("<think>"))
-        self.assertGreaterEqual(default.top_p, 0.95)
-        with self.assertRaisesRegex(ValueError, "n = 1"):
-            encoder.convert({"messages": [_user("hi")], "n": 2})
+
+    def test_api_validation_surfaces_as_value_error(self):
+        with self.assertRaises(ValueError):
+            self.encoder.encode(
+                {"messages": [_user("hi")], "thinking": True, "reasoning_effort": "x"}
+            )
 
 
 if __name__ == "__main__":

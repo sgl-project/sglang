@@ -632,7 +632,10 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if self._encoding_adapter is not None:
             return self._encoding_adapter.encode_messages(
-                messages=messages, request=request, tools=tools
+                messages=messages,
+                request=request,
+                tools=tools,
+                thinking=thinking_mode == ThinkingMode.THINKING,
             )
         if self.chat_encoding_spec == "kimi_k3":
             messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
@@ -1218,13 +1221,6 @@ class OpenAIServingChat(OpenAIServingBase):
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
         )
-        if self._encoding_adapter is not None:
-            self._encoding_adapter.apply_sampling(
-                request=request,
-                sampling_params=sampling_params,
-                prompt_tokens=len(processed_messages.prompt_ids),
-                context_length=self.tokenizer_manager.model_config.context_len,
-            )
 
         # Handle single vs multiple requests
         if request.input_ids is not None or self._can_reuse_text_only_prompt_ids(
@@ -2966,11 +2962,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
         NOTE: This is predefined based on model's chat template
         """
-        if self._encoding_adapter is not None:
-            thinking = self._encoding_adapter.thinking_enabled(request=request)
-            if thinking is not None:
-                return thinking
-
         if not self.reasoning_parser:
             return False
 
