@@ -36,15 +36,6 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 _is_npu_arch35 = is_npu_arch35()
 
 
-def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
-    return (
-        runtime_context.get_parallel().dcp_enabled
-        and not forward_context.get_attn_backend().is_draft_worker
-        and not dsa_use_prefill_cp(forward_batch)
-        and not forward_batch.forward_mode.is_idle()
-    )
-
-
 # region MHA
 def forward_mha_prepare_npu(
     m: "DeepseekV2AttentionMLA",
@@ -499,6 +490,7 @@ def forward_dsa_prepare_npu(
                 latent_cache, forward_batch, k_nope, k_pe
             )
 
+    backend = get_mla_dcp_backend(forward_context.get_attn_backend())
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
             hidden_states,
@@ -512,7 +504,7 @@ def forward_dsa_prepare_npu(
         # DSA layers that skip the indexer reuse ``prev_topk_indices``. Remap
         # only when a fresh global top-k is produced so shared-index layers do
         # not repeat the same DCP partitioning work.
-        if _use_dsa_dcp_partial_attention(forward_batch):
+        if backend.uses_dcp_partial_attention(forward_batch):
             parallel = runtime_context.get_parallel()
             topk_indices = dcp_layout.remap_dcp_sparse_indices(
                 topk_indices,
@@ -523,7 +515,7 @@ def forward_dsa_prepare_npu(
     else:
         topk_indices = prev_topk_indices
 
-    if _use_dsa_dcp_partial_attention(forward_batch):
+    if backend.uses_dcp_partial_attention(forward_batch):
         q_nope_out, q_pe = dcp_comm.all_gather_q_for_mla_decode(q_nope_out, q_pe)
 
     topk_indices = maybe_capture_indexer_topk(m.layer_id, topk_indices)
