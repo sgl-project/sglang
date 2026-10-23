@@ -295,5 +295,79 @@ class TestFilterBatchHostIndices(CustomTestCase):
         torch.testing.assert_close(a.future_indices, b.future_indices)
 
 
+@unittest.skipUnless(_HAS_CUDA, "host synchronization guard requires CUDA")
+class TestPrefillLengthTransfer(CustomTestCase):
+    """Prefill metadata must not make the host wait for queued target work."""
+
+    def test_prefill_positions_without_host_sync(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        device = torch.device("cuda")
+        for extend_lens, prefix_lens in [([4096], [0]), ([3, 5, 7], [0, 128, 8192])]:
+            with self.subTest(extend_lens=extend_lens, prefix_lens=prefix_lens):
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.EXTEND,
+                    seq_lens=torch.tensor(
+                        [p + n for p, n in zip(prefix_lens, extend_lens)],
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                    extend_lens=extend_lens,
+                    prefix_lens=prefix_lens,
+                    out_cache_loc=torch.arange(sum(extend_lens), device=device),
+                )
+                output = SimpleNamespace(
+                    kv_loc_plan=None,
+                    logits_output=SimpleNamespace(
+                        hidden_states=torch.zeros(sum(extend_lens), 1, device=device)
+                    ),
+                    next_token_ids=torch.zeros(
+                        len(extend_lens), dtype=torch.int64, device=device
+                    ),
+                )
+                materialized = {}
+                worker = SimpleNamespace(
+                    _validate_phase1_sampling_support=lambda batch: None,
+                    target_worker=SimpleNamespace(
+                        forward_batch_generation=lambda *args, **kwargs: output
+                    ),
+                    _tp_sync=SimpleNamespace(sync=lambda *args: None),
+                    model_runner=SimpleNamespace(
+                        prefill_attention_backend_str="trtllm"
+                    ),
+                    _draft_write_ids=lambda plan: batch.out_cache_loc,
+                    _append_target_hidden_to_draft_kv_by_loc=lambda **kwargs: (
+                        materialized.update(kwargs)
+                    ),
+                )
+                worker._make_next_draft_input_prefill = (
+                    DFlashWorkerV2._make_next_draft_input_prefill.__get__(worker)
+                )
+                # Exercise real metadata staging and position generation. Model
+                # execution and the KV writer are the external boundaries here.
+                previous = torch.cuda.get_sync_debug_mode()
+                try:
+                    torch.cuda.set_sync_debug_mode("error")
+                    result = DFlashWorkerV2.forward_batch_generation(worker, batch)
+                finally:
+                    torch.cuda.set_sync_debug_mode(previous)
+                expected_positions = torch.tensor(
+                    [p + i for p, n in zip(prefix_lens, extend_lens) for i in range(n)],
+                    dtype=torch.int64,
+                )
+                torch.testing.assert_close(
+                    materialized["positions"].cpu(), expected_positions
+                )
+                torch.testing.assert_close(
+                    materialized["extend_lens"].cpu(),
+                    torch.tensor(extend_lens, dtype=torch.int32),
+                )
+                self.assertIsNone(result.logits_output.hidden_states)
+                torch.testing.assert_close(
+                    result.next_draft_input.new_seq_lens, batch.seq_lens
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
