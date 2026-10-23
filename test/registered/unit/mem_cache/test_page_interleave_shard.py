@@ -120,6 +120,32 @@ GS = N * PS  # full-group span (N physical pages)
 
 
 class TestPageShardScratchSizing(CustomTestCase):
+    def test_dsa_mtp_budget_includes_both_indexer_scratch_pairs(self):
+        with (
+            self._fixture() as kvc,
+            get_context().override_server_args(enable_multi_layer_eagle=False),
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+                return_value=576,
+            ),
+        ):
+            kvc.page_size = 64
+            kvc.kv_cache_dtype = torch.float8_e4m3fn
+            kvc.model_config.hf_config = SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"],
+                index_topk=2048,
+                index_head_dim=128,
+            )
+            kvc.spec_algorithm = SpeculativeAlgorithm.EAGLE
+            kvc.spec_aux_config = SimpleNamespace(eagle_draft_num_layers=1)
+            spec = make_page_shard_spec(kvc)
+            # Two scratch slots per pool, each containing 576-byte latent KV
+            # and 128-byte index keys plus a four-byte scale for every token.
+            self.assertEqual(
+                compute_page_shard_scratch_bytes(kvc, include_mtp=True),
+                2 * 2 * spec.scratch_rows * (576 + 128 + 4),
+            )
+
     @contextmanager
     def _fixture(
         self,
