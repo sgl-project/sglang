@@ -2,11 +2,14 @@
 
 import asyncio
 import io
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from starlette.datastructures import UploadFile
@@ -17,6 +20,15 @@ from sglang.multimodal_gen.runtime.entrypoints.openai import (
     mesh_api,
     utils,
     video_api,
+)
+from sglang.multimodal_gen.runtime.postprocess import (
+    bounded_cache,
+    realesrgan_upscaler,
+    rife_interpolator,
+)
+from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
+    cache_get,
+    cache_put,
 )
 from sglang.multimodal_gen.runtime.utils.image_io import ensure_path_within_root
 
@@ -177,3 +189,197 @@ def test_multipart_upload_is_sanitized_before_generation(
         )
     assert response.status_code == 418, response.text
     assert not (tmp_path / "evil.png").exists()
+
+
+def test_invalid_output_quality_is_a_400_not_a_500(monkeypatch):
+    """A bad output_quality must surface as HTTP 400, not an unhandled ValueError."""
+    monkeypatch.setattr(
+        utils, "get_global_server_args", lambda: SimpleNamespace(model_path="m")
+    )
+    monkeypatch.setattr(
+        SamplingParams,
+        "from_user_sampling_params_args",
+        classmethod(
+            lambda cls, **kw: SimpleNamespace(
+                data_type=utils.DataType.IMAGE, output_compression=None
+            )
+        ),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        utils.build_sampling_params("request", output_quality="bogus")
+    assert exc_info.value.status_code == 400
+    assert "output_quality" in exc_info.value.detail
+
+
+@pytest.mark.parametrize(
+    "endpoint,kwargs,detail",
+    [
+        (
+            "/v1/images/generations",
+            {"json": {"prompt": "p", "response_format": "url"}},
+            "cloud storage",
+        ),
+        (
+            "/v1/images/edits",
+            {
+                "data": {"prompt": "p", "response_format": "url"},
+                "files": {"image": ("a.png", b"image", "image/png")},
+            },
+            "cloud storage",
+        ),
+        (
+            "/v1/images/generations",
+            {"json": {"prompt": "p", "response_format": "bmp"}},
+            "not supported",
+        ),
+    ],
+)
+def test_undeliverable_response_format_is_rejected_before_generation(
+    monkeypatch, endpoint, kwargs, detail
+):
+    """An unsupported response_format, or 'url' with no cloud storage and no
+    output_path, must fail fast instead of running the whole generation first."""
+    args = SimpleNamespace(
+        input_save_path=None, output_path=None, pipeline_class_name=None
+    )
+    monkeypatch.setattr(image_api, "get_global_server_args", lambda: args)
+    monkeypatch.setattr(
+        image_api, "resolve_sampling_params_cls", lambda args: SamplingParams
+    )
+    monkeypatch.setattr(image_api.cloud_storage, "enabled", False)
+
+    def generation_reached(*args, **kwargs):
+        raise HTTPException(status_code=599, detail="generation reached")
+
+    monkeypatch.setattr(image_api, "build_sampling_params", generation_reached)
+    app = FastAPI()
+    app.include_router(image_api.router)
+    with TestClient(app) as client:
+        response = client.post(endpoint, **kwargs)
+    assert response.status_code == 400, response.text
+    assert detail in response.json()["detail"]
+
+
+def _patch_download(monkeypatch, tmp_path, handler):
+    """Route the download through handler; return the dir holding partial files."""
+    part_dir = tmp_path / "parts"
+    part_dir.mkdir()
+    monkeypatch.setattr(utils.tempfile, "tempdir", str(part_dir))
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        utils.httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+    return part_dir
+
+
+def _chunked_png(request):
+    async def body():
+        for _ in range(8):
+            yield b"x" * 512
+
+    return httpx.Response(200, content=body(), headers={"content-type": "image/png"})
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        lambda request: httpx.Response(
+            200, content=b"x" * 4096, headers={"content-type": "image/png"}
+        ),
+        _chunked_png,
+    ],
+    ids=["content-length", "chunked-no-length"],
+)
+def test_image_download_over_size_limit_is_rejected(monkeypatch, tmp_path, handler):
+    """An oversized remote image must be aborted, not buffered and written."""
+    monkeypatch.setattr(utils, "_MAX_IMAGE_DOWNLOAD_BYTES", 1024)
+    part_dir = _patch_download(monkeypatch, tmp_path, handler)
+    target = tmp_path / "in" / "img.png"
+    with pytest.raises(Exception, match="exceeds"):
+        asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
+    assert not target.exists()
+    assert not any(part_dir.iterdir())
+
+
+def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
+    monkeypatch.setattr(utils, "_MAX_IMAGE_DOWNLOAD_BYTES", 1024)
+    part_dir = _patch_download(
+        monkeypatch,
+        tmp_path,
+        lambda request: httpx.Response(
+            200, content=b"x" * 512, headers={"content-type": "image/png"}
+        ),
+    )
+    target = tmp_path / "in" / "img.png"
+    saved = asyncio.run(
+        utils._save_url_image_to_path("https://x.test/a.png", str(target))
+    )
+    assert Path(saved).read_bytes() == b"x" * 512
+    assert not any(part_dir.iterdir())
+
+
+_CPU = SimpleNamespace(get_local_torch_device=lambda: torch.device("cpu"))
+
+
+def test_cache_evicts_least_recently_used():
+    """A get must refresh recency, so eviction drops the stale entry, not the oldest insert."""
+    cache = OrderedDict()
+    cache_put(cache, "a", 1, max_size=2)
+    cache_put(cache, "b", 2, max_size=2)
+    assert cache_get(cache, "a") == 1
+    cache_put(cache, "c", 3, max_size=2)
+    assert list(cache) == ["a", "c"]
+
+
+def test_cache_put_waits_for_the_shared_lock():
+    """Request threads share these caches; an unlocked move_to_end can race an
+    eviction and raise KeyError."""
+    cache = OrderedDict()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with bounded_cache._CACHE_LOCK:
+            future = pool.submit(cache_put, cache, "a", 1, max_size=1)
+            done, _ = wait([future], timeout=0.1)
+            assert not done
+        future.result(timeout=5)
+    assert cache == {"a": 1}
+
+
+def test_upscaler_uses_bounded_cache(monkeypatch):
+    monkeypatch.setattr(realesrgan_upscaler, "_MODEL_CACHE", OrderedDict())
+    monkeypatch.setattr(realesrgan_upscaler, "_MAX_CACHED_MODELS", 1)
+    monkeypatch.setattr(realesrgan_upscaler, "_resolve_model_path", lambda p: p)
+    monkeypatch.setattr(realesrgan_upscaler.torch, "load", lambda *a, **k: {})
+    monkeypatch.setattr(
+        realesrgan_upscaler,
+        "_build_net_from_state_dict",
+        lambda sd: torch.nn.Identity(),
+    )
+    monkeypatch.setattr(realesrgan_upscaler, "current_platform", _CPU)
+    for path in ["a.pth", "b.pth"]:
+        realesrgan_upscaler.ImageUpscaler(model_path=path)._ensure_model_loaded()
+    assert list(realesrgan_upscaler._MODEL_CACHE) == ["b.pth"]
+
+
+def test_rife_uses_bounded_cache(monkeypatch):
+    import sglang.multimodal_gen.runtime.utils.hf_diffusers_utils as hf
+
+    class FakeModel:
+        def __init__(self):
+            self.flownet = torch.nn.Identity()
+
+        def load_model(self, *a, **k):
+            pass
+
+        def eval(self):
+            pass
+
+    monkeypatch.setattr(rife_interpolator, "_MODEL_CACHE", OrderedDict())
+    monkeypatch.setattr(rife_interpolator, "_MAX_CACHED_MODELS", 1)
+    monkeypatch.setattr(hf, "maybe_download_model", lambda p: p)
+    monkeypatch.setattr(rife_interpolator, "Model", FakeModel)
+    monkeypatch.setattr(rife_interpolator, "current_platform", _CPU)
+    for path in ["a", "b"]:
+        rife_interpolator.FrameInterpolator(model_path=path)._ensure_model_loaded()
+    assert list(rife_interpolator._MODEL_CACHE) == ["b"]
