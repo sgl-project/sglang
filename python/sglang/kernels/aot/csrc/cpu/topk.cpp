@@ -328,7 +328,7 @@ void fused_moe_router_kernel_impl(
 
   at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
     alignas(64) float logits[kMaxExperts];
-    alignas(64) int32_t sel[kMaxExperts];
+    alignas(64) elem_t queue[kMaxExperts];
 
     for (int64_t token = begin; token < end; ++token) {
       float max_logit = -std::numeric_limits<float>::infinity();
@@ -353,7 +353,7 @@ void fused_moe_router_kernel_impl(
       }
       inv_sum_exp = 1.0f / inv_sum_exp;
 
-      std::partial_sort(queue.begin(), queue.begin() + topk, queue.end(), [](const elem_t& x, const elem_t& y) -> bool {
+      std::partial_sort(queue, queue + topk, queue + num_experts, [](const elem_t& x, const elem_t& y) -> bool {
         return x.first > y.first;
       });
 
