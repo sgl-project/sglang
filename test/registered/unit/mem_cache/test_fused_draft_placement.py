@@ -69,8 +69,9 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     register_host_kind,
 )
 from sglang.srt.runtime_context import get_parallel, override_platform
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -652,6 +653,9 @@ class TestFusedDraftDecision(CustomTestCase):
         kv_cache_dtype_flag="auto",
         draft_backend=None,
         target_backends=("triton", "triton"),
+        tp_size=1,
+        attn_cp_size=1,
+        attn_dp_size=1,
         dcp_size=1,
         hicache=False,
         retraction_backup=None,
@@ -665,10 +669,7 @@ class TestFusedDraftDecision(CustomTestCase):
         cfg.mambaish_config = None
         cfg.use_mla_backend = False
         cfg.is_draft_worker = False
-        cfg.spec_algorithm = SimpleNamespace(
-            is_eagle=lambda: algorithm == "EAGLE",
-            is_dflash_family=lambda: algorithm in ("DFLASH", "DSPARK"),
-        )
+        cfg.spec_algorithm = SpeculativeAlgorithm.from_string(algorithm)
         cfg.model_config = SimpleNamespace(
             is_multi_layer_eagle=False, sliding_window_size=None
         )
@@ -681,7 +682,7 @@ class TestFusedDraftDecision(CustomTestCase):
                 is_hybrid_swa=False,
                 is_deepseek_v4_arch=False,
                 num_nextn_predict_layers=None,
-                get_num_kv_heads=lambda tp: 4,
+                get_num_kv_heads=lambda tp: max(1, 4 // tp),
                 head_dim=64,
                 v_head_dim=64,
                 dtype=torch.bfloat16,
@@ -697,6 +698,11 @@ class TestFusedDraftDecision(CustomTestCase):
             speculative_draft_attention_backend=draft_backend,
         )
         with (
+            published_topology(
+                tp_size=tp_size,
+                attn_cp_size=attn_cp_size,
+                attn_dp_size=attn_dp_size,
+            ),
             patch.object(kvc, "get_memory", return_value=memory),
             patch.object(
                 kvc,
@@ -717,13 +723,31 @@ class TestFusedDraftDecision(CustomTestCase):
                 draft_worker_common, "attention_backends", return_value=target_backends
             ),
             patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None),
-            get_parallel().override(attn_tp_size=1, attn_dcp_size=dcp_size),
+            get_parallel().override(attn_dcp_size=dcp_size),
             override_platform(is_xpu=False, is_hip=False),
         ):
             return cfg._fused_draft_decision()
 
     def test_a_stateless_draft_is_placed(self):
         self.assertIsNotNone(self._decide().placement)
+
+    def test_cp_draft_placement_keeps_dp_isolated(self):
+        for algorithm, cp, dp, heads in (
+            ("DFLASH", 1, 1, 1),
+            ("DFLASH", 4, 1, 1),
+            ("DFLASH", 2, 2, 4),
+            ("EAGLE", 4, 1, 4),
+            ("DSPARK", 4, 1, 4),
+        ):
+            with self.subTest(algorithm=algorithm, cp=cp, dp=dp):
+                decision = self._decide(
+                    algorithm=algorithm,
+                    tp_size=4,
+                    attn_cp_size=cp,
+                    attn_dp_size=dp,
+                )
+                self.assertIsNotNone(decision.placement, decision.declined)
+                self.assertEqual(decision.placement.region("full").head_num, heads)
 
     def test_a_draft_kv_dtype_unlike_the_host_keeps_the_private_pool(self):
         """A fused draft stores its rows in the host's KV dtype; an explicit

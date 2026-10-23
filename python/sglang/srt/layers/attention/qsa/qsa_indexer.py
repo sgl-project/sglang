@@ -165,6 +165,7 @@ class QSAIndexer(MultiPlatformOp):
         pool=None,
         cache_loc: torch.Tensor | None = None,
         q_heads_padded: int | None = None,
+        ensure_cos_sin_cache: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
@@ -180,8 +181,10 @@ class QSAIndexer(MultiPlatformOp):
                 qsa_index_q_norm_rope_store,
             )
 
-            if not get_is_capture_mode() and hasattr(
-                self.rotary_emb, "_ensure_cos_sin_cache_length"
+            if (
+                ensure_cos_sin_cache
+                and not get_is_capture_mode()
+                and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length")
             ):
                 self.rotary_emb._ensure_cos_sin_cache_length(
                     int(positions.max().item())
@@ -208,7 +211,7 @@ class QSAIndexer(MultiPlatformOp):
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
         )
-        q = self.apply_rope(positions, q)
+        q = self.apply_rope(positions, q, ensure_cos_sin_cache=ensure_cos_sin_cache)
         if pool is not None:
             q = q.to(pool.qsa_compressed_dtype)
         return q, token_k, False
@@ -400,7 +403,12 @@ class QSAIndexer(MultiPlatformOp):
             return positions[0]
         return positions
 
-    def apply_rope(self, positions: torch.Tensor, tensor: torch.Tensor) -> torch.Tensor:
+    def apply_rope(
+        self,
+        positions: torch.Tensor,
+        tensor: torch.Tensor,
+        ensure_cos_sin_cache: bool = True,
+    ) -> torch.Tensor:
         if tensor.numel() == 0:
             return tensor
         positions = positions.long()
@@ -409,8 +417,10 @@ class QSAIndexer(MultiPlatformOp):
         )
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
-        if not get_is_capture_mode() and hasattr(
-            self.rotary_emb, "_ensure_cos_sin_cache_length"
+        if (
+            ensure_cos_sin_cache
+            and not get_is_capture_mode()
+            and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length")
         ):
             self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
 
@@ -558,7 +568,8 @@ class QSAIndexer(MultiPlatformOp):
         exactly as without CP (every rank ends up with the complete compressed-K
         cache). Selection then scores the local rows against all compressed
         blocks of their request, position-driven, so the output rows line up
-        with the local query rows the sparse attention consumes."""
+        with the local query rows the sparse attention consumes.
+        """
         strategy = get_cp_strategy()
         if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
             strategy_name = strategy.name if strategy is not None else "none"
@@ -584,8 +595,13 @@ class QSAIndexer(MultiPlatformOp):
         )
         # Use the compressed-cache dtype for Q. Leaving cache_loc unset defers
         # the ring store until raw local K has been gathered into global order.
+        # The load-time RoPE reservation covers these positions, as this layer's
+        # attention already assumed; re-checking costs a device sync per layer.
         q, token_k, _ = self.project_qk(
-            hidden_states, positions, pool=indexer_metadata.token_to_kv_pool
+            hidden_states,
+            positions,
+            pool=indexer_metadata.token_to_kv_pool,
+            ensure_cos_sin_cache=False,
         )
         # Raw keys of all new tokens in global packed order: the ring store
         # and compression use the global write plan unchanged. Cached prefix

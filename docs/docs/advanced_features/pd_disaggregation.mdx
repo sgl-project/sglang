@@ -585,6 +585,14 @@ python -m sglang.launch_server \
   --port 30000
 ```
 
+#### UCX device selection
+
+For NVIDIA CUDA and AMD ROCm deployments using NIXL UCX, `--disaggregation-ib-device` accepts a shared HCA list or a per-GPU JSON/file mapping. Mapping keys are process-visible GPU IDs; use HCA names without port suffixes, such as `mlx5_0`.
+
+A non-empty `UCX_NET_DEVICES` takes precedence over this CLI option. SGLang leaves the environment variable unchanged and skips the CLI mapping, including per-GPU mappings, with a warning. This preserves interfaces such as `lo` in an existing configuration like `rdma0:1,rdma4:1,lo`, which some RoCE hosts need for NIXL's self-endpoint.
+
+To use per-GPU CLI selection, unset `UCX_NET_DEVICES`; keep it configured on hosts that require the loopback entry. An explicit `device_list` in `SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS` is left unchanged and still overrides `UCX_NET_DEVICES`; do not set it if you rely on the environment's complete device list.
+
 ## ASCEND
 
 ### Usage
