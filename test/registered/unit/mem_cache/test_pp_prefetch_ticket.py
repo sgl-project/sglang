@@ -44,6 +44,7 @@ register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 class TestPPPrefetchTicket(unittest.TestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
+        c.cp_encoder_replay = False
         c.page_size = c.prefetch_threshold = 4
         c.storage_config = HiCacheStorageConfig(
             tp_rank=0,

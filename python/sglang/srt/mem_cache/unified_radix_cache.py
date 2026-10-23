@@ -207,7 +207,6 @@ class _OngoingPrefetch(NamedTuple):
 class UnifiedRadixCache(BasePrefixCache):
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
-    cp_encoder_replay = False
 
     def __init__(
         self,
