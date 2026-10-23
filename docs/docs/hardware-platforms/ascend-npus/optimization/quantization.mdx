@@ -495,14 +495,14 @@ python3 -m sglang.launch_server \
 
 On Ascend A3, dense compressed-tensors checkpoints support symmetric INT8 weights
 with per-channel or per-tensor scales, static symmetric per-tensor activation
-scales, and FP16 or BF16 activations. Use tensor parallelism of one (`--tp-size 1`).
+scales, and FP16 or BF16 activations.
 The loader detects the quantization configuration from the checkpoint's
 `config.json`.
 
 Fused QKV and gate/up projections must have identical activation scales across
 their logical shards. Each shard keeps its exported INT8 weight codes and weight
 scale. The calibrated activation scale stays fixed for every token. Asymmetric
-activations and tensor parallelism greater than one are rejected at loading.
+activations are rejected at loading.
 
 ## Diffusion Model Quantization on Ascend NPU
 

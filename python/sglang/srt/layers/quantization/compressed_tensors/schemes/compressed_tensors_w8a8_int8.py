@@ -81,7 +81,8 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         # INPUT SCALE
         if self.is_static_input_scheme:
             input_scale = PerTensorScaleParameter(
-                data=torch.empty(1, dtype=torch.float32), weight_loader=weight_loader
+                data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                weight_loader=weight_loader,
             )
             layer.register_parameter("input_scale", input_scale)
 
@@ -90,7 +91,8 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
                 # as the weights
                 # AZP loaded as int8 but used as int32
                 input_zero_point = PerTensorScaleParameter(
-                    data=torch.empty(1, dtype=torch.int8), weight_loader=weight_loader
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.int8),
+                    weight_loader=weight_loader,
                 )
                 layer.register_parameter("input_zero_point", input_zero_point)
 
@@ -205,15 +207,6 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
         if self.is_static_input_scheme:
             if params_dtype not in (torch.float16, torch.bfloat16):
                 raise ValueError("NPU static INT8 supports float16 and bfloat16 output")
-            group = getattr(layer, "tp_group", None)
-            if (
-                getattr(group, "world_size", 1) != 1
-                or kwargs.get("input_size", input_size_per_partition)
-                != input_size_per_partition
-                or kwargs.get("output_size", sum(output_partition_sizes))
-                != sum(output_partition_sizes)
-            ):
-                raise NotImplementedError("NPU static INT8 currently requires TP=1")
         super().create_weights(
             layer,
             output_partition_sizes,
@@ -225,12 +218,7 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
         if self.is_static_input_scheme:
             # QKV and gate/up loaders assign one scale to each logical shard.
             # Reject missing calibration data instead of consuming empty memory.
-            layer.input_scale = PerTensorScaleParameter(
-                data=torch.full(
-                    (len(output_partition_sizes),), float("nan"), dtype=torch.float32
-                ),
-                weight_loader=weight_loader,
-            )
+            layer.input_scale.data.fill_(float("nan"))
             layer.weight_scale.data.fill_(float("nan"))
 
     @classmethod
