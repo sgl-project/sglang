@@ -8,6 +8,10 @@
 
 mod ext;
 
+/// Version of this crate, which versions the `sglang.api.v1` schema and its
+/// generated Rust API independently of SGLang releases (see README.md).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod api {
     // Generated code optimizes for template uniformity, not lint cleanliness.
     #[allow(clippy::all)]
