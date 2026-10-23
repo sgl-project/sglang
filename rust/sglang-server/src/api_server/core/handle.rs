@@ -52,7 +52,7 @@ pub(crate) struct CoreMetadata {
     served_model_name: String,
     tokenizer_path: String,
     preferred_sampling_params: Option<crate::message::config::PreferredSamplingParams>,
-    weight_version: Option<String>,
+    weight_version: Option<Arc<str>>,
     load_format: Option<String>,
     reasoning_parser: Option<String>,
     tool_call_parser: Option<String>,
@@ -74,7 +74,7 @@ impl From<&ServerArgs> for CoreMetadata {
             served_model_name: args.served_model_name.clone(),
             tokenizer_path: args.tokenizer_path.clone(),
             preferred_sampling_params: args.preferred_sampling_params.clone(),
-            weight_version: args.weight_version.clone(),
+            weight_version: args.weight_version.as_deref().map(Arc::from),
             load_format: args.load_format.clone(),
             reasoning_parser: args.reasoning_parser.clone(),
             tool_call_parser: args.tool_call_parser.clone(),
@@ -162,7 +162,7 @@ impl CoreHandle {
         }
         self.submit_generation(request, generation)
             .await
-            .map(CoreCall::new)
+            .map(|runtime| self.generation_call(runtime))
     }
 
     /// Submit core-owned work without exposing it through the public Abort
@@ -172,7 +172,7 @@ impl CoreHandle {
             .await?;
         self.submit(RequestKind::Generate(Box::new(request)))
             .await
-            .map(CoreCall::new)
+            .map(|runtime| self.generation_call(runtime))
     }
 
     /// Prepare the group before submitting any surviving request. Explicit
@@ -212,7 +212,7 @@ impl CoreHandle {
         for (request, generation) in requests.into_iter().zip(generations) {
             let rid = request.rid.clone();
             let call = match self.submit_generation(request, generation).await {
-                Ok(call) => CoreCall::new(call),
+                Ok(call) => self.generation_call(call),
                 // Cancellation may happen during preparation or while waiting
                 // for intake. Keep this slot without rolling back siblings.
                 Err(CoreError::Cancelled(_)) => {
@@ -241,6 +241,10 @@ impl CoreHandle {
             .await
     }
 
+    fn generation_call(&self, runtime: RuntimeCall) -> CoreCall {
+        CoreCall::new(runtime, self.inner.metadata.weight_version.clone())
+    }
+
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
         prefetch::prefetch_all(requests, &self.inner.mm_limits)
             .await
@@ -256,7 +260,7 @@ impl CoreHandle {
             tokenizer_path: metadata.tokenizer_path.clone(),
             is_generation: true,
             preferred_sampling_params: metadata.preferred_sampling_params.clone(),
-            weight_version: metadata.weight_version.clone(),
+            weight_version: metadata.weight_version.as_deref().map(str::to_owned),
             load_format: metadata.load_format.clone(),
             reasoning_parser: metadata.reasoning_parser.clone(),
             tool_call_parser: metadata.tool_call_parser.clone(),
@@ -582,13 +586,17 @@ fn translate_runtime_error(error: Error) -> CoreError {
 pub(crate) struct CoreCall {
     runtime: RuntimeCall,
     events_finished: bool,
+    /// The launch weight version, stamped on every output (see
+    /// [`CoreOutput::weight_version`](super::CoreOutput)).
+    weight_version: Option<Arc<str>>,
 }
 
 impl CoreCall {
-    fn new(runtime: RuntimeCall) -> Self {
+    fn new(runtime: RuntimeCall, weight_version: Option<Arc<str>>) -> Self {
         Self {
             runtime,
             events_finished: false,
+            weight_version,
         }
     }
 
@@ -598,15 +606,18 @@ impl CoreCall {
         response_tx
             .try_send(ResponseItem::Error(Error::Disconnected))
             .expect("new response channel has room for its terminal error");
-        Self::new(RuntimeCall {
-            rid,
-            response_rx,
-            abort_tx,
-            admission: RequestAdmission::pending(),
-            expected_response: ExpectedResponse::Generate,
-            in_flight: false,
-            generation: None,
-        })
+        Self::new(
+            RuntimeCall {
+                rid,
+                response_rx,
+                abort_tx,
+                admission: RequestAdmission::pending(),
+                expected_response: ExpectedResponse::Generate,
+                in_flight: false,
+                generation: None,
+            },
+            None,
+        )
     }
 
     /// ID that adapters should return to their client.
@@ -623,7 +634,7 @@ impl CoreCall {
         }
 
         let event = match self.runtime.recv().await {
-            Some(item) => generation_event(item),
+            Some(item) => self.generation_event(item),
             None => CoreEvent::Failed(CoreError::Internal(
                 "response truncated before completion".into(),
             )),
@@ -637,7 +648,7 @@ impl CoreCall {
     pub(crate) fn drain_ready(&mut self, events: &mut Vec<CoreEvent>) {
         while !self.events_finished {
             let event = match self.runtime.try_recv() {
-                Ok(item) => generation_event(item),
+                Ok(item) => self.generation_event(item),
                 // Preserve every queued event before reporting a premature
                 // close. The next awaited `recv` translates that close into
                 // one terminal failure, maintaining stream order while still
@@ -659,15 +670,26 @@ impl CoreCall {
     ) -> Self {
         let admission = RequestAdmission::pending();
         assert!(admission.try_accept(), "test calls start already admitted");
-        Self::new(RuntimeCall {
-            rid,
-            response_rx,
-            abort_tx,
-            admission,
-            expected_response: ExpectedResponse::Generate,
-            in_flight: true,
-            generation: None,
-        })
+        Self::new(
+            RuntimeCall {
+                rid,
+                response_rx,
+                abort_tx,
+                admission,
+                expected_response: ExpectedResponse::Generate,
+                in_flight: true,
+                generation: None,
+            },
+            None,
+        )
+    }
+
+    fn generation_event(&self, item: ResponseItem) -> CoreEvent {
+        let mut event = generation_event(item);
+        if let CoreEvent::Delta(output) | CoreEvent::Finished(output) = &mut event {
+            output.weight_version = self.weight_version.clone();
+        }
+        event
     }
 }
 

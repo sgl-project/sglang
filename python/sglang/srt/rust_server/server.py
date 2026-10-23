@@ -51,6 +51,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The extras families' header columns (`BatchHeader.out_lp_lens` through
+# `hidden_poslens`). A frame without extras that sends a later column pads
+# them empty; `push_generation` asserts the count whenever it sends extras.
+_EXTRAS_HEADER_COLS = 12
+
 
 class RustServer:
     """Owns the embedded multi-threaded Rust server (``sglang_server.Server``).
@@ -394,16 +399,18 @@ class RustServer:
             "type": "abort",
             "message": abort.abort_message or "Abort in waiting queue",
         }
-        header = msgspec.msgpack.encode(
-            [
-                [abort.rid],
-                [finish_reason],
-                [len(req.origin_input_ids)],
-                [0],
-                [req.cached_tokens],
-                [req.reasoning_tokens],
-            ]
-        )
+        header_cols = [
+            [abort.rid],
+            [finish_reason],
+            [len(req.origin_input_ids)],
+            [0],
+            [req.cached_tokens],
+            [req.reasoning_tokens],
+        ]
+        if abort.weight_versions is not None:
+            header_cols += [[]] * _EXTRAS_HEADER_COLS
+            header_cols.append([abort.weight_versions])
+        header = msgspec.msgpack.encode(header_cols)
         if not self.server.push_decode_result_batch(header, [b""]):
             logger.warning(
                 "Rust egress closed; dropped abort of %s during shutdown", abort.rid
@@ -425,7 +432,8 @@ class RustServer:
             cached_tokens, reasoning_tokens``) plus
             the shape metadata for the optional families (``*_lens`` element counts
             for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
-            and hidden ones).
+            and hidden ones), then the finished requests' weight-version
+            spans and a multimodal model's media token counts.
           - ``data``: the raw little-endian numeric buffer: the token ids
             first, as the 8-byte ``array("q")`` bytes the scheduler already
             holds, then every logprob / hidden column as 4-byte elements
@@ -563,9 +571,33 @@ class RustServer:
                 for i in range(batch_size):
                     accept(i)
 
+            extras_start = len(header_cols)
             for extra in extras:
                 header_cols += extra.header_cols()
                 data_cols += extra.data_cols()
+            # The padding below must line up with these columns.
+            assert len(header_cols) - extras_start == _EXTRAS_HEADER_COLS, (
+                "_EXTRAS_HEADER_COLS no longer matches the extras families"
+            )
+
+        # After the extras: the finished requests' weight-version spans (None
+        # for the others) and a multimodal model's media token counts, each
+        # empty when nothing in the batch carries it. The lists are already
+        # built, so a frame pays only their encoding, and the header stops at
+        # its last non-empty column.
+        media = self._multimodal_enabled
+        trailing = [
+            payload.weight_versions or [],
+            (payload.image_tokens or []) if media else [],
+            (payload.audio_tokens or []) if media else [],
+            (payload.video_tokens or []) if media else [],
+        ]
+        while trailing and not trailing[-1]:
+            trailing.pop()
+        if trailing:
+            if not has_extra:
+                header_cols += [[]] * _EXTRAS_HEADER_COLS
+            header_cols += trailing
 
         header = msgspec.msgpack.encode(header_cols)
         # Pass the raw column list; the Rust side concatenates it into the frame
