@@ -1,8 +1,9 @@
 """qkv_proj LoRA with a V head narrower than Q/K (MiMo-V2), through the real wrapper.
 
 Each case builds the attention-TP shard of a QKVParallelLinear, wraps it, loads an
-adapter through the memory pool's member writes and runs the Triton LoRA kernels. The
-reference slices the adapter's q/k/v B rows by hand.
+adapter through the memory pool's member writes and runs the LoRA kernels of both the
+Triton backend and CSGMV, the server's default. The reference slices the adapter's q/k/v
+B rows by hand.
 """
 
 import unittest
@@ -68,11 +69,61 @@ class TestQKVLoRANarrowV(CustomTestCase):
             qkv.weight.weight_loader(qkv.weight, weight, name)
         return qkv.cuda()
 
-    def _check(self, name, tp_size, rank, form):
+    def _batch_info(self, backend_name, backend, tokens):
+        """An eager batch of adapted tokens (slot 1) then base tokens (slot 0), laid out as
+        each backend's prepare_lora_batch does."""
+        from sglang.srt.lora.utils import LoRABatchInfo
+
+        common = dict(
+            use_cuda_graph=False,
+            bs=2,
+            lora_ranks=torch.tensor([0, RANK], dtype=torch.int32).cuda(),
+            scalings=torch.tensor([0.0, SCALING]).cuda(),
+            expected_tokens=tokens,
+            has_active_lora=True,
+        )
+        if backend_name == "triton":
+            return LoRABatchInfo(
+                num_segments=2,
+                seg_indptr=torch.tensor(
+                    [0, ADAPTED_TOKENS, tokens], dtype=torch.int32
+                ).cuda(),
+                weight_indices=torch.tensor([1, 0], dtype=torch.int32).cuda(),
+                max_len=ADAPTED_TOKENS,
+                seg_lens=torch.tensor(
+                    [ADAPTED_TOKENS, BASE_TOKENS], dtype=torch.int32
+                ).cuda(),
+                permutation=None,
+                **common,
+            )
+        # CSGMV groups the tokens by adapter slot, then cuts each group into chunks.
+        slots = torch.tensor(
+            [1] * ADAPTED_TOKENS + [0] * BASE_TOKENS, dtype=torch.int32
+        )
+        permutation = torch.argsort(slots, stable=True)
+        chunk_size = backend._determine_chunk_size_for_tokens(tokens)
+        weight_indices, seg_indptr = backend._get_segments_info(
+            slots[permutation], chunk_size
+        )
+        return LoRABatchInfo(
+            num_segments=len(weight_indices),
+            seg_indptr=seg_indptr.cuda(),
+            weight_indices=weight_indices.cuda(),
+            max_len=chunk_size,
+            seg_lens=None,
+            permutation=permutation.to(torch.int32).cuda(),
+            req_seg_indptr=torch.tensor(
+                [0, ADAPTED_TOKENS, tokens], dtype=torch.int32
+            ).cuda(),
+            req_weight_indices=torch.tensor([1, 0], dtype=torch.int32).cuda(),
+            **common,
+        )
+
+    def _check(self, name, tp_size, rank, form, backend_name):
+        from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
         from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
         from sglang.srt.lora.layers import QKVParallelLinearWithLoRA
         from sglang.srt.lora.mem_pool import LoRAMemoryPool
-        from sglang.srt.lora.utils import LoRABatchInfo
 
         num_heads, num_kv_heads, config_kv_heads = GEOMETRIES[name]
         gen = torch.Generator().manual_seed(tp_size * 100 + rank)
@@ -90,7 +141,10 @@ class TestQKVLoRANarrowV(CustomTestCase):
             lora_a[1], lora_b[1] = None, None
 
         qkv = self._shard(tp_size, rank, num_heads, num_kv_heads, weights)
-        backend = TritonLoRABackend(max_loras_per_batch=2, device=torch.device("cuda"))
+        if backend_name == "triton":
+            backend = TritonLoRABackend(2, torch.device("cuda"))
+        else:
+            backend = ChunkedSgmvLoRABackend(2, torch.device("cuda"), server_args=None)
         layer = QKVParallelLinearWithLoRA(qkv, backend)
 
         # This rank's q heads and the kv head it holds (replicated when TP > kv heads).
@@ -159,24 +213,7 @@ class TestQKVLoRANarrowV(CustomTestCase):
 
         # Adapted tokens first: a write past a row's end lands in the next token.
         tokens = ADAPTED_TOKENS + BASE_TOKENS
-        backend.batch_info = LoRABatchInfo(
-            use_cuda_graph=False,
-            bs=2,
-            num_segments=2,
-            seg_indptr=torch.tensor(
-                [0, ADAPTED_TOKENS, tokens], dtype=torch.int32
-            ).cuda(),
-            weight_indices=torch.tensor([1, 0], dtype=torch.int32).cuda(),
-            lora_ranks=torch.tensor([0, RANK], dtype=torch.int32).cuda(),
-            scalings=torch.tensor([0.0, SCALING]).cuda(),
-            max_len=ADAPTED_TOKENS,
-            seg_lens=torch.tensor(
-                [ADAPTED_TOKENS, BASE_TOKENS], dtype=torch.int32
-            ).cuda(),
-            permutation=None,
-            expected_tokens=tokens,
-            has_active_lora=True,
-        )
+        backend.batch_info = self._batch_info(backend_name, backend, tokens)
         x = torch.randn(tokens, HIDDEN, generator=gen).bfloat16().cuda()
         base, _ = qkv(x)
         out, _ = layer(x)
@@ -214,9 +251,12 @@ class TestQKVLoRANarrowV(CustomTestCase):
             ("pro", 4, 1, "members"),
             ("pro", 8, 7, "fused"),
         ]
-        for name, tp_size, rank, form in cases:
-            with self.subTest(name=name, tp=tp_size, rank=rank, form=form):
-                self._check(name, tp_size, rank, form)
+        for backend in ("triton", "csgmv"):
+            for name, tp_size, rank, form in cases:
+                with self.subTest(
+                    backend=backend, name=name, tp=tp_size, rank=rank, form=form
+                ):
+                    self._check(name, tp_size, rank, form, backend)
 
 
 if __name__ == "__main__":
