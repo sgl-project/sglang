@@ -5,6 +5,7 @@
 import os
 import tempfile
 from collections.abc import Callable
+from contextlib import closing
 from io import BytesIO
 from urllib.parse import unquote, urlparse
 
@@ -126,6 +127,9 @@ def load_image(
     return image
 
 
+_VIDEO_DOWNLOAD_TIMEOUT_S = 60
+
+
 # adapted from diffusers.utils import load_video
 def load_video(
     video: str,
@@ -153,7 +157,6 @@ def load_video(
         raise ValueError(f"max_frames must be positive, got {max_frames}.")
     is_url = video.startswith("http://") or video.startswith("https://")
     is_file = os.path.isfile(video)
-    was_tempfile_created = False
 
     if not (is_url or is_file):
         raise ValueError(
@@ -161,24 +164,35 @@ def load_video(
         )
 
     if is_url:
-        response = requests.get(video, stream=True)
-        if response.status_code != 200:
-            raise ValueError(
-                f"Failed to download video. Status code: {response.status_code}"
-            )
-
         parsed_url = urlparse(video)
         file_name = os.path.basename(unquote(parsed_url.path))
 
         suffix = os.path.splitext(file_name)[1] or ".mp4"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-            video_path = temp_file.name
-            video_data = response.iter_content(chunk_size=8192)
-            for chunk in video_data:
-                temp_file.write(chunk)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = os.path.join(temp_dir, f"video{suffix}")
+            with closing(
+                requests.get(video, stream=True, timeout=_VIDEO_DOWNLOAD_TIMEOUT_S)
+            ) as response:
+                if response.status_code != 200:
+                    raise ValueError(
+                        f"Failed to download video. Status code: {response.status_code}"
+                    )
+                with open(video_path, "wb") as temp_file:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        temp_file.write(chunk)
+            pil_images = _read_video_frames(video_path, max_frames)
+    else:
+        pil_images = _read_video_frames(video, max_frames)
 
-        video = video_path
+    if convert_method is not None:
+        pil_images = convert_method(pil_images)
 
+    return pil_images
+
+
+def _read_video_frames(
+    video: str, max_frames: int | None = None
+) -> list[PIL.Image.Image]:
     pil_images = []
     if video.endswith(".gif"):
         gif = PIL.Image.open(video)
@@ -204,12 +218,6 @@ def load_video(
                 pil_images.append(PIL.Image.fromarray(frame))
                 if max_frames is not None and len(pil_images) >= max_frames:
                     break
-
-    if was_tempfile_created:
-        os.remove(video_path)
-
-    if convert_method is not None:
-        pil_images = convert_method(pil_images)
 
     return pil_images
 
