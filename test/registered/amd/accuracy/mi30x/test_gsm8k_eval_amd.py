@@ -32,16 +32,10 @@ LEGACY = ("legacy", "completion_stop_question")
 SGL = ("sgl_eval",)
 MIXTRAL_FP8 = "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8"
 # (model, tp, env overrides, extra server args, evals)
+MIXTRAL_BF16 = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 CONFIGS = [
-    (
-        "neuralmagic/Mistral-7B-Instruct-v0.3-FP8",
-        1,
-        {"SGLANG_USE_AITER": "1"},
-        [],
-        LEGACY,
-    ),
-    ("mistralai/Mixtral-8x7B-Instruct-v0.1", 2, {"SGLANG_USE_AITER": "1"}, [], LEGACY),
-    (MIXTRAL_FP8, 2, {"SGLANG_USE_AITER": "1", "SGLANG_MOE_PADDING": "0"}, [], LEGACY),
+    (MIXTRAL_BF16, 2, {"SGLANG_USE_AITER": "1"}, ["--quantization", "fp8"], SGL),
+    (MIXTRAL_BF16, 2, {"SGLANG_USE_AITER": "0"}, ["--quantization", "fp8"], SGL),
 ]
 
 
