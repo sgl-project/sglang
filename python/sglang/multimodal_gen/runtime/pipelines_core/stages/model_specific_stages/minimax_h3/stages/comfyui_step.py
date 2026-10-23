@@ -552,6 +552,7 @@ def comfyui_payload_to_branch_inputs(
         "orig_video_shape": orig_shape,
         "padded_video_shape": tuple(video.shape),
         "is_ref2va": bool(refs),
+        "native_layout": layout is None,
         "sample_sigmas": sample_sigmas,
         "sigma_v": float(sigma_v),
         "shift_v": shift_v,
@@ -669,6 +670,7 @@ def _step_attn_metadata(
         latent_shape=latent_shape,
         server_args=server_args,
         device=device,
+        native_layout=inputs["native_layout"],
     )
     if build is not None:
         return build
@@ -837,6 +839,11 @@ class MiniMaxH3ComfyUIStepStage(PipelineStage):
 
         stage = self._cache_dit_stage()
         step = state.steps_done
+        n_sigmas = _sample_sigmas_len(state.sample_sigmas)
+        if batch.enable_spectrum and n_sigmas is not None:
+            # Each ComfyUI step is a one-step request; Spectrum schedules (and
+            # resets) against the whole run, as Cache-DiT does at mount time.
+            batch.num_inference_steps = n_sigmas - 1
         attn_metadata = (
             state.step_attn_metadata(step)
             if state.step_attn_metadata is not None
