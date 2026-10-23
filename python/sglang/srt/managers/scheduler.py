@@ -3566,12 +3566,16 @@ class Scheduler(
 
         if (timeout_s := envs.SGLANG_REQ_RUNNING_TIMEOUT.get()) > 0:
             deadline = time.perf_counter() - timeout_s
-            inflight_batches = self._collect_inflight_batches()
+            req_groups = [
+                batch.reqs
+                for batch in self._collect_inflight_batches()
+                if batch is not None
+            ]
+            if self.dllm_config is not None:
+                req_groups.append(self.dllm_manager.waiting_queue)
             seen_rids = set()
-            for batch in inflight_batches:
-                if batch is None:
-                    continue
-                for req in batch.reqs:
+            for reqs in req_groups:
+                for req in reqs:
                     # Polling must not re-emit an abort awaiting result processing.
                     if (
                         req.rid in seen_rids
@@ -5613,7 +5617,7 @@ class Scheduler(
             ):
                 self._release_aborted_request(req)
                 self.ipc_channels.send_to_tokenizer.send_output(
-                    _make_abort_req(req), req
+                    _make_abort_req(req, finished_reason=recv_req.finished_reason), req
                 )
                 if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
