@@ -175,6 +175,12 @@ class _StateLayoutMismatch(ValueError):
     pass
 
 
+# NIXL reported ERR for a write it accepted; ERR makes no claim on what that
+# write still puts into the decode's pages, so its room must never be acked.
+class _NixlErrReport(RuntimeError):
+    pass
+
+
 # Once one handle of a batch reports ERR, its siblings settle only when NIXL
 # notices their peer is gone, which for UCX means waiting out peer keepalive.
 # This worker serves other rooms, so bound that wait.
@@ -980,7 +986,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         # The chunk owns the handle before posting, so a failed post settles too.
         yield xfer_handle
         if self.agent.transfer(xfer_handle) == "ERR":
-            raise RuntimeError("Failed to post prepared state transfer")
+            raise _NixlErrReport("Failed to post prepared state transfer")
 
     def _init_staging_prefill_ctx(self):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -1135,31 +1141,32 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     def _await_handles(
         self, handles: List[Any], *, failure_seen: bool
     ) -> Tuple[bool, bool]:
-        """Poll until every handle settled. Returns ``(settled, any_failed)``.
+        """Poll until every handle settled. Returns ``(settled, saw_err)``.
 
         The wait is unbounded while every handle is still healthy, and bounded
         to NIXL_ERR_SETTLE_TIMEOUT_S from the moment the batch is known broken.
         ``failure_seen`` arms that deadline up front, for a batch that raised
         before the barrier ran. A state that cannot be read counts as running,
         since it does not prove the write into the decode's pages is over.
+        ``saw_err`` reports only handles that NIXL itself reported as ERR.
         """
         deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S if failure_seen else None
         while True:
             all_settled = True
-            any_failed = failure_seen
+            saw_err = False
             try:
                 for handle in handles:
                     state = self.agent.check_xfer_state(handle)
                     if state == "ERR":
-                        any_failed = True
+                        saw_err = True
                     elif state != "DONE":
                         all_settled = False
             except Exception as e:
                 logger.warning(f"Failed to read NIXL transfer state: {e}")
                 return False, True
             if all_settled:
-                return True, any_failed
-            if not any_failed:
+                return True, saw_err
+            if not (saw_err or failure_seen):
                 time.sleep(0)
                 continue
             # This room is already lost, so trade its notification for the
@@ -1939,15 +1946,15 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # first ERR: a sibling still in PROC keeps writing into the
                 # decode's KV pages, and the failure path below tells the decode
                 # those pages are free.
-                settled, any_failed = self._await_handles(handles, failure_seen=False)
+                settled, saw_err = self._await_handles(handles, failure_seen=False)
                 if not settled:
                     settle_timed_out = True
                     raise RuntimeError(
                         f"NIXL transfer for room {room} left a handle running "
                         f"{NIXL_ERR_SETTLE_TIMEOUT_S}s after a peer handle failed"
                     )
-                if any_failed:
-                    raise RuntimeError(f"NIXL transfer encountered ERR room={room}")
+                if saw_err:
+                    raise _NixlErrReport(f"NIXL transfer encountered ERR room={room}")
 
                 if self.request_status.get(room) not in (None, KVPoll.Failed):
                     for peer_name, notif in state_notifs:
@@ -2001,9 +2008,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # An exception raised while the batch was still being built
                 # leaves the handles posted so far running, so settle here too
                 # rather than only after the barrier.
-                notify = False
+                notify, saw_err = False, True
                 if not settle_timed_out:
-                    notify, _ = self._await_handles(handles, failure_seen=True)
+                    notify, saw_err = self._await_handles(handles, failure_seen=True)
+                saw_err = saw_err or isinstance(e, _NixlErrReport)
                 if notify:
                     self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
                     # Every handle settled => the writes are done, but the
@@ -2013,7 +2021,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         kv_chunk.staging_counted = False
                         self._staging_outstanding[room] -= 1
                     if self.enable_deferred_decode_kv_release:
-                        self._maybe_ack_drained_abort(room)
+                        if saw_err:
+                            # An ERR write may still land in the decode's pages;
+                            # leave the room to the decode's release timeout.
+                            self.poison_deferred_ack_room(room)
+                        else:
+                            self._maybe_ack_drained_abort(room)
                 else:
                     # A handle can still write into the decode's KV pages, so
                     # leave the room to the decode's waiting timeout rather
@@ -2202,7 +2215,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 raise Exception("KVSender failed to create prepped transfer")
             state = self.agent.transfer(xfer_handle)
             if state == "ERR":
-                raise Exception("KVSender failed to post prepped transfer")
+                raise _NixlErrReport("KVSender failed to post prepped transfer")
             return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
@@ -2358,7 +2371,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise Exception("KVSender failed to create transfer")
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
+            raise _NixlErrReport("KVSender failed to post transfer")
         return xfer_handle
 
     def send_kvcache(
@@ -2536,7 +2549,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 raise Exception("KVSender failed to create mixed prepped transfer")
             state = self.agent.transfer(xfer_handle)
             if state == "ERR":
-                raise Exception("KVSender failed to post mixed prepped transfer")
+                raise _NixlErrReport("KVSender failed to post mixed prepped transfer")
             handles.append(xfer_handle)
         return handles
 
@@ -2583,7 +2596,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise Exception("KVSender failed to create prepped slice transfer")
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
-            raise Exception("KVSender failed to post prepped slice transfer")
+            raise _NixlErrReport("KVSender failed to post prepped slice transfer")
         return xfer_handle
 
     def send_kvcache_staged(
@@ -2694,7 +2707,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
-            raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
+            raise _NixlErrReport("[Staging] NIXL bulk transfer failed to post")
         return xfer_handle
 
     def _try_create_staging_strategy(self, staging_buffer):
@@ -2829,7 +2842,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise Exception("KVSender failed to create transfer")
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
-            raise Exception("KVSender failed to post transfer")
+            raise _NixlErrReport("KVSender failed to post transfer")
         return xfer_handle
 
     def _send_slot_state(
@@ -2883,7 +2896,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise Exception("KVSender failed to create dsa_tail transfer")
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
-            raise Exception("KVSender failed to post dsa_tail transfer")
+            raise _NixlErrReport("KVSender failed to post dsa_tail transfer")
         return xfer_handle
 
     def _send_mamba_state(
@@ -2939,7 +2952,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise Exception("Failed to create Mamba state transfer")
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
-            raise Exception("Failed to post Mamba state transfer")
+            raise _NixlErrReport("Failed to post Mamba state transfer")
         return xfer_handle
 
     def _send_mamba_state_slice(
@@ -3069,7 +3082,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise Exception("Failed to create Mamba state slice transfer")
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
-            raise Exception("Failed to post Mamba state slice transfer")
+            raise _NixlErrReport("Failed to post Mamba state slice transfer")
         return xfer_handle
 
     def _send_swa_state_slice(
@@ -3126,7 +3139,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise Exception("Failed to create SWA state slice transfer")
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
-            raise Exception("Failed to post SWA state slice transfer")
+            raise _NixlErrReport("Failed to post SWA state slice transfer")
         return xfer_handle
 
     def maybe_send_extra(
