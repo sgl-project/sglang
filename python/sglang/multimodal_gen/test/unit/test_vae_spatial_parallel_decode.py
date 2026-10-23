@@ -1,8 +1,13 @@
+import tempfile
 import unittest
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.multimodal_gen.configs.models.vaes.base import (
     VAEConfig,
@@ -30,6 +35,8 @@ from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     SpatialParallelConv2d,
     SpatialParallelConv3d,
     chunk_height_by_sizes,
+    fill_halo_rows_,
+    halo_exchange,
     split_for_parallel_decode,
 )
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder import AutoencoderKL
@@ -74,6 +81,35 @@ class _DispatchProbeVAE(ParallelTiledVAE):
         raise AssertionError(
             "spatial_shard decode should not use parallel_tiled_decode"
         )
+
+
+def _fill_halo_rows_on_two_ranks(rank: int, rendezvous: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        group = SimpleNamespace(
+            rank_in_group=rank,
+            world_size=2,
+            ranks=[0, 1],
+            device_group=dist.group.WORLD,
+        )
+        height = (3, 2)[rank]
+        # gloo only sends default-contiguous tensors, so the shards stay NCDHW
+        x = torch.randn(
+            1, 5, 2, height, 4, generator=torch.Generator().manual_seed(rank)
+        )
+        reference, _, _ = halo_exchange(x, 1, parallel_group=group)
+        padded = torch.zeros(1, 5, 2, height + 2, 4)
+        padded[..., 1:-1, :] = x
+        fill_halo_rows_(padded, 1, parallel_group=group)
+        assert torch.equal(padded, reference)
+    finally:
+        dist.destroy_process_group()
 
 
 class TestVAESpatialParallelDecode(unittest.TestCase):
@@ -265,6 +301,11 @@ class TestVAESpatialParallelDecode(unittest.TestCase):
         self.assertEqual(rank0.shape[-2], 3)
         self.assertEqual(rank1.shape[-2], 2)
         torch.testing.assert_close(torch.cat([rank0, rank1], dim=-2), x)
+
+    def test_halo_rows_filled_in_place_match_the_concatenated_halo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rendezvous = (Path(tmp) / "rendezvous").as_uri()
+            mp.spawn(_fill_halo_rows_on_two_ranks, args=(rendezvous,), nprocs=2)
 
     def test_chunk_height_by_sizes_keeps_original_partition(self):
         x = torch.arange(10).view(1, 1, 10, 1)
