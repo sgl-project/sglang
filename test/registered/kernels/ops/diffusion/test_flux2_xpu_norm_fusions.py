@@ -1,7 +1,7 @@
 """FLUX.2 XPU LayerNorm+modulate and gated residual norm fast paths.
 
 The fusion cases need an Intel XPU; the Intel-Triton import regression runs
-on any device, so the file is also registered on the CPU suite.
+on the CUDA kernel suite, which installs the diffusion dependencies.
 """
 
 import subprocess
@@ -21,10 +21,10 @@ from sglang.kernels.ops.diffusion import (
     xpu_gated_resnorm,
     xpu_layernorm_modulate,
 )
-from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
 _HIDDEN = 6144
