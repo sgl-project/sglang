@@ -1,6 +1,7 @@
 """M3.1 NVFP4 experts on flashinfer_trtllm_routed, alone and under MegaMoE prefill."""
 
 import socket
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
@@ -229,3 +230,7 @@ def test_mega_moe_on_trtllm_weights_matches_canonical_mega_moe(ep_group):
     assert torch.equal(y_hybrid, y_canonical), (
         (y_hybrid.float() - y_canonical.float()).abs().max().item()
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
