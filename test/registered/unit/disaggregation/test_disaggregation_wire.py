@@ -15,6 +15,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingContext,
     DecodeStagingHandler,
     handle_staging_req,
 )
@@ -30,10 +31,11 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mooncake.conn import (
     FailedSessionProbe,
     MooncakeKVManager,
+    MooncakeKVReceiver,
     MooncakeKVSender,
     TransferInfo,
 )
-from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVReceiver
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     build_transfer_entry_pairs,
@@ -1545,11 +1547,150 @@ class TestHiSparseStagedSpecRelay(CustomTestCase):
         )
 
 
+class TestStagingRequestBounds(CustomTestCase):
+    def setUp(self):
+        self._make_receiver(MooncakeKVManager, MooncakeKVReceiver, [7, 8, 9])
+
+    def _make_receiver(self, manager_cls, receiver_cls, pages, pool_size=128):
+        # Only device storage and the outgoing socket are replaced; allocation,
+        # metadata publication, request handling and watermarks use real code.
+        with patch(
+            "sglang.srt.disaggregation.common.staging_buffer.StagingBuffer"
+        ) as staging_buffer:
+            staging_buffer.return_value.data_ptr = 0
+            self.allocator = StagingAllocator(pool_size, "cpu", 0)
+        manager = object.__new__(manager_cls)
+        manager._staging_ctx = DecodeStagingContext(allocator=self.allocator)
+        manager.enable_staging = True
+        manager.attn_tp_size = 1
+        manager.local_ip, manager.rank_port = "127.0.0.1", 7200
+        manager.agent = SimpleNamespace(name="decode")
+        manager.kv_args = SimpleNamespace(
+            page_size=2, kv_item_lens=[16, 16], total_kv_head_num=2, engine_rank=0
+        )
+        self.messages = []
+        sock = SimpleNamespace(send_multipart=self.messages.append)
+        receiver = object.__new__(receiver_cls)
+        receiver.kv_mgr = manager
+        receiver.bootstrap_room = 7
+        receiver.bootstrap_infos = [{"pp_rank": 0, "is_dummy": False}]
+        receiver.prefill_info = SimpleNamespace(attn_tp_size=2)
+        receiver.session_id = "peer"
+        receiver.required_dst_info_num = 1
+        receiver._connect_to_bootstrap_server = lambda _: (sock, threading.Lock())
+        handler = DecodeStagingHandler(
+            manager,
+            self.allocator,
+            {"k_buffers": [SimpleNamespace(device=torch.device("cpu:0"))]},
+            1,
+            2,
+            0,
+            None,
+        )
+        handler._room_to_decode_req[7] = SimpleNamespace(kv_receiver=receiver)
+        manager._staging_handler = handler
+        # Observe the bound at publication, before a listener can find the room.
+        published = []
+        register = manager.register_staging_room_bootstrap
+
+        def publish(room, infos, recv):
+            published.append(getattr(recv, "_staging_total_pages", None))
+            register(room, infos, recv)
+
+        with patch.object(manager, "register_staging_room_bootstrap", publish):
+            receiver.send_metadata(np.array(pages, dtype=np.int32), decode_prefix_len=6)
+        self.manager, self.receiver = manager, receiver
+        self.published = published
+        self.messages.clear()
+
+    def _request(self, index, pages, session=b"peer"):
+        self.manager._handle_staging_req(
+            [b"STAGING_REQ", b"7", str(index).encode(), str(pages).encode(), session]
+        )
+
+    def test_rejects_invalid_chunks_without_retaining_state(self):
+        """A request outside the advertised pages must not allocate or subscribe."""
+        for pool_size in (16, 128):
+            for index, pages in ((-1, 1), (3, 1), (4, 1), (0, 0), (0, -1), (0, 4)):
+                with self.subTest(pool_size=pool_size, index=index, pages=pages):
+                    self._make_receiver(
+                        MooncakeKVManager, MooncakeKVReceiver, [7, 8, 9], pool_size
+                    )
+                    self._request(index, pages, session=b"rejected")
+                    self.assertEqual(self.receiver.chunk_staging_infos, [])
+                    self.assertEqual(self.allocator.allocations, {})
+                    self.assertEqual(self.allocator.next_alloc_id, 0)
+                    self.assertEqual(self.messages, [])
+                    self.assertEqual(self.manager._staging_handler._wm_subscribers, {})
+
+        self._request(0, 1)
+        self.assertEqual(self.receiver.chunk_staging_infos, [(0, 0, 0, 32, 1)])
+        self.assertEqual(
+            self.messages,
+            [
+                [b"STAGING_RSP", b"7", b"0", b"0", b"0", b"32", b"peer"],
+                [b"WATERMARK", b"0", b"0", b"peer"],
+            ],
+        )
+
+    def test_out_of_order_last_page_and_duplicates_share_allocations(self):
+        """One-page sender chunks may arrive out of order from multiple ranks."""
+        for index in (2, 0, 2):
+            self._request(index, 1)
+        self.assertEqual(
+            self.receiver.chunk_staging_infos,
+            [(1, 32, 0, 64, 1), (-1, -1, 0, -1, 0), (0, 0, 0, 32, 1)],
+        )
+        self.assertEqual(self.allocator.allocations, {0: (0, 32, 0), 1: (32, 32, 0)})
+        self.assertEqual(self.messages[0], self.messages[-1])
+
+    def test_valid_oversized_chunk_keeps_failure_response(self):
+        """A valid chunk larger than the ring still reports permanent failure."""
+        self._make_receiver(MooncakeKVManager, MooncakeKVReceiver, [7, 8, 9], 16)
+        for _ in range(2):
+            self._request(2, 1)
+        self.assertEqual(len(self.receiver.chunk_staging_infos), 3)
+        self.assertEqual(self.receiver.chunk_staging_infos[2], (-1, -2, 0, -1, 1))
+        self.assertEqual(self.allocator.allocations, {})
+        self.assertEqual(
+            self.messages[0],
+            [b"STAGING_RSP", b"7", b"2", b"-2", b"0", b"-1", b"peer"],
+        )
+        self.assertEqual(self.messages[0], self.messages[-1])
+
+    def test_metadata_publishes_suffix_page_bound_for_both_backends(self):
+        """The locally allocated suffix bounds requests before room publication."""
+        for manager_cls, receiver_cls in (
+            (MooncakeKVManager, MooncakeKVReceiver),
+            (NixlKVManager, NixlKVReceiver),
+        ):
+            for pages in ([7, 8, 9], []):
+                with self.subTest(backend=receiver_cls.__name__, pages=pages):
+                    self._make_receiver(manager_cls, receiver_cls, pages)
+                    self.assertEqual(self.published, [len(pages)])
+                    self._request(0, 3 if pages else 1)
+                    self.assertEqual(len(self.allocator.allocations), int(bool(pages)))
+                    self.assertEqual(
+                        self.receiver.chunk_staging_infos,
+                        [(0, 0, 0, 96, 3)] if pages else [],
+                    )
+
+    def test_missing_page_metadata_does_not_allocate(self):
+        """An incompletely published receiver must not acquire staging state."""
+        if hasattr(self.receiver, "_staging_total_pages"):
+            del self.receiver._staging_total_pages
+        self._request(0, 1)
+        self.assertEqual(self.receiver.chunk_staging_infos, [])
+        self.assertEqual(self.allocator.allocations, {})
+        self.assertEqual(self.messages, [])
+
+
 class TestMooncakePPStaging(unittest.TestCase):
     def test_staging_response_targets_requesting_pp_rank(self):
         sock = Mock()
         receiver = SimpleNamespace(
             chunk_staging_infos=[],
+            _staging_total_pages=1,
             _connect_to_bootstrap_server=Mock(return_value=(sock, threading.Lock())),
         )
         allocator = SimpleNamespace(

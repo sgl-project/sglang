@@ -798,11 +798,12 @@ def handle_staging_req(
     kv_buffer_tensors,
     room_receivers: dict,
     room_bootstrap: dict,
-):
+) -> bool:
     """Allocate staging for a chunk on-demand and send STAGING_RSP to prefill.
 
     Deduplicates: multiple prefill TP ranks requesting the same (room, chunk_idx)
     only allocate once.  Sends ALLOC_OVERSIZED on permanent failure.
+    Returns whether the request was accepted, including permanent failures.
     """
     from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
 
@@ -818,7 +819,7 @@ def handle_staging_req(
             room,
             chunk_idx,
         )
-        return
+        return False
 
     receiver = room_receivers.get(room)
     if receiver is None:
@@ -828,7 +829,19 @@ def handle_staging_req(
             chunk_idx,
             session_id,
         )
-        return
+        return False
+    # The sender chooses its chunk size, but each chunk contains at least one
+    # of the destination pages published locally by send_metadata.
+    total_pages = getattr(receiver, "_staging_total_pages", 0)
+    if not (0 <= chunk_idx < total_pages and 0 < chunk_num_pages <= total_pages):
+        logger.warning(
+            "STAGING_REQ dropped: invalid chunk room=%s chunk=%s pages=%s total_pages=%s",
+            room,
+            chunk_idx,
+            chunk_num_pages,
+            total_pages,
+        )
+        return False
     infos = receiver.chunk_staging_infos
 
     if chunk_idx < len(infos) and infos[chunk_idx][0] >= 0:
@@ -911,6 +924,7 @@ def handle_staging_req(
                     )
             except Exception:
                 pass
+    return True
 
 
 class StagingManagerMixin:
@@ -942,7 +956,7 @@ class StagingManagerMixin:
             )
             return
         prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
-        handle_staging_req(
+        if not handle_staging_req(
             msg,
             self._staging_ctx.allocator,
             self.kv_args,
@@ -951,7 +965,8 @@ class StagingManagerMixin:
             getattr(self, "kv_buffer_tensors", None),
             self._staging_ctx.room_receivers,
             self._staging_ctx.room_bootstrap,
-        )
+        ):
+            return
 
         receiver = self._staging_ctx.room_receivers.get(room)
         if receiver is not None:
