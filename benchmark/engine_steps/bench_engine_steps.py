@@ -12,6 +12,9 @@ needs the server on this host's clock, with SGLANG_LOG_MS=1. In HTTP mode the
 package, GPU and environment fields describe the benchmark client; server_info
 records the server.
 
+Prefill profiling starts after every rank warms up in a separate request burst;
+its JSON control bounds are not the captured step range, which comes from the trace.
+
   python bench_engine_steps.py prefill --base-url URL --dp 4 --tokens-per-step 8192
   python bench_engine_steps.py decode --base-url URL --dp 8 --batch-per-rank 64
   python bench_engine_steps.py prefill --engine --dp 4 --model-path M --dp-size 4 ...
