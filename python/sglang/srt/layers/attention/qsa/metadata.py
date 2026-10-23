@@ -162,27 +162,14 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
             query_sequence_ids.to(sequence_lengths.device),
             self.compress_ratio,
         )
-        if compressed_buffer.is_cuda:
-            compressed_keys = gather_qsa_compressed_keys(
-                compressed_buffer,
-                self.token_slot_table,
-                compressed_cu_seqlens,
-                sum(complete_blocks),
-                max(complete_blocks, default=0),
-                ratio,
-            )
-        else:
-            # compressed slot = first raw slot // ratio; the allocator is
-            # page-aligned, so each group is contiguous in one page.
-            compressed_keys = torch.cat(
-                [
-                    compressed_buffer.index_select(
-                        0, self.token_slot_table[i, : n * ratio : ratio].long() // ratio
-                    )
-                    for i, n in enumerate(complete_blocks)
-                ]
-                or [compressed_buffer[:0]]
-            )
+        compressed_keys = gather_qsa_compressed_keys(
+            compressed_buffer,
+            self.token_slot_table,
+            compressed_cu_seqlens,
+            sum(complete_blocks),
+            max(complete_blocks, default=0),
+            ratio,
+        )
         return compressed_keys, row_starts, row_ends, sequence_lengths
 
     def get_decode_mqa_inputs(
