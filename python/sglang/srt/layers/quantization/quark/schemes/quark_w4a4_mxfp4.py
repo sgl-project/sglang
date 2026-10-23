@@ -26,7 +26,11 @@ from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 from sglang.srt.utils import get_bool_env_var, is_hip
-from sglang.srt.utils.common import direct_register_custom_op, is_gfx95_supported
+from sglang.srt.utils.common import (
+    direct_register_custom_op,
+    is_gfx95_supported,
+    print_warning_once,
+)
 
 NVFP4_BLOCK_SIZE = 16
 
@@ -999,8 +1003,6 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
     PRESHUFFLE_MAX_M = 64
 
     def __init__(self, hadamard: bool = False):
-        self.hadamard = hadamard
-        self.quant_kwargs = {}
         if hadamard:
             from aiter import per_1x32_f4_quant_hip
 
@@ -1008,11 +1010,13 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
                 "hadamard_rotate"
                 not in inspect.signature(per_1x32_f4_quant_hip).parameters
             ):
-                raise RuntimeError(
-                    "the Hadamard rotation needs AITER with aiter#6734; "
-                    "set SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD=0 to run without it"
+                print_warning_once(
+                    "AITER has no hadamard_rotate on per_1x32_f4_quant_hip "
+                    "(ROCm/aiter#6734); online MXFP4 runs without the Hadamard rotation"
                 )
-            self.quant_kwargs = {"hadamard_rotate": True}
+                hadamard = False
+        self.hadamard = hadamard
+        self.quant_kwargs = {"hadamard_rotate": True} if hadamard else {}
 
     @classmethod
     def quantize_(cls, layer: torch.nn.Module, hadamard: bool = False) -> None:

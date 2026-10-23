@@ -1939,7 +1939,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Rotate each 32-wide block of the input dimension of the <code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code> projections by the orthonormal 32-point Hadamard matrix before MXFP4: the weight once at load, the activation inside the AITER MXFP4 quant. The product does not change, and the quantization error is lower. Needs AITER with <code>hadamard_rotate</code> on <code>per_1x32_f4_quant_hip</code> (ROCm/aiter#6734). Set to <code>0</code> for plain MXFP4.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Rotate each 32-wide block of the input dimension of the <code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code> projections by the orthonormal 32-point Hadamard matrix before MXFP4: the weight once at load, the activation inside the AITER MXFP4 quant. The product does not change, and the quantization error is lower. Needs AITER with <code>hadamard_rotate</code> on <code>per_1x32_f4_quant_hip</code> (ROCm/aiter#6734). With an older AITER, the server logs a warning and runs plain MXFP4. Set to <code>0</code> for plain MXFP4.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
   </tbody>
