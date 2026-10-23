@@ -212,6 +212,17 @@ class TestHostMemory(unittest.TestCase):
                             self.available(allow_cgroup_fallback=True), 5000
                         )
 
+    def test_membership_outside_mount_root_requires_explicit_sizing(self):
+        """A process joined from a sibling cgroup (an srun --overlap step) sees
+        a membership above the mount root; explicit sizing must still start."""
+        for v1 in [False, True]:
+            with self.subTest(v1=v1):
+                self.configure("/../../../step_129/user/task_0", v1=v1)
+                with self.assertRaisesRegex(RuntimeError, "set --hicache-size"):
+                    self.available()
+                with self.assertLogs(host_memory.logger, level="WARNING"):
+                    self.assertEqual(self.available(allow_cgroup_fallback=True), 5000)
+
     def test_missing_counters_for_known_limit_requires_explicit_sizing(self):
         for name in ("memory.current", "memory.stat"):
             with self.subTest(name=name):
