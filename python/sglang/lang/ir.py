@@ -5,8 +5,8 @@ import inspect
 import warnings
 from typing import List, Optional, Union
 
-from sglang.global_config import global_config
 from sglang.lang.choices import ChoicesSamplingMethod
+from sglang.lang.global_config import global_config
 
 REGEX_INT = r"[-+]?[0-9]+[ \n]*"
 REGEX_FLOAT = r"[-+]?[0-9]*\.?[0-9]+[ \n]*"
@@ -531,7 +531,6 @@ class SglRoleEnd(SglExpr):
 
 
 class SglSelect(SglExpr):
-
     def __init__(
         self,
         name: str,

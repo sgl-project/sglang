@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.xpu.simple_eval_gsm8k_xpu_mixin import SimpleEvalGSM8KXPUMixin
 
-register_xpu_ci(est_time=2400, suite="nightly-xpu-4-gpu", nightly=True)
+register_xpu_ci(est_time=2400, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
 
 
 @unittest.skipUnless(
@@ -23,7 +23,6 @@ class TestGemma4_26BA4BXPU(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     tp_size = 4
     accuracy = 0.90
     timeout_for_server_launch = 3600
-    env = {"SGLANG_USE_SGL_XPU": "1"}
 
     # Gemma-4 hybrid-attention kernels crash under chunked prefill on XPU.
     other_args = SimpleEvalGSM8KXPUMixin.other_args + [

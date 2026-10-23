@@ -1,21 +1,17 @@
 from __future__ import annotations
 
-import os
+from functools import cache, lru_cache
 from typing import Callable, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 try:
-    if os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1":
-        # A/B debug escape hatch: route through the pip flash-attn-4 package
-        # (dev's stack). rel_bias is vendored-only, so SHEARED must be 0.
-        from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
-    else:
-        from sglang.kernels.ops.attention.flash_attn.cute import (
-            flash_attn_varlen_func as _flash_attn_varlen_func,
-        )
+    from sglang.kernels.ops.attention.flash_attn.cute import (
+        flash_attn_varlen_func as _flash_attn_varlen_func,
+    )
 except Exception as _e:  # pragma: no cover
     _flash_attn_varlen_func = None
     _flash_attn_import_error = _e
@@ -27,8 +23,158 @@ def is_flash_attention_v4_available() -> bool:
     return _flash_attn_varlen_func is not None
 
 
+@lru_cache(maxsize=1)
+def _get_gqa_512_jit_cache():
+    from sglang.kernels.ops.attention.flash_attn.cute.interface import _get_jit_cache
+
+    return _get_jit_cache("fwd_gqa_512")
+
+
+def flash_attn_gqa_512(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: float = 1.0,
+    lse: Optional[torch.Tensor] = None,
+    pack_gqa: bool = True,
+    causal: bool = False,
+) -> torch.Tensor:
+    """GQA with 512-dimensional keys and separate values."""
+    import cutlass.cute as cute
+
+    from sglang.kernels.ops.attention.flash_attn.cute.cute_dsl_utils import (
+        to_cute_tensor,
+    )
+    from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_mla_sm100 import (
+        FlashAttentionMLAForwardSm100,
+    )
+
+    if cu_seqlens_q is not None:
+        cu_seqlens_q = cu_seqlens_q.to(dtype=torch.int32)
+    args = (
+        q,
+        k,
+        v,
+        out,
+        lse,
+        softmax_scale,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_k,
+        page_table,
+    )
+    use_cpasync = page_table is not None and k.shape[1] != 128
+    key = (
+        pack_gqa,
+        causal,
+        q.device,
+        q.shape[-2] // k.shape[-2],
+        k.shape[-2],
+        q.shape[-1],
+        v.shape[-1],
+        use_cpasync,
+        tuple(
+            (t.ndim, t.dtype, tuple(s if s in (0, 1) else 2 for s in t.stride()))
+            if isinstance(t, torch.Tensor)
+            else t
+            for t in args
+        ),
+    )
+    cache = _get_gqa_512_jit_cache()
+    if key not in cache:
+        compile_args = [
+            to_cute_tensor(
+                t,
+                assumed_align=4
+                if t.dtype in (torch.int32, torch.int64, torch.float32)
+                else 16,
+            )
+            if isinstance(t, torch.Tensor)
+            else t
+            for t in args
+        ]
+        kernel = FlashAttentionMLAForwardSm100(
+            is_causal=causal,
+            use_cpasync_load_KV=use_cpasync,
+            is_topk_gather=False,
+            pack_gqa=pack_gqa,
+            qhead_per_kvhead=q.shape[-2] // k.shape[-2],
+            nheads_kv=k.shape[-2],
+            is_varlen_q=cu_seqlens_q is not None,
+            has_qk=False,
+        )
+        cache[key] = cute.compile(
+            kernel.forward_gqa,
+            *compile_args,
+            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    cache[key](*args)
+    return out
+
+
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _pad_mla_q_heads(q, qv, v, pack_gqa):
+    if qv is None or pack_gqa is False:
+        return q, qv, None
+
+    num_heads = qv.shape[-2]
+    num_kv_heads = v.shape[-2]
+    qhead_per_kvhead = num_heads // num_kv_heads
+    if 128 % qhead_per_kvhead == 0 or qhead_per_kvhead % 128 == 0:
+        return q, qv, None
+
+    qhead_per_kvhead_padded = 1 << (qhead_per_kvhead - 1).bit_length()
+
+    def pad(x):
+        if x is None:
+            return None
+        prefix = x.shape[:-2]
+        x = x.reshape(*prefix, num_kv_heads, qhead_per_kvhead, x.shape[-1])
+        x = F.pad(x, (0, 0, 0, qhead_per_kvhead_padded - qhead_per_kvhead))
+        return x.reshape(*prefix, num_kv_heads * qhead_per_kvhead_padded, x.shape[-1])
+
+    # Pad each KV group to a valid ratio so MLA stays on the packed kernel.
+    return (
+        pad(q),
+        pad(qv),
+        (
+            num_kv_heads,
+            qhead_per_kvhead,
+            qhead_per_kvhead_padded,
+        ),
+    )
+
+
+def _unpad_mla_result(result, head_padding):
+    if head_padding is None:
+        return result
+
+    num_kv_heads, qhead_per_kvhead, qhead_per_kvhead_padded = head_padding
+    out, lse = result
+    prefix = out.shape[:-2]
+    out = out.reshape(*prefix, num_kv_heads, qhead_per_kvhead_padded, out.shape[-1])[
+        ..., :qhead_per_kvhead, :
+    ]
+    out = out.reshape(
+        *prefix, num_kv_heads * qhead_per_kvhead, out.shape[-1]
+    ).contiguous()
+    if lse is not None:
+        prefix = lse.shape[:-1]
+        lse = lse.reshape(*prefix, num_kv_heads, qhead_per_kvhead_padded)[
+            ..., :qhead_per_kvhead
+        ]
+        lse = lse.reshape(*prefix, num_kv_heads * qhead_per_kvhead).contiguous()
+    return out, lse
 
 
 @debug_kernel_api
@@ -71,6 +217,8 @@ def flash_attn_varlen_func(
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     return_softmax_lse: bool = False,
+    mask_mod: Optional[Callable] = None,
+    out: Optional[torch.Tensor] = None,
     **_: object,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
@@ -81,6 +229,15 @@ def flash_attn_varlen_func(
         ) from _flash_attn_import_error
 
     q, k, v, qv = [_maybe_contiguous(t) for t in (q, k, v, qv)]
+    if qv is None and q.shape[-1] == 256 and k.shape[-1] == 256 and v.shape[-1] == 256:
+        # The vendored hd256 kernel assumes dense Q/K/V strides.
+        # TODO: Remove this workaround after the FA4 in current environment includes
+        # https://github.com/Dao-AILab/flash-attention/pull/2670 (flash-attn-4 >= 4.0.0b20).
+        q, k, v = [t.contiguous() for t in (q, k, v)]
+    q, qv, mla_head_padding = _pad_mla_q_heads(q, qv, v, pack_gqa)
+    if qv is not None and num_splits < 1:
+        # FA4 MLA does not implement split-KV; auto mode must use one split.
+        num_splits = 1
     cu_seqlens_q, cu_seqlens_k = [
         _maybe_contiguous(t) for t in (cu_seqlens_q, cu_seqlens_k)
     ]
@@ -119,6 +276,9 @@ def flash_attn_varlen_func(
         rel_bias_kwargs["rel_bias"] = rel_bias
     if rel_bias_prep_cache is not None:
         rel_bias_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
+    # The kernel writes into out, except where it pads MLA heads: its output
+    # then has more heads than out, and the result is a new tensor.
+    out_kwargs = {"out": out} if out is not None and mla_head_padding is None else {}
     result = _flash_attn_varlen_func(
         q=q,
         k=k,
@@ -138,13 +298,16 @@ def flash_attn_varlen_func(
         learnable_sink=learnable_sink,
         num_splits=num_splits,
         pack_gqa=pack_gqa,
+        mask_mod=mask_mod,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
         return_lse=return_softmax_lse,
         **sf_kwargs,
         **descale_kwargs,
         **rel_bias_kwargs,
+        **out_kwargs,
     )
+    result = _unpad_mla_result(result, mla_head_padding)
 
     if return_softmax_lse:
         return result
@@ -193,6 +356,8 @@ def flash_attn_with_kvcache(
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     return_softmax_lse: bool = False,
+    mask_mod: Optional[Callable] = None,
+    out: Optional[torch.Tensor] = None,
     **_: object,
 ):
     if k is not None or v is not None:
@@ -224,6 +389,7 @@ def flash_attn_with_kvcache(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         learnable_sink=sinks,
+        mask_mod=mask_mod,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
         q_descale=q_descale,
@@ -235,6 +401,7 @@ def flash_attn_with_kvcache(
         rel_bias=rel_bias,
         rel_bias_prep_cache=rel_bias_prep_cache,
         return_softmax_lse=True,
+        out=out,
     )
 
     if return_softmax_lse:
@@ -242,3 +409,41 @@ def flash_attn_with_kvcache(
     if isinstance(result, tuple):
         return result[0]
     return result
+
+
+@cache
+def make_image_mask_mod(window_left: int = -1):
+    """Causal text plus same-image bidirectionality, with a left-window bound.
+
+    aux_tensors are packed query image ranges (inclusive, -1 for text) and
+    cu_seqlens_q. Ranges use absolute positions in each request's KV sequence.
+    Cache the callback so its identity remains stable across forward passes.
+    """
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Int32
+
+    from sglang.kernels.ops.attention.flash_attn.cute.utils import (
+        scalar_to_ssa,
+        ssa_to_scalar,
+    )
+
+    @cute.jit
+    def image_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        ranges, cu_q = aux_tensors
+        # Partial tiles can call the mask on padded query rows. Clamp the load;
+        # the kernel separately masks those rows out of the output.
+        local_q = cutlass.min(ssa_to_scalar(q_idx), seqlen_info.seqlen_q - 1)
+        row = cutlass.max(cu_q[batch_idx[0]] + local_q, Int32(0))
+        begin = scalar_to_ssa(ranges[row, 0], Int32)
+        end = scalar_to_ssa(ranges[row, 1], Int32)
+        absolute_q = q_idx + scalar_to_ssa(
+            seqlen_info.seqlen_k - seqlen_info.seqlen_q, Int32
+        )
+        keep = (kv_idx <= absolute_q) | ((kv_idx >= begin) & (kv_idx <= end))
+        if cutlass.const_expr(window_left >= 0):
+            keep = keep & (kv_idx >= absolute_q - window_left)
+        return keep
+
+    image_mask.__vec_size__ = 1
+    return image_mask

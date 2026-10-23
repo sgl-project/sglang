@@ -15,6 +15,7 @@ from torch.distributed.fsdp import FSDPModule
 from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -236,6 +237,17 @@ def read_rank_local_tensor(
     return local_tensor
 
 
+def _merged_output_sizes(actual_param: torch.nn.Parameter) -> list[int] | None:
+    """Logical output widths of a fused-on-disk MergedColumnParallelLinear."""
+    weight_loader = actual_param.__dict__.get("weight_loader")
+    if not isinstance(weight_loader, MethodType):
+        return None
+    owner = weight_loader.__self__
+    if isinstance(owner, MergedColumnParallelLinear):
+        return list(owner.output_sizes)
+    return None
+
+
 def _resolve_tp_shard_dim(
     actual_param: torch.nn.Parameter,
 ) -> tuple[bool, int | None]:
@@ -255,6 +267,43 @@ def _resolve_tp_shard_dim(
         input_dim = actual_param.__dict__.get("input_dim")
         return True, input_dim
     return False, None
+
+
+def read_fsdp_rank_local_tensor(
+    sources: list[SafetensorsSource],
+    handles: dict[str, Any],
+    global_shape: tuple[int, ...],
+    local_shape: tuple[int, ...],
+    global_offset: tuple[int, ...],
+    transform: Callable[[torch.Tensor], torch.Tensor] | None,
+) -> torch.Tensor:
+    if transform is None:
+        return read_rank_local_tensor(
+            sources,
+            handles,
+            local_shape,
+            global_offset,
+        )
+
+    loaded_tensor = read_rank_local_tensor(
+        sources,
+        handles,
+        global_shape,
+        (0,) * len(global_shape),
+    )
+    transformed_tensor = transform(loaded_tensor)
+    if tuple(transformed_tensor.shape) != global_shape:
+        raise RuntimeError(
+            "Rank-local checkpoint transform shape mismatch: "
+            f"transformed={tuple(transformed_tensor.shape)}, expected={global_shape}"
+        )
+
+    slices = tuple(
+        slice(offset, offset + size)
+        for offset, size in zip(global_offset, local_shape, strict=True)
+    )
+    # clone so the local shard does not retain the full transformed storage
+    return transformed_tensor[slices].clone(memory_format=torch.contiguous_format)
 
 
 def tp_local_shape(
@@ -281,6 +330,7 @@ def read_tp_local_tensor(
     shard_dim: int | None,
     tp_rank: int,
     tp_size: int,
+    output_sizes: list[int] | None = None,
 ) -> torch.Tensor:
     if shard_dim is None:
         assembled_shape = assembled_source_shape(sources)
@@ -300,6 +350,37 @@ def read_tp_local_tensor(
             source.merge_index if source.merge_index is not None else 0,
         ),
     )
+    # Fused-on-disk [Q|K|V] / [gate|up]: each logical matrix is sharded on
+    # its own, then concatenated. A contiguous half of the fused tensor is
+    # the same shape as the TP-local parameter but the wrong values.
+    if (
+        output_sizes is not None
+        and len(ordered_sources) == 1
+        and all(size % tp_size == 0 for size in output_sizes)
+    ):
+        source = ordered_sources[0]
+        if source.shape[shard_dim] != sum(output_sizes):
+            raise RuntimeError(
+                "Merged TP shard sizes do not cover the fused checkpoint: "
+                f"output_sizes={output_sizes}, source_dim={source.shape[shard_dim]}"
+            )
+        local_parts = []
+        offset = 0
+        for output_size in output_sizes:
+            shard_size = output_size // tp_size
+            slices = [slice(None)] * len(source.shape)
+            slices[shard_dim] = slice(
+                offset + tp_rank * shard_size,
+                offset + tp_rank * shard_size + shard_size,
+            )
+            local_parts.append(
+                handles[source.file_path]
+                .get_slice(source.param_name)[tuple(slices)]
+                .contiguous()
+            )
+            offset += output_size
+        return torch.cat(local_parts, dim=shard_dim)
+
     local_parts = []
     for source in ordered_sources:
         shard_size = source.shape[shard_dim] // tp_size
@@ -343,6 +424,7 @@ def try_load_rank_local_tp_state_dict(
     sources_by_target, reverse_param_names_mapping = checkpoint_sources
 
     shard_dims: dict[str, int | None] = {}
+    output_sizes_by_name: dict[str, list[int] | None] = {}
     for target_param_name, sources in sources_by_target.items():
         meta_param = meta_sd.get(target_param_name)
         if meta_param is None or isinstance(meta_param, dist_tensor.DTensor):
@@ -357,15 +439,22 @@ def try_load_rank_local_tp_state_dict(
             param_dict,
             target_param_name,
         )
+        output_sizes = None
         if actual_param is None:
             supported, shard_dim = True, None
         else:
             supported, shard_dim = _resolve_tp_shard_dim(actual_param)
+            output_sizes = _merged_output_sizes(actual_param)
+            if output_sizes is not None and any(
+                size % tp_size for size in output_sizes
+            ):
+                return None
         if not supported:
             return None
         if tp_local_shape(sources, shard_dim, tp_size) != tuple(meta_param.shape):
             return None
         shard_dims[target_param_name] = shard_dim
+        output_sizes_by_name[target_param_name] = output_sizes
 
     local_param_sd: dict[str, LocalTPShard] = {}
     local_bytes = 0
@@ -384,6 +473,7 @@ def try_load_rank_local_tp_state_dict(
                 shard_dims[target_param_name],
                 tp_rank,
                 tp_size,
+                output_sizes=output_sizes_by_name[target_param_name],
             )
             local_param_sd[target_param_name] = LocalTPShard(tensor)
             local_bytes += tensor.numel() * tensor.element_size()
@@ -421,6 +511,9 @@ def try_load_rank_local_fsdp_state_dict(
         return None
     sources_by_target, reverse_param_names_mapping = checkpoint_sources
 
+    param_dict = dict(model.named_parameters())
+    rank_local_transforms: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {}
+
     for target_param_name, sources in sources_by_target.items():
         meta_param = meta_sd.get(target_param_name)
         assembled_shape = assembled_source_shape(sources)
@@ -429,6 +522,27 @@ def try_load_rank_local_fsdp_state_dict(
         if meta_param.dtype in QUANTIZED_DTYPES:
             return None
         if any(source.dtype in _QUANTIZED_SAFETENSORS_DTYPES for source in sources):
+            return None
+
+        actual_param = get_param_for_weight_loading(
+            model,
+            param_dict,
+            target_param_name,
+        )
+        if actual_param is None:
+            continue
+        rank_local_transform = actual_param.__dict__.get("rank_local_weight_transform")
+        if rank_local_transform is not None:
+            rank_local_transforms[target_param_name] = rank_local_transform
+            continue
+
+        supported, _ = _resolve_tp_shard_dim(actual_param)
+        if not supported:
+            logger.info(
+                "Falling back from rank-local FSDP checkpoint loading for "
+                "custom weight loader: %s",
+                target_param_name,
+            )
             return None
 
     local_param_sd: dict[str, torch.Tensor | LocalFSDPShard] = {}
@@ -442,7 +556,9 @@ def try_load_rank_local_fsdp_state_dict(
         }
         for target_param_name in sorted(sources_by_target):
             meta_param = meta_sd[target_param_name]
-            if isinstance(meta_param, dist_tensor.DTensor):
+            global_shape = tuple(meta_param.shape)
+            is_sharded = isinstance(meta_param, dist_tensor.DTensor)
+            if is_sharded:
                 local_shape, global_offset = (
                     dist_tensor._utils.compute_local_shape_and_global_offset(
                         meta_param.shape,
@@ -450,21 +566,21 @@ def try_load_rank_local_fsdp_state_dict(
                         meta_param.placements,
                     )
                 )
-                tensor = read_rank_local_tensor(
-                    sources_by_target[target_param_name],
-                    handles,
-                    tuple(local_shape),
-                    tuple(global_offset),
-                )
-                local_param_sd[target_param_name] = LocalFSDPShard(tensor)
             else:
-                tensor = read_rank_local_tensor(
-                    sources_by_target[target_param_name],
-                    handles,
-                    tuple(meta_param.shape),
-                    (0,) * meta_param.ndim,
-                )
-                local_param_sd[target_param_name] = tensor
+                local_shape = global_shape
+                global_offset = (0,) * meta_param.ndim
+
+            tensor = read_fsdp_rank_local_tensor(
+                sources_by_target[target_param_name],
+                handles,
+                global_shape=global_shape,
+                local_shape=tuple(local_shape),
+                global_offset=tuple(global_offset),
+                transform=rank_local_transforms.get(target_param_name),
+            )
+            local_param_sd[target_param_name] = (
+                LocalFSDPShard(tensor) if is_sharded else tensor
+            )
             local_bytes += tensor.numel() * tensor.element_size()
 
     logger.info(

@@ -14,6 +14,12 @@ class BaseLinearScheme(ABC):
     of different quantization schemes.
     """
 
+    # Schemes whose parameters only implement the v2 loader API
+    # (load_{column,row,merged_column,qkv}_weight) set this so LinearBase
+    # routes them through weight_loader_v2 without flipping the loader for
+    # every scheme that shares the same LinearMethod class.
+    requires_weight_loader_v2: bool = False
+
     @abstractmethod
     def create_weights(self, *args, **kwargs):
         """
@@ -52,6 +58,12 @@ class BaseMoEScheme(ABC):
     Abstract class used to describe the weight creation and forward pass
     of different quantization schemes.
     """
+
+    runner = None
+
+    def get_moe_runner_backend(self, layer):
+        """Return the runner contract, or None for a direct standard/local-ID kernel."""
+        return self.runner.runner_backend if self.runner is not None else None
 
     @abstractmethod
     def create_weights(self, *args, **kwargs):

@@ -90,9 +90,10 @@ def compute_partition_count(
         fallback_count = math.ceil(total_time_seconds / target_time_seconds)
         return max(1, min(fallback_count, max_partitions))
 
-    preferred_count = math.ceil(total_time_seconds / target_time_seconds)
-    preferred_count = max(1, min(preferred_count, max_partitions))
-    return max(min_partition_count, min(preferred_count, max_partition_count))
+    return min(
+        range(min_partition_count, max_partition_count + 1),
+        key=lambda count: abs(total_time_seconds / count - target_time_seconds),
+    )
 
 
 def build_partition_items(
@@ -198,7 +199,7 @@ def print_suite_summary(
         )
         for standalone_file in suite_info.missing_standalone_estimates:
             print(f"    - {standalone_file}")
-    print(f"  Total estimated time: {total_time:.1f}s ({total_time/60:.1f} min)")
+    print(f"  Total estimated time: {total_time:.1f}s ({total_time / 60:.1f} min)")
     print(f"  Selected partitions: {len(partitions)}")
     print()
 
@@ -207,7 +208,7 @@ def print_suite_summary(
         partition_time = sum(item.est_time for item in partition)
         print(f"    Partition {idx}:")
         print(
-            f"      Estimated time: {partition_time:.1f}s ({partition_time/60:.1f} min)"
+            f"      Estimated time: {partition_time:.1f}s ({partition_time / 60:.1f} min)"
         )
         for item in partition:
             fallback_suffix = (
@@ -283,11 +284,7 @@ def main():
         print(f"Error: {exc}")
         sys.exit(1)
 
-    suites = collect_diffusion_suites(
-        case_config_path,
-        run_suite_path,
-        baseline_path,
-    )
+    suites = collect_diffusion_suites(case_config_path, baseline_path)
     validate_suite_case_coverage(suites)
 
     requested_case_ids = set(args.case_ids or [])
@@ -304,9 +301,11 @@ def main():
             sys.exit(1)
 
     print("=== Diffusion Partition Computation ===")
-    print(f"Min partition time: {args.min_time}s ({args.min_time/60:.1f} min)")
-    print(f"Target partition time: {args.target_time}s ({args.target_time/60:.1f} min)")
-    print(f"Max partition time: {args.max_time}s ({args.max_time/60:.1f} min)")
+    print(f"Min partition time: {args.min_time}s ({args.min_time / 60:.1f} min)")
+    print(
+        f"Target partition time: {args.target_time}s ({args.target_time / 60:.1f} min)"
+    )
+    print(f"Max partition time: {args.max_time}s ({args.max_time / 60:.1f} min)")
     print()
 
     for suite_name, suite_info in suites.items():

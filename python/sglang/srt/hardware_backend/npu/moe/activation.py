@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_gather,
 )
-from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -22,7 +21,7 @@ class BaseActivation(ABC):
 
 
 # =============================================================================
-# Concrete activation implementations (unchanged except removed 8.)
+# Concrete activation implementations
 # =============================================================================
 class NPUSwiglu(BaseActivation):
     def _apply_activation(self, hidden_states: torch.Tensor):
@@ -65,11 +64,31 @@ class NPUSwigluQuantWithScales(BaseActivation):
 
 
 class NPUSwigluDeepEPKernel(BaseActivation):
-    def __init__(self, need_quant: bool = True):
-        from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+    """DeepEP grouped SwiGLU for the Ascend MoE runner; picks ``swiglu_quant`` vs the MiniMax
+    SwiGLU-OAI variant (``swiglu_oai_quant``: ``gate*sigmoid(gate*alpha)*(up+1)`` w/ clamping)
+    based on whether ``alpha``/``limit`` are given. The runner must forward
+    ``gemm1_alpha``/``gemm1_clamp_limit`` here or experts fall back to wrong SwiGLU."""
 
-        self._kernel = swiglu_quant
+    def __init__(
+        self,
+        need_quant: bool = True,
+        alpha: Optional[float] = None,
+        limit: Optional[float] = None,
+    ):
         self.need_quant = need_quant
+        self.alpha = alpha
+        self.limit = limit
+        self._use_oai = alpha is not None and limit is not None
+        if self._use_oai:
+            from sgl_kernel_npu.activation.swiglu_oai_quant import (
+                swiglu_oai_quant,
+            )
+
+            self._kernel = swiglu_oai_quant
+        else:
+            from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+
+            self._kernel = swiglu_quant
 
     def _apply_activation(
         self,
@@ -77,16 +96,86 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         group_list: torch.Tensor,
         group_list_type: int,
     ):
-        hidden_states, per_token_scale = self._kernel(
-            hidden_states, group_list, group_list_type, need_quant=self.need_quant
-        )
+        if self._use_oai:
+            hidden_states, per_token_scale = self._kernel(
+                hidden_states,
+                self.alpha,
+                self.limit,
+                need_quant=self.need_quant,
+                group_list=group_list,
+                group_list_type=group_list_type,
+            )
+        else:
+            hidden_states, per_token_scale = self._kernel(
+                hidden_states, group_list, group_list_type, need_quant=self.need_quant
+            )
         if self.need_quant:
             return hidden_states, per_token_scale
         return hidden_states, None
 
 
+class NPUSitu(BaseActivation):
+    """SiTU activation and optional INT8 requantization for grouped rows."""
+
+    def __init__(
+        self,
+        *,
+        need_quant: bool,
+        beta: float = 4.0,
+        linear_beta: Optional[float] = 25.0,
+    ):
+        from sgl_kernel_npu.activation.situ import situ
+
+        self.situ = situ
+        self.need_quant = need_quant
+        self.beta = float(beta)
+        self.linear_beta = None if linear_beta is None else float(linear_beta)
+
+    def _apply_activation(
+        self,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ):
+        return self.situ(
+            hidden_states,
+            group_list,
+            group_list_type,
+            need_quant=self.need_quant,
+            beta=self.beta,
+            linear_beta=self.linear_beta,
+        )
+
+
+class NPUSituMXFP8Quant(BaseActivation):
+    """A5 AscendC grouped SiTU with valid-row MXFP8 quantization."""
+
+    def __init__(self, *, beta: float = 4.0, linear_beta: float = 25.0):
+        from sgl_kernel_npu.activation.situ_mxfp8_quant import situ_mxfp8_quant
+
+        self.situ_mxfp8_quant = situ_mxfp8_quant
+        self.beta = float(beta)
+        self.linear_beta = float(linear_beta)
+
+    def _apply_activation(
+        self,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ):
+        return self.situ_mxfp8_quant(
+            hidden_states,
+            group_list,
+            group_list_type,
+            beta=self.beta,
+            linear_beta=self.linear_beta,
+        )
+
+
 class NPUGeluAndMul(BaseActivation):
     def __init__(self):
+        from sglang.srt.layers.activation import GeluAndMul
+
         self._gelu = GeluAndMul()
 
     def _apply_activation(self, hidden_states: torch.Tensor):
@@ -136,6 +225,35 @@ class NPUSwigluStepAndMul(BaseActivation):
         gate = F.silu(gate).clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
         return gate * up
+
+
+class NPUSwigluMxfp8Quant(BaseActivation):
+    """DeepSeek-V4 grouped SwiGLU with MXFP8 requantization for GMM2."""
+
+    def __init__(self, limit: float):
+        self._limit = float(limit)
+
+    def _apply_activation(
+        self,
+        hidden_states: torch.Tensor,
+        group_list: torch.Tensor,
+        group_list_type: int,
+    ):
+        # The op sums the group list as per-expert counts and has no cumulative layout;
+        # a cusum list passed through would silently process the wrong rows.
+        if group_list_type != 1:
+            raise ValueError(
+                "swiglu_group_quant takes a per-expert count group list, got "
+                f"group_list_type={group_list_type}"
+            )
+        out, scale, _ = torch.ops.npu.swiglu_group_quant(
+            x=hidden_states,
+            group_index=group_list,
+            quant_mode=2,  # MX: one e8m0 scale per 32-element block
+            group_list_type=0,  # sglang numbers the count layout 1, the op numbers it 0
+            clamp_value=self._limit,
+        )
+        return out, scale
 
 
 # =============================================================================

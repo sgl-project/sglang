@@ -10,13 +10,11 @@ from sglang.srt.speculative.dspark_components.dspark_draft import make_next_draf
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpecInput
 
 
 def build_dspark_disagg_draft_input(
     batch: ScheduleBatch,
-    server_args: ServerArgs,
     last_tokens_tensor: torch.Tensor,
     future_map: FutureMap,
 ) -> SpecInput:

@@ -111,31 +111,10 @@ def assert_fits(nc: int, nv: int, gpu: str = "h100") -> None:
     cap = gpu_budget_bytes(gpu)
     if used > cap:
         raise ValueError(
-            f"fused IPM kernel needs {used/1024:.1f} KiB of shared memory for "
-            f"NC={nc}, NV={nv}, but {gpu} allows {cap/1024:.1f} KiB/block. "
+            f"fused IPM kernel needs {used / 1024:.1f} KiB of shared memory for "
+            f"NC={nc}, NV={nv}, but {gpu} allows {cap / 1024:.1f} KiB/block. "
             f"Either reduce problem size or switch to a tiled design."
         )
-
-
-def max_nc_for_nv(nv: int, gpu: str = "h100") -> int:
-    """Largest NC that fits for a given NV. Solves
-        4 * (NC^2 + (NV+1)*NC + 3*NV) + pad <= cap
-    via the quadratic formula (monotone in NC). Returns 0 if even NC=1 overflows.
-    """
-    cap = gpu_budget_bytes(gpu)
-    b = _BYTES_PER_ELEM
-    # cap - pad >= b * (NC^2 + (NV+1)*NC + 3*NV)
-    rhs = (cap - _RUNTIME_PAD_BYTES) / b - 3 * nv
-    if rhs <= 0:
-        return 0
-    # NC^2 + (NV+1)*NC - rhs <= 0
-    import math
-
-    disc = (nv + 1) ** 2 + 4 * rhs
-    nc_max = int((-(nv + 1) + math.sqrt(disc)) / 2.0)
-    while nc_max > 0 and shmem_bytes(nc_max, nv) > cap:
-        nc_max -= 1
-    return max(nc_max, 0)
 
 
 def report(nc: int, nv: int, gpu: str = "h100") -> str:
@@ -145,8 +124,8 @@ def report(nc: int, nv: int, gpu: str = "h100") -> str:
     status = "FITS" if bd.total_bytes <= cap else "OVER BUDGET"
     return (
         f"[shmem] NC={nc} NV={nv} gpu={gpu} | "
-        f"A={bd.a_bytes/1024:.1f}K "
-        f"ata={bd.ata_bytes/1024:.1f}K "
-        f"rest={(bd.c_bytes+bd.x_bytes+bd.rhs_bytes+bd.d_bytes)/1024:.1f}K | "
-        f"total={bd.total_bytes/1024:.1f}K / {cap/1024:.1f}K  {status}"
+        f"A={bd.a_bytes / 1024:.1f}K "
+        f"ata={bd.ata_bytes / 1024:.1f}K "
+        f"rest={(bd.c_bytes + bd.x_bytes + bd.rhs_bytes + bd.d_bytes) / 1024:.1f}K | "
+        f"total={bd.total_bytes / 1024:.1f}K / {cap / 1024:.1f}K  {status}"
     )

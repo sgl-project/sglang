@@ -32,7 +32,7 @@ from _mm_rust_utils import (  # noqa: E402
     spec_json,
 )
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 
 QWEN_CORE = getattr(load_core(), "qwen_vl", None)
 

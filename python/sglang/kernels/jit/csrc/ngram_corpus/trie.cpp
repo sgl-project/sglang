@@ -7,6 +7,8 @@
 #include <tuple>
 #include <vector>
 
+namespace sglang {
+
 namespace ngram {
 
 Trie::Trie(size_t capacity, const Param& param) : param_(param) {
@@ -329,3 +331,5 @@ Result Trie::buildFrequency(
 }
 
 }  // namespace ngram
+
+}  // namespace sglang
