@@ -835,20 +835,16 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             ),
         }
-        if self.dense_mla_dcp_target:
-            self.graph_metadata["dcp_seq_lens"] = torch.zeros(
-                max_bs, dtype=torch.int32, device=self.device
+        if self.dense_mla_dcp_target and self.speculative_num_draft_tokens is not None:
+            self.graph_metadata["dcp_mtp_attn_mask"] = torch.ones(
+                (
+                    max_bs,
+                    self.speculative_num_draft_tokens,
+                    graph_num_pages * self.page_size,
+                ),
+                dtype=torch.bool,
+                device=self.device,
             )
-            if self.speculative_num_draft_tokens is not None:
-                self.graph_metadata["dcp_mtp_attn_mask"] = torch.ones(
-                    (
-                        max_bs,
-                        self.speculative_num_draft_tokens,
-                        graph_num_pages * self.page_size,
-                    ),
-                    dtype=torch.bool,
-                    device=self.device,
-                )
         # DCP decode needs its own block_table (different stride: dcp_page_size).
         if self.dsa_dcp_target:
             dcp_page_size = self.page_size * self.dcp_size
@@ -966,12 +962,8 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
-        if self.dense_mla_dcp_target:
-            metadata.seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
-            if forward_mode.is_target_verify():
-                metadata.dcp_mtp_attn_mask = self.graph_metadata["dcp_mtp_attn_mask"][
-                    :bs
-                ]
+        if self.dense_mla_dcp_target and forward_mode.is_target_verify():
+            metadata.dcp_mtp_attn_mask = self.graph_metadata["dcp_mtp_attn_mask"][:bs]
         # Deliberately no seq_lens_cpu_int here: forward_mtp must bind
         # seq_lens_cpu_list so graph.update can rebind it.
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -1190,14 +1182,14 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[bs:, :].fill_(0)
 
         if self.dense_mla_dcp_target:
-            local_seq_lens = get_dcp_lens(
-                effective_seq_lens,
-                self.dcp_size,
-                self.dcp_rank,
-                interleave_size=self.page_size,
-            ).int()
             # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
             if in_capture:
+                local_seq_lens = get_dcp_lens(
+                    effective_seq_lens,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    interleave_size=self.page_size,
+                ).int()
                 metadata.seq_lens_cpu_list = local_seq_lens.cpu().tolist()
             if forward_mode.is_target_verify():
                 query_len = self.speculative_num_draft_tokens
@@ -1216,7 +1208,6 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 metadata.dcp_mtp_attn_mask[:, :, :active_mask_width].copy_(dcp_mask)
                 metadata.dcp_mtp_attn_mask[:, :, active_mask_width:].fill_(True)
-            effective_seq_lens = local_seq_lens
         elif forward_mode.is_target_verify():
             # For DFlash, seq_lens_cpu (= prefix + block_size) is the true KV
             # length; refresh the graph-bound list from that CPU tensor.
@@ -1230,7 +1221,8 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     kv_lens = effective_seq_lens
                 metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
-        metadata.seq_lens[:bs].copy_(effective_seq_lens)
+        if not self.dense_mla_dcp_target:
+            metadata.seq_lens[:bs].copy_(effective_seq_lens)
 
         self.forward_metadata = metadata
 
