@@ -10,12 +10,19 @@ from sglang.kernels.ops.kvcache.dsv4_request_window_copy import (
 )
 from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect, resolve_level
+
+_is_hip = is_hip()
 
 # A window row the replay expects but no longer holds; that request's attention
 # would read the wrong rows.
 _SWA_HISTORY_PRESENT = Invariant(
     "dsv41.swa_history_present", Bucket.FATAL_CONTAINABLE, IsTrue()
+)
+# More contiguous request runs than num_groups: the runs past it get no history.
+_WINDOW_GROUPS_FIT = Invariant(
+    "dsv41.window_groups_fit", Bucket.FATAL_CONTAINABLE, IsTrue()
 )
 
 
@@ -99,6 +106,31 @@ def window_layout(
     n = pos.numel()
     if n == 0:
         raise ValueError("request-window layout needs at least one query")
+    if req.is_cuda and not _is_hip:
+        from sglang.kernels.ops.kvcache.dsv41_window_layout import build_window_layout
+
+        group, first, last = _first_row_offsets(req)
+        if (
+            num_groups is not None
+            and resolve_level() >= InvariantCheckLevel.WARN
+            and not _capturing()
+        ):
+            expect(_WINDOW_GROUPS_FIT, group[-1:] < num_groups, msg="request runs")
+        return WindowLayout(
+            **build_window_layout(
+                req,
+                pos,
+                group,
+                first,
+                last,
+                zero_row=zero_row,
+                window=window,
+                capacity=capacity,
+                floor=floor,
+                num_groups=num_groups,
+                padded_rows=padded_rows,
+            )
+        )
     req = req.to(torch.int64)
     pos = pos.to(torch.int64)
     device = pos.device
@@ -225,6 +257,7 @@ class RequestWindow:
             self._ensure_workspace(workspace_rows)
         self.layout = None
         self.prepared = None
+        self._idle_layout = None
 
     def _ensure_workspace(self, rows: int) -> None:
         if self.workspace is not None and self.workspace.size >= rows:
@@ -264,6 +297,24 @@ class RequestWindow:
                 f"request-window workspace too small: {self.workspace.size} rows "
                 f"for a layout of {layout.size}"
             )
+
+    def activate_idle(self, num_rows: int) -> torch.Tensor:
+        """Activate a layout for an idle forward, whose attention metadata is
+        stale or unset. Its rows write the workspace past an empty history, and
+        an idle forward never commits them."""
+        layout = self._idle_layout
+        if layout is None or layout.pos.numel() != num_rows:
+            zeros = torch.zeros(num_rows, dtype=torch.int64, device=self.tags.device)
+            layout = window_layout(
+                zeros,
+                zeros,
+                zero_row=self.zero_row,
+                capacity=self.capacity,
+                num_groups=1,
+            )
+            self._idle_layout = layout
+        self.activate(layout)
+        return layout.write_loc
 
     def initialize_dummy_history(self):
         layout = self.layout

@@ -140,8 +140,9 @@ class SpeculativeAlgorithm(Enum):
 
         The backend must still declare a pre-replay read end.
         """
-        # DSPARK's draft KV inject reads the SWA mapping after the target prefill.
-        return self.is_none() or self.is_dflash()
+        # DSPARK's draft KV inject runs after the target prefill, but on write
+        # locations it computes before the target forward.
+        return self.is_none() or self.is_dflash_family()
 
     def supports_mixed_chunk(self) -> bool:
         """Whether mixed chunk prefill may stay enabled with this algorithm.

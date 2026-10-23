@@ -20,7 +20,10 @@ import torch
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import dp_gather_replicate
+from sglang.srt.layers.dp_attention import (
+    dp_gather_replicate,
+    note_rank_barrier_in_prefill_graph,
+)
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -650,6 +653,8 @@ def _tail_layers_in_prefill_graph(
     input_ids: torch.Tensor,
     input_ids_global: torch.Tensor,
 ) -> Tuple[Optional[torch.Tensor], ...]:
+    # The tail captures its row-bucket graphs on first use.
+    note_rank_barrier_in_prefill_graph()
     backend = get_attn_backend()
     saved, forward_batch = _enter_eager_tail_in_prefill_graph(
         backend, get_tc_piecewise_forward_context().forward_batch, source_kv_layer_id
