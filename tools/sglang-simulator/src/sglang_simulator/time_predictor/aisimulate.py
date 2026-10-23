@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+from statistics import pvariance
 from typing import Optional
 
 import numpy as np
@@ -103,9 +106,23 @@ def _resolve_comm_quant_mode(sched_config: SchedulerConfig) -> CommQuantMode:
         ) from None
 
 
-def get_quant_modes(config: SchedulerConfig) -> dict:
-    """One deployment mapping for memory estimation and static prediction."""
+def get_quant_modes(config: SchedulerConfig, *, native: bool = False) -> dict:
+    """One deployment mapping for memory, legacy prediction and native FPM.
+
+    The legacy path retains its historical defaults. Native prediction refuses
+    the legacy FP16->BF16 / INT8-MoE->FP8 approximations.
+    """
     dtype, kv = config.data_type, config.kv_cache_data_type
+    if native:
+        kv = kv or dtype
+        if dtype is None or kv is None:
+            raise ValueError("Native AISimulate needs resolved model and KV dtypes")
+        if dtype.name.startswith("FP16") or kv.name.startswith("FP16"):
+            raise ValueError("AISimulate has no faithful FP16 native quantization mode")
+        if dtype.name.startswith("INT8") and not config.moe_quant_mode_override:
+            raise ValueError("Declare moe_quant_mode_override for an INT8 deployment")
+        # Tensor-level cache/attention representations use the same SDK modes.
+        kv = DataType[kv.name.removesuffix("_TENSOR")]
     specs = (
         ("gemm", dtype, MAP_DTYPE_TO_GEMMQuantMode, GEMMQuantMode, None),
         (
@@ -126,6 +143,8 @@ def get_quant_modes(config: SchedulerConfig) -> dict:
     )
     result = {}
     for name, value, mapping, enum, override in specs:
+        if native and not override and value not in mapping:
+            raise ValueError(f"No faithful {name} mapping for {value}")
         result[name + "_quant_mode"] = (
             getattr(enum, override) if override else mapping.get(value, enum.bfloat16)
         )
@@ -172,8 +191,78 @@ class AISimulateTimePredictor(InferTimePredictor):
         prefill_min_latency: float = 0,
         workload_distribution: str = "balanced",
         enable_oom_check: bool = False,
+        *,
+        estimation_mode: str | None = None,
+        estimator_config: dict | None = None,
+        systems_paths: list[str] | None = None,
+        tune_observations: str | None = None,
+        worker_type: str = "aggregated",
     ):
         super().__init__(model, hw, config)
+
+        self._fpm = None
+        self.requires_batch_snapshot = estimation_mode is not None
+        if self.requires_batch_snapshot:
+            from aisimulate_core.sdk import (
+                ForwardPassPerfModelConfig,
+                RustForwardPassPerfModel,
+            )
+
+            if (
+                (prefill_scale_factor, decode_scale_factor, prefill_min_latency)
+                != (1, 1, 0)
+                or enable_oom_check
+                or workload_distribution != "balanced"
+                or database_path is not None
+            ):
+                raise ValueError(
+                    "Native modes use estimator_config and systems_paths; legacy scaling, OOM and database_path options are not supported"
+                )
+            if (
+                config.pp_size != 1
+                or config.dp_size != 1
+                or config.cp_size != 1
+                or config.cp_style != "none"
+            ):
+                raise ValueError(
+                    "Native AISimulate currently supports TP/EP with PP=DP=CP=1"
+                )
+            quant = {k: v.name for k, v in get_quant_modes(config, native=True).items()}
+            self._fpm = RustForwardPassPerfModel.best_available(
+                ForwardPassPerfModelConfig(
+                    model=model.model_path,
+                    system=hw.name,
+                    backend=config.backend_name,
+                    backend_version=config.backend_version,
+                    tp=config.attn_tp_size,
+                    pp=1,
+                    attention_dp=1,
+                    moe_tp_size=config.moe_tp_size,
+                    moe_ep_size=config.moe_ep_size,
+                    worker_type=worker_type,
+                    estimation_mode=estimation_mode,
+                    database_mode=database_mode.name
+                    if isinstance(database_mode, DatabaseMode)
+                    else database_mode,
+                    systems_paths=tuple(systems_paths or ()),
+                    estimator_config=estimator_config or {},
+                    fallback_policy="deny",
+                    **quant,
+                )
+            )
+            if tune_observations is not None:
+                self._fpm.tune_with_fpms(
+                    json.loads(Path(tune_observations).read_text())
+                )
+            logger.info("AISimulate: %s", self._fpm.diagnostics())
+            return
+        if (
+            estimator_config is not None
+            or systems_paths is not None
+            or tune_observations is not None
+            or worker_type != "aggregated"
+        ):
+            raise ValueError("Set estimation_mode when using native AISimulate options")
 
         self.prefill_scale_factor = prefill_scale_factor
         self.decode_scale_factor = decode_scale_factor
@@ -232,6 +321,9 @@ class AISimulateTimePredictor(InferTimePredictor):
         return actual_flops / avg_flops
 
     def predict_infer_latency_dict(self, batch: ScheduleBatch) -> dict:
+        # A calibrated whole-forward estimate has no per-operator attribution.
+        if self._fpm is not None:
+            raise ValueError("Operator breakdown is only available on the legacy path")
         # Returns latency details for debugging operators.
         if batch.is_decode():
             # Decode: output sequence length (osl) = 2, input sequence length (isl) = mean(past_kv_length)
@@ -289,7 +381,19 @@ class AISimulateTimePredictor(InferTimePredictor):
                 latency_dict = results[0]
         return latency_dict
 
+    def get_metrics(self) -> dict:
+        return self._fpm.diagnostics() if self._fpm is not None else {}
+
     def predict_infer_time(self, batch: ScheduleBatch) -> float:
+        if self._fpm is not None:
+            latency = self._fpm.estimate_forward_pass_time_ms(
+                batch_to_fpm_metrics(batch)
+            )
+            if latency is None:
+                raise RuntimeError(
+                    "AISimulate has no ready estimate for this workload; provide matching calibration observations"
+                )
+            return latency / 1000.0
         latency_dict = self.predict_infer_latency_dict(batch)
         infer_time = sum(latency_dict.values())
 
@@ -309,3 +413,30 @@ class AISimulateTimePredictor(InferTimePredictor):
             )
 
         return infer_time / 1e3
+
+
+def batch_to_fpm_metrics(batch: ScheduleBatch) -> dict:
+    """Translate scheduled work to native FPM features (prior KV, not total length)."""
+    prefill, decode = [], []
+    if batch.forward_mode not in {"extend", "decode", "mixed"}:
+        raise ValueError("Native prediction requires an extend/decode/mixed snapshot")
+    for req in batch.reqs:
+        phase = (
+            req.forward_mode if batch.forward_mode == "mixed" else batch.forward_mode
+        )
+        if phase not in {"extend", "decode"}:
+            raise ValueError("Mixed prediction requires per-request scheduler phases")
+        (prefill if phase == "extend" else decode).append(req)
+    lengths = [r.extend_length for r in prefill]
+    decode_kv = [r.past_kv_length for r in decode]
+    return {
+        "scheduled_requests": {
+            "num_prefill_requests": len(prefill),
+            "sum_prefill_tokens": sum(lengths),
+            "sum_prefill_kv_tokens": sum(r.past_kv_length for r in prefill),
+            "var_prefill_length": pvariance(lengths) if lengths else 0.0,
+            "num_decode_requests": len(decode),
+            "sum_decode_kv_tokens": sum(decode_kv),
+            "var_decode_kv_tokens": pvariance(decode_kv) if decode_kv else 0.0,
+        }
+    }

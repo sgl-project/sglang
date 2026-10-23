@@ -202,7 +202,13 @@ class C_KVCacheConfiguratorHook(BaseHook):
             scheduler_config = resolve_scheduler_config(
                 server_args=self.server_args,
                 model_config=self.model_config,
+                native=ConfigManager.uses_native_aisimulate(),
+                scheduler_overrides=ConfigManager._get_raw_config().get(
+                    "scheduler", {}
+                ),
             )
+            if ConfigManager.uses_native_aisimulate():
+                ConfigManager.set_scheduler_config(scheduler_config)
             if hardware is None or scheduler_config is None:
                 raise RuntimeError(
                     "Simulator model, accelerator, and scheduler configuration "

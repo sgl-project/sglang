@@ -48,10 +48,15 @@ pip install -e "tools/sglang-simulator[aisimulate]"
 
 The extra pins `aisimulate==0.13.0` (Python 3.11–3.13; official wheels cover
 Linux x86_64/aarch64 and macOS arm64). This release exposes the modern
-`aisimulate.sdk` namespace.
+`aisimulate.sdk` namespace and the native forward-pass API in
+`aisimulate_core.sdk`.
 
-Use the `aisimulate` predictor name for the existing static op-level path,
-including phase scale factors.
+Use the existing `aisimulate` predictor name for every mode. With no
+`estimation_mode`, the simulator retains its original static op-level path,
+including phase scale factors. Explicit modes use AISimulate's native
+forward-pass estimator. See [native modes and calibration](docs/aisimulate_fpm.md).
+The native modes are tested on the current checkout; the compatibility list
+above does not establish native-mode parity across SGLang versions.
 The shared memory-estimation path also uses this SDK for ML/replay predictors.
 
 When migrating an older AIConfigurator setup, replace the `[aic]` install extra
@@ -230,7 +235,7 @@ Supported predictors:
 
 | Predictor | Purpose |
 |---|---|
-| `aisimulate` | Operator and module performance-database estimation. |
+| `aisimulate` | Op-level estimation and native forward-pass modes. |
 | `ml` | A trained sklearn-compatible 18-feature latency model. |
 | `replay` | Exact or nearest-neighbor batch-composition replay. |
 
@@ -271,6 +276,8 @@ python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio
 python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
 python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_import.py
 python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_predictor.py
+python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_native.py
+python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_native_runner.py
 ```
 
 Run each file as a separate pytest command because the runner test installs

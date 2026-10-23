@@ -98,3 +98,5 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
           python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_import.py
           python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_predictor.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_native.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_native_runner.py
