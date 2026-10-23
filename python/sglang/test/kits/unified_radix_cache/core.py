@@ -86,9 +86,7 @@ class FakeFullComponent(TreeComponent):
 
 
 class PagedFullComponent(FullComponent):
-    """FULL component whose device values are not backed one-to-one by pool
-    rows: a value lists two entries per row, and the component can hand rows
-    of a node back to the allocator while the value stays on device."""
+    """FULL component whose device values are not backed one-to-one by pool rows."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -99,7 +97,6 @@ class PagedFullComponent(FullComponent):
 
 
 def component_with_cache(component_type, cache):
-    """A registry component instance bound to a (mock) cache and its tree_core."""
     component = object.__new__(COMPONENT_REGISTRY[component_type])
     component.cache = cache
     component.tree_core = cache.tree_core

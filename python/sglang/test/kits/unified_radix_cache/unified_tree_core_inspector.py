@@ -30,7 +30,6 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         return node_id in self._node_arena
 
     def get_parent_node_id(self, node_id: NodeId) -> Optional[NodeId]:
-        """The parent node id, or None for the root."""
         parent = self.node_by_id(node_id).parent
         return None if parent is None else parent.id
 
@@ -45,13 +44,11 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         return len(key)
 
     def get_node_token_ids(self, node_id: NodeId) -> list[int]:
-        """The raw token ids spanned by the node's radix key."""
         key = self.node_by_id(node_id).key
         assert key is not None
         return list(key.raw_token_ids())
 
     def is_node_key_bigram(self, node_id: NodeId) -> bool:
-        """Whether the node's radix key uses bigram atoms."""
         key = self.node_by_id(node_id).key
         assert key is not None
         return key.is_bigram
@@ -59,19 +56,16 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
     def get_component_host_value(
         self, node_id: NodeId, component_type: ComponentType
     ) -> Optional[torch.Tensor]:
-        """The component's host value on the node, or None if absent."""
         return self.node_by_id(node_id).component_data[component_type].host_value
 
     def get_component_device_lock_ref(
         self, node_id: NodeId, component_type: ComponentType
     ) -> int:
-        """The component's device lock count on the node."""
         return self.node_by_id(node_id).component_data[component_type].lock_ref
 
     def get_component_host_lock_ref(
         self, node_id: NodeId, component_type: ComponentType
     ) -> int:
-        """The component's host lock count on the node."""
         return self.node_by_id(node_id).component_data[component_type].host_lock_ref
 
     def get_node_hit_count(self, node_id: NodeId) -> int:
@@ -83,20 +77,17 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         return self.node_by_id(node_id).write_through_pending_id
 
     def is_external_cache_stored(self, node_id: NodeId) -> bool:
-        """Whether the node is known to be stored in the external cache."""
         return self.node_by_id(node_id).external_cache_stored
 
     def is_node_in_device_lru(
         self, node_id: NodeId, component_type: ComponentType
     ) -> bool:
-        """Whether the node belongs to the component's device LRU."""
         lru = self.lru_lists.get(component_type)
         return lru is not None and lru.in_list(self.node_by_id(node_id))
 
     def is_node_in_host_lru(
         self, node_id: NodeId, component_type: ComponentType
     ) -> bool:
-        """Whether the node belongs to the component's host LRU."""
         lru = self.host_lru_lists.get(component_type)
         return lru is not None and lru.in_list(self.node_by_id(node_id))
 
@@ -114,7 +105,6 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
     def get_component_device_lru_node_ids(
         self, component_type: ComponentType
     ) -> list[NodeId]:
-        """The component's device LRU members from most to least recent."""
         lru = self.lru_lists.get(component_type)
         return [] if lru is None else self._lru_node_ids(lru)
 
@@ -129,7 +119,6 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         return node is not None and node in self.evictable_host_leaves
 
     def is_device_leaf(self, node_id: NodeId) -> bool:
-        """Whether the node has no device-resident descendants."""
         return self._is_device_leaf(self.node_by_id(node_id))
 
     def get_all_node_ids(self) -> list[NodeId]:
@@ -137,13 +126,11 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         return [node.id for node in self._collect_all_nodes()]
 
     def component_protected_size(self, component_type: ComponentType) -> int:
-        """Protected token count for one component (0 if the component is absent)."""
         return self.component_protected_size_.get(component_type, 0)
 
     def set_node_hash_values(
         self, node_id: NodeId, hash_values: Optional[list[str]]
     ) -> None:
-        """Replace the node's page-hash field."""
         self.node_by_id(node_id).hash_value = hash_values
 
     def set_component_device_value_raw(
@@ -152,7 +139,6 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         component_type: ComponentType,
         value: Optional[torch.Tensor],
     ) -> None:
-        """Replace the device-value field without updating tree bookkeeping."""
         self.node_by_id(node_id).component_data[component_type].value = value
 
     def set_component_host_value_raw(
@@ -161,48 +147,40 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         component_type: ComponentType,
         value: Optional[torch.Tensor],
     ) -> None:
-        """Replace the host-value field without updating tree bookkeeping."""
         self.node_by_id(node_id).component_data[component_type].host_value = value
 
     def set_component_device_lock_ref(
         self, node_id: NodeId, component_type: ComponentType, lock_ref: int
     ) -> None:
-        """Replace the component's device lock count."""
         assert lock_ref >= 0
         self.node_by_id(node_id).component_data[component_type].lock_ref = lock_ref
 
     def remove_node_from_device_lru(
         self, node_id: NodeId, component_type: ComponentType
     ) -> None:
-        """Remove the node from the component's device LRU."""
         self.lru_lists[component_type].remove_node(self.node_by_id(node_id))
 
     def insert_node_into_host_lru(
         self, node_id: NodeId, component_type: ComponentType
     ) -> None:
-        """Insert the node as the component's most-recent host entry."""
         self.host_lru_lists[component_type].insert_mru(self.node_by_id(node_id))
 
     def set_component_evictable_size(
         self, component_type: ComponentType, value: int
     ) -> None:
-        """Replace the component's evictable device-token count."""
         assert value >= 0
         self.component_evictable_size_[component_type] = value
 
     def set_component_protected_size(
         self, component_type: ComponentType, value: int
     ) -> None:
-        """Replace the component's protected device-token count."""
         assert value >= 0
         self.component_protected_size_[component_type] = value
 
     def update_duplicate_tracking(self, node_id: NodeId) -> None:
-        """Refresh duplicate-host tracking for the node."""
         self._update_duplicate_tracking(self.node_by_id(node_id))
 
     def advance_insert_walk_once(self) -> None:
-        """Advance one suspended insert walk step without flushing its actions."""
         state = self._ongoing_insert_walk_state
         if state is None:
             raise RuntimeError("no in-flight insert")
@@ -216,7 +194,6 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         component_type: ComponentType,
         target: EvictLayer,
     ) -> BaseEvictionResult:
-        """Evict one component layer from a node and detach its LRU entry."""
         result = BaseEvictionResult()
         self._evict_component_and_detach_lru(
             self.node_by_id(node_id),
@@ -235,7 +212,6 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         component_type: ComponentType,
         target: EvictLayer,
     ) -> None:
-        """Validate the locks for a component-triggered cascade eviction."""
         node = self.node_by_id(node_id)
         trigger = self.components_by_type[component_type]
         is_leaf = self._is_cascade_evict_leaf(node, target)
@@ -243,7 +219,6 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
             self._should_cascade_evict_component(node, trigger, comp, target, is_leaf)
 
     def cleanup_tombstone_ancestors(self, node_id: NodeId) -> BaseEvictionResult:
-        """Delete childless tombstone ancestors until a live or locked node is reached."""
         result = BaseEvictionResult()
         self._iteratively_delete_tombstone_ancestors(
             self.node_by_id(node_id),
@@ -262,7 +237,6 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
-        """Run one component's match finalizer with NodeId boundaries."""
         node_result = result._replace(
             last_device_node=self.node_by_id(result.last_device_node),
             last_host_node=self.node_by_id(result.last_host_node),
@@ -285,7 +259,6 @@ class UnifiedTreeCoreInspector(UnifiedTreeCore, UnifiedTreeCoreInspectionInterfa
     def build_backup_node_ids(
         self, node_id: NodeId, write_back: bool = False
     ) -> list[NodeId]:
-        """Build the ordered node list for a device-to-host backup."""
         return self._build_backup_kv_action(
             self.node_by_id(node_id), write_back
         ).node_ids

@@ -1089,7 +1089,9 @@ class LogitsProcessor(nn.Module):
                 and hidden_states.dtype == lm_head.weight.dtype
                 and hidden_states.dtype in (torch.float16, torch.bfloat16)
             )
-            if use_mm_out_dtype and (self.use_fp32_lm_head or out is not None):
+            # A shared FP32 buffer must not change the lm_head's output precision.
+            # Keep the same rounding as the unbuffered path unless FP32 is enabled.
+            if use_mm_out_dtype and self.use_fp32_lm_head:
                 logits = torch.mm(
                     hidden_states,
                     lm_head.weight.T,

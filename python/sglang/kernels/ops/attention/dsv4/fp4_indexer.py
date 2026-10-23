@@ -185,6 +185,54 @@ def finish_flat_indexer_topk(
 
 
 @triton.jit
+def _flat_selection_slots_kernel(
+    Raw,
+    Starts,
+    Slots,
+    Pages,
+    K: tl.constexpr,
+    RAW_STRIDE: tl.constexpr,
+    PAGE_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.arange(0, BLOCK)
+    raw = tl.load(Raw + row * RAW_STRIDE + col, col < K, -1)
+    chosen = raw >= 0
+    slot = tl.load(Slots + (raw + tl.load(Starts + row)), chosen, -1)
+    tl.store(Pages + row * PAGE_STRIDE + col, slot.to(tl.int32), col < K)
+
+
+def flat_selection_slots(
+    raw_indices: torch.Tensor,
+    request_starts: torch.Tensor,
+    slots: torch.Tensor,
+    page_indices: torch.Tensor,
+) -> None:
+    """``page_indices[r, j] = slots[request_starts[r] + raw_indices[r, j]]``, or -1
+    where the request-local position ``raw_indices[r, j]`` is negative."""
+    rows, k = raw_indices.shape
+    if not rows or not k:
+        return
+    assert raw_indices.dtype == torch.int32 and raw_indices.stride(1) == 1
+    assert request_starts.shape == (rows,) and request_starts.is_contiguous()
+    assert slots.ndim == 1 and slots.is_contiguous()
+    assert page_indices.shape[0] >= rows and page_indices.shape[1] >= k
+    assert page_indices.dtype == torch.int32 and page_indices.stride(1) == 1
+    _flat_selection_slots_kernel[(rows,)](
+        raw_indices,
+        request_starts,
+        slots,
+        page_indices,
+        k,
+        raw_indices.stride(0),
+        page_indices.stride(0),
+        triton.next_power_of_2(k),
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _index_k_rope_pack_kernel(
     X,
     F,
