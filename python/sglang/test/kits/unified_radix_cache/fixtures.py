@@ -52,9 +52,7 @@ from sglang.test.kits.unified_radix_cache.unified_tree_core_inspector import (
     UnifiedTreeCoreInspector,
 )
 
-# The Rust re-run entry point overrides this without changing the process-wide
-# production backend selection. Every cache built by build_fixture follows it;
-# tests that construct a Python core directly stay Python-only.
+# The Rust re-run overrides this; every cache built by build_fixture follows it.
 TREE_CORE_TEST_BACKEND: Optional[str] = "python"
 
 
@@ -63,9 +61,8 @@ def selected_tree_core_test_backend() -> str:
 
 
 def drop_hicache_atexit_pin(cache):
-    """init_hicache registers ``cache.shutdown`` with atexit, which pins the
-    fixture's device and host pools until process exit; hundreds of HiCache
-    fixtures in one test process would otherwise accumulate on the GPU."""
+    """init_hicache registers cache.shutdown with atexit, which pins the fixture's GPU
+    memory until exit."""
     atexit.unregister(cache.shutdown)
 
 
@@ -128,19 +125,17 @@ def build_fixture(
 ):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig.
 
-    ``tree_page_size`` stands in for DCP, which widens the tree page past the
-    ``page_size`` the rest of the config still sees. It only reaches values
-    derived from the tree page: the allocator keeps ``cfg.page_size``, whereas
-    DCP sets the two equal, so do not read insert or match behaviour off it.
+    ``tree_page_size`` stands in for DCP but only reaches values derived from the
+    tree page; the allocator keeps ``cfg.page_size``, so do not read insert or
+    match behaviour off it.
     """
     server_args = ServerArgs(
         model_path="dummy",
         page_size=cfg.page_size,
         enable_int8_mamba_checkpoint=cfg.enable_int8_mamba_checkpoint,
     )
-    # The mamba component reads mamba_cache_chunk_size, whose property otherwise
-    # loads the HF config for self.model_path — impossible for the dummy model.
-    # Mirror the property's default for a dummy HF config: FLA_CHUNK_SIZE.
+    # The dummy HF config cannot supply mamba_cache_chunk_size, so preset
+    # FLA_CHUNK_SIZE.
     server_args._mamba_cache_chunk_size = (
         max(FLA_CHUNK_SIZE, cfg.page_size)
         if mamba_cache_chunk_size is None
