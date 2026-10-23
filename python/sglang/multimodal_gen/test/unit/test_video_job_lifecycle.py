@@ -4,8 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai import video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
+from sglang.multimodal_gen.runtime.entrypoints.openai import video_api
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
@@ -16,7 +16,11 @@ def test_worker_error_with_output_cannot_complete_video_job(monkeypatch, tmp_pat
     monkeypatch.setattr(
         async_scheduler_client,
         "forward",
-        AsyncMock(return_value=OutputBatch(output_file_paths=[str(output)], error="save failed")),
+        AsyncMock(
+            return_value=OutputBatch(
+                output_file_paths=[str(output)], error="save failed"
+            )
+        ),
     )
     monkeypatch.setattr(
         openai_utils,

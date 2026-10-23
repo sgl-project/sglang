@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import base64
 import io
 import json
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.http_server import forward_to_scheduler
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
@@ -27,6 +29,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     request_model_kwargs,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
 
 @pytest.mark.parametrize(
@@ -67,6 +70,25 @@ def test_generation_rejects_errors_before_publishing_partial_output(
         assert paths == ["recovered.png"] and result is recovered
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("error", [None, "output save failed"])
+def test_vertex_response_does_not_publish_failed_output(monkeypatch, tmp_path, error):
+    path = tmp_path / "out.mp4"
+    path.write_bytes(b"encoded video")
+    monkeypatch.setattr(
+        async_scheduler_client,
+        "forward",
+        AsyncMock(return_value=OutputBatch(output_file_paths=[str(path)], error=error)),
+    )
+    sampling = SamplingParams(prompt="test")
+    response = asyncio.run(
+        forward_to_scheduler(Req(sampling_params=sampling), sampling)
+    )
+    if error:
+        assert response == {"error": error}
+    else:
+        assert base64.b64decode(response["output"]) == path.read_bytes()
 
 
 def test_request_fields_preserve_falsy_values_and_extra_precedence():
