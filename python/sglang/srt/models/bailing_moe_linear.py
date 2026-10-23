@@ -97,17 +97,6 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 if _use_aiter_gfx95:
     pass
 
-if _is_cuda:
-    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
-elif _is_cpu and _is_cpu_amx_available:
-    pass
-elif _is_hip:
-    from sglang.kernels.ops.quantization.awq_triton import (
-        awq_dequantize_triton as awq_dequantize,
-    )
-else:
-    from vllm._custom_ops import awq_dequantize
-
 if _is_hip:
     pass
 
@@ -248,7 +237,9 @@ class BailingMoE(nn.Module):
         self.tp_size = get_parallel().tp_size
 
         self.top_k = config.num_experts_per_tok
-        self.norm_expert_prob = getattr(config, "norm_topk_prob", False)
+        # The reference modeling always renormalizes the top-k weights, and the
+        # Ling-2.5/2.6 configs carry no norm_topk_prob key.
+        self.norm_expert_prob = getattr(config, "norm_topk_prob", True)
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
         self.num_shared_experts = getattr(config, "num_shared_experts", 0)
@@ -318,6 +309,10 @@ class BailingMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=f"{prefix}.experts",
         )
+        self.topk.topk_config.apply_routed_scaling_factor_on_output = (
+            self.experts.should_fuse_routed_scaling_factor_in_topk
+        )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         if self.num_shared_experts > 0:
             intermediate_size = self.intermediate_size * self.num_shared_experts
@@ -1109,6 +1104,19 @@ class BailingMoELinearForCausalLM(nn.Module):
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
             if hasattr(self_attn.kv_b_proj, "qweight"):
+                if _is_cuda:
+                    from sglang.kernels.ops.quantization.awq_dequantize import (
+                        awq_dequantize,
+                    )
+                elif _is_cpu and _is_cpu_amx_available:
+                    pass
+                elif _is_hip:
+                    from sglang.kernels.ops.quantization.awq_triton import (
+                        awq_dequantize_triton as awq_dequantize,
+                    )
+                else:
+                    from vllm._custom_ops import awq_dequantize
+
                 # AWQ compatible
                 if _is_cuda or _is_hip:
                     w = awq_dequantize(

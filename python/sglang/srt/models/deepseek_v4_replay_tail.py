@@ -4,8 +4,9 @@ Eager prefill steps replay them directly. A prefill-graph shape of at least
 ``SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS`` tokens replays them from one
 eager break, through bridge buffers; smaller shapes keep the tail captured.
 
-Under DP attention every rank replays the largest rank's bucket. MegaMoE agrees
-on it through a host gather, so it needs the prefill graph off.
+Under DP attention every rank replays the largest rank's bucket. In an eager step
+MegaMoE agrees on it through a host gather; the prefill-graph break reads every
+rank's rows from the pre-forward exchange.
 """
 
 from __future__ import annotations
@@ -19,7 +20,10 @@ import torch
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import dp_gather_replicate
+from sglang.srt.layers.dp_attention import (
+    dp_gather_replicate,
+    note_rank_barrier_in_prefill_graph,
+)
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -28,7 +32,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import (
+    forward_context,
+    get_attn_backend,
+    get_forward_context,
+    has_forward_context,
+)
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     compute_attention_and_moe_layers,
 )
@@ -163,6 +172,15 @@ class DecoderReplayTail:
             max_rows=max_rows,
         )
 
+    @staticmethod
+    def _can_capture_moe_bound(forward_batch: ForwardBatch) -> bool:
+        # The row runner replaces only the local count with a graph-owned buffer.
+        bound = forward_batch.moe_num_token_non_padded()
+        return bound is None or (
+            bound is forward_batch.num_token_non_padded
+            and bound is not forward_batch.global_num_token_non_padded
+        )
+
     def plan(
         self,
         tail: Optional[LateLayerTail],
@@ -199,6 +217,7 @@ class DecoderReplayTail:
             or get_global_expert_distribution_recorder().recording
             or not self.runner.warm
             or (tail is not None and tail.cp_metadata is not None)
+            or not self._can_capture_moe_bound(forward_batch)
         ):
             return False, None
         if not dp:
@@ -267,7 +286,6 @@ class DecoderReplayTail:
 
         return (
             num_tokens >= envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS.get()
-            and (get_parallel().attn_dp_size == 1 or get_moe_a2a_backend().is_none())
             and tail.cp_metadata is None
             and not is_unified_kv_triton()
             # Encoder replay's folded rows are not checked against the exact tail.
@@ -414,7 +432,14 @@ class DecoderReplayTail:
                 gathered = input_ids.new_empty((sum(dp_rows), 1))
                 dp_gather_replicate(gathered, input_ids[:, None].clone(), tail_batch)
                 input_ids_global = gathered.squeeze(-1)
-            with self._break_context(tail_batch):
+            with (
+                (
+                    forward_context(get_forward_context(), forward_batch=tail_batch)
+                    if has_forward_context()
+                    else nullcontext()
+                ),
+                self._break_context(tail_batch),
+            ):
                 return self._layer_stack(
                     state,
                     positions=positions,
@@ -628,6 +653,8 @@ def _tail_layers_in_prefill_graph(
     input_ids: torch.Tensor,
     input_ids_global: torch.Tensor,
 ) -> Tuple[Optional[torch.Tensor], ...]:
+    # The tail captures its row-bucket graphs on first use.
+    note_rank_barrier_in_prefill_graph()
     backend = get_attn_backend()
     saved, forward_batch = _enter_eager_tail_in_prefill_graph(
         backend, get_tc_piecewise_forward_context().forward_batch, source_kv_layer_id
@@ -681,6 +708,7 @@ def _tail_layers_in_prefill_graph(
         if (
             not get_flags().dp.capturing_prefill_graph
             and runner.warm
+            and tail_layers._can_capture_moe_bound(forward_batch)
             and runner.bucket_rows(max(dp_rows) if dp else num_rows) is not None
         ):
             residual, pre, aux = tail_layers.run(**kwargs)
