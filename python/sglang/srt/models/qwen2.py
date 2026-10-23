@@ -93,6 +93,9 @@ class Qwen2MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
         )
+        # Quantized layers may store weight in another dtype or not as `weight`
+        # at all, and the LoRA wrapper does not expose params_dtype.
+        self.gate_up_input_dtype = self.gate_up_proj.params_dtype
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -115,9 +118,9 @@ class Qwen2MLP(nn.Module):
     ) -> torch.Tensor:
         if isinstance(x, torch.Tensor) and (
             should_force_bfloat16_dense_tensor_math()
-            or x.dtype != self.gate_up_proj.weight.dtype
+            or x.dtype != self.gate_up_input_dtype
         ):
-            x = x.to(self.gate_up_proj.weight.dtype)
+            x = x.to(self.gate_up_input_dtype)
 
         # The fused SwiGLU epilogue rounds differently from the trainer's
         # separate gate_up GEMM and activation.
