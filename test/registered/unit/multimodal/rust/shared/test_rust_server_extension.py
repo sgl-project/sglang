@@ -166,6 +166,8 @@ def launch_context(server_cls):
             return_value=SimpleNamespace(
                 nnodes=1,
                 pp_size=1,
+                dp_size=1,
+                attn_dp_enabled=True,
                 num_dp_ranks=2,
                 attn_dp_rank=1,
                 tp_size=2,
