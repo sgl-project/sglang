@@ -72,9 +72,11 @@ class TestVerifySharedKV(CustomTestCase):
         l_ext=4,
         atol=BF16_ATOL,
         rtol=BF16_RTOL,
+        prefix_lens=(512, 2048),
+        sliding_window_size=-1,
     ):
         inputs = _build_inputs(
-            prefix_lens=[512, 2048],
+            prefix_lens=list(prefix_lens),
             l_ext=l_ext,
             h_q=h_q,
             h_kv=h_kv,
@@ -105,6 +107,7 @@ class TestVerifySharedKV(CustomTestCase):
             k_scale,
             v_scale,
             sm_scale=scale,
+            sliding_window_size=sliding_window_size,
         )
         ran = verify_shared_kv_fwd(
             q,
@@ -123,7 +126,9 @@ class TestVerifySharedKV(CustomTestCase):
             k_scale,
             v_scale,
             sm_scale=scale,
+            sliding_window_size=sliding_window_size,
             max_bs=len(kv_indptr) - 1,
+            allow_sliding_window=sliding_window_size > 0,
         )
 
         self.assertTrue(ran)
@@ -170,6 +175,96 @@ class TestVerifySharedKV(CustomTestCase):
             h_kv=2,
             is_causal=False,
             l_ext=7,
+        )
+
+    def test_windowed_verify_matches_the_extend_kernel(self):
+        """Windowed verify must match the extend kernel at the M3.1 draft's window;
+        prefix lists are pre-windowed by the backend, at most one window long."""
+        for prefix_lens, window in (
+            ((300, 4095), 4095),
+            # the short window hides 0-6 of 16 keys per query, so an off-by-one shows
+            ((16, 13), 16),
+            # past 16 requests the combine merges several draft rows per program
+            ((300, 4095) * 9, 4095),
+        ):
+            with self.subTest(window=window):
+                self._run_parity(
+                    head_dim=128,
+                    v_head_dim=128,
+                    h_q=16,
+                    is_causal=False,
+                    l_ext=7,
+                    prefix_lens=prefix_lens,
+                    sliding_window_size=window,
+                )
+
+    def test_strided_draft_rows_match_contiguous_rows(self):
+        """K/V rows split out of a packed qkv projection (the attention hands them
+        over uncopied) give the bits contiguous rows give."""
+        q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = _build_inputs(
+            prefix_lens=[300, 4095], l_ext=7, h_q=16, head_dim=128, v_head_dim=128
+        )
+        tokens = q.shape[0]
+        qkv = torch.cat([q.reshape(tokens, -1), k[:, 0], v[:, 0]], dim=-1)
+        k_rows = qkv[:, 16 * 128 : 17 * 128].view(tokens, 1, 128)
+        v_rows = qkv[:, 17 * 128 :].view(tokens, 1, 128)
+        self.assertFalse(v_rows.is_contiguous())
+        outs = []
+        for k_ext, v_ext in (
+            (k_rows, v_rows),
+            (k_rows.contiguous(), v_rows.contiguous()),
+        ):
+            out = torch.empty_like(q)
+            self.assertTrue(
+                verify_shared_kv_fwd(
+                    q,
+                    k_ext,
+                    v_ext,
+                    out,
+                    k_buffer,
+                    v_buffer,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    None,
+                    False,
+                    None,
+                    7,
+                    1.0,
+                    1.0,
+                    sm_scale=128**-0.5,
+                    sliding_window_size=4095,
+                    max_bs=2,
+                    allow_sliding_window=True,
+                )
+            )
+            outs.append(out)
+        self.assertTrue(torch.equal(outs[0], outs[1]))
+
+    def test_sliding_window_is_declined_unless_the_caller_opts_in(self):
+        """Only the M3.1 draft opts in; every other windowed caller keeps the extend kernel."""
+        q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = _build_inputs(
+            prefix_lens=[16], l_ext=7, h_q=16, head_dim=128, v_head_dim=128
+        )
+        self.assertFalse(
+            verify_shared_kv_fwd(
+                q,
+                k,
+                v,
+                torch.empty_like(q),
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                False,
+                None,
+                7,
+                1.0,
+                1.0,
+                sliding_window_size=16,
+            )
         )
 
     def test_rejects_non_power_of_two_kv_group(self):

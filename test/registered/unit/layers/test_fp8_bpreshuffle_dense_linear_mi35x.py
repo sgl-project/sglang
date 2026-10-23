@@ -183,6 +183,63 @@ class TestDenseBpreshuffleScaleNoCopy(CustomTestCase):
                     f"dense linear output differs between scale-layout paths (M={m})",
                 )
 
+    def test_per_token_tuple_takes_the_rowwise_gemm(self):
+        # A per-token (fp8, scale [M, 1]) tuple from a fused producer must reach the
+        # rowwise-fp8 GEMM the bf16 input takes, not the block GEMM's group scales.
+        from aiter.ops.shuffle import shuffle_weight
+
+        weight, weight_scale = self._make_weight()
+        rowwise = (torch.rand(_N, _K, device=self.device) - 0.5).to(torch.float8_e4m3fn)
+        weight._ptpc_weight = shuffle_weight(rowwise, (16, 16))
+        weight._ptpc_scale = torch.rand(_N, 1, device=self.device) * 1e-2 + 1e-3
+        fp8 = fp8_utils.aiter.dtypes.fp8
+        for m in (1, 8, fp8_utils.MXFP8_DENSE_PTPC_DECODE_MAX_M):
+            with self.subTest(m=m):
+                x = self._rand_input(m)
+                self.assertEqual(
+                    fp8_utils.fp8_input_quant_format(weight, m), "fp8_per_token"
+                )
+                q, scale = fp8_utils.aiter.per_token_quant_hip(x, quant_dtype=fp8)
+
+                out_bf16 = fp8_utils.aiter_w8a8_block_fp8_linear(
+                    x, weight, _BLOCK, weight_scale
+                )
+                out_tuple = fp8_utils.aiter_w8a8_block_fp8_linear(
+                    q, weight, _BLOCK, weight_scale, input_scale=scale
+                )
+
+                self.assertEqual(out_tuple.dtype, torch.bfloat16)
+                self.assertTrue(torch.equal(out_tuple, out_bf16))
+
+    def test_group_tuple_takes_the_block_gemm(self):
+        # Above the rowwise-GEMM bound a fused producer's (fp8, column-major 1 x 128
+        # scale) tuple must give the block GEMM output the bf16 input gives.
+        from aiter.ops.shuffle import shuffle_weight
+
+        weight, weight_scale = self._make_weight()
+        rowwise = (torch.rand(_N, _K, device=self.device) - 0.5).to(torch.float8_e4m3fn)
+        weight._ptpc_weight = shuffle_weight(rowwise, (16, 16))
+        weight._ptpc_scale = torch.rand(_N, 1, device=self.device) * 1e-2 + 1e-3
+        fp8 = fp8_utils.aiter.dtypes.fp8
+        for m in (fp8_utils.MXFP8_DENSE_PTPC_DECODE_MAX_M + 1, 1000):
+            with self.subTest(m=m):
+                x = self._rand_input(m)
+                self.assertEqual(fp8_utils.fp8_input_quant_format(weight, m), "fp8")
+                q, scale = fp8_utils.aiter_per1x128_quant(
+                    x, quant_dtype=fp8, transpose_scale=True
+                )
+                scale = view_aiter_fused_rms_transposed_fp8_scale(scale)
+
+                out_bf16 = fp8_utils.aiter_w8a8_block_fp8_linear(
+                    x, weight, _BLOCK, weight_scale
+                )
+                out_tuple = fp8_utils.aiter_w8a8_block_fp8_linear(
+                    q, weight, _BLOCK, weight_scale, input_scale=scale
+                )
+
+                self.assertEqual(out_tuple.dtype, torch.bfloat16)
+                self.assertTrue(torch.equal(out_tuple, out_bf16))
+
 
 if __name__ == "__main__":
     unittest.main()
