@@ -279,6 +279,9 @@ class Sampler(nn.Module):
                         logits, dim=-1
                     )
 
+                # Sampling and the support log-probs need fp32 probs, also for bf16
+                # true-on-policy logits; .float() is a no-op for fp32 logits.
+                logits = logits.float()
                 # In-place op to save memory
                 logits[:] = (
                     torch.softmax(logits, dim=-1)
