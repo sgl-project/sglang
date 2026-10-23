@@ -764,6 +764,7 @@ class SchedulerDisaggregationPrefillMixin:
         # Keep the newer forward's sampling context across unfinished-result passes.
         batch = None
         batch_result = None
+        war_barrier_pending = False
 
         while True:
             if self.gracefully_exit:
@@ -811,7 +812,9 @@ class SchedulerDisaggregationPrefillMixin:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(batch)
                     batch_result = self.run_batch(batch)
-                    self._apply_war_barrier()
+                    # Deferred: result processing and the inflight queue mutate no
+                    # request in this forward; a continuing chunked one is only read.
+                    war_barrier_pending = True
                     self.result_queue.append((batch.copy(), batch_result))
                 else:
                     batch_result = None
@@ -827,6 +830,9 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                     ):
                         waiting_for_batch_result = True
+                        if war_barrier_pending:
+                            self._apply_war_barrier()
+                            war_barrier_pending = False
                         self._yield_gil_if_needed()
                         continue
                 # Process the oldest batch result.
@@ -837,6 +843,10 @@ class SchedulerDisaggregationPrefillMixin:
                 self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
+
+            if war_barrier_pending:
+                self._apply_war_barrier()
+                war_barrier_pending = False
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1703,7 +1713,7 @@ class SchedulerDisaggregationPrefillMixin:
                 sender.kv_mgr.enable_all_cp_ranks_for_transfer
                 and not get_parallel().enable_dsa_cache_layer_split
             ):
-                # The schedule stream waits on the in-flight forward; move the
+                # The schedule stream may wait on the in-flight forward; move the
                 # D2H wait to the transfer worker so scheduling can continue.
                 page_indices_dev = kv_indices[::page_size] // page_size
                 page_indices = torch.empty(
