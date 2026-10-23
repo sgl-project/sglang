@@ -165,6 +165,11 @@ _is_hip = is_hip()
 _QWEN3_5_MOE_TEXT_MODEL_TYPES = ("qwen3_5_moe_text", "qwen4_exp_text")
 # qwen4_exp shares these classes, but the ROCm packed path is Qwen3.5-only.
 _QWEN3_5_ROCM_PACKED_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
+# Row caps of the ROCm packed in_proj GEMM, measured on MI355X. MXFP4 goes up to
+# 256 rows only under CUDA-graph capture; eager extends keep 64 so short
+# prefills do not JIT extra quant/GEMM variants.
+_ROCM_PACKED_IN_PROJ_MAX_M = 64
+_ROCM_PACKED_MXFP4_IN_PROJ_GRAPH_MAX_M = 256
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
@@ -899,9 +904,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # decode/verify-sized batches, so larger batches keep the separate
             # projections below.
             x = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+            max_m = (
+                _ROCM_PACKED_MXFP4_IN_PROJ_GRAPH_MAX_M
+                if self._fused_in_proj_mxfp4 and get_is_capture_mode()
+                else _ROCM_PACKED_IN_PROJ_MAX_M
+            )
             if (
                 x.dtype == torch.bfloat16
-                and 0 < x.shape[0] <= 64
+                and 0 < x.shape[0] <= max_m
                 and not torch.compiler.is_compiling()
             ):
                 if self._fused_in_proj_mxfp4:
