@@ -1018,7 +1018,7 @@ class SchedulerMetricsReporter:
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(self.scheduler.enable_priority_scheduling)
-            msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
+            msg += f"pre-allocated usage: {self.stats.pre_allocated_token_usage:.2f}, "
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
             if get_disagg().disaggregation_decode_host_receive_threshold < 1:
@@ -1440,6 +1440,14 @@ class SchedulerMetricsReporter:
         )
         self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
             host_reqs, priority_enabled
+        )
+        prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
+        max_total_num_tokens = self.scheduler.max_total_num_tokens
+        self.stats.pending_prealloc_token_usage = (
+            prealloc_queue.num_tokens_pending_prealloc / max_total_num_tokens
+        )
+        self.stats.pre_allocated_token_usage = (
+            prealloc_queue.num_tokens_pre_allocated / max_total_num_tokens
         )
 
     def _maybe_log_idle_metrics(self):
