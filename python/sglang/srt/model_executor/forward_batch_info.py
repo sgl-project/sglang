@@ -78,7 +78,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import MultimodalInputs, Req, ScheduleBatch
     from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -489,6 +489,17 @@ class NgramEmbeddingInfo:
         )
 
 
+def prompt_rest_lens_of(
+    reqs: List[Req], seq_lens: List[int], decoding_req_ids: Set[int]
+) -> List[int]:
+    """Prompt tokens each request prefills after this extend, from the batch's own
+    ends (an encoder replay batch ends at its prefix); a decode row has none."""
+    return [
+        0 if id(req) in decoding_req_ids else len(req.full_untruncated_fill_ids) - end
+        for req, end in zip(reqs, seq_lens, strict=True)
+    ]
+
+
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
@@ -669,6 +680,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_prefix_lens_cpu: Optional[List[int]] = None
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
+    # Prompt tokens each request prefills after this extend (decoder SWA tail rows).
+    extend_prompt_rest_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
     # For DP attention (MLP sync sizes)
@@ -1015,6 +1028,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
         contains_last_prefill_chunk = False
+        prompt_rest_lens = None
         if batch.forward_mode.is_extend_without_speculative():
             decoding_req_ids = {id(req) for req in (batch.decoding_reqs or ())}
             contains_last_prefill_chunk = any(
@@ -1022,6 +1036,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 for req in batch.reqs
                 if id(req) not in decoding_req_ids
             )
+            if (
+                envs.SGLANG_OPT_DSV41_PROMPT_WINDOW_TAIL.get()
+                and get_parallel().attn_cp_size == 1
+                and seq_lens_cpu is not None
+            ):
+                prompt_rest_lens = prompt_rest_lens_of(
+                    batch.reqs, seq_lens_cpu.tolist(), decoding_req_ids
+                )
 
         from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -1082,6 +1104,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
+            extend_prompt_rest_lens_cpu=prompt_rest_lens,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
@@ -2073,6 +2096,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.extend_logprob_start_lens_cpu is not None:
             self.extend_logprob_start_lens_cpu.extend(
                 [0] * (bs - len(self.extend_logprob_start_lens_cpu))
+            )
+        if self.extend_prompt_rest_lens_cpu is not None:
+            self.extend_prompt_rest_lens_cpu.extend(
+                [0] * (bs - len(self.extend_prompt_rest_lens_cpu))
             )
 
         if self.rids_int is not None:

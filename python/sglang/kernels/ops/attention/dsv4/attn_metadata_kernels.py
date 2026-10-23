@@ -443,15 +443,23 @@ def late_layer_tail_lens(
     extend_lens_cpu: list[int],
     tail_len: int,
     whole_extend: Optional[list[bool]] = None,
+    prompt_rest_lens: Optional[list[int]] = None,
 ) -> list[int]:
     """Each request's late-layer tail: its last min(tail_len, extend_len) tokens,
-    or its whole extend where whole_extend is set."""
-    if whole_extend is None:
-        return [min(tail_len, n) for n in extend_lens_cpu]
-    return [
-        n if whole else min(tail_len, n)
-        for n, whole in zip(extend_lens_cpu, whole_extend)
-    ]
+    or its whole extend where whole_extend is set. With prompt_rest_lens (prompt
+    tokens left after each extend), only its rows in the prompt's last tail_len
+    tokens, and at least its last row."""
+    if whole_extend is not None and any(whole_extend):
+        return [
+            n if whole else min(tail_len, n)
+            for n, whole in zip(extend_lens_cpu, whole_extend)
+        ]
+    if prompt_rest_lens is not None:
+        return [
+            min(n, max(1, tail_len - rest))
+            for n, rest in zip(extend_lens_cpu, prompt_rest_lens, strict=True)
+        ]
+    return [min(tail_len, n) for n in extend_lens_cpu]
 
 
 def late_layer_tail_layout(
@@ -461,13 +469,15 @@ def late_layer_tail_layout(
     tail_len: int,
     device: torch.device,
     whole_extend: Optional[list[bool]] = None,
+    prompt_rest_lens: Optional[list[int]] = None,
 ) -> tuple[torch.Tensor, list[int], torch.Tensor]:
     """Tail rows of each prefill extend: its last min(tail_len, extend_len) tokens,
     or its whole extend where whole_extend is set.
     Returns (token indices into the extend, per-request tail lengths, per-row
     absolute window floor). The floor is seq_len - tail_len, so a tail shorter
     than tail_len reads rows the request wrote before this extend. A whole
-    extend keeps every row's plain window."""
+    extend keeps every row's plain window. With prompt_rest_lens, tails and
+    floors follow the prompt's end instead (late_layer_tail_lens, _tail_floors)."""
     if whole_extend is not None and any(whole_extend):
         return _whole_extend_tail_layout(
             extend_lens_cpu=extend_lens_cpu,
@@ -476,16 +486,19 @@ def late_layer_tail_layout(
             device=device,
             whole_extend=whole_extend,
         )
-    tail_lens_cpu = late_layer_tail_lens(extend_lens_cpu, tail_len)
+    tail_lens_cpu = late_layer_tail_lens(
+        extend_lens_cpu, tail_len, prompt_rest_lens=prompt_rest_lens
+    )
+    floors_cpu = _tail_floors(seq_lens_cpu, tail_len, prompt_rest_lens)
     if len(extend_lens_cpu) == 1:
-        n, t, s = extend_lens_cpu[0], tail_lens_cpu[0], seq_lens_cpu[0]
-        floor = torch.full((t,), max(0, s - tail_len), dtype=torch.int32, device=device)
+        n, t = extend_lens_cpu[0], tail_lens_cpu[0]
+        floor = torch.full((t,), floors_cpu[0], dtype=torch.int32, device=device)
         return torch.arange(n - t, n, device=device), tail_lens_cpu, floor
     # One H2D copy for the three length vectors; launch count does not grow with bs.
     lens = async_h2d(
-        [extend_lens_cpu, tail_lens_cpu, seq_lens_cpu], dtype=torch.int64, device=device
+        [extend_lens_cpu, tail_lens_cpu, floors_cpu], dtype=torch.int64, device=device
     )
-    extend_lens, tail_lens, seq_lens = lens[0], lens[1], lens[2]
+    extend_lens, tail_lens, floors = lens[0], lens[1], lens[2]
     total = sum(tail_lens_cpu)
     req = torch.repeat_interleave(
         torch.arange(len(tail_lens_cpu), device=device), tail_lens, output_size=total
@@ -495,8 +508,21 @@ def late_layer_tail_layout(
         - (torch.cumsum(tail_lens, 0) - tail_lens)[req]
     )
     token_indices = (torch.cumsum(extend_lens, 0) - tail_lens)[req] + offs
-    floor = (seq_lens - tail_len).clamp_min(0)[req].to(torch.int32)
+    floor = floors[req].to(torch.int32)
     return token_indices, tail_lens_cpu, floor
+
+
+def _tail_floors(
+    seq_lens_cpu: list[int], tail_len: int, prompt_rest_lens: Optional[list[int]]
+) -> list[int]:
+    """Each request's window floor: tail_len below its extend's end, or below its
+    prompt's end, clamped to its last row, whose own KV a lone tail row reads."""
+    if prompt_rest_lens is None:
+        return [max(0, s - tail_len) for s in seq_lens_cpu]
+    return [
+        min(max(0, s + rest - tail_len), max(0, s - 1))
+        for s, rest in zip(seq_lens_cpu, prompt_rest_lens, strict=True)
+    ]
 
 
 def _whole_extend_tail_layout(
