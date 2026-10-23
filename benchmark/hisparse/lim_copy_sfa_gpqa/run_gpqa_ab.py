@@ -89,8 +89,8 @@ try:
                 if server.poll() is not None:
                     raise RuntimeError("Server exited before readiness: " + tag)
                 try:
-                    current = request("/get_server_info")
-                    if current.get("server_args") is not None:
+                    current = request("/server_info")
+                    if current.get("server_args", current).get("model_path"):
                         break
                 except Exception:
                     pass

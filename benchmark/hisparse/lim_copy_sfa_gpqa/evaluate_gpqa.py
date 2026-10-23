@@ -15,11 +15,13 @@ p.add_argument("--num-examples", type=int, default=198)
 p.add_argument("--threads", type=int, default=8)
 args = p.parse_args()
 root = Path("/task/results")
-info = requests.get("http://127.0.0.1:8810/get_server_info", timeout=30).json()
+info = requests.get("http://127.0.0.1:8810/server_info", timeout=30).json()
 root.joinpath(args.tag + ".server-info.json").write_text(
     json.dumps(info, indent=2) + "\n"
 )
-config = info.get("server_args", {})
+config = info.get("server_args", info)
+assert config.get("model_path"), "Missing server configuration"
+assert "speculative_algorithm" in config, "Missing speculative decoding configuration"
 assert config.get("speculative_algorithm") in (None, "NONE"), config.get(
     "speculative_algorithm"
 )
