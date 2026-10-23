@@ -1,3 +1,4 @@
+import sys
 from unittest.mock import Mock, patch
 
 import pytest
@@ -107,3 +108,7 @@ def test_custom_op_dispatch_key(out_of_tree, key):
     ):
         common.direct_register_custom_op("op", op, mutates_args=[], target_lib=lib)
     assert torch._C._dispatch_has_kernel_for_dispatch_key(f"{lib_name}::op", key)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
