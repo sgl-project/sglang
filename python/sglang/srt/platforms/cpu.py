@@ -120,3 +120,8 @@ class CpuSRTPlatform(CpuDeviceMixin, SRTPlatform):
 
     def is_pin_memory_available(self, device=None) -> bool:
         return False
+
+    def get_dispatch_key_name(self) -> str:
+        from sglang.srt.utils.common import cpu_has_amx_support
+
+        return "cpu" if cpu_has_amx_support() else "native"

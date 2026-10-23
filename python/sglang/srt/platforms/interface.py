@@ -232,10 +232,11 @@ class SRTPlatform(DeviceMixin):
         """Return the dispatch key name for BaseFusedOp
         (``sglang.kernels.fused_op``).
 
-        Determines which ``forward_<key>()`` method is selected on an
-        out-of-tree platform. E.g. "cuda", "npu", "hip", "xpu", "cpu".
-        Forwards registered via ``BaseFusedOp.register_oot_forward`` with
-        this key take precedence over the method lookup.
+        Determines which ``forward_<key>()`` method is selected, e.g. "cuda",
+        "npu", "hip", "xpu", "cpu"; "native" selects ``forward_native``. On an
+        out-of-tree platform, forwards registered via
+        ``BaseFusedOp.register_oot_forward`` with this key take precedence
+        over the method lookup.
         """
         return "native"
 
