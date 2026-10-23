@@ -172,10 +172,11 @@ saving.
 
 ### Scope and tradeoffs
 
-- Only the output rank performs asynchronous saving, and only for requests that
-  save files and return their paths (`save_output=true` and
-  `return_file_paths_only=true` in the sampling parameters).
-- Warmup requests, raw-frame responses, requests with `save_output=false`, and
+- Only the output rank performs asynchronous saving, and only for requests whose
+  outputs it encodes: `return_file_paths_only=true` together with
+  `save_output=true` or `return_image_bytes=true` (set by `/v1/images`) in the
+  sampling parameters.
+- Warmup requests, raw-frame responses, other requests with `save_output=false`, and
   requests with `perf_dump_path` set or `SGLANG_DIFFUSION_STAGE_LOGGING=1` keep the
   synchronous path. This includes the frame-return path used by `/rollout/generate`.
 - Each reply is sent from the saving thread as soon as its output is saved,
