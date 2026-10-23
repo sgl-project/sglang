@@ -88,6 +88,35 @@ You can then send an image request using the [multimodal chat example](/docs/bas
 
 Validation is scoped to the single-NPU Qwen2.5-VL-3B-Instruct setup and the recorded JPEG contracts. It does not establish all-model compatibility or a performance improvement for every workload.
 
+### Accuracy validation
+
+The 2026-10-23 accuracy run used the runtime code and test bodies from commit `75461a3c6c3de477a863a715ba2676921d9010e3`, one Ascend NPU, Qwen2.5-VL-3B-Instruct in BF16, `torch 2.10.0+cpu`, `torch_npu 2.10.0.post4`, and `transformers 5.19.0`.
+
+| JPEG switch | Concurrent requests | Correct / total | Runtime failures | Observed decode route |
+| --- | --- | --- | --- | --- |
+| Off | 1 | 75 / 75 | 0 | PIL |
+| Off | 8 | 75 / 75 | 0 | PIL |
+| On | 1 | 75 / 75 | 0 | NPU |
+| On | 8 | 75 / 75 | 0 | NPU |
+
+These are the same 75 inputs repeated under four conditions: 72 constructed engineering inputs and three public probes. Answers were scored against fixed expected answers, allowing only whitespace, case, and trailing punctuation normalization. Encoded-input hashes linked all 300 requests to their actual decode events: 150 PIL and 150 NPU. Eight additional ordinary-entrypoint requests matched the corresponding observed requests in input hash and answer text. This run repeats the existing engineering set; it does not add 300 independent images or establish production-dataset accuracy.
+
+All 20 unit tests executed without skips:
+
+- Fifteen CPU tests use mocks to check dispatch, supported-input decisions, and decoder ownership. They are not device accuracy evidence.
+- Three NPU JPEG tests check exact NV12-to-RGB equality against independent CPU arithmetic on three padded layouts, 13 real solid-color JPEG decodes with maximum allowed per-channel error of 2, concurrent-worker reclamation, and unchanged PNG fallback pixels. The solid-color tolerance does not apply to arbitrary photographs.
+- Two NPU MRoPE tests check multidimensional and ordinary position semantics against exact independent CPU results for the documented BF16 configuration. They do not change MRoPE product code.
+
+After installing the checkout in a compatible Linux Ascend environment, run these commands from the repository root:
+
+```bash
+python test/registered/unit/multimodal/test_npu_jpeg_decode.py -v
+python test/registered/unit/npu/test_npu_jpeg_decode.py -v
+python test/registered/unit/npu/test_mrope_multiaxis.py -v
+```
+
+Require 20 executed tests and no skips when validating device support. These commands run component tests; they do not replay the 75-input model evaluation. JPEG's lossy compression and the documented chroma policy mean arbitrary output pixels are not required to equal either the uncompressed source or PIL bit for bit. This validation provides no new GPU comparison, speed benchmark, or sustained-load result.
+
 ## Used in DeepEP Ascend
 
 <table>
