@@ -11,7 +11,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Discovery and validation for a model-native trie output head."""
+"""Discovery and validation for a model-native trie output head.
+
+A model opts in with ``"beam_trie_output_head": true`` in config.json and ships
+``trie_output_head.safetensors`` at its root. Metadata (integer strings):
+``format_version`` = 1, ``token_start``, ``codebook_size``, ``num_codebooks`` = 3;
+the SID token for depth ``d`` and code ``c`` is
+``token_start + d * codebook_size + c``. Tensors are 1-D integer CSR arrays of
+codes relative to their codebook: sorted unique ``root_token_ids``; per root,
+``level1_offsets`` into sorted unique ``level1_token_ids``; per level-1 entry,
+``level2_offsets`` into sorted ``level2_token_ids``. Offsets start at 0, end at
+the child-array length, and no group is empty.
+"""
 
 from __future__ import annotations
 
