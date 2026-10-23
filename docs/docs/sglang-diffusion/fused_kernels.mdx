@@ -35,7 +35,7 @@ The quality levels are cumulative:
 | `high` | Everything in `lossless`, plus any model-owned approximate optimization, such as an audited Cache-DiT policy, lower-precision VAE decode, or the approximate fusions listed above |
 
 A fusion claiming `lossless` has to pass the admission checks in
-`sglang/multimodal_gen/test/quality_tier_admission.py`: scored against an fp64
+`python/sglang/multimodal_gen/test/quality_tier_admission.py`: scored against an fp64
 evaluation of the same math, its RMS and max error may not exceed 1.5x the
 path the model runs today, its rounding may not be biased, and NaN, Inf and
 non-contiguous inputs have to behave as before. Lowering an accumulation below
