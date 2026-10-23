@@ -27,6 +27,9 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+    FlowRolloutController,
+)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
 )
@@ -198,6 +201,8 @@ class Req:
     trajectory_timesteps: torch.Tensor | None = None
     trajectory_latents: torch.Tensor | None = None
     rollout_trajectory_data: RolloutTrajectoryData | None = None
+    # Rollout controllers of this request, keyed by latent stream.
+    rollout_controllers: dict[str, FlowRolloutController] = field(default_factory=dict)
     trajectory_audio_latents: torch.Tensor | None = None
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
@@ -349,7 +354,6 @@ class Req:
         self.suppress_logs = True
         self.metrics.suppress_stage_breakdown = True
         self.extra["cache_dit_num_inference_steps"] = self.num_inference_steps
-        self.extra["warmup_target_num_inference_steps"] = self.num_inference_steps
         floor = getattr(type(self.sampling_params), "min_num_inference_steps", 1)
         self.num_inference_steps = max(warmup_steps, floor)
 
@@ -357,34 +361,6 @@ class Req:
         req = deepcopy(self)
         req.set_as_warmup(warmup_steps)
         return req
-
-    def record_stage_iterations(
-        self,
-        measured_iterations: int,
-        target_iterations: int | None = None,
-    ) -> None:
-        """Record a stage loop against its full default-request work.
-
-        Most stages declare the count as a formula of the step count
-        (``PipelineStage.default_workload_iterations``) and never call this.
-        It is for loops whose length is only known inside them (chunked or
-        block-wise schedules); ``target_iterations`` defaults to scaling the
-        measured count from the probe's steps to the default workload's.
-        """
-        if not self.is_warmup or self.metrics is None:
-            return
-        measured = max(1, int(measured_iterations))
-        if target_iterations is None:
-            measured_request_steps = max(1, int(self.num_inference_steps))
-            target_request_steps = int(
-                self.extra.get(
-                    "warmup_target_num_inference_steps", measured_request_steps
-                )
-            )
-            target_iterations = (
-                measured * max(1, target_request_steps) + measured_request_steps - 1
-            ) // measured_request_steps
-        self.metrics.record_stage_iterations(measured, target_iterations)
 
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
@@ -508,6 +484,9 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
     output_file_paths: list[str] | None = None
+    # Decoded LiDAR of a joint camera/LiDAR request: file paths and metadata,
+    # plus range_m/intensity/validity arrays when the client asked for frames.
+    lidar: dict[str, Any] | None = None
 
     # logged metrics info, directly from Req.timings
     metrics: Optional[RequestMetrics] = None
@@ -526,5 +505,6 @@ class OutputBatch:
         self.rollout_trajectory_data = None
         self.trajectory_decoded = None
         self.output_file_paths = None
+        self.lidar = None
         self.raw_frame_batches = None
         self.noise_pred = None

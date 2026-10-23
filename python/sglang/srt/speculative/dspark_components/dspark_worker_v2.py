@@ -3,9 +3,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkabl
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
-    is_unified_kv_triton,
-)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -19,7 +16,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
     PPProxyTensors,
-    compute_position,
 )
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
@@ -87,17 +83,15 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
-    is_hip,
     is_npu,
-    is_pin_memory_available,
 )
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
-_is_hip = is_hip()
 _is_npu = is_npu()
 
 
@@ -178,6 +172,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         if (
             get_parallel().attn_dp_enabled
+            and not _is_npu
             and self._draft_is_moe
             and get_parallel().attn_tp_size > 1
         ):
@@ -365,6 +360,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 tp_sync=self._tp_sync,
                 fused_argmax=target_is_dsv41,
                 simulated_correct_len=self._simulated_correct_len,
+                simulate_fold=envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -380,9 +376,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         self._simulate_acc_greedy = (
-            _is_hip
-            and self._simulate_acc_len > 0
-            and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
+            self._simulate_acc_len > 0 and envs.SGLANG_SIMULATE_ACC_GREEDY.get()
         )
         if (
             self._simulate_acc_len > 0
@@ -647,11 +641,13 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
+        # Placing the draft KV reads scheduler-shared tables, which prefill
+        # read-done releases once the target forward's own reads end.
+        placement = self._kv_injector.place_prefill(batch)
         batch_output = self.target_worker.forward_batch_generation(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            return_kv_loc_plan=True,
         )
         # BCG replay skips model-side Python, so re-evaluate the same pure predicate.
         target_hidden_is_projected = (
@@ -674,63 +670,32 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark requires target aux hidden capture for prefill, but got None. "
                 "Make sure the target model has DFlash layers-to-capture configured."
             )
-        if batch.extend_lens is None or batch.prefix_lens is None:
-            raise RuntimeError(
-                "DSpark expected extend_lens / prefix_lens in extend mode, got None."
-            )
-        if batch.out_cache_loc is None:
-            raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
-
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
-        device = next_token_ids.device
-        pin_memory = is_pin_memory_available(device)
-        ctx_lens = torch.tensor(
-            batch.extend_lens, dtype=torch.int32, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
-        draft_seq_lens = torch.tensor(
-            batch.prefix_lens, dtype=torch.int32, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
-        positions, _ = compute_position(
-            self.model_runner.prefill_attention_backend_str,
-            draft_seq_lens,
-            ctx_lens,
-            int(sum(batch.extend_lens)),
-        )
-        # unified_kv injects into the SWA ring keyed by (draft req slot, position);
-        # thread the per-token state_slot + the req's final position so the
-        # injector keeps only the last SWA window (older prefill tokens share a
-        # ring slot and would race). Cheap; only consumed under unified_kv.
-        state_slot = final_pos = None
-        if is_unified_kv_triton():
-            repeats = ctx_lens.to(torch.int64)
-            num_tokens = sum(batch.extend_lens)
-            state_slot = torch.repeat_interleave(
-                batch.req_pool_indices.to(device=device, dtype=torch.int64),
-                repeats,
-                output_size=num_tokens,
-            )
-            final_pos = torch.repeat_interleave(
-                (draft_seq_lens + ctx_lens - 1).to(torch.int64),
-                repeats,
-                output_size=num_tokens,
-            )
-        # The draft KV goes to the slots the target prefill just wrote.
-        cache_loc = self._kv_injector.ids_for(batch_output.kv_loc_plan)
-        batch_output.kv_loc_plan = None
-        token_indices = logits_output.hidden_states_token_indices
-        if token_indices is not None:
-            cache_loc = cache_loc[token_indices]
-            positions = positions[token_indices]
-            if state_slot is not None:
-                state_slot = state_slot[token_indices]
-                final_pos = final_pos[token_indices]
-        self._kv_injector.inject_target_hidden(
+        device = placement.positions.device
+        draft_pool = self._kv_injector.draft_model_runner.token_to_kv_pool
+        if (
+            getattr(draft_pool, "swa_valid_from", None) is not None
+            and batch.encoder_swa_reset is not None
+        ):
+            # A newly placed request's ring holds nothing below its cached prefix.
+            placed = [i for i, reset in enumerate(batch.encoder_swa_reset) if reset]
+            if placed:
+                # Pinned copies and a device gather: a list index or a pageable
+                # copy here would wait for the whole target forward.
+                placed_rows = async_h2d(placed, dtype=torch.int64, device=device)
+                valid_from = async_h2d(
+                    [batch.prefix_lens[i] for i in placed],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                draft_pool.set_swa_valid_from(
+                    batch.req_pool_indices.index_select(0, placed_rows), valid_from
+                )
+        self._kv_injector.inject_prefill(
+            placement,
             target_hidden=logits_output.hidden_states,
-            cache_loc=cache_loc,
-            positions=positions,
-            state_slot=state_slot,
-            final_pos=final_pos,
+            token_indices=logits_output.hidden_states_token_indices,
             target_hidden_is_projected=target_hidden_is_projected,
         )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -932,11 +897,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             # draft proposal itself folded.
             and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
-            # The graph accept is greedy, so a sampled simulated bonus is eager.
-            and simulate_bonus_sampling_info is None
+            # The graph accept is greedy: a sampled simulated bonus stays in the graph
+            # only when the epilogue draws it there (SGLANG_DSPARK_SIMULATE_FOLD).
+            and (
+                simulate_bonus_sampling_info is None
+                or self._verify_executor.verify_epilogue.simulate_fold
+            )
             and not batch.has_grammar
         )
         self._verify_executor.begin_simulated_step()
+        if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
+            self._verify_executor.verify_epilogue.begin_sim_bonus(
+                bs,
+                (
+                    None
+                    if simulate_bonus_sampling_info is None
+                    else simulate_bonus_sampling_info.temperatures[:bs]
+                ),
+            )
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:

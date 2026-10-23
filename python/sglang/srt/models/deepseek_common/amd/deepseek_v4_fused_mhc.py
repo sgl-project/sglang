@@ -168,7 +168,10 @@ def _get_fused_hc_post_pre_buffers(
             num_ksplit, num_tokens, dtype=torch.float32, device=device
         ),
     }
-    _FUSED_HC_POST_PRE_CACHE[key] = bufs
+    # Cache only small batches: a caller that runs this path for every prefill
+    # size (gfx1250) would otherwise keep one buffer set per num_tokens forever.
+    if num_tokens <= _FUSED_HC_POST_PRE_M_THRESHOLD:
+        _FUSED_HC_POST_PRE_CACHE[key] = bufs
     return bufs
 
 

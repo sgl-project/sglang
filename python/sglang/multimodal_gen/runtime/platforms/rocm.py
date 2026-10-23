@@ -69,16 +69,6 @@ class RocmPlatform(Platform):
         return torch.cuda.get_device_properties(device_id).total_memory
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable CUDA graph. "
-                "Since enforce-eager is enabled, async output processor cannot be used"
-            )
-            return False
-        return True
-
-    @classmethod
     def get_current_memory_usage(cls, device: torch.device | None = None) -> float:
         torch.cuda.reset_peak_memory_stats(device)
         return float(torch.cuda.max_memory_allocated(device))
@@ -431,6 +421,8 @@ class RocmPlatform(Platform):
                 x,
                 cache_x=None,
                 *,
+                residual=None,
+                skip_bias=False,
                 _padding=padding,
                 _stride=stride,
                 _kt=kt,
@@ -443,14 +435,17 @@ class RocmPlatform(Platform):
                     pad[4] -= cache_x.shape[2]
                 x = F.pad(x, pad)
                 x = x.to(self.weight.dtype)
-                return RocmPlatform._conv3d_as_batched_conv2d(
+                # Same contract as WanCausalConv3d.forward: skip_bias leaves the bias
+                # to a following fused norm, residual is added to the conv output.
+                out = RocmPlatform._conv3d_as_batched_conv2d(
                     x,
                     self._weight_2d,
-                    self.bias,
+                    None if skip_bias else self.bias,
                     _stride,
                     _kt,
                     compute_bf16=_bf16,
                 )
+                return out if residual is None else out + residual
 
             def _patched_halo_conv_forward(
                 self,

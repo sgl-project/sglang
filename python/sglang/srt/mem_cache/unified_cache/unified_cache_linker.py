@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     MatchResult,
@@ -47,6 +46,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -54,11 +54,13 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
+device_module = get_device_module()
 
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
         ComponentType.SWA,
+        ComponentType.MAMBA,
     }
 )
 
@@ -132,6 +134,26 @@ class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
     layer_done_counter: object
+    pools: dict[PoolName, object]
+    # The stream the forward writes the device pools on; None when the current
+    # stream is the pages' only writer.
+    forward_stream: Optional[torch.cuda.Stream] = None
+
+    def record_offload_ready(self) -> list[torch.cuda.Event]:
+        """Record the events an offload waits on before it reads device pages.
+
+        The current stream has computed which pages to offload, and the forward
+        stream may still be writing them: prefill read-done lets the scheduler's
+        stream run ahead of the forward that fills a stashed chunk.
+        """
+        indices_ready = device_module.Event()
+        indices_ready.record()
+        events = [indices_ready]
+        if self.forward_stream is not None:
+            kv_written = device_module.Event()
+            kv_written.record(self.forward_stream)
+            events.append(kv_written)
+        return events
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -220,16 +242,15 @@ class UnifiedCacheLinkerWrapper:
                 component.name for component in sorted(unsupported, key=int)
             )
             raise ValueError(
-                "External cache linker supports only Full and SWA tree "
+                "External cache linker supports only Full, SWA and Mamba tree "
                 f"components; unsupported: {names}"
             )
 
         self.cache = cache
         self.cache_linker = cache_linker
         swa = cache.components.get(ComponentType.SWA)
-        self._skip_swa = swa is not None and is_swa_req_ring(
-            cache.token_to_kv_pool_allocator
-        )
+        # A store without SWA pages tombstones restored tails instead.
+        self._skip_swa = swa is not None and PoolName.SWA not in cache_linker.pools
         self._components = tuple(
             component
             for component in cache._components_tuple
