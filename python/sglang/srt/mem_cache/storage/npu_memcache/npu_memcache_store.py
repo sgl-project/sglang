@@ -337,8 +337,27 @@ class NpuMemcacheStore(HiCacheStorage):
         if get_val != warmup_value:
             raise RuntimeError("warmup get payload mismatch")
 
+    def _is_logical_anchor(self) -> bool:
+        """True for DeepSeek-V4's index-only KV anchor pool.
+
+        V4 builds a ``LogicalHostPool`` for the FULL/anchored KV pool: it owns
+        page-aligned token slots but no tensor, and every physical byte lives in
+        the per-component paged pools registered through
+        ``register_mem_host_pool_v2``. Mooncake treats that anchor as a no-op
+        KV object; the same must happen here or the KV registration crashes on
+        ``kv_buffer is None``.
+        """
+        return getattr(self.mem_pool_host, "kv_buffer", None) is None
+
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        if self._is_logical_anchor():
+            logger.info(
+                "Ascend MemCache: KV pool is a logical anchor; its physical "
+                "tensors are registered through register_mem_host_pool_v2()."
+            )
+            self.gb_per_page = 0.0
+            return
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
@@ -474,7 +493,9 @@ class NpuMemcacheStore(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
         qkeys = self._tag_keys(keys)
-        kv_pages = self.batch_exists(keys, extra_info)
+        kv_pages = (
+            len(keys) if self._is_logical_anchor() else self.batch_exists(keys, extra_info)
+        )
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
@@ -505,6 +526,21 @@ class NpuMemcacheStore(HiCacheStorage):
                     ):
                         boundary = prefix_len
                         break
+            elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+                # Compressed-block pools (DeepSeek-V4 C128) keep one key per
+                # block, not per FULL page, so only the block boundaries are
+                # meaningful. This pool reports its own verdict and must not
+                # shorten the KV prefix: `final_pages = min(...)` below would
+                # otherwise zero the whole hit.
+                block = max(1, int(transfer.block_pages))
+                complete = 0
+                for idx in range(block - 1, kv_pages, block):
+                    if not page_exists[idx]:
+                        break
+                    complete += 1
+                if complete:
+                    hit_count[transfer.name] = complete
+                continue
             if boundary:
                 hit_count[transfer.name] = boundary
             final_pages = min(final_pages, boundary)
@@ -762,6 +798,9 @@ class NpuMemcacheStore(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> bool:
         _ = values
+        if self._is_logical_anchor():
+            # Logical anchor: no KV bytes exist, the component pools carry data.
+            return True
         assert target_locations is not None and target_sizes is not None
         assert len(keys) == len(target_locations) == len(target_sizes)
 
@@ -829,6 +868,9 @@ class NpuMemcacheStore(HiCacheStorage):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> int:
+        if self._is_logical_anchor():
+            # Logical anchor: nothing to fetch, the component pools carry data.
+            return len(keys)
         assert len(keys) == len(target_locations) == len(target_sizes)
         if len(keys) == 0:
             return 0
@@ -863,6 +905,10 @@ class NpuMemcacheStore(HiCacheStorage):
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if self._is_logical_anchor():
+            # No KV object is written for a V4 logical anchor; the usable
+            # prefix is decided by the component pools in batch_exists_v2.
+            return len(keys)
         page_keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
