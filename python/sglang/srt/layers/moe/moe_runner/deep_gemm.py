@@ -1564,13 +1564,6 @@ def _varlen_deep_gemm_situ_mul_quant(
     return down_input, down_input_scale
 
 
-def _clamp_swiglu_gateup_(gateup_output: torch.Tensor, *, swiglu_limit: float) -> None:
-    """Apply the SwiGLU limit to a [..., gate | up] GEMM workspace in place."""
-    gate, up = gateup_output.chunk(2, dim=-1)
-    gate.clamp_(max=swiglu_limit)
-    up.clamp_(min=-swiglu_limit, max=swiglu_limit)
-
-
 def _varlen_deep_gemm_silu_mul_quant(
     gateup_output: torch.Tensor,
     masked_m: Optional[torch.Tensor],
@@ -1637,15 +1630,44 @@ def _varlen_deep_gemm_silu_mul_quant(
         return down_input, down_input_scale
 
     # The DSV4 JIT kernel packs four scale groups per int32, so D = 2304
-    # (DeepSeek-V4.1-Flash, G = 18) clamps here and takes the generic quantizer.
+    # (DeepSeek-V4.1-Flash, G = 18) takes the masked Triton kernel; it only
+    # touches rows below masked_m, unlike a clamp over the whole slab.
     if (
         swiglu_limit is not None
         and not swizzle
         and not silu_mul_keep_fp32
         and G % 4 != 0
     ):
-        _clamp_swiglu_gateup_(gateup_output, swiglu_limit=swiglu_limit)
-        swiglu_limit = None
+        from sglang.kernels.ops.moe.ep_moe_kernels import (
+            silu_and_mul_masked_post_quant_fwd,
+        )
+
+        down_input = torch.empty(
+            (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
+        )
+        # Rows past masked_m stay unwritten, and DeepGEMM's UE8M0 packing below
+        # faults on NaN scales, so they must not hold garbage.
+        down_input_scale = torch.zeros(
+            (E, N, G), device=hidden_states_device, dtype=torch.float32
+        )
+        silu_and_mul_masked_post_quant_fwd(
+            gateup_output,
+            down_input,
+            down_input_scale,
+            group_size,
+            masked_m,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            swiglu_limit=swiglu_limit,
+        )
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            import deep_gemm.utils.layout
+
+            down_input_scale = (
+                deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+                    down_input_scale
+                )
+            )
+        return down_input, down_input_scale
 
     # Only explicit precision requests opt additional callers into this kernel;
     # the generic fused quantizer rounds its SiLU intermediates to BF16.
