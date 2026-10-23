@@ -2643,11 +2643,8 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> str:
         """Process for generating a new and unique `tool_call_id`"""
         if self.tool_call_parser != "kimi_k2":
-            # A simple uuid is sufficient for all models except Kimi-K2, whose chat
-            # template requires `functions.{name}:{idx}`. Kimi-K3's encoder treats
-            # ids as opaque (index comes from position), so it gets a uuid too — a
-            # history-count id repeats whenever the client sends a shorter history,
-            # and clients that dedupe tool_use ids (Claude Code) drop the call.
+            # A simple uuid is sufficient for all models except Kimi-K2, whose
+            # chat template requires `functions.{name}:{idx}`.
             tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
             return tool_call_id
         tool_call_id = (
