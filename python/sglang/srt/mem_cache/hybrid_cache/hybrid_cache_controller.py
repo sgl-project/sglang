@@ -339,10 +339,14 @@ class HybridCacheController(BaseHiCacheController):
                 model_name=model_name,
                 storage_backend_extra_config=storage_backend_extra_config,
             )
+            self._validate_sidecar_pool_support(host_pools)
         except Exception:
             if self.pp_prefetch_command_group is not None:
                 torch.distributed.destroy_process_group(self.pp_prefetch_command_group)
                 self.pp_prefetch_command_group = None
+            # Roll the attach back to the base controller's clean state, so a
+            # rejected runtime attach leaves nothing half-wired.
+            self.detach_storage_backend()
             raise
 
         for entry in host_pools or []:
@@ -358,9 +362,43 @@ class HybridCacheController(BaseHiCacheController):
             self.pp_prefetch_states.clear()
             self.pp_prefetch_decisions.clear()
 
+    def _validate_sidecar_pool_support(
+        self, host_pools: Optional[list[PoolEntry]] = None
+    ) -> None:
+        """Reject v1-only backends before any sidecar pool can route through them.
+
+        A non-anchor host pool (Mamba/SWA/DSA sidecar, draft or retraction
+        backup pool) makes the cache stack issue v2 multi-pool transfers
+        against this backend. Failing here -- at attach time, on the scheduler
+        control path -- replaces the previous behavior where the first v2
+        transfer raised a bare ``NotImplementedError`` mid-serving.
+        """
+        if self.storage_backend is None:
+            return
+        extra_pools = [
+            entry for entry in host_pools or [] if not entry.is_primary_index_anchor
+        ]
+        if not extra_pools:
+            return
+        if self.storage_backend.supports_pool_transfers():
+            return
+        raise ValueError(
+            f"Storage backend "
+            f"'{self.storage_backend_type}' "
+            f"({type(self.storage_backend).__name__}) does not implement the "
+            f"multi-pool v2 storage API (batch_exists_v2/batch_get_v2/"
+            f"batch_set_v2), which is required by the sidecar pools "
+            f"{[entry.name.value for entry in extra_pools]} of this model's "
+            f"cache stack. Without it the first multi-pool transfer would "
+            f"crash mid-serving. Use a backend that supports multi-pool "
+            f"transfers (e.g. mooncake, hf3fs, nixl, file) or a "
+            f"v1-compatible model configuration."
+        )
+
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        self._validate_sidecar_pool_support([entry])
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())

@@ -300,6 +300,26 @@ class HiCacheStorage(ABC):
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
 
+    @classmethod
+    def supports_pool_transfers(cls) -> bool:
+        """Whether this backend implements the multi-pool v2 batch API.
+
+        Multi-pool (sidecar) cache stacks -- hybrid Mamba/SWA/DSA models,
+        draft pools, decode-retraction backups -- route every page transfer
+        through ``batch_exists_v2``/``batch_get_v2``/``batch_set_v2`` with one
+        ``PoolTransfer`` per pool. Backends that do not override those methods
+        inherit base-class stubs that raise ``NotImplementedError``, so the
+        combination used to fail mid-serving with an opaque crash instead of
+        being rejected at attach time. A backend advertises the capability by
+        overriding the methods; this probe keeps the answer derived from the
+        class itself, so new backends need no registry update.
+        """
+        return (
+            cls.batch_exists_v2 is not HiCacheStorage.batch_exists_v2
+            and cls.batch_get_v2 is not HiCacheStorage.batch_get_v2
+            and cls.batch_set_v2 is not HiCacheStorage.batch_set_v2
+        )
+
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}

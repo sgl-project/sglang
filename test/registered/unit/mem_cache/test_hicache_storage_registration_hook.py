@@ -51,6 +51,13 @@ class RecordingBackend:
         self.fail_on_complete = fail_on_complete
         self.closed = False
 
+    @classmethod
+    def supports_pool_transfers(cls) -> bool:
+        # Emulates a multi-pool-capable backend for the sidecar gate: this
+        # fake accepts register_mem_host_pool_v2 registrations, so it must
+        # also advertise the v2 batch API the gate probes.
+        return True
+
     def register_mem_pool_host(self, mem_pool_host: Any) -> None:
         self.order.append("v1")
 
