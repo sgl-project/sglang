@@ -224,10 +224,16 @@ class TestNemotron35Embedding(CustomTestCase):
         def assert_close(actual, expected):
             torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-4)
 
-        with patch.dict(os.environ, {"SGLANG_FORCE_FUSED_OP_BACKEND": "torch"}):
+        # Exact FP32 everywhere: the default ViT attention (triton) and cuDNN
+        # convolutions use TF32 on Ampere and newer.
+        env = {"SGLANG_FORCE_FUSED_OP_BACKEND": "torch", "NVIDIA_TF32_OVERRIDE": "0"}
+        with patch.dict(os.environ, env):
             self._check(
                 dtype="float32",
-                engine_kwargs={"attention_backend": "torch_native"},
+                engine_kwargs={
+                    "attention_backend": "torch_native",
+                    "mm_attention_backend": "sdpa",
+                },
                 assert_close=assert_close,
             )
 
