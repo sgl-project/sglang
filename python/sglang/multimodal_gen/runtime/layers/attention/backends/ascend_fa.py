@@ -1,6 +1,9 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
+from importlib.util import find_spec
 from itertools import pairwise
+from math import isfinite
+from numbers import Integral, Real
 from typing import Any, ClassVar
 
 import torch
@@ -11,6 +14,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
     AttentionMetadataBuilder,
+    trailing_padding_used_len,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -19,6 +23,156 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def validate_attention_config(config: dict) -> dict:
+    """Copy and validate an explicit dense configuration, independent of ServerArgs.
+
+    Layout and softmax scale belong to the attention layer. Configuration values
+    are immutable scalars or top-level tensors so callers can cache delegates
+    without comparing tensors or nested mutable structures.
+    """
+    if not isinstance(config, dict) or any(not isinstance(key, str) for key in config):
+        raise ValueError("attention_config must be a dictionary with string keys")
+    options = dict(config)
+    precision = options.setdefault("precision", "bf16")
+    if not isinstance(precision, str) or precision not in (
+        "bf16",
+        "fp8",
+        "mxfp8",
+        "mxfp4",
+    ):
+        raise ValueError("Dense attention precision must be bf16, fp8, mxfp8, or mxfp4")
+    common = {"q_rot", "k_rot", "pre_tokens", "next_tokens"}
+    mx_options = {
+        "mxfp4_scale_alg",
+        "mxfp4_dst_type_max",
+        "metadata",
+        "num_key_value_heads",
+        "max_seqlen_q",
+        "max_seqlen_kv",
+        "mask_mode",
+        "win_left",
+        "win_right",
+        "block_table",
+        "sinks",
+        "attn_mask",
+        "return_softmax_lse",
+    }
+    allowed = {"precision"}
+    if precision == "bf16":
+        allowed.add("enable_laser")
+    if precision != "bf16":
+        allowed |= common
+    if precision == "fp8":
+        allowed.add("fp8_fa_mode")
+    elif precision == "mxfp4":
+        allowed |= mx_options
+    unknown = options.keys() - allowed
+    if unknown:
+        raise ValueError(
+            f"Unsupported dense attention options for {precision}: {', '.join(sorted(unknown))}"
+        )
+    if "enable_laser" in options and not isinstance(options["enable_laser"], bool):
+        raise ValueError("enable_laser must be a boolean")
+    if precision == "fp8":
+        mode = options.get("fp8_fa_mode")
+        mode = "HIGH_PRECISION" if mode is None else mode
+        if not isinstance(mode, str) or mode not in (
+            "HIGH_PRECISION",
+            "C8V16_TILING512",
+        ):
+            raise ValueError("fp8_fa_mode must be HIGH_PRECISION or C8V16_TILING512")
+        options["fp8_fa_mode"] = mode
+    tensor_options = {"q_rot", "k_rot", "metadata", "block_table", "sinks", "attn_mask"}
+    for name in tensor_options & options.keys():
+        if options[name] is not None and not isinstance(options[name], torch.Tensor):
+            raise ValueError(f"{name} must be a tensor or None")
+    for name in (common & options.keys()) - tensor_options:
+        value = options[name]
+        if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+        options[name] = int(value)
+    for name in {
+        "mxfp4_scale_alg",
+        "num_key_value_heads",
+        "max_seqlen_q",
+        "max_seqlen_kv",
+        "mask_mode",
+        "win_left",
+        "win_right",
+    } & options.keys():
+        value = options[name]
+        if value is None and name in (
+            "mxfp4_scale_alg",
+            "num_key_value_heads",
+            "win_left",
+            "win_right",
+        ):
+            continue
+        minimum = -1 if name.startswith("max_seqlen_") else 0
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Integral)
+            or value < minimum
+        ):
+            raise ValueError(f"{name} must be an integer >= {minimum}")
+        if name == "num_key_value_heads" and value == 0:
+            raise ValueError("num_key_value_heads must be positive")
+        options[name] = int(value)
+    if "mxfp4_dst_type_max" in options and options["mxfp4_dst_type_max"] is not None:
+        value = options["mxfp4_dst_type_max"]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError("mxfp4_dst_type_max must be positive and finite")
+        options["mxfp4_dst_type_max"] = float(value)
+    if "return_softmax_lse" in options:
+        value = options["return_softmax_lse"]
+        if not isinstance(value, (Integral, bool)) or value != 0:
+            raise ValueError("Explicit quantized attention does not return softmax LSE")
+        options["return_softmax_lse"] = 0
+    return options
+
+
+def validate_attention_batch_config(
+    config: dict, *, batch_size=1, bounds=None, total_tokens=None
+) -> None:
+    """Reject reuse of batch-specific MXFP4 tensors across samples/documents.
+
+    Call before splitting packed inputs, including when a caller delegates each
+    resulting document to ``forward`` separately. Rotation matrices are shared
+    head-dimension transforms and do not carry batch/document coordinates.
+    """
+    if not any(
+        config.get(name) is not None
+        for name in ("attn_mask", "metadata", "block_table", "sinks")
+    ):
+        return
+    if batch_size != 1:
+        raise ValueError("Batch-specific MXFP4 tensors require a single sample")
+    if bounds is not None and (
+        total_tokens is None or tuple(bounds) != (0, total_tokens)
+    ):
+        raise ValueError(
+            "Batch-specific MXFP4 tensors require one unpadded packed document"
+        )
+
+
+def _supports_laser_shape(
+    query_shape, key_shape, value_shape, *, causal, return_softmax_lse
+):
+    return (
+        not causal
+        and not return_softmax_lse
+        and len(query_shape) == 4
+        and query_shape == key_shape == value_shape
+        and query_shape[1] >= 2048
+        and query_shape[-1] in (32, 64, 96, 128)
+    )
 
 
 def resolve_mx_fa_scheme(quant_config) -> str | None:
@@ -234,6 +388,13 @@ class AscendFABackend(AttentionBackend):
 
 
 class AscendFAImpl(AttentionImpl):
+    """Dense NPU attention with an optional explicit, caller-owned configuration.
+
+    Omitting ``attention_config`` preserves checkpoint-driven native MXFP8.
+    An explicit dictionary defaults to native BF16. ``enable_laser=True`` opts
+    BF16 into Laser's FP16 intermediates on supported 910 hardware.
+    """
+
     # FA v2 uses per-token-group quantization (mode 6) for Q/K and
     # per-channel-group quantization (mode 8) for V in the packed TND path.
     _MXFP8_LAYOUT = "TND"
@@ -257,12 +418,74 @@ class AscendFAImpl(AttentionImpl):
         softmax_scale: float,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        attention_config: dict | None = None,
         **extra_impl_args,
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
-        quant_config = extra_impl_args.get("quant_config")
-        self._quant_scheme = resolve_mx_fa_scheme(quant_config)
+        self.attention_config = (
+            None
+            if attention_config is None
+            else validate_attention_config(attention_config)
+        )
+        self._quant_attention = None
+        self._laser_impl = None
+        self._laser_unavailable = False
+        self._configured_heads = num_heads
+        self._configured_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        self._configured_head_size = head_size
+        self._packed_trailing_padding = extra_impl_args.get(
+            "packed_trailing_padding", False
+        )
+        if self.attention_config is not None:
+            if (
+                isinstance(num_heads, bool)
+                or not isinstance(num_heads, Integral)
+                or num_heads <= 0
+                or isinstance(self._configured_kv_heads, bool)
+                or not isinstance(self._configured_kv_heads, Integral)
+                or self._configured_kv_heads <= 0
+                or num_heads % self._configured_kv_heads
+            ):
+                raise ValueError(
+                    "Explicit Ascend attention requires valid Q/KV head counts"
+                )
+            if not isinstance(self._packed_trailing_padding, bool):
+                raise ValueError("packed_trailing_padding must be a boolean")
+            if any(
+                extra_impl_args.get(name, 0.0)
+                for name in ("dropout_p", "dropout_rate", "dropout")
+            ):
+                raise NotImplementedError(
+                    "Ascend attention does not support attention dropout"
+                )
+            if self.attention_config["precision"] != "bf16":
+                if causal:
+                    raise NotImplementedError(
+                        "MindIE-SD quantized attention does not support causal attention"
+                    )
+                if extra_impl_args.get("ring_degree", 1) > 1:
+                    raise NotImplementedError(
+                        "MindIE-SD quantized attention does not support Ring/LSE"
+                    )
+                if self.attention_config["precision"] == "fp8" and (
+                    head_size not in (64, 128)
+                    or (
+                        self.attention_config["fp8_fa_mode"] == "C8V16_TILING512"
+                        and head_size != 128
+                    )
+                ):
+                    raise ValueError(
+                        "FP8 HIGH_PRECISION requires D64/128; C8V16_TILING512 requires D128"
+                    )
+        # An explicit configuration takes precedence over checkpoint MXFP8.
+        # Omitting it leaves the existing native/offline-rotation path intact.
+        quant_config = (
+            extra_impl_args.get("quant_config") if attention_config is None else None
+        )
+        self._quant_scheme = (
+            resolve_mx_fa_scheme(quant_config) if attention_config is None else None
+        )
         self.use_offline_qk_rotation = (
             quant_config.use_offline_qk_rotation
             if hasattr(quant_config, "use_offline_qk_rotation")
@@ -306,6 +529,189 @@ class AscendFAImpl(AttentionImpl):
             )
         return self._rot_device
 
+    def _validate_explicit_qkv(self, query, key, value, *, packed=False):
+        ndim = 3 if packed else 4
+        tensors = (query, key, value)
+        if any(tensor.ndim != ndim for tensor in tensors):
+            raise ValueError("Ascend attention requires TND packed or BSND dense Q/K/V")
+        if (
+            key.shape != value.shape
+            or query.shape[0] != key.shape[0]
+            or any(tensor.shape[-1] != self._configured_head_size for tensor in tensors)
+        ):
+            raise ValueError(
+                "Ascend attention requires matching batch/head dimensions and K/V shapes"
+            )
+        heads, kv_heads = query.shape[-2], key.shape[-2]
+        if (
+            heads <= 0
+            or kv_heads <= 0
+            or heads % kv_heads
+            or self._configured_heads % heads
+            or self._configured_kv_heads % kv_heads
+        ):
+            raise ValueError(
+                "Runtime Q/KV heads must form valid partitions of the configured heads"
+            )
+        if any(
+            tensor.device != query.device or tensor.dtype != query.dtype
+            for tensor in tensors
+        ):
+            raise ValueError(
+                "Ascend attention requires Q/K/V with the same device and dtype"
+            )
+        allowed = (
+            (torch.bfloat16,)
+            if self.attention_config["precision"] == "bf16"
+            else (torch.float16, torch.bfloat16, torch.float32)
+        )
+        if query.dtype not in allowed:
+            raise ValueError(
+                "Explicit BF16 attention requires BF16; quantized attention requires floating-point Q/K/V"
+            )
+
+    def _get_laser_impl(self, query, key, value, return_softmax_lse):
+        """Optionally accelerate supported 910 BF16 inputs without a new dependency."""
+        if (
+            not self.attention_config.get("enable_laser", False)
+            or self._laser_unavailable
+            or query.device.type != "npu"
+            or not _supports_laser_shape(
+                query.shape,
+                key.shape,
+                value.shape,
+                causal=self.causal,
+                return_softmax_lse=return_softmax_lse,
+            )
+        ):
+            return None
+        if not torch.npu.get_device_name(query.device).startswith("Ascend910"):
+            return None
+        if self._laser_impl is None:
+            try:
+                if find_spec("attentions") is None:
+                    self._laser_unavailable = True
+                    return None
+                from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (
+                    LaserAttentionImpl,
+                )
+            except (ImportError, OSError, ValueError):
+                self._laser_unavailable = True
+                return None
+            if not hasattr(torch.ops.attentions, "la"):
+                self._laser_unavailable = True
+                return None
+            self._laser_impl = LaserAttentionImpl(
+                query.shape[2],
+                query.shape[3],
+                False,
+                self.softmax_scale,
+                num_kv_heads=key.shape[2],
+            )
+        return self._laser_impl
+
+    def _forward_quantized(self, query, key, value, return_softmax_lse):
+        if return_softmax_lse:
+            raise NotImplementedError(
+                "MindIE-SD quantized attention does not support softmax LSE"
+            )
+        self._validate_explicit_qkv(query, key, value)
+        if query.shape[0] == 0 or query.shape[1] == 0:
+            return torch.empty_like(query)
+        if key.shape[1] == 0:
+            raise ValueError("Nonempty queries require nonempty K/V")
+        config = self.attention_config
+        validate_attention_batch_config(config, batch_size=query.shape[0])
+        if config.get("num_key_value_heads") not in (None, key.shape[2]):
+            raise ValueError(
+                "num_key_value_heads must match the runtime K/V head count"
+            )
+        if self._quant_attention is None:
+            try:
+                from mindiesd import quant_attention
+            except (ImportError, OSError) as error:
+                raise ImportError(
+                    "Quantized Ascend FA requires MindIE-SD quant_attention "
+                    "with the requested precision installed"
+                ) from error
+            self._quant_attention = quant_attention
+        options = dict(config)
+        options.update(layout="BSND", scale=self.softmax_scale)
+        options.setdefault("pre_tokens", 2147483647)
+        options.setdefault("next_tokens", 2147483647)
+        if config["precision"] == "mxfp4":
+            options.update(layout_kv="BSND", layout_out="BSND")
+        logger.info_once(
+            f"Ascend FA: operator=mindiesd.quant_attention; precision={config['precision']}; "
+            f"layout=BSND; scale={self.softmax_scale}"
+        )
+        output = torch.empty_like(query)
+        # FP8 block and MX quantization scales must not mix independent samples.
+        for index in range(query.shape[0]):
+            result = self._quant_attention(
+                query[index : index + 1].contiguous(),
+                key[index : index + 1].contiguous(),
+                value[index : index + 1].contiguous(),
+                **options,
+            )
+            result = result[0] if isinstance(result, tuple) else result
+            if (
+                not isinstance(result, torch.Tensor)
+                or result.shape != query[index : index + 1].shape
+                or result.dtype != query.dtype
+                or result.device != query.device
+            ):
+                raise RuntimeError(
+                    "MindIE-SD quant_attention must return the input BSND shape, device and dtype"
+                )
+            output[index : index + 1].copy_(result)
+        return output
+
+    def _forward_explicit_varlen(
+        self, query, key, value, *, cu_seqlens, max_seqlen, cu_seqlens_host
+    ):
+        self._validate_explicit_qkv(query, key, value, packed=True)
+        if (
+            isinstance(max_seqlen, bool)
+            or not isinstance(max_seqlen, Integral)
+            or max_seqlen < 0
+        ):
+            raise ValueError("max_seqlen must be a non-negative integer")
+        if cu_seqlens_host is not None and (
+            not isinstance(cu_seqlens_host, Sequence)
+            or any(
+                isinstance(item, bool) or not isinstance(item, Integral)
+                for item in cu_seqlens_host
+            )
+        ):
+            raise ValueError("cu_seqlens_host must contain integers")
+        if not isinstance(cu_seqlens, torch.Tensor):
+            raise ValueError("cu_seqlens must be an integer tensor")
+        bounds = _packed_boundaries(
+            cu_seqlens, cu_seqlens_host, query.shape[0], "cu_seqlens"
+        )
+        validate_attention_batch_config(
+            self.attention_config, bounds=bounds, total_tokens=query.shape[0]
+        )
+        if self._packed_trailing_padding:
+            used = trailing_padding_used_len(query.shape[0], max_seqlen, bounds)
+            if used is not None:
+                bounds = (0, used)
+        if any(stop - start > max_seqlen for start, stop in pairwise(bounds)):
+            raise ValueError("max_seqlen is smaller than a packed sequence")
+        output = torch.zeros_like(query)
+        for start, stop in pairwise(bounds):
+            if start == stop:
+                continue
+            result = self.forward(
+                query[start:stop].unsqueeze(0),
+                key[start:stop].unsqueeze(0),
+                value[start:stop].unsqueeze(0),
+                None,
+            )
+            output[start:stop].copy_(result[0])
+        return output
+
     def forward(
         self,
         query: torch.Tensor,
@@ -314,6 +720,38 @@ class AscendFAImpl(AttentionImpl):
         attn_metadata: AttentionMetadata,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
+        if self.attention_config is not None:
+            if self.attention_config["precision"] != "bf16":
+                return self._forward_quantized(query, key, value, return_softmax_lse)
+            self._validate_explicit_qkv(query, key, value)
+            if query.shape[0] == 0 or query.shape[1] == 0:
+                output = torch.empty_like(query)
+                if return_softmax_lse:
+                    return output, torch.empty(
+                        (query.shape[0], query.shape[2], query.shape[1]),
+                        device=query.device,
+                        dtype=torch.float32,
+                    )
+                return output
+            if key.shape[1] == 0 or (self.causal and query.shape[1] != key.shape[1]):
+                raise ValueError(
+                    "BF16 causal attention requires matching nonempty Q/KV lengths"
+                )
+            laser = (
+                self._get_laser_impl(query, key, value, return_softmax_lse)
+                if self.attention_config.get("enable_laser", False)
+                else None
+            )
+            if laser is not None:
+                logger.info_once(
+                    "Ascend FA: operator=sgl_kernel_npu.laser; precision=bf16 inputs; intermediates=fp16"
+                )
+                return laser._forward_dense(
+                    query, key, value, attn_metadata, preserve_bf16_range=True
+                )
+            logger.info_once(
+                "Ascend FA: operator=torch_npu.npu_fused_infer_attention_score; precision=bf16"
+            )
         if (
             self._quant_scheme == "MXFP8"
             and not self.causal
@@ -377,6 +815,15 @@ class AscendFAImpl(AttentionImpl):
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
+        if self.attention_config is not None:
+            return self._forward_explicit_varlen(
+                query,
+                key,
+                value,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=cu_seqlens_host,
+            )
         del max_seqlen
         if (
             self._quant_scheme == "MXFP8"
@@ -544,6 +991,13 @@ class AscendFAImpl(AttentionImpl):
         value: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one Ascend TND ring chunk and return LSE in ``[H, Tq]``."""
+        if (
+            self.attention_config is not None
+            and self.attention_config["precision"] != "bf16"
+        ):
+            raise NotImplementedError(
+                "MindIE-SD quantized attention does not support Ring/LSE"
+            )
         cu_seqlens_q = torch.tensor(
             [0, query.shape[0]], dtype=torch.int32, device=query.device
         )

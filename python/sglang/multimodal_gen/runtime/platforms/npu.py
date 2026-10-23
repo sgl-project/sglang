@@ -137,6 +137,14 @@ class NPUPlatformBase(Platform):
             logger.info("Using Ascend Flash Attention backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa.AscendFABackend"
 
+        elif selected_backend == AttentionBackendEnum.ASCEND_SPARSE_ATTN:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_sparse_attn import (  # noqa: F401
+                AscendSparseAttentionBackend,
+            )
+
+            logger.info("Using Ascend sparse attention backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.ascend_sparse_attn.AscendSparseAttentionBackend"
+
         elif selected_backend == AttentionBackendEnum.LASER_ATTN:
             try:
                 from sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn import (  # noqa: F401

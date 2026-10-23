@@ -139,6 +139,11 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}><code>RAIN_FUSION_ATTN</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires <code>attentions</code> which can be installed with <code>sgl_kernel_npu</code>; available only for NPU.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>ascend_sparse_attn</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}><code>ASCEND_SPARSE_ATTN</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NPU-only MindIE-SD sparse attention with a shared <code>AscendFAImpl</code> dense executor. Requires compatible MindIE-SD and CANN operators.</td>
+    </tr>
 </tbody>
 </table>
 
@@ -517,6 +522,93 @@ Hybrid window attention constraints:
   </tbody>
 </table>
 
+**Ascend sparse attention (`ascend_sparse_attn`)**
+
+On Linux with Ascend NPUs, install the [NPU software stack](/docs/sglang-diffusion/installation#platform-specific-ascend-npu)
+and a compatible [MindIE-SD](https://github.com/Ascend/MindIE-SD) build exposing
+`sparse_attention` and the native operators for your selected sparse mode.
+Quantized dense modes also require its `quant_attention` API. Backend loading
+reports a missing MindIE-SD dependency before model execution.
+
+Sparse steps use MindIE-SD. Dense steps reuse `AscendFAImpl` with an explicit
+configuration from `dense_kwargs`, independently of the transformer's sparse
+precision and global FA settings. Both sparse and dense precision default to
+BF16, so the default configuration does not require A5 quantized operators.
+
+| Parameter | Description | Default |
+| --- | --- | --- |
+| `sparse_type` | Sparse algorithm: `rf_v2`, `rf_v3`, or `ada_bsa`. Use `--attention-backend fa` for dense-only attention; JSON `null` is rejected here. | `rf_v3` |
+| `precision` | Sparse precision: `bf16`, `mix` (INT8 Q/K and FP8 V), `fp8`, or `mxfp4`. Availability depends on the algorithm, device, and installed operators. | `bf16` |
+| `sparsity` | Fraction of attention blocks to discard, in `[0, 1]`. Zero uses the configured dense executor. | `0.6` |
+| `block_size` | Positive sparse Q block size. The builder resolves the default before execution; the native operator validates supported geometry. | `256` for RFv3 `fp8`/`mxfp4`; otherwise `128` |
+| `skip_first_steps` | Number of initial denoising steps that use dense attention. Non-negative integer. | `10` |
+| `skip_last_steps` | Number of final denoising steps that use dense attention. Non-negative integer. Pipelines supply `num_steps` from the actual timestep or sigma schedule. | `0` |
+| `dense_kwargs` | Explicit configuration for the shared Ascend FA executor. `precision` accepts `bf16`, `fp8`, `mxfp8`, or `mxfp4`; quantized modes may include their supported quantization options. | `{"precision":"bf16"}` |
+| `keep_sink` | Preserve attention-sink blocks in `ada_bsa` mask selection. Boolean. | `true` |
+| `keep_recent` | Preserve recent-token blocks in `ada_bsa` mask selection. Boolean. | `true` |
+| `cdf_threshold` | Cumulative attention-probability threshold for `ada_bsa` block selection, in `[0, 1]`. | `1.0` |
+| `mxfp4_dst_type_max` | Non-negative maximum-value override for MXFP4 quantization. Zero selects the vendor's automatic choice. | `0.0` |
+| `mxfp4_scale_alg` | Non-negative MXFP4 scale-algorithm identifier. JSON `null` keeps the vendor default. | `null` |
+
+SGLang validates types, finite numeric ranges, schedule bounds, token-grid
+shapes, and ordered nonoverlapping video spans before dispatch. Unsupported
+configuration keys are rejected; arbitrary `sparse_kwargs`, `block_size_kv`, and
+`inner_precise` overrides are not exposed. Operator precision is derived from
+the SoC: `4` on A5 and `0` on A2/A3.
+
+For RFv3, FP8 and MXFP4 use a default KV block size of 256 in MindIE-SD. Its
+video-span route requires matching Q/KV blocks, so this adapter defaults
+`block_size` to 256 for those modes. The public sparse API does not forward a
+separate KV block-size override. On A5, MindIE-SD remaps `rf_v2` to `rf_v3` and
+rejects `ada_bsa`.
+
+`AscendFAImpl` validates and handles `dense_kwargs`, including dense precision,
+FP8 mode, and MXFP4 options. The sparse adapter does not call dense MindIE-SD
+operators itself. Layer layout and softmax scale remain owned by the attention
+layer. Supported dense configuration keys are:
+
+| Dense option | Accepted values and effect | Default |
+| --- | --- | --- |
+| `precision` | `bf16`, `fp8`, `mxfp8`, or `mxfp4`. | `bf16` |
+| `enable_laser` | BF16-only boolean. Opt into Laser on supported Ascend 910 inputs when its native operator is installed. | `false` |
+| `fp8_fa_mode` | FP8-only mode: `HIGH_PRECISION` for head dimensions 64/128, or `C8V16_TILING512` for head dimension 128. | `HIGH_PRECISION` |
+| `q_rot`, `k_rot` | Optional query/key rotation tensors for quantized dense modes. | Not supplied |
+| `pre_tokens`, `next_tokens` | Non-negative attention-window token limits for quantized dense modes. | `2147483647` |
+| `mxfp4_scale_alg` | MXFP4 scale-algorithm identifier: non-negative integer or JSON `null`. | SDK default |
+| `mxfp4_dst_type_max` | MXFP4 maximum-value override: positive finite number or JSON `null`. | SDK default |
+| `num_key_value_heads` | MXFP4 positive KV head count matching the runtime tensor, or JSON `null`. | Inferred |
+| `max_seqlen_q`, `max_seqlen_kv` | MXFP4 sequence-length limits: integers at least `-1`. | SDK default |
+| `mask_mode` | MXFP4 mask-mode selector: non-negative integer. | SDK default |
+| `win_left`, `win_right` | MXFP4 window limits: non-negative integers or JSON `null`. | SDK default |
+| `metadata`, `block_table`, `sinks`, `attn_mask` | MXFP4 native metadata/mask tensors, or `None` in Python. | Not supplied |
+| `return_softmax_lse` | MXFP4 accepts only `0` or `false`; explicit quantized dense attention does not return LSE. | Not requested |
+
+BF16 uses native Ascend FIA by default. With `enable_laser=true`, Laser uses
+FP16 intermediates even for BF16 input; select it only when those value-range
+and numerical-precision tradeoffs suit your model. Unsupported shapes or a
+missing Laser operator retain native BF16 FIA.
+
+Tensor options are available to Python callers; JSON cannot construct tensors.
+MXFP4 `metadata`, `block_table`, `sinks`, and `attn_mask` tensors require a
+single sample and one unpadded document. SGLang rejects reuse of these tensors
+across packed documents or batch samples; shared `q_rot`/`k_rot` matrices are
+allowed across independent documents.
+Offline rotations for sparse attention are not exposed by this adapter.
+
+Keep causal components on a backend that preserves their masks. MiniMax-H3
+keeps its token refiner on dense FA and defaults its text encoder to SDPA unless
+you explicitly override it. Video spans retain their original packed token
+positions and are rebased within each independent document. With H3's explicit
+trailing-padding contract, attention skips the physical alignment tail and
+returns zeros for those rows, including with Ulysses sequence parallelism.
+
+When updating an earlier PR configuration, replace the backend name
+`rain_fusion_attn_v2` with `ascend_sparse_attn`. The builder accepts
+`dense_last_steps` as a migration alias for `skip_last_steps`, and
+`dense_precision` as an alias for `dense_kwargs.precision`. Conflicting old and
+new values raise an error. New configurations should use the canonical names
+shown above.
+
 **Sol-Attn (`sol_attn`)**
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -790,6 +882,16 @@ Hybrid window attention constraints:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>NPU-only. Requires <code>attentions</code> from <code>sgl_kernel_npu</code> Configuration via <code>--attention-backend-config</code>.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>ascend_sparse_attn</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>NPU-only. Requires MindIE-SD sparse operators and compatible CANN kernels; dense steps reuse Ascend FA. Mode support depends on your installed SDK and device.</td>
+    </tr>
 </tbody>
 </table>
 
@@ -810,6 +912,30 @@ sglang generate \
   --prompt "..." \
   --attention-backend torch_sdpa
 ```
+
+### Use Ascend sparse attention
+
+Use a Linux Ascend environment with the prerequisites above. Set `MODEL_PATH`
+to a supported pipeline's local directory or Hugging Face repository ID. This
+example uses one NPU with Ulysses degree 1, BF16 sparse attention, and the shared
+BF16 FA executor for the first 10 and final 2 steps:
+
+```bash
+MODEL_PATH="/path/to/pipeline"
+sglang generate \
+  --model-path "${MODEL_PATH}" \
+  --num-gpus 1 \
+  --ulysses-degree 1 \
+  --attention-backend ascend_sparse_attn \
+  --attention-backend-config '{"sparse_type":"rf_v3","precision":"bf16","sparsity":0.6,"skip_first_steps":10,"skip_last_steps":2,"dense_kwargs":{"precision":"bf16"}}' \
+  --prompt "A sailboat crossing a calm lake at sunrise"
+```
+
+For supported A5 operators, use `"precision":"mix"` for EagleQBSA sparse steps.
+To select FP8 dense attention independently, set
+`"dense_kwargs":{"precision":"fp8","fp8_fa_mode":"HIGH_PRECISION"}`. For
+MXFP4 dense attention, use `"dense_kwargs":{"precision":"mxfp4"}` and any
+supported MXFP4-specific options; omit FP8-specific options.
 
 ### Override one component
 
