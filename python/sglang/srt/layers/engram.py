@@ -52,6 +52,15 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    get_tc_piecewise_forward_context,
+)
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
@@ -223,6 +232,19 @@ def compute_engram_hash_ids(
         rolling = torch.bitwise_xor(rolling, products[..., i])
         hashes.append(rolling.unsqueeze(-1) % primes[:, i - 1])
     return torch.cat(hashes, dim=-1) + offsets
+
+
+def mask_image_lookback(
+    tokens: torch.Tensor, blocked: torch.Tensor, image_token_id: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read multimodal pad ids in tokens [T, n] as the image token, and block
+    each look-back from its first image on."""
+    tokens = tokens.masked_fill(tokens >= MM_PAD_SHIFT_VALUE, image_token_id)
+    # Once a lookback hits an image, every older predecessor is PAD.
+    blocked = (
+        (blocked | (tokens == image_token_id)).to(torch.int32).cummax(-1).values.bool()
+    )
+    return tokens, blocked
 
 
 class EngramHasher(nn.Module):
@@ -487,16 +509,7 @@ class EngramHasher(nn.Module):
             blocked[num_real:] = True
         if self.image_token_id is not None:
             # Scheduler-provided history still carries the multimodal pad ids.
-            tokens = tokens.masked_fill(
-                tokens >= MM_PAD_SHIFT_VALUE, self.image_token_id
-            )
-            # Once a lookback hits an image, every older predecessor is PAD.
-            blocked = (
-                (blocked | (tokens == self.image_token_id))
-                .to(torch.int32)
-                .cummax(-1)
-                .values.bool()
-            )
+            tokens, blocked = mask_image_lookback(tokens, blocked, self.image_token_id)
         hash_ids = compute_engram_hash_ids(
             tokens,
             blocked,
@@ -829,6 +842,8 @@ class EngramEmbedding(nn.Module):
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
         self._sort_host_reads = False
+        # Set when the scheduler stages this table's rows (EngramRowPrefetcher).
+        self.host_prefetch = False
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
@@ -922,6 +937,34 @@ class EngramEmbedding(nn.Module):
         if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
+
+    def dequant_staged(
+        self,
+        rows: torch.Tensor,
+        scales: torch.Tensor,
+        copied: torch.cuda.Event,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dequantize the rows the scheduler staged for `indices`, in their order.
+        Rows past the staged ones (prefill graph padding) are zero."""
+        stream = torch.cuda.current_stream()
+        stream.wait_event(copied)
+        rows.record_stream(stream)
+        scales.record_stream(stream)
+        out = self._empty(indices)
+        flat = out.view(-1, self.dim)
+        n = rows.shape[0]
+        assert n <= flat.shape[0], (n, flat.shape)
+        engram_gather(
+            rows.data_ptr(),
+            scales.data_ptr(),
+            torch.arange(n, dtype=torch.int32, device=indices.device),
+            flat[:n],
+            self.dim,
+            FP8_BLOCK_SIZE,
+        )
+        flat[n:].zero_()
+        return out
 
     def _lookup(self, indices: torch.Tensor) -> torch.Tensor:
         """Lookup when every TP rank holds the same indices: the device and
@@ -1087,7 +1130,16 @@ class Engram(nn.Module):
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] for this layer."""
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
-        emb = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
+        if (
+            self.embed.host_prefetch
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and is_in_breakable_cuda_graph()
+        ):
+            # Every replay stages new rows, so the lookup runs between segments.
+            emb = _bcg_engram_embed(self, hash_ids, cp_all_tokens)
+        else:
+            emb = self.embed_rows(hash_ids, forward_batch, cp_all_tokens)
         if x.shape[0] == 0:
             # Nothing to gate, and the MXFP8 quantize behind wkv rejects an
             # empty M.
@@ -1096,3 +1148,24 @@ class Engram(nn.Module):
         return engram_gate(
             x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value
         )
+
+    def embed_rows(
+        self,
+        hash_ids: torch.Tensor,
+        forward_batch: Optional[ForwardBatch],
+        cp_all_tokens: bool,
+    ) -> torch.Tensor:
+        """The rows the scheduler staged for this batch, else the table lookup."""
+        staged = None if forward_batch is None else forward_batch.engram_prefetch
+        if staged is not None:
+            return self.embed.dequant_staged(*staged[self.layer_hash_index], hash_ids)
+        return self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
+
+
+@eager_on_graph
+def _bcg_engram_embed(
+    engram: Engram, hash_ids: torch.Tensor, cp_all_tokens: bool
+) -> torch.Tensor:
+    # A replay builds a fresh batch; the capture-time one stages no rows.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    return engram.embed_rows(hash_ids, forward_batch, cp_all_tokens)

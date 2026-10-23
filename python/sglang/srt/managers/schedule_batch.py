@@ -2535,6 +2535,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # DeepSeek-V4.1 engram, extend batches only: [bs, n - 1] int32 predecessors
     # of each request's first extend token (NgramEmbeddingManager).
     engram_history: Optional[torch.Tensor] = None
+    # Per engram layer, the rows the scheduler staged (EngramRowPrefetcher).
+    engram_prefetch: Optional[list] = None
     encoder_swa_reset: Optional[List[bool]] = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
