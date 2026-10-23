@@ -577,26 +577,40 @@ class AscendAttnBackend(AttentionBackend):
         dense_mla_dcp_partial = (
             self.dense_mla_dcp_target and self.uses_dcp_partial_attention(forward_batch)
         )
+        spec_algorithm = forward_batch.spec_algorithm
+        if self.needs_cpu_seq_lens or dense_mla_dcp_partial:
+            # Prepare global Host lengths before DCP converts them to local lengths.
+            effective_seq_lens_cpu = forward_batch.seq_lens_cpu.to(
+                torch.int64 if dense_mla_dcp_partial else torch.int32
+            )
+            if forward_batch.forward_mode.is_target_verify():
+                if spec_algorithm is None or not spec_algorithm.is_dflash_family():
+                    effective_seq_lens_cpu = effective_seq_lens_cpu + int(
+                        forward_batch.spec_info.draft_token_num
+                    )
+            elif (
+                forward_batch.forward_mode.is_decode_or_idle()
+                and forward_batch.spec_info is not None
+            ):
+                effective_seq_lens_cpu = (
+                    effective_seq_lens_cpu + self.speculative_step_id + 1
+                )
+            self.forward_metadata.seq_lens_cpu_int = effective_seq_lens_cpu
+
         if dense_mla_dcp_partial:
             metadata = self.forward_metadata
-            # Derive FIA's Host lengths from the CPU mirror without a device readback.
-            effective_seq_lens_cpu = forward_batch.seq_lens_cpu.to(torch.int64)
             effective_seq_lens = forward_batch.seq_lens
             if forward_batch.forward_mode.is_target_verify():
                 query_len = forward_batch.spec_info.draft_token_num
                 effective_seq_lens = effective_seq_lens.to(torch.int64) + query_len
-                spec_algorithm = forward_batch.spec_algorithm
                 if spec_algorithm is not None and spec_algorithm.is_dflash_family():
                     # Active Host lengths already include verify tokens; Ascend's
                     # zero-filled DP padding rows still need the verify block.
                     effective_seq_lens_cpu = torch.where(
                         effective_seq_lens_cpu == 0, query_len, effective_seq_lens_cpu
                     )
-                else:
-                    effective_seq_lens_cpu = effective_seq_lens_cpu + query_len
             elif forward_batch.spec_info is not None:
                 step_offset = self.speculative_step_id + 1
-                effective_seq_lens_cpu = effective_seq_lens_cpu + step_offset
                 effective_seq_lens = effective_seq_lens + step_offset
             # Size the table from FIA's Host bound, which can lead device lengths.
             metadata.seq_lens_cpu_int, metadata.block_tables = (
@@ -692,8 +706,6 @@ class AscendAttnBackend(AttentionBackend):
                 self.device
             ).int()
 
-        if self.needs_cpu_seq_lens and not dense_mla_dcp_partial:
-            self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
         # In graph mode (see _init_cuda_graph_metadata) seq_lens_cpu_int stays
         # None so forward_mtp binds seq_lens_cpu_list instead: graph.update can
         # only rebind the Host-side IntArray when captured as a Python list.
@@ -704,21 +716,6 @@ class AscendAttnBackend(AttentionBackend):
         ):
             seq_lens_list_cumsum = np.cumsum(forward_batch.extend_seq_lens_cpu)
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
-
-        if forward_batch.forward_mode.is_target_verify():
-            spec_algorithm = forward_batch.spec_algorithm
-            if not dense_mla_dcp_partial and (
-                spec_algorithm is None or not spec_algorithm.is_dflash_family()
-            ):
-                self.forward_metadata.seq_lens_cpu_int += int(
-                    forward_batch.spec_info.draft_token_num
-                )
-        elif (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and forward_batch.spec_info is not None
-            and not dense_mla_dcp_partial
-        ):
-            self.forward_metadata.seq_lens_cpu_int += self.speculative_step_id + 1
 
         # Set actual_seq_lengths_q from the pre-pad batch size so that the DSA
         # indexer reads a value consistent with actual_seq_lengths_kv /
