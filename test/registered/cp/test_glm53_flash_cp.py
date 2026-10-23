@@ -1,4 +1,4 @@
-"""GLM-5.3-Flash interleave CP4 + native MTP on four Blackwell GPUs."""
+"""GLM-5.3-Flash interleave CP4 + DFlash2 on four Blackwell GPUs."""
 
 import base64
 import io
@@ -44,13 +44,13 @@ class TestGLM53FlashB200ContextParallel(
         "--tool-call-parser",
         "auto",
         "--speculative-algorithm",
-        "EAGLE",
-        "--speculative-num-steps",
-        "5",
-        "--speculative-eagle-topk",
-        "1",
-        "--speculative-num-draft-tokens",
-        "6",
+        "DFLASH",
+        "--speculative-draft-model-path",
+        "incoai/GLM-5.3-Flash-DFlash2",
+        "--speculative-draft-attention-backend",
+        "fa4",
+        "--mem-fraction-static",
+        "0.85",
         "--enable-prefill-cp",
         "--cp-strategy",
         "interleave",
@@ -85,7 +85,7 @@ class TestGLM53FlashB200ContextParallel(
     def test_gsm8k(self):
         super().test_gsm8k()
         # Require the metric as well as the floor: an accuracy pass alone must
-        # not hide disabled MTP or a draft whose tokens are mostly rejected.
+        # not hide disabled speculation or a draft whose tokens are mostly rejected.
         response = requests.get(self.base_url + "/server_info", timeout=30)
         response.raise_for_status()
         self.assertGreater(

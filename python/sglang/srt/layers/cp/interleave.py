@@ -231,15 +231,11 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         extend_seqs: Any,
     ):
         """Build device outputs in the shared kernel to keep the split graph-safe."""
-        from sglang.kernels.ops.attention.dsa.cp_split import (
-            dsa_cp_interleave_q_seqs_kernel,
-        )
+        from sglang.kernels.ops.attention.dsa.cp_split import dsa_cp_interleave_q_seqs
 
         cp_size = self.cp_size
         cp_rank = self.cp_rank
 
-        # Static BCG request buffers are int64; splitter loop offsets are int32.
-        extend_seqs = extend_seqs.to(dtype=torch.int32)
         extra_seq = 0
         q_lens_cpu: List[int] = []
         for cur_len in extend_seqs_cpu:
@@ -250,14 +246,8 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         bs_idx_cpu = [i for i, q_len in enumerate(q_lens_cpu) if q_len > 0]
         q_lens_cpu = [q_len for q_len in q_lens_cpu if q_len > 0]
 
-        q_lens = torch.empty(
-            (len(bs_idx_cpu),), device=extend_seqs.device, dtype=extend_seqs.dtype
-        )
-        bs_idx = torch.empty(
-            (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
-        )
-        dsa_cp_interleave_q_seqs_kernel[(1,)](
-            extend_seqs, q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
+        q_lens, bs_idx = dsa_cp_interleave_q_seqs(
+            extend_seqs, len(bs_idx_cpu), cp_size, cp_rank
         )
         return q_lens_cpu, q_lens, bs_idx_cpu, bs_idx
 
