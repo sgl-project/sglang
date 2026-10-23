@@ -54,7 +54,12 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPoo
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
-from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_hip,
+    is_sm100_supported,
+    is_sm120,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +86,7 @@ def _resolve_trtllm_sparse_decode():
 @lru_cache(maxsize=1)
 def _resolve_flydsl_sparse_decode():
     """The fused gfx950 FlyDSL decode module, or None when off or unavailable."""
-    if not (is_hip() and envs.SGLANG_ENABLE_QSA_FLYDSL_DECODE.get()):
+    if not (envs.SGLANG_USE_AITER.get() and is_gfx95_supported()):
         return None
     try:
         from aiter.ops.flydsl import qsa_sparse_decode as qsa_flydsl

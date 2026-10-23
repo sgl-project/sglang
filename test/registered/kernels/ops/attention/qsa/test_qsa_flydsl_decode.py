@@ -15,13 +15,14 @@ import torch
 pytest.importorskip("flydsl")
 qsa_flydsl = pytest.importorskip("aiter.ops.flydsl.qsa_sparse_decode")
 
+from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def _gfx950_available() -> bool:
-    if not torch.cuda.is_available() or torch.version.hip is None:
+    if not torch.cuda.is_available() or not is_gfx95_supported():
         return False
     probe = torch.empty(1, 1, 256, dtype=torch.bfloat16, device="cuda")
     return qsa_flydsl.can_use_flydsl_qsa_sparse_decode(probe, probe, probe)
@@ -107,7 +108,7 @@ def test_backend_decode_matches_triton_fallback(monkeypatch):
     outputs = {}
     for enabled in (False, True):
         qsa_module._resolve_flydsl_sparse_decode.cache_clear()
-        with envs.SGLANG_ENABLE_QSA_FLYDSL_DECODE.override(enabled):
+        with envs.SGLANG_USE_AITER.override(enabled):
             outputs[enabled] = backend._forward_paged_attention(
                 q, layer, forward_batch, indices
             )
