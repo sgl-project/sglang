@@ -124,6 +124,17 @@ def _build_dsa_token_shard_plan(forward_batch) -> Optional[DsaTokenShardPlan]:
         )
         return None
 
+    # Attention-DP MAX_LEN pads a rank to the widest DP rank, past the
+    # attn_tp_size alignment the plan covers. Refused here, before the indexer
+    # reads the plan, so neither it nor attention ever takes a token slice.
+    num_rows = forward_batch.input_ids.shape[0]
+    if num_rows > plan.num_tokens_pad:
+        print_info_once(
+            f"DSA token-shard is off for batches padded past the plan ({num_rows} "
+            f"rows for {plan.num_tokens} tokens): attention-DP MAX_LEN padding"
+        )
+        return None
+
     # Logged on engage too: an unset flag returns before every refusal, so the
     # absence of a refusal proves nothing.
     print_info_once(

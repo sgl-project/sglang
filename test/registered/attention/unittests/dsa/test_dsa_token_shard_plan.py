@@ -158,6 +158,7 @@ class TestTokenShardRefusesDcp(CustomTestCase):
             forward_mode=ForwardMode.EXTEND,
             extend_seq_lens_cpu=[16384],
             extend_prefix_lens_cpu=[0],
+            input_ids=torch.zeros(16384, dtype=torch.int64),
         )
         with get_parallel().override(
             attn_tp_size=16, attn_tp_rank=3, dcp_enabled=dcp_enabled
@@ -169,6 +170,31 @@ class TestTokenShardRefusesDcp(CustomTestCase):
 
     def test_refused_under_dcp(self):
         self.assertIsNone(self._plan(dcp_enabled=True))
+
+
+class TestTokenShardRefusesDpMaxLenPadding(CustomTestCase):
+    """Attention-DP MAX_LEN pads a rank to the widest DP rank. The plan is cut
+    from real extend lengths, so a wider batch would trip the redistribute's
+    width assert after the indexer had already kept only its local top-k."""
+
+    def _plan(self, num_rows):
+        batch = types.SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=[1000],
+            extend_prefix_lens_cpu=[0],
+            input_ids=torch.zeros(num_rows, dtype=torch.int64),
+        )
+        with get_parallel().override(
+            attn_tp_size=16, attn_tp_rank=3, dcp_enabled=False
+        ):
+            return _build_dsa_token_shard_plan(batch)
+
+    def test_attn_tp_alignment_is_planned(self):
+        # SUM_LEN pads only to a multiple of attn_tp_size: 1000 -> 1008.
+        self.assertIsNotNone(self._plan(num_rows=1008))
+
+    def test_max_len_padding_is_refused(self):
+        self.assertIsNone(self._plan(num_rows=2000))
 
 
 if __name__ == "__main__":
