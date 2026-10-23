@@ -53,6 +53,7 @@ class TestGlm47SchemaTypes(unittest.TestCase):
             ({"enum": ["ok", None]}, None),
             ({"type": ["string", "null"], "enum": ["ok", None]}, None),
             ({"anyOf": [{"type": "string", "enum": ["auto"]}, {"type": "integer"}]}, 7),
+            ({"anyOf": [{"type": "string"}, {"type": "null"}]}, None),
             (
                 {
                     "oneOf": [
