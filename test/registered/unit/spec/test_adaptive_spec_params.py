@@ -7,6 +7,7 @@ from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveStepSlot,
     resolve_candidate_steps_from_config,
 )
+from sglang.srt.speculative.adaptive_step_router import AdaptiveStepRouter
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -248,7 +249,7 @@ class TestAdaptiveStepSlot(CustomTestCase):
 class TestAdaptiveSpeculativeParams(CustomTestCase):
     def test_default_config_loads(self):
         params = AdaptiveSpeculativeParams(initial_steps=3)
-        self.assertEqual(params._bs_list, [1, 8, 32, 64])
+        self.assertEqual(params._router.batch_size_keys, [1, 8, 32, 64])
         self.assertEqual(params._slots[1].candidate_steps, [1, 3, 5, 7])
         self.assertEqual(params._slots[8].candidate_steps, [0, 1, 3])
         self.assertEqual(params._slots[32].candidate_steps, [0, 1])
@@ -265,7 +266,7 @@ class TestAdaptiveSpeculativeParams(CustomTestCase):
             )
             f.flush()
             params = AdaptiveSpeculativeParams(initial_steps=5, cfg_path=f.name)
-        self.assertEqual(params._bs_list, [1, 32])
+        self.assertEqual(params._router.batch_size_keys, [1, 32])
         # Slots are built straight from the config; the launch flag never pollutes
         # them. initial_steps just selects the smallest slot's starting step.
         self.assertEqual(params._slots[1].candidate_steps, [1, 5])
@@ -395,6 +396,23 @@ class TestBatchSizeRouting(CustomTestCase):
         self.assertEqual(params.get_steps_for_batch(32), 1)
 
 
+class TestAdaptiveStepRouter(CustomTestCase):
+    def test_routes_padded_batches_and_prunes_cuda_graphs(self):
+        router = AdaptiveStepRouter(
+            {
+                1: [1, 3, 5],
+                8: [1, 3],
+                32: [1],
+            }
+        )
+        router.set_cuda_graph_bs([4, 8, 16, 32])
+
+        self.assertEqual(router.candidate_steps, [1, 3, 5])
+        self.assertEqual(router.candidates_for_batch(5), [1, 3])
+        self.assertEqual(router.candidates_for_batch(17), [1])
+        self.assertEqual(router.cuda_graph_bs_for_step(3), [4, 8, 16])
+
+
 class TestResolveCandidateSteps(CustomTestCase):
     def test_default_config(self):
         steps = resolve_candidate_steps_from_config()
@@ -419,6 +437,20 @@ class TestResolveCandidateSteps(CustomTestCase):
             f.flush()
             steps = resolve_candidate_steps_from_config(cfg_path=f.name)
         self.assertEqual(steps, [1, 3, 5, 7])
+
+    def test_throughput_aware_config_uses_its_candidate_validation(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "strategy": "throughput_aware",
+                    "1": {"candidate_steps": [1, 3]},
+                    "8": {"candidate_steps": [1]},
+                },
+                f,
+            )
+            f.flush()
+            steps = resolve_candidate_steps_from_config(cfg_path=f.name)
+        self.assertEqual(steps, [1, 3])
 
 
 if __name__ == "__main__":
