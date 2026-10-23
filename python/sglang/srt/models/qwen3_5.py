@@ -185,11 +185,10 @@ _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
 _gdn_online_mxfp4 = (
-    ("in_proj_qkvz", "out_proj") if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() else ()
+    ("in_proj_qkvz", "out_proj")
+    if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
+    else ()
 )
-if _gdn_online_mxfp4 and not (_use_aiter and _is_gfx95):
-    logger.warning("SGLANG_ROCM_GDN_ONLINE_MXFP4 needs gfx95x and SGLANG_USE_AITER=1")
-    _gdn_online_mxfp4 = ()
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
@@ -534,17 +533,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
-        if _gdn_online_mxfp4:
+        if _gdn_online_mxfp4 and config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
             from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
                 AiterMxfp4OnlineLinearMethod,
             )
 
             # The loader quantizes these in process_weights_after_loading.
+            # gemm_a4w4 needs N, K % 256 == 0; other shapes stay BF16.
             for name in _gdn_online_mxfp4:
                 proj = getattr(self, name)
                 if (
                     isinstance(proj.quant_method, UnquantizedLinearMethod)
                     and proj.weight.dtype == torch.bfloat16
+                    and all(d % 256 == 0 for d in proj.weight.shape)
                 ):
                     proj.quant_method = AiterMxfp4OnlineLinearMethod()
 
