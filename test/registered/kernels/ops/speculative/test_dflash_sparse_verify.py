@@ -102,8 +102,21 @@ def _make_case(*, bs, top_ks, temperature, seed, scale=3.0, noise=0.3, peak=0.0)
     return raw, candidates, q_ids, q_rows, sampling_info, draft_input
 
 
-def _support_on_every_rank(*, raw, world, sampling_info, draft_input):
+def _rank_shards(raw, world):
+    """Each rank's logits shard in its own contiguous lm_head output buffer; verify
+    reads the first bs * block rows of a larger graph bucket's buffer."""
+    rows = raw.shape[0]
     shard = VOCAB // world
+    shards = []
+    for rank in range(world):
+        bucket = torch.zeros(GRAPH_BUCKET_BS * BLOCK, shard, device=raw.device)
+        bucket[:rows] = raw[:, rank * shard : (rank + 1) * shard]
+        shards.append(bucket[:rows])
+    return shards
+
+
+def _support_on_every_rank(*, raw, world, sampling_info, draft_input):
+    shards = _rank_shards(raw, world)
     packed = {}
     # Pass 1 records every rank's packed shard; pass 2 gathers them all.
     for _ in range(2):
@@ -118,7 +131,7 @@ def _support_on_every_rank(*, raw, world, sampling_info, draft_input):
                         batch=SimpleNamespace(has_grammar=False, return_logprob=False),
                         sampling_info=sampling_info,
                         draft_input=draft_input,
-                        logits_shard=raw[:, rank * shard : (rank + 1) * shard],
+                        logits_shard=shards[rank],
                     )
                 )
     return supports
