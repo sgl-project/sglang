@@ -61,12 +61,16 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     ``hicache_device_kernels``: the sgl_kernel HiCache transfer / write-back
     kernels are available; otherwise the host pools skip their staging
     buffers.
+    ``supports_pynccl``: model-parallel groups create a PyNccl communicator
+    when the caller does not choose. Read for out-of-tree platforms; in-tree
+    devices decide in ``parallel_state``.
     """
 
     supports_triton: bool = False
     graph_capture: bool = False
     piecewise_graph: bool = False
     hicache_device_kernels: bool = False
+    supports_pynccl: bool = False
 
 
 class SRTPlatform(DeviceMixin):
@@ -207,6 +211,21 @@ class SRTPlatform(DeviceMixin):
     def support_mamba_cache_extra_buffer(self) -> bool:
         """Whether this out-of-tree platform supports Mamba cache snapshots."""
         return False
+
+    # ------------------------------------------------------------------
+    # Distributed
+    # ------------------------------------------------------------------
+
+    def get_group_coordinator_device(self, local_rank: int) -> torch.device:
+        """Return the device a ``GroupCoordinator`` binds to on this rank.
+
+        Consulted only for out-of-tree platforms; in-tree devices are resolved
+        in ``parallel_state``. The default is CPU, which is what an unknown
+        device got before this hook existed.
+        """
+        import torch
+
+        return torch.device("cpu")
 
     # ------------------------------------------------------------------
     # Initialization

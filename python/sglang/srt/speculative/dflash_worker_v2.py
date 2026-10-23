@@ -103,7 +103,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import async_h2d, is_cuda, is_hip, is_npu, is_xpu
 
 _is_npu = is_npu()
 
@@ -411,10 +411,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._tp_sync = SpecTpSync(get_dp_tp_group())
         check_simulate_acc_token_mode()
 
-        # Under dp attention, the draft worker runs on the per-DP attn-TP
-        # group, independent of idle peer DP ranks; it is built and run under
-        # the same placement.
-        self.draft_owns_attention = get_parallel().attn_dp_enabled
+        # DP drafts use per-DP attention TP, independent of idle peers. CP
+        # drafts use full TP without CP, including their backend and KV pool.
+        self.draft_owns_attention = (
+            get_parallel().attn_dp_enabled or get_parallel().attn_cp_size > 1
+        )
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
         with draft_pp_context(), draft_tp_context(self.draft_owns_attention):
@@ -657,13 +658,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         # enabled, the draft worker keeps a private compact req->token table
         # over the same global KV index space, so radix-cache/prefix-hit KV
         # remains reusable while draft attention sees only the recent window.
-        self._draft_worker.alloc_memory_pool(
-            memory_pool_config=memory_pool_config,
-            req_to_token_pool=(
-                None if self.use_compact_draft_cache else req_to_token_pool
-            ),
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        )
+        with draft_tp_context(self.draft_owns_attention):
+            self._draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=(
+                    None if self.use_compact_draft_cache else req_to_token_pool
+                ),
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
 
     def init_attention_backends(self):
         with (
@@ -2329,6 +2331,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            self._wait_for_fused_hicache_load(batch)
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
@@ -2372,8 +2375,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
+            # Enqueue metadata copies without waiting for the target prefill's
+            # outstanding GPU work; the same stream orders their consumers.
+            ctx_lens = async_h2d(batch.extend_lens, dtype=torch.int32, device=device)
+            draft_seq_lens = async_h2d(
                 batch.prefix_lens, dtype=torch.int32, device=device
             )
 
