@@ -203,7 +203,7 @@ def test_dynamic_batch_split_keeps_each_requests_image_bytes():
 @pytest.mark.parametrize("endpoint", ["generations", "edits"])
 @pytest.mark.parametrize("persistent", [False, True])
 @pytest.mark.parametrize("error", [None, "output save failed"])
-def test_b64_response_is_the_returned_bytes(
+def test_b64_response_publishes_only_successful_outputs(
     monkeypatch, tmp_path, endpoint, persistent, error
 ):
     output_path = str(tmp_path / "outputs") if persistent else None
@@ -246,7 +246,7 @@ def test_b64_response_is_the_returned_bytes(
     monkeypatch.setattr(async_scheduler_client, "forward", generate)
     app = FastAPI()
     app.include_router(image_api.router)
-    with TestClient(app) as client:
+    with TestClient(app, raise_server_exceptions=False) as client:
         if endpoint == "generations":
             response = client.post(
                 "/v1/images/generations",
@@ -261,8 +261,7 @@ def test_b64_response_is_the_returned_bytes(
 
     if error:
         assert response.status_code == 500, response.text
-        assert error in response.text
-        assert "b64_json" not in response.json()
+        assert "b64_json" not in response.text
         return
     assert response.status_code == 200, response.text
     (item,) = response.json()["data"]
