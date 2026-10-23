@@ -96,14 +96,15 @@ class TestQuarkMxfp4AsmNarrowLayer(CustomTestCase):
         wrong rows 1..M-1 for it at small batch sizes."""
         n, k = 96, 5120
         layer = torch.nn.Module()
-        weight = torch.nn.Parameter(
-            torch.zeros((n, k // 2), dtype=torch.uint8), requires_grad=False
-        )
-        layer.weight = weight
-        layer.weight_scale = torch.nn.Parameter(
-            torch.zeros((n, k // 32), dtype=torch.uint8), requires_grad=False
-        )
         scheme = quark_w4a4_mxfp4.QuarkW4A4MXFP4({}, {})
+        scheme.create_weights(
+            layer=layer,
+            output_partition_sizes=[n],
+            input_size_per_partition=k,
+            params_dtype=torch.bfloat16,
+            weight_loader=lambda *args, **kwargs: None,
+        )
+        weight = layer.weight
 
         with (
             mock.patch.object(quark_w4a4_mxfp4, "_use_aiter_asm_fp4_gemm", True),

@@ -2071,6 +2071,9 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Dequantize Quark MXFP4 shared experts to BF16 at load so they join the
+    # merged Kimi-K3 MoE front on ROCm; at TP8 this takes ~2.8 GB/GPU from the KV pool.
+    SGLANG_OPT_HIP_K3_QUARK_SHARED_FULL_FRONT = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

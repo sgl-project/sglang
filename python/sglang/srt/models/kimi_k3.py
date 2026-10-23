@@ -729,6 +729,12 @@ class KimiK3MoE(nn.Module):
         if not (get_platform().is_cuda or get_platform().is_hip):
             return
         if self.shared_experts is not None and get_moe_a2a_backend().is_none():
+            if _is_hip and envs.SGLANG_OPT_HIP_K3_QUARK_SHARED_FULL_FRONT.get():
+                from sglang.srt.models.kimi_k3_rocm_quant import (
+                    densify_quark_mxfp4_shared_experts,
+                )
+
+                densify_quark_mxfp4_shared_experts(self.shared_experts)
             mods = [
                 self.shared_experts.gate_up_proj,
                 self.gate,
