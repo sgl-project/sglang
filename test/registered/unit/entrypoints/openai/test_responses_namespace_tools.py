@@ -13,7 +13,6 @@ from utils import (
 )
 
 from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
-from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -59,26 +58,33 @@ def _request(**kwargs) -> ResponsesRequest:
     return ResponsesRequest(**payload)
 
 
+def _muse_serving():
+    serving = make_serving()
+    serving.tool_call_parser = "muse"
+    return serving
+
+
 class NamespaceToolChatToolsTestCase(CustomTestCase):
     def test_function_tool_keeps_defer_loading(self):
         """``defer_loading`` on a Responses function tool used to be dropped while
         parsing the request, so the chat template rendered a deferred tool in full."""
-        tools = OpenAIServingResponses._response_tools_to_chat_tools(_request())
+        tools = _muse_serving()._response_tools_to_chat_tools(_request())
         by_name = {tool.function.name: tool.function for tool in tools}
         self.assertTrue(by_name["lookup"].defer_loading)
 
     def test_namespace_members_are_registered_under_qualified_names(self):
         """The tool-call parser only accepts registered names, and the model calls
         namespace members as ``<namespace>.<function>``."""
-        tools = OpenAIServingResponses._response_tools_to_chat_tools(_request())
+        tools = _muse_serving()._response_tools_to_chat_tools(_request())
         self.assertEqual(
             [tool.function.name for tool in tools], ["browser.search", "lookup"]
         )
 
 
 class NamespaceToolTemplateTestCase(CustomTestCase):
-    def _template_tools(self, request):
+    def _template_tools(self, request, tool_call_parser="muse"):
         serving = make_serving()
+        serving.tool_call_parser = tool_call_parser
         serving.template_manager.chat_template_name = None
         serving.template_manager.jinja_template_content_format = "string"
         serving._prompt_text_round_trip_is_lossy = False
@@ -130,6 +136,45 @@ class NamespaceToolTemplateTestCase(CustomTestCase):
         self.assertEqual(tool["function"]["name"], "lookup")
         self.assertTrue(tool["function"]["defer_loading"])
 
+    def test_non_muse_keeps_existing_function_and_custom_tool_schemas(self):
+        """Muse-only metadata must not change another model's rendered tools."""
+        custom = {
+            "type": "custom",
+            "name": "execute",
+            "description": "Execute a command.",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": 'start: "pwd"',
+            },
+        }
+        function = {k: v for k, v in LOOKUP.items() if k != "defer_loading"}
+        for parser in (None, "qwen25", "llama3"):
+            with self.subTest(parser=parser):
+                expected = self._template_tools(
+                    _request(tools=[function, custom]), parser
+                )
+                self.assertEqual(
+                    [tool["function"]["name"] for tool in expected],
+                    ["lookup", "execute"],
+                )
+                self.assertEqual(
+                    expected[1]["function"]["parameters"]["required"], ["input"]
+                )
+                for namespaces in ([], [BROWSER]):
+                    with self.subTest(namespaces=bool(namespaces)):
+                        actual = self._template_tools(
+                            _request(
+                                tools=[
+                                    *namespaces,
+                                    LOOKUP,
+                                    {**custom, "defer_loading": True},
+                                ]
+                            ),
+                            parser,
+                        )
+                        self.assertEqual(actual, expected)
+
     def test_namespace_does_not_hide_custom_tool_schema(self):
         """Adding a namespace must not remove a custom tool from the prompt."""
         for tool_format in (
@@ -163,43 +208,68 @@ class NamespaceToolCallOutputTestCase(CustomTestCase):
         '[{"name": "browser.search", "parameters": {"query": "news"}},'
         ' {"name": "lookup", "parameters": {"query": "C123"}}]'
     )
+    QWEN_RAW = (
+        '<tool_call>\n{"name": "browser.search", "arguments": {"query": "news"}}\n</tool_call>'
+        '\n<tool_call>\n{"name": "lookup", "arguments": {"query": "C123"}}\n</tool_call>'
+    )
 
-    def _serving(self):
+    def _serving(self, parser=None):
         serving = make_serving()
         serving.reasoning_parser = None
-        serving.tool_call_parser = None
+        serving.tool_call_parser = parser
         return serving
 
-    def _assert_split(self, items):
+    def _assert_unsplit(self, items):
         search, lookup = items
         self.assertEqual(search["type"], "function_call")
-        self.assertEqual((search["namespace"], search["name"]), ("browser", "search"))
+        self.assertEqual(search["name"], "browser.search")
+        self.assertNotIn("namespace", search)
+        self.assertEqual(json.loads(search["arguments"]), {"query": "news"})
         self.assertEqual(lookup["name"], "lookup")
         self.assertNotIn("namespace", lookup)
 
-    def test_full_response_reports_namespace_and_function_name(self):
-        """Responses clients route a namespace member's call by ``namespace`` plus
-        the bare ``name``, not the flattened call name the model emits."""
-        items = self._serving()._make_response_output_items(
-            _request(tool_choice="required"),
-            self.RAW,
-            tokenizer=None,
-            require_reasoning=False,
-        )
-        self._assert_split([item.model_dump(exclude_none=True) for item in items])
+    def test_non_muse_full_response_keeps_dotted_function_names(self):
+        """A namespace must not rename another model's ordinary function calls."""
+        for parser in (None, "qwen25"):
+            with self.subTest(parser=parser):
+                items = self._serving(parser)._make_response_output_items(
+                    _request(
+                        tools=[BROWSER, {**LOOKUP, "name": "browser.search"}, LOOKUP],
+                        tool_choice="required",
+                    ),
+                    self.RAW if parser is None else self.QWEN_RAW,
+                    tokenizer=None,
+                    require_reasoning=False,
+                )
+                self._assert_unsplit(
+                    [item.model_dump(exclude_none=True) for item in items]
+                )
 
-    def test_stream_reports_namespace_and_function_name(self):
-        raw = '[{"name": "browser.search", "parameters": {"query": "news"}}]'
-        request = _request(tool_choice="required", stream=True)
-        events = StreamFixture(self._serving(), request).run(
-            [engine_chunk(raw[:30]), engine_chunk(raw, 2, finish=True)]
+    def test_non_muse_stream_keeps_dotted_function_names(self):
+        request = _request(
+            tools=[BROWSER, {**LOOKUP, "name": "browser.search"}, LOOKUP],
+            tool_choice="required",
+            stream=True,
         )
-        pairs = list(zip(event_types(events), event_payloads(events)))
-        items = [p["item"] for t, p in pairs if t.startswith("response.output_item.")]
-        items += find_completed_event(events)["response"]["output"]
-        self.assertEqual(len(items), 3)
-        for item in items:
-            self.assertEqual((item["namespace"], item["name"]), ("browser", "search"))
+        for parser in (None, "qwen25"):
+            with self.subTest(parser=parser):
+                raw = (
+                    '[{"name": "browser.search", "parameters": {"query": "news"}}]'
+                    if parser is None
+                    else self.QWEN_RAW.split("\n<tool_call>")[0]
+                )
+                events = StreamFixture(self._serving(parser), request).run(
+                    [engine_chunk(raw[:30]), engine_chunk(raw, 2, finish=True)]
+                )
+                pairs = list(zip(event_types(events), event_payloads(events)))
+                items = [
+                    p["item"] for t, p in pairs if t.startswith("response.output_item.")
+                ]
+                items += find_completed_event(events)["response"]["output"]
+                self.assertEqual(len(items), 3)
+                for item in items:
+                    self.assertEqual(item["name"], "browser.search")
+                    self.assertNotIn("namespace", item)
 
     def test_muse_calls_accept_flat_and_wrapped_namespace_members(self):
         """Both member shapes accepted by Muse's template must parse and split.
@@ -217,8 +287,7 @@ class NamespaceToolCallOutputTestCase(CustomTestCase):
         for member in (function, {"type": "function", "function": function}):
             with self.subTest(member=member):
                 request = _request(tools=[{**BROWSER, "tools": [member]}])
-                serving = self._serving()
-                serving.tool_call_parser = "muse"
+                serving = self._serving("muse")
                 tools = serving._response_tools_to_chat_tools(request)
                 self.assertEqual(
                     [tool.function.name for tool in tools], ["browser.search"]
@@ -232,17 +301,25 @@ class NamespaceToolCallOutputTestCase(CustomTestCase):
                 events = StreamFixture(serving, request).run(
                     [engine_chunk(raw[:70]), engine_chunk(raw, 2, finish=True)]
                 )
-                (streamed,) = find_completed_event(events)["response"]["output"]
-                for item in (full, streamed):
+                pairs = list(zip(event_types(events), event_payloads(events)))
+                streamed = [
+                    p["item"] for t, p in pairs if t.startswith("response.output_item.")
+                ]
+                streamed += find_completed_event(events)["response"]["output"]
+                self.assertEqual(len(streamed), 3)
+                for item in (full, *streamed):
                     self.assertEqual(item["type"], "function_call")
                     self.assertEqual(
                         (item["namespace"], item["name"]), ("browser", "search")
                     )
-                    self.assertEqual(json.loads(item["arguments"]), {"query": "news"})
+                    if item["status"] == "completed":
+                        self.assertEqual(
+                            json.loads(item["arguments"]), {"query": "news"}
+                        )
 
 
 class NamespaceToolCallReplayTestCase(CustomTestCase):
-    def test_replayed_call_is_rejoined_for_the_template(self):
+    def test_replayed_call_is_rejoined_only_for_muse(self):
         """The template and the tool-call parser know the call as
         ``<namespace>.<function>``; a replayed item carries the two separately."""
         request = _request(
@@ -263,14 +340,19 @@ class NamespaceToolCallReplayTestCase(CustomTestCase):
                 },
             ]
         )
-        messages = [
-            OpenAIServingResponses._normalize_response_message_for_chat(item)
-            for item in request.input[1:]
-        ]
-        self.assertEqual(
-            [m["tool_calls"][0]["function"]["name"] for m in messages],
-            ["browser.search", "lookup"],
-        )
+        for parser in ("muse", None, "qwen25"):
+            with self.subTest(parser=parser):
+                serving = make_serving()
+                serving.tool_call_parser = parser
+                messages = serving._construct_input_messages(request)
+                self.assertEqual(
+                    [
+                        call["function"]["name"]
+                        for message in messages
+                        for call in message.get("tool_calls", [])
+                    ],
+                    ["browser.search" if parser == "muse" else "search", "lookup"],
+                )
 
 
 if __name__ == "__main__":
