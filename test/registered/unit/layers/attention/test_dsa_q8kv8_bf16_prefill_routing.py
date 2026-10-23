@@ -39,6 +39,12 @@ def _make_backend(prefill_impl: str, *, fp8_kv_cache: bool):
         ("flashmla_sparse_q8", False, ForwardMode.DECODE, PAGED),
         ("flashmla_sparse_q8", False, ForwardMode.TARGET_VERIFY, PAGED),
         ("flashmla_sparse_q8", False, ForwardMode.DRAFT_EXTEND_V2, PAGED),
+        # --enable-mixed-chunk batches: MIXED answers like EXTEND.
+        ("flashmla_sparse", True, ForwardMode.MIXED, RAGGED),
+        ("flashmla_sparse", False, ForwardMode.MIXED, PAGED),
+        ("flashmla_sparse_q8", False, ForwardMode.MIXED, RAGGED),
+        ("triton_sparse_mla", True, ForwardMode.MIXED, RAGGED),
+        ("flashmla_kv", True, ForwardMode.MIXED, PAGED),
     ],
 )
 def test_topk_transform_method(prefill_impl, fp8_kv_cache, forward_mode, expected):
@@ -82,17 +88,10 @@ def test_q8_validator_rejects_unsupported_configs(
         )
 
 
-@pytest.mark.parametrize(
-    "extra",
-    [
-        pytest.param({"hisparse_enabled": True}, id="hisparse"),
-        pytest.param({"mixed_chunk_enabled": True}, id="mixed_chunk"),
-    ],
-)
-def test_q8_validator_rejects_combinations_that_used_to_fail_mid_forward(extra):
-    """Both used to surface only once a batch of the wrong shape was formed --
-    HiSparse as an UnboundLocalError, mixed chunks as a NotImplementedError
-    hours into serving. The launch flags are visible at construction."""
+def test_q8_validator_rejects_hisparse():
+    """Used to surface only once a batch of the wrong shape was formed, as an
+    UnboundLocalError hours into serving; the launch flag is visible at
+    construction."""
     kwargs = dict(
         prefill_impl="flashmla_sparse_q8",
         decode_impl="tilelang",
@@ -100,8 +99,8 @@ def test_q8_validator_rejects_combinations_that_used_to_fail_mid_forward(extra):
         kv_cache_store_fp8=False,
         qk_rope_head_dim=0,
         device_sm_major=9,
+        hisparse_enabled=True,
     )
-    kwargs.update(extra)
     with pytest.raises(ValueError):
         _validate_flashmla_sparse_q8_backend(**kwargs)
 
