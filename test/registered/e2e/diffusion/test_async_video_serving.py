@@ -219,7 +219,7 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
         assert job["status"] == "failed" and job["progress"] < 100, job
     call("GET", "/health")
     if mode == "batch2":
-        assert "Processed native grouped batch" in ctx.stdout_file.read_text()
+        assert "Processed dynamic batch of 2/2" in ctx.stdout_file.read_text()
 
 
 if __name__ == "__main__":
