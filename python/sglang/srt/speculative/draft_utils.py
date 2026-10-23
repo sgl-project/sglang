@@ -1,3 +1,6 @@
+from typing import Optional
+
+from sglang.srt.layers.attention.qsa.config import QSAProfile
 from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -31,11 +34,13 @@ class DraftBackendFactory:
         topk: int,
         speculative_num_steps: int,
         seed_dsa_topk_from_draft_extend: bool = False,
+        qsa_profile: Optional[QSAProfile] = None,
     ):
         self.draft_model_runner = draft_model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.seed_dsa_topk_from_draft_extend = seed_dsa_topk_from_draft_extend
+        self.qsa_profile = qsa_profile
         # The draft runner's own backend, not the process-wide config.
         self.draft_attn_backend = draft_model_runner.draft_attention_backend
 
@@ -81,6 +86,9 @@ class DraftBackendFactory:
         if self.speculative_num_steps <= 1:
             return None
 
+        if self.qsa_profile is not None:
+            return self._create_qwen_qsa_decode_backend()
+
         # Returns a per-step CONTAINER, not an AttentionBackend, so
         # attn_backend_wrapper_for_draft_extend cannot give it a conv sidecar.
         _assert_draft_needs_no_conv_sidecar(self.draft_model_runner)
@@ -89,6 +97,7 @@ class DraftBackendFactory:
             "flashinfer": self._create_flashinfer_decode_backend,
             "triton": self._create_triton_decode_backend,
             "intel_amx": self._create_intel_amx_decode_backend,
+            "intel_xpu": self._create_intel_xpu_decode_backend,
             "aiter": self._create_aiter_decode_backend,
             "fa3": self._create_fa3_decode_backend,
             "hybrid_linear_attn": self._create_hybrid_linear_attn_decode_backend,
@@ -96,7 +105,6 @@ class DraftBackendFactory:
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
             "cutedsl_mla": self._create_cutedsl_mla_decode_backend,
-            "tokenspeed_mla": self._create_tokenspeed_mla_decode_backend,
             "dsa": self._create_dsa_decode_backend,
             "nsa": self._create_dsa_decode_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_decode_backend,
@@ -112,10 +120,14 @@ class DraftBackendFactory:
         )
 
     def create_draft_extend_backend(self):
+        if self.qsa_profile is not None:
+            return self._create_qwen_qsa_draft_extend_backend()
+
         backend_map = {
             "flashinfer": self._create_flashinfer_prefill_backend,
             "triton": self._create_triton_prefill_backend,
             "intel_amx": self._create_intel_amx_prefill_backend,
+            "intel_xpu": self._create_intel_xpu_prefill_backend,
             "aiter": self._create_aiter_prefill_backend,
             "fa3": self._create_fa3_prefill_backend,
             "hybrid_linear_attn": self._create_hybrid_linear_attn_prefill_backend,
@@ -124,7 +136,6 @@ class DraftBackendFactory:
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
             # cute-dsl MLA only supports decode; draft-extend falls back to trtllm-gen.
             "cutedsl_mla": self._create_trtllm_mla_prefill_backend,
-            "tokenspeed_mla": self._create_tokenspeed_mla_prefill_backend,
             "dsa": self._create_dsa_prefill_backend,
             "nsa": self._create_dsa_prefill_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_prefill_backend,
@@ -155,6 +166,35 @@ class DraftBackendFactory:
             )
             wrapped.decode_attention_backend_str = backend.decode_attention_backend_str
         return wrapped
+
+    @staticmethod
+    def _stamp_qsa(backend) -> None:
+        backend.prefill_attention_backend_str = "qsa"
+        backend.decode_attention_backend_str = "qsa"
+
+    def _create_qwen_qsa_draft_extend_backend(self):
+        from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+            QwenSparseAttnBackend,
+        )
+
+        # The draft is full-attention only: give it a QSA backend of its own
+        # instead of the hybrid wrapper whose linear side has no draft layers.
+        backend = QwenSparseAttnBackend(self.draft_model_runner)
+        self._stamp_qsa(backend)
+        return backend
+
+    def _create_qwen_qsa_decode_backend(self):
+        from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+            QwenSparseMultiStepDraftBackend,
+        )
+
+        backend = QwenSparseMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+        self._stamp_qsa(backend)
+        for child in backend.attn_backends:
+            self._stamp_qsa(child)
+        return backend
 
     def _create_dsa_decode_backend(self):
         from sglang.srt.layers.attention.dsa_backend import (
@@ -244,6 +284,16 @@ class DraftBackendFactory:
         if is_blackwell():
             return self._create_triton_prefill_backend()
         return self._create_fa3_prefill_backend()
+
+    def _create_intel_xpu_decode_backend(self):
+        from sglang.srt.layers.attention.xpu_backend import XPUMultiStepDraftBackend
+
+        return (
+            "intel_xpu",
+            XPUMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            ),
+        )
 
     def _create_aiter_decode_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterMultiStepDraftBackend
@@ -342,23 +392,6 @@ class DraftBackendFactory:
             ),
         )
 
-    def _create_tokenspeed_mla_decode_backend(self):
-        if not self.draft_model_runner.use_mla_backend:
-            raise ValueError(
-                "tokenspeed_mla backend requires MLA model (use_mla_backend=True)."
-            )
-
-        from sglang.srt.layers.attention.tokenspeed_mla_backend import (
-            TokenspeedMLAMultiStepDraftBackend,
-        )
-
-        return (
-            "tokenspeed_mla",
-            TokenspeedMLAMultiStepDraftBackend(
-                self.draft_model_runner, self.topk, self.speculative_num_steps
-            ),
-        )
-
     def _create_ascend_decode_backend(self):
         from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
             AscendAttnMultiStepDraftBackend,
@@ -389,8 +422,8 @@ class DraftBackendFactory:
                 DeepseekV4MultiStepBackend,
             )
         else:
-            from sglang.srt.layers.attention.deepseek_v4_backend import (
-                DeepseekV4MultiStepBackend,
+            from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+                create_deepseek_v4_multistep_backend as DeepseekV4MultiStepBackend,
             )
 
         return (
@@ -432,6 +465,14 @@ class DraftBackendFactory:
         from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
 
         return ("intel_amx", IntelAMXAttnBackend(self.draft_model_runner))
+
+    def _create_intel_xpu_prefill_backend(self):
+        from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+        return (
+            "intel_xpu",
+            XPUAttentionBackend(self.draft_model_runner, skip_prefill=False),
+        )
 
     def _create_aiter_prefill_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -481,21 +522,6 @@ class DraftBackendFactory:
             TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False),
         )
 
-    def _create_tokenspeed_mla_prefill_backend(self):
-        if not self.draft_model_runner.use_mla_backend:
-            raise ValueError(
-                "tokenspeed_mla backend requires MLA model (use_mla_backend=True)."
-            )
-
-        from sglang.srt.layers.attention.tokenspeed_mla_backend import (
-            TokenspeedMLABackend,
-        )
-
-        return (
-            "tokenspeed_mla",
-            TokenspeedMLABackend(self.draft_model_runner, skip_prefill=False),
-        )
-
     def _create_ascend_prefill_backend(self):
         from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
             AscendAttnBackend,
@@ -529,11 +555,13 @@ class DraftBackendFactory:
                 "dsv4",
                 DeepseekV4HipRadixBackend(self.draft_model_runner, skip_prefill=False),
             )
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DeepseekV4AttnBackend,
+        from sglang.srt.layers.attention.deepseek_v4_trtllm_backend import (
+            create_deepseek_v4_attn_backend,
         )
 
         return (
             "dsv4",
-            DeepseekV4AttnBackend(self.draft_model_runner, skip_prefill=False),
+            create_deepseek_v4_attn_backend(
+                self.draft_model_runner, skip_prefill=False
+            ),
         )

@@ -4,7 +4,8 @@ python offline_batch_inference_vlm.py --model-path Qwen/Qwen2-VL-7B-Instruct
 """
 
 import argparse
-import dataclasses
+
+import msgspec
 
 import sglang as sgl
 from sglang.srt.parser.conversation import chat_templates
@@ -14,7 +15,7 @@ from sglang.srt.server_args import ServerArgs
 def main(
     server_args: ServerArgs,
 ):
-    vlm = sgl.Engine(**dataclasses.asdict(server_args))
+    vlm = sgl.Engine(**msgspec.structs.asdict(server_args))
 
     conv = chat_templates[server_args.chat_template].copy()
     image_token = conv.image_token

@@ -134,6 +134,11 @@ class TestMoriHiSparseTransfer(unittest.TestCase):
             b"1024",
             b"",
             b"",
+            # DCP size, DCP rank, state layer ids, kv layer ids (unset)
+            b"",
+            b"",
+            b"",
+            b"",
             b"mem-kinds",
             b"item-lens",
             b"kv-groups",
@@ -365,6 +370,7 @@ class TestMoriHiSparseTransfer(unittest.TestCase):
     def test_transfer_plan_splits_at_registration_boundaries(self):
         manager = object.__new__(MoriKVManager)
         manager.engine = MagicMock()
+        manager._submission_local = SimpleNamespace(statuses=None)
         manager.engine.allocate_transfer_uid.side_effect = [11, 12, 13]
         manager.engine.batch_write.side_effect = [["s0"], ["s1"], ["s2"]]
         src = SimpleNamespace(size=300)

@@ -7,14 +7,16 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.ngram_embedding import update_token_table
+from sglang.kernels.ops.embeddings.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_schedule
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.engram import EngramHasher
+    from sglang.srt.layers.engram_staging import EngramRowStager
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -24,7 +26,9 @@ class NgramEmbeddingManager:
     enabled: bool
     table: Optional[torch.Tensor]
     n: int
-    k: int
+    # Draft runners have no hasher even when their config has engram layers.
+    engram_hasher: Optional[EngramHasher] = None
+    engram_stager: Optional[EngramRowStager] = None
 
     @classmethod
     def from_model(
@@ -33,13 +37,10 @@ class NgramEmbeddingManager:
         model: torch.nn.Module,
         model_config: ModelConfig,
         req_to_token_pool: ReqToTokenPool,
-        server_args: ServerArgs,
         max_running_requests: int,
         device: str,
     ):
         token_table = None
-        ngram_embedding_n = 0
-        ngram_embedding_k = 0
         use_ngram_embedding = model_config.use_ngram_embedding
         if use_ngram_embedding:
             from sglang.srt.layers.n_gram_embedding import NgramEmbedding
@@ -52,22 +53,35 @@ class NgramEmbeddingManager:
                 device=device,
             )
             chunked_prefill_size = get_schedule().chunked_prefill_size
-            assert (
-                chunked_prefill_size is not None and chunked_prefill_size > 0
-            ), "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"
+            assert chunked_prefill_size is not None and chunked_prefill_size > 0, (
+                "Ngram embedding requires chunked prefill to be enabled (chunked_prefill_size > 0)"
+            )
             for module in model.modules():
                 if isinstance(module, NgramEmbedding):
                     module.init_buffers(
                         max_running_requests, chunked_prefill_size, device
                     )
-            hf_config = model_config.hf_config
-            ngram_embedding_n = hf_config.ngram_embedding_n
-            ngram_embedding_k = hf_config.ngram_embedding_k
+        engram_hasher = engram_stager = None
+        if model_config.use_engram:
+            from sglang.srt.layers.engram import EngramHasher
+
+            for module in model.modules():
+                if isinstance(module, EngramHasher):
+                    assert engram_hasher is None, "one engram hasher per model"
+                    module.init_history(req_to_token_pool.req_to_token.shape[0], device)
+                    engram_hasher = module
+            if engram_hasher is not None:
+                from sglang.srt.layers.engram_staging import EngramRowStager
+
+                engram_stager = EngramRowStager.from_model(
+                    model, engram_hasher, torch.device(device)
+                )
         return cls(
             enabled=use_ngram_embedding,
             table=token_table,
-            n=ngram_embedding_n,
-            k=ngram_embedding_k,
+            n=model_config.ngram_embedding_n,
+            engram_hasher=engram_hasher,
+            engram_stager=engram_stager,
         )
 
     def update_after_decode(
@@ -87,23 +101,43 @@ class NgramEmbeddingManager:
             batch_size=forward_batch.batch_size,
         )
 
+    def update_after_verify(
+        self,
+        *,
+        verify_ids_2d: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        if self.engram_hasher is None:
+            return
+        self.engram_hasher.commit_after_verify(
+            verify_ids_2d, req_pool_indices, commit_lens
+        )
+
     def prepare_for_forward(
         self,
         batch: Optional[ScheduleBatch],
         *,
         chunked_req: Optional[Req],
     ) -> Optional[ScheduleBatch]:
-        """Fill the token table for ngram embedding before a forward pass."""
-        if batch is None or not self.enabled:
+        """Fill the ngram token table and engram history before a forward pass."""
+        if batch is None:
+            return batch
+        if self.engram_hasher is not None:
+            self._prepare_engram_history(batch)
+        if self.engram_stager is not None:
+            batch.engram_staged_rows = self.engram_stager.stage(batch)
+        if not self.enabled:
             return batch
         batch.ne_token_table = self.table
         if batch.forward_mode == ForwardMode.EXTEND:
             all_tokens = []
             column_starts = []
             request_lengths = []
-            for req in batch.reqs:
-                start = len(req.prefix_indices)
-                end = start + req.extend_range.length
+            for req, start, extend_len in zip(
+                batch.reqs, batch.prefix_lens, batch.extend_lens, strict=True
+            ):
+                end = start + extend_len
                 fill_ids = req.origin_input_ids + req.output_ids
                 if start == 0:
                     tokens = fill_ids[start:end]
@@ -145,6 +179,43 @@ class NgramEmbeddingManager:
                     else None
                 )
         return batch
+
+    def _prepare_engram_history(self, batch: ScheduleBatch) -> None:
+        """Refresh extend predecessors after prefix hits, retraction, or slot reuse."""
+        n1 = self.engram_hasher.max_ngram_size - 1
+        if batch.forward_mode.is_prebuilt():
+            # PD decode runs no EXTEND for this request, so the row its first
+            # DECODE reads is written here: the n - 1 tokens before the one
+            # prefill sampled, which is the token decode feeds next.
+            history = self.engram_hasher.history
+            rows = []
+            for req in batch.reqs:
+                # full_untruncated_fill_ids is only refreshed on the extend and
+                # decode paths, which a PD decode request has not run yet.
+                # Slice the tail first: origin_input_ids can be ~100k tokens.
+                tail = (req.origin_input_ids[-(n1 + 1) :] + req.output_ids)[-(n1 + 1) :]
+                rows.append(self.engram_hasher.history_row(tail[:-1]))
+            # Pinned copies keep the admission fence from stalling the CPU.
+            slots = async_h2d(
+                [req.kv.req_pool_idx for req in batch.reqs],
+                dtype=torch.int64,
+                device=history.device,
+            )
+            history[slots] = async_h2d(
+                rows, dtype=history.dtype, device=history.device
+            ).view(len(rows), n1)
+            return
+        if not batch.forward_mode.is_extend_without_speculative():
+            return
+        rows = []
+        for req, start in zip(batch.reqs, batch.prefix_lens, strict=True):
+            lo = max(0, start - n1)
+            ids = req.full_untruncated_fill_ids[lo:start]
+            rows.append(self.engram_hasher.history_row(ids))
+        # The forward stream waits on the schedule stream, which orders this copy.
+        batch.engram_history = async_h2d(
+            rows, dtype=torch.int32, device=self.engram_hasher.history.device
+        ).view(len(rows), n1)
 
 
 def update_ngram_token_table_after_sampling(

@@ -83,6 +83,10 @@ def _make_manager(requires_dcp_relayout: bool = False) -> MooncakeKVManager:
     transfer primitive underneath it is stubbed.
     """
     manager = object.__new__(MooncakeKVManager)
+    manager.state_layout_rejections = {}
+    manager._deferred_ack_targets = {}
+    manager._deferred_ack_poisoned_rooms = set()
+    manager._dcp_pack_buffers = None
     manager.enable_trace = False
     manager.enable_staging = False
     manager.enable_deferred_decode_kv_release = False

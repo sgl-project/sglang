@@ -21,7 +21,6 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -29,6 +28,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     write_github_step_summary,
 )
 
@@ -129,7 +129,7 @@ class TestDeepSeekR1HiCacheMI35x(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "process", None) is not None:
-            kill_process_tree(cls.process.pid)
+            terminate_and_kill_process_tree(cls.process)
         if getattr(cls, "l3_storage_dir", None):
             shutil.rmtree(cls.l3_storage_dir, ignore_errors=True)
 

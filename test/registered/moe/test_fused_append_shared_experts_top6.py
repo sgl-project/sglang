@@ -21,7 +21,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -100,6 +100,31 @@ class TestFusedAppendSharedExpertsTop6(CustomTestCase):
         )
         self.assertTrue(torch.equal(got_ids[:, :k], topk_ids))
         self.assertTrue(torch.allclose(got_w[:, :k], topk_weights))
+
+    def test_padded_rows(self):
+        m, k, s = 8, 6, 2
+        topk_ids, topk_weights = self._make_inputs(m, k)
+        for valid_rows in (0, 3, m):
+            with self.subTest(valid_rows=valid_rows):
+                num_token_non_padded = torch.tensor(
+                    [valid_rows], dtype=torch.int32, device=topk_ids.device
+                )
+                got_ids, got_w = fused_append_shared_experts(
+                    topk_ids,
+                    topk_weights,
+                    s,
+                    0.5,
+                    N=self.N_BASE,
+                    num_token_non_padded=num_token_non_padded,
+                )
+                exp_ids, exp_w = _reference_append(
+                    topk_ids, topk_weights, s, 0.5, self.N_BASE
+                )
+                exp_ids[valid_rows:, :k] = 0
+                exp_w[valid_rows:] = 0
+
+                self.assertTrue(torch.equal(got_ids, exp_ids))
+                self.assertTrue(torch.equal(got_w, exp_w))
 
     def test_no_shared_experts_is_noop(self):
         """s == 0 returns the inputs untouched (no kernel launch)."""

@@ -16,33 +16,6 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class TestLocalVerifyTierNumTokens(CustomTestCase):
-    def test_no_budget_returns_sentinel(self):
-        self.assertEqual(
-            local_verify_tier_num_tokens(
-                bs=8,
-                verify_token_budget=None,
-                verify_num_draft_tokens=6,
-                min_verify_len=1,
-            ),
-            -1,
-        )
-
-    def test_budget_adds_to_anchor_floor(self):
-        self.assertEqual(
-            local_verify_tier_num_tokens(
-                bs=8,
-                verify_token_budget=10,
-                verify_num_draft_tokens=6,
-                min_verify_len=1,
-            ),
-            18,
-        )
-
-    # Clamp/floor variants (verify-all clamp, min_verify_len floor, min=0) are
-    # covered by the TestBusyIdleGraphKeyIdentity sweep bounds.
-
-
 class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
     def test_any_sentinel_pins_everyone(self):
         # The sweep never emits a -1 contribution, so this is the only guard
@@ -62,12 +35,15 @@ class TestDraftDpSyncMetadata(CustomTestCase):
             num_tokens_for_logprob_per_req=1,
         )
         proposer.draft_model_runner = SimpleNamespace(device="cpu")
+        proposer._num_token_non_padded = torch.empty((1,), dtype=torch.int32)
 
         forward_batch = SimpleNamespace(input_ids=torch.arange(6))
         batch = SimpleNamespace(
             global_num_tokens=[1, 3, 0, 2],
             global_num_tokens_for_logprob=[1, 3, 0, 2],
-            can_run_dp_cuda_graph=True,
+            can_run_decode_cuda_graph=True,
+            is_extend_in_batch=False,
+            dp_spec_prefill_coordination_applied=False,
         )
 
         with patch(
@@ -81,10 +57,17 @@ class TestDraftDpSyncMetadata(CustomTestCase):
             [1, 3, 0, 2],
         )
         self.assertEqual(forward_batch.global_num_tokens_cpu, [6, 18, 0, 12])
+        # The LOCAL count reuses the proposer's persistent buffer; the GLOBAL
+        # count is the invariant every DP rank agrees on.
+        self.assertIs(
+            forward_batch.num_token_non_padded, proposer._num_token_non_padded
+        )
         self.assertEqual(forward_batch.num_token_non_padded.item(), 6)
-        self.assertEqual(forward_batch.num_token_non_padded.dtype, torch.int32)
         self.assertEqual(forward_batch.num_token_non_padded_cpu, 6)
-        self.assertTrue(forward_batch.can_run_dp_cuda_graph)
+        self.assertEqual(forward_batch.global_num_token_non_padded.item(), 6)
+        self.assertEqual(forward_batch.global_num_token_non_padded.dtype, torch.int32)
+        self.assertEqual(forward_batch.global_num_token_non_padded_cpu, 6)
+        self.assertTrue(forward_batch.can_run_decode_cuda_graph)
 
 
 class TestBusyIdleGraphKeyIdentity(CustomTestCase):

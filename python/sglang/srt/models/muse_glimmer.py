@@ -13,7 +13,7 @@
 # ==============================================================================
 
 import logging
-import re
+from array import array
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -48,8 +48,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -57,14 +57,24 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.utils import apply_qk_norm, permute_inv
+from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, permute_inv
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import add_prefix, is_cpu, is_cuda
 
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
 
 if _is_cuda:
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+elif _is_cpu:
+    _fused_sigmoid_mul_cpu = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
+
+    def fused_sigmoid_mul(x, gate, inplace=True):
+        if not inplace:
+            x = x.clone()
+        _fused_sigmoid_mul_cpu(x, gate)
+        return x
+
 
 logger = logging.getLogger(__name__)
 
@@ -84,22 +94,26 @@ _VISION_NAME_FRAGMENTS = (
     "perception_emb_norm",
 )
 
-# Vendor tensor names -> this port's; applied simultaneously.
-_VENDOR_RENAMES = {
-    "post_attention_layernorm": "post_attn_norm",
-    "pre_feedforward_layernorm": "post_attention_layernorm",
-    "post_feedforward_layernorm": "post_ffn_norm",
-    "self_attn.gate_proj": "self_attn.output_gate_proj",
-}
-
-_VENDOR_RENAME_RE = re.compile("|".join(re.escape(key) for key in _VENDOR_RENAMES))
+# Shared by _vendor_weight_name and hf_to_sglang_mapper;
+# a rule missing from one silently breaks the other.
+_VENDOR_TO_SGLANG = WeightsMapper(
+    orig_to_new_prefix={
+        "model.language_model.": "model.",
+        # The vision modules hang off the entry class, not off ``model``.
+        "model.vision_": "vision_",
+    },
+    # Only the first matching substring is applied; keep these non-overlapping.
+    orig_to_new_substr={
+        "post_attention_layernorm": "post_attn_norm",
+        "pre_feedforward_layernorm": "post_attention_layernorm",
+        "post_feedforward_layernorm": "post_ffn_norm",
+        "self_attn.gate_proj": "self_attn.output_gate_proj",
+    },
+)
 
 
 def _vendor_weight_name(name: str) -> str:
-    name = name.replace("model.language_model.", "model.", 1)
-    # The vision modules hang off the entry class, not off ``model``.
-    name = name.replace("model.vision_", "vision_", 1)
-    return _VENDOR_RENAME_RE.sub(lambda m: _VENDOR_RENAMES[m.group(0)], name)
+    return _VENDOR_TO_SGLANG.apply_list([name])[0]
 
 
 def get_attention_sliding_window_size(config) -> int:
@@ -299,7 +313,7 @@ class MuseGlimmerAttention(nn.Module):
 
         if self.use_output_gate:
             gate, _ = self.output_gate_proj(hidden_states)
-            if _is_cuda:
+            if _is_cuda or _is_cpu:
                 attn_out = fused_sigmoid_mul(attn_out, gate, inplace=True)
             else:
                 attn_out = torch.sigmoid(gate) * attn_out
@@ -522,7 +536,6 @@ class MuseGlimmerVisionPatchEmbedder(nn.Module):
 
 
 class MuseGlimmerVisionRotaryEmbedding(nn.Module):
-
     def __init__(self, head_dim: int, theta: float):
         super().__init__()
         spatial_dim = head_dim // 2
@@ -582,7 +595,8 @@ class MuseGlimmerVisionEncoderLayer(nn.Module):
         self.attn = VisionAttention(
             embed_dim=config.hidden_size,
             num_heads=config.num_attention_heads,
-            projection_size=config.hidden_size,
+            head_dim=config.head_dim,
+            projection_size=config.num_attention_heads * config.head_dim,
             use_qkv_parallel=True,
             qkv_bias=True,
             proj_bias=True,
@@ -611,7 +625,6 @@ class MuseGlimmerVisionEncoderLayer(nn.Module):
 
 
 class MuseGlimmerVisionModel(nn.Module):
-
     def __init__(
         self,
         config,
@@ -632,7 +645,7 @@ class MuseGlimmerVisionModel(nn.Module):
             prefix=add_prefix("patch_embedder", prefix),
         )
         self.rotary_emb = MuseGlimmerVisionRotaryEmbedding(
-            config.hidden_size // config.num_attention_heads, config.rope_theta
+            config.head_dim, config.rope_theta
         )
         self.ln_pre = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.layers = nn.ModuleList(
@@ -760,15 +773,16 @@ class MuseGlimmerVisionAdapter(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        sharded_size = config.padded_projector_hidden_size
         self.fc1 = ColumnParallelLinear(
             config.out_hidden_size,
-            config.projector_hidden_size,
+            sharded_size,
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("fc1", prefix),
         )
         self.fc2 = RowParallelLinear(
-            config.projector_hidden_size,
+            sharded_size,
             config.projector_hidden_size,
             bias=False,
             quant_config=quant_config,
@@ -930,6 +944,8 @@ class MuseGlimmerForCausalLM(nn.Module):
 class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):
     """Vendor multimodal HF export: the MuseGlimmerForCausalLM decoder plus the image tower."""
 
+    # Only this class reads vendor-named checkpoints, so only it needs the mapper.
+    hf_to_sglang_mapper = _VENDOR_TO_SGLANG
     checkpoint_uses_vendor_names = True
     builds_vision_tower = True
 
@@ -974,10 +990,8 @@ class MuseGlimmerForConditionalGeneration(MuseGlimmerForCausalLM):
             config.hidden_size, eps=config.rms_norm_eps, has_weight=False
         )
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
-            input_ids, mm_inputs
-        )
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = torch.cat([item.feature for item in items], dim=0)
