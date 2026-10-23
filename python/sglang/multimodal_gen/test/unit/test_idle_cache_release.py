@@ -12,6 +12,8 @@ from sglang.multimodal_gen.runtime.managers import gpu_worker as gpu_worker_modu
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
 class _Clock:
@@ -94,15 +96,26 @@ def test_without_an_idle_hook_each_request_still_releases(worker):
     assert releases == [clock.now]
 
 
-def test_idle_scheduler_sleeps_until_the_release_is_due(worker):
+@pytest.mark.parametrize(
+    "cli_args,tp_size,should_sleep",
+    [([], 1, False), (["--sleep-on-idle"], 1, True), (["--sleep-on-idle"], 2, False)],
+)
+def test_idle_scheduler_wait_policy(worker, cli_args, tp_size, should_sleep):
     worker, releases, clock = worker
     worker.defer_cache_release = True
     _finish_request(worker)
     due = clock.now + gpu_worker_module._IDLE_CACHE_RELEASE_S
+    clock.now += gpu_worker_module._IDLE_CACHE_RELEASE_S / 2
 
+    parser = FlexibleArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    parsed = parser.parse_args(["--model-path", "/fake", *cli_args])
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.server_args = SimpleNamespace(
-        sp_degree=1, tp_size=1, enable_cfg_parallel=False
+        sp_degree=1,
+        tp_size=tp_size,
+        enable_cfg_parallel=False,
+        sleep_on_idle=parsed.sleep_on_idle,
     )
     scheduler.worker = worker
     scheduler._disagg_role = RoleType.MONOLITHIC
@@ -123,8 +136,9 @@ def test_idle_scheduler_sleeps_until_the_release_is_due(worker):
     loops = []
 
     def recv_reqs():
-        # a spinning loop never advances the clock, so stop it
         loops.append(None)
+        if not should_sleep:
+            clock.now += gpu_worker_module._IDLE_CACHE_RELEASE_S / 2
         scheduler._running = len(loops) < 4
         return []
 
@@ -132,13 +146,13 @@ def test_idle_scheduler_sleeps_until_the_release_is_due(worker):
 
     def poll(timeout):
         timeouts.append(timeout)
-        if timeout is None:
+        clock.now += timeout / 1000.0
+        if len(timeouts) == 2:
             scheduler._running = False
-        else:
-            clock.now += timeout / 1000.0
 
     scheduler.recv_reqs = recv_reqs
     scheduler._poller = SimpleNamespace(poll=poll)
     scheduler.event_loop()
-    assert timeouts == [gpu_worker_module._IDLE_CACHE_RELEASE_S * 1000.0, None]
+    expected = [gpu_worker_module._IDLE_CACHE_RELEASE_S * 500.0, 1000]
+    assert timeouts == (expected if should_sleep else [])
     assert releases == [due]

@@ -1485,6 +1485,7 @@ class Scheduler(
                     not self.waiting_queue
                     and self.receiver is not None
                     and not self._is_multi_rank()
+                    and self.server_args.sleep_on_idle
                 ):
                     # Wait instead of spinning a core. Multi rank replicas keep
                     # spinning because their other ranks time their idle cache
@@ -1492,9 +1493,9 @@ class Scheduler(
                     with self._socket_lock:
                         self._poller.poll(
                             timeout=(
-                                None
+                                1000
                                 if release_wait_s is None
-                                else release_wait_s * 1000.0
+                                else min(release_wait_s * 1000.0, 1000)
                             )
                         )
                 continue

@@ -111,6 +111,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--srt-encoder-timeout {SECONDS}`: Timeout in seconds for HTTP requests to the SGLang encoder server
 - `--srt-encoder-connection-timeout {SECONDS}`: TCP connection timeout in seconds for SGLang encoder server
 - `--scheduler-rpc-timeout {SECONDS}`: optional end-to-end deadline for an internal scheduler RPC, including scheduler queue time. It is unset by default so valid long-running and queued video jobs are not failed by the transport layer. Set it only when the deployment requires a bounded request deadline; caller cancellation and server shutdown remain effective without it.
+- `--sleep-on-idle`: reduce idle scheduler CPU usage by waiting for socket events. Disabled by default, matching SRT, to minimize idle-to-active wake-up latency. Applies only to monolithic serving with one rank per DP replica; TP/SP/CFG multi-rank replicas keep polling. Each wait ends when a message arrives, a pending allocator-cache release is due, or one second elapses. Active generation is unchanged; benchmark low-QPS tail latency before enabling it in latency-sensitive deployments.
 - `--enable-trace`: export OpenTelemetry traces for the diffusion scheduler and worker stages.
 - `--otlp-traces-endpoint {HOST:PORT}`: OTLP collector endpoint used with `--enable-trace` (default: `localhost:4317`).
 - `--otlp-service-name {NAME}`: `service.name` attached to exported traces. Resolution order is this flag, `OTEL_SERVICE_NAME`, then `sglang-diffusion`.
