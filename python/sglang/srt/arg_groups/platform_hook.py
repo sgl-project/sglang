@@ -119,6 +119,13 @@ def handle_xpu_backends(server_args: Any):
                 "_handle_xpu_backends",
                 sampling_backend="intel_xpu",
             )
+        # Enable the fused qknorm + rope by default as the fused q/k-norm + RoPE kernel is a pure win here.
+        if cfg.enable_fused_qk_norm_rope is None:
+            declare_resolution(
+                server_args,
+                "_handle_xpu_backends",
+                enable_fused_qk_norm_rope=True,
+            )
         # Decode graph is opt-in on XPU: unless the user explicitly set
         # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
         # disabled so the default startup doesn't require graph capture.

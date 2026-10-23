@@ -11,7 +11,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+from sglang.kernels.ops.kvcache import dsv4_unified_kv_store
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV4_FP8_NOPE_ROW_BYTES
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -73,7 +73,7 @@ def _bf16_rope(n_rows):
 
 
 def _store(kv, pool, state_slot, positions, final_pos=None, **kw):
-    runtime.store_swa_into_unified(
+    dsv4_unified_kv_store.store_swa_into_unified(
         kv=kv,
         state_slot=state_slot,
         positions=positions,
@@ -258,7 +258,7 @@ class TestUnifiedFp8SwaScatter(CustomTestCase):
         expected = pool.clone()
         keep = loc >= 0
         expected[loc[keep].long()] = kv[keep]
-        runtime.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=pool)
+        dsv4_unified_kv_store.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=pool)
         self.assertTrue(torch.equal(pool, expected))
 
     def test_empty_batch_is_a_noop(self):

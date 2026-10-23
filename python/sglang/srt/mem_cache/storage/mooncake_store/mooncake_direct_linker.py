@@ -56,7 +56,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         *,
         components,
         storage=None,
+        forward_stream=None,
     ):
+        self.forward_stream = forward_stream
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
@@ -148,7 +150,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tuple[int, dict[str, list[PoolTransfer]], object] | None
         ] = Queue()
         self.offload_queue: Queue[
-            tuple[list[PoolTransfer], int, object, str | None] | None
+            tuple[list[PoolTransfer], int, list[object], str | None] | None
         ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
@@ -387,9 +389,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        ready_event = device_module.Event()
-        ready_event.record()
-        self.offload_queue.put((expanded, tokens, ready_event, session_id))
+        ready_events = self.record_offload_ready()
+        self.offload_queue.put((expanded, tokens, ready_events, session_id))
         return True
 
     def offload_thread_func(self) -> None:
@@ -398,8 +399,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                expanded, tokens, ready_event, session_id = task
-                ready_event.synchronize()
+                expanded, tokens, ready_events, session_id = task
+                for event in ready_events:
+                    event.synchronize()
                 extra_info = (
                     HiCacheStorageExtraInfo(extra_info={"session_id": session_id})
                     if session_id

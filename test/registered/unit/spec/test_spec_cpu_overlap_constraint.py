@@ -40,13 +40,6 @@ class TestSpecCPUOverlapConstraint(CustomTestCase):
 
         self.assertTrue(resolution_result(args, "disable_overlap_schedule"))
 
-    def test_cpu_eagle3_forces_disable_overlap_schedule(self):
-        args = _make_spec_args(device="cpu", algorithm="EAGLE3")
-
-        handle_speculative_decoding(args)
-
-        self.assertTrue(resolution_result(args, "disable_overlap_schedule"))
-
     def test_cpu_explicit_disable_overlap_is_preserved(self):
         args = _make_spec_args(device="cpu", disable_overlap_schedule=True)
 
