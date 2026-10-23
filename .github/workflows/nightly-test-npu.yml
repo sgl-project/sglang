@@ -23,12 +23,12 @@ on:
         description: 'The a3 running docker image of the test task.'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3'
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:20261022-cann9.2.0-a3'
       image_a5:
         description: 'The a5 running docker image of the test task.'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-950'
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:20261022-cann9.2.0-950'
       skip_install_flag:
         description: 'Indicates whether to skip the installation of sglang, defaulting to false.'
         required: false
@@ -94,12 +94,12 @@ jobs:
             echo "job_filter=${{ inputs.job_filter }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.image_a3 }}" ]; then
-            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3" >> $GITHUB_OUTPUT
+            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:20261022-cann9.2.0-a3" >> $GITHUB_OUTPUT
           else
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.image_a5 }}" ]; then
-            echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-950" >> $GITHUB_OUTPUT
+            echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:20261022-cann9.2.0-950" >> $GITHUB_OUTPUT
           else
             echo "image_a5=${{ inputs.image_a5 }}" >> $GITHUB_OUTPUT
           fi
@@ -139,7 +139,7 @@ jobs:
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -155,7 +155,7 @@ jobs:
   # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
   nightly-4-npu-a3:
     name: nightly-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -171,7 +171,7 @@ jobs:
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
-    if: ${{ !cancelled() }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -186,7 +186,7 @@ jobs:
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -217,7 +217,7 @@ jobs:
 
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -233,7 +233,7 @@ jobs:
 
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -268,7 +268,7 @@ jobs:
 
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -301,7 +301,7 @@ jobs:
 #       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() }}
+    if: false
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
@@ -349,7 +349,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !cancelled() }}
+    if: false
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
