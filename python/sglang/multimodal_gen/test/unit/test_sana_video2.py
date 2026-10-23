@@ -130,6 +130,32 @@ class TestSanaVideo2(unittest.TestCase):
         self.assertTrue(after.is_complex())
         torch.testing.assert_close(after, before, rtol=0, atol=0)
 
+    def test_rotary_tables_built_once_per_shape(self):
+        torch.manual_seed(18)
+        model = self.small_model()
+        uploads = []
+
+        class CountedUploads(torch.Tensor):
+            # the complex128 frequencies stay on the host; count their uploads
+            def to(self, *args, **kwargs):
+                uploads.append(args)
+                return super().to(*args, **kwargs).as_subclass(torch.Tensor)
+
+        for rope in (model.rope_linear, model.rope_softmax):
+            rope._freqs = rope._freqs.as_subclass(CountedUploads)
+        x, y, t = torch.randn(1, 4, 2, 2, 2), torch.randn(1, 5, 8), torch.tensor([20.0])
+        mask = torch.tensor([[1, 1, 1, 0, 0]])
+        with torch.no_grad():
+            first = model(x, t, y, mask)
+            steps = [model(x, t * step, y, mask) for step in (1, 2)]
+        # one upload per table for the request, not two per step
+        self.assertEqual(len(uploads), 2)
+        self.assertTrue(torch.equal(steps[0], first))
+        model._ropes_key = None
+        with torch.no_grad():
+            rebuilt = model(x, t * 2, y, mask)
+        self.assertTrue(torch.equal(steps[1], rebuilt))
+
     def test_official_checkpoint_names_and_output_sign(self):
         torch.manual_seed(17)
         model = self.small_model()
