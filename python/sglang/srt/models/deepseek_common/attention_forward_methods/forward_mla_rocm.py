@@ -136,6 +136,7 @@ if _use_aiter:
     )
 
 _gluon_mla_absorb = None
+_gluon_mla_absorb_v = None
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
@@ -155,6 +156,9 @@ if _use_aiter_gfx95:
     try:
         from sglang.kernels.ops.attention import (
             gluon_mla_absorb_rope_cache_gfx950 as _gluon_mla_absorb,
+        )
+        from sglang.kernels.ops.gemm import (
+            gluon_mla_absorb_v_gfx950 as _gluon_mla_absorb_v,
         )
     except ImportError:  # Triton without Gluon's gfx950 (cdna4) dialect
         pass
@@ -260,6 +264,8 @@ def rocm_absorb_q_bmm(
 def rocm_absorb_v_bmm(
     attn: DeepseekV2AttentionMLA,
     attn_output: torch.Tensor,
+    *,
+    decode_or_verify: bool = False,
 ) -> torch.Tensor:
     """Absorb ``attn_output @ w_vc`` (+ optional fused flatten quant) on HIP."""
     # TODO(haishaw): add bmm_fp8 to ROCm
@@ -296,19 +302,32 @@ def rocm_absorb_v_bmm(
                 device=attn_output.device,
                 dtype=torch.bfloat16,
             )
-            batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                X=attn_output,
-                WQ=attn.w_vc.transpose(-1, -2),
-                w_scale=attn.w_scale,
-                group_size=128,
-                YQ=_bmm_buf,
-                transpose_bm=True,
-                transpose_bm_in=True,
-                dtype=torch.bfloat16,
-                config=_absorb_bmm_config(
-                    attn.num_local_heads, attn_output.shape[0], attn.w_vc.shape[-1]
-                ),
-            )
+            w_vc = attn.w_vc.transpose(-1, -2)
+            if (
+                decode_or_verify
+                and attn.use_gluon_mla_decode_gfx950
+                and _gluon_mla_absorb_v is not None
+                and _gluon_mla_absorb_v.gluon_mla_absorb_v_supported(
+                    attn_output, w_vc, attn.w_scale, _bmm_buf
+                )
+            ):
+                _gluon_mla_absorb_v.gluon_mla_absorb_v(
+                    attn_output, w_vc, attn.w_scale, _bmm_buf
+                )
+            else:
+                batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+                    X=attn_output,
+                    WQ=w_vc,
+                    w_scale=attn.w_scale,
+                    group_size=128,
+                    YQ=_bmm_buf,
+                    transpose_bm=True,
+                    transpose_bm_in=True,
+                    dtype=torch.bfloat16,
+                    config=_absorb_bmm_config(
+                        attn.num_local_heads, attn_output.shape[0], attn.w_vc.shape[-1]
+                    ),
+                )
         elif not is_in_tc_piecewise_cuda_graph():
             # Same (batch, heads, dim) layout as the quantized paths above, so the
             # post-GEMM flatten is a view. Skipped under piecewise: torch dynamo
@@ -1157,7 +1176,9 @@ class DeepseekMLARocmForwardMixin:
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         else:
-            attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
+            attn_bmm_output = rocm_absorb_v_bmm(
+                self, attn_output, decode_or_verify=decode_or_verify
+            )
 
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (

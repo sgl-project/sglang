@@ -187,6 +187,57 @@ class TestGluonMlaDecodeGate(CustomTestCase):
             self.assertEqual(self.calls, ["aiter"])
 
 
+class TestGluonAbsorbVRouting(CustomTestCase):
+    """absorb_v runs the Gluon BMM only for enabled layers and supported shapes."""
+
+    def setUp(self):
+        self.calls = []
+        self.kernels = SimpleNamespace(
+            gluon_mla_absorb_v_supported=lambda *args: True,
+            gluon_mla_absorb_v=lambda *args: self.calls.append("gluon"),
+        )
+        for name, value in (
+            ("_use_aiter_gfx95", True),
+            ("_gluon_mla_absorb_v", self.kernels),
+            ("_is_block_scale_fp8", lambda layer: False),
+            ("_absorb_bmm_config", lambda *args: None),
+            (
+                "batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant",
+                lambda **kwargs: self.calls.append("aiter"),
+            ),
+        ):
+            p = mock.patch.object(forward_mla_rocm, name, value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
+        self.attn = SimpleNamespace(
+            use_gluon_mla_decode_gfx950=True,
+            num_local_heads=8,
+            w_kc=torch.empty(8, 512, 192, dtype=torch.float8_e4m3fn),
+            w_vc=torch.empty(8, 512, 256, dtype=torch.float8_e4m3fn),
+            w_scale=torch.ones(1),
+            o_proj=SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16)),
+        )
+
+    def _run(self, decode_or_verify=True):
+        self.calls.clear()
+        forward_mla_rocm.rocm_absorb_v_bmm(
+            self.attn, torch.empty(6, 8, 512), decode_or_verify=decode_or_verify
+        )
+        return self.calls
+
+    def test_routing(self):
+        self.assertEqual(self._run(), ["gluon"])
+        self.assertEqual(self._run(decode_or_verify=False), ["aiter"])
+        self.kernels.gluon_mla_absorb_v_supported = lambda *args: False
+        self.assertEqual(self._run(), ["aiter"])
+        self.kernels.gluon_mla_absorb_v_supported = lambda *args: True
+        self.attn.use_gluon_mla_decode_gfx950 = False
+        self.assertEqual(self._run(), ["aiter"])
+        self.attn.use_gluon_mla_decode_gfx950 = True
+        with mock.patch.object(forward_mla_rocm, "_gluon_mla_absorb_v", None):
+            self.assertEqual(self._run(), ["aiter"])
+
+
 class TestAbsorbBmmConfig(CustomTestCase):
     def setUp(self):
         self._saved = forward_mla_rocm._absorb_bmm_num_cu
