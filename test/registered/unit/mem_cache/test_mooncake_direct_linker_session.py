@@ -86,6 +86,30 @@ class TestLayerWiseLoadSessions(CustomTestCase):
             linker.storage.store.ended, [[f"{name}-page"] for name in POOLS]
         )
 
+    def test_sessions_start_before_the_slot_fence(self):
+        # Sessions need only keys; the slot locations wait for the GPU fence.
+        order = []
+
+        def start(keys):
+            order.append(("start", keys[0]))
+            return [0] * len(keys)
+
+        linker = _linker(start)
+        self.addCleanup(linker.session_executor.shutdown)
+        for pool in linker.pools.values():
+            pool.prepare_locations = lambda host_indices: (
+                order.append(("locations",)) or list(host_indices)
+            )
+        fence = SimpleNamespace(synchronize=lambda: order.append(("fence",)))
+        linker.load_layer_wise(0, _transfers(), fence)
+
+        self.assertEqual(linker.layer_done_counter.failures, [])
+        fence_at = order.index(("fence",))
+        self.assertCountEqual(
+            order[:fence_at], [("start", f"{name}-page") for name in POOLS]
+        )
+        self.assertEqual(order[fence_at + 1 :], [("locations",)] * len(POOLS))
+
     def test_failed_start_still_ends_the_sessions_that_started(self):
         def start(keys):
             return [1] if keys == ["index-page"] else [0]

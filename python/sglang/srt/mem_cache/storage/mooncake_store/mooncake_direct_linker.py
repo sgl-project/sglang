@@ -309,8 +309,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     return
                 counter_index, pending, ready_event = task
                 try:
-                    ready_event.synchronize()
-                    self.load_layer_wise(counter_index, list(pending.values()))
+                    self.load_layer_wise(
+                        counter_index, list(pending.values()), ready_event
+                    )
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
@@ -325,24 +326,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
 
     def load_layer_wise(
-        self, counter_index: int, request_transfers: list[list[PoolTransfer]]
+        self,
+        counter_index: int,
+        request_transfers: list[list[PoolTransfer]],
+        ready_event=None,
     ) -> None:
         started = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
                 for transfer in transfers:
-                    keys, locations = batches.setdefault(transfer.name, ([], []))
+                    keys, _ = batches.setdefault(transfer.name, ([], []))
                     component_keys, _ = self.storage._get_hybrid_page_component_keys(
                         list(transfer.keys), transfer
                     )
                     keys.extend(self.storage._tag_keys(component_keys))
-                    locations.extend(
-                        self.pools[transfer.name].prepare_locations(
-                            transfer.host_indices
-                        )
-                    )
-            # Each pool's session start is a separate master RPC; issue them together.
+            # Sessions need only the keys: start every pool's session concurrently,
+            # before waiting for the GPU work that writes the destination slots.
             session_futures = [
                 (keys, self.session_executor.submit(self._start_get_session, keys))
                 for keys, _ in batches.values()
@@ -357,6 +357,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 started.append(keys)
             if failure is not None:
                 raise failure
+            if ready_event is not None:
+                ready_event.synchronize()
+            for transfers in request_transfers:
+                for transfer in transfers:
+                    batches[transfer.name][1].extend(
+                        self.pools[transfer.name].prepare_locations(
+                            transfer.host_indices
+                        )
+                    )
 
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():
