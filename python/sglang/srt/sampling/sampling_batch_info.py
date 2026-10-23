@@ -18,6 +18,7 @@ from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_pena
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.sampling.watermarking.core import build_watermark_batch_config
 from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.watermarking.synthid import SynthIDState, get_synthid_config
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -102,17 +103,22 @@ class SamplingBatchInfo:
     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
 
-    watermark_keys: Optional[torch.Tensor] = None
-    watermark_context_windows: Optional[torch.Tensor] = None
-    watermark_enabled: Optional[torch.Tensor] = None
-    watermark_candidates_host: Optional[List[bool]] = None
-    has_watermark_candidates: bool = False
-
     # Device
     device: str = "cuda"
 
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
+
+    # Server-wide SynthID Text state. None keeps the disabled hot path allocation-free.
+    synthid_state: Optional[SynthIDState] = None
+    # Synthetic draft CUDA-graph capture keeps rejection probabilities dense so
+    # every captured step has the same static shape.
+    synthid_force_dense_draft_probs: bool = False
+    watermark_keys: Optional[torch.Tensor] = None
+    watermark_context_windows: Optional[torch.Tensor] = None
+    watermark_enabled: Optional[torch.Tensor] = None
+    watermark_candidates_host: Optional[List[bool]] = None
+    has_watermark_candidates: bool = False
 
     # Host-side eligibility for torch_npu.npu_top_k_top_p. Keeping this off the
     # device avoids a scalar synchronization in the per-token sampling path.
@@ -125,7 +131,8 @@ class SamplingBatchInfo:
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        enable_deterministic = get_exec().deterministic.enable_deterministic_inference
+        exec_config = get_exec()
+        enable_deterministic = exec_config.deterministic.enable_deterministic_inference
 
         reqs = batch.reqs
         device = batch.device
@@ -197,7 +204,7 @@ class SamplingBatchInfo:
 
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
-            get_exec().features.enable_custom_logit_processor
+            exec_config.features.enable_custom_logit_processor
             and any(r.custom_logit_processor for r in reqs)  # check the flag first.
         )  # then check the requests.
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
@@ -210,27 +217,6 @@ class SamplingBatchInfo:
         )
         from sglang.srt.managers.schedule_batch import ScheduleBatch
 
-        features = get_exec().features
-        if isinstance(batch, ScheduleBatch) and features.enable_watermark:
-            watermark_config = build_watermark_batch_config(
-                reqs,
-                default_key=features.watermark_key,
-                default_context_window=features.watermark_context_window,
-                default_enabled=features.watermark_default_enabled,
-                enforce_all=features.watermark_enforce_all,
-                device=device,
-            )
-            watermark_keys = watermark_config.keys
-            watermark_context_windows = watermark_config.context_windows
-            watermark_enabled = watermark_config.enabled
-            watermark_candidates_host = watermark_config.candidates_host
-            has_watermark_candidates = watermark_config.has_candidates
-        else:
-            watermark_keys = None
-            watermark_context_windows = None
-            watermark_enabled = None
-            watermark_candidates_host = None
-            has_watermark_candidates = False
         sampling_support_logprobs_capture_indices = (
             cls._make_sampling_support_logprobs_capture_indices(
                 return_sampling_masks,
@@ -266,6 +252,48 @@ class SamplingBatchInfo:
             merged_custom_logit_processor = None
             custom_params = None
 
+        synthid_config = get_synthid_config(exec_config)
+        if synthid_config is not None:
+            from sglang.srt.sampling.watermarking.synthid_request import request_enabled
+
+            enabled_host = [request_enabled(req, exec_config.features) for req in reqs]
+            synthid_state = SynthIDState.from_requests(
+                reqs=reqs,
+                config=synthid_config,
+                device=device,
+                req_pool_indices=batch.req_pool_indices,
+                req_pool_indices_cpu=batch.req_pool_indices_cpu,
+                req_generation=batch.req_to_token_pool.req_generation,
+                chunked_req=batch.chunked_req,
+                pin_memory=_pin,
+            )
+            if not all(enabled_host):
+                synthid_state.request_enabled_host = enabled_host
+                synthid_state.request_enabled = torch.tensor(
+                    enabled_host, dtype=torch.bool, device=device
+                )
+                synthid_state.commit_mask = (
+                    synthid_state.commit_mask & synthid_state.request_enabled
+                )
+        else:
+            synthid_state = None
+
+        features = exec_config.features
+        if (
+            isinstance(batch, ScheduleBatch)
+            and features.enable_watermark
+            and features.watermark_algorithm in (None, "gumbel")
+        ):
+            watermark_config = build_watermark_batch_config(
+                reqs,
+                default_key=features.watermark_key,
+                default_context_window=features.watermark_context_window,
+                default_enabled=features.watermark_default_enabled,
+                enforce_all=features.watermark_enforce_all,
+                device=device,
+            )
+        else:
+            watermark_config = None
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
         # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
         # should not add hefty computation overhead other than simple checks.
@@ -313,15 +341,32 @@ class SamplingBatchInfo:
             return_sampling_masks=return_sampling_masks,
             return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
-            watermark_keys=watermark_keys,
-            watermark_context_windows=watermark_context_windows,
-            watermark_enabled=watermark_enabled,
-            watermark_candidates_host=watermark_candidates_host,
-            has_watermark_candidates=has_watermark_candidates,
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
             sampling_mask_top_ks=sampling_mask_top_ks,
+            synthid_state=synthid_state,
+            watermark_keys=(
+                watermark_config.keys if watermark_config is not None else None
+            ),
+            watermark_context_windows=(
+                watermark_config.context_windows
+                if watermark_config is not None
+                else None
+            ),
+            watermark_enabled=(
+                watermark_config.enabled if watermark_config is not None else None
+            ),
+            watermark_candidates_host=(
+                watermark_config.candidates_host
+                if watermark_config is not None
+                else None
+            ),
+            has_watermark_candidates=(
+                watermark_config.has_candidates
+                if watermark_config is not None
+                else False
+            ),
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -475,19 +520,10 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
-            "watermark_keys",
-            "watermark_context_windows",
-            "watermark_enabled",
         ]:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
-
-        if self.watermark_candidates_host is not None:
-            self.watermark_candidates_host = [
-                self.watermark_candidates_host[index] for index in keep_indices
-            ]
-            self.has_watermark_candidates = any(self.watermark_candidates_host)
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -516,6 +552,21 @@ class SamplingBatchInfo:
                         self.device,
                     )
                 )
+        if self.synthid_state is not None:
+            self.synthid_state.filter_batch(keep_indices_device, keep_indices)
+        for name in (
+            "watermark_keys",
+            "watermark_context_windows",
+            "watermark_enabled",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, value[keep_indices_device])
+        if self.watermark_candidates_host is not None:
+            self.watermark_candidates_host = [
+                self.watermark_candidates_host[index] for index in keep_indices
+            ]
+            self.has_watermark_candidates = any(self.watermark_candidates_host)
 
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
@@ -605,6 +656,29 @@ class SamplingBatchInfo:
                 self.sampling_mask_top_ks or [1] * self_len
             ) + (other.sampling_mask_top_ks or [1] * other_len)
 
+        if self.synthid_state is not None or other.synthid_state is not None:
+            if self.synthid_state is None or other.synthid_state is None:
+                raise ValueError(
+                    "Cannot merge batches with mismatched SynthID watermark state."
+                )
+            self.synthid_state.merge_batch(other.synthid_state)
+        for name in (
+            "watermark_keys",
+            "watermark_context_windows",
+            "watermark_enabled",
+        ):
+            left, right = getattr(self, name), getattr(other, name)
+            if left is not None and right is not None:
+                setattr(self, name, torch.cat((left, right)))
+        if (
+            self.watermark_candidates_host is not None
+            and other.watermark_candidates_host is not None
+        ):
+            self.watermark_candidates_host = (
+                self.watermark_candidates_host + other.watermark_candidates_host
+            )
+            self.has_watermark_candidates = any(self.watermark_candidates_host)
+
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
@@ -614,21 +688,11 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
-            "watermark_keys",
-            "watermark_context_windows",
-            "watermark_enabled",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
                 setattr(self, item, torch.cat([self_val, other_val]))
-
-        if (
-            self.watermark_candidates_host is not None
-            and other.watermark_candidates_host is not None
-        ):
-            self.watermark_candidates_host.extend(other.watermark_candidates_host)
-            self.has_watermark_candidates = any(self.watermark_candidates_host)
 
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy

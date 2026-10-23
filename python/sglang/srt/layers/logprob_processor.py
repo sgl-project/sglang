@@ -18,6 +18,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_borrow_largest_run,
 )
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.sampling.watermarking.synthid_request import is_enabled
 from sglang.srt.utils.common import async_d2h, is_pin_memory_available
 
 if TYPE_CHECKING:
@@ -398,10 +399,25 @@ def compute_spec_logprobs(
     bs = len(batch.seq_lens)
     next_token_logits = logits_output.next_token_logits
 
+    synthid_applied = is_enabled(batch.sampling_info.synthid_state)
+    original_mode = envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get()
+    original_logits = (
+        logits_output.next_token_logits_before_watermark if synthid_applied else None
+    )
+    if (
+        synthid_applied
+        and not batch.sampling_info.is_all_greedy
+        and original_logits is None
+    ):
+        raise RuntimeError("Speculative SynthID logprobs require unwatermarked logits.")
+    source_logits = (
+        original_logits if original_logits is not None else next_token_logits
+    )
+
     if accept_index is not None:
         max_accept = accept_index.shape[1]
         flat_accept_idx = accept_index.long().reshape(-1)
-        gathered_logits = next_token_logits[flat_accept_idx]
+        gathered_logits = source_logits[flat_accept_idx]
         accepted_token_ids = predict[flat_accept_idx]
     else:
         max_accept = chain_stride
@@ -411,10 +427,10 @@ def compute_spec_logprobs(
             f"chain layout expects {bs * max_accept} logits rows, got "
             f"{next_token_logits.shape[0]}"
         )
-        gathered_logits = next_token_logits
+        gathered_logits = source_logits
         accepted_token_ids = predict
 
-    if batch.sampling_info.is_all_greedy or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
+    if batch.sampling_info.is_all_greedy or original_mode:
         gathered_logprobs = torch.nn.functional.log_softmax(gathered_logits, dim=-1)
     else:
         temperatures = torch.repeat_interleave(

@@ -73,11 +73,19 @@ class ExecFeatures(msgspec.Struct):
     ] = False
     enable_watermark: A[
         bool,
-        "Enable Aaronson-Gumbel text watermarking.",
+        Arg(help="Enable text watermarking.", resolvable=True),
     ] = False
+    watermark_algorithm: A[
+        Optional[str],
+        Arg(
+            help="Text watermark algorithm. Defaults to Gumbel; a SynthID key file selects SynthID.",
+            choices=["synthid", "gumbel"],
+            resolvable=True,
+        ),
+    ] = None
     watermark_config: A[
         Optional[str],
-        "Watermark settings as a JSON file path or an inline JSON object with "
+        "Watermark settings as a JSON file path (or inline JSON for Gumbel) with "
         "optional key, key_b, context_window, mixing_probability, max_probability, "
         "default_enabled, and enforce_all fields.",
     ] = None
@@ -231,6 +239,40 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    synthid_watermark_key_file: A[
+        Optional[str],
+        Arg(
+            help="Path to a JSON file containing secret SynthID integer keys; "
+            "key material is not accepted directly on the command line.",
+            resolvable=True,
+        ),
+    ] = None
+    synthid_watermark_ngram_len: A[
+        int,
+        Arg(help="SynthID n-gram length.", resolvable=True),
+    ] = 5
+    synthid_watermark_top_k: A[
+        int,
+        Arg(
+            help="SynthID candidate cap before request-level filtering.",
+            resolvable=True,
+        ),
+    ] = 1024
+    synthid_watermark_context_history_size: A[
+        int,
+        Arg(
+            help="Number of prior SynthID context hashes retained per request.",
+            resolvable=True,
+        ),
+    ] = 1024
+    synthid_watermark_skip_first_ngram_calls: A[
+        bool,
+        Arg(
+            help="Skip watermarking the first ngram_len - 1 generated tokens.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = False
     grammar_backend: A[
         Optional[str],
         Arg(

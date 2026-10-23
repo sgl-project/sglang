@@ -548,5 +548,11 @@ POSITIONAL_FIELD_ORDER = (
     "enable_megamoe_for_layernorm_sp",
     "enable_http_worker_reuseport",
     "prefill_decode_interval_min_bs",
+    "synthid_watermark_key_file",
+    "synthid_watermark_ngram_len",
+    "synthid_watermark_top_k",
+    "synthid_watermark_context_history_size",
+    "synthid_watermark_skip_first_ngram_calls",
+    "watermark_algorithm",
 )
 # fmt: on

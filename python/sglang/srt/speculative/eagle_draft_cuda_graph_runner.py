@@ -55,6 +55,11 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.watermarking.synthid import SynthIDState
+from sglang.srt.watermarking.synthid.graph import (
+    can_run_synthid_graph,
+    synthid_graph_config,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -77,6 +82,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     draft_probs: Optional[torch.Tensor]
+    draft_prob_token_ids: Optional[torch.Tensor]
     sampling_seed: Optional[torch.Tensor]
     hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
@@ -106,9 +112,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         *,
         draft_attn_backend=None,
         speculative_num_steps: Optional[int] = None,
+        synthid_enabled: bool = True,
+        initialize_attention_state: bool = True,
+        synthid_mixed: bool = False,
     ):
         # Parse args
         self.eagle_worker = eagle_worker
+        self.synthid_mixed = synthid_mixed
         if not hasattr(eagle_worker, "model_runner"):
             # V2: EagleDraftWorker
             self.model_runner = model_runner = eagle_worker.draft_runner
@@ -134,6 +144,27 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.topk = get_spec().speculative_eagle_topk
         self.draft_attn_backend = draft_attn_backend or model_runner.draft_attn_backend
+        self.synthid_watermark = getattr(
+            eagle_worker.target_worker.model_runner.sampler,
+            "synthid_watermark",
+            None,
+        )
+        if not synthid_enabled:
+            self.synthid_watermark = None
+        (
+            self.synthid_graph_supported,
+            self.sparse_synthid_draft_probs,
+        ) = synthid_graph_config(
+            processor=self.synthid_watermark,
+            num_steps=self.speculative_num_steps,
+            rejection_sampling=get_spec().speculative_use_rejection_sampling,
+        )
+        if self.synthid_mixed:
+            if not self.synthid_graph_supported:
+                raise ValueError(
+                    "Mixed SynthID graphs require supported state dimensions."
+                )
+            self.sparse_synthid_draft_probs = False
 
         # Patch_model in parent's capture() needs an attn_backend reference.
         # EAGLE doesn't use it (capture_one_shape calls draft_forward instead),
@@ -155,13 +186,22 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Bucket sizes
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
+        if self.synthid_mixed:
+            self.capture_bs = [bs for bs in self.capture_bs if bs >= 2]
+            if not self.capture_bs:
+                raise ValueError(
+                    "Mixed SynthID graphs require at least two captured rows."
+                )
         # Static capture width.
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_decode")
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 
         # Attention backend init
-        self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        if initialize_attention_state:
+            self.draft_attn_backend.init_cuda_graph_state(
+                self.max_bs, self.max_num_token
+            )
         self.seq_len_fill_value = self.draft_attn_backend.attn_backends[
             0
         ].get_cuda_graph_seq_len_fill_value()
@@ -196,14 +236,30 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
-            draft_probs = (
-                torch.zeros(
-                    (self.max_bs, self.model_runner.model_config.vocab_size),
+            if get_spec().speculative_use_rejection_sampling:
+                draft_prob_width = (
+                    min(
+                        self.synthid_watermark.config.top_k,
+                        self.model_runner.model_config.vocab_size,
+                    )
+                    if self.sparse_synthid_draft_probs
+                    else self.model_runner.model_config.vocab_size
+                )
+                draft_probs = torch.zeros(
+                    (self.max_bs, draft_prob_width),
                     dtype=torch.float32,
                 )
-                if get_spec().speculative_use_rejection_sampling
-                else None
-            )
+                draft_prob_token_ids = (
+                    torch.zeros(
+                        (self.max_bs, draft_prob_width),
+                        dtype=torch.int64,
+                    )
+                    if self.sparse_synthid_draft_probs
+                    else None
+                )
+            else:
+                draft_probs = None
+                draft_prob_token_ids = None
             sampling_seed = (
                 torch.zeros((self.max_bs,), dtype=torch.int64)
                 if get_exec().deterministic.enable_deterministic_inference
@@ -231,6 +287,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             # (SamplingParams rewrites it), and it would read as top_k <= 1, i.e.
             # greedy, for the padded rows and for a run that never copies in.
             self.top_ks = torch.full((self.max_bs,), TOP_K_ALL, dtype=torch.int32)
+            self.synthid_request_mask = (
+                torch.arange(self.max_bs) % 2 == 0 if self.synthid_mixed else None
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -278,6 +337,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_p=topk_p,
             topk_index=topk_index,
             draft_probs=draft_probs,
+            draft_prob_token_ids=draft_prob_token_ids,
             sampling_seed=sampling_seed,
             hidden_states=hidden_states,
             global_num_tokens_gpu=global_num_tokens_gpu,
@@ -336,6 +396,22 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # can_run_graph
     # -----------------------------------------------------------------
     def can_run_graph(self, forward_batch: ForwardBatch):
+        from sglang.srt.sampling.watermarking.synthid_request import is_mixed
+
+        mixed = forward_batch.sampling_info is not None and is_mixed(
+            forward_batch.sampling_info.synthid_state
+        )
+        if mixed != self.synthid_mixed:
+            return False
+        synthid_watermark = getattr(self, "synthid_watermark", None)
+        if synthid_watermark is not None and not can_run_synthid_graph(
+            forward_batch=forward_batch,
+            graph_supported=self.synthid_graph_supported,
+            sparse_draft_probs=self.sparse_synthid_draft_probs,
+            rejection_sampling=self.model_runner.server_args.speculative_use_rejection_sampling,
+        ):
+            return False
+
         # Uniform-width replay invariant: the batch's actual per-request width
         # must match this runner's capture width; anything else falls back to
         # eager. (Unset widths pass: not every path fills the field yet.)
@@ -414,6 +490,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         draft_probs = (
             buffers.draft_probs[:num_seqs] if buffers.draft_probs is not None else None
         )
+        draft_prob_token_ids = (
+            buffers.draft_prob_token_ids[:num_seqs]
+            if buffers.draft_prob_token_ids is not None
+            else None
+        )
 
         if self.require_mlp_tp_gather:
             global_num_tokens_cpu = [num_tokens] * self.attn_dp_size
@@ -447,23 +528,43 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_p=topk_p,
             topk_index=topk_index,
             draft_probs=draft_probs,
+            draft_prob_token_ids=draft_prob_token_ids,
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
         )
         if self.buffers.dsa_seed_topk is not None:
             spec_info.dsa_topk_indices = self.buffers.dsa_seed_topk[:num_seqs]
 
+        synthid_state = (
+            SynthIDState.for_initialized_slots(
+                req_pool_indices, config=self.synthid_watermark.config
+            )
+            if self.synthid_watermark is not None
+            else None
+        )
+        if self.synthid_mixed:
+            assert synthid_state is not None and self.synthid_request_mask is not None
+            synthid_state.request_enabled = self.synthid_request_mask[:num_seqs]
+            synthid_state.request_enabled_host = [i % 2 == 0 for i in range(num_seqs)]
         sampling_info = SamplingBatchInfo(
             temperatures=self.temperatures[:num_seqs],
             top_ps=torch.ones((num_seqs,), dtype=torch.float),
             top_ks=self.top_ks[:num_seqs],
             min_ps=torch.zeros((num_seqs,), dtype=torch.float),
-            is_all_greedy=False,
-            is_any_greedy=False,
+            is_all_greedy=(
+                self.synthid_watermark is not None and not self.synthid_graph_supported
+            ),
+            is_any_greedy=(
+                self.synthid_watermark is not None and not self.synthid_graph_supported
+            ),
             need_top_p_sampling=False,
             need_top_k_sampling=False,
             need_min_p_sampling=False,
             vocab_size=self.model_runner.model_config.vocab_size,
+            synthid_state=synthid_state,
+            synthid_force_dense_draft_probs=(
+                self.synthid_watermark is not None and not self.synthid_graph_supported
+            ),
             sampling_seed=(
                 self.buffers.sampling_seed[:num_seqs]
                 if self.buffers.sampling_seed is not None
@@ -559,14 +660,31 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 )
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
-        parent_list, top_scores_index, draft_tokens, draft_probs = (
-            t[:raw_bs] if t is not None else None for t in out
+        (
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            draft_probs,
+            draft_prob_token_ids,
+        ) = (t[:raw_bs] if t is not None else None for t in out)
+        return (
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            draft_probs,
+            draft_prob_token_ids,
         )
-        return parent_list, top_scores_index, draft_tokens, draft_probs
 
     # -----------------------------------------------------------------
     # Replay
     # -----------------------------------------------------------------
+    def _stage_synthid_request_mask(self, *, enabled: torch.Tensor, raw_bs: int):
+        mask = self.synthid_request_mask
+        if mask is None or enabled.shape != (raw_bs,) or enabled.dtype != torch.bool:
+            raise ValueError("Mixed graph request flags must match the live batch.")
+        mask.zero_()
+        mask[:raw_bs].copy_(enabled)
+
     def execute(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
@@ -574,6 +692,21 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.captured_req_width
+        if self.synthid_mixed:
+            state = forward_batch.sampling_info.synthid_state
+            if state is None or state.request_enabled is None:
+                raise RuntimeError(
+                    "Mixed graph replay is missing its request policy mask."
+                )
+            self._stage_synthid_request_mask(
+                enabled=state.request_enabled, raw_bs=raw_bs
+            )
+        synthid_watermark = getattr(self, "synthid_watermark", None)
+        if synthid_watermark is not None:
+            synthid_watermark.wait_for_speculative_commit()
+            synthid_watermark.state_pool.initialize_pending(
+                forward_batch.sampling_info.synthid_state
+            )
 
         # Pad to nearest captured shape
         if self.require_mlp_tp_gather:
@@ -600,6 +733,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.topk_index.zero_()
             if buffers.draft_probs is not None:
                 buffers.draft_probs.zero_()
+            if buffers.draft_prob_token_ids is not None:
+                buffers.draft_prob_token_ids.zero_()
             if buffers.hidden_states is not None:
                 buffers.hidden_states.zero_()
             if buffers.dsa_seed_topk is not None:
@@ -660,10 +795,19 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.
         if (
-            buffers.draft_probs is not None
+            raw_bs > 0
+            and buffers.draft_probs is not None
             and forward_batch.spec_info.draft_probs is not None
         ):
             buffers.draft_probs[:raw_bs].copy_(forward_batch.spec_info.draft_probs)
+        if (
+            raw_bs > 0
+            and buffers.draft_prob_token_ids is not None
+            and forward_batch.spec_info.draft_prob_token_ids is not None
+        ):
+            buffers.draft_prob_token_ids[:raw_bs].copy_(
+                forward_batch.spec_info.draft_prob_token_ids
+            )
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
@@ -675,8 +819,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.dsa_seed_topk[:raw_bs].copy_(seed)
             else:
                 buffers.dsa_seed_topk[:raw_bs].zero_()
-        # Only rejection sampling reads temperatures (renorm_draft_probs); skip
-        # the copy otherwise to keep the non-RS path free of extra work.
         if (
             get_spec().speculative_use_rejection_sampling
             and forward_batch.sampling_info is not None

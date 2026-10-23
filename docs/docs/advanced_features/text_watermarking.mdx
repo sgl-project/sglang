@@ -8,6 +8,12 @@ SGLang provides opt-in Aaronson-Gumbel watermarking for sampled text. The waterm
 
 This feature can support transparency controls such as the machine-readable marking and detectability described in [Article 50 of the EU AI Act](https://eur-lex.europa.eu/eli/reg/2024/1689/oj). It is one technical signal, not a complete compliance program or proof of authorship.
 
+## Select an algorithm
+
+Aaronson-Gumbel remains the default when `--enable-watermark` is set without an algorithm selector. Use `--watermark-algorithm gumbel` to select it explicitly. The configuration, request keys, and detector described on this page apply to Gumbel.
+
+For per-request SynthID Text watermarking, select `--watermark-algorithm synthid` and provide file-based SynthID configuration. See [SynthID Text Watermarking](/docs/advanced_features/synthid_text_watermarking) for its candidate cap, key format, speculative decoding support, and reporting conventions.
+
 ## How it works
 
 ### Generation

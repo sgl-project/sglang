@@ -211,6 +211,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
 from sglang.srt.sampling.watermarking.core import WatermarkState
+from sglang.srt.sampling.watermarking.engine import init_watermark_engine
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
     ServerArgs,
@@ -625,22 +626,14 @@ class ModelRunner:
         )
 
     def maybe_init_watermark_state(self):
-        features = get_exec().features
         self.watermark_state = (
-            WatermarkState(
-                max_num_reqs=self.req_to_token_pool.req_to_token.shape[0],
-                context_window=features.watermark_context_window,
-                max_contexts_per_req=self.req_to_token_pool.req_to_token.shape[1],
-                vocab_size=self.model_config.vocab_size,
-                key=features.watermark_key,
-                key_b=features.watermark_key_b,
-                mixing_probability=features.watermark_mixing_probability,
-                max_probability=features.watermark_max_probability,
+            init_watermark_engine(
+                sampler=self.sampler,
+                request_pool=self.req_to_token_pool,
                 device=self.device,
-                default_enabled=features.watermark_default_enabled,
-                enforce_all=features.watermark_enforce_all,
+                vocab_size=self.model_config.vocab_size,
             )
-            if features.enable_watermark and not self.is_draft_worker
+            if not self.is_draft_worker
             else None
         )
 

@@ -4935,6 +4935,28 @@ class Scheduler(
             # The worker sliced the tail off before sampling, so sampled tokens
             # cover only the reqs-aligned rows; the coordinator relays the rest.
             future_indices = future_indices[: batch.beam_tail.num_base_rows]
+        sampling_info = batch.sampling_info
+        features = get_exec().features
+        if (
+            sampling_info is not None
+            and sampling_info.synthid_state is not None
+            and features.enable_watermark
+            and features.watermark_algorithm == "synthid"
+            and not features.watermark_enforce_all
+        ):
+            payload.synthid_enabled_host = (
+                sampling_info.synthid_state.request_enabled_host
+                or [True] * len(future_indices)
+            )
+            payload.synthid_slot_indices_cpu = batch.req_pool_indices_cpu
+            if batch.beam_tail is not None:
+                num_base_rows = batch.beam_tail.num_base_rows
+                payload.synthid_enabled_host = payload.synthid_enabled_host[
+                    :num_base_rows
+                ]
+                payload.synthid_slot_indices_cpu = payload.synthid_slot_indices_cpu[
+                    :num_base_rows
+                ]
         self.future_map.stash(future_indices, payload)
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
@@ -5464,6 +5486,11 @@ class Scheduler(
             self.last_batch = None
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
+            if (
+                get_exec().features.enable_watermark
+                or get_exec().kernel.synthid_watermark_key_file is not None
+            ):
+                self.tp_worker.model_runner.sampler.invalidate_watermark_on_cache_flush()
             self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()
             self.grammar_manager.clear()

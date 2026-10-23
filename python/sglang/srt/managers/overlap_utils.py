@@ -173,7 +173,10 @@ class RelayPayload:
     topk_index: Optional[torch.Tensor] = None
     hidden_states: Optional[torch.Tensor] = None
     draft_probs: Optional[torch.Tensor] = None
+    draft_prob_token_ids: Optional[torch.Tensor] = None
     dsa_topk_indices: Optional[torch.Tensor] = None
+    synthid_enabled_host: Optional[list[bool]] = None
+    synthid_slot_indices_cpu: Optional[torch.Tensor] = None
     # ngram delays the draft extend (ngram update)
     accept_tokens: Optional[torch.Tensor] = None
     accept_lens: Optional[torch.Tensor] = None
@@ -196,6 +199,7 @@ class RelayPayload:
             topk_index=draft_input.topk_index,
             hidden_states=draft_input.hidden_states,
             draft_probs=getattr(draft_input, "draft_probs", None),
+            draft_prob_token_ids=getattr(draft_input, "draft_prob_token_ids", None),
             dsa_topk_indices=draft_input.dsa_topk_indices,
         )
 
@@ -283,6 +287,7 @@ class FutureMap:
     publish/stash; next iter reads via resolve_forward_inputs / resolve_seq_lens_cpu.
     """
 
+    request_proposal_relay = None
     _relay = None
 
     def __init__(
@@ -304,6 +309,7 @@ class FutureMap:
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
         # Kept for the mixed-tail late binding (reserved-slot gather).
         self.req_to_token = req_to_token_pool.req_to_token
+        self.request_proposal_relay = None
 
         if _DEBUG_ASSERT:
             # Poisoned init: every row must be written before its first gather.
@@ -338,6 +344,7 @@ class FutureMap:
         self.topk_index_buf = None
         self.hidden_states_buf = None
         self.draft_probs_buf = None
+        self.draft_prob_token_ids_buf = None
         self.dsa_topk_indices_buf = None
 
         # ngram-only relay bufs
@@ -408,11 +415,24 @@ class FutureMap:
                 device=self.device,
             )
 
+        self._maybe_init_draft_prob_buffers(payload)
+
+    def _maybe_init_draft_prob_buffers(self, payload: RelayPayload) -> None:
         if self.draft_probs_buf is None and payload.draft_probs is not None:
             draft_probs0 = payload.draft_probs[0]
             self.draft_probs_buf = torch.empty(
                 (self.req_pool_size, *draft_probs0.shape),
                 dtype=draft_probs0.dtype,
+                device=self.device,
+            )
+        if (
+            self.draft_prob_token_ids_buf is None
+            and payload.draft_prob_token_ids is not None
+        ):
+            draft_prob_token_ids0 = payload.draft_prob_token_ids[0]
+            self.draft_prob_token_ids_buf = torch.empty(
+                (self.req_pool_size, *draft_prob_token_ids0.shape),
+                dtype=draft_prob_token_ids0.dtype,
                 device=self.device,
             )
 
@@ -514,11 +534,26 @@ class FutureMap:
             draft_input.bonus_tokens = bonus_tokens
             if hidden_states is not None:
                 draft_input.hidden_states = hidden_states
-            # A staged HiSparse request carries only future_indices.  The
-            # rejection-sampling probabilities live in this relay buffer, so
-            # checking the empty draft_input would silently drop them.
-            if self.draft_probs_buf is not None:
+            if self.request_proposal_relay is not None:
+                draft_input.draft_probs, draft_input.draft_prob_token_ids = (
+                    self.request_proposal_relay.resolve(
+                        indices,
+                        batch.sampling_info.synthid_state,
+                        indices_cpu=batch.req_pool_indices_cpu,
+                    )
+                )
+            # A staged HiSparse request carries only future_indices; its
+            # probabilities still need to be restored from the relay.
+            elif self.draft_probs_buf is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
+            if self.request_proposal_relay is not None:
+                pass
+            elif self.draft_prob_token_ids_buf is not None:
+                draft_input.draft_prob_token_ids = self.draft_prob_token_ids_buf[
+                    indices
+                ]
+            else:
+                draft_input.draft_prob_token_ids = None
         else:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
@@ -709,7 +744,48 @@ class FutureMap:
             self.hidden_states_buf[indices] = payload.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
-        if self.draft_probs_buf is not None and payload.draft_probs is not None:
+        if payload.synthid_enabled_host is not None and payload.draft_probs is not None:
+            from sglang.srt.runtime_context import get_exec
+            from sglang.srt.sampling.watermarking.proposal_relay import (
+                RequestProposalRelay,
+            )
+
+            if self.request_proposal_relay is None:
+                self.request_proposal_relay = RequestProposalRelay(
+                    slots=self.req_pool_size,
+                    candidate_count=get_exec().kernel.synthid_watermark_top_k,
+                    device=self.device,
+                )
+            self.request_proposal_relay.store(
+                indices,
+                payload.draft_probs,
+                payload.draft_prob_token_ids,
+                payload.synthid_enabled_host,
+                indices_cpu=payload.synthid_slot_indices_cpu,
+            )
+        elif self.draft_prob_token_ids_buf is not None:
+            if payload.draft_probs is None:
+                raise RuntimeError("Draft probability relay unexpectedly became empty.")
+            if self.draft_probs_buf.shape[1:] != payload.draft_probs.shape[1:]:
+                raise RuntimeError(
+                    "Draft probability relay shape changed from "
+                    f"{tuple(self.draft_probs_buf.shape[1:])} to "
+                    f"{tuple(payload.draft_probs.shape[1:])}."
+                )
+            self.draft_probs_buf[indices] = payload.draft_probs
+            if payload.draft_prob_token_ids is None:
+                raise RuntimeError("Sparse draft probability relay lost its token ids.")
+            if (
+                self.draft_prob_token_ids_buf.shape[1:]
+                != payload.draft_prob_token_ids.shape[1:]
+            ):
+                raise RuntimeError(
+                    "Draft probability token-id relay shape changed from "
+                    f"{tuple(self.draft_prob_token_ids_buf.shape[1:])} to "
+                    f"{tuple(payload.draft_prob_token_ids.shape[1:])}."
+                )
+            self.draft_prob_token_ids_buf[indices] = payload.draft_prob_token_ids
+        elif self.draft_probs_buf is not None and payload.draft_probs is not None:
             self.draft_probs_buf[indices] = payload.draft_probs
         if (
             self.dsa_topk_indices_buf is not None

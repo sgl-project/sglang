@@ -18,7 +18,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.sampling.watermarking.config import load_watermark_config
+from sglang.srt.sampling.watermarking.server import resolve_watermark_config
 from sglang.srt.utils.common import (
     configure_media_url_security,
     get_device,
@@ -32,14 +32,7 @@ logger = logging.getLogger(__name__)
 
 def handle_watermark_config(server_args: Any) -> None:
     cfg = resolving_view(server_args)
-    if cfg.watermark_config is None:
-        return
-    config = load_watermark_config(cfg.watermark_config)
-    resolved = {
-        f"watermark_{field}": getattr(config, field)
-        for field in config.__struct_fields__
-        if getattr(config, field) is not None
-    }
+    resolved = resolve_watermark_config(cfg)
     if resolved:
         declare_resolution(server_args, "handle_watermark_config", **resolved)
 
