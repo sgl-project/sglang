@@ -29,6 +29,17 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="moe.bf16_mega_gate",
+        backend=KernelBackend.DEEPGEMM,
+        target="sglang.kernels.ops.moe.mega_gate:bf16_mega_gate",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.moe_align_block_size",
         backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",

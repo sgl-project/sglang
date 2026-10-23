@@ -191,7 +191,10 @@ export const DiffusionModelCatalog = ({ category }) => {
     },
     {
       name: "Wan-Animate-2",
-      modelIds: ["Wan-AI/Wan2.2-Animate-2-14B-Diffusers"],
+      modelIds: [
+        "Wan-AI/Wan2.2-Animate-2-14B-Diffusers",
+        "Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers",
+      ],
       cookbook: "/cookbook/diffusion/Wan/Wan-Animate-2",
     },
     {
@@ -301,17 +304,26 @@ export const DiffusionModelCatalog = ({ category }) => {
     {
       name: "Cosmos-Dreams (Cosmos3-Interactive)",
       modelIds: ["nvidia/Cosmos3-Nano-Sim-Bimanual"],
-      note: "Causal action-conditioned Cosmos3; local checkpoints are also detected by the CosmosDreamsPipeline class name.",
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
     },
     {
       name: "Cosmos-Dreams-Transfer",
       modelIds: ["nvidia/Cosmos3-Nano-Sim-Transfer"],
-      note: "Causal control-video (edge/blur/depth/seg) Cosmos3; local checkpoints are also detected by the CosmosDreamsTransferPipeline class name.",
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
     },
     {
       name: "Cosmos3 Multiview-AV",
       modelIds: ["nvidia/Cosmos3-Nano-Transfer-Auto"],
-      note: "11-camera WSM-to-RGB transfer in one pass with block-sparse cross-camera attention (single GPU or 2-GPU CFG parallel; no SP/TP); local checkpoints are also detected by the Cosmos3MultiviewPipeline class name.",
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
+    },
+    {
+      name: "Cosmos3 Sim-Auto",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Auto"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
     },
     {
       name: "FLUX 3 Action",
