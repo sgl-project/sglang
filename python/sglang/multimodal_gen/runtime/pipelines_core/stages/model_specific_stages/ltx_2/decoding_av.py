@@ -48,6 +48,15 @@ class LTX2AVDecodingStage(DecodingStage):
         # Replaces the convolutional decoder; latents and denormalization are
         # identical either way.
         self.diffusion_decoder = diffusion_decoder
+        if diffusion_decoder is not None:
+            from sglang.multimodal_gen.runtime.models.vaes.tiny_vae import (
+                TinyVAEDecodeWrapper,
+            )
+
+            if isinstance(vae, TinyVAEDecodeWrapper):
+                raise ValueError(
+                    "TinyVAE and the LTX diffusion decoder cannot be combined"
+                )
         self.video_processor = VideoProcessor(vae_scale_factor=32)
 
     def component_uses(
