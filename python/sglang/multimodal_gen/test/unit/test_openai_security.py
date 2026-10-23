@@ -302,6 +302,7 @@ def test_image_download_over_size_limit_is_rejected(monkeypatch, tmp_path, handl
         asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
     assert not target.exists()
     assert not any(part_dir.iterdir())
+    assert not list(target.parent.iterdir())
 
 
 def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
@@ -319,6 +320,7 @@ def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
     )
     assert Path(saved).read_bytes() == b"x" * 512
     assert not any(part_dir.iterdir())
+    assert list(target.parent.iterdir()) == [target]
 
 
 def test_cancelled_image_download_leaves_no_partial_file(monkeypatch, tmp_path):
@@ -386,6 +388,41 @@ def test_image_download_rejects_destination_directory(monkeypatch, tmp_path):
         asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
     assert not list(target.iterdir())
     assert not list(part_dir.iterdir())
+    assert set(tmp_path.iterdir()) == {target, part_dir}
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_image_download_retry_keeps_only_complete_output(
+    monkeypatch, tmp_path, recover
+):
+    """Failed attempts must leave neither partial files nor a truncated destination."""
+    attempts = 0
+
+    async def broken_body():
+        yield b"partial image"
+        raise httpx.ReadError("incomplete response")
+
+    def handler(request):
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            200,
+            content=b"complete image" if recover and attempts == 3 else broken_body(),
+        )
+
+    part_dir = _patch_download(monkeypatch, tmp_path, handler)
+    target = tmp_path / "image.png"
+    target.write_bytes(b"existing image")
+    request = utils._save_url_image_to_path("https://x.test/a.png", str(target))
+    if recover:
+        assert asyncio.run(request) == str(target)
+    else:
+        with pytest.raises(Exception, match="incomplete response"):
+            asyncio.run(request)
+    assert attempts == 3
+    assert target.read_bytes() == (b"complete image" if recover else b"existing image")
+    assert not list(part_dir.iterdir())
+    assert set(tmp_path.iterdir()) == {target, part_dir}
 
 
 _CPU = SimpleNamespace(get_local_torch_device=lambda: torch.device("cpu"))
