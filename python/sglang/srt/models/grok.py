@@ -363,7 +363,7 @@ class Grok1Attention(nn.Module):
         self.rope_theta = rope_theta
         rope_scaling = get_rope_scaling(config)
         self.load_presharded_attn = load_presharded_attn
-        self.alt_stream = alt_stream or torch.cuda.Stream()
+        self.alt_stream = None if _is_cpu else (alt_stream or torch.cuda.Stream())
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -479,7 +479,7 @@ class Grok1DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.residual_moe = getattr(config, "residual_moe", False)
         self.layer_id = layer_id
-        self.alt_stream = alt_stream or torch.cuda.Stream()
+        self.alt_stream = None if _is_cpu else (alt_stream or torch.cuda.Stream())
 
         rope_theta = getattr(config, "rope_theta", None)
         if rope_theta is None:
@@ -651,7 +651,7 @@ class Grok1Model(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        self.alt_stream = get_stream("alt")
+        self.alt_stream = None if _is_cpu else get_stream("alt")
         self.layers = nn.ModuleList(
             [
                 Grok1DecoderLayer(
