@@ -19,6 +19,7 @@ import torch
 
 from sglang.kernels.ops.speculative.eagle import prepare_verify_commit_outputs
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -204,9 +205,11 @@ class TestPostVerifyGraphs(CustomTestCase):
             pass
 
         for clears_c128 in (False, True):
-            kvcache = SimpleNamespace()
-            if clears_c128:
-                kvcache.clear_unaccepted_c128_draft_states = print
+            kvcache = (
+                object.__new__(DeepSeekV4TokenToKVPool)
+                if clears_c128
+                else SimpleNamespace()
+            )
             graphs = SimpleNamespace(run=MagicMock(return_value=None))
             batch = SimpleNamespace(
                 spec_info=SimpleNamespace(),

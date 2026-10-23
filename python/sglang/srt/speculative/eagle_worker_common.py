@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.eagle import (
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -663,16 +664,13 @@ def run_eagle_verify(
     )
     logits_output = forward_batch_output.logits_output
 
-    clear_unaccepted_c128 = getattr(
-        token_to_kv_pool_allocator.get_kvcache(),
-        "clear_unaccepted_c128_draft_states",
-        None,
-    )
+    kvcache = token_to_kv_pool_allocator.get_kvcache()
+    clears_c128 = isinstance(kvcache, DeepSeekV4TokenToKVPool)
     # SGLang's post-verify graphs when they are on, for a batch they can replay;
     # they skip the c128 cleanup below, so not for a KV pool that needs it.
     post = (
         None
-        if post_verify_graphs is None or clear_unaccepted_c128 is not None
+        if post_verify_graphs is None or clears_c128
         else post_verify_graphs.run(
             batch=batch,
             verify_input=verify_input,
@@ -764,8 +762,8 @@ def run_eagle_verify(
             batch=batch,
             accept_indices=accept_index,
         )
-    if clear_unaccepted_c128 is not None and not batch.forward_mode.is_idle():
-        clear_unaccepted_c128(
+    if clears_c128 and not batch.forward_mode.is_idle():
+        kvcache.clear_unaccepted_c128_draft_states(
             batch.req_pool_indices,
             batch.seq_lens,
             accept_lens,
