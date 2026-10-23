@@ -50,11 +50,13 @@ class ReportingTqdm(tqdm):
         *args: Any,
         reporter: ProgressReporter,
         request_ids: list[str],
+        progress_range: tuple[float, float] = (0.0, 1.0),
         **kwargs: Any,
     ):
         super().__init__(*args, **kwargs)
         self._reporter = reporter
         self._request_ids = request_ids
+        self._progress_range = progress_range
         self._completed = 0.0
         self._last_percent = 0
         self._iterating = False
@@ -83,8 +85,13 @@ class ReportingTqdm(tqdm):
         percent = int(self._completed * 100 // total)
         if percent > self._last_percent:
             self._last_percent = percent
+            completed = self._completed
+            if self._progress_range != (0.0, 1.0):
+                start, end = self._progress_range
+                completed = start + (end - start) * completed / total
+                total = 1
             self._reporter.step(
-                request_ids=self._request_ids, completed=self._completed, total=total
+                request_ids=self._request_ids, completed=completed, total=total
             )
 
 

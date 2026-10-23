@@ -355,7 +355,7 @@ class Scheduler(
         progress_reporter = get_progress_reporter()
         if progress_reporter is not None:
             for req in reqs:
-                if not req.is_warmup:
+                if req.report_progress and not req.is_warmup:
                     progress_reporter.start(request_ids=req.client_request_ids())
 
         # Use the head request trace context for scheduler-side dispatch work.
@@ -1069,8 +1069,11 @@ class Scheduler(
                     )
             merged_req.extra["dynamic_batch_output_paths"] = dynamic_output_paths
         merged_req.merged_request_ids = [
-            req.request_id for req in reqs if req.request_id is not None
+            req.request_id
+            for req in reqs
+            if req.report_progress and req.request_id is not None
         ]
+        merged_req.report_progress = bool(merged_req.merged_request_ids)
         merged_req.request_id = f"dynamic_batch::{merged_req.request_id}"
 
         return merged_req

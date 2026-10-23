@@ -75,6 +75,7 @@ class PipelineStage(StageDedupMixin, ABC):
     _component_residency_manager = None
     _registered_stage_name: str | None = None
     _profile_stage_name: str | None = None
+    _progress_range: tuple[float, float] = (0.0, 1.0)
 
     def __init__(self):
         self.server_args = get_global_server_args()
@@ -115,7 +116,12 @@ class PipelineStage(StageDedupMixin, ABC):
         # report even when the bar is hidden: the first rank of replica N>0 is
         # not world rank 0
         reporter = get_progress_reporter()
-        if reporter is not None and batch is not None and not batch.is_warmup:
+        if (
+            reporter is not None
+            and batch is not None
+            and batch.report_progress
+            and not batch.is_warmup
+        ):
             request_ids = batch.client_request_ids()
             if request_ids:
                 return ReportingTqdm(
@@ -124,6 +130,7 @@ class PipelineStage(StageDedupMixin, ABC):
                     disable=disable,
                     reporter=reporter,
                     request_ids=request_ids,
+                    progress_range=self._progress_range,
                     **kwargs,
                 )
         return tqdm(iterable=iterable, total=total, disable=disable, **kwargs)

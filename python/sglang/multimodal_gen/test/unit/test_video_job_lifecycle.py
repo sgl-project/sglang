@@ -3,6 +3,7 @@ import os
 import threading
 import uuid
 from contextlib import suppress
+from types import SimpleNamespace
 
 import pytest
 import zmq
@@ -10,11 +11,16 @@ import zmq.asyncio
 from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai import video_api, video_progress
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import AsyncDictStore
+from sglang.multimodal_gen.runtime.managers import progress_reporter
 from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     ProgressReporter,
     ReportingTqdm,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
+    SyncExecutor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import base as stage_base
@@ -236,7 +242,7 @@ def test_visible_progress_bar_counts_each_step_once(progress_channel):
     assert sent == [[], [1]]
 
 
-@pytest.mark.parametrize("peer", ["no-peer", "never-reads"])
+@pytest.mark.parametrize("peer", ["no-peer", "never-reads", "terminated"])
 def test_progress_reporter_never_blocks(peer):
     context = zmq.Context()
     endpoint = f"inproc://progress-{uuid.uuid4().hex}"
@@ -245,6 +251,8 @@ def test_progress_reporter_never_blocks(peer):
     if peer == "never-reads":
         pull.bind(endpoint)
     reporter = ProgressReporter(context, endpoint)
+    if peer == "terminated":
+        context.destroy(linger=0)
 
     def send_all():
         for k in range(50_000):
@@ -259,17 +267,24 @@ def test_progress_reporter_never_blocks(peer):
         context.destroy(linger=0)
 
 
-@pytest.mark.parametrize("is_warmup", [False, True], ids=["request", "warmup"])
-def test_progress_bar_reports_only_real_requests(monkeypatch, is_warmup):
+@pytest.mark.parametrize(
+    "is_warmup, report_progress", [(False, True), (True, True), (False, False)]
+)
+def test_progress_bar_reports_only_real_requests(
+    monkeypatch, is_warmup, report_progress
+):
     monkeypatch.setattr(stage_base, "get_progress_reporter", lambda: object())
     batch = Req(
         sampling_params=SamplingParams(prompt="p", seed=1, request_id="job"),
         is_warmup=is_warmup,
     )
+    batch.report_progress = report_progress
 
-    bar = stage_base.PipelineStage.progress_bar(None, total=3, batch=batch)
+    bar = stage_base.PipelineStage.progress_bar(
+        SimpleNamespace(_progress_range=(0.0, 1.0)), total=3, batch=batch
+    )
 
-    assert type(bar) is (tqdm if is_warmup else ReportingTqdm)
+    assert type(bar) is (ReportingTqdm if report_progress and not is_warmup else tqdm)
 
 
 def test_progress_tracker_averages_outputs():
@@ -306,7 +321,25 @@ def test_apply_progress_only_moves_running_jobs(monkeypatch):
     asyncio.run(run_test())
 
 
-def test_progress_listener_updates_store(monkeypatch):
+@pytest.mark.parametrize(
+    "invalid_message",
+    [
+        b"not json",
+        b"[1, 5, 10]",
+        b"[null, 5, 10]",
+        b'["job", "5", 10]',
+        b'["job", 5, "10"]',
+        b'["job", -1, 10]',
+        b'["job", 11, 10]',
+        b'["job", 5, -10]',
+        b'["job", true, 10]',
+        b'["job", NaN, 10]',
+        b'["job", 5, Infinity]',
+        b'["job", 5]',
+        b"\xff",
+    ],
+)
+def test_progress_listener_updates_store(monkeypatch, invalid_message):
     store = AsyncDictStore()
     tracker = video_progress.VideoProgressTracker()
     monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
@@ -316,13 +349,24 @@ def test_progress_listener_updates_store(monkeypatch):
 
     async def run_test():
         await store.upsert("job", {"status": "queued", "progress": 0})
+        await store.upsert("barrier", {"status": "queued", "progress": 0})
         tracker.register("job", num_outputs=1)
+        tracker.register("barrier", num_outputs=1)
         listener = asyncio.create_task(video_progress.run_progress_listener(endpoint))
         context = zmq.asyncio.Context()
         push = context.socket(zmq.PUSH)
         push.connect(endpoint)
         try:
-            await push.send(b"not json")
+            await push.send(invalid_message)
+            # The same PUSH socket preserves order: the barrier proves that
+            # the malformed message was consumed before checking the job.
+            await push.send_json(["barrier", 0, 0])
+            for _ in range(200):
+                if (await store.get("barrier"))["status"] == "in_progress":
+                    break
+                await asyncio.sleep(0.01)
+            assert (await store.get("barrier"))["status"] == "in_progress"
+            assert await store.get("job") == {"status": "queued", "progress": 0}
             await push.send_json(["job", 5, 10])
             for _ in range(200):
                 if (await store.get("job"))["progress"] == 50:
@@ -338,3 +382,138 @@ def test_progress_listener_updates_store(monkeypatch):
 
     asyncio.run(run_test())
     assert not os.path.exists(endpoint.removeprefix("ipc://"))
+
+
+def test_progress_reporter_reconnects_after_listener_restart(monkeypatch):
+    """Restarting telemetry must not require restarting the generating worker."""
+    store = AsyncDictStore()
+    tracker = video_progress.VideoProgressTracker()
+    monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
+    monkeypatch.setattr(video_progress, "VIDEO_PROGRESS", tracker)
+    endpoint = f"ipc:///tmp/sglang-progress-test-{uuid.uuid4().hex[:8]}"
+    context = zmq.Context()
+    reporter = ProgressReporter(context, endpoint)
+
+    async def run_test():
+        await store.upsert("job", {"status": "queued", "progress": 0})
+        tracker.register("job", num_outputs=1)
+        for completed in (25, 75):
+            listener = asyncio.create_task(
+                video_progress.run_progress_listener(endpoint)
+            )
+            try:
+                for _ in range(500):
+                    reporter.step(["job"], completed=completed, total=100)
+                    await asyncio.sleep(0.01)
+                    if (await store.get("job"))["progress"] == completed:
+                        break
+                assert (await store.get("job"))["progress"] == completed
+                assert not listener.done()
+            finally:
+                listener.cancel()
+                with suppress(asyncio.CancelledError):
+                    await listener
+            assert not os.path.exists(endpoint.removeprefix("ipc://"))
+            # Updates during the outage are advisory and may be dropped.
+            for _ in range(1000):
+                reporter.step(["job"], completed=50, total=100)
+
+    try:
+        asyncio.run(run_test())
+    finally:
+        context.destroy(linger=0)
+
+
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "deleted"])
+def test_late_progress_cannot_revive_terminal_job(monkeypatch, terminal_status):
+    store = AsyncDictStore()
+    tracker = video_progress.VideoProgressTracker()
+    monkeypatch.setattr(video_progress, "VIDEO_STORE", store)
+
+    async def run_test():
+        tracker.register("job", num_outputs=2)
+        await store.upsert("job", {"status": "queued", "progress": 0})
+        tracker.update("job:0", completed=10, total=10)
+        await store.update_fields("job", {"status": terminal_status, "progress": 100})
+        if terminal_status == "deleted":
+            await store.pop("job")
+        result = tracker.update("job:1", completed=8, total=10)
+        await video_progress.apply_progress(*result)
+        job = await store.get("job")
+        if terminal_status == "deleted":
+            assert job is None
+        else:
+            assert job == {"status": terminal_status, "progress": 100}
+        tracker.unregister("job")
+        assert tracker.update("job:1", completed=10, total=10) is None
+        assert not tracker._jobs
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("outcome", ["failed", "cancelled"])
+def test_dispatch_always_unregisters_progress(monkeypatch, outcome):
+    store = AsyncDictStore()
+    tracker = video_progress.VideoProgressTracker()
+    monkeypatch.setattr(video_api, "VIDEO_STORE", store)
+    monkeypatch.setattr(video_api, "VIDEO_PROGRESS", tracker)
+
+    async def run_test():
+        started = asyncio.Event()
+
+        async def generate(*args, **kwargs):
+            started.set()
+            if outcome == "failed":
+                raise RuntimeError("generation failed")
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(video_api, "process_generation_batch", generate)
+        await store.upsert("job", {"status": "queued", "progress": 0})
+        tracker.register("job", num_outputs=2)
+        task = asyncio.create_task(video_api._dispatch_job_async("job", _FakeBatch()))
+        await started.wait()
+        if outcome == "cancelled":
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        assert not tracker._jobs
+        if outcome == "failed":
+            assert (await store.get("job"))["status"] == "failed"
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("num_stages", [1, 2, 3])
+def test_progress_covers_all_denoising_stages(
+    monkeypatch, progress_channel, num_stages
+):
+    """Refinement must advance progress rather than freeze after the first pass."""
+    reporter, pull = progress_channel
+    monkeypatch.setattr(progress_reporter, "_reporter", reporter)
+
+    class DenoisingStage(stage_base.PipelineStage):
+        role_affinity = RoleType.DENOISER
+
+        def __init__(self):
+            pass
+
+        def forward(self, batch, server_args):
+            return batch
+
+    args = SimpleNamespace(disable_conditioning_cache=True, use_fsdp_inference=False)
+    executor = SyncExecutor(args)
+    executor.component_residency_manager = SimpleNamespace(
+        begin_request=lambda *args: None, finish_request=lambda: None
+    )
+    batch = Req(sampling_params=SamplingParams(prompt="p", seed=1, request_id="job"))
+    batch.report_progress = True
+    stages = [DenoisingStage() for _ in range(num_stages)]
+    with executor._component_residency_request(stages, batch, args):
+        for stage in stages:
+            with stage.progress_bar(total=2, disable=True, batch=batch) as bar:
+                bar.update()
+                bar.update()
+    percentages = [completed / total for _, completed, total in _received(pull)]
+    assert percentages == pytest.approx(
+        [(i + 1) / (num_stages * 2) for i in range(num_stages * 2)]
+    )

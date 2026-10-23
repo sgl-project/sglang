@@ -770,6 +770,7 @@ async def create_video(
             sampling_params=sampling_params,
             external_trace_header=trace_headers,
         )
+        batch.report_progress = True
         # Add diffusers_kwargs if provided.
         if req.diffusers_kwargs:
             batch.extra["diffusers_kwargs"] = req.diffusers_kwargs

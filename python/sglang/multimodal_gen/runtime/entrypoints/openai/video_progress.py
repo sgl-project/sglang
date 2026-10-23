@@ -78,6 +78,13 @@ async def run_progress_listener(endpoint: str) -> None:
         while True:
             try:
                 request_id, completed, total = await socket.recv_json()
+                if (
+                    not isinstance(request_id, str)
+                    or type(completed) not in (int, float)
+                    or type(total) is not int
+                    or not 0 <= completed <= total
+                ):
+                    raise ValueError("invalid progress message")
                 result = VIDEO_PROGRESS.update(
                     request_id=request_id, completed=completed, total=total
                 )
