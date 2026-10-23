@@ -66,6 +66,7 @@ dependencies = [
   "py-spy",
   "pybase64",
   "pydantic",
+  "python-dateutil<3",  # botocore requires <3
   "python-multipart",
   "pyzmq>=25.1.2",
   "quack-kernels==0.6.5",
