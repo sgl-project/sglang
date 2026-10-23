@@ -1213,7 +1213,7 @@ class Envs:
     # including the flashinfer_megamoe runner (BF16 combine).
     # For the MoE weight-dequantization and overlap design, see
     # "Faster-than-light NVFP4 decode—with precision"
-    # by Ziang Li and friends at humans&:
+    # by Ziang Li at humans& ai:
     # https://humansand.ai/blog/faster-than-light-nvfp4-decode
     SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
