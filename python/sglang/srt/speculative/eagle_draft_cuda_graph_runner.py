@@ -195,9 +195,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
+            # The proposal q is over the draft vocab: reduced under a token map.
+            hot_token_id = getattr(self.eagle_worker, "hot_token_id", None)
+            draft_vocab_size = (
+                hot_token_id.shape[0]
+                if hot_token_id is not None
+                else self.model_runner.model_config.vocab_size
+            )
             draft_probs = (
                 torch.zeros(
-                    (self.max_bs, self.model_runner.model_config.vocab_size),
+                    (self.max_bs, draft_vocab_size),
                     dtype=torch.float32,
                 )
                 if get_spec().speculative_use_rejection_sampling

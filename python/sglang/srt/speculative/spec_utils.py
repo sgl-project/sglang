@@ -147,6 +147,39 @@ def fast_sample(probs: torch.Tensor, num_samples: int = 1):
     return sample_p, sample_index
 
 
+def validate_draft_token_map(token_map: torch.Tensor, target_vocab_size: int) -> None:
+    """A draft-to-target token map must be a injective map into the target vocab, or the
+    scattered proposal q would not be the distribution the draft token was drawn from."""
+    if token_map.numel() == 0:
+        raise ValueError("The speculative token map is empty.")
+    if int(token_map.min()) < 0 or int(token_map.max()) >= target_vocab_size:
+        raise ValueError(
+            "The speculative token map holds ids outside the target vocab "
+            f"[0, {target_vocab_size}): min={int(token_map.min())}, "
+            f"max={int(token_map.max())}."
+        )
+    if torch.unique(token_map).numel() != token_map.numel():
+        raise ValueError(
+            "The speculative token map has duplicate ids; rejection sampling needs "
+            "each reduced-vocab slot to map to a distinct target token."
+        )
+
+
+def scatter_draft_probs_to_target_vocab(
+    draft_probs: torch.Tensor, token_map: torch.Tensor, target_vocab_size: int
+) -> torch.Tensor:
+    """Place a reduced-vocab draft proposal q into the target vocab.
+
+    `draft_probs[..., i]` is q of reduced-vocab token i, whose target id is
+    `token_map[i]`. Target tokens outside the map get q = 0, which is exact: the draft
+    never proposes them, so q is still the distribution X was drawn from and the
+    verify's residual still covers them through p.
+    """
+    out = draft_probs.new_zeros((*draft_probs.shape[:-1], target_vocab_size))
+    out.index_copy_(draft_probs.dim() - 1, token_map.to(draft_probs.device), draft_probs)
+    return out
+
+
 def renorm_draft_probs(
     next_token_logits: torch.Tensor,
     sampling_info,

@@ -115,6 +115,7 @@ from sglang.srt.speculative.spec_utils import (
     sample_draft_proposal,
     select_top_k_tokens,
     spec_stage_span,
+    validate_draft_token_map,
 )
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -238,19 +239,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
-            target_vocab_size = self.target_worker.model_config.vocab_size
-            draft_vocab_size = (
-                self.hot_token_id.shape[0]
-                if self.hot_token_id is not None
-                else target_vocab_size
-            )
-            # FIXME: support reduced (hot) draft vocab by scattering draft probs
-            # into the target vocab via the d2t map before the sampling kernel.
-            if draft_vocab_size != target_vocab_size:
-                raise ValueError(
-                    "--speculative-use-rejection-sampling requires the draft and "
-                    f"target to share one vocab, but the draft vocab "
-                    f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
+            # A reduced (FR-Spec) draft vocab is fine: the draft proposal q stays over
+            # the reduced vocab and is scattered into the target vocab right before
+            # the verify kernel (eagle_sample, via EagleVerifyInput.draft_token_map).
+            if self.hot_token_id is not None:
+                validate_draft_token_map(
+                    self.hot_token_id, self.target_worker.model_config.vocab_size
                 )
 
     def init_attention_backends(self):
@@ -682,6 +676,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
+        if draft_probs is not None and self.hot_token_id is not None:
+            verify_input.draft_token_map = self.hot_token_id
         if kv_loc_plan is not None:
             # Verify and draft extend write the window the draft planned.
             verify_input.kv_loc_plan = kv_loc_plan
@@ -1393,7 +1389,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     dtype=hidden_dtype,
                     topk=self.topk,
                     capture_hidden_mode=capture_mode,
-                    vocab_size=self.target_worker.model_config.vocab_size,
+                    # draft_probs live in the draft vocab (reduced under a token map).
+                    vocab_size=(
+                        self.draft_worker.hot_token_id.shape[0]
+                        if self.draft_worker.hot_token_id is not None
+                        else self.target_worker.model_config.vocab_size
+                    ),
                 )
             if batch.spec_info is not None and batch.spec_info.is_verify_input():
                 # PP+spec: the scheduler pre-built this round's verify input

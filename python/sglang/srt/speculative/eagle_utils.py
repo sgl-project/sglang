@@ -1005,6 +1005,19 @@ def eagle_sample(
             if use_rejection_sampling
             else torch.zeros_like(target_probs)
         )
+        if (
+            use_rejection_sampling
+            and draft_probs is not None
+            and verify_input.draft_token_map is not None
+        ):
+            # FR-Spec reduced draft vocab: q is over the draft vocab, p over the target's.
+            from sglang.srt.speculative.spec_utils import (
+                scatter_draft_probs_to_target_vocab,
+            )
+
+            draft_probs = scatter_draft_probs_to_target_vocab(
+                draft_probs, verify_input.draft_token_map, target_probs.shape[-1]
+            )
         # Defense-in-depth behind the spec_hook startup allowlist: validate
         # the actual kernel inputs before the Triton kernel.
         if use_rejection_sampling and (
