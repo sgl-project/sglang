@@ -312,7 +312,7 @@ def lighten_warmup_req(server_args: ServerArgs, req: Req) -> Req | None:
     cutting them leaves the spatial kernels at their serving shape.
     """
     params = req.sampling_params
-    if params is None:
+    if params is None or not params.supports_warmup_lightening:
         return None
 
     num_frames = params.num_frames or 1

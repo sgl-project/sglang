@@ -1666,6 +1666,13 @@
                     ]
                   },
                   {
+                    "group": "MAGI",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/MAGI/MAGI-2"
+                    ]
+                  },
+                  {
                     "group": "Kandinsky",
                     "tag": "NEW",
                     "pages": [

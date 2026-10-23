@@ -6,7 +6,7 @@ from sglang.multimodal_gen.test.server.common.case_fixtures import (
     diffusion_case_fixture,
 )
 from sglang.multimodal_gen.test.server.gpu_cases import (
-    MINIMAX_H3_FOUR_GPU_H100_CASES,
+    FOUR_GPU_H100_CASES,
 )
 from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     DiffusionServerBase,
@@ -15,4 +15,4 @@ from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
 
 
 class TestDiffusionServerFourGpuH100(DiffusionServerBase):
-    case = diffusion_case_fixture(MINIMAX_H3_FOUR_GPU_H100_CASES)
+    case = diffusion_case_fixture(FOUR_GPU_H100_CASES)

@@ -366,6 +366,9 @@ class SamplingParams:
     # A prompt-free pipeline (e.g. a text-free SR / video-to-video DiT) sets this to
     # ``True`` so the multipart video-generation route does not require ``prompt``.
     prompt_optional: ClassVar[bool] = False
+    # False when a smaller frame count or resolution fails this type's validation,
+    # so warmup probes keep their shape instead of being halved.
+    supports_warmup_lightening: ClassVar[bool] = True
 
     height: int | None = None
     width: int | None = None

@@ -253,6 +253,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#7-vdn-h3-hybrid-attention-8-step-distill",
     },
     {
+      name: "MAGI-2-preview",
+      modelIds: ["sand-ai/MAGI-2-preview"],
+      cookbook: "/cookbook/diffusion/MAGI/MAGI-2",
+    },
+    {
       name: "MOVA",
       modelIds: ["OpenMOSS-Team/MOVA-360p", "OpenMOSS-Team/MOVA-720p"],
       note: "Resolved by the MOVA resolution detector.",

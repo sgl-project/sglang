@@ -106,7 +106,7 @@ def _validate_fused_swiglu_interleaved(
     *,
     activation: str,
     is_gated: bool,
-    has_gemm1_modifiers: bool,
+    has_unsupported_gemm1_modifiers: bool,
     has_bias: bool,
     is_quantized: bool,
     apply_router_weight_on_input: bool,
@@ -116,7 +116,7 @@ def _validate_fused_swiglu_interleaved(
     if not (
         activation == "silu"
         and is_gated
-        and not has_gemm1_modifiers
+        and not has_unsupported_gemm1_modifiers
         and not has_bias
         and not is_quantized
         and not apply_router_weight_on_input
@@ -633,8 +633,11 @@ def _fused_moe_kernel_sequence(
         _validate_fused_swiglu_interleaved(
             activation=activation,
             is_gated=is_gated,
-            has_gemm1_modifiers=any(
-                value is not None for value in (gemm1_alpha, gemm1_limit, swiglu_limit)
+            # Neither set means plain silu, both set means swiglu(alpha, limit);
+            # the epilogue has no form for limit without alpha.
+            has_unsupported_gemm1_modifiers=(
+                (gemm1_alpha is None) != (gemm1_limit is None)
+                or swiglu_limit is not None
             ),
             has_bias=b1 is not None,
             is_quantized=any(
@@ -684,6 +687,8 @@ def _fused_moe_kernel_sequence(
         b_use_tma=up_moe_use_tma,
         filter_expert=filter_expert,
         fuse_swiglu=fuse_swiglu_interleaved,
+        swiglu_alpha=gemm1_alpha,
+        swiglu_limit=gemm1_limit,
     )
 
     if hooks and hooks.after_gate_up:
