@@ -24,11 +24,13 @@ from sglang.srt.layers.moe.fused_moe_triton import layer as fused_moe_layer_modu
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
     get_flags,
+    get_forward,
     get_model,
     get_parallel,
 )
@@ -456,8 +458,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
     @staticmethod
     def _mega_gate_reference(x, weight, top_k, **kwargs):
-        if not torch.isfinite(x).all():
-            raise ValueError("MegaGate rejects nonfinite GEMM inputs")
+        unmasked = x if kwargs["mask"] is None else x[kwargs["mask"]]
+        if not torch.isfinite(unmasked).all():
+            raise ValueError("MegaGate rejects nonfinite scores on unmasked rows")
         scores = torch.log1p(torch.exp(x.float() @ weight.float().T)).sqrt()
         if kwargs["unmapped_topk_idx"] is not None:
             ids = kwargs["unmapped_topk_idx"]
@@ -546,18 +549,33 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 self.assertFalse(supported(moe))
 
             hidden = torch.zeros((32, 256), dtype=torch.bfloat16)
+            use = mega_gate_runtime.should_use_mega_gate
+            decode = SimpleNamespace(forward_mode=ForwardMode.DECODE)
             with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(False):
-                self.assertFalse(mega_gate_runtime.should_use_mega_gate(moe, hidden))
+                self.assertFalse(use(moe, hidden, decode))
             with envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.override(True):
-                self.assertTrue(mega_gate_runtime.should_use_mega_gate(moe, hidden))
-                self.assertFalse(
-                    mega_gate_runtime.should_use_mega_gate(moe, hidden.float())
-                )
-                self.assertFalse(
-                    mega_gate_runtime.should_use_mega_gate(
-                        moe, torch.zeros((4096, 256), dtype=torch.bfloat16)
+                self.assertTrue(use(moe, hidden, decode))
+                self.assertTrue(
+                    use(
+                        moe,
+                        hidden,
+                        SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY),
                     )
                 )
+                self.assertFalse(use(moe, hidden.float(), decode))
+                self.assertFalse(
+                    use(moe, torch.zeros((4096, 256), dtype=torch.bfloat16), decode)
+                )
+                # Prefill graph capture runs with is_extend_in_batch cleared.
+                with get_forward().scoped(is_extend_in_batch=False):
+                    self.assertFalse(
+                        use(
+                            moe,
+                            hidden,
+                            SimpleNamespace(forward_mode=ForwardMode.EXTEND),
+                        )
+                    )
+                self.assertFalse(use(moe, hidden, None))
 
     def test_mega_gate_routes_vision_hash_and_padding(self):
         for is_hash in (False, True):

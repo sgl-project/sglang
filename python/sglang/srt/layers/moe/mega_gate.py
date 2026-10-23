@@ -78,14 +78,16 @@ def mega_gate_supported(moe) -> bool:
     )
 
 
-def should_use_mega_gate(moe, hidden_states: torch.Tensor) -> bool:
-    forward = get_forward()
+def should_use_mega_gate(moe, hidden_states: torch.Tensor, forward_batch) -> bool:
+    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get() or forward_batch is None:
+        return False
+    # Prefill graph capture clears is_extend_in_batch, so gate on the mode itself.
+    mode = forward_batch.forward_mode
     return (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_GATE.get()
+        (mode.is_decode() or mode.is_target_verify())
         and moe.mega_gate_supported
         and 0 < hidden_states.shape[0] <= _MEGA_GATE_MAX_ROWS
-        and not forward.is_extend_in_batch
-        and not forward.sp_active
+        and not get_forward().sp_active
         and hidden_states.dtype == torch.bfloat16
         and hidden_states.is_contiguous()
     )
