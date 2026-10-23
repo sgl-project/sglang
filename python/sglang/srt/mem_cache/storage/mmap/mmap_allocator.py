@@ -67,6 +67,18 @@ def _thp_page_size() -> int:
         return 0
 
 
+def _thp_fault_fallbacks() -> int:
+    """System-wide count of THP faults that fell back to 4K pages, or -1 if unknown."""
+    try:
+        with open("/proc/vmstat") as f:
+            for line in f:
+                if line.startswith("thp_fault_fallback "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return -1
+
+
 @functools.cache
 def _has_madv_populate_write() -> bool:
     """Whether this kernel implements MADV_POPULATE_WRITE (Linux 5.14+).
@@ -156,7 +168,20 @@ def _alloc_thp(n_bytes: int, page_size: int) -> ctypes.Array:
         errno = ctypes.get_errno()
         _libc.munmap(ctypes.c_void_p(ptr), alloc_bytes)
         raise OSError(errno, os.strerror(errno))
+    fallbacks_before = _thp_fault_fallbacks()
     ctypes.memset(ctypes.c_void_p(aligned), 0, n_bytes)
+    fell_back = _thp_fault_fallbacks() - fallbacks_before
+    if fallbacks_before >= 0 and fell_back > 0:
+        # THP is best effort: with no free 2MiB blocks the kernel serves the
+        # fault with 4K pages and reports nothing else. The counter is
+        # system-wide, so it can also include other processes.
+        logger.warning(
+            "%d transparent hugepage faults fell back to 4K pages while "
+            "populating %d bytes; the NIC may still see more page-table "
+            "entries than a hugepage-backed pool would give.",
+            fell_back,
+            n_bytes,
+        )
     array = (ctypes.c_uint8 * n_bytes).from_address(aligned)
     # Unmap from the raw base, not the aligned one, or the alignment slack leaks.
     weakref.finalize(array, _libc.munmap, ctypes.c_void_p(ptr), alloc_bytes)
