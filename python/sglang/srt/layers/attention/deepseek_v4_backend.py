@@ -4384,9 +4384,7 @@ class DeepseekV4AttnBackend(
                     n_compressed,
                 ),
             )
-            if not compressed_filled or not (
-                envs.SGLANG_OPT_DSV4_SPARSE_PREFILL_DEQUANT_DEDUP.get()
-            ):
+            if not compressed_filled:
                 compressed_slice = workspace[:n_compressed]
             swa_slice = workspace[n_compressed:]
 
