@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
@@ -16,6 +17,7 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -155,6 +157,26 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             [[-0.5, -0.75], None, [-0.25]],
         )
         self.assertIsNone(output.sampling_mask_output)
+
+    def test_zero_output_prefill_returns_no_sampling_mask_row(self):
+        """A request that finishes with no output tokens (max_new_tokens=0) in a
+        sampled prefill returns one sampling mask row per output token: none."""
+        processor = SchedulerBatchResultProcessor.__new__(SchedulerBatchResultProcessor)
+        output = SimpleNamespace(
+            next_token_sampling_mask_idx=[np.array([5, 7], dtype=np.int32)],
+            next_token_sampling_logprobs=[np.array([-2.0, -0.25], dtype=np.float32)],
+        )
+        finished = SimpleNamespace(
+            output_ids=[7], finished_len=0, sampling_mask_rows=SamplingMaskRows()
+        )
+        running = SimpleNamespace(
+            output_ids=[7], finished_len=None, sampling_mask_rows=SamplingMaskRows()
+        )
+        for req in (finished, running):
+            processor.add_sampling_mask_return_values(0, req, output)
+
+        self.assertEqual(finished.sampling_mask_rows.take().lengths.tolist(), [])
+        self.assertEqual(running.sampling_mask_rows.take().lengths.tolist(), [2])
 
 
 class _PrefillReq:

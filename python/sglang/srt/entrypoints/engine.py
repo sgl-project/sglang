@@ -1370,6 +1370,8 @@ class Engine(EngineScoreMixin, EngineBase):
         finally:
             if not startup_complete and isinstance(tokenizer_manager, TokenizerManager):
                 tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+                if tokenizer_manager.output_store is not None:
+                    tokenizer_manager.output_store.shutdown()
 
         return (
             tokenizer_manager,
@@ -1457,6 +1459,8 @@ class Engine(EngineScoreMixin, EngineBase):
                 if mm_processor is not None:
                     mm_processor.shutdown()
                 self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+                if self.tokenizer_manager.output_store is not None:
+                    self.tokenizer_manager.output_store.shutdown()
             return
         shm = getattr(self, "_multi_tokenizer_shm", None)
         if shm is not None:
@@ -1495,6 +1499,8 @@ class Engine(EngineScoreMixin, EngineBase):
                 if mm_processor is not None:
                     mm_processor.shutdown()
                 self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+                if self.tokenizer_manager.output_store is not None:
+                    self.tokenizer_manager.output_store.shutdown()
 
     def __enter__(self):
         return self

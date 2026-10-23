@@ -3,7 +3,7 @@
 import pickle
 import sys
 from array import array
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import msgspec
 import numpy as np
@@ -49,6 +49,12 @@ class SamplingMaskChunk(
                 values.append(self.logprobs[start:end].tolist())
             start = end
         return masks, values
+
+    def selected_logprobs(self, output_ids: Sequence[int]) -> np.ndarray:
+        """Support mode: each row's logprob of its sampled token, float32 [num_rows]."""
+        sampled = np.repeat(np.asarray(output_ids, dtype=np.int32), self.lengths)
+        # The sampler marks a row INVALID unless its support holds the sampled token.
+        return self.logprobs[self.token_ids == sampled]
 
 
 def _chunk_from_buffers(lengths, token_ids, logprobs) -> SamplingMaskChunk:
