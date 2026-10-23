@@ -4,8 +4,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-os.environ.setdefault("SGLANG_USE_CPU_ENGINE", "1")
-
 import torch
 
 import sglang.srt.layers.layer_boundary.residual.stream as stream_mod
@@ -170,7 +168,6 @@ class TestCPUGraph(CustomTestCase):
     def test_cpu_graph_boundary_patch_is_reentrant_and_restores(self):
         import msgspec.structs
 
-        import sglang.srt.layers.layer_boundary.residual.stream as stream_mod
         from sglang.srt.layers.layer_boundary import exit as exit_mod
         from sglang.srt.layers.layer_boundary import output as output_mod
         from sglang.srt.layers.layer_boundary import prepare as prepare_mod
