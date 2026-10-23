@@ -1608,7 +1608,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _staged_signature(self, forward_batch: ForwardBatch) -> Optional[tuple]:
         input_ids, positions = forward_batch.input_ids, forward_batch.positions
-        if input_ids is None or positions is None:
+        # inference tensors (SGLANG_ENABLE_TORCH_INFERENCE_MODE) keep no version
+        if (
+            input_ids is None
+            or positions is None
+            or input_ids.is_inference()
+            or positions.is_inference()
+        ):
             return None
         # PyTorch bumps a tensor's version on every in-place write it makes
         versions = (input_ids._version, positions._version)

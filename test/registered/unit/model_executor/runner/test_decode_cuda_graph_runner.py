@@ -478,6 +478,26 @@ class TestPrePlannedReplayRestage(CustomTestCase):
                         want = [-1] * 4 if skipped else src.tolist()
                         self.assertEqual(buf.tolist(), want, (name, load))
 
+    def test_inference_tensors_are_always_copied(self):
+        """SGLANG_ENABLE_TORCH_INFERENCE_MODE: inference tensors keep no version, so
+        a write since the full load cannot be ruled out."""
+        import torch
+
+        runner = self._runner(["forward"])
+        with torch.inference_mode():
+            fb = SimpleNamespace(
+                needs_forward_metadata_init=lambda: False,
+                input_ids=torch.tensor([5, 6, 7, 8]),
+                positions=torch.tensor([20, 21, 22, 23]),
+                input_embeds=None,
+            )
+            runner._staged_inputs = runner._staged_signature(fb)
+            runner.buffers.input_ids.fill_(-1)
+            runner.buffers.positions.fill_(-1)
+            runner.load_batch(fb)
+        self.assertEqual(runner.buffers.input_ids.tolist(), [5, 6, 7, 8])
+        self.assertEqual(runner.buffers.positions.tolist(), [20, 21, 22, 23])
+
 
 if __name__ == "__main__":
     unittest.main()

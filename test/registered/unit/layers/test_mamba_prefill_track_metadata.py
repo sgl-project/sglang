@@ -498,6 +498,16 @@ class TestVerifyTrackIndexReuse(unittest.TestCase):
                 )
                 self.assertEqual(got, self._prepare(batch, None))
 
+    def test_inference_tensors_are_rebuilt_every_round(self):
+        # SGLANG_ENABLE_TORCH_INFERENCE_MODE: inference tensors keep no version
+        with torch.inference_mode():
+            batch, reuse = make_verify_batch(), spec_utils.VerifyTrackIndices()
+            want = self._prepare(batch, None)
+            for _ in range(2):
+                builds = self.builds
+                self.assertEqual(self._prepare(batch, reuse), want)
+                self.assertEqual(self.builds, builds + 1)
+
     def test_lazy_plan_is_never_reused_over(self):
         batch, reuse = make_verify_batch(), spec_utils.VerifyTrackIndices()
         self._prepare(batch, reuse)

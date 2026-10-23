@@ -873,6 +873,7 @@ class VerifyTrackIndices:
             req_pool_indices is self._req_pool_indices
             and mapping is self._mapping
             and positions == self._positions
+            and self._versions is not None
             and _versions(req_pool_indices, mapping, self._indices) == self._versions
         ):
             batch.mamba_track_buffer_indices = [
@@ -886,8 +887,11 @@ class VerifyTrackIndices:
         self._versions = _versions(req_pool_indices, mapping, self._indices)
 
 
-def _versions(*tensors: torch.Tensor) -> tuple[int, ...]:
-    # PyTorch bumps a tensor's version on every in-place write it makes
+def _versions(*tensors: torch.Tensor) -> Optional[tuple[int, ...]]:
+    # PyTorch bumps a tensor's version on every in-place write it makes; inference
+    # tensors (SGLANG_ENABLE_TORCH_INFERENCE_MODE) have none, so they never match
+    if any(t.is_inference() for t in tensors):
+        return None
     return tuple(t._version for t in tensors)
 
 
