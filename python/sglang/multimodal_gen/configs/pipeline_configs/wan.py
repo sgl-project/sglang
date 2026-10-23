@@ -2,14 +2,18 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
-from sglang.multimodal_gen.configs.models.dits import WanAnimate2Config, WanVideoConfig
+from sglang.multimodal_gen.configs.models.dits import (
+    WanAnimate2Config,
+    WanAnimate2DistilledConfig,
+    WanVideoConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPVisionConfig,
@@ -428,6 +432,21 @@ class Wan_Animate_2_14B_Config(WanI2V720PConfig):
         super().validate_server_args(server_args)
 
 
+@dataclass
+class Wan_Animate_2_14B_Distilled_Config(Wan_Animate_2_14B_Config):
+    """Distilled Wan-Animate-2 14B: same components and stages, log_scale -1.3 in the DiT."""
+
+    dit_config: DiTConfig = field(default_factory=WanAnimate2DistilledConfig)
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # No unconditional branch to split: a CFG group would recompute one branch per rank,
+        # so an explicit CFG group is rejected. Auto-enable needs no flag: the server only
+        # auto-enables CFG parallel for a model whose default sampling params use guidance.
+        return replace(
+            super().get_model_deployment_config(), supports_cfg_parallel=False
+        )
+
+
 # =============================================
 # ============= Causal Self-Forcing =============
 # =============================================
@@ -441,6 +460,19 @@ class SelfForcingWanT2V480PConfig(WanT2V480PConfig):
     warp_denoising_step: bool = True
 
 
+def _is_wan_animate_2_path(p: str) -> bool:
+    # Registry probes are lower-cased. Require the "-2-"/"_2" token so a v1
+    # Wan2.2-Animate-14B checkpoint (a different model / pipeline) does not route here.
+    return "wan_animate_2" in p or "wan2.2-animate-2" in p
+
+
+def _is_wan_animate_2_distilled_path(p: str) -> bool:
+    # The distill token counts in the directory's own name only, so a base checkpoint
+    # kept under a parent such as distillation-runs/ keeps the base config.
+    short_name = p.rstrip("/").split("/")[-1]
+    return _is_wan_animate_2_path(p) and "distill" in short_name
+
+
 def register():
     from sglang.multimodal_gen.configs.sample.wan import (
         FastWanT2V480PConfig,
@@ -449,6 +481,7 @@ def register():
         Wan2_2_I2V_A14B_SamplingParam,
         Wan2_2_T2V_A14B_SamplingParam,
         Wan2_2_TI2V_5B_SamplingParam,
+        Wan_Animate_2_14B_Distilled_SamplingParam,
         Wan_Animate_2_14B_SamplingParam,
         WanI2V_14B_480P_SamplingParam,
         WanI2V_14B_720P_SamplingParam,
@@ -551,20 +584,34 @@ def register():
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
         ],
     )
+    # Both repos ship model_index.json with the same _class_name (WanAnimate2Pipeline);
+    # modular_model_index.json names the variant, and the registry probes the detectors
+    # with both classes and the path (a distill token counts in the directory's own name
+    # only). Detectors are checked in registration order, and a directory that ships
+    # model_index.json matches the base detector through the shared class as well, so
+    # the distilled entry is registered first.
+    register_configs(
+        sampling_param_cls=Wan_Animate_2_14B_Distilled_SamplingParam,
+        pipeline_config_cls=Wan_Animate_2_14B_Distilled_Config,
+        hf_model_paths=["Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers"],
+        model_detectors=[
+            lambda p: (
+                p == "wananimate2distilledmodularpipeline"
+                or _is_wan_animate_2_distilled_path(p)
+            )
+        ],
+    )
     register_configs(
         sampling_param_cls=Wan_Animate_2_14B_SamplingParam,
         pipeline_config_cls=Wan_Animate_2_14B_Config,
-        hf_model_paths=[
-            "Wan-AI/Wan2.2-Animate-2-14B-Diffusers",
-        ],
+        hf_model_paths=["Wan-AI/Wan2.2-Animate-2-14B-Diffusers"],
         model_detectors=[
-            # The registry calls this with the path and with model_index's lower-cased
-            # _class_name. Require the "-2-"/"_2" token so a v1 Wan2.2-Animate-14B
-            # checkpoint (a different model / pipeline) does not mis-route here.
             lambda p: (
-                "wan_animate_2" in p.lower()
-                or "wan2.2-animate-2" in p.lower()
-                or p.lower() == "wananimate2pipeline"
+                p in ("wananimate2modularpipeline", "wananimate2pipeline")
+                or (
+                    _is_wan_animate_2_path(p)
+                    and not _is_wan_animate_2_distilled_path(p)
+                )
             )
         ],
     )

@@ -7,7 +7,7 @@ import torch
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     CompressedGather,
     SparsePrefillChunkCache,
-    SparsePrefillWorkspace,
+    SparsePrefillKVBuffer,
 )
 
 
@@ -175,9 +175,9 @@ class TestRaggedPrefill(unittest.TestCase):
             cache = make_cache([44198, 577152, 95723, 51427, 6144], [1] * 5, "cuda")
             table = torch.arange(2255, device="cuda", dtype=torch.int32).expand(5, -1)
             with self.assertRaises(torch.OutOfMemoryError):
-                SparsePrefillWorkspace(torch.device("cuda")).get(2902511)
+                SparsePrefillKVBuffer(torch.device("cuda")).get(2902511)
             gather = cache.ensure_compressed(1, table, 256)
-            workspace = SparsePrefillWorkspace(torch.device("cuda")).get(
+            workspace = SparsePrefillKVBuffer(torch.device("cuda")).get(
                 gather.flat_token_ids.numel() + 16751
             )
             self.assertEqual(workspace.shape[0], 791395)
@@ -200,7 +200,7 @@ class TestRaggedPrefill(unittest.TestCase):
             new_rows = gather.flat_token_ids.numel() + swa
             self.assertEqual(old_rows, expected_old)
             self.assertEqual(new_rows, expected_new)
-            ws = SparsePrefillWorkspace(torch.device("cuda"))
+            ws = SparsePrefillKVBuffer(torch.device("cuda"))
             before = torch.cuda.memory_allocated()
             buf = ws.get(new_rows)
             allocated = torch.cuda.memory_allocated() - before
