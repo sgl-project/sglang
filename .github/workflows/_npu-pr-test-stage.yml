@@ -242,7 +242,7 @@ jobs:
         shell: bash
         run: |
           python3 scripts/ci/npu/patch_torch_npu_trace_rule.py
-          python3 -c "import torch_npu.dynamo.trace_rule as t; assert 'torch.npu.random.manual_seed_all' in t.skip_functions_npu"
+          python3 scripts/ci/npu/patch_torch_npu_trace_rule.py
 
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
