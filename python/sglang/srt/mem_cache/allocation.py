@@ -113,7 +113,7 @@ def write_cache_indices_torch(
     prefix_tensors: list[torch.Tensor],
     req_to_token: torch.Tensor,
 ):
-    """Non-Triton writer: one ``index_copy_`` into the flattened table.
+    """Non-Triton writer: one ``index_put_`` into the flattened table.
 
     Equivalent to writing, per request ``i``, ``prefix_tensors[i]`` into
     ``req_to_token[row_i, :prefix_len_i]`` and its slice of ``out_cache_loc``
@@ -145,9 +145,9 @@ def write_cache_indices_torch(
 
     values = [t.to(device) for t in prefix_tensors if t.numel() > 0]
     assert sum(t.numel() for t in values) == int(prefix_lens.sum())
-    values.append(out_cache_loc[:num_extend])
+    values.append(out_cache_loc[:num_extend].to(device))
     values = torch.cat(values).to(req_to_token.dtype)
-    req_to_token.view(-1).index_copy_(0, flat_indices, values)
+    req_to_token.view(-1).index_put_((flat_indices,), values)
 
 
 def get_last_loc(

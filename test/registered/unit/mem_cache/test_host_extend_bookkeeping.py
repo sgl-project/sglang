@@ -25,6 +25,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+if torch.cuda.is_available():
+    _ACCEL_DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    _ACCEL_DEVICE = "mps"
+else:
+    _ACCEL_DEVICE = None
+
 # (extend_prefix_lens, extend_seq_lens)
 POSITION_CASES = [
     ([0], [1]),
@@ -197,6 +204,25 @@ class TestWriteCacheIndicesTorch(unittest.TestCase):
 
     def test_zero_extend_request(self):
         self._check(rows=[1, 2], prefix_lens=[5, 0], extend_lens=[0, 3])
+
+    @unittest.skipUnless(_ACCEL_DEVICE is not None, "needs a non-CPU device")
+    def test_host_table_with_device_locs(self):
+        # A platform may keep req_to_token on the host while the allocator
+        # hands out device-resident slots.
+        rows, prefix_lens, extend_lens = [5, 1], [16, 0], [4, 9]
+        inp = self._inputs(rows, prefix_lens, extend_lens)
+        ref_pool, new_pool = self._pool(), self._pool()
+        _old_write_cache_indices(**inp, req_to_token_pool=ref_pool)
+
+        write_cache_indices_torch(
+            inp["out_cache_loc"].to(_ACCEL_DEVICE),
+            inp["req_pool_indices_cpu"],
+            inp["prefix_lens_cpu"],
+            inp["extend_lens_cpu"],
+            [t.to(_ACCEL_DEVICE) for t in inp["prefix_tensors"]],
+            new_pool.req_to_token,
+        )
+        self.assertTrue(torch.equal(new_pool.req_to_token, ref_pool.req_to_token))
 
 
 if __name__ == "__main__":
