@@ -465,6 +465,9 @@ class LogitsProcessor(nn.Module):
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
             config, "enable_lm_head_fp32", False
         )
+        self.use_fp32_lm_head_output = getattr(
+            config, "enable_lm_head_output_fp32", False
+        )
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
@@ -1092,7 +1095,9 @@ class LogitsProcessor(nn.Module):
             )
             # A shared FP32 buffer must not change the lm_head's output precision.
             # Keep the same rounding as the unbuffered path unless FP32 is enabled.
-            if use_mm_out_dtype and self.use_fp32_lm_head:
+            if use_mm_out_dtype and (
+                self.use_fp32_lm_head or self.use_fp32_lm_head_output
+            ):
                 logits = torch.mm(
                     hidden_states,
                     lm_head.weight.T,
