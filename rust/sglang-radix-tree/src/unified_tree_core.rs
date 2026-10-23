@@ -605,6 +605,8 @@ pub struct CacheInitParams {
     pub swa_sliding_window_size: Option<usize>,
     /// Whether SWA lives in a per-request ring rather than cached paged slots.
     pub swa_req_ring: bool,
+    /// PD decode matches FULL only; SWA remains request-owned.
+    pub pd_decode_aux_from_prefill: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub has_swa_host_pool: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
@@ -631,6 +633,7 @@ impl Default for CacheInitParams {
             device: Device::Cpu,
             swa_sliding_window_size: None,
             swa_req_ring: false,
+            pd_decode_aux_from_prefill: false,
             has_swa_host_pool: false,
             enable_kv_cache_events: false,
             dynamo_kv_event_format: false,
@@ -694,6 +697,7 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) is_write_back: bool,
     /// Whether the host tier (HiCache) is wired.
     pub(crate) enable_hicache: bool,
+    pub(crate) pd_decode_aux_from_prefill: bool,
     /// Whether the host tier stages one node per FIFO backup intent rather than
     /// caching windows; buffer mode sizes its storage keys off a single node.
     pub(crate) is_host_memory_buffer_only: bool,
@@ -1038,6 +1042,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             page_size: params.page_size,
             is_write_back: params.is_write_back,
             enable_hicache: params.enable_hicache,
+            pd_decode_aux_from_prefill: params.pd_decode_aux_from_prefill,
             is_host_memory_buffer_only: false,
             enable_storage: false,
             enable_external_cache_linker: false,

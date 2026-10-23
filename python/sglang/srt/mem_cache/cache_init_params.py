@@ -71,6 +71,9 @@ class CacheInitParams:
     )
     tree_core_backend: Optional[str] = dataclasses.field(default=None, kw_only=True)
 
+    # PD decode reuses Full KV; request-owned SWA is transferred fresh.
+    pd_decode_aux_from_prefill: bool = False
+
     mtp_draft_device_pools: tuple[object, ...] = ()
     # Draft KV pools that share the target KV slots but are stored apart from it.
     sidecar_draft_device_pools: tuple[object, ...] = ()
