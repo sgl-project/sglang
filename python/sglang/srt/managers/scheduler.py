@@ -3286,6 +3286,7 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
         if self.enable_hicache_storage or self.enable_lmcache:
+            req.time_stats.reset_prefetch_start_time()  # clear stale start
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
@@ -3323,7 +3324,8 @@ class Scheduler(
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                return tree_cache.prefetch_from_storage(
+
+                prefetch_ret = tree_cache.prefetch_from_storage(
                     req.cache_request_handle,
                     last_host_node,
                     new_input_tokens,
@@ -3334,6 +3336,12 @@ class Scheduler(
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
                 )
+                # Record the prefetch start only if it was actually issued.
+                # prefetch_from_storage has early-exit branches (below_threshold,
+                # rate_limited, aux_alloc_failed) that never write ongoing_prefetch.
+                if req.cache_request_handle in tree_cache.ongoing_prefetch:
+                    req.time_stats.set_prefetch_start_time()
+                return prefetch_ret
 
     def _process_storage_prefetch_retries(self):
         """Issue due L3 attempts in the current waiting-queue order."""
@@ -4201,6 +4209,7 @@ class Scheduler(
                     # Cache-mode host memory is a resident L2 tier. Buffer mode
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
+                req.time_stats.observe_prefetch_stage_finish()
 
             req.init_next_round_input(self.tree_cache)
             if self.enable_hicache_storage and (

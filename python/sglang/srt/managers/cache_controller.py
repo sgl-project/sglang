@@ -42,7 +42,10 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.mem_cache.utils import (
+    get_storage_hash_str,
+    log_hicache_event,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
@@ -239,6 +242,10 @@ class StorageOperation:
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
+        # Set by the IO thread on a page read/write failure; read by the
+        # scheduler thread (via the ack queues) to classify the outcome.
+        self.prefetch_read_failed = False
+        self.write_storage_failed = False
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
         # Full queried page-hash chain, set by _storage_hit_query before
@@ -249,6 +256,9 @@ class StorageOperation:
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
+        # Monotonic; read by the scheduler thread in _drain_backup to time the
+        # enqueue-to-ack span of L2->L3 writes.
+        self.enqueue_time = time.perf_counter()
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -1078,6 +1088,7 @@ class HiCacheController:
                 logger.warning(
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
+                operation.prefetch_read_failed = True
                 break
             inc += 1
         return inc
@@ -1098,6 +1109,7 @@ class HiCacheController:
                 logger.warning(
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
+                operation.prefetch_read_failed = True
                 break
             if operation.is_terminated():
                 break
@@ -1381,8 +1393,14 @@ class HiCacheController:
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
-                logger.warning(
-                    f"Write page to storage: {len(batch_hashes)} pages failed."
+                operation.write_storage_failed = True
+                log_hicache_event(
+                    event="backup",
+                    tier="l2_to_l3",
+                    result="failed",
+                    reason="error",
+                    tokens=len(operation.token_ids),
+                    extra=f"Write page to storage: {len(batch_hashes)} pages failed.",
                 )
                 break
 

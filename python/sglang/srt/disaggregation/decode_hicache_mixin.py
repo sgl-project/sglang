@@ -114,6 +114,7 @@ class DecodeHiCachePreallocMixin:
 
         On failure, degrades to L2-only restore by clearing l3 fields.
         """
+        req.time_stats.reset_prefetch_start_time()
         if (
             prefix_match is None
             or prefix_match.l3_storage_hit_length <= 0
@@ -143,6 +144,8 @@ class DecodeHiCachePreallocMixin:
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle
             )
+            if prefix_match.prefetch_registered:
+                req.time_stats.set_prefetch_start_time()
         except Exception as e:
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
@@ -209,6 +212,7 @@ class DecodeHiCacheTransferMixin:
             if not self.tree_cache.check_prefetch_progress(dr.req.cache_request_handle):
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
+            dr.req.time_stats.observe_prefetch_stage_finish()
 
         # Re-match: req.last_node / prefix_len updated to current device state.
         rematch = match_kv_cache(
