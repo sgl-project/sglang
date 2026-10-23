@@ -47,7 +47,7 @@ class TestHealthWarmupGate(unittest.IsolatedAsyncioTestCase):
             router = DiffusionServer(
                 frontend_endpoint=endpoint,
                 encoder_work_endpoints=[],
-                denoiser_work_endpoints=[],
+                denoiser_work_endpoints=[f"ipc://{directory}/denoiser-work"],
                 decoder_work_endpoints=[],
                 encoder_result_endpoint=f"ipc://{directory}/encoder",
                 denoiser_result_endpoint=f"ipc://{directory}/denoiser",
