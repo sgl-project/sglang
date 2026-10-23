@@ -432,7 +432,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         translator.bind_own_plan(forward_batch)
 
-        static_batch = runner.load_batch(forward_batch)
+        static_batch, _ = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
 
@@ -688,6 +688,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
                     self.assertEqual(
                         _local_prefill_cuda_graph_vote(
                             local_batch=schedule_batch,
+                            num_tokens=4,
                             prefill_graph_runner=runner,
                             coordinated_prefill=True,
                             breakable_prefill=backend == Backend.BREAKABLE,

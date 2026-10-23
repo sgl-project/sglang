@@ -22,7 +22,7 @@ on:
           - gfx942-rocm1000
           - gfx950-rocm1000
   schedule:
-    - cron: '0 12 * * *'
+    - cron: '0 10 * * *'  # before the ROCm 7.2 build, so it is not queued behind it
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
