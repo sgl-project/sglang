@@ -47,6 +47,9 @@ class MultiLayerEagleDraftExtendNpuGraphRunner(
 class MultiLayerEagleMultiStepDraftExtendNpuGraphRunner(
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner
 ):
+    # Sampling under NPU graph replay is unvalidated; the worker samples instead.
+    captures_proposal = False
+
     def _create_runner(self, step: int) -> MultiLayerEagleDraftExtendNpuGraphRunner:
         return MultiLayerEagleDraftExtendNpuGraphRunner(self.eagle_worker, step)
 

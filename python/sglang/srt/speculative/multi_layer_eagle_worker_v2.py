@@ -144,8 +144,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         # Leviathan/Chen rejection sampling (temp>0): the draft samples X ~ q and
         # provides q so the verify accepts iff coin*q < p and resamples the residual.
-        # Single-CG runner samples in-graph (_sample_draft_proposal); per-step
-        # runner samples worker-side between replays.
+        # Draft-extend graphs sample in-graph where the runner can
+        # (samples_in_graph); otherwise the worker samples between replays.
         self.use_rejection_sampling = get_spec().speculative_use_rejection_sampling
         assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
             "multi-layer EAGLE requires speculative_num_draft_tokens == "
@@ -903,15 +903,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 # against it and the chain is advanced in place between steps.
                 cgr.prepare(forward_batch, staged=staged)
                 rotates_in_graph = cgr.rotates_in_graph
+                samples_in_graph = cgr.samples_in_graph
                 for step in range(self.speculative_num_steps):
                     _out, ret_topk_p, ret_topk_index = cgr.replay(step)
-                    # Rejection sampling with the per-step runner re-picks X ~ q
-                    # worker-side so the worker rotation carries it to step N+1; the
-                    # single-CG runner samples in-graph (q cloned after the loop).
+                    # Rejection sampling on a runner whose graphs don't sample
+                    # re-picks X ~ q here so the rotation carries it to step N+1;
+                    # otherwise the graph drew X (q cloned after the loop).
                     if (
                         self.use_rejection_sampling
                         and self.topk == 1
-                        and not rotates_in_graph
+                        and not samples_in_graph
                     ):
                         if cgr.prune_draft_extend_logits:
                             step_logits = _out.next_token_logits
@@ -946,7 +947,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                             ret_topk_index,
                             cgr.buffers.select_index[: cgr.raw_bs],
                         )
-                if self.use_rejection_sampling and self.topk == 1 and rotates_in_graph:
+                if samples_in_graph:
                     ret_draft_probs = cgr.clone_draft_probs()
         else:
             logger.warning_once(
