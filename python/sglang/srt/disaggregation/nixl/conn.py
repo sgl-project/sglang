@@ -2013,6 +2013,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     notify, saw_err = self._await_handles(handles, failure_seen=True)
                 saw_err = saw_err or isinstance(e, _NixlErrReport)
                 if notify:
+                    if saw_err and self.enable_deferred_decode_kv_release:
+                        # An ERR write may still land in the decode's pages;
+                        # leave the room to the decode's release timeout.
+                        self.poison_deferred_ack_room(room)
                     self.conclude_failure(bootstrap_room=room, failure_reason=str(e))
                     # Every handle settled => the writes are done, but the
                     # normal-path decrement was never reached, so without this
@@ -2021,12 +2025,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         kv_chunk.staging_counted = False
                         self._staging_outstanding[room] -= 1
                     if self.enable_deferred_decode_kv_release:
-                        if saw_err:
-                            # An ERR write may still land in the decode's pages;
-                            # leave the room to the decode's release timeout.
-                            self.poison_deferred_ack_room(room)
-                        else:
-                            self._maybe_ack_drained_abort(room)
+                        self._maybe_ack_drained_abort(room)
                 else:
                     # A handle can still write into the decode's KV pages, so
                     # leave the room to the decode's waiting timeout rather
