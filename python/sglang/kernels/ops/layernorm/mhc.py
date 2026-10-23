@@ -2186,6 +2186,31 @@ def _mhc_combine_kernel(
 
 
 @triton.jit
+def _mhc_stream_mean_kernel(
+    x_ptr,
+    y_ptr,
+    H,
+    x_stride_m,
+    x_stride_k,
+    y_stride_m,
+    HC: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs_h < H
+    x_row = x_ptr + pid_m.to(tl.int64) * x_stride_m + offs_h
+    # Streams are added in order in fp32, as torch.mean's reduction does.
+    acc = tl.load(x_row, mask=mask, other=0.0).to(tl.float32)
+    for k in tl.static_range(1, HC):
+        acc += tl.load(x_row + k * x_stride_k, mask=mask, other=0.0).to(tl.float32)
+    tl.store(
+        y_ptr + pid_m.to(tl.int64) * y_stride_m + offs_h, acc * (1.0 / HC), mask=mask
+    )
+
+
+@triton.jit
 def _hc_mix_stats_partial_kernel(
     x_ptr,
     w_ptr,
@@ -2731,6 +2756,28 @@ def mhc_combine(
         x_flat.stride(0),
         pre.stride(0),
         pre.stride(1),
+        y.stride(0),
+        HC=hc,
+        BLOCK_H=block_h,
+    )
+    return y
+
+
+def mhc_stream_mean(x: torch.Tensor) -> torch.Tensor:
+    """y[m, h] = x[m, :, h].mean(), bitwise equal to ``x.mean(dim=1)``."""
+    m, hc, h = x.shape
+    # The in-order fp32 sum matches torch's CUDA reduction for 4 streams (the mHC
+    # width) over rows of whole 1024-element blocks; it differs for some other widths.
+    if _is_hip or x.device.type != "cuda" or hc != 4 or h % 1024 or x.stride(2) != 1:
+        return x.mean(dim=1)
+    y = torch.empty((m, h), dtype=x.dtype, device=x.device)
+    block_h = 1024
+    _mhc_stream_mean_kernel[(m, triton.cdiv(h, block_h))](
+        x,
+        y,
+        h,
+        x.stride(0),
+        x.stride(1),
         y.stride(0),
         HC=hc,
         BLOCK_H=block_h,

@@ -4103,11 +4103,13 @@ class DeepseekV4Model(nn.Module):
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
             if capture_dspark and i in self.dspark_layers_to_capture:
+                from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
+
                 # The draft head reads the attention input of its target layers.
                 aux = state.residual
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
-                dspark_aux_hidden_states.append(aux.mean(dim=1))
+                dspark_aux_hidden_states.append(mhc_stream_mean(aux))
                 del aux
             ctx = (
                 nullcontext()
@@ -4438,6 +4440,8 @@ class DeepseekV4Model(nn.Module):
                             prev_comb=prev_comb,
                         )
                 if capture_dspark and i in self.dspark_layers_to_capture:
+                    from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
+
                     if _is_cuda:
                         completed = hc_boundary.materialize(
                             hidden_states, forward_batch, consume=False
@@ -4448,7 +4452,7 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
+                    dspark_aux_hidden_states.append(mhc_stream_mean(completed))
             if _is_cuda:
                 hidden_states = residual_batch.read_output(
                     hidden_states, forward_batch, hc_boundary.FinalRead(), None
