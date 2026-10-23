@@ -25,9 +25,16 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    get_is_extend_in_batch,
+)
 from sglang.srt.hardware_backend.npu.moe.finalize_routing import NPUFinalizeRouting
-from sglang.srt.hardware_backend.npu.moe.init_routing import NPUMoEInitRouting_v2
+from sglang.srt.hardware_backend.npu.moe.init_routing import (
+    MXFP8_QUANT_MODE,
+    NPUMoEInitRouting_v2,
+    _normalize_mxfp_scale,
+)
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
@@ -111,6 +118,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         # Prefill communication is scoped to TP; decode routing is scoped to EP.
         parallel = get_parallel()
         self.tp_group = parallel.tp_group.device_group
+        self.attn_tp_size = parallel.attn_tp_size
         self.ep_coordinator = parallel.moe_ep_group
         self.ep_group = self.ep_coordinator.device_group
         self.ep_size = self.ep_coordinator.world_size
@@ -127,6 +135,18 @@ class AscendOpsDispatcher(BaseDispatcher):
         self._mc2_state: Optional[_MC2State] = None
         self._pad_buffers: dict[tuple, tuple] = {}
         self._alltoall_state: Optional[dict[str, Any]] = None
+        self._allgather_state: Optional[dict[str, Any]] = None
+        if self.ascend_ops_config.prefill == "allgather":
+            if not (
+                parallel.tp_size == parallel.moe_ep_size
+                and parallel.attn_cp_size == 1
+                and self.num_local_experts * self.ep_size == self.num_experts
+                and not moe_runner_config.num_fused_shared_experts
+            ):
+                raise ValueError(
+                    "NPU AllGather requires TP=EP, Attention CP=1, "
+                    "contiguous expert placement and no fused shared experts"
+                )
         self._init_routing = NPUMoEInitRouting_v2(quant_mode=-1)
         self._finalize_routing = NPUFinalizeRouting(drop_pad_mode=2)
 
@@ -179,7 +199,7 @@ class AscendOpsDispatcher(BaseDispatcher):
     def _dispatch_prefill_allgather(self, hidden_states, topk_weights, topk_ids):
         self._dispatch_path = "prefill_allgather"
         self._dispatch_group = self.tp_group
-        raise NotImplementedError("Ascend Ops prefill allgather dispatch is pending")
+        return self._dispatch_allgather(hidden_states, topk_weights, topk_ids)
 
     def _dispatch_prefill_alltoallv(self, hidden_states, topk_weights, topk_ids):
         self._dispatch_path = "prefill_alltoallv"
@@ -216,7 +236,7 @@ class AscendOpsDispatcher(BaseDispatcher):
     # Combine path boundaries --------------------------------------------------
 
     def _combine_prefill_allgather(self, combine_input):
-        raise NotImplementedError("Ascend Ops prefill allgather combine is pending")
+        return self._combine_allgather(combine_input.hidden_states)
 
     def _combine_prefill_alltoallv(self, combine_input):
         return self._combine_alltoallv(combine_input.hidden_states)
@@ -421,6 +441,179 @@ class AscendOpsDispatcher(BaseDispatcher):
                 name = self.ep_group.get_hccl_comm_name(self.ep_rank)
             self._ep_comm_name = name
         return self._ep_comm_name
+
+    # Prefill allgather --------------------------------------------------------
+
+    def _dispatch_allgather(self, hidden_states, topk_weights, topk_ids):
+        if self._dispatch_output is not None:
+            raise RuntimeError("NPU dispatch called before the previous combine")
+        group = self._dispatch_group
+        input_dtype = hidden_states.dtype
+        quant_mode = self._routing_quant_mode()
+        if quant_mode not in (-1, 1, MXFP8_QUANT_MODE):
+            raise NotImplementedError(
+                "NPU AllGather supports BF16, INT8 and MXFP8 routing"
+            )
+        world_size = dist.get_world_size(group)
+        # The MoE boundary already splits each DP shard across attention TP.
+        # Mirror tensor_split using CPU counts, including scheduler padding.
+        sizes = get_dp_global_num_tokens()
+        if sizes is None:
+            raise RuntimeError("NPU AllGather requires scheduler DP token counts")
+        row_sizes = []
+        for rows in sizes:
+            base, extra = divmod(rows, self.attn_tp_size)
+            row_sizes.extend(
+                base + (rank < extra) for rank in range(self.attn_tp_size)
+            )
+        if (
+            len(row_sizes) != world_size
+            or row_sizes[dist.get_rank(group)] != hidden_states.shape[0]
+        ):
+            raise ValueError("NPU AllGather input rows disagree with DP token counts")
+        max_rows = max(row_sizes)
+        if max_rows == 0:
+            raise RuntimeError("NPU prefill requires at least one global token")
+
+        equal_rows = min(row_sizes) == max_rows
+
+        def gather_rows(tensor):
+            if equal_rows:
+                padded = tensor.contiguous()
+            else:
+                padded = tensor.new_zeros((max_rows, *tensor.shape[1:]))
+                padded[: tensor.shape[0]].copy_(tensor)
+            gathered = tensor.new_empty((world_size * max_rows, *tensor.shape[1:]))
+            dist.all_gather_into_tensor(gathered, padded, group=group)
+            if equal_rows:
+                return gathered
+            return torch.cat(
+                [
+                    gathered[rank * max_rows : rank * max_rows + rows]
+                    for rank, rows in enumerate(row_sizes)
+                ],
+                dim=0,
+            )
+
+        scales = None
+        if quant_mode == MXFP8_QUANT_MODE:
+            import torch_npu
+
+            # Quantize local rows once, then gather MXFP8 payload and scales.
+            if hidden_states.shape[0] > 0:
+                hidden_states, scales = torch_npu.npu_dynamic_mx_quant(
+                    hidden_states, dst_type=torch.float8_e4m3fn
+                )
+                scales = _normalize_mxfp_scale(scales).view(torch.uint8)
+            else:
+                hidden_states = hidden_states.new_empty(
+                    (0, self.hidden_size), dtype=torch.float8_e4m3fn
+                )
+                scales = hidden_states.new_empty(
+                    (0, (self.hidden_size + 63) // 64, 2), dtype=torch.uint8
+                )
+
+        hidden_states = gather_rows(hidden_states)
+        if scales is not None:
+            scales = gather_rows(scales)
+        topk_weights = gather_rows(topk_weights.float())
+        topk_ids = gather_rows(topk_ids.to(torch.int32))
+        local_ids = topk_ids - self.ep_rank * self.num_local_experts
+        is_local = (local_ids >= 0) & (local_ids < self.num_local_experts)
+        topk_weights = topk_weights.masked_fill(~is_local, 0)
+        # Operator constraint: npu_moe_init_routing_v2 needs a non-negative
+        # out-of-range expert ID for dropped routes. Do not use -1: it can
+        # corrupt valid expert counts even when the routing weight is zero.
+        # num_local_experts is just beyond the valid local expert ID range.
+        local_ids = local_ids.masked_fill(~is_local, self.num_local_experts)
+        if scales is not None:
+            # Already MXFP8: reorder payload and scales without requantizing.
+            x, row_idx, expert_tokens, scales = torch_npu.npu_moe_init_routing_v2(
+                hidden_states,
+                local_ids,
+                active_num=local_ids.numel(),
+                expert_num=self.num_local_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                row_idx_type=0,
+                active_expert_range=[0, self.num_local_experts],
+                quant_mode=-1,
+                scale=scales,
+                x_dtype=torch.float8_e4m3fn,
+            )
+            scales = _normalize_mxfp_scale(scales)
+        else:
+            x, row_idx, expert_tokens, scales = self._init_routing_tokens(
+                hidden_states, local_ids, self.num_local_experts, quant_mode
+            )
+        # Grouped GEMM and activation use device counts, so keep the capacity.
+        # If any route is dropped, the final capacity row is unused. Combine
+        # zeros unused rows on device before this sentinel is read by finalize.
+        row_idx = row_idx.masked_fill(~is_local.reshape(-1), local_ids.numel() - 1)
+        self._allgather_state = {
+            "group": group,
+            "row_sizes": row_sizes,
+            "input_dtype": input_dtype,
+        }
+        self._dispatch_output = AscendOpsDispatchOutput(
+            hidden_states=x,
+            hidden_states_scale=scales,
+            topk_weights=topk_weights,
+            topk_ids=local_ids,
+            expanded_row_idx=row_idx,
+            expert_tokens=expert_tokens,
+            group_list_type=1,
+            prefill_mode="allgather",
+        )
+        return self._dispatch_output
+
+    def _combine_allgather(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        state = self._allgather_state
+        if state is None:
+            raise RuntimeError("NPU AllGather combine called before dispatch")
+        dispatched = self._dispatch_output
+        sizes = state["row_sizes"]
+        group = state["group"]
+        # Operator constraint: finalize mode 2 requires the full
+        # [global_tokens * top_k, hidden] shape, not just the valid expert rows.
+        expert_output = torch.zeros(
+            (dispatched.topk_ids.numel(), self.hidden_size),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        expert_output[: hidden_states.shape[0]].copy_(hidden_states)
+        # Keep the valid count on device. Zero unused capacity before finalize:
+        # dropped routes must not read NaN even when their weight is zero.
+        unused_rows = torch.arange(
+            expert_output.shape[0], device=expert_output.device
+        ) >= dispatched.expert_tokens.sum()
+        expert_output.masked_fill_(unused_rows[:, None], 0)
+        # Keep weighted expert sums in FP32 across ranks. Rounding each
+        # rank's partial output to BF16 before ReduceScatter loses precision.
+        contributions = self._finalize_routing._finalize_routing(
+            expert_output,
+            topk_weights=dispatched.topk_weights,
+            expanded_row_idx=dispatched.expanded_row_idx,
+            topk_ids=dispatched.topk_ids,
+        )
+        # Equal-sized chunks already have the layout required by ReduceScatter.
+        max_rows = max(sizes)
+        if min(sizes) == max_rows:
+            padded = contributions
+        else:
+            padded = contributions.new_zeros((len(sizes) * max_rows, self.hidden_size))
+            offset = 0
+            for rank, rows in enumerate(sizes):
+                padded[rank * max_rows : rank * max_rows + rows].copy_(
+                    contributions[offset : offset + rows]
+                )
+                offset += rows
+        output = contributions.new_empty((max_rows, self.hidden_size))
+        dist.reduce_scatter_tensor(output, padded, group=group)
+        output = output[: sizes[dist.get_rank(group)]].to(state["input_dtype"])
+        self._dispatch_output = None
+        self._allgather_state = None
+        return output
 
     # Prefill alltoallv --------------------------------------------------------
 
