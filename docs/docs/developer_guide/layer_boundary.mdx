@@ -308,18 +308,24 @@ Paths in this table are relative to `python/sglang/srt/layers/layer_boundary/`.
 | `contracts.py` | Resolved input/output contracts, edge declarations, batch variants, and bound step records |
 | `layout.py` | Token axes, layouts, named sum groups, and topology/batch facts |
 | `construction.py` | Build a `StagePlan` and select its batch variant |
-| `boundary.py` | Select and bind producer/consumer boundary operations from contracts |
+| `boundary.py` | Select and bind producer/consumer boundary operations from contracts; for prefill CP, one `CpMoves` (`contracts.py`) pairs the FFN-input gather, the take-back of a complete output, and, where there is one, the reduce-scatter that completes a sum |
 | `prepare.py` | Execute completion, update, read, and input movement in the selected order |
 | `ops.py` | Collective and token-row movement primitives |
 | `stage.py` | Model-facing `StageBoundary` methods |
 | `exit.py` | Select output completion and publish scoped compute flags |
 | `output.py` | Unreduced outputs, deferred finalizes and output transforms |
+| `facts.py` | What binding keeps of a stage it does not run (`facts_of()`): a stack's neighbours on other pipeline ranks and a bound stage's producer |
+| `row_transport.py` | Row transports that run a stage's compute on token rows other than its residual's (`RowTransport`, `ComputeTransport`) |
 | `residual/__init__.py` | `ResidualUpdate`/`ResidualReadout` protocols and `LayerResidualOps` |
 | `residual/stream.py` | Per-forward state and ownership of outstanding work |
 | `residual/batch.py` | Model-stack entry, final norm, pipeline-parallel (PP) transport, snapshots, and extra contributions |
 | `residual/access.py` | Tensor access and materialization helpers |
 | `residual/add_norm.py`, `residual/mhc.py` | Plain add/norm and MHC read/update implementations |
-| `adapters/` | Attention input, CP, TBO, branches, and LoRA integration |
+| `residual/ihc.py`, `residual/gated.py` | Gated and gated-injection hyper-connection read/update implementations |
+| `residual/post_norm.py` | Post-norm residual: each stage's output is normalized before it is added |
+| `residual/attn_bank.py` | A residual read that aggregates a bank of residual snapshots |
+| `residual/short_conv.py` | Deferred channelwise convolution followed by residual add and normalization |
+| `adapters/` | Attention input, TBO, branches, and LoRA integration |
 | `fusions/` | Consumer all-reduce fusion and CuteDSL integration |
 
 Models normally use factories, `StageBoundary`, and `residual.batch`. Keep row arithmetic, process-group selection, and calls such as `token_axis_sizes()` inside the boundary implementation.
@@ -363,7 +369,6 @@ Producer GEMM plus reduce-scatter fusion is not a generic implemented API here. 
 ### Special adapters
 
 - **Attention/DeepSeek Sparse Attention (DSA) adapters:** retain `AttnTpContext` and its input-scattered/latent-input hooks. They are not a general asynchronous dependency scheduler.
-- **CP adapters:** pair gather, return-to-local-rows, and eligible reduce-scatter operations using the same token mapping.
 - **LoRA adapter:** publishes the selected compute input's rows for LoRA execution.
 - **TBO and branch adapters:** manage layer exits and entries that cannot be represented as a normal sequential prepare call.
 

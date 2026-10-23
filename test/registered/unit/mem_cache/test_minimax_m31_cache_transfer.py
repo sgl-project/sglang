@@ -491,7 +491,7 @@ def dspark_params(target, draft):
         None,
         SimpleNamespace(get_kvcache=lambda: target),
         128,
-        draft_sidecar_device_pools=(draft,),
+        sidecar_draft_device_pools=(draft,),
     )
 
 

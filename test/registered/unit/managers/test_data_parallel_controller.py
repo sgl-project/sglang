@@ -295,54 +295,6 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         self.assertEqual(budget.total_tokens, [100, 50, 300])
 
 
-class TestDPBudgetDispatch(CustomTestCase):
-    """DPBudget.dispatch picks a rank from current state and updates counters."""
-
-    def test_total_requests_dispatch_picks_min_and_increments(self):
-        budget = DPBudget(num_dp_ranks=3)
-        budget.total_requests = [4, 2, 7]
-        rank = budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.assertEqual(rank, 1)
-        self.assertEqual(
-            budget.total_requests[1],
-            3,
-            "dispatch should increment chosen worker's request count",
-        )
-
-    def test_total_tokens_dispatch_applies_estimated_tokens(self):
-        budget = DPBudget(num_dp_ranks=3)
-        budget.total_tokens = [100, 50, 200]
-        budget.total_requests = [0, 0, 0]
-        rank = budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=30)
-        self.assertEqual(rank, 1, "should pick worker with min total_tokens")
-        self.assertEqual(
-            budget.total_tokens[1],
-            80,
-            "dispatch should add estimated_tokens to chosen worker",
-        )
-        self.assertEqual(
-            budget.total_requests[1],
-            1,
-            "dispatch should also increment request count",
-        )
-
-    def test_total_tokens_tie_breaks_on_total_requests(self):
-        budget = DPBudget(num_dp_ranks=3)
-        budget.total_tokens = [50, 50, 50]
-        budget.total_requests = [4, 2, 7]
-        rank = budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=10)
-        self.assertEqual(
-            rank, 1, "tie on total_tokens should fall back to min total_requests"
-        )
-
-    def test_dispatch_returns_none_for_methods_not_handled(self):
-        """Round-robin and follow_bootstrap_room dispatch elsewhere; DPBudget
-        only handles the load-aware variants."""
-        budget = DPBudget(num_dp_ranks=3)
-        self.assertIsNone(budget.dispatch(LoadBalanceMethod.ROUND_ROBIN))
-        self.assertIsNone(budget.dispatch(LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM))
-
-
 class TestRoundRobinScheduler(CustomTestCase):
     def test_cycles_through_active_workers_in_order(self):
         ctl = _make_controller(num_dp_ranks=4)

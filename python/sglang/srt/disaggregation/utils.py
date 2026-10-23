@@ -259,14 +259,22 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers) -> None:
                 polls[i] = int(KVPoll.Transferring)
 
 
+def all_reduce_flags(
+    flags: List[int], group: dist.ProcessGroup, op: dist.ReduceOp
+) -> List[int]:
+    """Reduce one small int per entry across `group`; every rank must pass the
+    same number of entries in the same order. Empty or single-rank: unchanged."""
+    if not flags or dist.get_world_size(group) == 1:
+        return flags
+
+    tensor_to_reduce = torch.tensor(flags, dtype=torch.int32, device="cpu")
+    dist.all_reduce(tensor_to_reduce, op=op, group=group)
+    return tensor_to_reduce.tolist()
+
+
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
-    if dist.get_world_size(group) == 1:
-        return polls
-
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
-    return tensor_to_reduce.tolist()
+    return all_reduce_flags(flags=polls, group=group, op=dist.ReduceOp.MIN)
 
 
 def poll_and_all_reduce(

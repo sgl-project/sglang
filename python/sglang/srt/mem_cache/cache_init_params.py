@@ -72,8 +72,9 @@ class CacheInitParams:
     tree_core_backend: Optional[str] = dataclasses.field(default=None, kw_only=True)
 
     mtp_draft_device_pools: tuple[object, ...] = ()
+    # Draft KV pools that share the target KV slots but are stored apart from it.
+    sidecar_draft_device_pools: tuple[object, ...] = ()
     mtp_draft_mamba_pools: tuple[object, ...] = ()
-    draft_sidecar_device_pools: tuple[object, ...] = ()
 
     @property
     def swa_retain_window(self) -> Optional[int]:

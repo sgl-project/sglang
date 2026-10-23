@@ -394,18 +394,6 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
-@lru_cache(maxsize=1)
-def is_tokenspeed_mla_available():
-    """
-    Check whether the tokenspeed_mla CuTe DSL kernels are available.
-    Only available on NVIDIA Blackwell (SM100) at the moment.
-    """
-    return (
-        importlib.util.find_spec("tokenspeed_mla") is not None
-        and is_blackwell_supported()
-    )
-
-
 def is_nvidia_cublas_version_ge_12_9():
     """
     temporary fix for issue #11272 (cublas 12.9+)
@@ -682,6 +670,12 @@ def is_device_stream_capturing(device: torch.device) -> bool:
     if not current_platform.capabilities.graph_capture:
         return False
     return torch.get_device_module(device).is_current_stream_capturing()
+
+
+def create_device_event(device):
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).Event()
 
 
 def get_amdgpu_memory_capacity():

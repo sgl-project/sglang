@@ -20,8 +20,8 @@ ARG SGL_KERNEL_VERSION=0.4.10
 ARG MSA_COMMIT=1e7bf76f26a5f53cfc2d4d297e1ec2e40955e431
 # Wheel build args
 ARG MANYLINUX_IMAGE=pytorch/manylinuxaarch64-builder:cuda13.4
-ARG DEEPGEMM_REF=v0.2.1.post1
-ARG SGL_DEEP_GEMM_VERSION=0.2.1.post1
+ARG DEEPGEMM_REF=v0.2.3.post2
+ARG SGL_DEEP_GEMM_VERSION=0.2.3.post2
 ARG DEEPEP_SOURCE_REF=sgl-deepep
 ARG SGL_DEEP_EP_VERSION=0.1.2.post1
 
@@ -52,6 +52,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Point Triton at the CUDA 13.4 toolkit's ptxas instead of its bundled copy.
 ENV TRITON_PTXAS_PATH=/usr/local/cuda-13.4/bin/ptxas \
     TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.4/bin/ptxas
+
+# Turn off torch.distributed's NCCL2 path in the torch nightly.
+ENV TORCH_DIST_USE_NCCL2=0
 
 # Add GKE default lib and bin locations
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
@@ -1012,6 +1015,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Point Triton at the CUDA 13.4 toolkit's ptxas instead of its bundled copy.
 ENV TRITON_PTXAS_PATH=/usr/local/cuda-13.4/bin/ptxas \
     TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda-13.4/bin/ptxas
+
+# Turn off torch.distributed's NCCL2 path in the torch nightly.
+ENV TORCH_DIST_USE_NCCL2=0
 
 # Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
 ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
