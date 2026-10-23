@@ -319,15 +319,30 @@ class MegakernelBinding:
         mode = str(forward_batch.forward_mode)
         key = f"{mode}:{int(forward_batch.batch_size)}"
         mla, kda = view.hybrid.mla, view.hybrid.kda
-        getters = self._capture_getters(forward_batch)
-        tensors = {
-            "mla.block_table": mla.block_table,
-            "mla.sequence_lengths": mla.sequence_lengths,
-            "mla.write_slots": mla.write_slots,
-            "kda.state_indices": kda.state_indices,
-        }
-        for name, tensor in tensors.items():
-            getter = getters[name]
+        sources = self._current_hybrid_sources()
+        mla_metadata = self._mla_metadata(sources)
+        kda_metadata = sources.linear_backend.forward_metadata
+        # Keep each graph's metadata owners when the backend selects another
+        # batch-size bucket, while still detecting replacement of their fields.
+        tensors = (
+            (
+                "mla.block_table",
+                mla.block_table,
+                lambda: mla_metadata.block_kv_indices,
+            ),
+            (
+                "mla.sequence_lengths",
+                mla.sequence_lengths,
+                lambda: mla_metadata.seq_lens_k,
+            ),
+            ("mla.write_slots", mla.write_slots, lambda: forward_batch.out_cache_loc),
+            (
+                "kda.state_indices",
+                kda.state_indices,
+                lambda: kda_metadata.mamba_cache_indices,
+            ),
+        )
+        for name, tensor, getter in tensors:
             if _identity(getter()) != _identity(tensor):
                 raise RuntimeError(
                     f"megakernel binding: capture[{key}].{name} changed before seal"
@@ -538,24 +553,8 @@ class MegakernelBinding:
                 runner.attn_backend.req_to_token_pool.mamba_map
             ),
         }
-        values = {
-            "hybrid_backend": sources.backend,
-            "full_backend": sources.full_backend,
-            "linear_backend": sources.linear_backend,
-            "hybrid_kv_pool": sources.token_pool,
-            "full_kv_pool": sources.full_pool,
-            "request_pool": sources.request_pool,
-            "mamba_pool": sources.mamba_pool,
-            "attention_backend_list": sources.backend.attn_backend_list,
-            "full_backend_kv_pool": sources.full_backend.token_to_kv_pool,
-            "full_backend_request_pool": sources.full_backend.req_to_token_pool,
-            "linear_backend_kv_pool": sources.linear_backend.token_to_kv_pool,
-            "linear_backend_request_pool": sources.linear_backend.req_to_token_pool,
-            "full_layer_mapping": sources.token_pool.full_attention_layer_id_mapping,
-            "mamba_layer_mapping": sources.request_pool.mamba_map,
-        }
-        for name, value in values.items():
-            self._seal(name, value, getters[name])
+        for name, getter in getters.items():
+            self._seal(name, getter(), getter)
 
     def _current_hybrid_sources(self) -> _HybridSources:
         sources = self._hybrid_sources
@@ -632,25 +631,6 @@ class MegakernelBinding:
         if metadata is None:
             raise RuntimeError("megakernel binding: MLA decode metadata is unavailable")
         return metadata
-
-    def _capture_getters(
-        self, forward_batch: ForwardBatch
-    ) -> dict[str, Callable[[], torch.Tensor]]:
-        """Live tensor reads from the exact metadata objects used for this graph.
-
-        Backends legitimately select another metadata object while capturing a
-        different batch-size graph. Keeping each graph's owner object here detects
-        replacement of its tensor fields without confusing that normal selection.
-        """
-        sources = self._current_hybrid_sources()
-        mla_metadata = self._mla_metadata(sources)
-        kda_metadata = sources.linear_backend.forward_metadata
-        return {
-            "mla.block_table": lambda: mla_metadata.block_kv_indices,
-            "mla.sequence_lengths": lambda: mla_metadata.seq_lens_k,
-            "mla.write_slots": lambda: forward_batch.out_cache_loc,
-            "kda.state_indices": lambda: kda_metadata.mamba_cache_indices,
-        }
 
     def _current_pool(self) -> Any:
         from sglang.srt.model_executor.forward_context import get_attn_backend

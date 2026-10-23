@@ -409,17 +409,25 @@ class TestMegakernelBinding(CustomTestCase):
             ),
         }
         for expected, replace in replacements.items():
-            with self.subTest(expected=expected):
-                fixture = hybrid_backend()
-                binding = mb.MegakernelBinding(model=torch.nn.Module())
-                binding.preparation_view(fixture.runner)
-                batch = forward_batch()
-                with patch(BACKEND, return_value=fixture.backend):
-                    view = binding.forward_view(batch)
-                    binding.seal_capture_view(batch, view)
-                    replace(fixture, batch)
-                    with self.assertRaisesRegex(RuntimeError, expected):
-                        binding.assert_live()
+            for before_seal in (False, True):
+                with self.subTest(expected=expected, before_seal=before_seal):
+                    fixture = hybrid_backend()
+                    binding = mb.MegakernelBinding(model=torch.nn.Module())
+                    binding.preparation_view(fixture.runner)
+                    batch = forward_batch()
+                    with patch(BACKEND, return_value=fixture.backend):
+                        view = binding.forward_view(batch)
+                        if before_seal:
+                            replace(fixture, batch)
+                            with self.assertRaisesRegex(
+                                RuntimeError, f"{expected} changed before seal"
+                            ):
+                                binding.seal_capture_view(batch, view)
+                        else:
+                            binding.seal_capture_view(batch, view)
+                            replace(fixture, batch)
+                            with self.assertRaisesRegex(RuntimeError, expected):
+                                binding.assert_live()
 
     def test_required_metadata_fields_are_distinct_from_unset_values(self):
         fields = (
