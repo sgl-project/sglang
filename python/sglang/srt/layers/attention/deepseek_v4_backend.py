@@ -146,8 +146,7 @@ from sglang.srt.utils import ceil_align, is_cuda, is_xpu
 from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
-    from sgl_kernel.flash_mla import FlashMLASchedMeta
-
+    from sglang.kernels.ops.attention.flash_mla_interface import FlashMLASchedMeta
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -210,9 +209,9 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 def _create_flashmla_metadata():
     if get_platform().is_sm120 or _is_xpu:
         return None
-    import sgl_kernel.flash_mla as flash_mla
+    from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
 
-    return flash_mla.get_mla_metadata()[0]
+    return get_mla_metadata()[0]
 
 
 # FlashMLA's head64 sm100 decode scheduling constants; not exported, so they hold
@@ -271,6 +270,13 @@ def _maybe_precompute_flashmla_sched_meta(
     )
     flashmla_metadata.tile_scheduler_metadata = meta
     flashmla_metadata.num_splits = num_splits
+
+
+def _flashmla_v41_splits_kv(
+    indices: torch.Tensor, extra_indices: Optional[torch.Tensor], min_topk: int
+) -> bool:
+    extra_topk = 0 if extra_indices is None else extra_indices.shape[-1]
+    return indices.shape[-1] + extra_topk >= min_topk
 
 
 def _low_ratio_source_projections(
@@ -1237,6 +1243,17 @@ class DeepseekV4AttnBackend(
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
+        if is_cuda():
+            from sglang.kernels.ops.attention import flash_mla_interface
+
+            self._swa_interleaved = (
+                self.token_to_kv_pool.get_swa_key_layout().is_interleaved
+            )
+            self._flash_mla_with_kvcache = functools.partial(
+                flash_mla_interface.flash_mla_with_kvcache,
+                use_legacy=not self._swa_interleaved,
+            )
+            self._flashmla_split_kv_min_topk = flash_mla_interface.SPLIT_KV_MIN_TOPK
         # The C4 state ring is addressed per SWA page, so a page holds whole windows.
         assert self.token_to_kv_pool.swa_page_size % SWA_WINDOW == 0
         self.hisparse_coordinator = model_runner.hisparse_coordinator
@@ -3781,7 +3798,7 @@ class DeepseekV4AttnBackend(
                     loc=slots,
                     cache_k=layer.indexer.index_keys(latent, freqs),
                 )
-        if pool.get_extra_key_layout(layer.layer_id) is KVLayout.V41_FP4:
+        if pool.get_extra_key_layout(layer.layer_id).is_fp4:
             # The fp4 cache stores e2m1 codes: the kernel rotates the tail and
             # rounds once, with no fake quantization in between.
             pool.set_extra_key_buffer_fused(
@@ -4290,9 +4307,16 @@ class DeepseekV4AttnBackend(
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
                 else:
-                    from sgl_kernel.flash_mla import flash_mla_with_kvcache
+                    flash_mla_with_kvcache = self._flash_mla_with_kvcache
 
-                if self.is_dsv41:
+                if self.is_dsv41 and (
+                    not self._swa_interleaved
+                    or _flashmla_v41_splits_kv(
+                        swa_page_indices,
+                        extra_indices,
+                        self._flashmla_split_kv_min_topk,
+                    )
+                ):
                     _maybe_precompute_flashmla_sched_meta(
                         flashmla_metadata,
                         q=q,
@@ -4339,7 +4363,9 @@ class DeepseekV4AttnBackend(
         if _is_xpu:
             from sgl_kernel import flash_mla_sparse_fwd
         else:
-            from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+            from sglang.kernels.ops.attention.flash_mla_interface import (
+                flash_mla_sparse_fwd,
+            )
 
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
