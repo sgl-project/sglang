@@ -4,7 +4,10 @@
 
 use std::borrow::Cow;
 
-use crate::api::v1::{FinishReason, FinishStop, Matched, MatchedTokens, finish_reason, matched};
+use crate::api::v1::{
+    BoolOrList, FinishReason, FinishStop, Int64OrList, Matched, MatchedTokens, bool_or_list,
+    finish_reason, int64_or_list, matched,
+};
 
 impl FinishReason {
     /// A stop reason (`type: "stop"`), optionally carrying what matched.
@@ -59,5 +62,21 @@ impl FinishReason {
 impl From<Vec<i64>> for MatchedTokens {
     fn from(ids: Vec<i64>) -> Self {
         MatchedTokens { ids }
+    }
+}
+
+impl From<bool> for BoolOrList {
+    fn from(value: bool) -> Self {
+        Self {
+            value: Some(bool_or_list::Value::One(value)),
+        }
+    }
+}
+
+impl From<i64> for Int64OrList {
+    fn from(value: i64) -> Self {
+        Self {
+            value: Some(int64_or_list::Value::One(value)),
+        }
     }
 }
