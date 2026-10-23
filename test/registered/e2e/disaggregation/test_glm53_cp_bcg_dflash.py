@@ -1,4 +1,4 @@
-"""GLM CP2/BCG prefill -> TP2 DFlash2 decode, with padding and cached prefixes."""
+"""GLM CP4/BCG prefill -> TP4 DFlash2 decode, with padding and cached prefixes."""
 
 import unittest
 
@@ -12,7 +12,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import popen_with_error_check, try_cached_model
 
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=900, stage="extra-b", runner_config="8-gpu-b300")
 
 COMMON_ARGS = [
     "--dsa-prefill-backend",
@@ -55,9 +55,9 @@ class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase, GSM8KMixin):
     gsm8k_temperature = 1.0
     gsm8k_top_p = 0.95
 
-    prefill_tp_size = 2
-    decode_tp_size = 2
-    decode_base_gpu_id = 2
+    prefill_tp_size = 4
+    decode_tp_size = 4
+    decode_base_gpu_id = 4
 
     @classmethod
     def setUpClass(cls):
@@ -173,8 +173,8 @@ class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase, GSM8KMixin):
                 f"PD smoke: length={length}, cached_tokens={cached_tokens}, "
                 f"graph_passes={graph_passes}"
             )
-            # A one-token suffix cannot activate CP2. All other text shapes
-            # fit a bucket, including padded prefills with cached prefixes.
+            # Fewer tokens than the CP size cannot activate CP. Other text
+            # shapes fit a bucket, including prefills with cached prefixes.
             if length - cached_tokens >= self.prefill_tp_size:
                 self.assertGreater(graph_passes, 0, f"length={length}")
             else:
