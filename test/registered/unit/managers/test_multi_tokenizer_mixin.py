@@ -1,3 +1,4 @@
+import asyncio
 import pickle
 import unittest
 from types import SimpleNamespace
@@ -25,12 +26,16 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BeamSearchOutput,
     ConfigureLoggingReq,
+    ContinueGenerationReqInput,
+    PauseGenerationReqInput,
+    TokenizerWorkerRegistrationReq,
     unwrap_from_pickle,
     wrap_as_pickle,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
     MultiHttpWorkerDetokenizerMixin,
+    MultiTokenizerRouter,
     _cached_output_fields,
     _handle_output_by_index,
     _handle_output_by_indices,
@@ -476,6 +481,75 @@ class TestMultiTokenizerMixin(CustomTestCase):
                 ("detok-for-rid-0", "AbortReq"),
             ],
         )
+
+    def test_router_forwards_abort_pause_to_scheduler(self):
+        """Regression: abort-mode pause must reach the scheduler, not just the workers.
+
+        With several tokenizer workers a request can slip past a worker's
+        pause gate while the pause is being broadcast; only the scheduler's
+        pending-abort gate can keep such a late request from being scheduled
+        against the KV-cache release that follows the pause.
+        """
+        router = MultiTokenizerRouter.__new__(MultiTokenizerRouter)
+        router.all_worker_ipcs = set()
+        # Sockets are never touched: async_sock_recv/async_sock_send are patched.
+        router.receive_from_worker = object()
+        router.send_to_scheduler = object()
+        broadcast = []
+        forwarded = []
+        router.socket_mapping = SimpleNamespace(
+            send_output=lambda ipc_name, obj: broadcast.append((ipc_name, obj.is_pause))
+        )
+
+        inbox = [
+            TokenizerWorkerRegistrationReq(worker_ipc_name="worker-a"),
+            TokenizerWorkerRegistrationReq(worker_ipc_name="worker-b"),
+            PauseGenerationReqInput(mode="abort"),
+            ContinueGenerationReqInput(),
+            EOFError("end of input"),
+        ]
+
+        async def fake_recv(sock, flags=0):
+            item = inbox.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        async def fake_send(sock, obj, flags=0):
+            forwarded.append(obj)
+
+        with (
+            patch(
+                "sglang.srt.managers.multi_tokenizer_mixin.async_sock_recv",
+                new=fake_recv,
+            ),
+            patch(
+                "sglang.srt.managers.multi_tokenizer_mixin.async_sock_send",
+                new=fake_send,
+            ),
+            self.assertRaisesRegex(EOFError, "end of input"),
+        ):
+            asyncio.run(router.router_worker_obj())
+
+        # Both pause and continue are broadcast to every registered worker
+        # (all_worker_ipcs is a set, so compare order-independently)...
+        self.assertEqual(
+            sorted(broadcast),
+            sorted(
+                [
+                    ("worker-a", True),
+                    ("worker-b", True),
+                    ("worker-a", False),
+                    ("worker-b", False),
+                ]
+            ),
+        )
+        # ...and both reach the scheduler, including the abort-mode pause.
+        self.assertEqual(
+            [type(obj).__name__ for obj in forwarded],
+            ["PauseGenerationReqInput", "ContinueGenerationReqInput"],
+        )
+        self.assertEqual(forwarded[0].mode, "abort")
 
     def test_return_path_batching_preserves_owner_order(self):
         output = _handle_output_by_indices(_make_batch_str_output(), [0, 1, 0])
