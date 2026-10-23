@@ -100,11 +100,16 @@ def _load_with_blocked_import(relpath, module_name, blocked):
     from unittest import mock
 
     import sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion as plugin
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
+        _ADAPTERS,
+    )
 
     path = Path(plugin.__file__).parent / relpath
     spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
-    with mock.patch.dict(sys.modules, {blocked: None}):  # None makes import raise
+    # Private adapter classes register themselves while the module executes.
+    # Keep the real registry intact for subsequent tests.
+    with mock.patch.dict(_ADAPTERS), mock.patch.dict(sys.modules, {blocked: None}):
         spec.loader.exec_module(module)
     return module
 
@@ -142,6 +147,59 @@ def test_generator_reports_real_runtime_import_error(caplog) -> None:
     with pytest.raises(RuntimeError, match="failed to import") as err:
         module.SGLDiffusionGenerator().init_generator("flux", "FluxPipeline", {})
     assert isinstance(err.value.__cause__, ImportError)
+
+
+def test_h3_executor_import_survives_a_missing_runtime() -> None:
+    """generator.py imports minimax_h3 unconditionally, so an unguarded runtime
+    import there hid every node, Flux and Z-Image included."""
+    blocked = "sglang.multimodal_gen.configs.sample.minimax_h3"
+    module = _load_with_blocked_import(
+        "executors/minimax_h3.py",
+        "sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors._h3_blocked",
+        blocked,
+    )
+    with pytest.raises(RuntimeError, match="failed to import") as err:
+        module.MiniMaxH3Executor()
+    assert isinstance(err.value.__cause__, ImportError)
+
+
+def test_plugin_logs_why_nodes_failed_to_register(caplog) -> None:
+    module = _load_with_blocked_import(
+        "__init__.py", "_sgld_init_blocked", "_sgld_init_blocked.nodes"
+    )
+    assert module.NODE_CLASS_MAPPINGS == {}
+    assert any("failed to register nodes" in r.getMessage() for r in caplog.records)
+
+
+def test_undetectable_checkpoint_raises_instead_of_returning_none(
+    monkeypatch,
+) -> None:
+    """A bare None return surfaced as 'cannot unpack non-iterable NoneType'."""
+    import sys
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import generator
+
+    detection = SimpleNamespace(
+        unet_prefix_from_state_dict=lambda sd: "",
+        detect_unet_config=lambda sd, prefix: {"image_model": "flux"},
+        model_config_from_unet=lambda sd, prefix: None,
+        convert_diffusers_mmdit=lambda sd, prefix: None,
+        model_config_from_diffusers_unet=lambda sd: None,
+    )
+    management = SimpleNamespace(get_torch_device=lambda: "cpu")
+    utils = SimpleNamespace(
+        calculate_parameters=lambda sd: 0,
+        state_dict_prefix_replace=lambda sd, *a, **k: sd,
+        unet_to_diffusers=None,
+    )
+    comfy = SimpleNamespace(model_detection=detection, model_management=management)
+    monkeypatch.setitem(sys.modules, "comfy", comfy)
+    monkeypatch.setitem(sys.modules, "comfy.utils", utils)
+    monkeypatch.setattr(generator, "_load_state_dict_for_detection", lambda p: {})
+    runtime = SGLDiffusionGenerator()
+    runtime.pipeline_class_dict = {"flux": "FluxPipeline"}
+    with pytest.raises(ValueError, match="No ComfyUI model config"):
+        runtime.get_comfyui_model("/models/dit.safetensors")
 
 
 def _runtime_that_must_reject() -> SGLDiffusionGenerator:

@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import math
 import time
 import uuid
 from collections import OrderedDict
@@ -687,63 +686,6 @@ class OpenAIServingChat(OpenAIServingBase):
             return prompt_ids
         return None
 
-    @staticmethod
-    def _pop_inkling_assistant_prefix(
-        messages: list[dict[str, Any]],
-        request: ChatCompletionRequest,
-    ) -> str | None:
-        """Extract the trailing assistant text for ``continue_final_message``.
-
-        Only a plain-string assistant message with no tool calls and no
-        reasoning content can be continued; anything else renders as a closed
-        historical turn. Mutates ``messages`` in place (callers pass a copy).
-        """
-        if not request.continue_final_message or not messages:
-            return None
-        last = messages[-1]
-        if (
-            last.get("role") != "assistant"
-            or not isinstance(last.get("content"), str)
-            or last.get("tool_calls")
-            or last.get("reasoning_content")
-        ):
-            return None
-        messages.pop()
-        return last["content"]
-
-    @staticmethod
-    def _parse_inkling_reasoning_effort(
-        value: str | float | None,
-    ) -> float | None:
-        """Convert an OpenAI-style reasoning_effort to an Inkling float."""
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            raise ValueError("Inkling reasoning_effort must not be a boolean")
-        if isinstance(value, (int, float)):
-            parsed = float(value)
-            if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
-                raise ValueError("Inkling reasoning_effort must be in [0.0, 0.99]")
-            return parsed
-        _EFFORT_MAP = {
-            "none": 0.0,
-            "minimal": 0.1,
-            "low": 0.2,
-            "medium": 0.7,
-            "high": 0.9,
-            "xhigh": 0.99,
-            "max": 0.99,
-        }
-        if value in _EFFORT_MAP:
-            return _EFFORT_MAP[value]
-        try:
-            parsed = float(value)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"invalid Inkling reasoning_effort: {value!r}") from exc
-        if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
-            raise ValueError("Inkling reasoning_effort must be in [0.0, 0.99]")
-        return parsed
-
     def _resolve_dsv41_reasoning_effort(self, value: Any) -> Union[str, int]:
         """Request effort for the V4.1 encoder; unsupported values warn and fall back."""
         effort = chat_encoding.parse_dsv41_reasoning_effort(value)
@@ -758,26 +700,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 self._dsv41_default_reasoning_effort,
             )
         return self._dsv41_default_reasoning_effort
-
-    @staticmethod
-    def _get_inkling_default_reasoning_effort() -> float:
-        """Read the default Inkling reasoning effort from the environment."""
-        from sglang.srt.environ import envs
-
-        val = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT.get()
-        if not val:
-            return 0.9
-        try:
-            parsed = float(val)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(
-                "SGLANG_INKLING_DEFAULT_REASONING_EFFORT must be numeric"
-            ) from exc
-        if not math.isfinite(parsed) or not 0.0 <= parsed <= 0.99:
-            raise ValueError(
-                "SGLANG_INKLING_DEFAULT_REASONING_EFFORT must be in [0.0, 0.99]"
-            )
-        return parsed
 
     def _decode_response(self, ret_item: dict[str, Any]) -> str | ErrorResponse:
         """Extract text from response."""
