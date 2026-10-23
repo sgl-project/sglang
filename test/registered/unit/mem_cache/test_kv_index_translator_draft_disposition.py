@@ -427,8 +427,11 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
-        full = torch.tensor([4, 5, 6, 9], dtype=torch.int64)
-        swa = torch.tensor([11, 3, 7, 2], dtype=torch.int64)
+        # A real pool's KV write picks its kernel by platform, not by tensor device:
+        # on a CUDA host it is the CUDA-only store_cache, so the pool must sit there.
+        dev = torch.device("cuda" if torch.cuda.is_available() else _DEV)
+        full = torch.tensor([4, 5, 6, 9], dtype=torch.int64, device=dev)
+        swa = torch.tensor([11, 3, 7, 2], dtype=torch.int64, device=dev)
         target_translator, draft_translator = object(), object()
         plan = SimpleNamespace(
             write_ids=lambda reader, cols=None, kind=None: (
@@ -457,12 +460,12 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
                 head_dim=4,
                 swa_attention_layer_ids=[0],
                 full_attention_layer_ids=[],
-                device=_DEV,
+                device=dev,
             )
             worker = SimpleNamespace(
                 _draft_kv_on_swa=True,
                 model_runner=SimpleNamespace(
-                    device=torch.device(_DEV), kv_index_translator=target_translator
+                    device=dev, kv_index_translator=target_translator
                 ),
                 draft_model_runner=SimpleNamespace(
                     kv_index_translator=draft_translator, token_to_kv_pool=pool
@@ -482,7 +485,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             )
             return worker, pool.swa_kv_pool.k_buffer[0]
 
-        hidden = torch.arange(32, dtype=torch.float32).view(4, 8)
+        hidden = torch.arange(32, dtype=torch.float32, device=dev).view(4, 8)
         k_rows = hidden[:, :4].view(4, 1, 4)
 
         def write(worker, **kw):
@@ -490,7 +493,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
                 worker,
                 target_hidden=hidden,
                 cache_loc=DFlashWorkerV2._draft_write_ids(worker, plan),
-                positions=torch.arange(4),
+                positions=torch.arange(4, device=dev),
                 swa_cache_loc=DFlashWorkerV2._draft_swa_write_ids(worker, plan),
                 **kw,
             )
@@ -505,7 +508,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         write(
             worker,
             cache_loc_2d=full.view(2, 2),
-            commit_lens=torch.tensor([2, 1], dtype=torch.int32),
+            commit_lens=torch.tensor([2, 1], dtype=torch.int32, device=dev),
         )
         torch.testing.assert_close(swa_k[swa[:3]], k_rows[:3], rtol=0, atol=0)
         self.assertEqual(int(swa_k[swa[3]].abs().sum()), 0)
@@ -515,7 +518,7 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
             worker.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
                 layer,
                 full.view(2, 2),
-                torch.tensor([2, 2], dtype=torch.int32),
+                torch.tensor([2, 2], dtype=torch.int32, device=dev),
                 k_rows,
                 k_rows,
             )
