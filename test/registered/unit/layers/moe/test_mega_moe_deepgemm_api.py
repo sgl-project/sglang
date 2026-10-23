@@ -456,8 +456,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
     @staticmethod
     def _mega_gate_reference(x, weight, top_k, **kwargs):
-        if not torch.isfinite(x).all():
-            raise ValueError("MegaGate rejects nonfinite GEMM inputs")
+        unmasked = x if kwargs["mask"] is None else x[kwargs["mask"]]
+        if not torch.isfinite(unmasked).all():
+            raise ValueError("MegaGate rejects nonfinite scores on unmasked rows")
         scores = torch.log1p(torch.exp(x.float() @ weight.float().T)).sqrt()
         if kwargs["unmapped_topk_idx"] is not None:
             ids = kwargs["unmapped_topk_idx"]
