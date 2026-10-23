@@ -124,9 +124,24 @@ class LagunaMoEGate(nn.Module):
             torch.zeros(config.num_experts, dtype=torch.float32),
             requires_grad=False,
         )
+        self._flydsl_router = _load_flydsl_router()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._flydsl_router is not None:
+            logits = self._flydsl_router(hidden_states, self.weight)
+            if logits is not None:
+                return logits
         return F.linear(hidden_states.to(torch.float32), self.weight, None)
+
+
+def _load_flydsl_router():
+    if not envs.SGLANG_OPT_LAGUNA_ROUTER_FLYDSL.get():
+        return None
+    if not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx1250"):
+        return None
+    from sglang.srt.layers.moe.laguna_router_gemv_gfx1250 import router_logits_fp32
+
+    return router_logits_fp32
 
 
 class LagunaMoE(nn.Module):
