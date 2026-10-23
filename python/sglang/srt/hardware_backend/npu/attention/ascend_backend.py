@@ -423,9 +423,9 @@ class AscendAttnBackend(AttentionBackend):
         )
 
         if not envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get():
-            # Hybrid SWA table/mask paths and FIA host IntArrays consume the
-            # CPU mirror; keep it on instead of crashing later.
-            if self.is_hybrid_swa or self.use_fia:
+            # FIA host IntArrays consume the CPU mirror; keep it on instead of
+            # crashing later. Hybrid SWA is allowed through for dsv4 experiments.
+            if self.use_fia:
                 logger.warning(
                     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0 is ignored: "
                     "host-bound attention paths present; keeping the mirror."
@@ -540,7 +540,10 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        if self.needs_cpu_seq_lens:
+        # Data-driven branch: take the CPU-mirror path whenever the mirror is
+        # present, instead of statically gating on needs_cpu_seq_lens. When the
+        # mirror is absent (true mirrorless), fall through to the else branch.
+        if forward_batch.seq_lens_cpu is not None:
             seq_lens_max = forward_batch.seq_lens.max()
             if forward_batch.forward_mode.is_target_verify():
                 if (
