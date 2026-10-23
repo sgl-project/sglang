@@ -300,7 +300,6 @@ class DSANPUIndexerMixin:
                 raise RuntimeError(
                     "SGLANG_NPU_INDEXER_INT8 is on together with prefill CP (attn_cp_size>1)"
                 )
-            block_table = block_table[: actual_seq_lengths_q[0].numel()]
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
                 past_key_states,
