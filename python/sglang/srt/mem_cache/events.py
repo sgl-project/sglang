@@ -167,26 +167,36 @@ def enable_mm_routing_labels() -> None:
     MM_ROUTING_LABELS.enabled = True
 
 
-def attach_mm_routing_labels(mm_items, labels) -> None:
-    """Attach caller routing labels to processed items, one per item in order.
+def attach_mm_routing_labels(mm_items, labels_by_modality) -> None:
+    """Attach caller routing labels to processed items, per media type.
 
-    On a count mismatch the request keeps no labels, so its multimodal
-    tokens are reported without spans.
+    Each type's inputs fill that type's placeholders in order, so the k-th
+    image item is the k-th image input however images and videos interleave
+    in the prompt. A type whose item count differs from its labels, such as
+    an unsplit bundle, stays unlabeled and its tokens are reported without
+    spans.
     """
-    if not labels or not mm_items:
-        return
-    if len(labels) != len(mm_items):
-        logger.warning(
-            "mm_routing_labels length (%d) != mm_items length (%d); "
-            "ignoring routing labels for this request.",
-            len(labels),
-            len(mm_items),
-        )
+    if not labels_by_modality or not mm_items:
         return
     from sglang.srt.managers.schedule_batch import MultimodalDataItem
 
-    for item, label in zip(mm_items, labels):
-        if isinstance(item, MultimodalDataItem) and isinstance(label, str):
+    items_by_modality = {}
+    for item in mm_items:
+        if isinstance(item, MultimodalDataItem):
+            items_by_modality.setdefault(item.modality.name.lower(), []).append(item)
+    for modality, labels in labels_by_modality.items():
+        items = items_by_modality.get(modality, [])
+        if len(items) != len(labels):
+            logger.warning(
+                "mm_routing_labels has %d %s labels for %d %s items; "
+                "leaving those items unlabeled.",
+                len(labels),
+                modality,
+                len(items),
+                modality,
+            )
+            continue
+        for item, label in zip(items, labels):
             item.routing_label = label or None
 
 
@@ -201,17 +211,25 @@ def register_mm_routing_labels(mm_items) -> None:
 
 def mm_routing_spans(token_ids, block_size: int, num_blocks: int):
     """Per-block [start, length, label] runs of labeled multimodal tokens."""
-    if not MM_ROUTING_LABELS or block_size <= 0:
+    if not MM_ROUTING_LABELS or block_size <= 0 or not token_ids:
+        return None
+    if isinstance(token_ids[0], tuple):
+        return None  # bigram (Eagle) keys are not labeled
+    # Text holds no value at or above the pad shift, and max() runs in C, so
+    # text skips the per-token loop: whole events here, blocks of mixed
+    # events below.
+    if max(token_ids) < _MM_PAD_SHIFT_VALUE:
         return None
     per_block = []
     any_span = False
     for block_index in range(num_blocks):
         block = token_ids[block_index * block_size : (block_index + 1) * block_size]
         spans = []
+        per_block.append(spans)
+        if not block or max(block) < _MM_PAD_SHIFT_VALUE:
+            continue
         run_start, run_label = 0, None
         for position, token in enumerate(block):
-            if isinstance(token, tuple):
-                return None  # bigram (Eagle) keys are not labeled
             label = (
                 MM_ROUTING_LABELS.get(token) if token >= _MM_PAD_SHIFT_VALUE else None
             )
@@ -222,7 +240,6 @@ def mm_routing_spans(token_ids, block_size: int, num_blocks: int):
         if run_label is not None:
             spans.append((run_start, len(block) - run_start, run_label))
         any_span = any_span or bool(spans)
-        per_block.append(spans)
     return per_block if any_span else None
 
 

@@ -1260,9 +1260,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                                 "this item will fall back to hash_feature().",
                                 hex_hash,
                             )
-            if mm_inputs:
+            if mm_inputs and isinstance(obj, GenerateReqInput):
                 attach_mm_routing_labels(
-                    mm_inputs.mm_items, getattr(obj, "mm_routing_labels", None)
+                    mm_inputs.mm_items, obj.mm_routing_labels_by_modality()
                 )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
@@ -1629,7 +1629,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
                 encoder_urls=obj.encoder_urls,
-                mm_routing_labels=obj.mm_routing_labels,
+                mm_routing_labels=obj.mm_routing_labels_by_modality(),
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
