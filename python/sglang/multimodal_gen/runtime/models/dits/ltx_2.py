@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.attention.layer import prepare_sdpa_mask
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, RMSNormNoWeight
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -2182,6 +2183,20 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 encoder_attention_mask == 1
             ):
                 encoder_attention_mask = None
+
+        # prompt cross-attention reads the additive mask; build it once, not per block
+        if encoder_attention_mask is not None:
+            encoder_attention_mask = prepare_sdpa_mask(
+                encoder_attention_mask,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        if audio_encoder_attention_mask is not None:
+            audio_encoder_attention_mask = prepare_sdpa_mask(
+                audio_encoder_attention_mask,
+                dtype=audio_hidden_states.dtype,
+                device=audio_hidden_states.device,
+            )
 
         # 5. Run blocks
         skip_video_self_attn_blocks = set(skip_video_self_attn_blocks or ())
