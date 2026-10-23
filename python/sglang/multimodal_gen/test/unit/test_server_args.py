@@ -2711,6 +2711,19 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertFalse(args.vae_cpu_offload)
         self.assertIsNone(args.layerwise_offload_components)
 
+    def test_auto_ltx2_two_stage_device_mode_follows_device_memory(self):
+        for memory_gb, mode in ((140, "resident"), (80, "original")):
+            args = self._from_dict_with_pipeline_config(
+                LTX2PipelineConfig(),
+                memory_gb=memory_gb,
+                kwargs={
+                    "model_path": "Lightricks/LTX-2",
+                    "num_gpus": 2,
+                    "pipeline_class_name": "LTX2TwoStagePipeline",
+                },
+            )
+            self.assertEqual(args.ltx2_two_stage_device_mode, mode)
+
     def test_auto_high_memory_ltx23_original_keeps_default_layerwise_components(self):
         args = self._from_dict_with_pipeline_config(
             LTX2PipelineConfig(),
