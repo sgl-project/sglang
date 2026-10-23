@@ -686,8 +686,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "--speculative-draft-model-path."
             )
 
-    _keep_mla_dspark_draft_off_trtllm_mha(server_args)
-
     if cfg.speculative_num_steps is None:
         declare_resolution(
             server_args,
@@ -817,38 +815,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
 
-def _load_draft_hf_config(cfg):
-    from sglang.srt.utils.hf_transformers_utils import get_config
-
-    return get_config(
-        cfg.speculative_draft_model_path,
-        trust_remote_code=cfg.trust_remote_code,
-        revision=cfg.speculative_draft_model_revision,
-        model_override_args=json.loads(cfg.json_model_override_args),
-    )
-
-
-def _keep_mla_dspark_draft_off_trtllm_mha(server_args: ServerArgs) -> None:
-    """trtllm_mha serves only MHA/GQA layers, so an MLA DSpark draft falls back."""
-    cfg = resolving_view(server_args)
-    draft_backend = cfg.speculative_draft_attention_backend
-    if draft_backend is None:
-        draft_backend, _ = attention_backends_of(resolved_view(server_args))
-    if draft_backend != "trtllm_mha":
-        return
-    from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
-
-    if not parse_dflash_draft_config(draft_hf_config=_load_draft_hf_config(cfg)).is_mla:
-        return
-    # trtllm_mha implies CUDA, where flashinfer serves MLA drafts.
-    logger.warning("DSpark MLA drafts cannot use 'trtllm_mha'; using 'flashinfer'.")
-    declare_resolution(
-        server_args,
-        "_handle_dspark",
-        speculative_draft_attention_backend="flashinfer",
-    )
-
-
 def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """Resolve `speculative_draft_attention_backend` to a final, supported value.
 
@@ -913,8 +879,14 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             get_dflash_layer_types,
             parse_dflash_draft_config,
         )
+        from sglang.srt.utils.hf_transformers_utils import get_config
 
-        draft_hf_config = _load_draft_hf_config(cfg)
+        draft_hf_config = get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+            model_override_args=json.loads(cfg.json_model_override_args),
+        )
         draft_text_config = (
             getattr(draft_hf_config, "text_config", None) or draft_hf_config
         )

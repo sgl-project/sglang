@@ -291,6 +291,29 @@ class TestDFlashMLA(CustomTestCase):
             attn = DFlashMLAAttention(config, layer_id=0)
         self.assertEqual(attn.attn_mqa.sliding_window_size, 3)
 
+    def test_dspark_mla_draft_leaves_inherited_trtllm_mha(self):
+        """A GQA target on Blackwell runs trtllm_mha, which a DSpark draft inherits;
+        an MLA draft must take flashinfer instead or its backend fails to build."""
+        from sglang.srt.speculative.dspark_components import dspark_config
+
+        resolve = "sglang.srt.speculative.draft_worker_common.resolve_draft_worker_attention_backend"
+        mla, gqa = Qwen3Config(**_export_fields()), Qwen3Config(num_hidden_layers=1)
+        for config, inherited, expected in (
+            (mla, "trtllm_mha", "flashinfer"),
+            (gqa, "trtllm_mha", None),
+            (mla, "triton", None),
+        ):
+            with (
+                patch.object(
+                    dspark_config, "_load_draft_hf_config", return_value=config
+                ),
+                patch(resolve, return_value=inherited),
+            ):
+                self.assertEqual(
+                    dspark_config.draft_attention_backend_override(draft_is_moe=False),
+                    expected,
+                )
+
     def test_matches_specforge_reference(self):
         """Context-KV materialization and the block forward reproduce SpecForge's
         expanded attention: partial RoPE, pair convention, K/V of different width."""
