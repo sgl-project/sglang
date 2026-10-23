@@ -759,26 +759,39 @@ class AscendAttnBackend(AttentionBackend):
         if dense_mla_dcp_partial:
             self._init_mla_dcp_forward_metadata(forward_batch)
 
-        # Draft workers retain allocator-global cache slots and use the non-DCP
-        # attention path, so only target workers need DCP-specific metadata.
         if self.dsa_dcp_target:
-            metadata = self.forward_metadata
-            metadata.dcp_origin_out_cache_loc = forward_batch.origin_out_cache_loc
-            is_spec = forward_batch.forward_mode.is_target_verify()
-            local_lens_cpu, block_tables = self._get_kv_lens_and_block_tables(
-                kv_lens_cpu=metadata.seq_lens_cpu_int,
-                req_pool_indices=forward_batch.req_pool_indices,
-                is_spec=is_spec,
+            # Draft workers retain allocator-global cache slots and use the non-DCP
+            # attention path, so only target workers need DCP-specific metadata.
+            self.forward_metadata.dcp_origin_out_cache_loc = (
+                forward_batch.origin_out_cache_loc
             )
-            local_lens = local_lens_cpu.to(device=self.device, dtype=torch.int32)
-            if is_spec:
-                metadata.dcp_spec_seq_lens_cpu_int = local_lens_cpu
-                metadata.dcp_spec_seq_lens = local_lens
-                metadata.dcp_spec_block_tables = block_tables
+            if forward_batch.forward_mode.is_target_verify():
+                (
+                    self.forward_metadata.dcp_spec_seq_lens_cpu_int,
+                    self.forward_metadata.dcp_spec_block_tables,
+                ) = self._get_kv_lens_and_block_tables(
+                    kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    is_spec=True,
+                )
+                self.forward_metadata.dcp_spec_seq_lens = (
+                    self.forward_metadata.dcp_spec_seq_lens_cpu_int.to(
+                        device=self.device, dtype=torch.int32
+                    )
+                )
             else:
-                metadata.dcp_seq_lens_cpu_int = local_lens_cpu
-                metadata.dcp_seq_lens = local_lens
-                metadata.dcp_block_tables = block_tables
+                (
+                    self.forward_metadata.dcp_seq_lens_cpu_int,
+                    self.forward_metadata.dcp_block_tables,
+                ) = self._get_kv_lens_and_block_tables(
+                    kv_lens_cpu=self.forward_metadata.seq_lens_cpu_int,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                )
+                self.forward_metadata.dcp_seq_lens = (
+                    self.forward_metadata.dcp_seq_lens_cpu_int.to(
+                        device=self.device, dtype=torch.int32
+                    )
+                )
 
         if (
             self.use_mla
