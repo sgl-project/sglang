@@ -97,8 +97,8 @@ Checkpoint validation
 ---------------------
 GLM-5.2 W4A8 startup and decode smoke passed with TP16/EP16, attention DP2,
 BF16 KV, page128, context36864, max_running_requests=4 and decode graph bs=[8].
-All 16 ranks completed graph capture; the log confirms five request storage
-rows while the captured graph has eight batch rows. Speculation was disabled.
+All 16 ranks completed graph capture; the log confirms three request storage
+rows per attention-DP rank while the captured graph has eight batch rows. Speculation was disabled.
 
 Input tokens   Generated tokens   Expected needle present
 512            32                 yes

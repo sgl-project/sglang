@@ -167,7 +167,7 @@
       "speculative_algorithm": null
     },
     "driver_returncode": 0,
-    "request_pool_rows_5_logged": false
+    "request_pool_rows_per_rank": 3
   },
   "kernel_build": {
     "libraries": {
