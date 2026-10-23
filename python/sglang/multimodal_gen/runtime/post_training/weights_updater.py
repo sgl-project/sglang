@@ -145,6 +145,14 @@ def get_updatable_modules(pipeline) -> dict[str, torch.nn.Module]:
     return {n: m for n, m in raw.items() if isinstance(m, torch.nn.Module)}
 
 
+def _run_weight_update_hook(module: torch.nn.Module, hook_name: str, **kwargs) -> None:
+    # BaseDiT declares the hooks with no-op defaults; a component outside that
+    # hierarchy (the MiniMax-H3 video VAE) defines the same method when needed.
+    hook = getattr(module, hook_name, None)
+    if callable(hook):
+        hook(**kwargs)
+
+
 def _get_weights_iter(weights_dir: str):
     """Return a (name, tensor) iterator over safetensors in weights_dir."""
     safetensors_files = _list_safetensors_files(weights_dir)
@@ -408,10 +416,11 @@ class WeightsUpdater:
 
         try:
             for module_name, module in modules_to_update:
-                if isinstance(module, BaseDiT):
-                    module.validate_weight_update_source(
-                        weights_path=weights_map[module_name]
-                    )
+                _run_weight_update_hook(
+                    module,
+                    "validate_weight_update_source",
+                    weights_path=weights_map[module_name],
+                )
         except ValueError as e:
             logger.error(str(e))
             return False, str(e)
@@ -429,13 +438,14 @@ class WeightsUpdater:
             if target_modules is None:
                 self.pipeline.model_path = local_model_path
             for module_name, module in modules_to_update:
-                if isinstance(module, BaseDiT):
-                    # Weight-derived caches must not survive a weight swap
-                    # (regardless of flush_cache, which only governs
-                    # optimization caches like TeaCache).
-                    module.refresh_weight_derived_caches(
-                        weights_path=weights_map[module_name]
-                    )
+                # Weight-derived caches must not survive a weight swap
+                # (regardless of flush_cache, which only governs
+                # optimization caches like TeaCache).
+                _run_weight_update_hook(
+                    module,
+                    "refresh_weight_derived_caches",
+                    weights_path=weights_map[module_name],
+                )
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -573,8 +583,9 @@ class WeightsUpdater:
 
         try:
             for _module_name, module in modules_to_update:
-                if isinstance(module, BaseDiT):
-                    module.validate_weight_update_source(weights_path=None)
+                _run_weight_update_hook(
+                    module, "validate_weight_update_source", weights_path=None
+                )
         except ValueError as e:
             logger.error(str(e))
             return False, str(e)
@@ -596,11 +607,12 @@ class WeightsUpdater:
                 return False, error_msg
 
         for module_name, module in modules_to_update:
-            if isinstance(module, BaseDiT):
-                # Same invariant as the disk path. Any model whose derived
-                # state needs an on-disk source rejected this update above, so
-                # what reaches here only has caches to drop.
-                module.refresh_weight_derived_caches(weights_path=None)
+            # Same invariant as the disk path. Any model whose derived
+            # state needs an on-disk source rejected this update above, so
+            # what reaches here only has caches to drop.
+            _run_weight_update_hook(
+                module, "refresh_weight_derived_caches", weights_path=None
+            )
 
         gc.collect()
         torch.cuda.empty_cache()

@@ -2946,6 +2946,29 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertFalse(args.vae_cpu_offload)
         self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
 
+    def test_minimax_h3_memory_mode_keeps_one_vae_tile_per_forward(self):
+        for pipeline_cls, mode, expected in (
+            (MiniMaxH3PipelineConfig, "speed", (64, 1)),
+            (MiniMaxH3PipelineConfig, "memory", (1, 1)),
+            (FastH3PipelineConfig, "speed", (0, 1)),
+            (FastH3PipelineConfig, "memory", (1, 1)),
+        ):
+            config = pipeline_cls()
+            self._from_dict_with_pipeline_config(
+                config,
+                kwargs={
+                    "model_path": "MiniMaxAI/MiniMax-H3",
+                    "num_gpus": 4,
+                    "ulysses_degree": 4,
+                    "performance_mode": mode,
+                },
+            )
+            self.assertEqual(
+                (config.vae_config.decoder_tile_batch, config.vae_config.window_batch),
+                expected,
+                (pipeline_cls.__name__, mode),
+            )
+
     def test_minimax_h3_rejects_explicit_cfg_parallel(self):
         with self.assertRaisesRegex(
             ValueError, "MiniMaxH3PipelineConfig does not support CFG parallelism"
@@ -2956,6 +2979,77 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                     "model_path": "MiniMaxAI/MiniMax-H3",
                     "num_gpus": 4,
                     "cfg_parallel_degree": 2,
+                },
+            )
+
+    def test_video_vae_fp8_override_requires_resident_fp16_cuda(self):
+        sm_gate = (
+            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+            "is_cuda_sm_at_least"
+        )
+        base = {
+            "model_path": "MiniMaxAI/MiniMax-H3",
+            "num_gpus": 4,
+            "ulysses_degree": 4,
+            "component_quantizations": {"video_vae": "fp8"},
+        }
+        with patch(sm_gate, return_value=False):
+            with self.assertRaisesRegex(ValueError, "compute capability 10.0"):
+                self._from_dict_with_pipeline_config(
+                    MiniMaxH3PipelineConfig(), kwargs=base
+                )
+        with patch(sm_gate, return_value=True):
+            with self.assertRaisesRegex(ValueError, "fp16 decode autocast"):
+                self._from_dict_with_pipeline_config(
+                    MiniMaxH3PipelineConfig(),
+                    kwargs={**base, "disable_autocast": True},
+                )
+            for precision in ("fp16", "bf16"):
+                with (
+                    self.subTest(precision=precision),
+                    self.assertRaisesRegex(ValueError, "fp16 decode autocast"),
+                ):
+                    self._from_dict_with_pipeline_config(
+                        MiniMaxH3PipelineConfig(),
+                        kwargs={
+                            **base,
+                            "component_precisions": {"video_vae": precision},
+                        },
+                    )
+            with self.assertRaisesRegex(
+                ValueError, "--component-residency video_vae=resident"
+            ):
+                self._from_dict_with_pipeline_config(
+                    MiniMaxH3PipelineConfig(),
+                    kwargs={**base, "performance_mode": "memory"},
+                )
+            with self.assertRaisesRegex(ValueError, "ignored-layers.video_vae"):
+                self._from_dict_with_pipeline_config(
+                    MiniMaxH3PipelineConfig(),
+                    kwargs={
+                        **base,
+                        "performance_mode": "speed",
+                        "component_quantization_ignored_layers": {"video_vae": ["ff"]},
+                    },
+                )
+            args = self._from_dict_with_pipeline_config(
+                MiniMaxH3PipelineConfig(),
+                kwargs={**base, "performance_mode": "speed"},
+            )
+
+        self.assertEqual(args.component_quantizations, {"video_vae": "fp8"})
+        self.assertEqual(args.residency_mode("video_vae"), RESIDENT)
+
+    def test_video_vae_rejects_non_fp8_quantization(self):
+        with self.assertRaisesRegex(
+            ValueError, r"--component-quantizations\.video_vae fp8, got 'int8'"
+        ):
+            self._from_dict_with_pipeline_config(
+                MiniMaxH3PipelineConfig(),
+                kwargs={
+                    "model_path": "MiniMaxAI/MiniMax-H3",
+                    "num_gpus": 4,
+                    "component_quantizations": {"video_vae": "int8"},
                 },
             )
 

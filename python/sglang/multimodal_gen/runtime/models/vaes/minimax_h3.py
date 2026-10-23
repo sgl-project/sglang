@@ -9,11 +9,15 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import VaeFastPathGate
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_audio_vae import (
     DacAudioVAE,
 )
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
+)
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.fp8 import (
+    install_fp8_block_linears,
 )
 
 
@@ -73,7 +77,8 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
             and config.use_parallel_decode
             and config.use_parallel_tiling
             and bool(arch.vae_parallel_tiling),
-            stack_tiling=config.stack_tiling,
+            decoder_tile_batch=config.decoder_tile_batch,
+            window_batch=config.window_batch,
             tile_size=int(arch.vae_tile_size),
             tile_overlap_min=int(arch.vae_tile_overlap_min),
             encoder_parallel=False,
@@ -83,9 +88,37 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
         self.sglang_config = config
         self.use_parallel_decode = config.use_parallel_decode
         self.parallel_decode_mode = parallel_decode_mode
+        # The tiled decode batches under this gate; the CUDA installer registers
+        # it for use_vae_fast_path and adds its attention fusion, so other
+        # platforms keep the one-tile-per-forward decode.
+        self._sgl_gate = VaeFastPathGate()
 
     def prepare_decoder_autocast_weights(self, dtype) -> int:
         return self.decoder.prepare_autocast_linear_weights(dtype)
+
+    def quantize_decoder_fp8(self) -> int:
+        """Replace the 144 decoder block linears with online FP8 modules."""
+        return install_fp8_block_linears(self.decoder)
+
+    def validate_weight_update_source(self, *, weights_path: str | None) -> None:
+        """Reject a runtime weight update once the decoder holds FP8 weights.
+
+        The updater copies checkpoint tensors into parameters. The FP8 block
+        linears hold rounded payloads next to per-channel scales, so such a
+        copy would serve a decoder whose scales no longer match its weights,
+        and the rollback would write the same way. Runs before any weight is
+        written, so the served decoder stays intact.
+        """
+        del weights_path
+        if self.decoder.fp8_installed:
+            raise ValueError(
+                "MiniMax-H3 video_vae was started with "
+                "--component-quantizations.video_vae fp8; its decoder block "
+                "linears hold FP8 weights with per-channel scales that an "
+                "in-place weight update cannot requantize. Restart the server "
+                "on the new checkpoint, or pass a target_modules list that leaves "
+                "video_vae out (an omitted target_modules updates every module)"
+            )
 
 
 class MiniMaxH3AudioVAE(DacAudioVAE, LayerwiseOffloadableModuleMixin):

@@ -54,6 +54,7 @@ from sglang.kernels.ops.diffusion import (
     wan_rmsnorm_silu,
 )
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
     QwenImage21VAEArchConfig,
     QwenImage21VAEConfig,
@@ -144,8 +145,9 @@ from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=110, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=8, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=100, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# backend-specific: preserve ROCm eager fallback coverage for CUDA-only fusions.
+register_amd_ci(est_time=6, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
