@@ -549,5 +549,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_http_worker_reuseport",
     "prefill_decode_interval_min_bs",
     "unified_cache_external_linker_config",
+    "clamp_max_new_tokens_to_context",
 )
 # fmt: on
