@@ -1540,7 +1540,8 @@
                   {
                     "group": "Tencent",
                     "pages": [
-                      "cookbook/diffusion/Tencent/HunyuanImage3"
+                      "cookbook/diffusion/Tencent/HunyuanImage3",
+                      "cookbook/diffusion/Tencent/HY-Nomas"
                     ]
                   },
                   {
