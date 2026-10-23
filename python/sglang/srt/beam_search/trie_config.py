@@ -21,8 +21,12 @@ from typing import Optional
 
 import msgspec
 from safetensors import safe_open
+from transformers import PretrainedConfig
+from transformers.utils import cached_file
 
 TRIE_OUTPUT_HEAD_FILENAME = "trie_output_head.safetensors"
+# config.json key a model sets to true to bundle the trie output head.
+TRIE_OUTPUT_HEAD_CONFIG_KEY = "beam_trie_output_head"
 TRIE_OUTPUT_HEAD_FORMAT_VERSION = 1
 
 
@@ -85,28 +89,10 @@ def load_trie_output_head_config(tensor_path: str) -> TrieOutputHeadConfig:
 
 
 def discover_trie_output_head_config(
-    model_path: str, revision: Optional[str] = None
+    hf_config: PretrainedConfig, model_path: str, revision: Optional[str] = None
 ) -> Optional[TrieOutputHeadConfig]:
-    """Discover the optional ``trie_output_head.safetensors`` model artifact."""
-
-    path = Path(model_path).expanduser()
-    if path.is_dir():
-        tensor_path = path / TRIE_OUTPUT_HEAD_FILENAME
-        if not tensor_path.is_file():
-            return None
-        return load_trie_output_head_config(str(tensor_path))
-    if path.is_absolute() or model_path.startswith(("./", "../", "~")):
+    if not getattr(hf_config, TRIE_OUTPUT_HEAD_CONFIG_KEY, False):
         return None
-
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
-
-    try:
-        tensor_path = hf_hub_download(
-            model_path,
-            TRIE_OUTPUT_HEAD_FILENAME,
-            revision=revision,
-        )
-    except (EntryNotFoundError, LocalEntryNotFoundError):
-        return None
+    # A model that opts in must ship the artifact; a missing file raises.
+    tensor_path = cached_file(model_path, TRIE_OUTPUT_HEAD_FILENAME, revision=revision)
     return load_trie_output_head_config(tensor_path)

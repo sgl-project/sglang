@@ -6,9 +6,11 @@ from unittest import mock
 import numpy as np
 import torch
 from safetensors.torch import save_file
+from transformers import PretrainedConfig
 
 import sglang.srt.beam_search.trie_constraint as trie_constraint_module
 from sglang.srt.beam_search.trie_config import (
+    TRIE_OUTPUT_HEAD_CONFIG_KEY,
     TRIE_OUTPUT_HEAD_FILENAME,
     discover_trie_output_head_config,
     load_trie_output_head_config,
@@ -288,16 +290,18 @@ class TestBeamTrieConstraint(CustomTestCase):
                 rl_on_policy_target=None,
             )
 
-    def test_discovers_only_model_root_artifact(self):
+    def test_discovers_declared_model_root_artifact(self):
         model_root = self.root / "model"
-        model_root.mkdir()
-        self.assertIsNone(discover_trie_output_head_config(str(model_root)))
-        nested_root = model_root / "nested"
-        nested_root.mkdir()
-        self._write_artifact(nested_root)
-        self.assertIsNone(discover_trie_output_head_config(str(model_root)))
+        (model_root / "nested").mkdir(parents=True)
+        self._write_artifact(model_root / "nested")
+        declared = PretrainedConfig(**{TRIE_OUTPUT_HEAD_CONFIG_KEY: True})
+        with self.assertRaises(OSError):
+            discover_trie_output_head_config(declared, str(model_root))
         self._write_artifact(model_root)
-        config = discover_trie_output_head_config(str(model_root))
+        self.assertIsNone(
+            discover_trie_output_head_config(PretrainedConfig(), str(model_root))
+        )
+        config = discover_trie_output_head_config(declared, str(model_root))
         self.assertIsNotNone(config)
         self.assertEqual(config.token_start, 10)
         self.assertEqual(

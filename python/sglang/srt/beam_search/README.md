@@ -7,7 +7,9 @@ Models without the optional trie artifact keep the ordinary beam-search path.
 ## Model artifact
 
 Place `trie_output_head.safetensors` at the root of a local model directory or
-Hugging Face model repository. Token IDs for depth `d` are
+Hugging Face model repository, and set `"beam_trie_output_head": true` in the
+model's `config.json`. Only a model that sets the key loads the artifact, and
+startup fails if the file is missing. Token IDs for depth `d` are
 `token_start + d * codebook_size + code`.
 
 The safetensors metadata must contain these integer-valued strings:

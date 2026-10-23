@@ -878,7 +878,9 @@ class ModelConfig:
         self.beam_trie_config = (
             None
             if self.is_draft_model
-            else discover_trie_output_head_config(self.model_path, revision)
+            else discover_trie_output_head_config(
+                self.hf_config, self.model_path, revision
+            )
         )
         if self.beam_trie_config is not None:
             if self.beam_trie_config.token_end > self.vocab_size:
