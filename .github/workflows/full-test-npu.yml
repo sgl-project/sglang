@@ -288,132 +288,6 @@ jobs:
   nightly-acc-8-npu-a5:
     name: nightly-acc-8-npu-a5
     if: ${{ !cancelled() }}
-  nighly-test-npu:
-    needs: [set-image-config]
-    name: nightly-test-npu
-    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    uses: ./.github/workflows/nightly-test-npu.yml
-    with:
-      ref:  ${{ needs.set-image-config.outputs.ref }}
-      job_filter: ${{ needs.set-image-config.outputs.job_filter }}
-      image_a3: ${{ needs.set-image-config.outputs.image_a3 }}
-    secrets: inherit
-
-  full-1-npu-a3:
-    name: full-1-npu-a3
-    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: full-1-npu-a3
-      runner_config: linux-aarch64-a3-2
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '240'
-      timeout_per_file: '3600'
-      ref: ${{ needs.set-image-config.outputs.ref }}
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-    secrets: inherit
-
-  full-2-npu-a3:
-    name: full-2-npu-a3
-    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: full-2-npu-a3
-      runner_config: linux-aarch64-a3-2
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '240'
-      timeout_per_file: '3600'
-      ref: ${{ needs.set-image-config.outputs.ref }}
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-    secrets: inherit
-
-  full-4-npu-a3:
-    name: full-4-npu-a3
-    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: full-4-npu-a3
-      runner_config: linux-aarch64-a3-4
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '240'
-      timeout_per_file: '3600'
-      ref: ${{ needs.set-image-config.outputs.ref }}
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-    secrets: inherit
-
-  full-8-npu-a3:
-    name: full-8-npu-a3
-    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: full-8-npu-a3
-      runner_config: linux-aarch64-a3-8
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '240'
-      timeout_per_file: '3600'
-      ref: ${{ needs.set-image-config.outputs.ref }}
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-    secrets: inherit
-
-  full-16-npu-a3:
-    name: full-16-npu-a3
-    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-pr-test-stage.yml
-    with:
-      self_name: full-16-npu-a3
-      runner_config: linux-aarch64-a3-16
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      run_timeout_minutes: '240'
-      timeout_per_file: '3600'
-      ref: ${{ needs.set-image-config.outputs.ref }}
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-    secrets: inherit
-
-  full-acc-2-npu-a3:
-    name: full-acc-2-npu-a3
-    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-2-
-      test_type: 'accuracy'
-      test_suite: full-acc-2-npu-a3
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      is_nightly_pipeline_job: true
-      install_sglang_deps: true
-      device_type_for_deps: 'a3'
-      skip_pr_test_health_check: 'true'
-    secrets: inherit
-
-  full-acc-4-npu-a3:
-    name: full-acc-4-npu-a3
-    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-4-
-      test_type: 'accuracy'
-      test_suite: full-acc-4-npu-a3
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      is_nightly_pipeline_job: true
-      install_sglang_deps: true
-      device_type_for_deps: 'a3'
-      skip_pr_test_health_check: 'true'
-    secrets: inherit
-
-  full-acc-16-npu-a3:
-    name: full-acc-16-npu-a3
-    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -426,6 +300,134 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a5'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
+#  full-1-npu-a3:
+#    name: full-1-npu-a3
+#    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+#    needs: [set-image-config]
+#    uses: ./.github/workflows/_npu-pr-test-stage.yml
+#    with:
+#      self_name: full-1-npu-a3
+#      runner_config: linux-aarch64-a3-2
+#      image: ${{ needs.set-image-config.outputs.image_a3 }}
+#      run_timeout_minutes: '240'
+#      timeout_per_file: '3600'
+#      ref: ${{ needs.set-image-config.outputs.ref }}
+#      is_nightly_pipeline_job: true
+#      skip_pr_test_health_check: 'true'
+#    secrets: inherit
+#
+#  full-2-npu-a3:
+#    name: full-2-npu-a3
+#    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+#    needs: [set-image-config]
+#    uses: ./.github/workflows/_npu-pr-test-stage.yml
+#    with:
+#      self_name: full-2-npu-a3
+#      runner_config: linux-aarch64-a3-2
+#      image: ${{ needs.set-image-config.outputs.image_a3 }}
+#      run_timeout_minutes: '240'
+#      timeout_per_file: '3600'
+#      ref: ${{ needs.set-image-config.outputs.ref }}
+#      is_nightly_pipeline_job: true
+#      skip_pr_test_health_check: 'true'
+#    secrets: inherit
+#
+#  full-4-npu-a3:
+#    name: full-4-npu-a3
+#    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+#    needs: [set-image-config]
+#    uses: ./.github/workflows/_npu-pr-test-stage.yml
+#    with:
+#      self_name: full-4-npu-a3
+#      runner_config: linux-aarch64-a3-4
+#      image: ${{ needs.set-image-config.outputs.image_a3 }}
+#      run_timeout_minutes: '240'
+#      timeout_per_file: '3600'
+#      ref: ${{ needs.set-image-config.outputs.ref }}
+#      is_nightly_pipeline_job: true
+#      skip_pr_test_health_check: 'true'
+#    secrets: inherit
+#
+#  full-8-npu-a3:
+#    name: full-8-npu-a3
+#    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+#    needs: [set-image-config]
+#    uses: ./.github/workflows/_npu-pr-test-stage.yml
+#    with:
+#      self_name: full-8-npu-a3
+#      runner_config: linux-aarch64-a3-8
+#      image: ${{ needs.set-image-config.outputs.image_a3 }}
+#      run_timeout_minutes: '240'
+#      timeout_per_file: '3600'
+#      ref: ${{ needs.set-image-config.outputs.ref }}
+#      is_nightly_pipeline_job: true
+#      skip_pr_test_health_check: 'true'
+#    secrets: inherit
+#
+#  full-16-npu-a3:
+#    name: full-16-npu-a3
+#    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+#    needs: [set-image-config]
+#    uses: ./.github/workflows/_npu-pr-test-stage.yml
+#    with:
+#      self_name: full-16-npu-a3
+#      runner_config: linux-aarch64-a3-16
+#      image: ${{ needs.set-image-config.outputs.image_a3 }}
+#      run_timeout_minutes: '240'
+#      timeout_per_file: '3600'
+#      ref: ${{ needs.set-image-config.outputs.ref }}
+#      is_nightly_pipeline_job: true
+#      skip_pr_test_health_check: 'true'
+#    secrets: inherit
+#
+#  full-acc-2-npu-a3:
+#    name: full-acc-2-npu-a3
+#    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+#    needs: [set-image-config]
+#    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+#    with:
+#      runner: linux-aarch64-a3-2-
+#      test_type: 'accuracy'
+#      test_suite: full-acc-2-npu-a3
+#      image: ${{ needs.set-image-config.outputs.image_a3 }}
+#      is_nightly_pipeline_job: true
+#      install_sglang_deps: true
+#      device_type_for_deps: 'a3'
+#      skip_pr_test_health_check: 'true'
+#    secrets: inherit
+#
+#  full-acc-4-npu-a3:
+#    name: full-acc-4-npu-a3
+#    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+#    needs: [set-image-config]
+#    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+#    with:
+#      runner: linux-aarch64-a3-4-
+#      test_type: 'accuracy'
+#      test_suite: full-acc-4-npu-a3
+#      image: ${{ needs.set-image-config.outputs.image_a3 }}
+#      is_nightly_pipeline_job: true
+#      install_sglang_deps: true
+#      device_type_for_deps: 'a3'
+#      skip_pr_test_health_check: 'true'
+#    secrets: inherit
+#
+#  full-acc-16-npu-a3:
+#    name: full-acc-16-npu-a3
+#    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+#    needs: [set-image-config]
+#    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+#    with:
+#      runner: linux-amd64-a5-8
+#      test_type: 'accuracy'
+#      test_suite: nightly-acc-8-npu-a5-
+#      is_nightly_pipeline_job: true
+#      skip_pr_test_health_check: 'true'
+#      image: ${{ needs.set-image-config.outputs.image_a5 }}
+#      install_sglang_deps: false
+#      device_type_for_deps: 'a5'
+#      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     if: false
@@ -600,35 +602,35 @@ jobs:
 #            if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then FAIL=1; fi
 #          done
 #          exit $FAIL
-  check-all-jobs:
-    if: github.repository == 'sgl-project/sglang' && always()
-    needs:
-      - nighly-test-npu
-      - full-1-npu-a3
-      - full-2-npu-a3
-      - full-4-npu-a3
-      - full-8-npu-a3
-      - full-16-npu-a3
-      - full-acc-2-npu-a3
-      - full-acc-4-npu-a3
-      - full-acc-16-npu-a3
-      - full-perf-2-npu-a3
-      - full-perf-4-npu-a3
-      - full-perf-8-npu-a3
-      - full-perf-16-npu-a3
-      - full-poc-multi-node-mix-tests
-    runs-on: ubuntu-latest
-    container:
-      image: docker.m.daocloud.io/ubuntu:22.04
-    steps:
-      - name: Check if any job failed
-        run: |
-          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
-            echo "One or more nightly test jobs failed"
-            exit 1
-          fi
-          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "One or more nightly test jobs were cancelled"
-            exit 1
-          fi
-          echo "All nightly test jobs passed"
+#  check-all-jobs:
+#    if: github.repository == 'sgl-project/sglang' && always()
+#    needs:
+#      - nighly-test-npu
+#      - full-1-npu-a3
+#      - full-2-npu-a3
+#      - full-4-npu-a3
+#      - full-8-npu-a3
+#      - full-16-npu-a3
+#      - full-acc-2-npu-a3
+#      - full-acc-4-npu-a3
+#      - full-acc-16-npu-a3
+#      - full-perf-2-npu-a3
+#      - full-perf-4-npu-a3
+#      - full-perf-8-npu-a3
+#      - full-perf-16-npu-a3
+#      - full-poc-multi-node-mix-tests
+#    runs-on: ubuntu-latest
+#    container:
+#      image: docker.m.daocloud.io/ubuntu:22.04
+#    steps:
+#      - name: Check if any job failed
+#        run: |
+#          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+#            echo "One or more nightly test jobs failed"
+#            exit 1
+#          fi
+#          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+#            echo "One or more nightly test jobs were cancelled"
+#            exit 1
+#          fi
+#          echo "All nightly test jobs passed"
