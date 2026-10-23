@@ -1,0 +1,12 @@
+from mechanical_refactor_reproduction_utils import Repro
+import sys
+
+r = Repro(base='5f5529241c95258a3572773278c0e75983aa29fd', target='9cbd39a5ca65fcf7d4211d66459c296b84a7fadd')
+r.extract_function('python/sglang/srt/layers/radix_attention.py', 'python/sglang/srt/layers/cp/padding.py', name='attention_query_tokens', signature='def attention_query_tokens(forward_batch, n):', body='        cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)\n        if getattr(cp_metadata, "graph_num_tokens", None) is not None:\n            # Interleave BCG gathers KV in global sequence order but Q stays\n            # local. Empty padded queries must not enter sparse attention.\n            n = cp_metadata.per_rank_logical_token[get_parallel().attn_cp_rank]\n', body_indent=8, call='        n = attention_query_tokens(forward_batch, n)\n', return_text='    return n\n')
+r.add_import('python/sglang/srt/layers/attention/graph_utils.py', 'from sglang.srt.layers.cp.padding import attention_query_tokens as attention_query_tokens')
+r.add_import('python/sglang/srt/layers/radix_attention.py', 'from sglang.srt.layers.attention.graph_utils import attention_query_tokens')
+r.extract_function('python/sglang/srt/layers/radix_attention.py', 'python/sglang/srt/layers/cp/padding.py', name='attention_output_tokens', signature='def attention_output_tokens(forward_batch, raw):', body='            cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)\n            if (\n                cp_metadata is not None\n                and cp_metadata.per_rank_logical_token is not None\n            ):\n                # Q/output rows are CP-local; cache locations and positions\n                # above remain global. Zero every invalid local row before\n                # captured projections/MoE can consume an empty-attention NaN.\n                raw = cp_metadata.per_rank_logical_token[get_parallel().attn_cp_rank]\n', body_indent=12, call='            raw = attention_output_tokens(forward_batch, raw)\n', return_text='    return raw\n')
+r.add_import('python/sglang/srt/layers/attention/graph_utils.py', 'from sglang.srt.layers.cp.padding import attention_output_tokens as attention_output_tokens')
+r.add_import('python/sglang/srt/layers/radix_attention.py', 'from sglang.srt.layers.attention.graph_utils import attention_output_tokens')
+r.remove_imported_name('python/sglang/srt/layers/radix_attention.py', module="sglang.srt.runtime_context", name="get_parallel")
+sys.exit(1 if r.run() else 0)
