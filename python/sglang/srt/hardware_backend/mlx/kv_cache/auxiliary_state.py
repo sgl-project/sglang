@@ -286,6 +286,7 @@ class MlxAuxiliaryStateReqToTokenPool(ReqToTokenPool):
             if mamba_ping_pong_track_buffer_to_keep is None:
                 self.auxiliary_state_pool.free(track_buffer)
             req.kv.mamba_ping_pong_track_buffer = None
+            req.kv.mamba_ping_pong_empty = None
             req.kv.mamba_next_track_idx = None
             req.kv.mamba_last_track_idx = None
 
@@ -387,6 +388,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
                 if track_buffer is not None:
                     self.cache.req_to_token_pool.auxiliary_state_pool.free(track_buffer)
                 req.kv.mamba_ping_pong_track_buffer = None
+                req.kv.mamba_ping_pong_empty = None
                 req.kv.mamba_next_track_idx = None
                 req.kv.mamba_last_track_idx = None
             req.kv.mamba_last_track_seqlen = None
@@ -412,6 +414,7 @@ class MlxAuxiliaryStateComponent(MambaComponent):
             if track_buffer is not None:
                 self.cache.req_to_token_pool.auxiliary_state_pool.free(track_buffer)
                 req.kv.mamba_ping_pong_track_buffer = None
+                req.kv.mamba_ping_pong_empty = None
                 req.kv.mamba_next_track_idx = None
                 req.kv.mamba_last_track_idx = None
             req.kv.mamba_pool_idx = None
