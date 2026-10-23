@@ -478,11 +478,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
         scheduler = SimpleNamespace(
             enable_priority_scheduling=False,
             abort_on_priority_when_disabled=True,
-            ipc_channels=SimpleNamespace(
-                send_to_tokenizer=SimpleNamespace(
-                    send_output=lambda obj, req_arg: sent.append(obj)
-                )
-            ),
+            send_abort_output=lambda obj, req_arg: sent.append(obj),
         )
 
         with patch(

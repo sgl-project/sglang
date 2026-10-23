@@ -352,6 +352,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             last_device_node=result.last_device_node_id,
             last_host_node=result.last_host_node_id,
             best_match_node=result.best_match_node_id,
+            last_visited_node_id=result.last_visited_node_id,
+            full_device_match_len=result.full_device_match_len,
             host_hit_length=result.host_hit_length,
             swa_host_hit_length=result.swa_host_hit_length,
             swa_branching_seqlen=result.swa_branching_seqlen,
