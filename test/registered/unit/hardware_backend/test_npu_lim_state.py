@@ -5,6 +5,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.kernels.ops.attention.npu_lim import (
     fused_lightning_indexer_manage,
     load_fused_lim_operator,
@@ -14,6 +15,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables imp
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
     resolve_sparse_kv_budget,
+    sparse_batch_capacity,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim import (
     LIMDecodeAdapter,
@@ -48,7 +50,7 @@ class TestLIMState(CustomTestCase):
                         torch.tensor(requests), torch.tensor(lengths), 4, 8
                     )
 
-    def test_copy_sfa_packs_native_miss_stride_and_masks_interior_padding(self):
+    def test_copy_sfa_shares_native_miss_stride_and_masks_interior_padding(self):
         batch, top_k = 3, 2048
         ints = lambda *shape: torch.empty(*shape, dtype=torch.int32)
         manager = SimpleNamespace(
@@ -74,7 +76,9 @@ class TestLIMState(CustomTestCase):
         sources = torch.arange(batch * 32768, dtype=torch.int32).view(batch, 32768)
         plan = SimpleNamespace(
             source_ids=torch.arange(top_k, dtype=torch.int32).expand(batch, -1).clone(),
-            device_slots=torch.arange(top_k, dtype=torch.int32).expand(batch, -1),
+            device_slots=torch.arange(top_k, dtype=torch.int32)
+            .expand(batch, -1)
+            .clone(),
             topk_misses=torch.tensor([3, 99, 7], dtype=torch.int32),
             miss_sources=sources,
             miss_slots=sources + 1,
@@ -86,13 +90,115 @@ class TestLIMState(CustomTestCase):
         plan.source_ids[1].fill_(-1)
         metadata = adapter.copy_sfa_metadata(manager, plan)
         self.assertTrue(all(t.is_contiguous() for t in metadata))
-        torch.testing.assert_close(metadata[3][2], sources[2, :top_k])
+        torch.testing.assert_close(metadata[3][2], sources[2])
+        for actual, native in zip(
+            metadata[:6],
+            (
+                plan.source_ids,
+                plan.device_slots,
+                plan.topk_misses,
+                plan.miss_sources,
+                plan.miss_slots,
+                plan.miss_counts,
+            ),
+        ):
+            self.assertEqual(actual.data_ptr(), native.data_ptr())
         self.assertEqual(metadata[5].tolist(), [3, 0, 7])
         self.assertEqual(metadata[7].tolist(), [2048, 0, 2048])
-        self.assertTrue(torch.all(metadata[1][1] == -1))
-        self.assertTrue(torch.all(metadata[3][1] == -1))
+        self.assertEqual(metadata[2][1].item(), 0)
         self.assertEqual(metadata[9][:, 0].tolist(), [48, 0, 16])
         self.assertEqual(metadata[10][:, 0].tolist(), [99, 0, 33])
+        plan.source_ids[0, 0] = 19
+        self.assertEqual(metadata[0][0, 0, 0].item(), 19)
+
+    def test_padded_graph_scratch_keeps_request_bounds_and_avoids_tail_workspace(self):
+        rows, batch, top_k = 3, 16, 2048
+        key = torch.empty((32, 128, 1, 128), dtype=torch.bfloat16)
+        manager = SimpleNamespace(
+            indexer_impl="li_reference",
+            size=rows,
+            batch_capacity=batch,
+            device_cache_size=top_k,
+            sparse_context_len=top_k,
+            copy_sfa_enabled=True,
+            max_context_len=4096,
+            layer_num=2,
+            head_num=1,
+            head_dim=576,
+            store_dtype=torch.bfloat16,
+            device="cpu",
+            start_layer=0,
+            paged_kv_cache=SimpleNamespace(get_index_k_buffer=lambda _: key),
+        )
+        adapter = LIMDecodeAdapter(manager)
+        self.assertIsNone(adapter.combined_kv)
+        self.assertIsNone(adapter.combined_ids)
+        self.assertEqual(adapter.last_prefix.shape, (2, rows + 1))
+        self.assertEqual(adapter.source_ids.shape[0], batch)
+        req_ids = torch.tensor([1, 2, 99] + [0] * (batch - 3))
+        lengths = torch.tensor([2049, 2177, 4097] + [0] * (batch - 3))
+        forward_batch = SimpleNamespace(
+            req_pool_indices=req_ids,
+            seq_lens=lengths,
+            seq_lens_cpu=lengths,
+        )
+
+        def reference_indexer(**_kwargs):
+            return torch.arange(top_k, dtype=torch.int32).expand(batch, 1, -1)
+
+        plan = adapter.select(
+            manager,
+            query=torch.empty((batch, 32, 128), dtype=torch.bfloat16),
+            weights=torch.empty((batch, 32), dtype=torch.bfloat16),
+            key=key,
+            block_table=torch.zeros((batch, 32), dtype=torch.int32),
+            forward_batch=forward_batch,
+            layer_id=0,
+            reference_indexer=reference_indexer,
+        )
+        self.assertEqual(plan.request_slots.tolist(), [1, 2] + [rows] * (batch - 2))
+        self.assertTrue(torch.all(plan.source_ids[2:] == -1))
+        budget = resolve_sparse_kv_budget(
+            request_rows=rows,
+            graph_batch_capacity=batch,
+            context_len=4096,
+            num_layers=2,
+            top_k=top_k,
+            kv_bytes_per_token=1152,
+            indexer_impl="li_reference",
+            copy_sfa=True,
+        )
+        allocated = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in vars(adapter).values()
+            if isinstance(tensor, torch.Tensor)
+        )
+        self.assertEqual(budget.adapter_bytes, allocated)
+
+    def test_graph_budget_grows_scratch_without_growing_residency(self):
+        options = dict(
+            request_rows=9,
+            context_len=32768,
+            num_layers=4,
+            top_k=2048,
+            kv_bytes_per_token=1152,
+            indexer_impl="lim",
+            copy_sfa=True,
+        )
+        small = resolve_sparse_kv_budget(**options)
+        padded = resolve_sparse_kv_budget(**options, graph_batch_capacity=16)
+        self.assertEqual(sparse_batch_capacity(9, 16), 16)
+        self.assertEqual(small.device_kv_bytes, padded.device_kv_bytes)
+        self.assertEqual(small.slot_map_bytes, padded.slot_map_bytes)
+        self.assertEqual(small.host_kv_bytes, padded.host_kv_bytes)
+        self.assertEqual(padded.selected_kv_bytes, 16 * 2048 * 1152)
+        self.assertGreater(padded.adapter_bytes, small.adapter_bytes)
+        with self.assertRaisesRegex(ValueError, "exceeding"):
+            resolve_sparse_kv_budget(
+                **options,
+                graph_batch_capacity=16,
+                hbm_budget_bytes=small.managed_hbm_bytes,
+            )
 
     def test_full_visible_q1_transition_padding_and_reuse(self):
         previous = torch.tensor([-1, -1, 2048, 3000, -1], dtype=torch.int32)

@@ -261,6 +261,7 @@ class TestSparseKVManager(unittest.TestCase):
     def manager(self, capacity=4):
         m = self.Manager.__new__(self.Manager)
         m.lim_adapter = None
+        m.copy_sfa_enabled = False
         m.size, m.max_context_len, m.sparse_context_len = 4, 64, 2
         m.device_cache_size, m.use_lru = capacity, capacity > 2
         m.device, m.start_layer, m.layer_num = "cpu", 0, 1
@@ -384,12 +385,15 @@ class TestSparseKVManager(unittest.TestCase):
 
         def sparse_attention(query, key, value, indices, scale, **kwargs):
             observed.append((key.clone(), kwargs["key_rope"].clone()))
-            return torch.zeros_like(query)
+            return torch.full_like(query, 123)
 
         scope = dict(
             torch=torch,
             torch_npu=SimpleNamespace(npu_sparse_flash_attention=sparse_attention),
             _get_sparse_kv_manager=lambda backend: backend.sparse_kv_manager,
+            # Isolate compact fallback payloads; the real fused eligibility and
+            # graph transitions are covered by check_lim_copy_sfa.py on NPU.
+            _copy_sfa_decode_eligible=lambda *_args: False,
             normalize_batch_topk_indices=self.manager_scope[
                 "normalize_batch_topk_indices"
             ],
@@ -425,18 +429,24 @@ class TestSparseKVManager(unittest.TestCase):
             req_pool_indices=torch.tensor([1, 2]),
             seq_lens=torch.tensor([64, 64]),
         )
-        result = scope["forward_sparsity_driven_kv_offload"](
-            backend,
-            torch.ones(2, 1, 2),
-            torch.ones(2, 1, 2),
-            None,
-            SimpleNamespace(layer_id=0, tp_k_head_num=1, tp_q_head_num=1, scaling=0.5),
-            batch,
-            save_kv_cache=False,
-            q_rope=torch.ones(2, 1, 1),
-            k_rope=torch.ones(2, 1, 1),
-            topk_indices=torch.tensor([[1], [7]], dtype=torch.int32),
-        )
+
+        def run_attention():
+            return scope["forward_sparsity_driven_kv_offload"](
+                backend,
+                torch.ones(2, 1, 2),
+                torch.ones(2, 1, 2),
+                None,
+                SimpleNamespace(
+                    layer_id=0, tp_k_head_num=1, tp_q_head_num=1, scaling=0.5
+                ),
+                batch,
+                save_kv_cache=False,
+                q_rope=torch.ones(2, 1, 1),
+                k_rope=torch.ones(2, 1, 1),
+                topk_indices=torch.tensor([[1], [7]], dtype=torch.int32),
+            )
+
+        result = run_attention()
         self.assertEqual(result.shape, (2, 2))
         nope, rope = observed[0]
         for row, (request, token) in enumerate(((1, 1), (2, 7))):
@@ -446,6 +456,13 @@ class TestSparseKVManager(unittest.TestCase):
             )
         self.assertIn(("wait", "main", manager.miss_done), self.log)
         self.assertIn(("wait", "main", manager.refill_done), self.log)
+        # A skipped vendor output must be cleared for padding while real rows
+        # keep their output. The fake kernel deliberately returns nonzero data.
+        batch.seq_lens[1] = 0
+        batch.req_pool_indices[1] = 0
+        result = run_attention()
+        self.assertTrue(torch.all(result[0] == 123))
+        self.assertTrue(torch.all(result[1] == 0))
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+
 from sglang.kernels.ops.attention.npu_lim import (
     fused_lightning_indexer_manage,
     load_fused_lim_operator,
@@ -55,6 +56,7 @@ class LIMDecodeAdapter:
         self.is_native = self.impl == "lim"
         self.capacity = manager.device_cache_size
         self.rows = manager.size
+        self.batch_capacity = manager.batch_capacity
         self.top_k = manager.sparse_context_len
         self.full_visible = manager.copy_sfa_enabled
         self.source_capacity = (manager.max_context_len + 127) // 128 * 128
@@ -62,36 +64,42 @@ class LIMDecodeAdapter:
         device = manager.device
         self.operator = load_fused_lim_operator() if self.is_native else None
         self.source_ids = torch.empty(
-            (self.rows, 1, self.top_k), dtype=torch.int32, device=device
+            (self.batch_capacity, 1, self.top_k), dtype=torch.int32, device=device
         )
         self.device_slots = torch.empty_like(self.source_ids)
-        self.topk_misses = torch.empty(self.rows, dtype=torch.int32, device=device)
+        self.topk_misses = torch.empty(
+            self.batch_capacity, dtype=torch.int32, device=device
+        )
         self.miss_sources = torch.empty(
-            (self.rows, 32768), dtype=torch.int32, device=device
+            (self.batch_capacity, 32768), dtype=torch.int32, device=device
         )
         self.miss_slots = torch.empty_like(self.miss_sources)
         self.miss_counts = torch.empty_like(self.topk_misses)
         self.query_ends = torch.arange(
-            1, self.rows + 1, dtype=torch.int32, device=device
+            1, self.batch_capacity + 1, dtype=torch.int32, device=device
         )
         self.query_scale = torch.empty(
-            (self.rows, 64), dtype=torch.float32, device=device
+            (self.batch_capacity, 64), dtype=torch.float32, device=device
         )
         self.block_table = torch.empty(
-            (self.rows, self.source_capacity // 128), dtype=torch.int32, device=device
+            (self.batch_capacity, self.source_capacity // 128),
+            dtype=torch.int32,
+            device=device,
         )
         self.last_prefix = torch.full(
             (manager.layer_num, self.rows + 1), -1, dtype=torch.int32, device=device
         )
         self.tail_offsets = torch.arange(128, dtype=torch.int32, device=device)
-        self.combined_kv = torch.empty(
-            (self.rows, self.width, manager.head_num, manager.head_dim),
-            dtype=manager.store_dtype,
-            device=device,
-        )
-        self.combined_ids = torch.empty(
-            (self.rows, self.width), dtype=torch.int32, device=device
-        )
+        self.combined_kv = self.combined_ids = None
+        if not self.full_visible:
+            self.combined_kv = torch.empty(
+                (self.batch_capacity, self.width, manager.head_num, manager.head_dim),
+                dtype=manager.store_dtype,
+                device=device,
+            )
+            self.combined_ids = torch.empty(
+                (self.batch_capacity, self.width), dtype=torch.int32, device=device
+            )
         # One scale workspace is shared by all indexer layers. Native BF16 LIM
         # does not read its values, but its ABI requires the complete PA shape.
         # Its variable 4 bytes/index-token are charged to the indexer pool coeff.
@@ -124,9 +132,12 @@ class LIMDecodeAdapter:
         reference_indexer=None,
     ):
         batch = query.shape[0]
-        if batch != forward_batch.req_pool_indices.numel() or batch > self.rows:
+        if (
+            batch != forward_batch.req_pool_indices.numel()
+            or batch > self.batch_capacity
+        ):
             raise ValueError(
-                "LIM Q1 requires one query row per padded request and batch <= request capacity."
+                "LIM Q1 requires one query row per padded request and batch <= graph capacity."
             )
         if (
             block_table.shape[0] != batch
@@ -221,31 +232,19 @@ class LIMDecodeAdapter:
         )
 
     def copy_sfa_metadata(self, manager, plan):
-        """Adapt native LIM plans to contiguous Copy-SFA metadata, without replanning."""
+        """Pass graph-stable native LIM buffers directly, without replanning."""
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
             fill_request_block_table,
         )
 
         batch = plan.source_ids.shape[0]
         valid = plan.valid_rows & plan.sparse_rows
-        manager.planner_topk_src_ids[:batch, 0].copy_(plan.source_ids)
-        manager.planner_topk_dst_slots[:batch, 0].copy_(
-            torch.where(valid[:, None], plan.device_slots, -1)
-        )
-        manager.planner_topk_miss_counts[:batch].copy_(
-            torch.where(valid, plan.topk_misses, 0)
-        )
-        # Native LIM's ABI has a 32768-wide miss row. A slice alone is strided
-        # at B>1; Copy-SFA requires tightly packed [B,2048] rows.
-        manager.planner_miss_src_ids[:batch].copy_(
-            torch.where(valid[:, None], plan.miss_sources[:, : self.top_k], -1)
-        )
-        manager.planner_miss_dst_slots[:batch].copy_(
-            torch.where(valid[:, None], plan.miss_slots[:, : self.top_k], -1)
-        )
-        manager.planner_miss_counts[:batch].copy_(
-            torch.where(valid, plan.miss_counts, 0)
-        )
+        # Invalid native queries may leave old output contents. Zero counts
+        # prevent either copy phase from reading their unused source/slot rows.
+        plan.topk_misses.masked_fill_(~valid, 0)
+        plan.miss_counts.masked_fill_(~valid, 0)
+        # Preserve the full contiguous [B,32768] rows. A [:,:K] slice would
+        # retain the native row stride and fail the Copy-SFA layout contract.
         lengths = valid.to(torch.int32) * self.top_k
         manager.planner_actual_seq_lengths_kv[:batch].copy_(lengths)
         manager.planner_num_cache_tokens[:batch].copy_(lengths)
@@ -265,12 +264,12 @@ class LIMDecodeAdapter:
                 plan.request_slots, valid, offsets, pages, output[:batch]
             )
         return (
-            manager.planner_topk_src_ids[:batch],
-            manager.planner_topk_dst_slots[:batch],
-            manager.planner_topk_miss_counts[:batch],
-            manager.planner_miss_src_ids[:batch],
-            manager.planner_miss_dst_slots[:batch],
-            manager.planner_miss_counts[:batch],
+            plan.source_ids.unsqueeze(1),
+            plan.device_slots.unsqueeze(1),
+            plan.topk_misses,
+            plan.miss_sources,
+            plan.miss_slots,
+            plan.miss_counts,
             manager.planner_actual_seq_lengths_query[:batch],
             manager.planner_actual_seq_lengths_kv[:batch],
             manager.planner_num_cache_tokens[:batch],

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import torch
 from bench_lim_framework import FrameworkCase, inputs
+
 from sglang.srt.environ import envs
 
 
@@ -24,7 +25,7 @@ def verify(case, output, *, resident=True):
         valid = (ids[row] >= 0) & (ids[row] < int(case.batch.seq_lens[row]))
         selected_ids = ids[row, valid]
         selected = (
-            case.fixture.host[row + 1, selected_ids, 0] + case.args.layers - 1
+            case.fixture.host[row + 1, selected_ids, 0] + (case.args.layers - 1)
         ).float()
         q = case.fixture.q[row].cpu().float()
         rope = case.fixture.rope[row].cpu().float()
@@ -42,10 +43,10 @@ def verify(case, output, *, resident=True):
                 torch.testing.assert_close(cached, expected_kv, rtol=0, atol=0)
 
 
-def run(output_path):
+def run(output_path, padded_batch=False):
     torch.npu.set_device(0)
     args = SimpleNamespace(
-        batch=2,
+        batch=16 if padded_batch else 2,
         context=8192,
         tail=1,
         capacity=2048,
@@ -53,12 +54,24 @@ def run(output_path):
         query_heads=8,
         layers=2,
     )
-    fixture = inputs(2, args.context, 1024, 32, 8, 20261022)
+    fixture = inputs(args.batch, args.context, 1024, 32, 8, 20261022)
     with (
         envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
         envs.SGLANG_NPU_ENABLE_COPY_SFA.override(True),
     ):
-        case = FrameworkCase("lim", fixture, args)
+        case = FrameworkCase(
+            "lim",
+            fixture,
+            args,
+            request_capacity=2,
+            graph_batch_capacity=args.batch if padded_batch else 0,
+        )
+        if padded_batch:
+            case.batch.req_pool_indices[2:].zero_()
+            case.batch.seq_lens[2:].zero_()
+            case.batch.seq_lens_cpu[2:].zero_()
+            case.backend.forward_metadata.seq_lens_cpu_int[2:] = [0] * (args.batch - 2)
+            assert case.manager.batch_capacity == 16 and case.manager.size == 3
         prefill = SimpleNamespace(
             req_pool_indices=torch.tensor([2, 0, 1], dtype=torch.int64, device="npu"),
             seq_lens=torch.tensor([3, 0, 5], dtype=torch.int64, device="npu"),
@@ -75,8 +88,8 @@ def run(output_path):
             torch.npu.synchronize()
             verify(case, result)
             torch.testing.assert_close(
-                case.latest_ids.sort(dim=1).values,
-                fixture.expected[route],
+                case.latest_ids[:2].sort(dim=1).values,
+                fixture.expected[route][:2],
                 rtol=0,
                 atol=0,
             )
@@ -143,6 +156,20 @@ def run(output_path):
             )
             > 0
         ), counts
+        plan = case.backend.forward_metadata.sparse_kv_lim_plan
+        metadata = case.manager.lim_adapter.copy_sfa_metadata(case.manager, plan)
+        for actual, native in zip(
+            metadata[:6],
+            (
+                plan.source_ids,
+                plan.device_slots,
+                plan.topk_misses,
+                plan.miss_sources,
+                plan.miss_slots,
+                plan.miss_counts,
+            ),
+        ):
+            assert actual.is_contiguous() and actual.data_ptr() == native.data_ptr()
         record = {
             "scope": "fixed projections, real manager/allocator/attention; no model score or timing claim",
             "eager_topk": "pass",
@@ -152,6 +179,10 @@ def run(output_path):
             "mixed_fallback_to_graph": "pass",
             "prefill_ragged_gather": "pass",
             "operator_calls": counts,
+            "request_rows": case.manager.size,
+            "batch_capacity": case.manager.batch_capacity,
+            "decode_path": case.manager.last_decode_path,
+            "native_plan_shared": True,
         }
         output_path.write_text(json.dumps(record, indent=2) + "\n")
         print(json.dumps(record, indent=2))
@@ -160,4 +191,6 @@ def run(output_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    run(parser.parse_args().output)
+    parser.add_argument("--padded-batch", action="store_true")
+    args = parser.parse_args()
+    run(args.output, args.padded_batch)

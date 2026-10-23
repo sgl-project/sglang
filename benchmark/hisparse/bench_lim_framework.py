@@ -99,9 +99,13 @@ class FixtureIndexPool(MLATokenToKVPool):
 
 
 class FrameworkCase:
-    def __init__(self, mode, fixture, args):
+    def __init__(
+        self, mode, fixture, args, *, request_capacity=None, graph_batch_capacity=0
+    ):
         self.mode, self.fixture, self.args = mode, fixture, args
-        self.pool = ReqToTokenPool(args.batch, fixture.context, "npu", False)
+        self.pool = ReqToTokenPool(
+            request_capacity or args.batch, fixture.context, "npu", False
+        )
         kv = FixtureIndexPool(fixture.key, args.layers)
         with (
             envs.SGLANG_NPU_SPARSE_KV_INDEXER.override(mode),
@@ -113,9 +117,12 @@ class FrameworkCase:
                 SimpleNamespace(get_kvcache=lambda: kv),
                 K,
                 copy_sfa_padded_query_heads=args.query_heads,
+                graph_batch_capacity=graph_batch_capacity,
             )
         for layer in range(args.layers):
-            self.manager.host_kv_buffer[layer].copy_(fixture.host + layer)
+            self.manager.host_kv_buffer[layer].copy_(
+                fixture.host[: self.manager.size] + layer
+            )
         self.batch = SimpleNamespace(
             batch_size=args.batch,
             forward_mode=ForwardMode.DECODE,
@@ -227,22 +234,33 @@ class FrameworkCase:
 
     def verify_payload(self):
         a = self.manager.lim_adapter
-        ids = a.combined_ids[: self.args.batch] if a else self.latest_ids
+        ids = (
+            a.combined_ids[: self.args.batch]
+            if a and not a.full_visible
+            else self.latest_ids
+        )
         got = (
             a.combined_kv[: self.args.batch]
-            if a
+            if a and not a.full_visible
             else self.manager.selected_kv_buffer[: self.args.batch]
         )
         ids_cpu = ids.cpu().long()
         for row in range(self.args.batch):
             valid = ids_cpu[row] >= 0
+            if not bool(valid.any()):
+                continue
             expected = (self.fixture.host[row + 1] + (self.args.layers - 1))[
                 ids_cpu[row, valid]
             ]
-            torch.testing.assert_close(got[row].cpu()[valid], expected, rtol=0, atol=0)
+            if a and a.full_visible and self.manager.last_decode_path == "copy_sfa":
+                slots = a.device_slots[row, 0].cpu().long()[valid]
+                actual = self.manager.device_kv_buffer[-1][row + 1, :, 0].cpu()[slots]
+            else:
+                actual = got[row].cpu()[valid]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def reset(self):
-        self.manager.reset_requests(list(range(1, self.args.batch + 1)))
+        self.manager.reset_requests(list(range(1, self.manager.size)))
 
     def verify_indexer_entry_and_decode_offload(self):
         """Exercise the real framework entry with fixed projection boundaries."""

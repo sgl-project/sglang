@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_flags,
     get_parallel,
     get_spec,
@@ -383,6 +384,16 @@ class AscendAttnBackend(AttentionBackend):
                 SparseKVCacheManager,
                 register_sparse_kv_manager,
             )
+            from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+                get_batch_sizes_to_capture,
+            )
+
+            graph_batch_capacity = 0
+            graph = get_exec().graph
+            config = graph.cuda_graph_config
+            if not graph.disable_cuda_graph and config is not None and config.decode.bs:
+                capture_bs, _ = get_batch_sizes_to_capture(model_runner)
+                graph_batch_capacity = max(capture_bs)
 
             self.sparse_kv_manager = SparseKVCacheManager(
                 model_runner.req_to_token_pool,
@@ -404,6 +415,7 @@ class AscendAttnBackend(AttentionBackend):
                     if envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
                     else None
                 ),
+                graph_batch_capacity=graph_batch_capacity,
             )
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(

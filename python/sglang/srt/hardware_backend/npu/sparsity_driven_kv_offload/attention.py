@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch_npu
+
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
     _wait_stream_event,
@@ -144,6 +145,8 @@ def forward_sparsity_driven_kv_offload(
     elif forward_batch.forward_mode.is_decode() and _copy_sfa_decode_eligible(
         backend, forward_batch, layer, q_nope, topk_indices
     ):
+        sparse_kv_manager.last_decode_path = "copy_sfa"
+        forward_batch.sparse_kv_decode_path = "copy_sfa"
         batch_size = forward_batch.batch_size
         padded_query_heads = q_nope.numel() // (batch_size * backend.kv_lora_rank)
         attn_out = sparse_kv_manager.copy_sfa_decode(
@@ -162,6 +165,8 @@ def forward_sparsity_driven_kv_offload(
             ),
         )
     elif forward_batch.forward_mode.is_decode():
+        sparse_kv_manager.last_decode_path = "reference"
+        forward_batch.sparse_kv_decode_path = "reference"
         batch_size = forward_batch.batch_size
         num_kv_heads = layer.tp_k_head_num
         num_query_heads = layer.tp_q_head_num
@@ -373,6 +378,9 @@ def forward_sparsity_driven_kv_offload(
         attn_out = attn_out[:, :, :num_query_heads, :].reshape(
             batch_size, num_query_heads * nope_head_dim
         )
+        # Empty/padded rows use a dummy KV entry to satisfy the SFA contract.
+        # The vendor kernel may leave their output unwritten; never publish it.
+        attn_out.masked_fill_(empty_rows.view(batch_size, 1), 0)
     else:
         if is_prefill:
             k_nope_sfa, k_pe_sfa = sparse_kv_manager.get_forward_kv(

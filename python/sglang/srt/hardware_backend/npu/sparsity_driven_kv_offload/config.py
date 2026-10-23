@@ -13,14 +13,16 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
     SparseKVBudget,
     resolve_sparse_kv_budget,
+    sparse_batch_capacity,
 )
 from sglang.srt.runtime_context import (
     attention_backends,
+    get_exec,
     get_parallel,
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import get_cuda_graph_max_batch_size, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -159,7 +161,19 @@ def get_sparse_kv_budget(
     top_k: int,
     kv_bytes_per_token: int,
     copy_sfa_query_heads: int = 128,
+    graph_batch_capacity: Optional[int] = None,
 ) -> SparseKVBudget:
+    if graph_batch_capacity is None:
+        # Reserve before admission determines the final request-pool size.
+        # Capture buckets may round that size up for attention parallelism.
+        graph = get_exec().graph
+        config = graph.cuda_graph_config
+        decode = config.decode if config is not None else None
+        graph_batch_capacity = (
+            min(max(decode.bs), get_cuda_graph_max_batch_size(request_rows))
+            if not graph.disable_cuda_graph and decode is not None and decode.bs
+            else 0
+        )
     return resolve_sparse_kv_budget(
         request_rows=request_rows,
         context_len=context_len,
@@ -171,4 +185,5 @@ def get_sparse_kv_budget(
         indexer_impl=get_sparse_kv_indexer_impl(),
         copy_sfa=envs.SGLANG_NPU_ENABLE_COPY_SFA.get(),
         copy_sfa_query_heads=copy_sfa_query_heads,
+        graph_batch_capacity=sparse_batch_capacity(request_rows, graph_batch_capacity),
     )
