@@ -26,21 +26,30 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, popen_launch_server
 
 register_amd_ci(est_time=3600, suite="nightly-amd", nightly=True)
 
-# (model, tp, env overrides)
+os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
+
+LEGACY = ("legacy", "completion_stop_question")
+SGL = ("sgl_eval",)
+MIXTRAL_FP8 = "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8"
+# (model, tp, env overrides, extra server args, evals)
 CONFIGS = [
-    ("neuralmagic/Mistral-7B-Instruct-v0.3-FP8", 1, {"SGLANG_USE_AITER": "1"}),
-    ("mistralai/Mistral-7B-Instruct-v0.3", 1, {"SGLANG_USE_AITER": "1"}),
     (
-        "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
-        2,
-        {"SGLANG_USE_AITER": "1", "SGLANG_MOE_PADDING": "0"},
+        "neuralmagic/Mistral-7B-Instruct-v0.3-FP8",
+        1,
+        {"SGLANG_USE_AITER": "1"},
+        [],
+        LEGACY,
     ),
+    ("mistralai/Mixtral-8x7B-Instruct-v0.1", 2, {"SGLANG_USE_AITER": "1"}, [], LEGACY),
+    (MIXTRAL_FP8, 2, {"SGLANG_USE_AITER": "1", "SGLANG_MOE_PADDING": "0"}, [], LEGACY),
+    (MIXTRAL_FP8, 2, {"SGLANG_USE_AITER": "1", "SGLANG_MOE_PADDING": "1"}, [], SGL),
     (
-        "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
+        MIXTRAL_FP8,
         2,
         {"SGLANG_USE_AITER": "0", "SGLANG_MOE_PADDING": "0"},
+        ["--disable-cuda-graph"],
+        SGL,
     ),
-    ("mistralai/Mixtral-8x7B-Instruct-v0.1", 2, {"SGLANG_USE_AITER": "1"}),
 ]
 
 
@@ -106,13 +115,14 @@ def sgl_eval(base_url, model):
 class TestDiagGsm8kMistral(unittest.TestCase):
     def test_diag(self):
         rows = []
-        for model, tp, env in CONFIGS:
-            label = f"{model} tp={tp} {env}"
+        for model, tp, env, extra_args, evals in CONFIGS:
+            label = f"{model} tp={tp} {env} {extra_args}"
             print(f"\n{'=' * 70}\nDIAG {label}\n{'=' * 70}", flush=True)
             os.environ.update(env)
             other_args = ["--trust-remote-code", "--log-level-http", "warning"]
             if tp == 2:
                 other_args += ["--tp", "2"]
+            other_args += extra_args
             process = None
             row = {"label": label}
             try:
@@ -126,6 +136,8 @@ class TestDiagGsm8kMistral(unittest.TestCase):
                     ("completion_stop_question", completion_eval),
                     ("sgl_eval", sgl_eval),
                 ):
+                    if name not in evals:
+                        continue
                     try:
                         out = fn(DEFAULT_URL_FOR_TEST, model)
                         if isinstance(out, dict):
