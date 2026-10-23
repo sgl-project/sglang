@@ -1770,11 +1770,17 @@ class Envs:
     # "shared" is one buffer for the whole TP group, mapped by every rank, with no
     # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
     # anonymous mapping per rank holding only its rows, gathered with the
-    # all-reduce, and the only layout that gets huge pages without shmem THP.
+    # all-reduce, and the only layout that gets huge pages without shmem THP;
+    # "replicated" is a private huge-page copy of the full table per rank (no
+    # collective, about the TP size times the host memory of "shared"); "hybrid"
+    # keeps both "shared" and "per_rank" (see SGLANG_DSV41_ENGRAM_HYBRID_MIN_TOKENS).
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
+    # "hybrid": forwards with at least this many tokens summed over the DP ranks
+    # read the huge-page per-rank shards, smaller ones the shared copy.
+    SGLANG_DSV41_ENGRAM_HYBRID_MIN_TOKENS = EnvInt(4096)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
