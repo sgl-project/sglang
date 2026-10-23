@@ -6,12 +6,13 @@ from typing import NamedTuple
 
 import msgspec
 import torch
-import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
 )
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
+from sglang.kernels.ops.quantization.fp4_indexer_quant import (
+    quantize_fp4_indexer_tensor,
+)
 from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
     DeepGEMMPrefillData,
 )
@@ -47,6 +48,10 @@ class Case(NamedTuple):
 def make_case(rows, ctx, seed) -> Case:
     """One request: `rows` query tokens whose causal lengths end at `ctx`, its
     index K in the pool page layout [pages, PAGE * 64 payload | PAGE * 4 scale]."""
+    from sglang.kernels.ops.attention.dsv4.index_logits import (
+        index_logits_dtype,
+        index_weights_dtype,
+    )
     from sglang.srt.layers.attention.deep_gemm_mqa_logits import fp8_mqa_logits
 
     torch.manual_seed(seed)
@@ -72,14 +77,16 @@ def make_case(rows, ctx, seed) -> Case:
     lens[0] = 0  # a query that sees no compressed position yet
     width = (ctx + 7) // 8 * 8
     starts = torch.zeros(rows, device=dev, dtype=torch.int32)
+    # Score in the dtypes the indexer uses on this GPU, so the reference matches.
     dense = fp8_mqa_logits(
         (q_fp4, q_sf),
         (k_fp4[:width], k_sf[:width]),
-        weights,
+        weights.to(index_weights_dtype()),
         starts,
         lens,
         max_seqlen_k=width,
-    )
+        logits_dtype=index_logits_dtype(),
+    ).float()
     data = DeepGEMMPrefillData(
         k_slots=torch.arange(width, device=dev),
         request_starts=starts,
@@ -192,23 +199,6 @@ def rows_of(data: DeepGEMMPrefillData, idx: torch.Tensor) -> DeepGEMMPrefillData
     )
 
 
-def reference_block_scores(case: Case) -> torch.Tensor:
-    """[rows, blocks] the scores `select_candidate_block_ids` ranks blocks by."""
-    j = torch.arange(case.dense.shape[1], device=case.dense.device)
-    scores = case.dense.masked_fill(j[None, :] >= case.lens[:, None], -torch.inf)
-    scores = F.pad(scores, (0, -scores.shape[1] % BLOCK), value=-torch.inf)
-    scores = scores.unflatten(1, (-1, BLOCK)).amax(-1)
-    last = ((case.lens - 1) // BLOCK).long()
-    blocks = torch.arange(scores.shape[1], device=scores.device)
-    return scores.masked_fill(blocks[None, :] == last[:, None], torch.inf)
-
-
-def ranked(scores: torch.Tensor, picked: torch.Tensor) -> torch.Tensor:
-    """The scores of each row's picked entries, descending: equal for two picks
-    that differ only among exactly tied scores."""
-    return scores.masked_fill(~picked, -torch.inf).sort(dim=1, descending=True).values
-
-
 def reference_blocks(case: Case) -> torch.Tensor:
     """[rows, blocks] bool: the torch block selection of the dense scores."""
     j = torch.arange(case.dense.shape[1], device=case.dense.device)
@@ -299,6 +289,20 @@ def logits_of(table, data: DeepGEMMPrefillData, k_cache: torch.Tensor):
     )
 
 
+def block_scores(case: Case) -> torch.Tensor:
+    """[rows, blocks] max dense score per block, the score blocks are ranked by."""
+    j = torch.arange(case.dense.shape[1], device=case.dense.device)
+    scores = case.dense.masked_fill(j[None, :] >= case.lens[:, None], -torch.inf)
+    pad = -scores.shape[1] % BLOCK
+    if pad:
+        scores = torch.nn.functional.pad(scores, (0, pad), value=-torch.inf)
+    scores = scores.unflatten(-1, (-1, BLOCK)).amax(dim=-1)
+    # the block of the last causal position is always kept
+    last = (case.lens.long() - 1) // BLOCK
+    blocks = torch.arange(scores.shape[1], device=scores.device)
+    return scores.masked_fill(blocks[None, :] == last[:, None], torch.inf)
+
+
 def picks(positions: torch.Tensor, row: int) -> set:
     return set(positions[row].tolist()) - {-1}
 
@@ -322,10 +326,14 @@ class TestPrefillSparseIndexer(CustomTestCase):
                 # INT32_MAX padding lands in a spare column instead of a block
                 got = torch.zeros(rows, nb + 1, dtype=torch.bool, device="cuda")
                 got.scatter_(1, table.blocks.clamp_max(nb).long(), True)
-                scores = reference_block_scores(case)
-                self.assertTrue(
-                    torch.equal(ranked(scores, got[:, :nb]), ranked(scores, expected))
-                )
+                got = got[:, :nb]
+                # bf16 scores tie often: blocks may differ only among those tied
+                # at the row's selection floor.
+                self.assertTrue(torch.equal(got.sum(-1), expected.sum(-1)))
+                scores = block_scores(case)[:, :nb]
+                floor = scores.masked_fill(~expected, torch.inf).amin(-1, keepdim=True)
+                differ = got ^ expected
+                self.assertTrue((~differ | (scores == floor)).all())
                 self.assertFalse(got[0, :nb].any(), "an empty row keeps no block")
                 _, own_dense = publish_dense(case)
                 for r in range(rows):
@@ -347,9 +355,13 @@ class TestPrefillSparseIndexer(CustomTestCase):
         for rows, ctx in CASES:
             with self.subTest(rows=rows, ctx=ctx):
                 case = make_case(rows, ctx, seed=rows * 3 + ctx)
-                got = select_sparse(publish_sparse(case)[0], case.data, case.k_cache)
+                table = publish_sparse(case)[0]
+                got = select_sparse(table, case.data, case.k_cache)
                 want = select_dense(publish_dense(case)[0], case)
-                keep = reference_blocks(case).repeat_interleave(BLOCK, dim=1)
+                nb = -(-case.dense.shape[1] // BLOCK)
+                keep = torch.zeros(rows, nb + 1, dtype=torch.bool, device="cuda")
+                keep.scatter_(1, table.blocks.clamp_max(nb).long(), True)
+                keep = keep[:, :nb].repeat_interleave(BLOCK, dim=1)
                 self.assertEqual(picks(got, 0), set(), "an empty row selects nothing")
                 for r in range(1, rows):
                     g, w = picks(got, r), picks(want, r)
@@ -357,11 +369,18 @@ class TestPrefillSparseIndexer(CustomTestCase):
                     self.assertTrue(
                         keep[r, list(g)].all(), f"row {r}: outside its blocks"
                     )
-                    floor = case.dense[r, list(w)].min()
-                    tied = {p for p in g - w if case.dense[r, p] >= floor}
-                    self.assertGreaterEqual(
-                        len(g & w) + len(tied), MIN_OVERLAP * len(w), r
+                    # A dense pick the sparse side dropped at its own selection
+                    # floor is a rounding swap, not a miss.
+                    g_floor = case.dense[r, list(g)].min()
+                    swaps = sum(
+                        bool(
+                            case.dense[r, p]
+                            <= g_floor + g_floor.abs() * FLOOR_TOLERANCE
+                        )
+                        for p in w - g
                     )
+                    self.assertGreaterEqual(len(g & w) + swaps, MIN_OVERLAP * len(w), r)
+                    floor = case.dense[r, list(w)].min()
                     self.assertTrue(
                         (
                             case.dense[r, list(g)]
@@ -387,7 +406,15 @@ class TestPrefillSparseIndexer(CustomTestCase):
         part = select_sparse(sub, rows_of(case.data, idx), case.k_cache)
         for r in range(tail):
             a, b = picks(full, rows - tail + r), picks(part, r)
-            self.assertGreaterEqual(len(a & b), MIN_TAIL_OVERLAP * len(a), r)
+            # A full-table pick the tail dropped at its own selection floor is a
+            # rounding swap, as in the dense comparison above.
+            scores = case.dense[rows - tail + r]
+            b_floor = scores[list(b)].min()
+            swaps = sum(
+                bool(scores[p] <= b_floor + b_floor.abs() * FLOOR_TOLERANCE)
+                for p in a - b
+            )
+            self.assertGreaterEqual(len(a & b) + swaps, MIN_TAIL_OVERLAP * len(a), r)
 
     @torch.inference_mode()
     def test_row_pair_ids_schedule_the_same_logits_as_per_request_ids(self):

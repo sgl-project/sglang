@@ -73,13 +73,14 @@ def mx_kv_scale(k_scale: torch.Tensor) -> torch.Tensor:
 
 
 def paged_mqa_logits_indices(
-    num_rows: int, device: torch.device
+    num_rows: int, device: torch.device, rows_per_request: int = 1
 ) -> Optional[torch.Tensor]:
-    """The request of each paged query row on SM100 (here every row is its own
-    request); SM90 takes none."""
+    """The request of each paged query row on SM100, ``rows_per_request``
+    consecutive rows per request; SM90 takes none."""
     if not uses_mx_mqa_logits(device):
         return None
-    return torch.arange(num_rows, dtype=torch.int32, device=device)
+    indices = torch.arange(num_rows, dtype=torch.int32, device=device)
+    return indices // rows_per_request if rows_per_request > 1 else indices
 
 
 def _empty_logits(num_rows: int, num_cols: int, device) -> torch.Tensor:
@@ -94,6 +95,12 @@ def to_fp32_logits(logits: torch.Tensor) -> torch.Tensor:
         return logits
     out = _empty_logits(logits.shape[0], logits.shape[1], logits.device)
     return out.copy_(logits)
+
+
+def _to_logits_dtype(logits: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if dtype == torch.float32:
+        return to_fp32_logits(logits)
+    return logits.to(dtype)
 
 
 @triton.jit
@@ -154,10 +161,12 @@ def fp8_mqa_logits(
     ke: torch.Tensor,
     clean_logits: bool = False,
     max_seqlen_k: int = 0,
+    logits_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Ragged logits: full width ``[rows, num_keys]`` with ``-inf`` outside
     ``[ks, ke)`` when ``max_seqlen_k`` is 0, else compressed ``[rows, max_seqlen_k]``
-    (column ``j`` of row ``i`` is key ``ks[i] + j``, garbage past ``ke[i] - ks[i]``)."""
+    (column ``j`` of row ``i`` is key ``ks[i] + j``, garbage past ``ke[i] - ks[i]``).
+    ``logits_dtype`` applies to compressed logits; full-width ones are FP32."""
     import deep_gemm
 
     k_fp8, k_scale = kv
@@ -169,7 +178,7 @@ def fp8_mqa_logits(
         q, (k_fp8, k_scale), weights, ks, ke, max_seqlen_k or num_keys
     )
     if max_seqlen_k:
-        return to_fp32_logits(logits)
+        return _to_logits_dtype(logits, logits_dtype)
     return expand_compressed_logits(logits, ks, ke, num_keys)
 
 
@@ -182,14 +191,22 @@ def fp8_paged_mqa_logits(
     schedule_metadata: torch.Tensor,
     max_seq_len: int,
     clean_logits: bool = False,
+    logits_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """``[rows, max_seq_len]`` logits of ``q_fp8`` ``[batch, next_n, heads, dim]``
-    (``next_n == 1`` on SM100), garbage past each row's context length."""
+    """``[batch * next_n, max_seq_len]`` logits of ``q_fp8`` ``[batch, next_n, heads,
+    dim]``, garbage past each row's context length. SM100 scores the ``next_n`` rows
+    of a request as varlen rows, matching :func:`get_paged_mqa_logits_metadata`."""
     import deep_gemm
 
     assert not clean_logits, "DeepGEMM no longer cleans MQA logits"
     q, weights = mx_q_and_weights(q_fp8, weights)
-    num_rows = (q_fp8[0] if isinstance(q_fp8, (tuple, list)) else q_fp8).shape[0]
+    q_lead = q_fp8[0] if isinstance(q_fp8, (tuple, list)) else q_fp8
+    batch_size = q_lead.shape[0]
+    next_n = q_lead.shape[1] if q_lead.dim() == 4 else 1
+    if next_n > 1 and uses_mx_mqa_logits(kv_cache.device):
+        q = tuple(t.flatten(0, 1).unsqueeze(1) for t in q)
+        context_lens = context_lens.reshape(-1, 1)
+        block_table = block_table.repeat_interleave(next_n, dim=0)
     logits = deep_gemm.fp8_fp4_paged_mqa_logits(
         q,
         kv_cache,
@@ -198,9 +215,9 @@ def fp8_paged_mqa_logits(
         block_table,
         schedule_metadata,
         max_seq_len,
-        indices=paged_mqa_logits_indices(num_rows, kv_cache.device),
+        indices=paged_mqa_logits_indices(batch_size * next_n, kv_cache.device, next_n),
     )
-    return to_fp32_logits(logits)
+    return _to_logits_dtype(logits, logits_dtype)
 
 
 def get_paged_mqa_logits_metadata(
@@ -209,12 +226,15 @@ def get_paged_mqa_logits_metadata(
     num_sms: int,
     indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """On SM100 ``[batch, next_n]`` context lengths are flattened to one row per
-    token, matching :func:`paged_mqa_logits_indices`."""
+    """On SM100 ``[batch, next_n]`` context lengths are flattened to ``next_n`` varlen
+    rows per request, matching :func:`fp8_paged_mqa_logits`."""
     import deep_gemm
 
     if indices is None:
-        indices = paged_mqa_logits_indices(context_lens.numel(), context_lens.device)
+        next_n = context_lens.shape[1] if context_lens.dim() == 2 else 1
+        indices = paged_mqa_logits_indices(
+            context_lens.numel(), context_lens.device, next_n
+        )
         if indices is not None:
             context_lens = context_lens.reshape(-1, 1)
     extra = () if indices is None else (indices,)

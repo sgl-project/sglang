@@ -86,7 +86,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--lora-weight-name {FILE}`: select one adapter file from a repository that contains multiple LoRA revisions. The Hub download is filtered to that file plus JSON metadata, so unused weights are not downloaded.
 - `--lora-alpha {N}`: supply the training alpha when a single-file adapter omits both per-layer alpha tensors and `adapter_config.json`. Do not set it when the adapter already records alpha metadata.
 - PEFT `adapter_config.json` semantics are applied automatically for named adapter slots, RSLoRA, and per-layer `alpha_pattern`. Adapters that require unsupported auxiliary parameters or runtime behavior, such as DoRA, fail before weight injection instead of silently using ordinary LoRA math.
-- `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` statically merges regular weights and uses dynamic LoRA for FSDP-sharded weights to avoid full-gather peaks.
+- `--lora-merge-mode {auto|merge|dynamic}`: choose how LoRA is applied. `auto` normally merges regular weights, but keeps FSDP-sharded weights dynamic to avoid full-gather peaks. For a single adapter, it also stays dynamic when an estimate shows that merging would round away more than 50% of the update's norm. `merge` forces merging; `dynamic` applies the adapter at forward time.
 - `--num-gpus {N}`: number of GPUs to use
 - `--numa-node {N} [N ...]`: NUMA node for each GPU worker, the i-th value for the worker on local GPU i. When unset, each worker binds its CPUs and host memory to its GPU's NUMA node on multi-socket hosts, as srt does (CPUs only without `CAP_SYS_NICE`); set `SGLANG_AUTO_NUMA_BIND=0` to turn that off. Unbound workers on a two-socket host (e.g. GB200/GB300) can drift to the other socket, which slows host-bound steps and makes latency vary run to run.
 - `--performance-mode {manual|auto|speed|memory}` / `--mode`: preset for latency/throughput and memory defaults. `auto` is the default and dispatches residency from selected-GPU headroom and workload type: image DiTs stay resident above the 45 GiB threshold, while video DiT placement remains model-specific. It uses FSDP only for validated DiT-offload replacement paths. `speed` keeps `torch.compile` disabled unless a model-specific deployment config opts in after validation; pass `--enable-torch-compile true` to enable it explicitly. Use `manual` to keep performance-related server args under explicit user control. Explicit offload, FSDP, and parallelism flags take precedence in all modes.
@@ -117,6 +117,19 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--enable-metrics`: expose Prometheus metrics at `/metrics` (default: disabled). Includes request counts, queue time, host-side stage timing and LoRA state, separated by role and DP replica. See [Production metrics](/docs/sglang-diffusion/production_metrics) for metric semantics and disaggregated scraping.
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
 - `--prompt-enhancer-config {JSON_FILE}`: configure an independent SRT LLM/VLM for opt-in HTTP prompt rewriting. Requests use `enhance_prompt=true`; no enhancer runs by default. See [Prompt enhancement](/docs/sglang-diffusion/models_with_pe).
+
+### Disaggregated serving
+
+- `--disagg-role {monolithic|encoder|prompt_encoder|image_encoder|denoiser|decoder|server}`: select the stages run by this process. `monolithic` is the default; the split `prompt_encoder` and `image_encoder` roles currently support FLUX.3 Image.
+- `--disagg-server-addr {TCP_ENDPOINT}`: head scheduler endpoint used by workers for registration and result routing.
+- `--encoder-urls {ENDPOINTS}`: combined encoder pool on the head. For split encoding, replace it with both `--prompt-encoder-urls` and `--image-encoder-urls`; do not mix the two topologies.
+- `--denoiser-urls {ENDPOINTS}` and `--decoder-urls {ENDPOINTS}`: downstream worker pools on the head. Each pool URL flag accepts a quoted, semicolon-separated list of TCP endpoints.
+- `--disagg-p2p-hostname {HOST}` and `--disagg-ib-device {DEVICE}`: worker address and optional RDMA device for tensor transfers. The advertised worker address and scheduler port must match its entry in the head's URL list.
+- `--disagg-transfer-pool-size {BYTES}`: transfer buffer per worker (default: 268435456 bytes). Include space for incoming tensors, outgoing tensors, and preallocated receive slots.
+
+See [Disaggregated diffusion](/docs/sglang-diffusion/disaggregation#flux3-split-encoding)
+for deployment commands, ports, and the validation scope. Generation and editing
+still use the existing image APIs; encoding is not exposed as a standalone API.
 
 ### Sampling and output
 
