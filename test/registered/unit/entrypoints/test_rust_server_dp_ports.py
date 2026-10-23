@@ -275,6 +275,37 @@ def test_dp_leaders_reuse_node_local_ports(
         assert ports == [30000 + offset for offset in expected]
 
 
+def test_plain_dp_replicas_bind_their_own_ports():
+    # Each replica is its own TP group led by TP rank 0, so the replica index
+    # must separate the ports.
+    with (
+        get_context().override_server_args(
+            tp_size=2, dp_size=2, host="0.0.0.0", port=30000
+        ),
+        patch.object(rust_extensions, "load_rust_extension") as extension,
+        patch.object(rust_server, "_partition_cores", return_value=(None, None)),
+        patch.object(rust_server, "_build_server_args"),
+    ):
+        scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(),
+            model_config=SimpleNamespace(is_multimodal=False),
+        )
+        ports = []
+        for dp_rank in range(2):
+            with get_parallel().override(
+                tp_rank=0,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                attn_dp_rank=0,
+                dp_rank=dp_rank,
+            ):
+                ports.append(rust_server.RustServer.launch(scheduler).http_port)
+
+        calls = extension.return_value.Server.call_args_list
+        assert [c.kwargs["port_offset"] for c in calls] == [0, 1]
+        assert ports == [30000, 30001]
+
+
 @pytest.mark.parametrize(
     "pp_size,expected",
     [(1, [True, False, True, False]), (2, [True, True, False, False])],
