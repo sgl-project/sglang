@@ -10,6 +10,7 @@ import torch
 from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
 )
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Mxfp8Activation
 from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
@@ -359,6 +360,11 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         self.index_q_lora = index_args[2]
         return compress_args[2], compress_args[3], index_args[3], index_args[4]
 
+    def _quantized_q_lora(self, rows):
+        return Mxfp8Activation(
+            q=torch.arange(rows * 64).view(rows, 64), scale=torch.zeros(rows, 2)
+        )
+
     def test_tail_break_uses_live_prefix_of_hoisted_rows(self):
         # Bucket of 8 rows, the 5 live tail rows first.
         hoisted_req = torch.tensor([7, 7, 9, 9, 9, 0, 0, 0])
@@ -369,13 +375,6 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         self.assertEqual(pos.tolist(), [2, 3, 3, 4, 5])
         self.assertEqual(index_req.tolist(), [7, 7, 9, 9, 9])
         self.assertEqual(index_pos.tolist(), [2, 3, 3, 4, 5])
-
-    def _quantized_q_lora(self, rows):
-        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Mxfp8Activation
-
-        return Mxfp8Activation(
-            q=torch.arange(rows * 64).view(rows, 64), scale=torch.zeros(rows, 2)
-        )
 
     def test_quantized_q_lora_passes_through_when_every_row_is_live(self):
         """With every row live (each decode and verify step), HIP's quantized q_lora goes
@@ -392,10 +391,10 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         q_lora = self._quantized_q_lora(5)
         positions = torch.cat([hoisted[1], torch.zeros(2, dtype=torch.long)])
         self._run(*hoisted, positions, q_lora)
-        got = self.index_q_lora
-        self.assertIsInstance(got, type(q_lora))
-        self.assertTrue(torch.equal(got.q, q_lora.q[:3]))
-        self.assertEqual(tuple(got.scale.shape), (3, 2))
+        cut = self.index_q_lora
+        self.assertIsInstance(cut, Mxfp8Activation)
+        self.assertTrue(torch.equal(cut.q, q_lora.q[:3]))
+        self.assertEqual(tuple(cut.scale.shape), (3, 2))
 
 
 if __name__ == "__main__":
