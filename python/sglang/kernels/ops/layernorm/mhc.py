@@ -2609,7 +2609,8 @@ def hc_mix_stats_sinkhorn_bf16x3(
     m, k = x.shape
     mix = (2 + hc_mult) * hc_mult
     slices = _HC_MIX_COMPENSATED_SLICES
-    hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
+    is_hopper = get_platform().is_sm90
+    hopper_medium = is_hopper and 32 <= m < 4096
     block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
     assert x.is_contiguous() and x.dtype == torch.bfloat16
     assert hopper_medium or 4096 <= m <= 65536
@@ -2637,7 +2638,9 @@ def hc_mix_stats_sinkhorn_bf16x3(
         BLOCK_K=_HC_MIX_BLOCK_K,
         BLOCK_M=block_m,
         num_warps=4,
-        num_stages=3,
+        # Keep a single load stage on SM90 for repeatable scratch reuse. Restore
+        # multiple stages after validating the pinned Triton toolchain.
+        num_stages=1 if is_hopper else 3,
     )
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         part_mix,
