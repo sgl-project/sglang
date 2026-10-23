@@ -48,3 +48,53 @@ def materialize_compression_inputs(key, score, positions, forward_batch):
         packed[..., width:].contiguous(),
         forward_batch.positions,
     )
+
+
+def run_indexer_with_kv_gather(
+    indexer, x, q_lora, positions, forward_batch, layer_id, kv_local
+):
+    """Overlap MLA KV replication with already-enqueued indexer kernels.
+
+    Record readiness immediately before MQA logits, then enqueue the KV gather
+    after submitting the indexer. Waiting on that event (rather than the
+    current stream tail) starts communication alongside logits and top-k.
+    """
+    from sglang.srt.runtime_context import get_stream
+
+    current_stream = torch.cuda.current_stream()
+    stream = get_stream("dsa_cp_kv")
+    ready = torch.cuda.Event()
+    marked_ready = False
+
+    def mark_ready():
+        nonlocal marked_ready
+        assert not marked_ready, "The indexer overlap boundary must be recorded once"
+        ready.record(current_stream)
+        marked_ready = True
+
+    topk = indexer._forward_cuda_impl(
+        x=x,
+        q_lora=q_lora,
+        positions=positions,
+        forward_batch=forward_batch,
+        layer_id=layer_id,
+        on_logits_start=mark_ready,
+    )
+    if not marked_ready:
+        # Short/empty or unplanned prefills can skip MQA logits. Preserve
+        # the usual gather after their indexer (and index-key collective).
+        mark_ready()
+
+    def gather_kv():
+        stream.wait_event(ready)
+        with torch.cuda.stream(stream):
+            return get_cp_strategy().gather_kv_cache(kv_local, forward_batch)
+
+    try:
+        kv_full = gather_kv()
+    finally:
+        current_stream.wait_stream(stream)
+    # The result was allocated on the side stream and outlives this function.
+    # Keep its storage until attention (or the BCG bridge copy) finishes.
+    kv_full.record_stream(current_stream)
+    return topk, kv_full

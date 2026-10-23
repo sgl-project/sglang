@@ -18,6 +18,8 @@ def _kpool_indexer_prefill_with_output(
     positions: torch.Tensor,
     output: torch.Tensor,
     layer_id: int,
+    kv_local: torch.Tensor | None = None,
+    kv_output: torch.Tensor | None = None,
 ) -> None:
     # Metadata, write counts and cache destinations change between requests.
     # Resolve the live batch inside the eager break, never from capture args.
@@ -33,14 +35,33 @@ def _kpool_indexer_prefill_with_output(
     if n > q_lora.shape[0] or n > positions.shape[0]:
         raise ValueError("Pooled-indexer prefill inputs have inconsistent rows")
     return_indices = output.shape[0] != 0
-    result = indexer._forward_cuda_impl(
-        x=x[:n],
-        q_lora=q_lora[:n],
-        positions=positions[:n],
-        forward_batch=forward_batch,
-        layer_id=layer_id,
-        return_indices=return_indices,
-    )
+    if kv_local is not None:
+        from sglang.srt.layers.cp.interleave_kpool import run_indexer_with_kv_gather
+
+        assert return_indices and kv_output is not None
+        result, kv_full = run_indexer_with_kv_gather(
+            indexer,
+            x[:n],
+            q_lora[:n],
+            positions[:n],
+            forward_batch,
+            layer_id,
+            kv_local[:n],
+        )
+        kv_rows = sum(forward_batch.extend_seq_lens_cpu)
+        if kv_full.shape[0] != kv_rows or kv_rows > kv_output.shape[0]:
+            raise ValueError("CP KV gather returned an unexpected token count")
+        kv_output[:kv_rows].copy_(kv_full)
+        kv_output[kv_rows:].zero_()
+    else:
+        result = indexer._forward_cuda_impl(
+            x=x[:n],
+            q_lora=q_lora[:n],
+            positions=positions[:n],
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            return_indices=return_indices,
+        )
     if not return_indices:
         return
     if (
@@ -66,8 +87,12 @@ def _kpool_indexer_prefill_capture_stub(
     positions: torch.Tensor,
     output: torch.Tensor,
     layer_id: int,
+    kv_local: torch.Tensor | None = None,
+    kv_output: torch.Tensor | None = None,
 ) -> None:
     output.fill_(-1)
+    if kv_output is not None:
+        kv_output.zero_()
 
 
 bcg_kpool_indexer_prefill_with_output = eager_on_graph(

@@ -16,6 +16,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
 from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
+from sglang.srt.layers.cp.interleave import is_interleave_extend
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -325,6 +326,7 @@ class DeepseekMLAForwardMixin:
             # force standard absorb so the full-head w_kc bmm runs
             fuse_bmm_attention = False
         q_lora = None
+        cp_kv = None
         topk_indices = None
         q_nope = None
         q_pe = None
@@ -448,13 +450,38 @@ class DeepseekMLAForwardMixin:
 
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
-                        topk_indices = self.indexer(
-                            x=hidden_states,
-                            q_lora=q_lora,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            layer_id=self.layer_id,
-                        )
+                        if (
+                            _is_cuda
+                            and self.rotary_emb is None
+                            and is_interleave_extend(forward_batch)
+                            and hasattr(self.indexer, "forward_with_cp_kv")
+                        ):
+                            # No-RoPE KPool MLA has its final local KV already.
+                            # Replicate it alongside the already-enqueued
+                            # indexer scoring and top-k kernels.
+                            kv_local = torch.cat(
+                                (
+                                    k_nope.squeeze(1),
+                                    latent_cache[..., self.kv_lora_rank :],
+                                ),
+                                dim=-1,
+                            )
+                            topk_indices, cp_kv = self.indexer.forward_with_cp_kv(
+                                hidden_states,
+                                q_lora,
+                                positions,
+                                forward_batch,
+                                self.layer_id,
+                                kv_local,
+                            )
+                        else:
+                            topk_indices = self.indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                            )
                     else:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
@@ -635,13 +662,17 @@ class DeepseekMLAForwardMixin:
                 num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
             )
 
-        k_nope, k_pe = prepare_kv_for_attention(
-            self,
-            forward_batch,
-            k_nope,
-            k_pe,
-            defer_materialization=fuse_rope_for_trtllm_mla,
-        )
+        if cp_kv is not None:
+            k_nope = cp_kv[..., : self.kv_lora_rank].unsqueeze(1)
+            k_pe = cp_kv[..., self.kv_lora_rank :].unsqueeze(1)
+        else:
+            k_nope, k_pe = prepare_kv_for_attention(
+                self,
+                forward_batch,
+                k_nope,
+                k_pe,
+                defer_materialization=fuse_rope_for_trtllm_mla,
+            )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if self.dcp_size > 1:

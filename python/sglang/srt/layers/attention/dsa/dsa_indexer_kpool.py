@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1115,6 +1115,7 @@ class IndexerKPool(MultiPlatformOp):
         topk_row_starts: Optional[torch.Tensor],
         row_chunks: Tuple[slice, ...],
         out_rows: Optional[int],
+        on_logits_start: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         # Each row's top-k reads only its own logits row, pooled length and
         # page-table row, so row chunks select the same pages as one pass.
@@ -1131,6 +1132,9 @@ class IndexerKPool(MultiPlatformOp):
             else:
                 assert logits_starts is not None
                 k_fp8, k_scale = kv_fp8
+                if on_logits_start is not None:
+                    on_logits_start()
+                    on_logits_start = None
                 logits = self._fp8_mqa_logits(
                     q_fp8=q_fp8[rows].contiguous(),
                     k_fp8=k_fp8,
@@ -1182,6 +1186,7 @@ class IndexerKPool(MultiPlatformOp):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
+        on_logits_start: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             gather_index_k_scale_prefix_into,
@@ -1252,6 +1257,7 @@ class IndexerKPool(MultiPlatformOp):
                 num_rows=n_real, num_cols=total_k_rows, device=device
             ),
             out_rows=total_q,
+            on_logits_start=on_logits_start,
         )
 
     def _get_topk_ragged_kpool(
@@ -1697,6 +1703,33 @@ class IndexerKPool(MultiPlatformOp):
             x, q_lora, positions, forward_batch, layer_id, return_indices
         )
 
+    def forward_with_cp_kv(
+        self, x, q_lora, positions, forward_batch, layer_id, kv_local
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """KPool prefill plus overlapped replication of no-RoPE MLA KV."""
+        from sglang.srt.layers.cp.interleave_kpool import run_indexer_with_kv_gather
+
+        if is_in_breakable_cuda_graph():
+            from sglang.srt.layers.attention.dsa.kpool_prefill_cuda_graph import (
+                bcg_kpool_indexer_prefill_with_output,
+            )
+
+            output = torch.empty(
+                (x.shape[0], self.index_topk + self.index_kpool - 1),
+                dtype=torch.int32,
+                device=x.device,
+            )
+            kv_output = kv_local.new_empty(
+                (forward_batch.extend_num_tokens, kv_local.shape[-1])
+            )
+            bcg_kpool_indexer_prefill_with_output(
+                self, x, q_lora, positions, output, layer_id, kv_local, kv_output
+            )
+            return output, kv_output
+        return run_indexer_with_kv_gather(
+            self, x, q_lora, positions, forward_batch, layer_id, kv_local
+        )
+
     def _forward_cuda_impl(
         self,
         x: torch.Tensor,
@@ -1705,6 +1738,7 @@ class IndexerKPool(MultiPlatformOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
+        on_logits_start: Optional[Callable[[], None]] = None,
     ) -> Optional[torch.Tensor]:
         if is_hip():
             from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
@@ -1854,6 +1888,7 @@ class IndexerKPool(MultiPlatformOp):
                         q_fp8,
                         weights,
                         metadata,
+                        on_logits_start=on_logits_start,
                     )
                 else:
                     topk_result = self._get_topk_ragged(
