@@ -163,6 +163,14 @@ install_aisbench() {
     echo "===== Install aisbench in virtual env - Begin ====="
     PYTHON_ENV_FOR_AISBENCH=test_env_aisbench
     PIP_FOR_AISBENCH=${PYTHON_ENV_FOR_AISBENCH}/bin/pip
+    # Reuse the venv when it already imports cleanly; this keeps benchmark
+    # retry attempts fast and surfaces broken installs immediately.
+    if [ -x "${PYTHON_ENV_FOR_AISBENCH}/bin/python" ] && \
+       "${PYTHON_ENV_FOR_AISBENCH}/bin/python" -c "import ais_bench, datasets, pyarrow" >/dev/null 2>&1; then
+        echo "aisbench venv already usable, skip installation."
+        echo "===== Install aisbench in virtual env - End ====="
+        return
+    fi
     python -m venv ${PYTHON_ENV_FOR_AISBENCH}
     AISBENCH_SOURCE_PATH=/root/.cache/.cache/benchmark
     AISBENCH_PKG_PATH=/root/.cache/.cache/aisbench-packages
@@ -201,6 +209,11 @@ install_aisbench() {
             ${PIP_FOR_AISBENCH} install -r ${AISBENCH_SOURCE_PATH}/requirements/datasets/bfcl_dependencies.txt --no-index --find-links=${AISBENCH_PKG_PATH}
         fi
     fi
+    # The requirements pull numpy<2 (torch-npu ecosystem) but leave pyarrow
+    # unpinned, and the latest pyarrow imports only with numpy>=2:
+    # "ImportError: pyarrow requires NumPy 2.0 or newer, found 1.26.4".
+    # Cap pyarrow to a numpy-1.x-compatible release.
+    ${PIP_FOR_AISBENCH} install "pyarrow<16" -i ${pip_mirror_source}
     echo "===== Install aisbench in virtual env - End ====="
 }
 
@@ -510,7 +523,7 @@ if [ "$MODE" == "perf" ];then
         gen_dataset_gsm8k_config_file "${dataset_dir}"
         gen_model_config_file_vllm_api_stream_chat
 
-        if (( $(echo "$REPEAT_RATE > 0" | bc -l) )); then
+        if awk "BEGIN{exit !(${REPEAT_RATE:-0} > 0)}"; then
             TARGET_CONFIG_FILE="${DEST_COPY_DIR}/config"
 
             echo "===== [Step 2/4] Prefix Mode Detected: Updating temporary config file ====="
