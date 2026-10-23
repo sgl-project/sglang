@@ -50,6 +50,8 @@ cu_seqlens is cached into a dict during create_graph(), and its contents are not
 
 For the same graph_key = S, you not only require the input shape to match, but also require the segmentation pattern in cu_seqlens (and window seqlens) to be identical. Otherwise, attention will segment the sequence incorrectly.
 
+Because the key includes the segmentation pattern, every new image size or batch composition captures a new graph. Set `SGLANG_VIT_CUDA_GRAPH_CACHE_CAPACITY=N` to capture at most N graphs; later layouts run the same blocks eagerly instead of growing the cache.
+
 ### Rotary buffer management
 The feature reallocates a larger sin_cos_ws when seq_len increases.
 The max_content_len is used to make sure the maximum size of the allocated rotary buffer.

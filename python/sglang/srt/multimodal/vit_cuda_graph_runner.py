@@ -17,14 +17,18 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from contextlib import nullcontext
 from typing import Dict, Hashable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.runtime_context import get_parallel
+
+logger = logging.getLogger(__name__)
 
 
 class ViTCudaGraphRunner:
@@ -58,6 +62,17 @@ class ViTCudaGraphRunner:
         # being serialized on one stream and on replay() returning a copy of the
         # output, since the next replay of any graph can reuse that memory.
         self._graph_pool = None
+        # Graphs are keyed on the exact attention layout, so batch compositions can
+        # add new keys indefinitely; past this many, layouts run uncaptured.
+        self._max_graphs: Optional[int] = (
+            envs.SGLANG_VIT_CUDA_GRAPH_CACHE_CAPACITY.get()
+        )
+        if self._max_graphs is not None and self._max_graphs < 0:
+            raise ValueError(
+                "SGLANG_VIT_CUDA_GRAPH_CACHE_CAPACITY must be >= 0, "
+                f"got {self._max_graphs}"
+            )
+        self._capacity_logged = False
 
         # captured seqlens buffers (addresses must be stable for cuda-graph replay)
         self.cu_full_len: Dict[Hashable, torch.Tensor] = {}
@@ -197,6 +212,7 @@ class ViTCudaGraphRunner:
         graph = torch.cuda.CUDAGraph()
         vit = self.vit
 
+        cu_window = cu_window_kk = max_window_len = None
         # Qwen2.5-VL
         if self._fullatt_block_indexes:
             cu_window = self.cu_window_len[graph_key]
@@ -244,92 +260,129 @@ class ViTCudaGraphRunner:
                 graph, pool=self._graph_pool, capture_error_mode="thread_local"
             ),
         ):
-            y = None
-            deepstack_outs: List[torch.Tensor] = []
-            deepstack_capture_idx = 0
+            self.block_output[graph_key] = self._forward_blocks(
+                self.block_input[graph_key],
+                cu_full=cu_full,
+                cu_full_kk=cu_full_kk,
+                max_full_len=max_full_len,
+                cu_window=cu_window,
+                cu_window_kk=cu_window_kk,
+                max_window_len=max_window_len,
+                position_embeddings=position_embeddings,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+                output_ws=self.block_ws[graph_key],
+            )
 
-            for layer_num, blk in enumerate(vit.blocks):
-                if self._fullatt_block_indexes:
-                    if layer_num in vit.fullatt_block_indexes:
-                        cu_seqlens_now = cu_full
-                        cu_seqlens_kk_now = cu_full_kk
-                        max_len = max_full_len
-                    else:
-                        cu_seqlens_now = cu_window
-                        cu_seqlens_kk_now = cu_window_kk
-                        max_len = max_window_len
-                else:
+        self.block_graphs[graph_key] = graph
+
+    def _new_block_ws(self, seq_len: int) -> torch.Tensor:
+        attn_module: VisionAttention = self.vit.blocks[0].attn
+        return torch.empty(
+            seq_len,
+            attn_module.num_attention_heads_per_partition,
+            attn_module.head_size,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+    def _forward_blocks(
+        self,
+        x: torch.Tensor,
+        *,
+        cu_full: torch.Tensor,
+        cu_full_kk: torch.Tensor,
+        max_full_len: int,
+        cu_window: Optional[torch.Tensor],
+        cu_window_kk: Optional[torch.Tensor],
+        max_window_len: Optional[int],
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        rotary_pos_emb_cos: Optional[torch.Tensor],
+        rotary_pos_emb_sin: Optional[torch.Tensor],
+        output_ws: torch.Tensor,
+    ) -> torch.Tensor:
+        """Blocks + merger (+ deepstack mergers): the work a graph captures."""
+        vit = self.vit
+        backend = self._attn_backend
+        y = None
+        deepstack_outs: List[torch.Tensor] = []
+        deepstack_capture_idx = 0
+
+        for layer_num, blk in enumerate(vit.blocks):
+            if self._fullatt_block_indexes:
+                if layer_num in vit.fullatt_block_indexes:
                     cu_seqlens_now = cu_full
                     cu_seqlens_kk_now = cu_full_kk
                     max_len = max_full_len
-
-                if backend == "triton_attn":
-                    cu_seq_len_ws = [cu_seqlens_now, cu_seqlens_kk_now, max_len]
-                elif backend in ("fa3", "fa4", "aiter_attn"):
-                    cu_seq_len_ws = [cu_seqlens_now, max_len]
                 else:
-                    raise RuntimeError(
-                        f"ViT CUDA graph does not support attention backend: {backend}"
-                    )
-
-                if position_embeddings is not None:
-                    if layer_num == 0:
-                        y = blk(
-                            self.block_input[graph_key],
-                            cu_seqlens=cu_seq_len_ws,
-                            position_embeddings=position_embeddings,
-                            output_ws=self.block_ws[graph_key],
-                        )
-                    else:
-                        y = blk(
-                            y,
-                            cu_seqlens=cu_seq_len_ws,
-                            position_embeddings=position_embeddings,
-                            output_ws=self.block_ws[graph_key],
-                        )
-                elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-                    if layer_num == 0:
-                        y = blk(
-                            self.block_input[graph_key],
-                            cu_seqlens=cu_seq_len_ws,
-                            rotary_pos_emb_cos=rotary_pos_emb_cos,
-                            rotary_pos_emb_sin=rotary_pos_emb_sin,
-                            output_ws=self.block_ws[graph_key],
-                        )
-                    else:
-                        y = blk(
-                            y,
-                            cu_seqlens=cu_seq_len_ws,
-                            rotary_pos_emb_cos=rotary_pos_emb_cos,
-                            rotary_pos_emb_sin=rotary_pos_emb_sin,
-                            output_ws=self.block_ws[graph_key],
-                        )
-
-                # Optional deepstack support (Qwen3-VL)
-                if (
-                    self._deepstack_visual_indexes
-                    and layer_num in self._deepstack_visual_indexes
-                ):
-                    if self._deepstack_merger_list is None:
-                        raise RuntimeError(
-                            "deepstack_visual_indexes exists but deepstack_merger_list is missing."
-                        )
-                    deepstack_out = self._deepstack_merger_list[deepstack_capture_idx](
-                        y
-                    )
-                    deepstack_outs.append(deepstack_out)
-                    deepstack_capture_idx += 1
-
-            main_out = vit.merger(y)
-
-            if deepstack_outs:
-                self.block_output[graph_key] = torch.cat(
-                    [main_out] + deepstack_outs, dim=1
-                )
+                    cu_seqlens_now = cu_window
+                    cu_seqlens_kk_now = cu_window_kk
+                    max_len = max_window_len
             else:
-                self.block_output[graph_key] = main_out
+                cu_seqlens_now = cu_full
+                cu_seqlens_kk_now = cu_full_kk
+                max_len = max_full_len
 
-        self.block_graphs[graph_key] = graph
+            if backend == "triton_attn":
+                cu_seq_len_ws = [cu_seqlens_now, cu_seqlens_kk_now, max_len]
+            elif backend in ("fa3", "fa4", "aiter_attn"):
+                cu_seq_len_ws = [cu_seqlens_now, max_len]
+            else:
+                raise RuntimeError(
+                    f"ViT CUDA graph does not support attention backend: {backend}"
+                )
+
+            if position_embeddings is not None:
+                if layer_num == 0:
+                    y = blk(
+                        x,
+                        cu_seqlens=cu_seq_len_ws,
+                        position_embeddings=position_embeddings,
+                        output_ws=output_ws,
+                    )
+                else:
+                    y = blk(
+                        y,
+                        cu_seqlens=cu_seq_len_ws,
+                        position_embeddings=position_embeddings,
+                        output_ws=output_ws,
+                    )
+            elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
+                if layer_num == 0:
+                    y = blk(
+                        x,
+                        cu_seqlens=cu_seq_len_ws,
+                        rotary_pos_emb_cos=rotary_pos_emb_cos,
+                        rotary_pos_emb_sin=rotary_pos_emb_sin,
+                        output_ws=output_ws,
+                    )
+                else:
+                    y = blk(
+                        y,
+                        cu_seqlens=cu_seq_len_ws,
+                        rotary_pos_emb_cos=rotary_pos_emb_cos,
+                        rotary_pos_emb_sin=rotary_pos_emb_sin,
+                        output_ws=output_ws,
+                    )
+
+            # Optional deepstack support (Qwen3-VL)
+            if (
+                self._deepstack_visual_indexes
+                and layer_num in self._deepstack_visual_indexes
+            ):
+                if self._deepstack_merger_list is None:
+                    raise RuntimeError(
+                        "deepstack_visual_indexes exists but deepstack_merger_list is missing."
+                    )
+                deepstack_out = self._deepstack_merger_list[deepstack_capture_idx](y)
+                deepstack_outs.append(deepstack_out)
+                deepstack_capture_idx += 1
+
+        main_out = vit.merger(y)
+
+        if deepstack_outs:
+            return torch.cat([main_out] + deepstack_outs, dim=1)
+        return main_out
 
     def create_graph(
         self,
@@ -343,7 +396,6 @@ class ViTCudaGraphRunner:
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
         attention_layout_key: Optional[Hashable] = None,
     ) -> Hashable:
-        vit = self.vit
         graph_key = self._get_graph_key(
             x_3d,
             cu_seqlens,
@@ -355,11 +407,6 @@ class ViTCudaGraphRunner:
         if graph_key in self.block_graphs:
             return graph_key
 
-        # pre-allocate workspace
-        attn_module: VisionAttention = vit.blocks[0].attn
-        num_heads = attn_module.num_attention_heads_per_partition
-        attn_head_dim = attn_module.head_size
-
         if graph_key not in self.block_output:
             self.block_output[graph_key] = torch.empty_like(
                 x_3d, device=self.device
@@ -367,13 +414,7 @@ class ViTCudaGraphRunner:
             self.block_input[graph_key] = torch.empty_like(
                 x_3d, device=self.device
             ).contiguous()
-            self.block_ws[graph_key] = torch.empty(
-                seq_len,
-                num_heads,
-                attn_head_dim,
-                device=self.device,
-                dtype=self.dtype,
-            )
+            self.block_ws[graph_key] = self._new_block_ws(seq_len)
 
         # Qwen2.5-VL
         if self._fullatt_block_indexes:
@@ -478,6 +519,17 @@ class ViTCudaGraphRunner:
             attention_layout_key,
         )
 
+        if graph_key not in self.block_graphs and self._cache_is_full():
+            return self._run_uncaptured(
+                x_3d=x_3d,
+                cu_seqlens=cu_seqlens,
+                cu_window_seqlens=cu_window_seqlens,
+                position_embeddings=position_embeddings,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+                output_indices=output_indices,
+            )
+
         if graph_key not in self.block_graphs:
             self.create_graph(
                 x_3d=x_3d,
@@ -497,3 +549,50 @@ class ViTCudaGraphRunner:
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             output_indices=output_indices,
         )
+
+    def _cache_is_full(self) -> bool:
+        if self._max_graphs is None or len(self.block_graphs) < self._max_graphs:
+            return False
+        if not self._capacity_logged:
+            logger.warning(
+                "ViT CUDA graph cache reached SGLANG_VIT_CUDA_GRAPH_CACHE_CAPACITY=%d; "
+                "new attention layouts run without a graph",
+                self._max_graphs,
+            )
+            self._capacity_logged = True
+        return True
+
+    def _run_uncaptured(
+        self,
+        x_3d: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        cu_window_seqlens: Optional[torch.Tensor],
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        rotary_pos_emb_cos: Optional[torch.Tensor],
+        rotary_pos_emb_sin: Optional[torch.Tensor],
+        output_indices: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run the captured part eagerly, with the same arguments a graph uses."""
+        cu_window = cu_window_kk = max_window_len = None
+        if self._fullatt_block_indexes:
+            cu_window = cu_window_seqlens
+            cu_window_kk = cu_window_seqlens[1:] - cu_window_seqlens[:-1]
+            max_window_len = int(cu_window_kk.max().item())
+        cu_full_kk = cu_seqlens[1:] - cu_seqlens[:-1]
+
+        out = self._forward_blocks(
+            x_3d,
+            cu_full=cu_seqlens,
+            cu_full_kk=cu_full_kk,
+            max_full_len=int(cu_full_kk.max().item()),
+            cu_window=cu_window,
+            cu_window_kk=cu_window_kk,
+            max_window_len=max_window_len,
+            position_embeddings=position_embeddings,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            output_ws=self._new_block_ws(x_3d.shape[0]),
+        )
+        if output_indices is not None:
+            out = out.index_select(0, output_indices)
+        return out
