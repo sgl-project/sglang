@@ -1950,15 +1950,16 @@ class DeepseekV4AttnBackend(
     ) -> None:
         """Write every row's compressed KV for the source layer the tail starts at,
         before enter_late_layer_tail; the layer's own pass inside the tail then
-        skips its compressor."""
-        self.forward_low_ratio_sources(
-            layer=layer,
-            x=x,
-            q_lora=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            run_indexer=False,
-        )
+        skips its compressor, also on a rank with no rows to write."""
+        if x.shape[0] > 0:
+            self.forward_low_ratio_sources(
+                layer=layer,
+                x=x,
+                q_lora=None,
+                positions=positions,
+                forward_batch=forward_batch,
+                run_indexer=False,
+            )
         self.tail_source_kv_layer_id = layer.layer_id
 
     def enter_late_layer_tail(self, forward_batch: ForwardBatch) -> tuple:
@@ -3211,23 +3212,18 @@ class DeepseekV4AttnBackend(
             return
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
         hoisted_pos = getattr(meta, "low_ratio_pos_i64", None)
-        if hoisted_pos is not None and hoisted_pos.shape[0] < positions.shape[0]:
-            # DP attention pads an eager extend past the rows extend_seq_lens cover.
-            num_real = hoisted_pos.shape[0]
-            x, positions = x[:num_real], positions[:num_real]
-            if q_lora is not None:
-                q_lora = q_lora[:num_real]
-        if (
-            hoisted_req is not None
-            and hoisted_pos is not None
-            and hoisted_pos.shape[0] == positions.shape[0]
-        ):
-            # Bucket-sized under the prefill graph; an eager break sees the
-            # live rows only and falls through.
-            req, pos = hoisted_req, hoisted_pos
-        else:
+        if hoisted_pos is None:
             req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
             pos = positions
+        else:
+            # The hoisted rows list the live rows first. DP attention pads an eager
+            # extend past them; an eager break in the late-layer tail sees fewer, and
+            # there extend_seq_lens still spans the whole extend.
+            n = min(hoisted_pos.shape[0], positions.shape[0])
+            x, positions = x[:n], positions[:n]
+            if q_lora is not None:
+                q_lora = q_lora[:n]
+            req, pos = hoisted_req[:n], hoisted_pos[:n]
         if (
             forward_batch.forward_mode.is_extend()
             and self._low_ratio_in_prefill_graph()

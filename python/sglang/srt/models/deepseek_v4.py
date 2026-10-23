@@ -849,6 +849,34 @@ bcg_deepseek_v4_low_ratio_sources = eager_on_graph(
 )
 
 
+def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
+    """Whether the ratio-1/2 sources run as an eager break: inside a breakable graph
+    without the in-graph low-ratio path, or in a decoder tail graph."""
+    return (
+        forward_batch.forward_mode.is_extend()
+        and is_in_breakable_cuda_graph()
+        and (
+            not getattr(attn_backend, "low_ratio_prefill_graph", False)
+            or in_replay_tail_graph()
+        )
+    )
+
+
+def deepseek_v4_write_tail_source_kv(layer, x, positions) -> None:
+    # Like the sources above: the compressor syncs with the host.
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    get_attn_backend().write_tail_source_kv(
+        layer=layer,
+        x=x[:real_num_tokens],
+        positions=positions[:real_num_tokens],
+        forward_batch=forward_batch,
+    )
+
+
+bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(deepseek_v4_write_tail_source_kv)
+
+
 def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor:
     # The hasher reads per-request rows, so it cannot run inside the CUDA graph.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
@@ -2425,14 +2453,7 @@ class MQALayer(MqaAttentionBase):
         if self.compress_ratio in (1, 2) and (
             self.compressor is not None or self.indexer is not None
         ):
-            if (
-                forward_batch.forward_mode.is_extend()
-                and is_in_breakable_cuda_graph()
-                and (
-                    not getattr(attn_backend, "low_ratio_prefill_graph", False)
-                    or in_replay_tail_graph()
-                )
-            ):
+            if _low_ratio_sources_break(attn_backend, forward_batch):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
                 attn_backend.forward_low_ratio_sources(
@@ -3975,12 +3996,17 @@ class DeepseekV4Model(nn.Module):
                         source_x = fused_boundary_attn_input(source, state)
                     else:
                         source_x = mhc.combine(source.attn_hc, state)
-                    attn_backend.write_tail_source_kv(
-                        layer=source.self_attn,
-                        x=source_x,
-                        positions=positions,
-                        forward_batch=forward_batch,
-                    )
+                    if _low_ratio_sources_break(attn_backend, forward_batch):
+                        bcg_deepseek_v4_write_tail_source_kv(
+                            source.self_attn, source_x, positions
+                        )
+                    else:
+                        attn_backend.write_tail_source_kv(
+                            layer=source.self_attn,
+                            x=source_x,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                        )
                 # Decode reaches back at most SWA_WINDOW positions.
                 if tail_in_graph:
                     # Eager break: re-run at replay so the backend swaps onto the
