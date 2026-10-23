@@ -21,7 +21,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.runtime_context import get_resources
-from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils import get_device, get_int_env_var, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +163,9 @@ class _MooncakeEPDispatcherImpl:
 
         self.first_execution = True
         self.timeout_us = 10000000
+        self._all_ranks_active = None
+        # The Intel XPU expert path is a BF16 bmm (no FP8 masked GEMM).
+        self.dispatch_use_fp8 = not is_xpu()
 
         self.handle = None
 
@@ -181,7 +184,7 @@ class _MooncakeEPDispatcherImpl:
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
-            use_fp8=True,
+            use_fp8=self.dispatch_use_fp8,
         )
         return (
             hidden_states,
@@ -289,7 +292,11 @@ class _MooncakeEPDispatcherImpl:
         elastic_state = ElasticEPStateManager.instance()
         if elastic_state is not None:
             return elastic_state.active_ranks
-        return torch.ones(self.group.size(), dtype=torch.int32, device="cuda")
+        if self._all_ranks_active is None:
+            self._all_ranks_active = torch.ones(
+                self.group.size(), dtype=torch.int32, device=get_device()
+            )
+        return self._all_ranks_active
 
     def _get_buffer(self):
         return EPBuffer.get_ep_buffer(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
@@ -41,7 +41,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -166,7 +167,16 @@ class DeepEPMoE(FusedMoE):
             self.use_block_quant = False
 
         self.deepep_mode = get_deepep_mode()
-        if (
+        if _is_xpu and self.deepep_mode.enable_low_latency():
+            # _forward_masked_xpu is a bf16/fp16 bmm; no quantized masked GEMM.
+            assert quant_config is None, (
+                "Low-latency expert parallelism on Intel XPU supports "
+                "unquantized MoE weights only"
+            )
+            self.xpu_masked_activation = _xpu_masked_activation(
+                self.moe_runner_config.activation, self.moe_runner_config.is_gated
+            )
+        elif (
             self.deepep_mode.enable_low_latency()
             and not _is_npu
             and not _is_hip
@@ -297,6 +307,8 @@ class DeepEPMoE(FusedMoE):
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8_masked(dispatch_output)
+            elif _is_xpu:
+                output = self._forward_masked_xpu(dispatch_output)
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
 
@@ -311,6 +323,29 @@ class DeepEPMoE(FusedMoE):
             topk_ids=dispatch_output.topk_ids,
             topk_weights=dispatch_output.topk_weights,
         )
+
+    def _forward_masked_xpu(
+        self, dispatch_output: DeepEPLLDispatchOutput
+    ) -> torch.Tensor:
+        # No masked grouped GEMM on XPU, so bmm over each expert's first m rows,
+        # m covering the fullest expert. The buffer holds num_ranks * T rows per
+        # expert while decode fills a few, so this costs one host sync per layer
+        # instead of a capacity-sized GEMM.
+        hidden_states, _, _, _, masked_m, _ = dispatch_output
+        capacity = hidden_states.shape[1]
+        # Combine reads only each expert's first masked_m rows, so rows past
+        # them may hold anything.
+        out = torch.empty_like(hidden_states)
+        m = int(masked_m.max().item())
+        if m == 0:
+            return out
+        # Rounded so steps with similar occupancy reuse one GEMM shape.
+        m = min(capacity, -(-m // 16) * 16)
+        gate_up = torch.bmm(hidden_states[:, :m], self.w13_weight.transpose(1, 2))
+        out[:, :m] = torch.bmm(
+            self.xpu_masked_activation(gate_up), self.w2_weight.transpose(1, 2)
+        )
+        return out
 
     def combine(
         self,
@@ -347,6 +382,28 @@ class DeepEPMoE(FusedMoE):
             layer=self,
             dispatch_output=dispatch_output,
         )
+
+
+def _xpu_masked_activation(
+    activation: str, is_gated: bool
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Activation over a [num_experts, m, width] gate-up output."""
+    if not is_gated and activation in ("silu", "gelu"):
+        return getattr(torch.nn.functional, activation)
+    if is_gated and activation in ("silu", "gelu"):
+        from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
+
+        op = SiluAndMul() if activation == "silu" else GeluAndMul()
+
+        def act_and_mul(gate_up: torch.Tensor) -> torch.Tensor:
+            num_experts, m, width = gate_up.shape
+            return op(gate_up.reshape(-1, width)).reshape(num_experts, m, width // 2)
+
+        return act_and_mul
+    raise NotImplementedError(
+        f"activation={activation} (gated={is_gated}) is not supported by the "
+        "Intel XPU low-latency MoE path"
+    )
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):

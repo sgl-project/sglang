@@ -571,6 +571,20 @@ def handle_a2a_moe(server_args: Any):
                 "(chunked_prefill_size by default)"
             )
 
+    if a2a_backend == "mooncake":
+        if cfg.deepep_mode == "normal":
+            raise ValueError(
+                "moe_a2a_backend='mooncake' only supports low-latency mode; "
+                "set --deepep-mode to 'low_latency' or 'auto'."
+            )
+        if cfg.deepep_mode == "auto":
+            declare_resolution(
+                server_args,
+                "_handle_a2a_moe",
+                deepep_mode="low_latency",
+            )
+            logger.warning("auto set deepep_mode=`low_latency` for Mooncake EP")
+
     if a2a_backend == "pplx":
         if cfg.deepep_mode == "normal":
             raise ValueError(
