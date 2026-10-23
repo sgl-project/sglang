@@ -1,4 +1,4 @@
-"""Length-aware split-KV segment plan of the gfx950 asm attention kernel (the default split for bs > 1).
+"""Length-aware split-KV segment plan of the gfx950 asm attention kernel (the default split).
 
 Guards, on a gfx950 device:
   * the planned split matches an fp32 reference as closely as the fixed split, for both GQA ratios the
@@ -10,6 +10,7 @@ Guards, on a gfx950 device:
 
 import math
 import unittest
+from unittest import mock
 
 import torch
 from torch.profiler import ProfilerActivity, profile
@@ -196,6 +197,31 @@ class TestVattnSegPlan(CustomTestCase):
         g.replay()
         torch.cuda.synchronize()
         self.assertLess((out.float() - r).abs().max().item(), 0.05)
+
+    def test_triton_reduce_matches_vred(self):
+        # Same batch, same plan, two reducers: vred.s (cap 64) vs the Triton fallback
+        # (cap patched to 128; the plan's T is unchanged, ~32 real segments).
+        V = self.V
+        lens, qlens, hq, hkv = [70000] * 8, [4] * 8, 16, 1
+        k, v, bt, q, cu_q, seq_lens, kd, vd = make(lens, qlens, hq, hkv)
+        scale = 1.0 / math.sqrt(HD)
+        V.reset_seg_plan_cache()
+        with mock.patch.object(V, "_reduce_triton", wraps=V._reduce_triton) as tri:
+            o_vred = V.mtp_verify_attn_fwd_asm(
+                q, k, v, bt, seq_lens, cu_q, kd, vd, scale
+            ).float()
+            self.assertEqual(tri.call_count, 0)
+            V.reset_seg_plan_cache()
+            with mock.patch.object(V, "mtp_verify_attn_seg_max", return_value=128):
+                o_tri = V.mtp_verify_attn_fwd_asm(
+                    q, k, v, bt, seq_lens, cu_q, kd, vd, scale
+                ).float()
+            self.assertEqual(tri.call_count, 1)
+        torch.cuda.synchronize()
+        self.assertFalse(torch.isnan(o_tri).any().item())
+        # measured on MI355X: max diff 2e-6 on an output absmax of 4e-3 (~5e-4 relative)
+        scale_o = o_vred.abs().max().item()
+        self.assertLess((o_vred - o_tri).abs().max().item(), 0.01 * scale_o)
 
     def test_plan_cache_per_forward(self):
         V = self.V

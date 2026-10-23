@@ -341,7 +341,7 @@ def mtp_verify_attn_seg_max(
     if num_cus is None:
         num_cus = _seg_plan_target_wgs()
     uniform_share = max(1, num_cus // max(1, num_seqs * num_kv_heads))
-    return max(16, min(num_cus, 2 * uniform_share))
+    return max(16, min(num_cus, 2 * uniform_share))  # 16 = min segments, not tiles
 
 
 def _get_plan_kernel():
@@ -378,7 +378,7 @@ def _get_plan_kernel():
                     (total + target_wgs - 1) // target_wgs,
                     (mx + seg_max - 1) // seg_max,
                 ),
-                16,  # >= 256 tokens: shorter segments cost more in fp32 partials than they save
+                16,  # min KV tiles per segment (= 256 tokens): shorter segments cost more in fp32 partials than they save
             )
             slack = target_wgs - num_seqs
             hi = tl.where(
@@ -513,7 +513,10 @@ def _get_reduce_triton():
             HEAD_SIZE: tl.constexpr,
             BLOCK_D: tl.constexpr,
         ):
-            # same contract as vred.s, one program per (token, head, BLOCK_D dims)
+            # same contract as vred.s, one program per (token, head, BLOCK_D dims).
+            # Not unified_attention_3d_mtp_reduce_segments_kernel: that one derives the
+            # segment count from seq_len, this one takes the planner's tok_nseg.
+            # Each BLOCK_D program recomputes max/denominator over the segments on purpose.
             t = tl.program_id(0)
             h = tl.program_id(1)
             s = tl.arange(0, NSEG_P2)
@@ -540,6 +543,7 @@ def _get_reduce_triton():
 def _reduce_triton(out, segm_out, segm_max, segm_expsum, tok_nseg, num_segments):
     num_tokens, num_q_heads, head_size = out.shape
     block_d = 64
+    assert head_size % block_d == 0
     _get_reduce_triton()[(num_tokens, num_q_heads, head_size // block_d)](
         out,
         segm_out,
