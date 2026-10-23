@@ -685,6 +685,9 @@ class Envs:
     # Overlap scheduler and pipeline parallelism
     # ===================================================================
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    # Optional consecutive-prefill resource limits; non-positive disables each.
+    SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET = EnvInt(0)
+    SGLANG_PREFILL_OVERLAP_MIN_FREE_GB = EnvFloat(0.0)
     # Force delay_sample_func for all overlap decode (not just grammar mode),
     # allowing CPU result processing to overlap with subsequent forward computation
     # and reducing the impact of sampling overhead on the critical path.
