@@ -11,10 +11,12 @@ step outputs:
     only_tests_<key>   multi-line list of intersected files (repo-relative);
                        exported non-empty ONLY in precision mode, so callers
                        can reference it without any extra guard expression
-    should_run_<key>   'false' only when precision mode is active, the suite
+    should_run_<key>   'false' when precision mode is active, the suite
                        enumerated a non-empty registered pool, and this
                        suite's bucket is empty -> the caller skips the whole
-                       job; 'true' otherwise (including full-suite runs)
+                       job; also 'false' for ALL suites when nothing was
+                       recommended and every PR change is under python/sglang/
+                       (--changed-files); 'true' otherwise (incl. full suites)
 
 Suite keys replace '-' with '_' because GitHub Actions output names must be
 valid shell identifiers. Any failure path yields empty/missing outputs, which
@@ -23,6 +25,8 @@ callers treat as "run the full suite".
 When --github-summary points at $GITHUB_STEP_SUMMARY, a markdown section is
 appended with the recommended test cases, counts, per-suite buckets, and the
 files that matched no suite pool (not run by the bucketed a3 suites).
+--report-file writes the same section to a plain file (e.g. for artifact
+upload, so the report is downloadable from the run page).
 
 Usage:
     python3 bucket_recommended_tests.py \
@@ -30,7 +34,8 @@ Usage:
         --suites base-a-test-npu,base-b-test-1-npu-a3 \
         --precision-mode true \
         --github-output "$GITHUB_OUTPUT" \
-        --github-summary "$GITHUB_STEP_SUMMARY"
+        --github-summary "$GITHUB_STEP_SUMMARY" \
+        --report-file recommended-tests-report.md
 """
 
 import argparse
@@ -80,16 +85,17 @@ def enumerate_suite_files(suite: str, work_dir: Path) -> list:
 
 
 def write_github_summary(
-    summary_file: str,
+    target_files: list,
     raw_entries: list,
     recommended: set,
     all_pool: set,
     buckets: dict,
     suite_pool_sizes: dict,
     precision_mode: bool,
+    skip_all_suites: bool = False,
 ) -> None:
-    """Append a markdown section with the recommendation results to the
-    GitHub Actions step summary ($GITHUB_STEP_SUMMARY)."""
+    """Append a markdown section with the recommendation results to every
+    target file: $GITHUB_STEP_SUMMARY and/or a plain report file."""
     unbucketed = sorted(recommended - all_pool)
     lines = []
     lines.append("### Recommended tests from coverage")
@@ -100,6 +106,12 @@ def write_github_summary(
         )
     else:
         lines.append("Precision mode **off** — suites run in full.")
+    if skip_all_suites:
+        lines.append("")
+        lines.append(
+            "**All suites skipped**: nothing was recommended and every PR "
+            "change is under `python/sglang/`."
+        )
     lines.append("")
     lines.append(
         f"Recommended **{len(raw_entries)}** test cases "
@@ -110,7 +122,9 @@ def write_github_summary(
     lines.append("| Suite | Registered files | Bucketed files | Action |")
     lines.append("|---|---|---|---|")
     for suite, files in buckets.items():
-        if precision_mode and suite_pool_sizes[suite] and not files:
+        if skip_all_suites or (
+            precision_mode and suite_pool_sizes[suite] and not files
+        ):
             action = "skipped (no recommended test)"
         elif precision_mode and files:
             action = "run subset"
@@ -155,9 +169,10 @@ def write_github_summary(
             lines.extend(f"- {f}" for f in files)
             lines.append("")
         lines.append("</details>")
-    with open(summary_file, "a", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    print(f"Summary written to: {summary_file}")
+    for target in target_files:
+        with open(target, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"Summary written to: {target}")
 
 
 def main():
@@ -183,6 +198,14 @@ def main():
         help="'true' to enable precision mode (run only the recommended tests)",
     )
     parser.add_argument(
+        "--changed-files",
+        type=str,
+        default="",
+        help="pr_changed_files.txt written by test_selector.py; enables the "
+        "skip-all rule: nothing recommended + every change under python/sglang/"
+        " -> should_run 'false' for all suites (empty/missing = rule disabled)",
+    )
+    parser.add_argument(
         "--github-output",
         type=str,
         default="",
@@ -193,6 +216,13 @@ def main():
         type=str,
         default="",
         help="GITHUB_STEP_SUMMARY file to append a markdown report to (empty = skip)",
+    )
+    parser.add_argument(
+        "--report-file",
+        type=str,
+        default="",
+        help="Also write the markdown report to this file, e.g. for artifact "
+        "upload (empty = skip)",
     )
     args = parser.parse_args()
 
@@ -212,6 +242,28 @@ def main():
     else:
         print(f"::warning::Recommended file not found: {rec_file}")
     print(f"Recommended test entries: {len(raw_entries)} ({len(recommended)} files)")
+
+    # Skip-all rule: an empty recommendation is only trustworthy when every
+    # changed file lives under the covered product tree (python/sglang/);
+    # test/script/workflow changes are invisible to the coverage baseline, so
+    # those PRs keep the full-suite fallback.
+    changed_files: list[str] = []
+    if args.changed_files:
+        cf = Path(args.changed_files)
+        if cf.exists():
+            changed_files = [
+                ln.strip() for ln in cf.read_text().splitlines() if ln.strip()
+            ]
+    skip_all_suites = (
+        not raw_entries
+        and bool(changed_files)
+        and all(p.startswith("python/sglang/") for p in changed_files)
+    )
+    if skip_all_suites:
+        print(
+            "::notice::No tests recommended and every changed file is under "
+            "python/sglang/ — skipping all suites."
+        )
 
     suites = [s.strip() for s in args.suites.split(",") if s.strip()]
     work_dir = Path(tempfile.mkdtemp(prefix="bucket_tests_"))
@@ -254,29 +306,35 @@ def main():
                 for line in bucket_files:
                     out.write(line + "\n")
                 out.write("EOF\n")
-                # 'false' ONLY when precision mode is on, the suite enumerated a
+                # 'false' when precision mode is on, the suite enumerated a
                 # non-empty registered pool, and this bucket is empty -> the
-                # caller skips the whole suite job. An empty ENUMERATION (0
-                # registered files, e.g. a list_tests/run_suite filter drift)
-                # falls back to 'true' so the job runs the full suite instead of
-                # silently vanishing. Anything else ('true', or a missing output
-                # from a failed step) means full-suite run.
+                # caller skips the whole suite job; or for ALL suites under the
+                # skip-all rule (nothing recommended, all changes confined to
+                # python/sglang/). An empty ENUMERATION (0 registered files,
+                # e.g. a list_tests/run_suite filter drift) falls back to
+                # 'true' so the job runs the full suite instead of silently
+                # vanishing. Anything else ('true', or a missing output from a
+                # failed step) means full-suite run.
                 should_run = (
                     "false"
-                    if (precision_mode and suite_pool_sizes[suite] and not files)
+                    if (
+                        skip_all_suites
+                        or (precision_mode and suite_pool_sizes[suite] and not files)
+                    )
                     else "true"
                 )
                 out.write(f"should_run_{key}={should_run}\n")
 
-    if args.github_summary:
+    if args.github_summary or args.report_file:
         write_github_summary(
-            args.github_summary,
+            [p for p in (args.github_summary, args.report_file) if p],
             raw_entries,
             recommended,
             all_pool,
             buckets,
             suite_pool_sizes,
             precision_mode,
+            skip_all_suites,
         )
 
 
