@@ -1377,21 +1377,20 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         msg_type = message.get("type")
         if msg_type == "function_call":
-            # Coerce ``arguments`` to a valid JSON-object string so the chat
-            # template's unconditional ``orjson.loads`` survives truncated or
-            # dict-shaped echoes.
             raw = message.get("arguments")
             if isinstance(raw, str):
                 try:
-                    parsed = orjson.loads(raw) if raw else None
-                except orjson.JSONDecodeError:
-                    parsed = None
+                    parsed = orjson.loads(raw)
+                except orjson.JSONDecodeError as exc:
+                    raise ValueError(
+                        "function_call arguments must be valid JSON"
+                    ) from exc
                 if not isinstance(parsed, dict):
-                    raw = "{}"
+                    raise ValueError("function_call arguments must be a JSON object")
             elif isinstance(raw, dict):
                 raw = orjson.dumps(raw).decode("utf-8")
             else:
-                raw = "{}"
+                raise ValueError("function_call arguments must be a JSON object")
             return cls._chat_tool_call_message(message, message.get("name"), raw)
         if msg_type == "custom_tool_call":
             # Replay through the same single-string shim the tool was offered as.

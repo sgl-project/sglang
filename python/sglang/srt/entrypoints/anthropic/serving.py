@@ -84,6 +84,10 @@ ERROR_TYPE_MAP = {
 }
 
 
+class _InvalidToolArguments(ValueError):
+    """Model output cannot be represented as an Anthropic tool input."""
+
+
 def _cached_prompt_tokens(usage) -> int:
     prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
     return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
@@ -781,7 +785,12 @@ class AnthropicServing:
             return self._convert_openai_error_response(response)
 
         # Convert to Anthropic response
-        anthropic_response = self._convert_response(response)
+        try:
+            anthropic_response = self._convert_response(response)
+        except _InvalidToolArguments as exc:
+            return self._error_response(
+                status_code=502, error_type="api_error", message=str(exc)
+            )
         return JSONResponse(content=anthropic_response.model_dump(exclude_none=True))
 
     async def _handle_streaming(
@@ -1284,17 +1293,14 @@ class AnthropicServing:
                 raw_args = tool_call.function.arguments
                 try:
                     tool_input = json.loads(raw_args)
-                except (json.JSONDecodeError, TypeError):
-                    # Surface invalid tool arguments so an empty-dict
-                    # tool call is never indistinguishable from a real
-                    # one when something downstream goes wrong.
-                    logger.warning(
-                        "Tool %r emitted invalid JSON arguments: %r — "
-                        "defaulting to empty input",
-                        tool_call.function.name,
-                        (raw_args or "")[:200],
+                except (json.JSONDecodeError, TypeError) as exc:
+                    raise _InvalidToolArguments(
+                        "Model emitted invalid JSON tool arguments"
+                    ) from exc
+                if not isinstance(tool_input, dict):
+                    raise _InvalidToolArguments(
+                        "Model tool arguments must be a JSON object"
                     )
-                    tool_input = {}
 
                 content.append(
                     ToolUseBlock(
