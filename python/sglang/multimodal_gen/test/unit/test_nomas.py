@@ -15,7 +15,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.nomas import (
     nomas_postprocess_text,
 )
 from sglang.multimodal_gen.runtime.models.dits.nomas import NomasTransformer3DModel
-from sglang.multimodal_gen.runtime.models.dits.nomas_layers.kv import (
+from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import (
     NomasAttentionPlan,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
@@ -82,7 +82,7 @@ def condition(device="cpu", dtype=torch.float32, padded=True):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @torch.inference_mode()
 def test_shared_modulation_and_residual_preserve_rounding(tokens, dtype):
-    from sglang.multimodal_gen.runtime.models.dits.nomas_layers.blocks import (
+    from sglang.multimodal_gen.runtime.models.dits.nomas_layers import (
         gated_residual,
         modulate,
     )
@@ -718,7 +718,7 @@ def test_latent_preparation_preserves_offline_noise_and_skips_online_draw(online
 
 
 def test_local_token_range_requires_divisible_tokens():
-    from sglang.multimodal_gen.runtime.models.dits.nomas_layers.parallel import (
+    from sglang.multimodal_gen.runtime.models.dits.nomas_layers import (
         ParallelInfo,
         local_token_range,
     )

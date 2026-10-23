@@ -488,7 +488,7 @@ def test_segment_payload_validation():
 
 @torch.inference_mode()
 def test_growth_failure_after_eviction_requires_reset(monkeypatch):
-    from sglang.multimodal_gen.runtime.models.dits.nomas_layers.kv import NomasCache
+    from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import NomasCache
 
     model = tiny_model()
     c = condition()
