@@ -77,6 +77,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
@@ -951,6 +952,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         a reason rejects the peer, ``fully_checked`` retires the per-transfer
         check.
         """
+        if (
+            get_spec().speculative_algorithm == "DFLASH"
+            # Bootstrap runs concurrently with temporary draft TP scopes.
+            # Use the manager's captured target layout, not scoped CP flags.
+            and self.state_tp_size != self.attn_tp_size
+            and registration_info.dst_attn_tp_size != self.state_tp_size
+        ):
+            # Appended draft MHA KV uses physical TP shards, while target MLA
+            # KV is replicated. The draft transfer cannot reslice those shards.
+            return False, (
+                "CP/TP-sharing DFLASH PD requires the same physical TP size: "
+                f"prefill={self.state_tp_size}, "
+                f"decode={registration_info.dst_attn_tp_size}"
+            )
         state_types = getattr(self.kv_args, "state_types", [])
         fully_checked = True
         for i, st in enumerate(state_types):

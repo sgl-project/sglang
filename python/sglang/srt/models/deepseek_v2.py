@@ -1869,6 +1869,12 @@ class DeepseekV2MoE(nn.Module):
     def _routed_mxfp8_prequant_static_enabled(self) -> bool:
         return self._compute_routed_mxfp8_prequant_enabled()[0]
 
+    @cached_property
+    def mega_gate_supported(self) -> bool:
+        from sglang.srt.layers.moe.mega_gate import mega_gate_supported
+
+        return mega_gate_supported(self)
+
     def _compute_routed_mxfp8_prequant_enabled(self) -> Tuple[bool, str]:
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
 
