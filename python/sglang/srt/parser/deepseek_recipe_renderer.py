@@ -15,7 +15,7 @@ DEEPSEEK_RECIPE_INSTALL_HINT = (
     "`pip install deepseek-recipe`."
 )
 
-MODEL_NAMES = {"v4": "DeepSeek-V4-Pro", "v41": "DeepSeek-V4.1-Flash"}
+MODEL_NAMES = {"dsv4": "DeepSeek-V4-Pro", "dsv41": "DeepSeek-V4.1-Flash"}
 # The checkpoint tokenizer's image token; recipe's bundled tokenizer spells it <｜image｜>.
 IMAGE_TOKEN = "<｜deepseek_image｜>"
 ASSISTANT_TOKEN = "<｜Assistant｜>"
@@ -69,24 +69,15 @@ def pre_normalize(body: dict[str, Any]) -> dict[str, Any]:
     response_format = request.get("response_format")
     if response_format and response_format.get("type") == "structural_tag":
         del request["response_format"]
-    _normalize_tool_choice(request)
-    continue_final = bool(request.pop("continue_final_message", False))
-    _normalize_history(request["messages"], continue_final)
-    return request
-
-
-def _normalize_tool_choice(request: dict[str, Any]) -> None:
-    """`required` and a named tool render as `auto`: SGLang enforces the choice
-    with its grammar, which expects the model to open the calls block itself."""
     choice = request.get("tool_choice")
     if not request.get("tools") or choice == "none":
         request.pop("tools", None)
         request.pop("tool_choice", None)
     elif choice == "required" or isinstance(choice, dict):
+        # SGLang enforces the choice with its grammar, which expects the model
+        # to open the calls block itself.
         request["tool_choice"] = "auto"
-
-
-def _normalize_history(messages: list[dict[str, Any]], continue_final: bool) -> None:
+    messages = request["messages"]
     for message in messages:
         if message["role"] == "developer":
             message["role"] = "system"
@@ -96,8 +87,10 @@ def _normalize_history(messages: list[dict[str, Any]], continue_final: bool) -> 
                 function["arguments"] = json.dumps(
                     function["arguments"], ensure_ascii=False, separators=(",", ":")
                 )
+    continue_final = request.pop("continue_final_message", False)
     if continue_final and messages and messages[-1]["role"] == "assistant":
         messages[-1]["prefix"] = True
+    return request
 
 
 def _error_message(body: Any) -> str:
@@ -111,30 +104,31 @@ class RecipeEncoder:
     """`tokenizer` is the checkpoint's `tokenizers.Tokenizer`; recipe encodes prompts
     with its own copy of it, and the SGLang extensions splice ids from the original."""
 
-    def __init__(self, model_version: str, tokenizer: Any):
+    def __init__(self, chat_encoding_spec: str, tokenizer: Any):
         recipe = load_deepseek_recipe()
-        self.model = MODEL_NAMES[model_version]
+        self.model = MODEL_NAMES[chat_encoding_spec]
         self.hf_tokenizer = tokenizer
         special = recipe.SpecialTokens(image=IMAGE_TOKEN)
         self._options = recipe.ConversionOptions().with_special_tokens(special)
         encoding = (
             recipe.DeepseekV4Encoding()
-            if model_version == "v4"
+            if chat_encoding_spec == "dsv4"
             else recipe.DeepseekV41Encoding()
         )
-        self.tokenizer = recipe.Tokenizer.from_str(tokenizer.to_str())
         self._encoding = encoding.with_special_tokens(special).with_tokenizer(
-            self.tokenizer
+            recipe.Tokenizer.from_str(tokenizer.to_str())
         )
 
     @classmethod
-    def from_hf_tokenizer(cls, model_version: str, tokenizer: Any) -> RecipeEncoder:
+    def from_hf_tokenizer(
+        cls, chat_encoding_spec: str, tokenizer: Any
+    ) -> RecipeEncoder:
         backend = getattr(tokenizer, "backend_tokenizer", None)
         if backend is None:
             raise ValueError(
                 "deepseek-recipe needs the checkpoint's fast tokenizer (tokenizer.json)"
             )
-        return cls(model_version, backend)
+        return cls(chat_encoding_spec, backend)
 
     def encode(
         self,

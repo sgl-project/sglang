@@ -15,7 +15,6 @@ from sglang.srt.utils import ImageData
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-MODEL_VERSIONS = {"dsv4": "v4", "dsv41": "v41"}
 DEFAULT_EFFORT_ENVS = {
     "dsv4": envs.SGLANG_DSV4_REASONING_EFFORT,
     "dsv41": envs.SGLANG_DSV41_REASONING_EFFORT,
@@ -36,9 +35,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         default_chat_template_kwargs: Optional[dict[str, Any]],
     ):
         self._spec = chat_encoding_spec
-        self.encoder = RecipeEncoder.from_hf_tokenizer(
-            MODEL_VERSIONS[chat_encoding_spec], tokenizer
-        )
+        self.encoder = RecipeEncoder.from_hf_tokenizer(chat_encoding_spec, tokenizer)
         raw = (DEFAULT_EFFORT_ENVS[chat_encoding_spec].get() or "").strip()
         self._default_effort = int(raw) if raw.isdigit() else raw or None
         # Encoded at boot, so a bad server default fails startup, not requests.

@@ -2,17 +2,34 @@ import unittest
 
 from sglang.srt.parser import deepseek_recipe_renderer as renderer
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.deepseek_recipe_common import tokenizer_file, user
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
+
+
+def _tokenizer_file():
+    """The V4.1 tokenizer; only outside CI does an unreachable Hub skip the test."""
+    from huggingface_hub import hf_hub_download
+
+    try:
+        return hf_hub_download(MODEL, "tokenizer.json", revision=REVISION)
+    except Exception as error:  # noqa: BLE001
+        if is_in_ci():
+            raise
+        raise unittest.SkipTest(f"the tokenizer is not available: {error}")
 
 
 class TestPreNormalize(CustomTestCase):
     def test_developer_becomes_system(self):
         body = renderer.pre_normalize(
             {
-                "messages": [{"role": "developer", "content": "Be terse."}, user()],
+                "messages": [
+                    {"role": "developer", "content": "Be terse."},
+                    {"role": "user", "content": "x"},
+                ],
                 "thinking": False,
             }
         )
@@ -25,7 +42,7 @@ class TestPreNormalize(CustomTestCase):
         ]
         named = renderer.pre_normalize(
             {
-                "messages": [user()],
+                "messages": [{"role": "user", "content": "x"}],
                 "thinking": False,
                 "tools": tools,
                 "tool_choice": {"type": "function", "function": {"name": "b"}},
@@ -35,7 +52,7 @@ class TestPreNormalize(CustomTestCase):
         self.assertEqual(len(named["tools"]), 2)
         required = renderer.pre_normalize(
             {
-                "messages": [user()],
+                "messages": [{"role": "user", "content": "x"}],
                 "thinking": False,
                 "tools": tools,
                 "tool_choice": "required",
@@ -45,7 +62,7 @@ class TestPreNormalize(CustomTestCase):
         for tools_field, choice in ((tools, "none"), ([], "auto")):
             off = renderer.pre_normalize(
                 {
-                    "messages": [user()],
+                    "messages": [{"role": "user", "content": "x"}],
                     "thinking": False,
                     "tools": tools_field,
                     "tool_choice": choice,
@@ -58,7 +75,7 @@ class TestPreNormalize(CustomTestCase):
         body = renderer.pre_normalize(
             {
                 "messages": [
-                    user("weather?"),
+                    {"role": "user", "content": "weather?"},
                     {
                         "role": "assistant",
                         "content": None,
@@ -106,25 +123,32 @@ class TestRecipeEncoder(CustomTestCase):
         super().setUpClass()
         from tokenizers import Tokenizer
 
-        cls.tokenizer = Tokenizer.from_file(tokenizer_file())
-        cls.encoder = renderer.RecipeEncoder("v41", cls.tokenizer)
+        cls.tokenizer = Tokenizer.from_file(_tokenizer_file())
+        cls.encoder = renderer.RecipeEncoder("dsv41", cls.tokenizer)
 
     def _ids(self, *tokens):
         return [self.tokenizer.token_to_id(token) for token in tokens]
 
     def test_encodes_with_the_served_vocabulary(self):
         self.assertEqual(
-            self.encoder.encode({"messages": [user("")], "thinking": False}),
+            self.encoder.encode(
+                {"messages": [{"role": "user", "content": ""}], "thinking": False}
+            ),
             self._ids(
                 "<｜begin▁of▁sentence｜>", "<｜User｜>", "<｜Assistant｜>", "</think>"
             ),
         )
-        thinking = self.encoder.encode({"messages": [user("hi")], "thinking": True})
+        thinking = self.encoder.encode(
+            {"messages": [{"role": "user", "content": "hi"}], "thinking": True}
+        )
         self.assertEqual(thinking[-2:], self._ids("<｜Assistant｜>", "<think>"))
 
     def test_tasks_replace_or_follow_the_generation_header(self):
         for thinking in (False, True):
-            body = {"messages": [user("hello")], "thinking": thinking}
+            body = {
+                "messages": [{"role": "user", "content": "hello"}],
+                "thinking": thinking,
+            }
             plain = self.encoder.encode(body)
             for task, token in renderer.TASK_TOKENS.items():
                 with self.subTest(thinking=thinking, task=task):
@@ -135,7 +159,10 @@ class TestRecipeEncoder(CustomTestCase):
                     )
                     self.assertEqual(self.encoder.encode(body, task=task), expected)
         continued = {
-            "messages": [user("count"), {"role": "assistant", "content": "1, 2,"}],
+            "messages": [
+                {"role": "user", "content": "count"},
+                {"role": "assistant", "content": "1, 2,"},
+            ],
             "thinking": False,
             "continue_final_message": True,
         }
@@ -143,7 +170,7 @@ class TestRecipeEncoder(CustomTestCase):
             self.encoder.encode(continued, task="query")
 
     def test_effort_budget_rewrites_the_effort_line(self):
-        body = {"messages": [user("hi")], "thinking": True}
+        body = {"messages": [{"role": "user", "content": "hi"}], "thinking": True}
         high = self.tokenizer.decode(
             self.encoder.encode({**body, "reasoning_effort": "high"}),
             skip_special_tokens=False,
@@ -159,7 +186,7 @@ class TestRecipeEncoder(CustomTestCase):
                     self.tokenizer.encode(expected, add_special_tokens=False).ids,
                 )
         # Chat mode renders no effort line, so the budget changes nothing.
-        chat = {"messages": [user("hi")], "thinking": False}
+        chat = {"messages": [{"role": "user", "content": "hi"}], "thinking": False}
         self.assertEqual(
             self.encoder.encode(chat, effort_budget=30), self.encoder.encode(chat)
         )
@@ -167,7 +194,11 @@ class TestRecipeEncoder(CustomTestCase):
     def test_api_validation_surfaces_as_value_error(self):
         with self.assertRaises(ValueError):
             self.encoder.encode(
-                {"messages": [user("hi")], "thinking": True, "reasoning_effort": "x"}
+                {
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "thinking": True,
+                    "reasoning_effort": "x",
+                }
             )
 
 

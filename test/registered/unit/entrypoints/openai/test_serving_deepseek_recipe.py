@@ -2,10 +2,24 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.deepseek_recipe_common import tokenizer_file, user
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
+
+
+def _tokenizer_file():
+    """The V4.1 tokenizer; only outside CI does an unreachable Hub skip the test."""
+    from huggingface_hub import hf_hub_download
+
+    try:
+        return hf_hub_download(MODEL, "tokenizer.json", revision=REVISION)
+    except Exception as error:  # noqa: BLE001
+        if is_in_ci():
+            raise
+        raise unittest.SkipTest(f"the tokenizer is not available: {error}")
 
 
 def _serving(test, tokenizer, *, is_multimodal=False, **server_args):
@@ -75,7 +89,7 @@ class TestAdapterRegistry(CustomTestCase):
     def _fast_tokenizer(self):
         from tokenizers import Tokenizer
 
-        return SimpleNamespace(backend_tokenizer=Tokenizer.from_file(tokenizer_file()))
+        return SimpleNamespace(backend_tokenizer=Tokenizer.from_file(_tokenizer_file()))
 
     def test_bad_default_effort_fails_startup(self):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
@@ -112,7 +126,7 @@ class TestAdapterRegistry(CustomTestCase):
             "function": {**tool["function"], "strict": None},
             "defer_loading": None,
         }
-        request = ChatCompletionRequest(messages=[user("hi")])
+        request = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}])
         self.assertEqual(
             adapter.encode_messages(
                 messages=[],
@@ -137,7 +151,7 @@ class TestHandlerRequestSemantics(CustomTestCase):
         super().setUpClass()
         from transformers import PreTrainedTokenizerFast
 
-        cls.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file())
+        cls.tokenizer = PreTrainedTokenizerFast(tokenizer_file=_tokenizer_file())
 
     def _token(self, token):
         return self.tokenizer.convert_tokens_to_ids(token)
@@ -145,7 +159,9 @@ class TestHandlerRequestSemantics(CustomTestCase):
     def _prompt(self, chat, **fields):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-        request = ChatCompletionRequest(messages=[user("hi")], **fields)
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "hi"}], **fields
+        )
         return chat._process_messages(request, False)
 
     def test_thinking_defaults_off(self):
@@ -185,12 +201,19 @@ class TestHandlerRequestSemantics(CustomTestCase):
         answer = {"role": "assistant", "content": "Hel"}
         # Without continue_final_message the trailing turn becomes a user turn.
         self.assertEqual(
-            prompt([user("hi"), answer]), prompt([user("hi"), user("Hel")])
+            prompt([{"role": "user", "content": "hi"}, answer]),
+            prompt(
+                [{"role": "user", "content": "hi"}, {"role": "user", "content": "Hel"}]
+            ),
         )
         # A task renders its own tail; the continued prefix follows it.
         self.assertEqual(
-            prompt([user("hi"), answer], task="title", continue_final_message=True),
-            prompt([user("hi")], task="title")
+            prompt(
+                [{"role": "user", "content": "hi"}, answer],
+                task="title",
+                continue_final_message=True,
+            ),
+            prompt([{"role": "user", "content": "hi"}], task="title")
             + self.tokenizer.encode("Hel", add_special_tokens=False),
         )
 
@@ -222,7 +245,7 @@ class TestHandlerRequestSemantics(CustomTestCase):
         ]
         request = ChatCompletionRequest(
             messages=[
-                user("both?"),
+                {"role": "user", "content": "both?"},
                 {"role": "assistant", "content": "", "tool_calls": calls},
                 *results,
             ],
@@ -246,7 +269,7 @@ class TestHandlerRequestSemantics(CustomTestCase):
 
         chat = _serving(self, self.tokenizer)
         request = ChatCompletionRequest(
-            messages=[user("hi")],
+            messages=[{"role": "user", "content": "hi"}],
             temperature=0.0,
             chat_template_kwargs={"thinking": True, "reasoning_effort": 30},
         )

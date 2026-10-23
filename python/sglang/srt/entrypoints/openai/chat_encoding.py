@@ -110,9 +110,7 @@ def encode_simple_chat(
     if spec in ("dsv4", "dsv41"):
         from sglang.srt.parser.deepseek_recipe_renderer import RecipeEncoder
 
-        encoder = RecipeEncoder.from_hf_tokenizer(
-            "v4" if spec == "dsv4" else "v41", tokenizer
-        )
+        encoder = RecipeEncoder.from_hf_tokenizer(spec, tokenizer)
         return encoder.encode(
             {"messages": list(messages), "thinking": thinking_mode == "thinking"}
         )
