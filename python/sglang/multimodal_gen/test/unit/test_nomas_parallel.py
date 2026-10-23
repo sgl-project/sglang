@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Nomas TP, Ulysses SP and both combined reproduce the single-rank segment outputs."""
+"""Nomas TP=2 and Ulysses SP=2 reproduce the single-rank segment outputs (2-GPU lane)."""
 
 import os
 from pathlib import Path
@@ -129,57 +129,9 @@ def _launch(world_size, tp_size, backend, output_dir):
     )
 
 
-def test_local_token_range_requires_divisible_tokens():
-    from sglang.multimodal_gen.runtime.models.dits.nomas_layers.parallel import (
-        ParallelInfo,
-        local_token_range,
-    )
-
-    assert local_token_range(16, ParallelInfo(sp_size=2, sp_rank=1)) == (8, 16)
-    with pytest.raises(ValueError, match="not divisible"):
-        local_token_range(15, ParallelInfo(sp_size=2))
-
-
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA GPUs")
 @pytest.mark.parametrize("backend", ["sdpa", "flex"])
 def test_tensor_and_sequence_parallel_match_single_rank(tmp_path, backend):
     _launch(1, 1, backend, str(tmp_path))
     _launch(2, 2, backend, str(tmp_path))  # TP=2
     _launch(2, 1, backend, str(tmp_path))  # Ulysses SP=2
-
-
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four CUDA GPUs")
-@pytest.mark.parametrize("backend", ["sdpa", "flex"])
-def test_combined_tensor_and_sequence_parallel_match_single_rank(tmp_path, backend):
-    _launch(1, 1, backend, str(tmp_path))
-    _launch(4, 2, backend, str(tmp_path))  # TP=2 x Ulysses SP=2, one head per rank
-
-
-def _run_shared_memory_budget(rank, port):
-    """Use a real CPU collective without allocating on either GPU."""
-    from unittest.mock import patch
-
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas import (
-        stages,
-    )
-
-    dist.init_process_group(
-        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2
-    )
-    try:
-        group = SimpleNamespace(world_size=2, cpu_group=dist.group.WORLD)
-        with (
-            patch.object(torch.cuda, "mem_get_info", return_value=(16 + rank * 16, 64)),
-            patch.object(stages, "model_parallel_is_initialized", return_value=True),
-            patch.object(stages, "get_replica_group", return_value=group),
-        ):
-            assert stages._free_bytes(torch.device("cuda", rank)) == 16
-    finally:
-        dist.destroy_process_group()
-
-
-def test_memory_budget_uses_least_free_rank(monkeypatch):
-    monkeypatch.setenv("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "cpu")
-    mp.spawn(
-        _run_shared_memory_budget, args=(get_free_port_below_ephemeral(),), nprocs=2
-    )

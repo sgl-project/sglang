@@ -1678,6 +1678,7 @@ STANDALONE_FILES = {
         "../unit/test_async_output_save.py",
         "../unit/test_kandinsky6_sequence_parallel.py",
         "../unit/test_kandinsky6_sr_sequence_parallel.py",
+        "../unit/test_nomas_parallel.py",
         "../unit/test_qwen_image21_distributed.py",
     ],
 }
@@ -1738,6 +1739,7 @@ STANDALONE_FILE_EST_TIMES = {
         "../unit/test_async_output_save.py": 20.0,
         "../unit/test_kandinsky6_sequence_parallel.py": 90.0,
         "../unit/test_kandinsky6_sr_sequence_parallel.py": 90.0,
+        "../unit/test_nomas_parallel.py": 60.0,
         "../unit/test_qwen_image21_distributed.py": 40.0,
     },
 }
