@@ -905,11 +905,11 @@ def get_free_cpu_memory() -> int:
     return free_cpu_memory
 
 
-def get_free_cpu_memory_per_rank() -> int:
+def get_free_cpu_memory_per_rank() -> float:
     free_cpu_memory = psutil.virtual_memory().available
 
     numa_count = len({node for _, _, _, node in parse_lscpu_topology()}) or 1
-    memory_per_rank = free_cpu_memory // numa_count
+    memory_per_rank = free_cpu_memory / numa_count
 
     instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
     instance_current_cpu_memory = get_instance_memory_status(
@@ -929,10 +929,10 @@ def get_free_cpu_memory_per_rank() -> int:
             else 1
         )
         memory_per_rank = min(
-            memory_per_rank, instance_free_cpu_memory // num_local_ranks
+            memory_per_rank, instance_free_cpu_memory / num_local_ranks
         )
 
-    return memory_per_rank
+    return round(memory_per_rank, 3)
 
 
 def get_cpu_memory_capacity():
