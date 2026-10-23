@@ -1697,18 +1697,43 @@ class SchedulerDisaggregationPrefillMixin:
                     raw_kv_indices
                 )
             )
-            page_indices = kv_to_page_indices(kv_indices, page_size)
-            segment_is_last = last_chunk and is_final_segment
-            if not req.disagg_kv_sender.should_send_kv_chunk(
-                len(page_indices), segment_is_last
+            sender = req.disagg_kv_sender
+            indices_event = None
+            if getattr(sender, "supports_host_tensor_indices", False) and not (
+                sender.kv_mgr.enable_all_cp_ranks_for_transfer
+                and not get_parallel().enable_dsa_cache_layer_split
             ):
+                # The schedule stream waits on the in-flight forward; move the
+                # D2H wait to the transfer worker so scheduling can continue.
+                page_indices_dev = kv_indices[::page_size] // page_size
+                page_indices = torch.empty(
+                    page_indices_dev.shape,
+                    dtype=page_indices_dev.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                page_indices.copy_(page_indices_dev, non_blocking=True)
+                indices_event = torch.cuda.Event()
+                indices_event.record(torch.cuda.current_stream())
+            else:
+                page_indices = kv_to_page_indices(kv_indices, page_size)
+            segment_is_last = last_chunk and is_final_segment
+            if not sender.should_send_kv_chunk(len(page_indices), segment_is_last):
                 continue
             send_state_indices = state_indices if segment_is_last else None
-            req.disagg_kv_sender.send(
-                page_indices,
-                send_state_indices,
-                num_kv_tokens=seg_end - seg_start,
-            )
+            if indices_event is not None:
+                sender.send(
+                    page_indices,
+                    send_state_indices,
+                    num_kv_tokens=seg_end - seg_start,
+                    indices_event=indices_event,
+                )
+            else:
+                sender.send(
+                    page_indices,
+                    send_state_indices,
+                    num_kv_tokens=seg_end - seg_start,
+                )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.
