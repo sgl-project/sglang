@@ -2,7 +2,6 @@ export const config = {
   modelName: "Beam 1.0",
   supportedHardware: ["b300", "gb300", "h200"],
   groupHardware: false,
-  runModes: ["python"],
   showPlaygroundLink: false,
   accuracyLabels: [["gsm8k_pct", "GSM8K", "%"]],
   matchDims: [
@@ -42,6 +41,11 @@ export const config = {
     CURL_PORT: { target: "curl", label: "Server port", default: "30000" },
   },
   curl: `curl http://{{CURL_HOST}}:{{CURL_PORT}}/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"beam","messages":[{"role":"user","content":"Hello"}]}'`,
+  dockerImages: {
+    b300: "lmsysorg/sglang:beam",
+    gb300: "lmsysorg/sglang:beam",
+    h200: "lmsysorg/sglang:beam",
+  },
   github: {
     cookbookModel: "reflection/Beam-1.0-501B-A23B",
   },
