@@ -3738,6 +3738,7 @@ dependencies = [
  "pyo3",
  "serde_json",
  "sglang-api-types",
+ "subtle",
  "tokenizers",
  "tokio",
  "tokio-stream",
