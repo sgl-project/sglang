@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Shared segment executor for the registered pipeline and numerical parity tests."""
+"""Nomas segment denoising: per-segment Euler loop and KV cache write."""
 
 import math
 import threading
