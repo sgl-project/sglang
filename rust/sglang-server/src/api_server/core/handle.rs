@@ -354,7 +354,7 @@ impl CoreHandle {
         })
     }
 
-    async fn control(&self, request: ControlRequest) -> Result<bytes::Bytes, CoreError> {
+    pub(super) async fn control(&self, request: ControlRequest) -> Result<bytes::Bytes, CoreError> {
         let mut call = self.submit(RequestKind::Control(Box::new(request))).await?;
         match call.recv().await {
             Some(ResponseItem::Control(bytes)) => Ok(bytes),
@@ -1373,15 +1373,7 @@ mod tests {
             shutdown_rx,
         );
         let dispatcher = std::thread::spawn(move || dispatcher.run());
-        let handle = configured_handle(
-            intake_tx,
-            abort_tx,
-            8,
-            activity,
-            true,
-            false,
-            Vec::new(),
-        );
+        let handle = configured_handle(intake_tx, abort_tx, 8, activity, true, false, Vec::new());
         let probe_handle = handle.clone();
         let probe =
             tokio::spawn(async move { probe_handle.probe_health(Duration::from_secs(1)).await });

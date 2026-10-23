@@ -4,8 +4,9 @@ Eager prefill steps replay them directly. A prefill-graph shape of at least
 ``SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS`` tokens replays them from one
 eager break, through bridge buffers; smaller shapes keep the tail captured.
 
-Under DP attention every rank replays the largest rank's bucket. MegaMoE agrees
-on it through a host gather, so it needs the prefill graph off.
+Under DP attention every rank replays the largest rank's bucket. In an eager step
+MegaMoE agrees on it through a host gather; the prefill-graph break reads every
+rank's rows from the pre-forward exchange.
 """
 
 from __future__ import annotations
@@ -19,7 +20,10 @@ import torch
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import dp_gather_replicate
+from sglang.srt.layers.dp_attention import (
+    dp_gather_replicate,
+    note_rank_barrier_in_prefill_graph,
+)
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -282,7 +286,6 @@ class DecoderReplayTail:
 
         return (
             num_tokens >= envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS.get()
-            and (get_parallel().attn_dp_size == 1 or get_moe_a2a_backend().is_none())
             and tail.cp_metadata is None
             and not is_unified_kv_triton()
             # Encoder replay's folded rows are not checked against the exact tail.
@@ -650,6 +653,8 @@ def _tail_layers_in_prefill_graph(
     input_ids: torch.Tensor,
     input_ids_global: torch.Tensor,
 ) -> Tuple[Optional[torch.Tensor], ...]:
+    # The tail captures its row-bucket graphs on first use.
+    note_rank_barrier_in_prefill_graph()
     backend = get_attn_backend()
     saved, forward_batch = _enter_eager_tail_in_prefill_graph(
         backend, get_tc_piecewise_forward_context().forward_batch, source_kv_layer_id
