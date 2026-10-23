@@ -4,11 +4,12 @@ import unittest
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestGlm47SchemaTypes(unittest.TestCase):
+class TestGlm47SchemaTypes(CustomTestCase):
     def check_arguments(self, schema, expected, raw_values=None, name="inspect"):
         tools = [
             Tool(type="function", function=Function(name="inspect", parameters=schema))
