@@ -1395,8 +1395,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # Without a parser nothing else owns the prefix, so the tags must
         # admit it whenever the chat template turns thinking on.
         xgrammar_reasoning = (
-            self.reasoning_parser is None
-            and self._template_enables_reasoning(request)
+            self.reasoning_parser is None and self._template_enables_reasoning(request)
         )
         tool_call_constraint = None
 
