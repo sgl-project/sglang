@@ -1,6 +1,3 @@
-"""deepseek-recipe as the DeepSeek-V4 / V4.1 prompt renderer: the request
-translation, the encoder and the SGLang extensions (tasks, V4.1 integer effort)."""
-
 import unittest
 
 from sglang.srt.parser import deepseek_recipe_renderer as renderer
@@ -18,7 +15,6 @@ def _user(content="x"):
 
 
 def _tokenizer_file():
-    """The V4.1 tokenizer from the Hub cache or the Hub; skip when neither answers."""
     from huggingface_hub import hf_hub_download
 
     try:

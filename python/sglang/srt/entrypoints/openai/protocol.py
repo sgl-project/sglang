@@ -741,7 +741,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
-    # DeepSeek API: continue this final assistant message (DeepSeek-V4 / V4.1).
+    # DeepSeek API prefix completion: continue this final assistant message.
     prefix: Optional[bool] = None
 
     @field_validator("role", mode="before")

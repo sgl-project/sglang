@@ -1513,7 +1513,6 @@ class _DeepSeekV3Detector(Qwen3Detector):
         self.reasoning_default = "explicit_thinking"
 
 
-# DeepSeek-V4 / V4.1 output tokens.
 DSV4_EOS_TOKEN = "<｜end▁of▁sentence｜>"
 DSV4_THINK_START_TOKEN = "<think>"
 DSV4_THINK_END_TOKEN = "</think>"

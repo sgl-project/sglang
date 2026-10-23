@@ -22,9 +22,6 @@ DEFAULT_EFFORT_ENVS = {
 
 
 class DeepSeekRecipeChatEncodingAdapter:
-    """recipe renders and tokenizes the prompt; thinking, effort and sampling follow
-    SGLang's request rules, and output stays with the registered DeepSeek parsers."""
-
     collects_openai_media = True
     output = None
     strict_tool_call_arguments = False  # recipe serializes object arguments itself.

@@ -1,6 +1,5 @@
-"""DeepSeek-V4 / V4.1 prompts through deepseek-recipe, the library behind the official
-API: request translation, conversion, rendering and tokenization, plus the SGLang
-extensions recipe does not model (quick instruction tasks, V4.1 integer effort)."""
+"""DeepSeek-V4 / V4.1 prompts through deepseek-recipe, plus the SGLang extensions
+recipe does not model (quick instruction tasks, V4.1 integer effort)."""
 
 from __future__ import annotations
 
@@ -45,7 +44,6 @@ def load_deepseek_recipe() -> ModuleType:
 
 
 def parse_effort_budget(value: Union[int, float]) -> int:
-    """A V4.1 integer budget in [1, 100], or a float in [0, 0.99] scaled to it."""
     if isinstance(value, bool):
         raise ValueError("reasoning_effort must not be a boolean")
     if isinstance(value, int) and 1 <= value <= 100:
@@ -89,7 +87,6 @@ def _normalize_tool_choice(request: dict[str, Any]) -> None:
 
 
 def _normalize_history(messages: list[dict[str, Any]], continue_final: bool) -> None:
-    """developer -> system, object arguments -> JSON, continue_final_message -> prefix."""
     for message in messages:
         if message["role"] == "developer":
             message["role"] = "system"
@@ -104,7 +101,6 @@ def _normalize_history(messages: list[dict[str, Any]], continue_final: bool) -> 
 
 
 def _error_message(body: Any) -> str:
-    """The `error.message` of recipe's API-style error body, else the body."""
     try:
         return json.loads(body)["error"]["message"]
     except (TypeError, ValueError, KeyError):
@@ -112,10 +108,8 @@ def _error_message(body: Any) -> str:
 
 
 class RecipeEncoder:
-    """recipe's conversion options, prompt encoding and tokenizer for one served model.
-
-    `tokenizer` is the checkpoint's `tokenizers.Tokenizer`; recipe encodes prompts with
-    its own copy of it, and the SGLang extensions splice ids from the original."""
+    """`tokenizer` is the checkpoint's `tokenizers.Tokenizer`; recipe encodes prompts
+    with its own copy of it, and the SGLang extensions splice ids from the original."""
 
     def __init__(self, model_version: str, tokenizer: Any):
         recipe = load_deepseek_recipe()
@@ -135,7 +129,6 @@ class RecipeEncoder:
 
     @classmethod
     def from_hf_tokenizer(cls, model_version: str, tokenizer: Any) -> RecipeEncoder:
-        """From the served fast tokenizer, so ids come from the checkpoint's vocabulary."""
         backend = getattr(tokenizer, "backend_tokenizer", None)
         if backend is None:
             raise ValueError(
@@ -150,10 +143,8 @@ class RecipeEncoder:
         task: Optional[str] = None,
         effort_budget: Optional[int] = None,
     ) -> list[int]:
-        """Prompt ids for one request (see `pre_normalize`). Raises ValueError.
-
-        `effort_budget` (V4.1) renders recipe's "high" tier, then rewrites its budget.
-        """
+        """Prompt ids for `body` (see `pre_normalize`); a request recipe rejects
+        raises ValueError."""
         recipe = load_deepseek_recipe()
         normalized = pre_normalize(body)
         normalized["model"] = self.model
@@ -189,8 +180,9 @@ class RecipeEncoder:
     def _attach_task(
         self, prompt_ids: list[int], task: str, thinking: bool
     ) -> list[int]:
-        """Quick instruction task on the last user turn, as the V4 encoder renders it:
-        `action` follows the generation header, other tasks replace it."""
+        """A quick instruction task on the last user turn, as DeepSeek's checkpoint
+        encoder renders it: `action` follows the generation header, other tasks
+        replace it."""
         header = [
             self.hf_tokenizer.token_to_id(ASSISTANT_TOKEN),
             self.hf_tokenizer.token_to_id(

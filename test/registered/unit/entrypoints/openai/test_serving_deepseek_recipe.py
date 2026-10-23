@@ -1,6 +1,3 @@
-"""DeepSeek-V4 / V4.1 chat encoding through deepseek-recipe: the adapter
-registration and the prompt path under SGLang's request semantics."""
-
 import unittest
 from types import SimpleNamespace
 
@@ -18,7 +15,6 @@ def _user(content="x"):
 
 
 def _tokenizer_file():
-    """The V4.1 tokenizer from the Hub cache or the Hub; skip when neither answers."""
     from huggingface_hub import hf_hub_download
 
     try:
@@ -28,7 +24,6 @@ def _tokenizer_file():
 
 
 def _serving(test, tokenizer, **server_args):
-    """A chat handler configured like a V4.1 server."""
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
     from sglang.srt.runtime_context import publish, reset_context
     from sglang.srt.server_args import ServerArgs
@@ -71,8 +66,6 @@ def _serving(test, tokenizer, **server_args):
 
 
 class TestAdapterRegistry(CustomTestCase):
-    """deepseek-recipe is the builder of the dsv4 / dsv41 specs."""
-
     def _context(self, spec, tokenizer=None, default_kwargs=None):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
 
@@ -156,8 +149,6 @@ class TestAdapterRegistry(CustomTestCase):
 
 
 class TestHandlerRequestSemantics(CustomTestCase):
-    """Thinking, effort and sampling follow SGLang's rules; recipe only renders."""
-
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
