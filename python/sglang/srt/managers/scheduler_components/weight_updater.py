@@ -44,7 +44,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_model, get_parallel, get_spec
 from sglang.srt.utils.weight_checker import overall_checksum
 
 logger = logging.getLogger(__name__)
@@ -137,6 +137,21 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if (
+            recv_req.recapture_cuda_graph
+            and get_spec().enable_speculative_step_cuda_graph
+        ):
+            # The step CUDA graph replays the per-stage graphs it captured; a
+            # recapture would replace them under it. Refused on every rank
+            # before any weight is loaded.
+            message = (
+                "recapture_cuda_graph is not supported with "
+                "--enable-speculative-step-cuda-graph; no weights were loaded."
+            )
+            logger.error(message)
+            return UpdateWeightFromDiskReqOutput(
+                success=False, message=message, num_paused_requests=0
+            )
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False

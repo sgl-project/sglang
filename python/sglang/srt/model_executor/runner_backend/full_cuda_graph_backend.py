@@ -30,6 +30,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend_utils.child_graph_capture import (
+    current_child_graph_capture,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
     get_or_create_global_graph_memory_pool,
@@ -99,6 +102,10 @@ def _copy_output_to_buffer(output: Any, output_buffer: Any) -> Optional[Any]:
 class FullCudaGraphBackend(BaseCudaGraphBackend):
     """One torch.cuda.CUDAGraph per shape; attention metadata is
     captured inside the graph. Memory-saver-aware.
+
+    With ``keep_raw_graph`` the graphs keep their cudaGraph_t, so a replay
+    inside an active ``ChildGraphCapture`` can be spliced into the enclosing
+    capture as a child-graph node instead of being launched.
     """
 
     def __init__(
@@ -107,6 +114,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
         reuse_output_buffer: bool = False,
+        keep_raw_graph: bool = False,
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
@@ -118,6 +126,10 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._precarve = GraphPoolPrecarve()
         self._reuse_output_buffer = reuse_output_buffer
         self._output_buffer: Optional[Any] = None
+        self._keep_raw_graph = keep_raw_graph
+        # Bumped whenever this backend's graphs are captured or released, so a
+        # graph that spliced them as children can tell that it is stale.
+        self.graph_epoch = 0
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -179,7 +191,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             self._reuse_output_buffer = self._output_buffer is not None
         del warmup_output
 
-        graph = torch.cuda.CUDAGraph()
+        graph = torch.cuda.CUDAGraph(keep_graph=self._keep_raw_graph)
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
@@ -209,11 +221,19 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
                 if shared_output is not None:
                     out = shared_output
 
+        if self._keep_raw_graph:
+            graph.instantiate()
+
         if profiler is not None:
             profiler.step()
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        self.graph_epoch += 1
+
+    @property
+    def keep_raw_graph(self) -> bool:
+        return self._keep_raw_graph
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -228,6 +248,10 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        capture = current_child_graph_capture()
+        if capture is not None:
+            capture.add_graph(self._graphs[shape_key], owner=self)
+            return self._outputs[shape_key]
         with graph_pool_replay_scope():
             self._graphs[shape_key].replay()
         return self._outputs[shape_key]
@@ -239,3 +263,4 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs.clear()
         self._output_buffer = None
         self._pool = None
+        self.graph_epoch += 1
