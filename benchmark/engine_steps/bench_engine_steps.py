@@ -84,7 +84,7 @@ def log_steps(lines, mode, t0, t1, size, tol=None):
     the lines whose interval since the rank's previous line lies inside the window, at
     batch `size`."""
     per_rank, spans, prev, accept, seen = {}, {}, {}, [], set()
-    edges = {}
+    edges, inside = {}, []
     for m in filter(None, map(LINES[mode].search, lines)):
         ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").timestamp()
         ts, step = ts + float(m.group(2) or 0), 0.001 if m.group(2) else 1.0
@@ -99,9 +99,16 @@ def log_steps(lines, mode, t0, t1, size, tol=None):
         if start < t0 or ts + step > t1:  # stamps are truncated to `step`
             continue
         seen.add(int(m.group(4)))
+        inside.append((m, ts, step, rank, start))
+    if size is None and inside:
+        size = statistics.mode(int(m.group(4)) for m, *_ in inside)
+    for m, ts, step, rank, start in inside:
         if int(m.group(4)) == size:
             accept_len = float(m.group(5) or 1.0)
-            ms = size * accept_len / float(m.group(6)) * 1000
+            # The engine's input throughput counts replayed tokens with the new ones
+            replay = re.search(r"#replay-token: (\d+)", m.string)
+            tokens = size * accept_len + (int(replay.group(1)) if replay else 0)
+            ms = tokens / float(m.group(6)) * 1000
             per_rank.setdefault(rank, []).append(ms)
             lo, hi = spans.get(rank, (start, ts + step))
             spans[rank] = min(lo, start), max(hi, ts + step)
@@ -164,8 +171,13 @@ def check_logs(check, result, size, dp, blurred):
     errors = []
     if set(per_rank) != set(range(dp)):
         errors.append(f"expected ranks {list(range(dp))}, got {sorted(per_rank)}")
-    if set(check["sizes_seen"]) != {size}:
-        errors.append(f"expected batch size {size}, got {check['sizes_seen']}")
+    seen = check["sizes_seen"]
+    if size is None:  # prefill: one step size, near the measured new tokens per step
+        target = result["new_tokens_per_step"]
+        if len(seen) != 1 or abs(seen[0] - target) > 0.01 * target:
+            errors.append(f"expected one batch size near {target}, got {seen}")
+    elif set(seen) != {size}:
+        errors.append(f"expected batch size {size}, got {seen}")
     if not check["complete"]:
         errors.append(
             "engine lines miss part of the window on some rank; set SGLANG_LOG_MS=1 "
@@ -362,21 +374,25 @@ async def prefill(args, tp, prompt):
     )
     stamp = "scheduler" if all(s for _, s, _, _ in done) else "arrival"
     times = [s if stamp == "scheduler" else t for t, s, _, _ in done]
-    t0, t1, _, group_ms = group_window(
-        step_groups(times, per_step * args.dp), args.lo, args.hi
-    )
+    groups = step_groups(times, per_step * args.dp)
+    t0, t1, _, group_ms = group_window(groups, args.lo, args.hi)
     per_rank = [0] * args.dp
     for t, (_, _, n, r) in zip(times, done):
         per_rank[r] += n if t0 < t <= t1 else 0
-    if len(set(per_rank)) > 1:
+    # Requests count at completion, so window edges can shift a few between ranks;
+    # a rank short by a whole step's budget missed steps.
+    if max(per_rank) - min(per_rank) > B:
         raise SystemExit(f"ranks served unequal tokens in the window: {per_rank}")
     tokens = sum(per_rank)
-    steps = tokens / (B * args.dp)
+    # Count steps, not tokens / B: replayed tokens (e.g. the encoder's SWA window)
+    # share the step budget, so a full step can carry fewer than B new tokens.
+    steps = len(group_ms)
     if steps < 3:
         raise SystemExit("the window holds under three steps; raise --requests")
-    if len(group_ms) > 1.05 * steps + 1:  # a short step finishes fewer requests
+    counts = [c for end, c in groups if t0 < end <= t1]
+    if min(counts) < 0.8 * statistics.median(counts):  # a short step
         raise SystemExit(
-            f"{len(group_ms)} steps for {steps:.1f} full ones: the queue ran dry"
+            f"steps finished {min(counts)} to {max(counts)} requests: the queue ran dry"
         )
     if args.profile_steps:
         await tp.start_profile(args.profile)
@@ -388,7 +404,7 @@ async def prefill(args, tp, prompt):
         tokens=tokens,
         wall=(t0, t1),
         group_ms=group_ms,
-        size=B,
+        size=round(tokens / (steps * args.dp)),
         stamp=stamp,
     )
 
@@ -604,6 +620,8 @@ def run_benchmark(args, tp):
             sample_text = sample_output.read()
             sample_output.close()
     size = res.pop("size")
+    if args.mode == "prefill":
+        res["new_tokens_per_step"] = size
     steps, span, tokens = res["steps"], res["seconds"], res["tokens"]
     res.update(
         ms_per_step=span / steps * 1000, tok_s_per_gpu=tokens / span / args.num_gpus
@@ -628,8 +646,10 @@ def run_benchmark(args, tp):
     )
     check = {}
     if args.server_log:
-        check = log_steps(lines, args.mode, *res["wall"], size, tol)
-        check = check_logs(check, res, size, args.dp, blurred)
+        # Prefill steps carry the engine's batch, not --tokens-per-step: match any size
+        fixed = None if args.mode == "prefill" else size
+        check = log_steps(lines, args.mode, *res["wall"], fixed, tol)
+        check = check_logs(check, res, fixed, args.dp, blurred)
     record = dict(
         mode=args.mode,
         transport="engine" if args.engine else "http",

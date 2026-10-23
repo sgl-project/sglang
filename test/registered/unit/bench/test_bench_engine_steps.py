@@ -88,6 +88,19 @@ class TestLogSteps(unittest.TestCase):
         self.assertEqual(got["accept_len"], 2.5)
         got = bench.log_steps(lines, "decode", t0, t0 + 2, 63)
         self.assertEqual((got["ms_per_step_per_rank"], got["sizes_seen"]), ({}, [64]))
+        # The engine's input throughput counts replayed tokens with the new ones.
+        replayed = [
+            stamp.format(5, "DP0 TP0 EP0") + prefill.format(7936, "10000.00"),
+            stamp.format(6, "DP0 TP0 EP0")
+            + prefill.format(7936, "40960.00").replace(
+                "cuda graph", "#replay-token: 256, cuda graph"
+            ),
+        ]
+        got = bench.log_steps(replayed, "prefill", t0, t0 + 2, 7936)
+        self.assertEqual(got["ms_per_step_per_rank"], {0: 200.0})
+        # Without a size, the window's most common batch is matched.
+        got = bench.log_steps(lines, "prefill", t0, t0 + 2, None)
+        self.assertEqual(got["ms_per_step_per_rank"], {0: 200.0, 1: 163.84, 2: 100.0})
 
     def test_prefill_lines_at_step_ends(self):
         # Step ends at 10:00:05.000, .100, .200 and .300; each rank logs within 1 ms.
@@ -124,6 +137,24 @@ class TestLogSteps(unittest.TestCase):
         self.assertFalse(check({0: 90, 1: 90})["agree"])
         self.assertFalse(check({}, sizes=(), coverage=0)["agree"])
         self.assertFalse(check({0: 100, 1: 100}, blurred=True)["agree"])
+
+    def test_prefill_cross_check_takes_the_engine_batch(self):
+        # Window edges cut chunked requests, so the measured new tokens per step only
+        # approximate the engine's batch: one batch size within 1% of it agrees.
+        def check(sizes):
+            return bench.check_logs(
+                dict(
+                    ms_per_step_per_rank={0: 100}, sizes_seen=list(sizes), complete=True
+                ),
+                {"ms_per_step": 100, "new_tokens_per_step": 31793},
+                None,
+                1,
+                False,
+            )
+
+        self.assertTrue(check([31744])["agree"])
+        self.assertFalse(check([31744, 32768])["agree"])
+        self.assertFalse(check([28672])["agree"])
 
 
 class TestWorkloadGuards(unittest.TestCase):
@@ -197,6 +228,65 @@ class TestWorkloadGuards(unittest.TestCase):
                 bench.batch(args, StalledTransport(), lambda rank: [], 2, {}, [], "x")
             )
         self.assertEqual(len(cancelled), 2)
+
+    def test_prefill_steps_short_of_the_budget(self):
+        # Steps of two 2-token requests every 100 ms against a 6-token budget, as
+        # when replayed tokens share it: steps come from boundaries, not tokens / B.
+        class Transport:
+            def __init__(self):
+                self.count = 0
+
+            def server_info(self):
+                return dict(tp_size=1, dp_size=1)
+
+            def flush_cache(self):
+                return None
+
+            async def generate(self, ids, params, rank, stream):
+                self.count += 1
+                stamp = 1000 + (self.count // 2) * 0.1
+                yield (
+                    stamp,
+                    dict(prompt_tokens=9, cached_tokens=7, prefill_finished_time=stamp),
+                )
+
+            def run(self, coro):
+                return asyncio.run(coro)
+
+            def finish(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "result.json"
+            argv = [
+                "bench",
+                "prefill",
+                "--dp",
+                "1",
+                "--base-url",
+                "http://localhost",
+                "--context",
+                "9",
+                "--new-tokens",
+                "2",
+                "--tokens-per-step",
+                "6",
+                "--requests",
+                "80",
+                "--warmup-steps",
+                "1",
+                "--out",
+                str(output),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(bench, "HttpTransport", return_value=Transport()),
+                patch.object(bench, "environment", return_value={}),
+            ):
+                bench.main()
+            result = json.loads(output.read_text())["result"]
+        self.assertAlmostEqual(result["ms_per_step"], 100.0)
+        self.assertEqual(result["new_tokens_per_step"], 4)
 
     def test_prefill_record_uses_server_gpu_count(self):
         class Transport:
