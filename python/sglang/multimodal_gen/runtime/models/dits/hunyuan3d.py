@@ -173,6 +173,7 @@ class _FluxSelfAttention(nn.Module):
             supported_attention_backends = {
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.AMX_ATTN,
             }
         self.local_attn = LocalAttention(
             num_heads=self.local_num_heads,
@@ -276,6 +277,7 @@ class _FluxDoubleStreamBlock(nn.Module):
             supported_attention_backends = {
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.AMX_ATTN,
             }
         self.local_attn_joint = LocalAttention(
             num_heads=self.local_num_heads,
@@ -398,6 +400,7 @@ class _FluxSingleStreamBlock(nn.Module):
             supported_attention_backends = {
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.AMX_ATTN,
             }
         self.local_attn = LocalAttention(
             num_heads=self.local_num_heads,
