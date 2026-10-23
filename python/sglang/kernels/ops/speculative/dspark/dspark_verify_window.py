@@ -675,6 +675,8 @@ def _commit_inject_layout_kernel(
     prefix = tl.load(prefix_lens_ptr + r, mask=mask, other=0).to(tl.int64)
     pos_off = tl.load(block_pos_offsets_ptr + c, mask=mask, other=0).to(tl.int64)
     rp = tl.load(req_pool_ptr + r, mask=mask, other=0).to(tl.int64)
+    # Padded/uncommitted slots need no cache lookup. Their request-table
+    # entries may be stale or uninitialized, so mask before dereferencing them.
     commit_len = tl.load(commit_lens_ptr + r, mask=mask, other=0).to(tl.int64)
     committed = mask & (c.to(tl.int64) < commit_len)
     full_loc = tl.load(

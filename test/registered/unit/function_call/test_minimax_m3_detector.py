@@ -2,6 +2,7 @@ import json
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.minimax_m3 import MINIMAX_NS_TOKEN, MinimaxM3Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -580,6 +581,46 @@ class TestMinimaxM3TopLevelOneOf(CustomTestCase):
         calls, _ = _parse_segments(self.segments, self.tools)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["args"], self.expected)
+
+
+class TestMinimaxM3WithoutTools(CustomTestCase):
+    """A request that declares no tools still gets the model's tool call parsed."""
+
+    _CALL = ("<tool_call>", '<invoke name="list_skills">', "</invoke>", "</tool_call>")
+
+    def setUp(self):
+        self.parser = FunctionCallParser(tools=[], tool_call_parser="minimax-m3")
+
+    def test_non_stream_keeps_undeclared_call(self):
+        normal, calls = self.parser.parse_non_stream("Retrying." + _wire(*self._CALL))
+        self.assertEqual(normal, "Retrying.")
+        self.assertEqual(
+            [(c.name, json.loads(c.parameters)) for c in calls], [("list_skills", {})]
+        )
+
+    def test_stream_keeps_undeclared_call(self):
+        normal, calls = "", []
+        for chunk in ["Retrying."] + _segments(*self._CALL):
+            chunk_text, chunk_calls = self.parser.parse_stream_chunk(chunk)
+            normal += chunk_text
+            calls += chunk_calls
+        end_text, end_calls = self.parser.parse_stream_end()
+        self.assertEqual(normal + end_text, "Retrying.")
+        self.assertEqual(
+            [c["name"] for c in _collect_streamed_tool_calls(calls + end_calls)],
+            ["list_skills"],
+        )
+
+    def test_stream_end_releases_held_back_text(self):
+        """A trailing "]" held back as a possible marker start is released at stream end."""
+        parser = FunctionCallParser(tools=_make_tools(), tool_call_parser="minimax-m3")
+        normal = "".join(parser.parse_stream_chunk(c)[0] for c in ("[SILENCE", "]"))
+        self.assertEqual(normal + parser.parse_stream_end()[0], "[SILENCE]")
+
+    def test_other_parsers_skip_requests_without_tools(self):
+        text = '<tool_call>{"name": "lookup", "arguments": {}}</tool_call>'
+        parser = FunctionCallParser(tools=[], tool_call_parser="hermes")
+        self.assertEqual(parser.parse_non_stream(text), (text, []))
 
 
 if __name__ == "__main__":

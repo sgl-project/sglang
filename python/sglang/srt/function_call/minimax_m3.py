@@ -84,6 +84,10 @@ class MinimaxM3Detector(BaseFormatDetector):
             )
             return StreamingParseResult(normal_text=original_text, calls=[])
 
+    @classmethod
+    def parses_without_tools(cls) -> bool:
+        return True
+
     def supports_structural_tag(self) -> bool:
         return False
 
@@ -136,7 +140,18 @@ class MinimaxM3Detector(BaseFormatDetector):
             )
             action = {"name": func_name, "arguments": params}
             try:
-                parsed_calls = self.parse_base_json(action, tools)
+                # With no tools declared the call is kept as sent; the history names it.
+                parsed_calls = (
+                    self.parse_base_json(action, tools)
+                    if tools
+                    else [
+                        ToolCallItem(
+                            tool_index=-1,
+                            name=func_name,
+                            parameters=json.dumps(params, ensure_ascii=False),
+                        )
+                    ]
+                )
                 for call in parsed_calls:
                     call.tool_index = len(results)
                     results.append(call)
@@ -190,6 +205,14 @@ class MinimaxM3Detector(BaseFormatDetector):
                 break
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        # Outside a tool call the buffer only holds a possible marker prefix
+        # (e.g. a trailing "]"); the stream is over, so release it as text.
+        if self._in_tool_call or not self._buffer:
+            return StreamingParseResult()
+        normal_text, self._buffer = self._buffer, ""
+        return StreamingParseResult(normal_text=normal_text)
 
     def _consume_tool_call_end(self) -> bool:
         start = self._buffer.find(self.TOOL_CALL_END)

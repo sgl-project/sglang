@@ -17,6 +17,9 @@ from sglang.srt.distributed import (
     GroupCoordinator,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+    CustomAllReduceV2,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -34,6 +37,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_resources,
+    get_spec,
     get_stream,
 )
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip
@@ -182,6 +186,9 @@ class DpPaddingMode(IntEnum):
                 return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
+        if _decode_sum_len_fits_custom_all_reduce(global_num_tokens):
+            return cls.SUM_LEN
+
         # we choose the mode that minimizes the communication cost
         # prefer MAX_LEN when communication cost is equal to enable symmetric memory
         max_len = max(global_num_tokens)
@@ -192,13 +199,37 @@ class DpPaddingMode(IntEnum):
             return cls.SUM_LEN
 
     @classmethod
-    def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:
+    def get_default_mode_in_cuda_graph(
+        cls, global_num_tokens: Optional[List[int]] = None
+    ) -> DpPaddingMode:
+        """``global_num_tokens``: a decode capture's per-rank token counts."""
         # TODO(kkhuang-amd): noqa, temporary work-around for rocm 7.0.0 alpha
         # it can be safely removed later, once RCCL fixed
-        if _USE_ROCM700A_WA:
+        if _USE_ROCM700A_WA or (
+            global_num_tokens is not None
+            and _decode_sum_len_fits_custom_all_reduce(global_num_tokens)
+        ):
             return cls.SUM_LEN
         else:
             return cls.MAX_LEN
+
+
+def _decode_sum_len_fits_custom_all_reduce(global_num_tokens: List[int]) -> bool:
+    """SUM_LEN gathers and combines DP decode rows with one TP all-reduce of the
+    summed buffer; take it while the custom all-reduce can hold that buffer."""
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    comm = get_parallel().tp_group.ca_comm
+    dp = get_flags().dp
+    nbytes = sum(global_num_tokens) * dp.buffer_hidden_size * dp.buffer_dtype.itemsize
+    return (
+        len(global_num_tokens) > 1
+        and get_moe_a2a_backend().is_none()
+        and get_spec().speculative_algorithm is None
+        and isinstance(comm, CustomAllReduceV2)
+        and not comm.disabled
+        and nbytes <= comm.max_size
+    )
 
 
 class _DpGatheredBufferWrapper:

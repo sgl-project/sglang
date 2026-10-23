@@ -151,6 +151,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         write_back_staging: tuple[torch.Tensor, torch.Tensor] | None = None,
         pool_label: str = "kv",
         head_group_num: int = 1,
+        host_token_capacity: int | None = None,
     ):
         if _is_xpu:
             require_kvcacheio_ops(
@@ -220,6 +221,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=device,
             allocator_type=allocator_type,
             pool_label=pool_label,
+            host_token_capacity=host_token_capacity,
         )
         self.device_k_buffers = tuple(b for info in infos for b in info.buffers.k)
         self.device_v_buffers = tuple(b for info in infos for b in info.buffers.v)
@@ -254,7 +256,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             # transfer kernels address the fused buffer directly instead.
             self.k_data_refs = []
             self.v_data_refs = []
-        elif self.layout == "page_first":
+        elif self.layout in ("page_first", "page_first_direct"):
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
             k_transposed = self.k_buffer.transpose(0, 1)

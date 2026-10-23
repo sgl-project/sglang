@@ -187,6 +187,7 @@ class HostKVCache(abc.ABC):
         dcp_rank: int = 0,
         pool_label: str = "kv",
         is_dummy: bool = False,
+        host_token_capacity: int | None = None,
     ):
         """Allocate host pages from geometry prepared by the concrete host pool."""
         self.pool_label = pool_label
@@ -208,15 +209,24 @@ class HostKVCache(abc.ABC):
         self.dtype = dtype
         self.size_per_token = size_per_token
         self.device_capacity_tokens = device_capacity_tokens
-        if host_size > 0:
-            self.size = sync_fixed_hicache_size(
-                int(host_size * 1e9 // self.size_per_token), host_size
-            )
+        if host_token_capacity is not None:
+            if host_token_capacity <= 0 or host_token_capacity % self.page_size:
+                raise ValueError(
+                    "Host token capacity must be positive and page-aligned, got "
+                    f"{host_token_capacity} for page_size={self.page_size}"
+                )
+            self.size = host_token_capacity
+            self.page_num = self.size // self.page_size
         else:
-            self.size = int(device_capacity_tokens * host_to_device_ratio)
-        # Align up the host memory pool size to the page size
-        self.page_num = self.size // self.page_size + 1
-        self.size = self.page_num * self.page_size
+            if host_size > 0:
+                self.size = sync_fixed_hicache_size(
+                    int(host_size * 1e9 // self.size_per_token), host_size
+                )
+            else:
+                self.size = int(device_capacity_tokens * host_to_device_ratio)
+            # Reserve the padding page only when sizing an independent pool.
+            self.page_num = self.size // self.page_size + 1
+            self.size = self.page_num * self.page_size
         self.start_layer = start_layer
         self.end_layer = end_layer
         if not is_dummy:

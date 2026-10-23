@@ -68,6 +68,8 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    target_model_type,
+    target_uses_fused_argmax,
     verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.spec_sampling_mask import (
@@ -334,14 +336,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
         )
         self._verify_epilogue = None
-        target_is_dsv41 = (
-            getattr(
-                self.target_worker.model_runner.model_config.hf_text_config,
-                "model_type",
-                None,
-            )
-            == "deepseek_v41"
-        )
+        target_is_dsv41 = target_model_type(self.target_worker) == "deepseek_v41"
         static_epilogue_supported = (
             target_is_dsv41
             and self._verify_planner.mode_value == "static"
@@ -361,7 +356,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
                 tp_sync=self._tp_sync,
-                fused_argmax=target_is_dsv41,
+                fused_argmax=target_uses_fused_argmax(self.target_worker),
                 simulated_correct_len=self._simulated_correct_len,
                 simulate_fold=_is_hip and envs.SGLANG_DSPARK_SIMULATE_FOLD.get(),
                 commit_ctx=CommitInjectCtx(
@@ -742,14 +737,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             if state_slot is not None:
                 state_slot = state_slot[token_indices]
                 final_pos = final_pos[token_indices]
-        self._kv_injector.inject_target_hidden(
-            target_hidden=logits_output.hidden_states,
-            cache_loc=cache_loc,
-            positions=positions,
-            state_slot=state_slot,
-            final_pos=final_pos,
-            target_hidden_is_projected=target_hidden_is_projected,
-        )
+        # Inject under the draft's TP placement, like the draft and decode paths.
+        with self._draft_context():
+            self._kv_injector.inject_target_hidden(
+                target_hidden=logits_output.hidden_states,
+                cache_loc=cache_loc,
+                positions=positions,
+                state_slot=state_slot,
+                final_pos=final_pos,
+                target_hidden_is_projected=target_hidden_is_projected,
+            )
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
         logits_output.hidden_states_token_indices = None

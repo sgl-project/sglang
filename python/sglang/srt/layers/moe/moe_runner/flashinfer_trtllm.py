@@ -1455,16 +1455,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         use_routed_topk = True
 
     # Deferred outputs keep the padded width, so padded weights always finalize.
-    defer_finalize = _deferred_finalize_enabled.get() and hidden_pad == 0
-    if defer_finalize:
-        valid_deferred_input = (
-            use_routed_topk and TopKOutputChecker.format_is_standard(topk_output)
-        ) or (not use_routed_topk and TopKOutputChecker.format_is_bypassed(topk_output))
-        if not valid_deferred_input:
-            raise RuntimeError(
-                "FP4 deferred finalize requires either materialized routed TopK "
-                "or the logits-based bypassed TopK input"
-            )
+    defer_finalize = (
+        _deferred_finalize_enabled.get()
+        and (use_routed_topk or TopKOutputChecker.format_is_bypassed(topk_output))
+        and hidden_pad == 0
+    )
 
     symm_output = None
     if not defer_finalize:
