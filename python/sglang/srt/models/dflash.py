@@ -11,11 +11,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.communication.muse_spark_all_gather import gemm_ag_supported
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.communication.muse_spark_gemm_ag import gemm_ag
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -665,6 +668,14 @@ class DFlashDraftModel(nn.Module):
         self.lilicorr: Optional[nn.Module] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
         self.quantizable = self.supports_quantization or self.is_nemotron_35_draft
+        # gemm_ag needs the same fc input on every rank of the TP group; attention DP
+        # and prefill CP give ranks different tokens.
+        self.split_fc = (
+            not self.quantizable
+            and envs.SGLANG_OPT_DFLASH_SPLIT_FC.get()
+            and get_parallel().attn_dp_size == 1
+            and get_parallel().attn_cp_size == 1
+        )
         self.embed_tokens: Optional[VocabParallelEmbedding] = None
         if self.is_nemotron_35_draft:
             embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
@@ -732,6 +743,8 @@ class DFlashDraftModel(nn.Module):
             self.fc = nn.Linear(
                 self.num_context_features * hidden_size, hidden_size, bias=False
             )
+            # Inference-only weight; CuTe-DSL GEMMs on the split path cannot export grad tensors.
+            self.fc.weight.requires_grad_(False)
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         # The model loader calls load_weights() before set_block_size(). Build
@@ -799,10 +812,20 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = self.fc(target_hidden)
-        if self.quantizable:
-            projected = projected[0]
+        if self.split_fc:
+            projected = self._fc_split_gather(target_hidden)
+        else:
+            projected = self.fc(target_hidden)
+            if self.quantizable:
+                projected = projected[0]
         return self.hidden_norm(projected)
+
+    def _fc_split_gather(self, x: torch.Tensor) -> torch.Tensor:
+        """``self.fc(x)`` as per-rank column slices + one multicast all-gather; plain fc when unsupported."""
+        comm = get_parallel().tp_group.ca_comm
+        if not gemm_ag_supported(comm, x, self.fc.weight):
+            return self.fc(x)
+        return gemm_ag(comm, x, self.fc.weight)
 
     @torch.no_grad()
     def forward(
