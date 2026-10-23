@@ -378,17 +378,16 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         )
 
     def test_quantized_q_lora_passes_through_when_every_row_is_live(self):
-        """HIP passes q_lora as a quantized struct, which a slice cannot cut. A step
-        whose rows are all live (every decode and verify step) must hand it on as
-        is; slicing it anyway failed every decode graph capture with a TypeError."""
+        """With every row live (each decode and verify step), HIP's quantized q_lora goes
+        on uncut: slicing it raised a TypeError at decode graph capture."""
         hoisted = torch.tensor([7, 7, 9]), torch.tensor([2, 3, 3])
         q_lora = self._quantized_q_lora(3)
         self._run(*hoisted, hoisted[1].clone(), q_lora)
         self.assertIs(self.index_q_lora, q_lora)
 
     def test_dp_padding_cuts_a_quantized_q_lora_by_rows(self):
-        """Rows past the hoisted ones (DP attention padding an eager extend) are
-        dropped from every field of a quantized q_lora, which keeps its type."""
+        """DP padding past the hoisted rows must cut a quantized q_lora field by field
+        and keep its type; a plain slice raises a TypeError."""
         hoisted = torch.tensor([7, 7, 9]), torch.tensor([2, 3, 3])
         q_lora = self._quantized_q_lora(5)
         positions = torch.cat([hoisted[1], torch.zeros(2, dtype=torch.long)])

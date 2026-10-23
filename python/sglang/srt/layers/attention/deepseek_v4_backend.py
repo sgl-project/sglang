@@ -327,8 +327,8 @@ _bcg_low_ratio_source_projections = eager_on_graph(True)(_low_ratio_source_proje
 
 
 def _first_rows(act, n: int):
-    """``act``'s first n rows. HIP's quantized activations (``Mxfp8Activation``,
-    ``Fp8GridActivation``) are structs of row-major tensors, which a slice cannot cut."""
+    """First ``n`` rows of ``act``, cut field by field for HIP's quantized activations
+    (``Mxfp8Activation``, ``Fp8GridActivation``), which refuse a slice."""
     if isinstance(act, msgspec.Struct):
         return msgspec.structs.replace(
             act, **{k: getattr(act, k)[:n] for k in act.__struct_fields__}
