@@ -105,6 +105,12 @@ class SWAKVPool(BaseSWAKVPool):
             layer_num=self.swa_layer_nums,
             **swa_kv_pool_kwargs,
         )
+        for pool, layer_ids in (
+            (self.full_kv_pool, full_attention_layer_ids),
+            (self.swa_kv_pool, swa_attention_layer_ids),
+        ):
+            if isinstance(pool, MHATokenToKVPool):
+                pool.model_layer_ids = tuple(layer_ids)
         self.dsa_kv_cache_store_fp8 = False
         self.kv_cache_dim = None
         self.index_head_dim = None

@@ -1128,13 +1128,6 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
     major, minor = _torch.cuda.get_device_capability()
 
     if impl == "flashmla_sparse" or impl == "flashmla_kv":
-        try:
-            from sgl_kernel.flash_mla import (  # noqa: F401
-                flash_mla_sparse_fwd,
-                flash_mla_with_kvcache,
-            )
-        except ImportError as exc:
-            return False, f"sgl_kernel.flash_mla unavailable: {exc}"
         if major < 9:
             return False, f"{impl} requires SM>=9.0, got SM{major}.x"
         return True, ""
@@ -1255,7 +1248,7 @@ DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
 # take in FP8 deployments. The `flashmla_kv` decode kernel and *both*
 # flashmla prefill kernels are the production-relevant FP8 paths.
 DSA_FP8_COMPATIBLE_PREFILL_IMPLS: frozenset[str] = frozenset(
-    {"flashmla_sparse", "flashmla_kv", "flashmla_auto", "triton_sparse_mla"}
+    {"aiter", "flashmla_sparse", "flashmla_kv", "flashmla_auto", "triton_sparse_mla"}
 )
 DSA_FP8_COMPATIBLE_DECODE_IMPLS: frozenset[str] = frozenset(
     {"flashmla_kv", "flashmla_auto"}
@@ -1394,7 +1387,7 @@ def run_dsa_sparse_fp8_prefill_case(
 ) -> None:
     """FP8-KV-cache prefill. With `flashmla_sparse` + EXTEND + non-empty
     prefix, `get_topk_transform_method` returns `RAGGED` (the only path
-    that exercises `dequantize_k_cache_paged` + the
+    that exercises `dequantize_k_cache_paged_dsa` + the
     `topk_indices_offset` shift). With `flashmla_kv` or `flashmla_auto`
     it stays on `PAGED` topk; the auto resolver picks `flashmla_kv` for
     FP8 KV cache (`set_dsa_prefill_impl`), so `flashmla_auto` and
@@ -1402,8 +1395,8 @@ def run_dsa_sparse_fp8_prefill_case(
     if dsa_prefill_backend not in DSA_FP8_COMPATIBLE_PREFILL_IMPLS:
         testcase.skipTest(
             f"DSA prefill impl `{dsa_prefill_backend}` does not support FP8 KV "
-            f"cache (only `flashmla_sparse`, `flashmla_kv`, and `flashmla_auto` "
-            f"read FP8 K directly; others require BF16 K)."
+            f"cache (only `aiter`, `flashmla_sparse`, `flashmla_kv`, and "
+            f"`flashmla_auto` read FP8 K directly; others require BF16 K)."
         )
     if not case.forward_mode.is_extend_without_speculative():
         raise ValueError("run_dsa_sparse_fp8_prefill_case expects an EXTEND case.")

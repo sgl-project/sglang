@@ -104,48 +104,6 @@ def _looks_like_gguf(path: str) -> bool:
     )
 
 
-def _h3_detect_companion(gguf_ref: str) -> str:
-    """ComfyUI detect needs H3 safetensors keys; GGUF only overrides the DiT."""
-    name = os.path.basename(gguf_ref).lower()
-    prefer = []
-    if "ref2va" in name:
-        prefer.append("minimax_h3_ref2va_bf16.safetensors")
-    prefer.extend(
-        [
-            "minimax_h3_fl2va_bf16.safetensors",
-            "minimax_h3_ref2va_bf16.safetensors",
-        ]
-    )
-    folders = (
-        [os.path.dirname(os.path.abspath(gguf_ref))]
-        if os.path.dirname(gguf_ref)
-        else []
-    )
-    try:
-        import folder_paths
-
-        folders.extend(folder_paths.get_folder_paths("diffusion_models"))
-    except Exception:
-        pass
-    seen: set[str] = set()
-    for folder in folders:
-        if not folder:
-            continue
-        for candidate in prefer:
-            path = os.path.join(folder, candidate)
-            if path in seen:
-                continue
-            seen.add(path)
-            if os.path.isfile(path):
-                return path
-    raise ValueError(
-        "GGUF transformer needs a MiniMax-H3 BF16 safetensors in "
-        "models/diffusion_models for ComfyUI architecture detect "
-        f"(looked for {prefer}). Keep --model-path / unet_name on the "
-        "BF16 file and pass the GGUF via transformer_weights_path."
-    )
-
-
 _NATIVE_MODEL_TYPES = {"FastH3Pipeline": "fast_h3", "VDNH3Pipeline": "vdn_h3"}
 NATIVE_MODEL_TYPES = tuple(_NATIVE_MODEL_TYPES.values())
 
@@ -210,10 +168,16 @@ def _h3_unet_config_from_native(model_dir: str) -> dict:
 
 def _load_state_dict_for_detection(model_path: str):
     if _looks_like_gguf(model_path):
-        raise ValueError(
-            f"Cannot detect architecture from GGUF {model_path!r}. "
-            "Use a MiniMax-H3 BF16 safetensors for detect."
+        # Same header-only trick as safetensors: tensor names and logical
+        # (unpacked) shapes are all detect_unet_config looks at.
+        from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+            read_gguf_tensor_meta,
         )
+
+        return {
+            name: _HeaderTensor(meta.logical_shape)
+            for name, meta in read_gguf_tensor_meta(model_path).items()
+        }
     if model_path.endswith(".safetensors"):
         from safetensors import safe_open
 
@@ -322,7 +286,11 @@ class SGLDiffusionGenerator:
             _SHARED.close_generator()
 
     def init_generator(
-        self, model_path: str, pipeline_class_name: str, kwargs: dict = None
+        self,
+        model_path: str,
+        pipeline_class_name: str,
+        kwargs: dict = None,
+        worker_patches=(),
     ):
         """Initialize the diffusion generator."""
         if self.generator is not None:
@@ -352,7 +320,11 @@ class SGLDiffusionGenerator:
             kwargs.setdefault("model_id", _H3_MODEL_IDS[pipeline_class_name])
         kwargs = self._server_args_kwargs(kwargs)
         try:
-            with _spawn_without_launcher_main():
+            from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+                scheduler_profiles,
+            )
+
+            with scheduler_profiles(worker_patches), _spawn_without_launcher_main():
                 self.generator = DiffGenerator.from_pretrained(
                     model_path=model_path,
                     pipeline_class_name=pipeline_class_name,
@@ -527,11 +499,11 @@ class SGLDiffusionGenerator:
             if new_sd is not None:  # diffusers mmdit
                 model_config = model_detection.model_config_from_unet(new_sd, "")
                 if model_config is None:
-                    return None
+                    raise ValueError(f"No ComfyUI model config for {model_path!r}")
             else:  # diffusers unet
                 model_config = model_detection.model_config_from_diffusers_unet(sd)
                 if model_config is None:
-                    return None
+                    raise ValueError(f"No ComfyUI model config for {model_path!r}")
 
                 diffusers_keys = unet_to_diffusers(model_config.unet_config)
                 new_sd = {}
@@ -576,6 +548,13 @@ class SGLDiffusionGenerator:
             )
         check_sgld_options(sgld_options)
         plugin = {k: sgld_options.pop(k) for k in PLUGIN_KEYS if k in sgld_options}
+        from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+            canonical_profiles,
+            validate_options,
+        )
+
+        patches = canonical_profiles(plugin.get("worker_patches"))
+        reload_kwargs["sgld_options"]["worker_patches"] = patches
         set_model_type = plugin.get("model_type")
         if set_model_type in NATIVE_MODEL_TYPES:
             raise ValueError(
@@ -596,8 +575,6 @@ class SGLDiffusionGenerator:
         else:
             sgld_options.pop("transformer_weights_path", None)
         detect_path = model_path
-        if _looks_like_gguf(model_path):
-            detect_path = _h3_detect_companion(sgld_options["transformer_weights_path"])
         gather_options = {
             "model_path": detect_path,
             "model_options": model_options,
@@ -605,8 +582,10 @@ class SGLDiffusionGenerator:
             "set_model_type": set_model_type,
             "runtime_model_path": runtime_model_path,
             "int8_kernel": plugin.get("int8_kernel", "auto"),
+            "worker_patch_identity": patches,
         }
         if self._can_reuse(gather_options):
+            validate_options(patches, self.model_type, {**sgld_options, **plugin})
             check_model_options(
                 self.model_type, {**sgld_options, **plugin}, native_dir=native_dir
             )
@@ -624,6 +603,7 @@ class SGLDiffusionGenerator:
         check_model_options(
             model_type, {**sgld_options, **plugin}, native_dir=native_dir
         )
+        validate_options(patches, model_type, {**sgld_options, **plugin})
         if model_type == "fast_h3":
             load_fasth3_release(runtime_model_path)
         if model_type == "minimax_h3":
@@ -645,7 +625,10 @@ class SGLDiffusionGenerator:
         )
         with _worker_env(worker_env):
             self.generator = self.init_generator(
-                worker_model_path, pipeline_class_name, sgld_options
+                worker_model_path,
+                pipeline_class_name,
+                sgld_options,
+                worker_patches=patches,
             )
         self.model_type = model_type
 

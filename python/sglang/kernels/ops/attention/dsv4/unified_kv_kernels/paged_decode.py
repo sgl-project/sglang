@@ -52,13 +52,13 @@ the captured launch sequence.
 from __future__ import annotations
 
 import functools
-import os
 
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_gfx1250_supported
 
@@ -86,7 +86,7 @@ _TARGET_WG_PER_CU = 1.5 if _is_hip else 2.0
 # halving from bf16→fp8 = 2× saving — net ~46% read bandwidth reduction).
 _FP8_GROUP_SIZE = 64
 # Match the KV-cache write format: fnuz only on AMD gfx942; Other platform e.g.
-# gfx950 store e4m3fn. See quant_k_cache.py / indexer.py FP8_DTYPE.
+# gfx950 store e4m3fn. See quantization/dsa_quant_k_cache.py / indexer.py FP8_DTYPE.
 _FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 
@@ -117,10 +117,10 @@ _FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 # End to end on DSv4 / MI355X / c128, n-weighted at matched batch size against
 # the same config with the plain heuristic: decode step 121.76 -> 114.12 ms
 # (-7.50 ms, -6.2 %). At c256 the gain is smaller (-5.37 ms of 156.19).
-_HCA_KV_SPLITS = int(os.environ.get("SGLANG_MLA_HCA_KV_SPLITS", "4"))
+_HCA_KV_SPLITS = envs.SGLANG_MLA_HCA_KV_SPLITS.get()
 
 
-def _kv_splits_for_stream(compress_ratio: int) -> int | None:
+def kv_splits_for_stream(compress_ratio: int) -> int | None:
     """-> kv_splits override for a decode stream, or None to keep the heuristic.
 
     Only the unclamped stream is overridden. SWA (ratio 0) is a 128-entry
@@ -951,7 +951,7 @@ def sparse_attn_v4_paged_decode(
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
 
     ``kv_splits`` overrides `_kv_splits_heuristic`. The caller knows the layer's
-    ``compress_ratio`` and the heuristic does not; see `_kv_splits_for_stream`.
+    ``compress_ratio`` and the heuristic does not; see `kv_splits_for_stream`.
     """
     if _is_gfx1250_supported:
         # aiter ships only on ROCm, and this module is imported by a CPU-registered

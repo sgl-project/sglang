@@ -201,8 +201,9 @@ def test_default_value_projection_matches_bmm(monkeypatch, fp8):
 
 
 @pytest.mark.parametrize("carry_indices", [None, False, True])
+@pytest.mark.parametrize("lora_mode", ["legacy", "v2", "experimental"])
 def test_projection_override_keeps_lora_gate_and_output_order(
-    monkeypatch, carry_indices
+    monkeypatch, carry_indices, lora_mode
 ):
     values = torch.ones(3, 2, 4)
     indices = torch.zeros(3, 2, dtype=torch.int32)
@@ -213,9 +214,25 @@ def test_projection_override_keeps_lora_gate_and_output_order(
         torch.testing.assert_close(value, values)
         return torch.full((3, 6), 2.0)
 
-    def lora(module, value, projected):
+    prepared = object()
+
+    def prepare_lora(module, value):
+        events.append("prepare_lora")
+        assert module is attn
+        torch.testing.assert_close(value, values)
+        return prepared
+
+    def apply_lora(projected):
         events.append("lora")
         return projected + 3
+
+    def apply_v2(state, projected):
+        assert state is prepared
+        return apply_lora(projected)
+
+    def apply_experimental(module, value, projected, state):
+        assert state is prepared
+        return apply_lora(projected)
 
     def gate(projected, gate):
         events.append("gate")
@@ -237,9 +254,32 @@ def test_projection_override_keeps_lora_gate_and_output_order(
         apply_attention_output_gate=gate,
         o_proj=output,
     )
-    monkeypatch.setattr(forward_mla, "_SGLANG_EXPERIMENTAL_LORA_OPTI", False)
-    monkeypatch.setattr(forward_mla, "is_kv_b_lora_active", lambda _: True)
-    monkeypatch.setattr(forward_mla, "apply_kv_b_lora_v_correction", lora)
+    monkeypatch.setattr(
+        forward_mla, "_SGLANG_EXPERIMENTAL_LORA_OPTI", lora_mode == "experimental"
+    )
+    monkeypatch.setattr(forward_mla, "kv_b_lora_correction", lambda _: lora_mode)
+    if lora_mode == "legacy":
+        from sglang.srt.lora import deepseek_mla_correction
+
+        monkeypatch.setattr(
+            deepseek_mla_correction,
+            "apply_v_correction",
+            lambda module, value, projected: apply_lora(projected),
+        )
+    elif lora_mode == "v2":
+        from sglang.srt.lora.dense import mla_correction
+
+        monkeypatch.setattr(mla_correction, "prepare_v_correction", prepare_lora)
+        monkeypatch.setattr(mla_correction, "apply_correction", apply_v2)
+    else:
+        from sglang.srt.lora.trtllm_lora_temp import deepseek_mla_correction
+
+        monkeypatch.setattr(
+            deepseek_mla_correction, "kv_b_lora_v_prepare", prepare_lora
+        )
+        monkeypatch.setattr(
+            deepseek_mla_correction, "kv_b_lora_v_apply", apply_experimental
+        )
     result = MLA.forward_absorb_core(
         attn,
         None,
@@ -253,7 +293,8 @@ def test_projection_override_keeps_lora_gate_and_output_order(
         None,
         attention_output_gate=torch.tensor(5.0),
     )
-    assert events == ["projection", "lora", "gate", "output"]
+    expected = [] if lora_mode == "legacy" else ["prepare_lora"]
+    assert events == expected + ["projection", "lora", "gate", "output"]
     if carry_indices is not None:
         result, returned_indices = result
         assert returned_indices is (indices if carry_indices else None)

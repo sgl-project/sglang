@@ -53,6 +53,7 @@ def test_eager_metadata_hook_sees_current_request_page_table(monkeypatch):
     page_table = torch.arange(32, dtype=torch.int32).reshape(4, 8)
     backend = SimpleNamespace(
         req_to_token_pool=SimpleNamespace(req_to_token=page_table),
+        _kv_shard_pool=None,
         set_dsa_prefill_impl=lambda batch: None,
         dsa_decode_impl="trtllm",
         use_mha=False,
@@ -172,7 +173,7 @@ def test_multistep_refreshes_custom_metadata_for_every_child(monkeypatch, path):
         )
 
     children[0]._precompute_replay_metadata = precompute
-    module = ModuleType("sglang.kernels.ops.attention.fused_metadata_copy")
+    module = ModuleType("sglang.kernels.ops.attention.dsa.fused_metadata_copy")
 
     def fused_copy(*args):
         if path == "fallback":

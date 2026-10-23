@@ -121,6 +121,7 @@ class BenchArgs:
     return_logprob: bool = False
     client_stream_interval: int = 1
     input_len_step_percentage: float = 0.0
+    input_len_list: str = ""
     base_url: str = ""
     local_tokenizer_path: str = ""
     skip_warmup: bool = False
@@ -196,6 +197,14 @@ class BenchArgs:
             "--input-len-step-percentage",
             type=float,
             default=BenchArgs.input_len_step_percentage,
+        )
+        parser.add_argument(
+            "--input-len-list",
+            type=str,
+            default=BenchArgs.input_len_list,
+            help="Comma-separated per-request input lengths for random/random-ids "
+            "batches: request i gets entry i modulo the list length, and the "
+            "reported input_len is the batch's mean.",
         )
         parser.add_argument("--base-url", type=str, default=BenchArgs.base_url)
         parser.add_argument(
@@ -633,6 +642,7 @@ def run_one_case(
     fixed_prompt_file: str = "",
     apply_chat_template: bool = False,
     flush_hicache_storage: bool = False,
+    input_len_list: str = "",
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -733,6 +743,12 @@ def run_one_case(
         else:
             input_ids = [req.prompt for req in input_requests]
             image_data = None
+            if input_len_list:
+                lens = _batch_input_lens(input_len_list, batch_size)
+                input_ids = [
+                    (ids * (n // len(ids) + 1))[:n] for ids, n in zip(input_ids, lens)
+                ]
+                input_len = sum(lens) // batch_size
 
     # Build payload based on backend
     if backend == "vllm":
@@ -1027,13 +1043,35 @@ def run_one_case(
     return result
 
 
+def _parse_input_len_list(input_len_list: str) -> List[int]:
+    entries = [entry.strip() for entry in input_len_list.split(",")]
+    if not all(entry.isdecimal() and int(entry) > 0 for entry in entries):
+        raise ValueError(
+            "--input-len-list must be comma-separated positive integers, "
+            f"got {input_len_list!r}"
+        )
+    return [int(entry) for entry in entries]
+
+
+def _batch_input_lens(input_len_list: str, batch_size: int) -> List[int]:
+    """Per-request input lengths of a batch: --input-len-list cycled to its size."""
+    lens = _parse_input_len_list(input_len_list)
+    return [lens[i % len(lens)] for i in range(batch_size)]
+
+
 def should_skip_due_to_token_capacity(
-    batch_size, input_len, output_len, skip_token_capacity_threshold
+    batch_size, input_len, output_len, skip_token_capacity_threshold, input_len_list=""
 ):
-    if batch_size * (input_len + output_len) > skip_token_capacity_threshold:
+    input_tokens = (
+        sum(_batch_input_lens(input_len_list, batch_size))
+        if input_len_list
+        else batch_size * input_len
+    )
+    resident_tokens = input_tokens + batch_size * output_len
+    if resident_tokens > skip_token_capacity_threshold:
         print(
             "=" * 8
-            + f"Skip benchmark {batch_size=} * ({input_len=} + {output_len=}) = {batch_size * (input_len + output_len)} > {skip_token_capacity_threshold=} due to kv cache limit."
+            + f"Skip benchmark {batch_size=} {input_len=} {output_len=}: {resident_tokens=} > {skip_token_capacity_threshold=} due to kv cache limit."
             + "=" * 8
         )
         return True
@@ -1171,6 +1209,19 @@ def run_benchmark_internal(
                 "larger intervals quantize them by up to interval-1 tokens per "
                 "request."
             )
+
+    if bench_args.input_len_list:
+        _parse_input_len_list(bench_args.input_len_list)
+    if bench_args.input_len_list and (
+        bench_args.dataset_name not in ("random", "random-ids")
+        or bench_args.fixed_prompt_file
+        or len(bench_args.input_len) > 1
+    ):
+        raise ValueError(
+            "--input-len-list sizes random/random-ids prompts and replaces "
+            "--input-len: use one of those datasets, one --input-len value and "
+            "no --fixed-prompt-file."
+        )
 
     if bench_args.dataset_name in REPLAY_TEXT_DATASETS:
         if bench_args.backend == "vllm":
@@ -1401,7 +1452,11 @@ def run_benchmark_internal(
             if should_skip_due_to_max_running_requests(
                 bs, skip_max_running_requests_threshold
             ) or should_skip_due_to_token_capacity(
-                kv_footprint_bs, il, ol, skip_token_capacity_threshold
+                kv_footprint_bs,
+                il,
+                ol,
+                skip_token_capacity_threshold,
+                bench_args.input_len_list,
             ):
                 continue
             results.append(
@@ -1431,6 +1486,7 @@ def run_benchmark_internal(
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
                     fixed_prompt_file=bench_args.fixed_prompt_file,
                     apply_chat_template=bench_args.apply_chat_template,
+                    input_len_list=bench_args.input_len_list,
                     **gsp_kwargs,
                 )
             )
@@ -1449,7 +1505,11 @@ def run_benchmark_internal(
                     if should_skip_due_to_max_running_requests(
                         bs, skip_max_running_requests_threshold
                     ) or should_skip_due_to_token_capacity(
-                        kv_footprint_bs, il, ol, skip_token_capacity_threshold
+                        kv_footprint_bs,
+                        il,
+                        ol,
+                        skip_token_capacity_threshold,
+                        bench_args.input_len_list,
                     ):
                         continue
                     profile_prefix = (
@@ -1489,6 +1549,7 @@ def run_benchmark_internal(
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,
                             fixed_prompt_file=bench_args.fixed_prompt_file,
                             apply_chat_template=bench_args.apply_chat_template,
+                            input_len_list=bench_args.input_len_list,
                             **gsp_kwargs,
                         )
                     )

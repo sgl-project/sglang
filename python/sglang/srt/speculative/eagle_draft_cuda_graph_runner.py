@@ -77,6 +77,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     draft_probs: Optional[torch.Tensor]
+    sampling_seed: Optional[torch.Tensor]
     hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
@@ -203,6 +204,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 if get_spec().speculative_use_rejection_sampling
                 else None
             )
+            sampling_seed = (
+                torch.zeros((self.max_bs,), dtype=torch.int64)
+                if get_exec().deterministic.enable_deterministic_inference
+                and get_spec().speculative_use_rejection_sampling
+                else None
+            )
             _hidden_size, _hidden_dtype = get_draft_recurrent_hidden_state_spec(
                 model_runner
             )
@@ -271,6 +278,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_p=topk_p,
             topk_index=topk_index,
             draft_probs=draft_probs,
+            sampling_seed=sampling_seed,
             hidden_states=hidden_states,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -300,7 +308,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self._metadata_glue = None
 
     def _replay_graph(self, shape_key, forward_batch):
-        return self.backend.replay(shape_key, forward_batch)
+        with self.model_context():
+            return self.backend.replay(shape_key, forward_batch)
 
     # -----------------------------------------------------------------
     # Helpers
@@ -455,6 +464,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             need_top_k_sampling=False,
             need_min_p_sampling=False,
             vocab_size=self.model_runner.model_config.vocab_size,
+            sampling_seed=(
+                self.buffers.sampling_seed[:num_seqs]
+                if self.buffers.sampling_seed is not None
+                else None
+            ),
         )
 
         forward_batch = ForwardBatch(
@@ -510,7 +524,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
-        with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
+        with forward_context(
+            ForwardContext(attn_backend=self.draft_attn_backend),
+            forward_batch=forward_batch,
+        ):
             self.draft_attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=True
             )
@@ -667,6 +684,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self.temperatures[:raw_bs].copy_(
                 forward_batch.sampling_info.temperatures[:raw_bs]
             )
+            if self.buffers.sampling_seed is not None:
+                self.buffers.sampling_seed[:raw_bs].copy_(
+                    forward_batch.sampling_info.sampling_seed[:raw_bs]
+                )
             self.top_ks[:raw_bs].copy_(forward_batch.sampling_info.top_ks[:raw_bs])
 
         # TODO(ch-wan): support num_token_non_padded
