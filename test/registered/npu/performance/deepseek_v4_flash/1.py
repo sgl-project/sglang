@@ -9,6 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=400, suite="base-b-test-8-npu-a3", nightly=False)
 register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
+
 class TestQwen330Bw8a8FuseEP(GSM8KAscendMixin, CustomTestCase):
     """Testcase: Verify that the inference accuracy of the Qwen/Qwen3-30B-A3B-w8a8 model on the GSM8K dataset is no less than 0.90.
 
@@ -39,6 +40,7 @@ class TestQwen330Bw8a8FuseEP(GSM8KAscendMixin, CustomTestCase):
         "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "100",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "188416",
     }
+
 
 class TestQwen330Bw8a8FuseEPTestQwen330Bw8a8FuseModeWithOne(
     GSM8KAscendMixin, CustomTestCase
