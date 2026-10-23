@@ -13,6 +13,7 @@ from unittest.mock import patch
 import sglang.srt.observability.trace as mod
 from sglang.srt.observability.trace import (
     SpanAttributes,
+    TraceCustomIdGenerator,
     TraceEvent,
     TraceNullContext,
     TraceReqContext,
@@ -90,6 +91,24 @@ class TestSpanAttributes(unittest.TestCase):
     def test_constants_exist(self):
         self.assertEqual(SpanAttributes.GEN_AI_LATENCY_E2E, "gen_ai.latency.e2e")
         self.assertIsInstance(SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS, str)
+
+
+class TestTraceCustomIdGenerator(unittest.TestCase):
+    def test_trace_ids_use_all_128_bits(self):
+        """W3C trace IDs are 128-bit; the upper half must not be left zero."""
+        generator = TraceCustomIdGenerator()
+        ids = [generator.generate_trace_id() for _ in range(64)]
+        self.assertTrue(all(0 < i < 2**128 for i in ids))
+        self.assertTrue(any(i >= 2**64 for i in ids))
+
+    def test_generators_created_at_the_same_instant_draw_different_ids(self):
+        """Processes that start together must not share an ID sequence."""
+        with patch("time.time", return_value=1792000000.123456):
+            first, second = TraceCustomIdGenerator(), TraceCustomIdGenerator()
+        self.assertNotEqual(
+            [first.generate_trace_id() for _ in range(4)],
+            [second.generate_trace_id() for _ in range(4)],
+        )
 
 
 # __get_host_id
