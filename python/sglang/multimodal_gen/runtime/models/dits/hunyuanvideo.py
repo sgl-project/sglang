@@ -832,16 +832,23 @@ class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
             ow // self.patch_size[2],
         )
 
-        # Get rotary embeddings
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            (tt * get_sp_world_size(), th, tw),
-            self.hidden_size,
-            self.num_attention_heads,
-            self.rope_dim_list,
-            self.rope_theta,
+        # Get rotary embeddings, built on the host and uploaded once per request
+        rope_cache = (
+            {}
+            if forward_batch is None
+            else forward_batch.extra.setdefault("_hunyuanvideo_rope", {})
         )
-        freqs_cos = freqs_cos.to(x.device)
-        freqs_sin = freqs_sin.to(x.device)
+        rope_key = (tt, th, tw, x.device)
+        if rope_key not in rope_cache:
+            freqs_cos, freqs_sin = get_rotary_pos_embed(
+                (tt * get_sp_world_size(), th, tw),
+                self.hidden_size,
+                self.num_attention_heads,
+                self.rope_dim_list,
+                self.rope_theta,
+            )
+            rope_cache[rope_key] = (freqs_cos.to(x.device), freqs_sin.to(x.device))
+        freqs_cos, freqs_sin = rope_cache[rope_key]
         # Prepare modulation vectors
         vec = self.time_in(t)
 
