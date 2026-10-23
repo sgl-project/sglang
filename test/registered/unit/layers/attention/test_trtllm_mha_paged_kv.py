@@ -89,6 +89,20 @@ class TestTRTLLMHAPagedKV(unittest.TestCase):
             self.assertEqual(out.data_ptr(), buf.data_ptr())
             self.assertTrue(torch.equal(out, buf))
 
+    def test_large_page_is_read_as_64_token_pages(self):
+        def runner(page_size, use_hnd=False):
+            return SimpleNamespace(
+                page_size=page_size, token_to_kv_pool=SimpleNamespace(use_hnd=use_hnd)
+            )
+
+        for page_size in (64, 128):
+            self.assertEqual(
+                TRTLLMHAAttnBackend._kernel_page_size(runner(page_size)), page_size
+            )
+        self.assertEqual(TRTLLMHAAttnBackend._kernel_page_size(runner(256)), 64)
+        with self.assertRaises(ValueError):
+            TRTLLMHAAttnBackend._kernel_page_size(runner(256, use_hnd=True))
+
 
 if __name__ == "__main__":
     unittest.main()
