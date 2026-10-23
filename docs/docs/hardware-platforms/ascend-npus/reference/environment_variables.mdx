@@ -115,7 +115,46 @@ python test/registered/unit/npu/test_npu_jpeg_decode.py -v
 python test/registered/unit/npu/test_mrope_multiaxis.py -v
 ```
 
-Require 20 executed tests and no skips when validating device support. These commands run component tests; they do not replay the 75-input model evaluation. JPEG's lossy compression and the documented chroma policy mean arbitrary output pixels are not required to equal either the uncompressed source or PIL bit for bit. This validation provides no new GPU comparison, speed benchmark, or sustained-load result.
+Require 20 executed tests and no skips when validating device support. These commands run component tests; they do not replay the model evaluations. JPEG's lossy compression and the documented chroma policy mean arbitrary output pixels are not required to equal either the uncompressed source or PIL bit for bit.
+
+#### Public JPEG evaluation
+
+A subsequent 2026-10-23 run tested the same product runtime, also present in documentation commit `5a4cc248822db6a723d8251cba1706b0151ffa1a`, on fixed JPEG subsets derived from [MMBench](https://github.com/open-compass/MMBench) and [MMMU validation](https://huggingface.co/datasets/MMMU/MMMU). Both switch states used the same Qwen2.5-VL-3B-Instruct/BF16 model on the same NPU and received byte-identical requests.
+
+| Derived JPEG subset | PIL: correct / total | NPU: correct / total | Correct to incorrect | Incorrect to correct |
+| --- | --- | --- | --- | --- |
+| MMBench DEV EN v1.1 | 83 / 100 | 82 / 100 | 1 | 0 |
+| MMMU validation | 50 / 100 | 50 / 100 | 2 | 2 |
+
+**The MMBench subset lost one percentage point with NPU decoding.** MMMU retained the same aggregate score but changed correctness on four questions. This is an observed quality difference, not evidence of lossless model-answer equivalence. Validate your representative images before enabling this path for quality-sensitive use.
+
+The correctness changes were:
+
+| Dataset question ID | Reference | PIL answer | NPU answer |
+| --- | --- | --- | --- |
+| MMBench `3724` | A | A | B |
+| MMMU `validation_Art_Theory_17` | D | C | D |
+| MMMU `validation_Energy_and_Power_19` | B | B | C |
+| MMMU `validation_Architecture_and_Engineering_24` | C | B | C |
+| MMMU `validation_Clinical_Medicine_28` | D | D | C |
+
+MMMU also changed one wrong option to another for `validation_Materials_16` (A to B) and `validation_Agriculture_10` (A to D). Predictions agreed on 99/100 MMBench and 94/100 MMMU questions; exact answer texts agreed on 94/100 and 93/100, respectively, with punctuation accounting for some text differences. The cause of these model-answer differences has not been isolated to chroma reconstruction, downstream preprocessing, or inference numerics.
+
+The evaluation protocol was:
+
+- Freeze 100 different base questions per dataset before inference: five per MMBench category across 20 categories, and three or four per MMMU subject across 30 subjects, using seed-42 hash ranking. MMBench used one option order per base question; this is a single-round engineering subset rather than full CircularEval. MMMU included four multi-image and two open-answer questions, preserving image references in questions and options.
+- Preserve the source bytes, then re-encode every image with Pillow `12.3.0` as metadata-free RGB baseline JPEG, quality 95 and 4:2:0 sampling. Apply EXIF orientation, composite transparency onto white, and pad only the right/bottom to even dimensions with a minimum of 32; 94 of 206 image entries needed padding. No resizing was performed during this conversion. The 206 image entries comprise 205 different images, originally 98 JPEG and 108 PNG entries.
+- Use concurrency 1, `temperature=0`, `seed=42`, 64 output tokens for multiple-choice questions and 128 for open answers, with the model's other generation defaults. Set `--context-length 16384`, `--mm-process-config '{"image":{"max_pixels":1003520}}'`, `--disable-radix-cache`, and `--mm-preprocess-cache-size-mb 0`, and disable the VLM embedding cache with `SGLANG_VLM_CACHE_SIZE_MB=0`. Model preprocessing can still resize images within this pixel budget.
+- Score a single option letter deterministically; invalid answers count as incorrect without random guessing. Score open answers with the fixed official MMMU numeric/text normalization. The two numeric open answers were wrong in both states. All 400 formal requests completed with no runtime errors, invalid parses, or truncated outputs.
+- Match every image to its loader event by request time and JPEG SHA, including repeated image hashes and multi-image questions: 206 PIL events with the switch off and 206 NPU events with it on. Check startup PNG warmups separately. A preceding 32-request pilot repeated 16 of these questions in each state; all 16 answers per state repeated exactly in the formal run, including MMBench `3724` changing from A to B. These repeats do not add distinct questions.
+
+For the same 205 different JPEGs, actual Triton RGB output matched independent NumPy arithmetic on the same DVPP-decoded NV12 frame exactly, with NPU device, `uint8`, CHW shape, dimensions, and contiguity checked. This verifies the color-conversion step rather than independent JPEG-decoder equivalence. Against PIL, the mean of per-image pixel MAE was `0.427227` and the maximum single-channel difference was `78`, on the 0-255 scale. Saved hashes and error records were independently audited; the original NV12/RGB arrays were not retained for a second offline pixel recomputation.
+
+MMMU was pinned to dataset revision `876ce5cb130f7f7e290ce4d9984357737d4db5cf`. The MMBench TSV matched the official VLMEvalKit MD5 `30c05be8f2f347a50be25aa067248184`. The frozen JPEG manifest SHA-256 is `0f15df1da707a660fa7c6efc5c972d7baecb4d37333e0c6cf6a49b3d3e9461d3`; the raw-result archive SHA-256 is `e01502ef45b4001d5e9fc1cfb1f8a248c8bbb02f09fa042ba6b8121b565bede1`. Original responses, request hashes, scoring, route events, and resource-release records were independently checked. The retained local evidence archive and evaluation scripts are separate from the component tests shipped in this PR.
+
+For published reference context, [GPU JPEG PR #19749](https://github.com/sgl-project/sglang/pull/19749) reports Qwen3-VL-8B MMMU validation accuracy of 50.22% before and after its optimization on 900 questions. [GPU JPEG PR #34163](https://github.com/sgl-project/sglang/pull/34163) reports Kimi-K3 OCRBench accuracy of 89.5% for both GPU fancy decoding and PIL on 1,000 images, with six correctness changes in each direction. Those models and evaluation protocols differ from this run, so their scores are reference context rather than a controlled GPU/NPU comparison. The [Qwen2.5-VL-3B model card](https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct) reports 53.1% on full MMMU validation and 77.6% on MMBench v1.1 test; its score table does not specify hardware, and its MMBench split differs from this dev subset.
+
+The public subsets extend the engineering-set evidence with observed answer changes. They provide no new speed or sustained-load measurements for this runtime.
 
 ## Used in DeepEP Ascend
 
