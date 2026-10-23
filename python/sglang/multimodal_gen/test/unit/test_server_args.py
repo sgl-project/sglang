@@ -3450,7 +3450,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         args = self._from_dict(
             {"model_path": "/fake", "disagg_server_addr": "127.0.0.1:30000"}
         )
-        with self.assertRaisesRegex(ValueError, "only defined for encoder"):
+        with self.assertRaisesRegex(ValueError, "only defined for worker roles"):
             args.derive_pool_result_endpoint()
 
     def test_cli_args_parsed(self):
