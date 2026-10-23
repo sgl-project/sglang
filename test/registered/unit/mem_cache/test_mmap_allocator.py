@@ -211,6 +211,27 @@ class TestMmapAllocator(unittest.TestCase):
         array[n_bytes - 1] = 2
         self.assertEqual((array[0], array[n_bytes - 1]), (1, 2))
 
+    @unittest.skipUnless(sys.platform == "linux", "transparent hugepages are Linux-only")
+    def test_alloc_thp_warns_when_faults_fall_back_to_4k(self):
+        from sglang.srt.mem_cache.storage.mmap import mmap_allocator
+
+        page = mmap_allocator._thp_page_size()
+        if not page or mmap_allocator._libc is None:
+            self.skipTest("transparent hugepages are not available on this host")
+        with unittest.mock.patch.object(
+            mmap_allocator, "_thp_fault_fallbacks", side_effect=[10, 15]
+        ), self.assertLogs(mmap_allocator.logger, level="WARNING") as logs:
+            try:
+                mmap_allocator._alloc_thp(page, page)
+            except OSError as e:
+                self.skipTest(f"madvise(MADV_HUGEPAGE) not permitted here: {e}")
+        self.assertIn("5 transparent hugepage faults fell back", logs.output[0])
+
+    def test_thp_fault_fallbacks_is_a_count_or_unknown(self):
+        from sglang.srt.mem_cache.storage.mmap import mmap_allocator
+
+        self.assertGreaterEqual(mmap_allocator._thp_fault_fallbacks(), -1)
+
     def test_shm_host_tensor_allocator_invalid_device(self):
         allocator = ShmHostTensorAllocator()
         with self.assertRaises(AssertionError) as ctx:
