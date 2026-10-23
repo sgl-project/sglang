@@ -163,9 +163,15 @@ class RustServer:
             nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
             tp_size_per_node = get_parallel().tp_size // nnodes_per_pp_rank
         dp_group_width = get_parallel().attn_tp_size * get_parallel().attn_cp_size
-        # Count DP leaders within this node's TP range. The first leader must
-        # use the base port even when a DP group spans multiple nodes.
-        local_dp_rank = (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
+        if not get_parallel().attn_dp_enabled and get_parallel().dp_size > 1:
+            # Plain DP: one TP group per replica, every leader on this node.
+            local_dp_rank = get_parallel().dp_rank
+        else:
+            # Count DP leaders within this node's TP range. The first leader must
+            # use the base port even when a DP group spans multiple nodes.
+            local_dp_rank = (
+                get_parallel().tp_rank % tp_size_per_node
+            ) // dp_group_width
         listen_port = get_serving().port + local_dp_rank
         listen_addr = NetworkAddress(get_serving().host, listen_port).to_host_port_str()
 
