@@ -96,14 +96,22 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         is_deepseek_v4,
         is_minimax_sparse,
     )
+    from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
 
     hf_config = model_config_of(server_args).hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
     is_m3_hisparse = is_minimax_sparse(hf_config)
+    is_qsa_hisparse = is_qwen_qsa(hf_config)
     is_hip = get_platform().is_hip
-    assert is_deepseek_dsa(hf_config) or is_v4_hisparse or is_m3_hisparse, (
+    assert (
+        is_deepseek_dsa(hf_config)
+        or is_v4_hisparse
+        or is_m3_hisparse
+        or is_qsa_hisparse
+    ), (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
-        "models (e.g., DeepSeek V3.2, GLM-5), DeepSeek V4, and MiniMax M3 now. "
+        "models (e.g., DeepSeek V3.2, GLM-5), DeepSeek V4, MiniMax M3, and "
+        "Qwen4-Exp QSA now. "
     )
 
     assert cfg.disable_radix_cache, (
@@ -125,6 +133,17 @@ def validate_hisparse(server_args: ServerArgs) -> None:
             "HiSparse speculative decoding uses statically sized swap state; "
             "--speculative-adaptive is not supported."
         )
+
+    # Qwen4 QSA keeps its own bf16 K/V layout: only the full-attention K/V
+    # tier is paged, while the indexer state stays device-resident. There is
+    # no DSA prefill/decode backend or MLA dim to validate here.
+    if is_qsa_hisparse:
+        if resolved_view(server_args).kv_cache_dtype not in ("bfloat16", "auto"):
+            raise ValueError(
+                "Qwen4 QSA HiSparse keeps the paged K/V tier in bfloat16; "
+                "use --kv-cache-dtype=bfloat16 (or auto)."
+            )
+        return
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

@@ -526,12 +526,27 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         qsa_profile = parse_qsa_profile(hf_config)
         if qsa_profile is None:
             return 0
-        return QSATokenToKVPool.qsa_bytes_per_token(
-            kv_heads=qsa_profile.kv_heads,
-            head_dim=qsa_profile.head_dim,
-            compress_ratio=qsa_profile.compress_ratio,
-            num_layers=num_layers,
-            compressed_dtype=resolve_qsa_indexer_dtype(get_model().qsa_indexer_dtype),
+        # HiSparse gives every *device* slot a full logical share of the
+        # indexer cache (it stays device resident and is addressed by
+        # ``full_slot // compress_ratio``), so the per-slot indexer cost grows
+        # with the host-to-device ratio.  The K/V part of ``cell_size`` is
+        # already per device slot and must not be scaled.
+        indexer_ratio = 1
+        if get_memory().enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            indexer_ratio = parse_hisparse_config().host_to_device_ratio
+        return (
+            QSATokenToKVPool.qsa_bytes_per_token(
+                kv_heads=qsa_profile.kv_heads,
+                head_dim=qsa_profile.head_dim,
+                compress_ratio=qsa_profile.compress_ratio,
+                num_layers=num_layers,
+                compressed_dtype=resolve_qsa_indexer_dtype(
+                    get_model().qsa_indexer_dtype
+                ),
+            )
+            * indexer_ratio
         )
 
     def _compute_dsa_indexer_cell_size(

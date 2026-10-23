@@ -190,6 +190,9 @@ class HiSparseMHAMainPool(MHATokenToKVPool):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        enable_kv_cache_copy: bool = False,
+        quant_method=None,
+        post_capture_active: bool = False,
     ):
         super().__init__(
             size=size,
@@ -202,6 +205,9 @@ class HiSparseMHAMainPool(MHATokenToKVPool):
             enable_memory_saver=enable_memory_saver,
             start_layer=start_layer,
             end_layer=end_layer,
+            enable_kv_cache_copy=enable_kv_cache_copy,
+            quant_method=quant_method,
+            post_capture_active=post_capture_active,
         )
         self.full_to_hisparse_device_index_mapping: Optional[torch.Tensor] = None
         self.bytes_per_token_k = head_num * head_dim * self.store_dtype.itemsize

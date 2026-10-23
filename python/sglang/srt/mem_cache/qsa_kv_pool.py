@@ -95,6 +95,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         quant_method=None,
         post_capture_active: bool = False,
         qsa_indexer_dtype: torch.dtype = torch.bfloat16,
+        logical_size: Optional[int] = None,
     ):
         if page_size <= 1 or page_size % qsa_compress_ratio != 0:
             raise ValueError(
@@ -156,7 +157,11 @@ class QSATokenToKVPool(HybridLinearKVPool):
             self.qsa_compressed_dtype,
             self.index_state_dtype,
         )
-        state_size = size + page_size
+        # ``size`` is the number of device slots.  A host-tier pool (HiSparse)
+        # holds ``logical_size`` slots in host memory and keeps the indexer
+        # cache for all of them on device; ``logical_size`` defaults to
+        # ``size`` for every other pool.
+        state_size = (logical_size or size) + page_size
         # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
@@ -324,3 +329,136 @@ class QSATokenToKVPool(HybridLinearKVPool):
             + self.qsa_rope_position_buffer.numel() * 8
         )
         return k_size + qsa_k_size, v_size
+
+
+class HiSparseQSATokenToKVPool(QSATokenToKVPool):
+    """QSA pool with a host tier for the full-attention K/V.
+
+    The logical (host) slot space is ``host_to_device_ratio`` times the device
+    slot space, exactly like the other HiSparse pools.  QSA stores plain MHA
+    K/V (``kv_heads x head_dim`` bf16 per token per layer), so the paged device
+    tier is an :class:`HiSparseMHAMainPool`; the indexer caches
+    (``qsa_key_state_buffer_pool`` / ``qsa_compressed_k_buffer_pool``) stay
+    device-resident and only their slot space grows with the ratio.
+
+    P0 residency policy: a static prefix window.  Logical slot ids below
+    ``resident_tokens`` are read from the device tier at the *same* row index;
+    every other slot id is read through the pinned host copy (the kernels get
+    ``resident_tokens`` and treat ``dslot <= 0`` as "read host").  This is a
+    pure address-translation mask: no device page is swapped, and
+    ``HiSparseTokenToKVPoolAllocator`` never has to allocate device pages for
+    the window.  ``resident_tokens=0`` keeps every K/V row on the host.
+    """
+
+    is_hisparse_qsa = True
+
+    def __init__(
+        self,
+        *,
+        host_to_device_ratio: int = 2,
+        resident_tokens: Optional[int] = None,
+        **kwargs,
+    ):
+        if host_to_device_ratio < 1:
+            raise ValueError(
+                f"host_to_device_ratio must be >= 1, got {host_to_device_ratio}"
+            )
+        self.host_to_device_ratio = int(host_to_device_ratio)
+        self._logical_size = kwargs["size"] * self.host_to_device_ratio
+        super().__init__(**kwargs, logical_size=self._logical_size)
+        full = self.full_kv_pool
+        if not getattr(full, "register_mapping", None):
+            raise ValueError(
+                "HiSparseQSATokenToKVPool requires a HiSparse full-KV pool; "
+                f"got {type(full).__name__}"
+            )
+        if resident_tokens is None:
+            resident_tokens = self.size
+        # The identity window can only cover rows the device tier really has
+        # (the full KV pool was sized for ``size`` device slots).
+        self.hisparse_resident_tokens = min(int(resident_tokens), self.size)
+        # Host rows are addressed by logical slot id, so there is one row per
+        # logical slot plus the base pool's padding page.  Pinned memory keeps
+        # the zero-copy device reads cheap; rows are bf16 like the device tier.
+        rows = self._logical_size + self.page_size
+        kv_heads = full.head_num
+        head_dim = full.head_dim
+        host_kwargs = dict(
+            dtype=full.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+        self.host_key_buffer_pool = [
+            torch.zeros((rows, kv_heads, head_dim), **host_kwargs)
+            for _ in self.full_attention_layer_id_mapping
+        ]
+        self.host_value_buffer_pool = [
+            torch.zeros((rows, kv_heads, head_dim), **host_kwargs)
+            for _ in self.full_attention_layer_id_mapping
+        ]
+
+    # ---- address translation -------------------------------------------------
+    def _translate_loc_to_hisparse_device(self, loc: torch.Tensor) -> torch.Tensor:
+        """Logical slot id -> device row for the resident window, else -1."""
+        keep = (loc > 0) & (loc < self.hisparse_resident_tokens)
+        return torch.where(keep, loc, torch.full_like(loc, -1))
+
+    @property
+    def resident_device_bytes(self) -> int:
+        if not self.host_key_buffer_pool:
+            return 0
+        per_row = self.host_key_buffer_pool[0][0].numel() * 2
+        return self.hisparse_resident_tokens * per_row * 2 * len(
+            self.host_key_buffer_pool
+        )
+
+    def register_mapping(self, mapping) -> None:
+        """Receive the logical->device slot table from the HiSparse allocator.
+
+        P0 maps slots by a static window (see ``hisparse_resident_tokens``), so
+        the table itself is only kept for bookkeeping and forwarded to the
+        device tier, whose write path needs it.
+        """
+        self.full_to_hisparse_device_index_mapping = mapping
+        self.full_kv_pool.register_mapping(mapping)
+
+    def get_host_key_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.host_key_buffer_pool[self._transfer_full_attention_id(layer_id)]
+
+    def get_host_value_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.host_value_buffer_pool[self._transfer_full_attention_id(layer_id)]
+
+    # ---- write path (write-through) -----------------------------------------
+    def set_kv_buffer(
+        self, layer, loc_info, cache_k, cache_v, *args, **kwargs
+    ) -> None:
+        if args or kwargs:
+            raise NotImplementedError(
+                "HiSparseQSATokenToKVPool.set_kv_buffer does not take scales"
+            )
+        from sglang.srt.mem_cache.memory_pool import (
+            unwrap_write_loc,
+            write_loc_is_physical,
+        )
+
+        if write_loc_is_physical(loc_info):
+            raise NotImplementedError(
+                "HiSparse QSA writes must carry logical slot ids"
+            )
+        loc, _, full_loc = unwrap_write_loc(loc_info)
+        logical = loc if full_loc is None else full_loc
+        layer_id = self._transfer_full_attention_id(layer.layer_id)
+        host_k = self.host_key_buffer_pool[layer_id]
+        host_v = self.host_value_buffer_pool[layer_id]
+        ck = cache_k.to(host_k.dtype)
+        cv = cache_v.to(host_v.dtype)
+        host_idx = logical.to("cpu", non_blocking=False)
+        host_k[host_idx] = ck.to("cpu", non_blocking=False)
+        host_v[host_idx] = cv.to("cpu", non_blocking=False)
+        if self.hisparse_resident_tokens <= 0:
+            return
+        resident = logical < self.hisparse_resident_tokens
+        if bool(resident.any()):
+            slots = logical[resident]
+            self.full_kv_pool.k_buffer[layer_id][slots] = ck[resident]
+            self.full_kv_pool.v_buffer[layer_id][slots] = cv[resident]
