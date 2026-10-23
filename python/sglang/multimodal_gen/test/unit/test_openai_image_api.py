@@ -237,20 +237,22 @@ def test_response_resize_prefers_requested_size_over_generation_canvas():
     assert _get_response_resize(glm_sampling) == "1280x720"
 
 
-def test_response_resize_uses_actual_generated_image_size(tmp_path):
-    output_path = tmp_path / "output.png"
-    Image.new("RGB", (1280, 736)).save(output_path)
+def _png_bytes(size: tuple[int, int]) -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", size).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_response_resize_uses_actual_generated_image_size():
     glm_sampling = GlmImageSamplingParams(image_path="input.png")
 
-    assert _get_response_resize(glm_sampling, str(output_path)) == "1280x736"
+    assert _get_response_resize(glm_sampling, _png_bytes((1280, 736))) == "1280x736"
 
 
-def test_response_resize_prefers_final_output_over_sampling_canvas(tmp_path):
-    output_path = tmp_path / "upscaled.png"
-    Image.new("RGB", (2560, 1472)).save(output_path)
+def test_response_resize_prefers_final_output_over_sampling_canvas():
     glm_sampling = GlmImageSamplingParams(width=1280, height=736)
 
-    assert _get_response_resize(glm_sampling, str(output_path)) == "2560x1472"
+    assert _get_response_resize(glm_sampling, _png_bytes((2560, 1472))) == "2560x1472"
 
 
 def test_url_response_uses_variant_fallback_urls_for_multiple_persistent_outputs():

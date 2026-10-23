@@ -120,14 +120,12 @@ class SparseTableBackend:
         self,
         *,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
-        req_to_token: torch.Tensor,
         page_size: int,
         candidate_topk_blocks: int,
         candidate_block_size: int,
     ) -> None:
         assert candidate_block_size == CANDIDATE_BLOCK_SIZE
         self.token_to_kv_pool = token_to_kv_pool
-        self.req_to_token = req_to_token
         self.page_size = page_size
         self.topk_blocks = candidate_topk_blocks
         self.alt_stream = torch.cuda.Stream()
@@ -139,7 +137,7 @@ class SparseTableBackend:
 
     def publish_prefill(self, inputs: PrefillInputs):
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return None
         index_page_size = self.token_to_kv_pool.get_index_k_page_size(
@@ -169,7 +167,7 @@ class SparseTableBackend:
         published: Optional[_SparsePrefillTable],
     ) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs, self.req_to_token)
+        data = get_deep_gemm_prefill_data(inputs)
         if data is None:
             return
         assert published is not None
@@ -202,7 +200,7 @@ class SparseTableBackend:
         k_cache = get_index_k_cache(
             token_to_kv_pool=self.token_to_kv_pool,
             layer_id=inputs.layer_id,
-            page_size=inputs.paged_metadata.compressed_page_size,
+            page_size=inputs.index_page_size,
         )
         logits = _prefill_table_logits(published, q_fp4, q_sf, inputs.weights, k_cache)
         topk = min(indexer.index_topk, published.blocks.shape[1] * CANDIDATE_BLOCK_SIZE)
