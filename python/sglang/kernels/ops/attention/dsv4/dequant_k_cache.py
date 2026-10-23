@@ -102,13 +102,13 @@ def dequantize_k_cache_paged_v41(
     out: Optional[torch.Tensor] = None,
     layout: KVLayout = KVLayout.V41,
 ) -> torch.Tensor:
-    """Dequantize a V4.1 paged cache (fp8 ``V41`` or fp4 ``V41_FP4``) for a list
+    """Dequantize a V4.1 paged cache (fp8 ``V41`` / ``V41_NEW`` or fp4 ``V41_FP4`` / ``V41_FP4_NEW``) for a list
     of token IDs into ``(num_tokens, 1, 512)`` bf16.
 
     Bit-exact with the pure-torch dequantizer of these formats.
     """
     layout = KVLayout.parse(layout)
-    assert layout in (KVLayout.V41, KVLayout.V41_FP4), layout
+    assert layout.encoding in (KVLayout.V41, KVLayout.V41_FP4), layout
     if is_hip_runtime():
         supported = is_gfx95_supported()
     else:
@@ -143,9 +143,10 @@ def dequantize_k_cache_paged_v41(
 
     kernel = (
         _dequantize_k_cache_paged_v41_fp8_kernel
-        if layout is KVLayout.V41
+        if layout.encoding is KVLayout.V41
         else _dequantize_k_cache_paged_v41_fp4_kernel
     )
+    data_stride, scale_base, scale_stride = layout.row_addressing(page_size)
     kernel[(num_tokens,)](
         out,
         buf_fp8,
@@ -157,7 +158,9 @@ def dequantize_k_cache_paged_v41(
         DATA_BYTES=layout.data_bytes,
         SCALE_BYTES=layout.scale_bytes,
         TILE_SIZE=layout.tile_size,
-        S_OFFSET_BYTES=layout.scale_offset(page_size),
+        DATA_STRIDE=data_stride,
+        SCALE_BASE=scale_base,
+        SCALE_STRIDE=scale_stride,
         IS_HIP=is_hip_runtime(),
     )
     return out
@@ -329,7 +332,9 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     DATA_BYTES: tl.constexpr,
     SCALE_BYTES: tl.constexpr,
     TILE_SIZE: tl.constexpr,
-    S_OFFSET_BYTES: tl.constexpr,
+    DATA_STRIDE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
     IS_HIP: tl.constexpr,
 ):
     # V41: 512 e4m3 values per token, then 16 ue8m0 scales (one per 32 values).
@@ -339,8 +344,8 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * DATA_BYTES
-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+    token_data_base = page_byte_base + in_page * DATA_STRIDE
+    token_scale_base = page_byte_base + SCALE_BASE + in_page * SCALE_STRIDE
 
     offs = tl.arange(0, DATA_BYTES)
     vals = tl.load(buf_fp8_ptr + token_data_base + offs).to(tl.float32)
@@ -364,7 +369,9 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     DATA_BYTES: tl.constexpr,
     SCALE_BYTES: tl.constexpr,
     TILE_SIZE: tl.constexpr,
-    S_OFFSET_BYTES: tl.constexpr,
+    DATA_STRIDE: tl.constexpr,
+    SCALE_BASE: tl.constexpr,
+    SCALE_STRIDE: tl.constexpr,
     IS_HIP: tl.constexpr,
 ):
     # V41_FP4: 512 e2m1 codes packed two per byte (even index in the low nibble),
@@ -375,8 +382,8 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
     page_idx = loc // PAGE_SIZE
     in_page = loc % PAGE_SIZE
     page_byte_base = page_idx * BYTES_PER_PAGE
-    token_data_base = page_byte_base + in_page * DATA_BYTES
-    token_scale_base = page_byte_base + S_OFFSET_BYTES + in_page * SCALE_BYTES
+    token_data_base = page_byte_base + in_page * DATA_STRIDE
+    token_scale_base = page_byte_base + SCALE_BASE + in_page * SCALE_STRIDE
 
     boffs = tl.arange(0, DATA_BYTES)
     packed = tl.load(buf_uint8_ptr + token_data_base + boffs)
