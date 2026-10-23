@@ -7,9 +7,8 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <cuda_fp8.h>
-
 #include <cstdint>
+#include <cuda_fp8.h>
 
 namespace sglang {
 
@@ -73,8 +72,7 @@ SGL_DEVICE uint32_t f32x8_to_e2m1x8(const float (&x)[8]) {
 /// \param global_scale The pool's outer scale (unit in production).
 /// \param scale_out Receives the E4M3 scale byte.
 /// \return The eight packed payload bytes.
-SGL_DEVICE uint64_t quantize_block(const bf16_t* __restrict__ src, float global_scale,
-                                   uint8_t* scale_out) {
+SGL_DEVICE uint64_t quantize_block(const bf16_t* __restrict__ src, float global_scale, uint8_t* scale_out) {
   float v[kNvfp4BlockSize];
   float amax = 0.0f;
 #pragma unroll
@@ -132,7 +130,7 @@ struct Nvfp4StoreTrait {
   SGL_DEVICE static void forward(const Nvfp4StoreParams& params) {
     using namespace device;
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t work_id = tid / kWorkerSize;  // which (token, head) job
+    const uint32_t work_id = tid / kWorkerSize;   // which (token, head) job
     const uint32_t block_id = tid % kWorkerSize;  // which 16-element block
     if (work_id >= params.total_jobs) return;
 
@@ -152,8 +150,7 @@ struct Nvfp4StoreTrait {
       head_id = 0;
     }
 
-    const auto src = static_cast<const bf16_t*>(params.in_ptrs[branch]) +
-                     token_id * params.in_token_stride[branch] +
+    const auto src = static_cast<const bf16_t*>(params.in_ptrs[branch]) + token_id * params.in_token_stride[branch] +
                      head_id * params.in_head_stride[branch] + block_id * kNvfp4BlockSize;
 
     // Every global read, `indices` included, stays behind the PDL wait.
@@ -164,11 +161,10 @@ struct Nvfp4StoreTrait {
 
     const auto& pay_s = params.payload_strides[branch];
     const auto& sc_s = params.scale_strides[branch];
-    const auto payload = pointer::offset(params.payload_ptrs[branch], page * pay_s[0],
-                                         head_id * pay_s[1], row * pay_s[2],
-                                         block_id * kNvfp4BlockBytes);
-    const auto scale = pointer::offset(params.scale_ptrs[branch], page * sc_s[0],
-                                       head_id * sc_s[1], row * sc_s[2], block_id);
+    const auto payload = pointer::offset(
+        params.payload_ptrs[branch], page * pay_s[0], head_id * pay_s[1], row * pay_s[2], block_id * kNvfp4BlockBytes);
+    const auto scale =
+        pointer::offset(params.scale_ptrs[branch], page * sc_s[0], head_id * sc_s[1], row * sc_s[2], block_id);
 
     uint8_t scale_byte;
     const uint64_t packed = minimax_nvfp4::quantize_block(src, *params.global_scale, &scale_byte);
@@ -282,8 +278,8 @@ void nvfp4_store_kv_index(
       .with_device(device)
       .verify(global_scale);
 
-  CHECK_HOST(R.unwrap() == page_size)
-      << "page size " << page_size << " does not match the cache row count " << R.unwrap();
+  CHECK_HOST(R.unwrap() == page_size) << "page size " << page_size << " does not match the cache row count "
+                                      << R.unwrap();
 
   const int64_t num_tokens = T.unwrap();
   const int64_t num_kv_heads = H.unwrap();

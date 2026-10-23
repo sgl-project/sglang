@@ -455,6 +455,8 @@ def all_reduce_residual_norm(
         vecs_per_thread,
     )
     return out, residual_out
+
+
 @cache_once
 def _jit_shared_gate_module(
     world_size: int,

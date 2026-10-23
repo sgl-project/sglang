@@ -102,5 +102,6 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         self.assertEqual(decode_req.hicache_restored_kv_indices.tolist(), [12, 13])
         tree_cache.lock.assert_called_once_with("restored")
 
+
 if __name__ == "__main__":
     unittest.main()

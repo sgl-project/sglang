@@ -219,8 +219,7 @@ void qknorm_rope_impl(
         .with_device(device)
         .verify(*out);
     CHECK_HOST(G.unwrap() == counts[group_id])
-        << "fp8 output has " << G.unwrap() << " heads, group " << group_id << " has "
-        << counts[group_id];
+        << "fp8 output has " << G.unwrap() << " heads, group " << group_id << " has " << counts[group_id];
     params.fp8_out[group_id] = static_cast<fp8_e4m3_t*>(out->data_ptr());
     params.fp8_token_stride[group_id] = out->stride(0);
   };
@@ -260,8 +259,27 @@ void fused_gemma_qknorm_rope(
     int64_t num_groups,
     double eps) {
   details::qknorm_rope_impl<PosT, HEAD_DIM, ROTARY_DIM, kUsePDL>(
-      qkv, w0, w1, w2, w3, cos_sin_cache, positions, off0, cnt0, off1, cnt1, off2, cnt2, off3, cnt3,
-      num_groups, eps, nullptr, -1, nullptr, -1);
+      qkv,
+      w0,
+      w1,
+      w2,
+      w3,
+      cos_sin_cache,
+      positions,
+      off0,
+      cnt0,
+      off1,
+      cnt1,
+      off2,
+      cnt2,
+      off3,
+      cnt3,
+      num_groups,
+      eps,
+      nullptr,
+      -1,
+      nullptr,
+      -1);
 }
 
 /// \brief As above, additionally emitting two groups as dense FP8 tensors.
@@ -293,8 +311,27 @@ void fused_gemma_qknorm_rope_fp8(
     int64_t group_b,
     double eps) {
   details::qknorm_rope_impl<PosT, HEAD_DIM, ROTARY_DIM, kUsePDL>(
-      qkv, w0, w1, w2, w3, cos_sin_cache, positions, off0, cnt0, off1, cnt1, off2, cnt2, off3, cnt3,
-      num_groups, eps, &fp8_a, group_a, &fp8_b, group_b);
+      qkv,
+      w0,
+      w1,
+      w2,
+      w3,
+      cos_sin_cache,
+      positions,
+      off0,
+      cnt0,
+      off1,
+      cnt1,
+      off2,
+      cnt2,
+      off3,
+      cnt3,
+      num_groups,
+      eps,
+      &fp8_a,
+      group_a,
+      &fp8_b,
+      group_b);
 }
 
 }  // namespace sglang

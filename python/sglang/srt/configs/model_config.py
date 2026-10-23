@@ -1020,8 +1020,7 @@ class ModelConfig:
         if (
             is_draft_model
             and self.speculative_algorithm == "DSPARK"
-            and self.hf_config.architectures[0]
-            == "DSparkMiniMaxDraftModel"
+            and self.hf_config.architectures[0] == "DSparkMiniMaxDraftModel"
         ):
             from sglang.srt.configs.minimax_vl import configure_minimax_m3_dspark
 

@@ -5818,9 +5818,7 @@ def get_minimax_sparse_index_dtype(
     # also stores the index K in fp8 for the fp16-widened Triton decode; elsewhere
     # plain fp8 KV keeps the index K in the model dtype.
     if fp8_attn_gemm or (
-        _is_cuda
-        and get_platform().is_sm90
-        and kv_cache_dtype == torch.float8_e4m3fn
+        _is_cuda and get_platform().is_sm90 and kv_cache_dtype == torch.float8_e4m3fn
     ):
         return kv_cache_dtype
     if _is_gfx95_supported and envs.SGLANG_OPT_MINIMAX_M3_FP8_INDEX_CACHE.get():
