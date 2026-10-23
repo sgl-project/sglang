@@ -23,6 +23,18 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    if cfg.enable_mla_hicache_host_dedup:
+        if not cfg.enable_hierarchical_cache:
+            raise ValueError("--enable-mla-hicache-host-dedup requires HiCache.")
+        if cfg.dcp_size > 1:
+            raise ValueError(
+                "MLA host dedup requires replicated KV across ranks; "
+                "--dcp-size > 1 stores distinct KV shards."
+            )
+        if cfg.enable_dsa_cache_layer_split:
+            raise ValueError("MLA host dedup cannot use DSA cache layer splitting.")
+        if cfg.hicache_storage_backend is not None:
+            raise ValueError("MLA host dedup storage requires the file L3 integration.")
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
