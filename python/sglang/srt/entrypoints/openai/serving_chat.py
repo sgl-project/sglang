@@ -2963,6 +2963,22 @@ class OpenAIServingChat(OpenAIServingBase):
             # output into reasoning_content.
             return request.reasoning_effort not in (None, "none", "no_think")
 
+        if chat_encoding.spec_prompt_reads_default_thinking_env(
+            self.chat_encoding_spec
+        ):
+            # The dsv4/dsv41/dsv32 encoders build the prompt from the explicit
+            # `thinking` kwarg and fall back to SGLANG_DEFAULT_THINKING when it
+            # is absent (see `_apply_jinja_template`). The parse side must
+            # mirror that or the two disagree about the default thinking
+            # state: with SGLANG_DEFAULT_THINKING=1 the prompt opens a
+            # thinking block while the reasoning parser is built with
+            # force_reasoning=False, leaking the chain-of-thought into
+            # `content`.
+            chat_template_kwargs = request.chat_template_kwargs or {}
+            if "thinking" in chat_template_kwargs:
+                return chat_template_kwargs["thinking"] is True
+            return envs.SGLANG_DEFAULT_THINKING.get()
+
         config = self.template_manager.reasoning_config
         if config is None:
             # Fallback to parser-level defaults when template toggle config

@@ -161,6 +161,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.waiting_queue = []
         self.cur_batch_for_debug = None
         self._engine_paused = False
+        self._pending_abort_pause = False
         self.gracefully_exit = False
         self.enable_staging = False
         self.enable_overlap = True

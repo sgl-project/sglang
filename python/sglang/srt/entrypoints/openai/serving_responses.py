@@ -60,6 +60,7 @@ from sglang.srt.entrypoints.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
+from sglang.srt.entrypoints.openai import chat_encoding
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
@@ -87,6 +88,7 @@ from sglang.srt.entrypoints.openai.responses_adapters import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -992,6 +994,15 @@ class OpenAIServingResponses(OpenAIServingChat):
             return effort not in (None, "none", "no_think")
         if self.template_manager.force_reasoning:
             return True
+        if chat_encoding.spec_prompt_reads_default_thinking_env(
+            self.chat_encoding_spec
+        ):
+            # The dsv4/dsv41/dsv32 encoders build the prompt from the explicit
+            # `thinking` kwarg and fall back to SGLANG_DEFAULT_THINKING when it
+            # is absent (see serving_chat._apply_jinja_template, which this
+            # path reuses via _process_messages). Mirror that default here so
+            # the reasoning parser splits exactly what the prompt requested.
+            return envs.SGLANG_DEFAULT_THINKING.get()
         config = self.template_manager.reasoning_config
         if config is None:
             # Parser-only models (DeepSeek-R1, …) carry the thinking default in
