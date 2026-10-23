@@ -4,6 +4,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.activations import get_activation
 from diffusers.models.autoencoders.vae import (
     DecoderOutput,
@@ -227,6 +228,31 @@ class LTX2VideoCausalConv3d(nn.Module):
                         hidden_states[:, :, -1:, :, :].repeat((1, 1, right, 1, 1))
                     )
                 hidden_states = torch.concatenate(parts, dim=2)
+
+        if (
+            use_channels_last_pad
+            and hidden_states.is_cuda
+            and type(self.conv) is nn.Conv3d
+            and self.conv.padding_mode == "reflect"
+        ):
+            # reflection_pad3d converts NCDHW inputs to contiguous storage, even
+            # when cuDNN will immediately convert them back to channels-last.
+            # In NDHWC order, reflect H/W and leave C unpadded to keep that layout.
+            _, height_pad, width_pad = self.conv.padding
+            hidden_states = F.pad(
+                hidden_states.permute(0, 2, 3, 4, 1),
+                (0, 0, width_pad, width_pad, height_pad, height_pad),
+                mode="reflect",
+            ).permute(0, 4, 1, 2, 3)
+            return F.conv3d(
+                hidden_states,
+                self.conv.weight,
+                self.conv.bias,
+                self.conv.stride,
+                0,
+                self.conv.dilation,
+                self.conv.groups,
+            )
 
         hidden_states = self.conv(hidden_states)
         return hidden_states

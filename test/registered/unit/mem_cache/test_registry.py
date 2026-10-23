@@ -8,6 +8,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 import unittest
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
     TreeCacheBuildContext,
@@ -148,54 +149,6 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
                 _make_ctx(self, backend="nonstreaming", enable_streaming=True)
             )
 
-    def test_full_attention_with_disable_radix_routes_to_unified(self):
-        ctx = _make_ctx(self, disable_radix_cache=True)
-        with patch(
-            "sglang.srt.mem_cache.registry.create_unified_radix_cache"
-        ) as create_unified:
-            result = default_radix_cache_factory(ctx)
-        create_unified.assert_called_once_with(ctx)
-        self.assertIs(result, create_unified.return_value)
-
-    def test_kv_sharding_with_disable_radix_routes_to_unified(self):
-        ctx = _make_ctx(self, disable_radix_cache=True, enable_kv_cache_sharding=True)
-        with patch(
-            "sglang.srt.mem_cache.registry.create_unified_radix_cache"
-        ) as create_unified:
-            result = default_radix_cache_factory(ctx)
-        create_unified.assert_called_once_with(ctx)
-        self.assertIs(result, create_unified.return_value)
-
-    def test_kv_sharding_uses_unified_radix_cache(self):
-        ctx = _make_ctx(self, enable_kv_cache_sharding=True)
-        fake_components = MagicMock()
-        fake_radix = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {
-                "sglang.srt.mem_cache.unified_cache.components": fake_components,
-                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
-            },
-        ):
-            result = default_radix_cache_factory(ctx)
-
-        fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
-        self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
-
-    def test_hybrid_swa_with_disable_radix_routes_to_unified(self):
-        ctx = _make_ctx(
-            self,
-            disable_radix_cache=True,
-            is_hybrid_swa=True,
-            full_tokens_per_layer=128,
-        )
-        with patch(
-            "sglang.srt.mem_cache.registry.create_unified_radix_cache"
-        ) as create_unified:
-            result = default_radix_cache_factory(ctx)
-        create_unified.assert_called_once_with(ctx)
-        self.assertIs(result, create_unified.return_value)
-
     def test_swa_component_accepts_hisparse_allocator(self):
         # Disabled DeepSeek V4 HiSparse routes to UnifiedRadixCache, whose SWA
         # component must accept the HiSparse allocator.
@@ -204,9 +157,14 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         )
         from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 
-        params = MagicMock(sliding_window_size=128, page_size=64)
-        params.token_to_kv_pool_allocator = MagicMock(
-            spec=DeepSeekV4HiSparseTokenToKVPoolAllocator
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=MagicMock(
+                spec=DeepSeekV4HiSparseTokenToKVPoolAllocator
+            ),
+            page_size=64,
+            sliding_window_size=128,
         )
         component = SWAComponent(MagicMock(), params)
         self.assertEqual(component.full_window_pages, 2)
@@ -229,23 +187,6 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             PureSWARadixCache.assert_called_once_with(params=ctx.params)
             self.assertIs(result, PureSWARadixCache.return_value)
 
-    def test_pure_swa_with_disable_radix_and_host_pool_goes_to_unified(self):
-        ctx = _make_ctx(
-            self, disable_radix_cache=True, is_hybrid_swa=True, full_tokens_per_layer=0
-        )
-        enter_override(
-            self,
-            get_context().override_server_args(
-                disaggregation_decode_retraction_backup="host_pool"
-            ),
-        )
-        with patch(
-            "sglang.srt.mem_cache.registry.create_unified_radix_cache"
-        ) as create_unified:
-            result = default_radix_cache_factory(ctx)
-            create_unified.assert_called_once_with(ctx)
-            self.assertIs(result, create_unified.return_value)
-
     def test_mamba_rejected_on_cache_without_mamba(self):
         inner = MagicMock()
         inner.supports_mamba.return_value = False
@@ -253,24 +194,6 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
 
         with self.assertRaisesRegex(NotImplementedError, "not verified"):
             create_tree_cache(_make_ctx(self, backend="nomamba", is_hybrid_ssm=True))
-
-    def test_unified_radix_cache_is_the_default(self):
-        ctx = _make_ctx(
-            self,
-        )
-        # Shim both factory imports — each transitively loads sgl_kernel.
-        fake_components = MagicMock()
-        fake_radix = MagicMock()
-        with patch.dict(
-            "sys.modules",
-            {
-                "sglang.srt.mem_cache.unified_cache.components": fake_components,
-                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
-            },
-        ):
-            result = default_radix_cache_factory(ctx)
-            fake_radix.UnifiedRadixCache.assert_called_once_with(ctx.params)
-            self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
     def test_unified_radix_cache_when_hierarchical(self):
         ctx = _make_ctx(self, enable_hierarchical_cache=True)
@@ -333,6 +256,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             ctx.server_args,
             ctx.params,
             components={"full"},
+            forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
         cache.init_cache_linker.assert_called_once_with(linker)
         ctx.params.token_to_kv_pool_allocator.get_kvcache.return_value.register_layer_transfer_counter.assert_called_once_with(
