@@ -61,6 +61,42 @@ class _FakeProcess:
 
 
 class TestLaunchServerShutdown(unittest.TestCase):
+    def test_pool_failure_releases_previously_started_roles(self):
+        args = SimpleNamespace(
+            host="127.0.0.1",
+            enable_metrics=False,
+            scheduler_port=15000,
+            disagg_dispatch_policy="round_robin",
+            disagg_timeout=30,
+            get_role_parallelism=lambda role: dict(
+                tp_size=None, sp_degree=None, ulysses_degree=None, ring_degree=None
+            ),
+        )
+        for failure in ("later_role", "router"):
+            workers = [_FakeProcess() for _ in range(3)]
+            router = Mock()
+            router.wait_ready.side_effect = RuntimeError("bind failed")
+            starts = [[p] for p in workers]
+            if failure == "later_role":
+                starts[1] = RuntimeError("worker failed")
+            with (
+                self.subTest(failure=failure),
+                patch.object(ls, "configure_logger"),
+                patch.object(ls, "_find_available_port", side_effect=lambda port: port),
+                patch.object(ls.dataclasses, "fields", return_value=[]),
+                patch.object(
+                    ls.ServerArgs, "from_kwargs", return_value=SimpleNamespace()
+                ),
+                patch.object(ls, "_start_scheduler_processes", side_effect=starts),
+                patch.object(ls, "DiffusionServer", return_value=router),
+            ):
+                with self.assertRaises(RuntimeError):
+                    ls.launch_pool_disagg_server(args, [[0]], [[1]], [[0]])
+                for worker in workers[:1] if failure == "later_role" else workers:
+                    self.assertTrue(worker.terminated and worker.killed)
+                if failure == "router":
+                    router.stop.assert_called_once()
+
     @unittest.skipUnless(sys.platform == "linux", "uses CPU-only fork and SIGALRM")
     def test_startup_waits_for_all_ranks_and_cleans_up_failures(self):
         context = mp.get_context("fork")

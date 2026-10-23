@@ -218,7 +218,6 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     node_rank = server_args.node_rank
     local_num_gpus = num_gpus // nnodes
     rank_offset = node_rank * local_num_gpus
-    worker_context = mp.get_context("spawn")
     server_args_payload = ServerArgsPayload.capture(server_args)
     processes = _start_scheduler_processes(
         server_args_payload,
@@ -255,7 +254,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         logger.info("Starting FastAPI server.")
         if server_args.webui:
             logger.info("Launch FastAPI server in another process because of webui.")
-            http_server_process = worker_context.Process(
+            http_server_process = mp.get_context("spawn").Process(
                 target=bootstrap_http_server_process,
                 args=(server_args_payload,),
                 name="sglang-diffusion-webui",
