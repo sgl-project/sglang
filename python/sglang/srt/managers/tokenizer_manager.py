@@ -119,6 +119,7 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
+    MultimodalProcessorOutput,
     get_request_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -1283,10 +1284,52 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             mm_inputs = None
 
+        if (
+            isinstance(obj, EmbeddingReqInput)
+            and obj.truncate_prompt_tokens is not None
+        ):
+            input_ids = self._truncate_embedding_prompt(
+                input_ids, obj.truncate_prompt_tokens, mm_inputs
+            )
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+
+    def _truncate_embedding_prompt(
+        self,
+        input_ids: List[int],
+        max_tokens: int,
+        mm_inputs: Optional[MultimodalProcessorOutput],
+    ) -> List[int]:
+        """Keep the first max_tokens prompt tokens (-1: as many as the context allows)."""
+        if max_tokens == -1:
+            max_tokens = self.context_len - self.num_reserved_tokens - 1
+        if len(input_ids) <= max_tokens:
+            return input_ids
+        if mm_inputs is not None:
+            if any(
+                end >= max_tokens
+                for item in mm_inputs.mm_items
+                for _, end in item.offsets or ()
+            ):
+                raise ValueError(
+                    f"truncate_prompt_tokens={max_tokens} would cut multimodal "
+                    f"tokens from a {len(input_ids)}-token prompt"
+                )
+            # Position tensors are sized to the full prompt.
+            if (
+                mm_inputs.mrope_positions is not None
+                or mm_inputs.vision_position_ids is not None
+                or mm_inputs.token_type_ids is not None
+            ):
+                raise ValueError(
+                    "truncate_prompt_tokens is not supported for this model's "
+                    "multimodal inputs"
+                )
+            if mm_inputs.padded_input_ids is not None:
+                mm_inputs.padded_input_ids = mm_inputs.padded_input_ids[:max_tokens]
+        return input_ids[:max_tokens]
 
     @staticmethod
     def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:

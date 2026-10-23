@@ -1264,6 +1264,10 @@ class EmbeddingReqInput:
     return_pooled_hidden_states: bool = False
     # Whether to return prompt token IDs without computing logprobs
     return_prompt_token_ids: bool = False
+    # Keep at most this many prompt tokens, cutting from the end (-1: the context length).
+    truncate_prompt_tokens: Optional[int] = None
+    # Per-request multimodal processor overrides, e.g. {"size": {"longest_edge": 1024}}.
+    mm_processor_kwargs: Optional[Dict[str, Any]] = None
 
     # Propagates trace context via Engine.encode/async_encode
     external_trace_header: Optional[Dict[str, Any]] = None
@@ -1488,6 +1492,8 @@ class EmbeddingReqInput:
                 dimensions=self.dimensions,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
+                truncate_prompt_tokens=self.truncate_prompt_tokens,
+                mm_processor_kwargs=self.mm_processor_kwargs,
                 external_trace_header=self.external_trace_header,
                 received_time=self.received_time,
                 multi_item_delimiter_indices=(

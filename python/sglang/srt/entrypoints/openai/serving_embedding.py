@@ -49,6 +49,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 f"got {request.encoding_format!r}"
             )
 
+        if request.messages is not None:
+            return None if request.messages else "messages cannot be empty"
+
         if not (input := request.input):
             return "Input cannot be empty"
 
@@ -90,7 +93,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         """Convert OpenAI embedding request to internal format"""
         prompt = request.input
 
-        if isinstance(prompt, str):
+        if request.messages is not None:
+            prompt_kwargs = self._render_embedding_messages(request.messages)
+        elif isinstance(prompt, str):
             # Single string input
             prompt_kwargs = {"text": prompt}
         elif isinstance(prompt, list):
@@ -179,9 +184,65 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             lora_path=lora_path,
             embed_override_token_id=request.embed_override_token_id,
             embed_overrides=embed_overrides,
+            truncate_prompt_tokens=request.truncate_prompt_tokens,
+            mm_processor_kwargs=request.mm_processor_kwargs,
         )
 
         return adapted_request, request
+
+    def _render_embedding_messages(self, messages) -> Dict[str, Any]:
+        """Render one conversation through the tokenizer's Jinja chat template.
+
+        Media parts are collected in message order and passed alongside the prompt.
+        """
+        if getattr(self.tokenizer_manager.tokenizer, "chat_template", None) is None:
+            raise ValueError("messages require a model with a Jinja chat template")
+        image_data, video_data, audio_data, modalities = [], [], [], []
+        processed_messages = []
+        for message in messages:
+            msg_dict = message.model_dump()
+            if msg_dict.get("content") is None:
+                msg_dict["content"] = ""
+            processed_messages.append(
+                process_content_for_template_format(
+                    msg_dict,
+                    self.template_manager.jinja_template_content_format,
+                    image_data,
+                    video_data,
+                    audio_data,
+                    modalities,
+                )
+            )
+        return {
+            "text": self._apply_chat_template(
+                processed_messages, add_generation_prompt=False
+            ),
+            "image_data": image_data or None,
+            "video_data": video_data or None,
+            "audio_data": audio_data or None,
+        }
+
+    def _apply_chat_template(
+        self, messages: List[Dict[str, Any]], add_generation_prompt: bool
+    ) -> str:
+        # Jinja failures become ValueError so the caller returns HTTP 400, not 500.
+        try:
+            return self.tokenizer_manager.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        except jinja2.TemplateError as template_error:
+            location = getattr(template_error, "lineno", None)
+            name = getattr(template_error, "name", None)
+            suffix = ""
+            if name or location:
+                suffix = f" (template={name or '<unknown>'}, line={location})"
+            raise ValueError(f"{template_error}{suffix}") from template_error
+        except (TypeError, KeyError, AttributeError) as template_error:
+            raise ValueError(
+                f"Failed to render chat template for embedding input: {template_error}"
+            ) from template_error
 
     def _apply_jinja_template_to_embedding_inputs(
         self,
@@ -224,24 +285,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 audio_data=[],
                 modalities=[],
             )
-            try:
-                prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
-                    [processed_msg],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            except jinja2.TemplateError as template_error:
-                location = getattr(template_error, "lineno", None)
-                name = getattr(template_error, "name", None)
-                suffix = ""
-                if name or location:
-                    suffix = f" (template={name or '<unknown>'}, line={location})"
-                raise ValueError(f"{template_error}{suffix}") from template_error
-            except (TypeError, KeyError, AttributeError) as template_error:
-                raise ValueError(
-                    f"Failed to render chat template for embedding input: {template_error}"
-                ) from template_error
-            prompts.append(prompt)
+            prompts.append(
+                self._apply_chat_template([processed_msg], add_generation_prompt=True)
+            )
 
         return prompts
 

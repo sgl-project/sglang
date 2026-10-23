@@ -1358,7 +1358,8 @@ EmbeddingInput = Union[
 class EmbeddingRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/embeddings/create
-    input: EmbeddingInput
+    # Exactly one of input or messages is required.
+    input: Optional[EmbeddingInput] = None
     model: str = DEFAULT_MODEL_NAME
     encoding_format: str = "float"
     dimensions: Optional[int] = None
@@ -1375,6 +1376,22 @@ class EmbeddingRequest(BaseModel):
     # Per-input embedding overrides (null entries skip that input).
     # Shape: [num_inputs][num_replacements][hidden_size]
     embed_overrides: Optional[List[Optional[List[List[float]]]]] = None
+
+    # vLLM-compatible extensions.
+    # One conversation rendered with the model's chat template, embedded as a
+    # single input; lets templates take a system prompt and several images.
+    messages: Optional[List[ChatCompletionMessageParam]] = None
+    # Keep at most this many prompt tokens, cutting from the end; -1 means
+    # the context length.
+    truncate_prompt_tokens: Optional[int] = Field(default=None, ge=-1)
+    # Per-request multimodal processor overrides, e.g. {"size": {"longest_edge": 1024}}.
+    mm_processor_kwargs: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def validate_input_or_messages(self):
+        if (self.input is None) == (self.messages is None):
+            raise ValueError("Exactly one of 'input' or 'messages' is required")
+        return self
 
 
 class EmbeddingObject(BaseModel):

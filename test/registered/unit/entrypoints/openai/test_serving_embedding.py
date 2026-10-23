@@ -355,6 +355,81 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         )
         self.assertEqual(response.usage.prompt_tokens, 2)
 
+    def test_convert_messages_request_renders_one_conversation(self):
+        """messages render once with the template, keeping system prompts and images."""
+        self.tokenizer_manager.tokenizer.chat_template = "mock-template"
+        self.tokenizer_manager.tokenizer.apply_chat_template = Mock(
+            return_value="passage: [IMG] [IMG] page text"
+        )
+        request = EmbeddingRequest(
+            model="test-model",
+            messages=[
+                {"role": "system", "content": "passage: "},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "data:a"}},
+                        {"type": "text", "text": "page text"},
+                        {"type": "image_url", "image_url": {"url": "data:b"}},
+                    ],
+                },
+            ],
+            truncate_prompt_tokens=10240,
+            mm_processor_kwargs={"size": {"longest_edge": 896}},
+        )
+
+        self.assertIsNone(self.serving_embedding._validate_request(request))
+        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
+            request
+        )
+
+        self.assertEqual(adapted_request.text, "passage: [IMG] [IMG] page text")
+        self.assertEqual(
+            [image.url for image in adapted_request.image_data], ["data:a", "data:b"]
+        )
+        self.assertIsNone(adapted_request.video_data)
+        self.assertEqual(adapted_request.truncate_prompt_tokens, 10240)
+        self.assertEqual(
+            adapted_request.mm_processor_kwargs, {"size": {"longest_edge": 896}}
+        )
+        call = self.tokenizer_manager.tokenizer.apply_chat_template.call_args
+        messages = call.args[0]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[0]["content"], "passage: ")
+        self.assertEqual(
+            [part["type"] for part in messages[1]["content"]],
+            ["image", "text", "image"],
+        )
+        self.assertEqual(call.kwargs["add_generation_prompt"], False)
+
+    def test_messages_require_a_jinja_chat_template(self):
+        request = EmbeddingRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}]
+        )
+
+        with self.assertRaisesRegex(ValueError, "Jinja chat template"):
+            self.serving_embedding._convert_to_internal_request(request)
+
+    def test_exactly_one_of_input_or_messages(self):
+        with self.assertRaises(ValueError):
+            EmbeddingRequest(model="test-model")
+        with self.assertRaises(ValueError):
+            EmbeddingRequest(
+                model="test-model",
+                input="hi",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+    def test_rejects_empty_messages_and_invalid_truncation(self):
+        self.assertEqual(
+            self.serving_embedding._validate_request(
+                EmbeddingRequest(model="test-model", messages=[])
+            ),
+            "messages cannot be empty",
+        )
+        with self.assertRaises(ValueError):
+            EmbeddingRequest(model="test-model", input="hi", truncate_prompt_tokens=-2)
+
     def test_rejects_unknown_embedding_encoding_format(self):
         invalid_request = EmbeddingRequest(
             model="test-model", input="hello", encoding_format="binary"
