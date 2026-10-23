@@ -889,7 +889,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._async_output_save
             and not req.is_warmup
             and not req.return_raw_frames
-            and bool(req.save_output and req.return_file_paths_only)
+            and self._encodes_on_output_rank(req)
             and req.perf_dump_path is None
             and not envs.SGLANG_DIFFUSION_STAGE_LOGGING
         )
@@ -981,10 +981,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if req.return_raw_frames:
             self._materialize_raw_frame_transport(output_batch, req)
-        elif req.save_output and req.return_file_paths_only:
+        elif self._encodes_on_output_rank(req):
             self._materialize_file_path_transport(output_batch, save_output_paths)
         elif getattr(req, "return_frames", False):
             self._materialize_frame_outputs_for_return(output_batch, req)
+
+    @staticmethod
+    def _encodes_on_output_rank(req: Req) -> bool:
+        # the output rank encodes the outputs to save them or to return the image bytes
+        return req.return_file_paths_only and (
+            req.save_output or req.return_image_bytes
+        )
 
     def _materialize_raw_frame_transport(
         self, output_batch: OutputBatch, req: Req
@@ -1291,14 +1298,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             def build_output_path(idx: int) -> str:
                 return req.output_file_path(num_outputs, idx)
 
+        image_bytes = [] if req.return_image_bytes else None
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             req.data_type,
             req.fps,
-            True,
+            req.save_output,
             build_output_path,
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
+            image_bytes_out=image_bytes,
             output_compression=req.output_compression,
             x264_preset=req.x264_preset,
             enable_frame_interpolation=req.enable_frame_interpolation,
@@ -1309,6 +1318,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             upscaling_model_path=req.upscaling_model_path,
             upscaling_scale=req.upscaling_scale,
         )
+        output_batch.output_image_bytes = image_bytes
 
     def _save_group_output_paths(
         self,
@@ -1324,14 +1334,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
 
         first_req = reqs[0]
+        image_bytes = [] if first_req.return_image_bytes else None
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             first_req.data_type,
             first_req.fps,
-            True,
+            first_req.save_output,
             lambda idx: output_requests[idx].output_file_path(),
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
+            image_bytes_out=image_bytes,
             output_compression=first_req.output_compression,
             x264_preset=first_req.x264_preset,
             enable_frame_interpolation=first_req.enable_frame_interpolation,
@@ -1342,6 +1354,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             upscaling_model_path=first_req.upscaling_model_path,
             upscaling_scale=first_req.upscaling_scale,
         )
+        output_batch.output_image_bytes = image_bytes
 
     @staticmethod
     def _validate_group_forward_reqs(reqs: list[Req]) -> None:
@@ -1351,6 +1364,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             "save_output",
             "return_frames",
             "return_file_paths_only",
+            "return_image_bytes",
             "data_type",
             "fps",
             "output_compression",
