@@ -2101,7 +2101,7 @@ class CommonKVSender(BaseKVSender):
         self.trace_ctx.trace_req_start()
         # inner state
         self.curr_idx = 0
-        self.init_time = time.time()
+        self.init_time: Optional[float] = None
         self._prefill_complete_time: Optional[float] = None
         self._owns_bootstrap_room = True
         if mgr.deferred_bootstrap is not None:
@@ -2143,6 +2143,8 @@ class CommonKVSender(BaseKVSender):
                 )
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
+        # Bootstrap timeout clock starts after the registration above.
+        self.init_time = time.time()
 
     def _register_prefill_dp_rank(self):
         """Register this request's prefill dp_rank to the bootstrap server."""
