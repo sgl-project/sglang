@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.scheduler_client import (
     run_zeromq_broker,
 )
 from sglang.multimodal_gen.runtime.server_args import MAX_SCHEDULER_RPC_TIMEOUT_S
+from sglang.srt.utils.network import get_free_port
 
 
 def test_sync_scheduler_client_converts_configured_seconds_to_milliseconds():
@@ -217,9 +218,7 @@ def test_broker_closes_socket_and_context(monkeypatch, failure):
 
 
 @pytest.mark.parametrize("failure", ["decode", "forward", "encode"])
-def test_broker_serves_next_request_after_job_error(
-    monkeypatch, unused_tcp_port, failure
-):
+def test_broker_serves_next_request_after_job_error(monkeypatch, failure):
     async def run_test():
         async def forward(request):
             if request == "bad":
@@ -229,11 +228,12 @@ def test_broker_serves_next_request_after_job_error(
             return {"request": request}
 
         monkeypatch.setattr(async_scheduler_client, "forward", forward)
+        port = get_free_port()
         context = zmq.asyncio.Context()
         socket = context.socket(zmq.REQ)
-        socket.connect(f"tcp://127.0.0.1:{unused_tcp_port}")
+        socket.connect(f"tcp://127.0.0.1:{port}")
         broker = asyncio.create_task(
-            run_zeromq_broker(SimpleNamespace(broker_port=unused_tcp_port))
+            run_zeromq_broker(SimpleNamespace(broker_port=port))
         )
         try:
             payload = b"invalid pickle" if failure == "decode" else pickle.dumps("bad")
