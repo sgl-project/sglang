@@ -11,6 +11,7 @@ ForwardBatch to evaluate and so is not part of this predicate.
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -79,6 +80,111 @@ class TestFusedAbsorbGate(CustomTestCase):
         ):
             with self.subTest(term=name):
                 self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
+
+
+_GLUON_OK = forward_mla_rocm._gluon_mla_decode_gfx950_ok
+_GLUON_LAYER = dict(
+    kv_cache_dtype="fp8_e4m3",
+    kv_lora_rank=512,
+    qk_nope_head_dim=192,
+    qk_rope_head_dim=64,
+    v_head_dim=256,
+    num_local_heads=8,
+    dcp_size=1,
+)
+
+
+class TestGluonMlaDecodeGate(CustomTestCase):
+    """Which layers may swap the aiter decode prologue for the gfx950 Gluon kernel."""
+
+    def setUp(self):
+        self.calls = []
+        self.kernels = SimpleNamespace(
+            gluon_mla_absorb_rope_cache_supported=lambda *args: True,
+            gluon_mla_absorb_rope_cache=lambda *args: (
+                self.calls.append("gluon") or "q_cat"
+            ),
+        )
+        exec_cfg = SimpleNamespace(kernel=SimpleNamespace(dsa_decode_backend="triton"))
+        for name, value in (
+            ("_gluon_mla_absorb", self.kernels),
+            ("get_exec", lambda: exec_cfg),
+            (
+                "get_kv_layers",
+                lambda: SimpleNamespace(read=lambda i: SimpleNamespace(key=lambda: i)),
+            ),
+            ("fp8_dtype", torch.float8_e4m3fn),
+            (
+                "fused_fp8_bmm_rope_cat_and_cache_mla",
+                lambda *args, **kwargs: self.calls.append("aiter") or ("q",) * 4,
+            ),
+        ):
+            p = mock.patch.object(forward_mla_rocm, name, value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
+        self.exec_cfg = exec_cfg
+
+    def test_takes_gluon_when_every_term_holds(self):
+        for heads in (8, 16):
+            with self.subTest(heads=heads):
+                self.assertTrue(_GLUON_OK(**{**_GLUON_LAYER, "num_local_heads": heads}))
+
+    def test_each_term_alone_turns_it_off(self):
+        for name, broken in (
+            ("kv_cache_dtype", "auto"),
+            ("kv_lora_rank", 448),
+            ("qk_nope_head_dim", 128),
+            ("qk_rope_head_dim", 0),
+            ("v_head_dim", 128),
+            ("num_local_heads", 12),
+            ("dcp_size", 2),
+        ):
+            with self.subTest(term=name):
+                self.assertFalse(_GLUON_OK(**{**_GLUON_LAYER, name: broken}))
+        # aiter and tilelang decode read the roped k_pe, which this kernel skips.
+        for backend in ("aiter", "tilelang"):
+            self.exec_cfg.kernel.dsa_decode_backend = backend
+            self.assertFalse(_GLUON_OK(**_GLUON_LAYER))
+        self.exec_cfg.kernel.dsa_decode_backend = "triton"
+        with mock.patch.object(forward_mla_rocm, "_gluon_mla_absorb", None):
+            self.assertFalse(_GLUON_OK(**_GLUON_LAYER))
+
+    def test_outside_the_gate_the_aiter_kernel_runs(self):
+        attn = SimpleNamespace(
+            use_gluon_mla_decode_gfx950=True,
+            rotary_emb=SimpleNamespace(
+                is_neox_style=False, cos_cache=None, sin_cache=None
+            ),
+            attn_mqa=SimpleNamespace(layer_id=0, k_scale=None),
+            w_kc=torch.empty(8, 192, 512),
+            w_scale=None,
+            kv_cache_dtype="fp8_e4m3",
+        )
+        args = (attn,) + (torch.empty(1, 1, 1),) * 6
+        self.assertEqual(
+            forward_mla_rocm._fused_bmm_rope_cat_and_cache(
+                *args, decode_or_verify=True
+            )[0],
+            "q_cat",
+        )
+        # Draft extend also takes the fused path upstream; the Gluon kernel is
+        # only enabled for decode and target verify.
+        self.calls.clear()
+        forward_mla_rocm._fused_bmm_rope_cat_and_cache(*args, decode_or_verify=False)
+        self.assertEqual(self.calls, ["aiter"])
+        for flip in (
+            lambda: setattr(attn, "use_gluon_mla_decode_gfx950", False),
+            lambda: setattr(attn.rotary_emb, "is_neox_style", True),
+            lambda: setattr(
+                self.kernels,
+                "gluon_mla_absorb_rope_cache_supported",
+                lambda *args: False,
+            ),
+        ):
+            flip()
+            self.calls.clear()
+            forward_mla_rocm._fused_bmm_rope_cat_and_cache(*args, decode_or_verify=True)
+            self.assertEqual(self.calls, ["aiter"])
 
 
 class TestAbsorbBmmConfig(CustomTestCase):

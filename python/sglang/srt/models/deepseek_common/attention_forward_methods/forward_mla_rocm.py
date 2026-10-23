@@ -135,6 +135,7 @@ if _use_aiter:
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
 
+_gluon_mla_absorb = None
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import (
         fused_flatten_fp8_group_quant,
@@ -150,6 +151,13 @@ if _use_aiter_gfx95:
         fused_fp8_bmm_rope_cat_and_cache_mla,
         fused_qk_rope_cat_and_cache_mla,
     )
+
+    try:
+        from sglang.kernels.ops.attention import (
+            gluon_mla_absorb_rope_cache_gfx950 as _gluon_mla_absorb,
+        )
+    except ImportError:  # Triton without Gluon's gfx950 (cdna4) dialect
+        pass
 
 
 _ABSORB_BMM_DECODE_MAX_M = 256
@@ -454,6 +462,30 @@ def _can_fuse_bmm_rope_cat_and_cache(attn: DeepseekV2AttentionMLA) -> bool:
     )
 
 
+def _gluon_mla_decode_gfx950_ok(
+    *,
+    kv_cache_dtype: str,
+    kv_lora_rank: int,
+    qk_nope_head_dim: int,
+    qk_rope_head_dim: int,
+    v_head_dim: int,
+    num_local_heads: int,
+    dcp_size: int,
+) -> bool:
+    """Whether a layer's decode MLA kernels can be the gfx950 Gluon ones."""
+    return (
+        _gluon_mla_absorb is not None
+        # Measured with, and k_rope-free only under, the Triton DSA decode impl.
+        and get_exec().kernel.dsa_decode_backend == "triton"
+        and kv_cache_dtype == "fp8_e4m3"
+        and (kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim)
+        == (512, 192, 64, 256)
+        and num_local_heads in (8, 16)
+        # Under DCP the attention output carries every rank's heads.
+        and dcp_size == 1
+    )
+
+
 def _fused_bmm_rope_cat_and_cache(
     attn: DeepseekV2AttentionMLA,
     q_nope: torch.Tensor,
@@ -462,12 +494,49 @@ def _fused_bmm_rope_cat_and_cache(
     k_pe: torch.Tensor,
     positions: torch.Tensor,
     out_cache_loc: torch.Tensor,
+    *,
+    decode_or_verify: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """q absorb + RoPE + concat + KV-cache write in one AITER kernel.
+    """q absorb + RoPE + concat + KV-cache write in one kernel.
 
     Takes q_nope un-absorbed: the BMM ``rocm_absorb_q_bmm`` would have done is
     the first half of this kernel's grid.
     """
+    if (
+        decode_or_verify
+        and attn.use_gluon_mla_decode_gfx950
+        and not attn.rotary_emb.is_neox_style
+    ):
+        kv_cache = get_kv_layers().read(attn.attn_mqa.layer_id).key()
+        w_kc = attn.w_kc.transpose(-1, -2)
+        k_scale = attn.attn_mqa.k_scale
+        if _gluon_mla_absorb.gluon_mla_absorb_rope_cache_supported(
+            q_nope,
+            q_pe,
+            k_nope,
+            k_pe,
+            kv_cache,
+            w_kc,
+            attn.w_scale,
+            attn.rotary_emb.cos_cache,
+            k_scale,
+        ):
+            q_cat = _gluon_mla_absorb.gluon_mla_absorb_rope_cache(
+                q_nope,
+                w_kc,
+                attn.w_scale,
+                q_pe,
+                k_nope,
+                k_pe,
+                kv_cache,
+                out_cache_loc,
+                positions,
+                attn.rotary_emb.cos_cache,
+                attn.rotary_emb.sin_cache,
+                k_scale,
+            )
+            # The roped k_pe only goes to the KV cache, which this already wrote.
+            return q_cat, None, None, None
     kv_cache_dtype = fp8_dtype if attn.kv_cache_dtype == "fp8_e4m3" else q_nope.dtype
     # Same weights and group size the fp8 branch of rocm_absorb_q_bmm passes to
     # batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant;
@@ -493,6 +562,17 @@ def _fused_bmm_rope_cat_and_cache(
 
 
 class DeepseekMLARocmForwardMixin:
+    def init_mla_rocm_forward(self: DeepseekV2AttentionMLA):
+        self.use_gluon_mla_decode_gfx950 = _gluon_mla_decode_gfx950_ok(
+            kv_cache_dtype=self.kv_cache_dtype,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            v_head_dim=self.v_head_dim,
+            num_local_heads=self.num_local_heads,
+            dcp_size=self.dcp_size,
+        )
+
     def forward_absorb_rocm_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -830,6 +910,10 @@ class DeepseekMLARocmForwardMixin:
         q_nope_unabsorbed=None,
     ):
         save_kv_cache = True
+        decode_or_verify = (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        )
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             if self._skip_rope_for_dsa_tilelang_fused() and self.rotary_emb is not None:
@@ -845,6 +929,7 @@ class DeepseekMLARocmForwardMixin:
                         k_pe,
                         positions,
                         forward_batch.out_cache_loc,
+                        decode_or_verify=decode_or_verify,
                     )
                 else:
                     q_cat, _, k_pe_fused, _ = _fused_rope_cat_and_cache(
@@ -863,10 +948,7 @@ class DeepseekMLARocmForwardMixin:
                 # step. Target-verify is the same absorbed shape as decode, just
                 # more rows; real prefill keeps the split form because the Triton
                 # sparse-MLA kernel reads q_nope/q_rope separately.
-                if (
-                    forward_batch.forward_mode.is_decode_or_idle()
-                    or forward_batch.forward_mode.is_target_verify()
-                ):
+                if decode_or_verify:
                     if llama_4_scaling is not None:
                         # llama_4_scaling applies only to the q_nope portion;
                         # mutate in place via the slice view of q_cat.
