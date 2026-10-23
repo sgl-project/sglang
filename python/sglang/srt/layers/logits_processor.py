@@ -912,8 +912,15 @@ class LogitsProcessor(nn.Module):
             if self.do_tensor_parallel_all_gather_dp_attn
             else LoRABatchLayout.DP_LOCAL
         )
+        logits_buffer = (
+            logits_metadata.next_token_logits_buffer
+            if use_logits_buffer and not self.do_tensor_parallel_all_gather
+            else None
+        )
         with get_forward().scoped(lora_batch_layout=lora_batch_layout):
-            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+            logits = self._compute_lm_head(
+                hidden_states, lm_head, embedding_bias, out=logits_buffer
+            )
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
@@ -1061,6 +1068,8 @@ class LogitsProcessor(nn.Module):
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
+        *,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
@@ -1070,26 +1079,30 @@ class LogitsProcessor(nn.Module):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
-            if self.use_fp32_lm_head:
-                # Avoid materializing FP32 copies for same-dtype CUDA FP16/BF16
-                # inputs. Retain explicit FP32 casts for unsupported devices or
-                # dtype combinations.
-                use_mm_out_dtype = (
-                    hidden_states.is_cuda
-                    and hidden_states.dtype == lm_head.weight.dtype
-                    and hidden_states.dtype in (torch.float16, torch.bfloat16)
+            if out is not None and out.shape != (
+                hidden_states.shape[0],
+                lm_head.weight.shape[0],
+            ):
+                out = None
+            use_mm_out_dtype = (
+                hidden_states.is_cuda
+                and hidden_states.dtype == lm_head.weight.dtype
+                and hidden_states.dtype in (torch.float16, torch.bfloat16)
+            )
+            # A shared FP32 buffer must not change the lm_head's output precision.
+            # Keep the same rounding as the unbuffered path unless FP32 is enabled.
+            if use_mm_out_dtype and self.use_fp32_lm_head:
+                logits = torch.mm(
+                    hidden_states,
+                    lm_head.weight.T,
+                    out_dtype=torch.float32,
+                    out=out,
                 )
-                if use_mm_out_dtype:
-                    logits = torch.mm(
-                        hidden_states,
-                        lm_head.weight.T,
-                        out_dtype=torch.float32,
-                    )
-                else:
-                    logits = torch.matmul(
-                        hidden_states.to(torch.float32),
-                        lm_head.weight.to(torch.float32).T,
-                    )
+            elif self.use_fp32_lm_head:
+                logits = torch.matmul(
+                    hidden_states.to(torch.float32),
+                    lm_head.weight.to(torch.float32).T,
+                )
             elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
@@ -1248,6 +1261,8 @@ class LogitsProcessor(nn.Module):
         softcap: Optional[float] = None,
     ) -> torch.Tensor:
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
+        if logits is logits_buffer and softcap is None:
+            return logits
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
         logits_width = logits.shape[-1]

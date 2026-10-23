@@ -70,7 +70,7 @@ from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
-from sglang.srt.configs.model_config import load_joint_head_config
+from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -2406,13 +2406,18 @@ def _execute_server_warmup(server_args: ServerArgs):
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
-    if (
-        not model_info["is_generation"]
-        and model_info.get("architectures") == ["Qwen3_5ForConditionalGeneration"]
-        and load_joint_head_config(get_model().model_path, get_model().revision)
-        is not None
+    model = get_model()
+    if not model_info["is_generation"] and (
+        (
+            model_info.get("architectures") == ["Qwen3_5ForConditionalGeneration"]
+            and load_joint_head_config(model.model_path, model.revision) is not None
+        )
+        or (
+            model_info.get("architectures") == ["Qwen3_5ForCausalLM"]
+            and load_pointer_head(model.model_path, model.revision) is not None
+        )
     ):
-        # A Clef checkpoint answers /v1/systemone decisions only.
+        # A Clef or Kev checkpoint answers /v1/systemone decisions only.
         request_name = "/v1/systemone"
         json_data = {
             "model": "warmup",
