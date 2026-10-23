@@ -1182,122 +1182,74 @@ def run_lora_multiple_batch_on_model_cases(
                     print(f"--- Batch {i + 1} Comparison Passed --- ")
 
 
-def run_lora_batch_splitting_equivalence_test(
-    model_cases: List[LoRAModelCase],
-    attention_backend: str = "torch_native",
-    disable_cuda_graph: bool = True,
-    disable_radix_cache: bool = True,
-    enable_lora_overlap_loading: Optional[bool] = None,
-    lora_drain_wait_threshold: float = 0.0,
+def lora_split_batches(a, b):
+    """Route patterns on one shared prompt; three-route ones get split."""
+    prompts = [TEST_MULTIPLE_BATCH_PROMPTS[0]] * 3
+    routes = [
+        [None, a, b],
+        [a, None, b],
+        [a, b, None],
+        [None, b, None],
+        [a, b, a],
+        [None, None, None],
+    ]
+    return [(prompts, lora_paths) for lora_paths in routes]
+
+
+def assert_lora_routes_match_hf(
+    test_case, model_case: LoRAModelCase, torch_dtype, batches, **srt_kwargs
 ):
-    """
-    Test that SRT correctly handles batch splitting with multiple LoRA adapters.
+    """Serve each (prompts, lora_paths) batch on one SRT server with two LoRA
+    slots, so three-route batches are split into microbatches, and compare
+    every row with HF+PEFT run on that row alone: a dropped, swapped or stale
+    adapter row diverges whatever the batch did."""
+    max_new_tokens = 32
+    rouge_l_tolerance = 0.9
+    a, b = [adaptor.name for adaptor in model_case.adaptors]
 
-    When the number of distinct adapters (including None for base model) exceeds
-    max_loras_per_batch, SRT internally splits requests into microbatches.
-
-    This test validates:
-    1. SRT can process batches that trigger internal splitting without errors
-    2. Different adapters don't produce all identical outputs (i.e., at least one
-       output differs, indicating adapters are being applied correctly)
-
-    Args:
-        model_cases: List of LoRAModelCase configurations to test
-        attention_backend: Attention backend to use
-        disable_cuda_graph: Whether to disable CUDA graph
-        disable_radix_cache: Whether to disable radix cache
-        lora_drain_wait_threshold: When any LoRA adapter request waits longer than
-            this threshold (in seconds), the scheduler will selectively drain one
-            running adapter to make room. Set to 0 to disable draining (default).
-    """
-    max_loras_per_batch = 2
-
-    def _run_test(model_case: LoRAModelCase, torch_dtype: torch.dtype):
-        lora_adapter_paths = [a.name for a in model_case.adaptors]
-        assert len(lora_adapter_paths) >= max_loras_per_batch, (
-            f"Need at least {max_loras_per_batch} adapters for this test"
-        )
-
-        max_new_tokens = 64
-        base_path = model_case.base
-
-        maybe_drain_info = (
-            f", lora_drain_wait_threshold={lora_drain_wait_threshold}"
-            if lora_drain_wait_threshold > 0
-            else ""
-        )
-        print(
-            f"\n========== Testing batch splitting on base '{base_path}', "
-            f"dtype={torch_dtype}{maybe_drain_info} =========="
-        )
-
-        prompts = [TEST_MULTIPLE_BATCH_PROMPTS[0]] * 3
-        test_cases = [
-            (
-                prompts,
-                [None, lora_adapter_paths[0], lora_adapter_paths[1]],
-            ),
-            (
-                prompts,
-                [lora_adapter_paths[0], None, lora_adapter_paths[1]],
-            ),
-            (
-                prompts,
-                [lora_adapter_paths[0], lora_adapter_paths[1], None],
-            ),
-            (
-                prompts,
-                [None, lora_adapter_paths[1], None],
-            ),
-            (
-                prompts,
-                [lora_adapter_paths[0], lora_adapter_paths[1], lora_adapter_paths[0]],
-            ),
-            (
-                prompts,
-                [None, None, None],
-            ),
-        ]
-
-        ensure_reproducibility()
-        with SRTRunner(
-            base_path,
-            torch_dtype=torch_dtype,
-            model_type="generation",
-            lora_paths=lora_adapter_paths,
-            enable_lora_overlap_loading=enable_lora_overlap_loading,
-            max_loras_per_batch=max_loras_per_batch,
-            max_loaded_loras=model_case.max_loaded_loras,
-            sleep_on_idle=True,
-            attention_backend=attention_backend,
-            disable_cuda_graph=disable_cuda_graph,
-            disable_radix_cache=disable_radix_cache,
-            lora_drain_wait_threshold=lora_drain_wait_threshold,
-        ) as srt_runner:
-            for batch_idx, (batch_prompts, lora_paths) in enumerate(test_cases):
-                print(f"\n--- Batch {batch_idx + 1} ---")
-                print(f"  Adapters: {lora_paths}")
-
-                srt_outputs = srt_runner.batch_forward(
-                    batch_prompts,
-                    max_new_tokens=max_new_tokens,
-                    lora_paths=lora_paths,
+    ensure_reproducibility()
+    srt_runner = SRTRunner(
+        model_case.base,
+        torch_dtype=torch_dtype,
+        model_type="generation",
+        lora_paths=[a, b],
+        # The base model holds a slot too.
+        max_loras_per_batch=2,
+        max_loaded_loras=model_case.max_loaded_loras,
+        sleep_on_idle=True,  # schedule each request batch as one batch
+        attention_backend="torch_native",
+        disable_cuda_graph=True,
+        disable_radix_cache=True,
+        **srt_kwargs,
+    )
+    ensure_reproducibility()
+    hf_runner = HFRunner(
+        model_case.base,
+        torch_dtype=torch_dtype,
+        model_type="generation",
+        patch_model_do_sample_false=True,
+    )
+    # HF generates one row at a time, so a (prompt, route) reference does
+    # not depend on the batch that asked for it.
+    hf_cache = {}
+    with srt_runner, hf_runner:
+        for i, (prompts, lora_paths) in enumerate(batches):
+            print(f"\n--- Batch {i + 1} --- lora_paths: {lora_paths}")
+            srt_strs = srt_runner.batch_forward(
+                prompts, max_new_tokens=max_new_tokens, lora_paths=lora_paths
+            ).output_strs
+            for prompt, route, srt_str in zip(prompts, lora_paths, srt_strs):
+                if (prompt, route) not in hf_cache:
+                    hf_cache[prompt, route] = hf_runner.forward(
+                        [prompt], max_new_tokens=max_new_tokens, lora_paths=[route]
+                    ).output_strs[0]
+                hf_str = hf_cache[prompt, route]
+                rouge = calculate_rouge_l([srt_str.strip()], [hf_str.strip()])[0]
+                print(f"route={route} rouge_l={rouge:.3f}")
+                print(f"  SRT: {srt_str.strip()!r}")
+                print(f"  HF:  {hf_str.strip()!r}")
+                test_case.assertGreaterEqual(
+                    rouge,
+                    rouge_l_tolerance,
+                    f"batch {i + 1}, route {route}: SRT output diverges from HF",
                 )
-
-                # If different adapters are used in this batch, verify that not every
-                # output is identical (at least one should differ)
-                unique_adapters = set(lora_paths)
-                if len(unique_adapters) >= 2:
-                    all_outputs = [s.strip() for s in srt_outputs.output_strs]
-                    all_identical = all(out == all_outputs[0] for out in all_outputs)
-                    assert not all_identical, (
-                        f"Every output was identical despite using different adapters for "
-                        f"base '{base_path}', batch {batch_idx + 1}: "
-                        f"adapters={lora_paths}. Expected at least one output to differ."
-                    )
-
-                print(f"--- Batch {batch_idx + 1} passed ---")
-
-    for model_case in model_cases:
-        for torch_dtype in TORCH_DTYPES:
-            _run_test(model_case, torch_dtype)

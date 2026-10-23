@@ -18,7 +18,9 @@ import unittest
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
-    run_lora_batch_splitting_equivalence_test,
+    TORCH_DTYPES,
+    assert_lora_routes_match_hf,
+    lora_split_batches,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -32,9 +34,20 @@ register_amd_ci(est_time=75, suite="stage-b-test-1-gpu-small-amd")
 
 class TestLoRAOverlapLoading(CustomTestCase):
     def test_ci_lora_models_batch_splitting(self):
-        run_lora_batch_splitting_equivalence_test(
-            CI_MULTI_LORA_MODELS, enable_lora_overlap_loading=True
-        )
+        """With two slots every three-route batch is split and its adapters
+        load asynchronously under eviction; each row must still match HF run
+        on that row alone, so a request served on another adapter's or on
+        half-copied weights fails."""
+        for model_case in CI_MULTI_LORA_MODELS:
+            a, b = [adaptor.name for adaptor in model_case.adaptors]
+            for torch_dtype in TORCH_DTYPES:
+                assert_lora_routes_match_hf(
+                    self,
+                    model_case,
+                    torch_dtype,
+                    lora_split_batches(a, b),
+                    enable_lora_overlap_loading=True,
+                )
 
 
 if __name__ == "__main__":
