@@ -914,7 +914,13 @@ class XPUAttentionBackend(AttentionBackend):
                 causal=causal_arg,
                 window_size=window_size,
                 softcap=layer.logit_cap,
-                bidirectional_block_ids=bidirectional_block_ids,
+                # Only Gemma-3 image batches set this; omitting it otherwise keeps
+                # sgl-kernel-xpu builds without the kwarg working.
+                **(
+                    {"bidirectional_block_ids": bidirectional_block_ids}
+                    if bidirectional_block_ids is not None
+                    else {}
+                ),
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
