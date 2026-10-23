@@ -290,7 +290,9 @@ def _run_mega_routed(
             else None
         )
         with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-            routing = run_mega_gate(moe, hidden_states, input_ids_global, buf)
+            routing = run_mega_gate(
+                moe, hidden_states, input_ids_global, buf, forward_batch
+            )
 
     if routing is not None:
         topk_ids = routing.topk_ids

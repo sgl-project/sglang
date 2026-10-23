@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.activation.softcap import (
+    cast_to_float32_logits,
     gathered_softcap_logits,
 )
 from sglang.kernels.ops.activation.softcap import (
@@ -1279,6 +1280,9 @@ class LogitsProcessor(nn.Module):
             logits.shape
         ):
             assert logits_buffer.dtype == torch.float
+            if logits.is_cuda and logits.dtype in (torch.float16, torch.bfloat16):
+                # Measured on GB300: torch's dtype-casting copy_ is ~2.8x slower.
+                return cast_to_float32_logits(logits, logits_buffer)
             logits_buffer.copy_(logits)
             logits = logits_buffer
         else:
