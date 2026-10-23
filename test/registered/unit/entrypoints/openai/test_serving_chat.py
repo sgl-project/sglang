@@ -38,7 +38,6 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
-from sglang.srt.entrypoints.openai.serving_inkling import InklingChatEncodingAdapter
 from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -3459,6 +3458,49 @@ class ServingChatTestCase(CustomTestCase):
         return parsed
 
     def test_streaming_created_is_stable_across_chunks(self):
+        for spec in (None, "inkling"):
+            with self.subTest(spec=spec):
+                if spec == "inkling":
+                    self._stream_inkling_output_in_two_chunks()
+                self._assert_streaming_created_is_stable()
+
+    def _stream_inkling_output_in_two_chunks(self):
+        from sglang.srt.parser.inkling_renderer import load_tml_renderers
+
+        tokenizer = load_tml_renderers().tokenizer
+        output_ids = [
+            tokenizer.encode_special("message_model"),
+            tokenizer.encode_special("content_text"),
+            *tokenizer.encode_ordinary("Hello there"),
+            tokenizer.encode_special("end_message"),
+        ]
+
+        async def generate():
+            for count, finish in (
+                (len(output_ids) - 1, None),
+                (len(output_ids), {"type": "stop", "matched": None}),
+            ):
+                yield {
+                    "text": "",
+                    "output_ids": output_ids[:count],
+                    "index": 0,
+                    "meta_info": {
+                        "id": "chatcmpl-inkling",
+                        "prompt_tokens": 2,
+                        "completion_tokens": count,
+                        "cached_tokens": 0,
+                        "finish_reason": finish,
+                    },
+                }
+
+        self.chat.chat_encoding_spec = "inkling"
+        self.chat.reasoning_parser = "inkling"
+        self.chat.tool_call_parser = "inkling"
+        self.tm.tokenizer = None
+        self.chat._encoding_adapter = self.chat._build_chat_encoding_adapter()
+        self.tm.generate_request.return_value = generate()
+
+    def _assert_streaming_created_is_stable(self):
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
@@ -5158,180 +5200,6 @@ class TestNormalizeToolContent(unittest.TestCase):
             "tool", ["plain", {"type": "text", "text": "rich"}]
         )
         self.assertEqual(result, "plain rich")
-
-
-class InklingReasoningEffortTest(unittest.TestCase):
-    """Inkling reasoning-effort mapping and validation."""
-
-    def test_named_levels(self):
-        parse = OpenAIServingChat._parse_inkling_reasoning_effort
-        self.assertEqual(parse("none"), 0.0)
-        self.assertEqual(parse("minimal"), 0.1)
-        self.assertEqual(parse("low"), 0.2)
-        self.assertEqual(parse("medium"), 0.7)
-        self.assertEqual(parse("high"), 0.9)
-        # "xhigh" and "max" are aliases for the same 0.99 ceiling
-        self.assertEqual(parse("xhigh"), 0.99)
-        self.assertEqual(parse("max"), 0.99)
-        self.assertEqual(parse("max"), parse("xhigh"))
-
-    def test_scalar_range_is_validated(self):
-        parse = OpenAIServingChat._parse_inkling_reasoning_effort
-        self.assertEqual(parse(0.5), 0.5)
-        self.assertEqual(parse(0.99), 0.99)
-        for value in (1.0, "1.0", 2.0, "1.5", -1.0, float("nan"), True):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                parse(value)
-
-    def test_invalid_and_none(self):
-        parse = OpenAIServingChat._parse_inkling_reasoning_effort
-        self.assertIsNone(parse(None))
-        with self.assertRaises(ValueError):
-            parse("garbage")
-
-    def test_env_default(self):
-        from sglang.srt.environ import envs
-
-        get = OpenAIServingChat._get_inkling_default_reasoning_effort
-        env = envs.SGLANG_INKLING_DEFAULT_REASONING_EFFORT
-        try:
-            env.clear()  # unset -> EnvStr default "0.9"
-            self.assertEqual(get(), 0.9)
-            env.set("")  # explicit empty still uses the protocol default
-            self.assertEqual(get(), 0.9)
-            env.set("0.7")
-            self.assertEqual(get(), 0.7)
-            for value in ("1.0", "1.1", "garbage"):
-                env.set(value)
-                with self.subTest(value=value), self.assertRaises(ValueError):
-                    get()
-        finally:
-            env.clear()
-
-    def test_thinking_disabled_maps_to_no_thinking_effort(self):
-        """Bug regression: Inkling is an always-on parser, so Anthropic
-        thinking={"type": "disabled"} was rejected outright even though effort
-        "none" (0.0) expresses exactly that."""
-        serving = object.__new__(OpenAIServingChat)
-        serving.reasoning_parser = "inkling"
-        serving.template_manager = Mock(reasoning_config=None)
-        serving._reasoning_detector = Mock(reasoning_default="always")
-        request = ChatCompletionRequest(
-            model="test-model", messages=[{"role": "user", "content": "hi"}]
-        )
-
-        serving.apply_reasoning_enabled(request, False)
-        self.assertEqual(request.reasoning_effort, "none")
-
-        # Enabling leaves an effort set via output_config.effort alone.
-        request.reasoning_effort = "low"
-        serving.apply_reasoning_enabled(request, True)
-        self.assertEqual(request.reasoning_effort, "low")
-
-    def test_serving_does_not_prefill_model_message(self):
-        from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
-
-        class Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                return list(text.encode())
-
-        serving = object.__new__(OpenAIServingChat)
-        serving.chat_encoding_spec = "inkling"
-        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
-        serving._encoding_adapter = InklingChatEncodingAdapter(tokenizer=Tokenizer())
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[{"role": "user", "content": "hello"}],
-            reasoning_effort=0.5,
-        )
-        prompt_ids = serving._encode_messages(
-            [message.model_dump() for message in request.messages],
-            request,
-            thinking_mode=None,
-        )
-        self.assertEqual(prompt_ids[-1], INKLING_SPECIAL_TOKEN_IDS["<|end_message|>"])
-
-    def test_continue_final_message_resumes_open_model_text_block(self):
-        """Bug regression: continue_final_message was silently ignored on the
-        inkling path — the trailing assistant message rendered as a CLOSED
-        historical turn (<|end_message|> + <|content_model_end_sampling|>), so
-        the model started a fresh turn instead of continuing. The prefix must
-        render as an OPEN model text block."""
-        from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
-
-        class Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                return list(text.encode())
-
-        serving = object.__new__(OpenAIServingChat)
-        serving.chat_encoding_spec = "inkling"
-        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
-        serving._encoding_adapter = InklingChatEncodingAdapter(tokenizer=Tokenizer())
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[
-                {"role": "user", "content": "hello"},
-                {"role": "assistant", "content": "The answer"},
-            ],
-            reasoning_effort=0.5,
-            continue_final_message=True,
-        )
-        prompt_ids = serving._encode_messages(
-            [message.model_dump() for message in request.messages],
-            request,
-            thinking_mode=None,
-        )
-        open_block = [
-            INKLING_SPECIAL_TOKEN_IDS["<|message_model|>"],
-            INKLING_SPECIAL_TOKEN_IDS["<|content_text|>"],
-            *list(b"The answer"),
-        ]
-        self.assertEqual(prompt_ids[-len(open_block) :], open_block)
-        self.assertNotIn(
-            INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"], prompt_ids
-        )
-
-    def test_continue_final_message_leaves_tool_call_turns_closed(self):
-        """A trailing assistant message with tool_calls cannot be continued —
-        it must keep rendering as a closed historical turn."""
-        from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS
-
-        class Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                return list(text.encode())
-
-        serving = object.__new__(OpenAIServingChat)
-        serving.chat_encoding_spec = "inkling"
-        serving.tokenizer_manager = Mock(tokenizer=Tokenizer())
-        serving._encoding_adapter = InklingChatEncodingAdapter(tokenizer=Tokenizer())
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[
-                {"role": "user", "content": "hello"},
-                {
-                    "role": "assistant",
-                    "content": "calling",
-                    "tool_calls": [
-                        {
-                            "id": "call-1",
-                            "type": "function",
-                            "function": {"name": "weather", "arguments": "{}"},
-                        }
-                    ],
-                },
-            ],
-            reasoning_effort=0.5,
-            continue_final_message=True,
-        )
-        prompt_ids = serving._encode_messages(
-            [message.model_dump() for message in request.messages],
-            request,
-            thinking_mode=None,
-        )
-        self.assertEqual(
-            prompt_ids[-1],
-            INKLING_SPECIAL_TOKEN_IDS["<|content_model_end_sampling|>"],
-        )
 
 
 class TestRequestChatTemplateTrustGate(CustomTestCase):

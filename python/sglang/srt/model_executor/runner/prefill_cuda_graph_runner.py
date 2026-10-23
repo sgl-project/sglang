@@ -979,12 +979,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
         # the same replay path. Sparse-DP batches (one or more ranks with
         # zero local tokens) fall back to eager to avoid hanging ranks.
-        # MegaMoE graphs without a captured DP gather tolerate per-rank buckets
-        # and an eager idle rank; graphs with one fall through to the check.
+        # MegaMoE graphs without a captured DP gather or rank barrier tolerate
+        # per-rank buckets and an eager idle rank; others fall through.
         global_num_tokens = forward_batch.global_num_tokens_cpu
         if global_num_tokens is None:
             return False
-        if prefill_graph_tolerates_sum_len():
+        if (
+            prefill_graph_tolerates_sum_len()
+            and not get_flags().dp.prefill_graph_has_rank_barrier
+        ):
             return False
         return len(global_num_tokens) > 1 and any(
             int(num_tokens) == 0 for num_tokens in global_num_tokens
@@ -1785,6 +1788,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self._init_forward_metadata_for_capture(forward_batch, shape_key)
 
         def run_once():
+            if forward_batch.lora_ids is not None:
+                self.model_runner.lora_manager.reset_routing_cache()
             # Record LoRA kernels even when capture uses base-model requests.
             with (
                 model_capture_mode()
@@ -2037,6 +2042,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
         static_forward_batch.engram_history = forward_batch.engram_history
+        # The engram lookup break reads the staged rows at replay.
+        static_forward_batch.engram_staged_rows = forward_batch.engram_staged_rows
         # The encoder replay fold: a replay builds the same window floors and
         # compressor slots as an eager prefill.
         static_forward_batch.encoder_swa_replay = forward_batch.encoder_swa_replay

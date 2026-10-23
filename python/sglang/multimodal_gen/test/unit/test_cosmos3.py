@@ -8,6 +8,7 @@ import types
 import unittest
 from unittest import mock
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -76,6 +77,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
     is_cosmos_guardrail_available,
 )
+from sglang.srt.environ import envs
+from sglang.test.test_utils import CustomTestCase
 
 
 def _apply(mapping_fn, key):
@@ -2055,6 +2058,49 @@ class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
     def test_prose_prompt_still_gets_the_duration_suffix(self):
         final = self._run_prompt_stage("A curious raccoon.", use_duration_template=True)
         self.assertIn("seconds long", final)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.version.hip is None, "requires CUDA"
+)
+class TestCosmos3VideoPreprocess(CustomTestCase):
+    def test_gpu_preprocess_switch(self):
+        """CPU padding and deferred GPU padding preserve the same source pixels."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+            cosmos3,
+        )
+
+        stage = Cosmos3ImagePreprocessStage.__new__(Cosmos3ImagePreprocessStage)
+        stage.log_info = lambda *_args, **_kwargs: None
+        frames = np.random.default_rng(816).integers(
+            0, 256, (5, 32, 48, 3), dtype=np.uint8
+        )
+        outputs = []
+        for force_cpu in (True, False):
+            with (
+                self.subTest(force_cpu=force_cpu),
+                envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.override(force_cpu),
+                mock.patch.object(
+                    cosmos3,
+                    "_iter_video_frames_pyav",
+                    side_effect=lambda *_: (frame for frame in frames),
+                ),
+            ):
+                batch = types.SimpleNamespace(
+                    image_path=None,
+                    video_path="input.mp4",
+                    data_type=DataType.VIDEO,
+                    height=24,
+                    width=40,
+                    num_frames=45,
+                    sampling_params=types.SimpleNamespace(),
+                )
+                stage.forward(batch, types.SimpleNamespace())
+                actual = batch.preprocessed_video
+                self.assertEqual(actual.device.type, "cpu" if force_cpu else "cuda")
+                self.assertEqual(actual.shape, (1, 3, 45 if force_cpu else 5, 24, 40))
+                outputs.append(actual[:, :, :5].cpu())
+        self.assertTrue(torch.equal(outputs[0], outputs[1]))
 
 
 if __name__ == "__main__":
