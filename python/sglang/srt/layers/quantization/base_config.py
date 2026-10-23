@@ -113,6 +113,16 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ):
         raise NotImplementedError
 
+    def get_moe_runner_backend(
+        self, layer: torch.nn.Module
+    ) -> MoeRunnerBackendLike | None:
+        """Return the execution contract after create_moe_runner.
+
+        None declares a direct kernel consuming standard TopK with local IDs.
+        Override when apply uses a different path from the owned runner.
+        """
+        return self.runner.runner_backend if self.runner is not None else None
+
     @abstractmethod
     def apply(
         self,
@@ -266,6 +276,20 @@ class QuantizationConfig(ABC):
             method.
         """
         raise NotImplementedError()
+
+    def is_linear_unquantized(self, prefix: str) -> bool:
+        """Whether a linear layer at ``prefix`` keeps its checkpoint precision.
+
+        A query for deciding module layouts before layers are built, so an
+        override must not register ``prefix`` as a quantized layer.
+        """
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        return isinstance(
+            self.get_quant_method(LinearBase(1, 1), prefix=prefix),
+            UnquantizedLinearMethod,
+        )
 
     @abstractmethod
     def get_scaled_act_names(self) -> List[str]:

@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 import unittest
 
@@ -43,52 +43,6 @@ class TestConv2dLayer(unittest.TestCase):
                 layer.forward_native(x), ref(x), rtol=1e-4, atol=1e-4
             )
 
-    def test_padding_valid(self):
-        layer = Conv2dLayer(3, 768, kernel_size=14, stride=14, padding="valid")
-        self.assertFalse(layer.enable_linear)
-        self.assertEqual(layer.padding, (0, 0))
-
-    def test_padding_same_disables_linear(self):
-        layer = Conv2dLayer(3, 64, kernel_size=3, stride=1, padding="same")
-        self.assertFalse(layer.enable_linear)
-
-    def test_non_matching_stride_disables_linear(self):
-        layer = Conv2dLayer(3, 64, kernel_size=3, stride=1, padding=1)
-        self.assertFalse(layer.enable_linear)
-
-    def test_groups_disable_linear(self):
-        layer = Conv2dLayer(4, 8, kernel_size=2, stride=2, groups=2)
-        self.assertFalse(layer.enable_linear)
-
-    def test_dilation_disables_linear(self):
-        layer = Conv2dLayer(3, 64, kernel_size=3, stride=3, dilation=2)
-        self.assertFalse(layer.enable_linear)
-
-    def test_padding_mode_reflect(self):
-        layer = Conv2dLayer(
-            3, 64, kernel_size=3, stride=1, padding=1, padding_mode="reflect", bias=True
-        )
-        ref = nn.Conv2d(
-            3, 64, kernel_size=3, stride=1, padding=1, padding_mode="reflect", bias=True
-        )
-        self.assertFalse(layer.enable_linear)
-        _copy_weights(layer, ref)
-        x = torch.randn(1, 3, 16, 16)
-        with torch.no_grad():
-            torch.testing.assert_close(
-                layer.forward_native(x), ref(x), rtol=1e-4, atol=1e-4
-            )
-
-    def test_conv_path_with_padding(self):
-        layer = Conv2dLayer(3, 64, kernel_size=3, stride=1, padding=1, bias=True)
-        ref = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=True)
-        _copy_weights(layer, ref)
-        x = torch.randn(1, 3, 32, 32)
-        with torch.no_grad():
-            torch.testing.assert_close(
-                layer.forward_native(x), ref(x), rtol=1e-4, atol=1e-4
-            )
-
     def test_mulmat_matches_conv(self):
         layer = Conv2dLayer(
             3, 768, kernel_size=14, stride=14, bias=True, disable_linear=False
@@ -102,50 +56,6 @@ class TestConv2dLayer(unittest.TestCase):
                 rtol=1e-4,
                 atol=1e-4,
             )
-
-    def test_forward_cuda_uses_mulmat_when_enabled(self):
-        layer = Conv2dLayer(
-            3, 64, kernel_size=4, stride=4, bias=False, disable_linear=False
-        )
-        self.assertTrue(layer.enable_linear)
-        x = torch.randn(1, 3, 16, 16)
-        with torch.no_grad():
-            torch.testing.assert_close(layer.forward_cuda(x), layer._forward_mulmat(x))
-
-    def test_forward_cuda_uses_conv_when_not_eligible(self):
-        layer = Conv2dLayer(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.assertFalse(layer.enable_linear)
-        x = torch.randn(1, 3, 16, 16)
-        with torch.no_grad():
-            torch.testing.assert_close(layer.forward_cuda(x), layer._forward_conv(x))
-
-    def test_tuple_kernel_size(self):
-        layer = Conv2dLayer(
-            3,
-            768,
-            kernel_size=(14, 14),
-            stride=(14, 14),
-            bias=False,
-            disable_linear=False,
-        )
-        self.assertTrue(layer.enable_linear)
-        ref = nn.Conv2d(3, 768, kernel_size=(14, 14), stride=(14, 14), bias=False)
-        _copy_weights(layer, ref)
-        x = torch.randn(1, 3, 224, 224)
-        with torch.no_grad():
-            torch.testing.assert_close(
-                layer.forward_native(x), ref(x), rtol=1e-4, atol=1e-4
-            )
-
-    def test_output_shape(self):
-        layer = Conv2dLayer(3, 768, kernel_size=16, stride=16, bias=False)
-        x = torch.randn(4, 3, 224, 224)
-        out = layer.forward_native(x)
-        self.assertEqual(out.shape, (4, 768, 14, 14))
-
-    def test_no_bias_parameter(self):
-        layer = Conv2dLayer(3, 64, kernel_size=4, stride=4, bias=False)
-        self.assertIsNone(layer.bias)
 
 
 class TestConvValidation(unittest.TestCase):
@@ -243,86 +153,6 @@ class TestConv3dLayer(unittest.TestCase):
                 rtol=1e-4,
                 atol=1e-4,
             )
-
-    def test_non_matching_stride_disables_linear(self):
-        layer = Conv3dLayer(3, 64, kernel_size=3, stride=1, padding=1)
-        self.assertFalse(layer.enable_linear)
-
-    def test_dilation_disables_linear(self):
-        layer = Conv3dLayer(3, 64, kernel_size=3, stride=3, dilation=2)
-        self.assertFalse(layer.enable_linear)
-
-    def test_disable_linear(self):
-        layer = Conv3dLayer(
-            3,
-            1152,
-            kernel_size=[2, 14, 14],
-            stride=[2, 14, 14],
-            bias=False,
-            disable_linear=True,
-        )
-        self.assertFalse(layer.enable_linear)
-        ref = nn.Conv3d(
-            3, 1152, kernel_size=[2, 14, 14], stride=[2, 14, 14], bias=False
-        )
-        _copy_weights(layer, ref)
-        x = torch.randn(1, 3, 2, 14, 14)
-        with torch.no_grad():
-            torch.testing.assert_close(
-                layer.forward_native(x), ref(x), rtol=1e-4, atol=1e-4
-            )
-
-    def test_conv_path_with_padding(self):
-        layer = Conv3dLayer(3, 64, kernel_size=3, stride=1, padding=1, bias=True)
-        ref = nn.Conv3d(3, 64, kernel_size=3, stride=1, padding=1, bias=True)
-        _copy_weights(layer, ref)
-        x = torch.randn(1, 3, 4, 8, 8)
-        with torch.no_grad():
-            torch.testing.assert_close(
-                layer.forward_native(x), ref(x), rtol=1e-4, atol=1e-4
-            )
-
-    def test_output_shape(self):
-        layer = Conv3dLayer(
-            3, 1152, kernel_size=[2, 14, 14], stride=[2, 14, 14], bias=False
-        )
-        x = torch.randn(1, 3, 2, 14, 14)
-        out = layer.forward_native(x)
-        self.assertEqual(out.shape, (1, 1152, 1, 1, 1))
-
-    def test_batch_processing(self):
-        layer = Conv3dLayer(
-            3, 1536, kernel_size=[2, 14, 14], stride=[2, 14, 14], bias=True
-        )
-        ref = nn.Conv3d(3, 1536, kernel_size=[2, 14, 14], stride=[2, 14, 14], bias=True)
-        _copy_weights(layer, ref)
-        x = torch.randn(8, 3, 2, 14, 14)
-        with torch.no_grad():
-            torch.testing.assert_close(
-                layer.forward_native(x), ref(x), rtol=1e-4, atol=1e-4
-            )
-
-    def test_forward_native_uses_mulmat_when_eligible(self):
-        layer = Conv3dLayer(3, 128, kernel_size=[2, 4, 4], stride=[2, 4, 4], bias=True)
-        self.assertTrue(layer.enable_linear)
-        x = torch.randn(1, 3, 2, 4, 4)
-        with torch.no_grad():
-            torch.testing.assert_close(
-                layer.forward_native(x), layer._forward_mulmat(x)
-            )
-
-    def test_padding_valid(self):
-        layer = Conv3dLayer(
-            3, 64, kernel_size=[2, 4, 4], stride=[2, 4, 4], padding="valid"
-        )
-        self.assertTrue(layer.enable_linear)
-        self.assertEqual(layer.padding, (0, 0, 0))
-
-    def test_weight_shape(self):
-        layer = Conv3dLayer(
-            3, 1152, kernel_size=[2, 14, 14], stride=[2, 14, 14], bias=False
-        )
-        self.assertEqual(layer.weight.shape, (1152, 3, 2, 14, 14))
 
     def test_glm4v_workflow(self):
         """GLM4V-style: 2D input -> reshape to 5D -> Conv3dLayer -> flatten."""

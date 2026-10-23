@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.multimodal_gen.runtime.entrypoints import diffusion_generator as dg
+from sglang.multimodal_gen.runtime.entrypoints.cli import generate as cli_generate
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import ShutdownReq
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator
 
@@ -31,6 +32,39 @@ class _FakeProcess:
 
 
 class TestDiffGeneratorShutdown(unittest.TestCase):
+    def test_generate_cmd_shuts_down_generator_on_success_and_error(self):
+        server_args = SimpleNamespace(model_path="dummy", load_diffusion_decoder=False)
+        sampling_params_cls = Mock()
+        sampling_params_cls.get_cli_args.return_value = {"prompt": "test prompt"}
+        cli_args = SimpleNamespace(
+            config=None,
+            diffusers_kwargs=None,
+            output_file_path=None,
+            perf_dump_path=None,
+        )
+        succeeded, failed = Mock(), Mock()
+        failed.generate.side_effect = RuntimeError("generation failed")
+        with (
+            patch.object(
+                cli_generate.ServerArgs, "from_cli_args", return_value=server_args
+            ),
+            patch.object(
+                cli_generate,
+                "_resolve_cli_sampling_params_cls",
+                return_value=sampling_params_cls,
+            ),
+            patch.object(
+                cli_generate.DiffGenerator,
+                "from_pretrained",
+                side_effect=[succeeded, failed],
+            ),
+        ):
+            cli_generate.generate_cmd(cli_args)
+            with self.assertRaisesRegex(RuntimeError, "generation failed"):
+                cli_generate.generate_cmd(cli_args)
+        succeeded.shutdown.assert_called_once_with()
+        failed.shutdown.assert_called_once_with()
+
     def test_shutdown_uses_bounded_scheduler_timeout_and_forces_worker(self):
         generator = object.__new__(DiffGenerator)
         process = _FakeProcess()

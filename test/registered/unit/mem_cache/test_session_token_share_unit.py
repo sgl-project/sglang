@@ -79,7 +79,7 @@ class TestSessionTokenShare(CustomTestCase):
         if baked is None:
             baked = len(output)
         req.output_ids.extend(output[:baked])
-        req._refresh_fill_ids()
+        req.refresh_fill_ids()
         req.output_ids.extend(output[baked:])
         self.session.finish_req(req)
 
@@ -105,6 +105,21 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(list(r3.origin_input_ids), in1 + out1 + in2 + out2 + [9])
         self.assertEqual(list(r3.full_untruncated_fill_ids), list(r3.origin_input_ids))
 
+    def test_multimodal_counts_follow_committed_history(self):
+        """An aborted turn's count edits must not leak into the next turn."""
+        r1 = self._create("r1", [1])
+        r1.mm_image_tokens, r1.mm_audio_tokens, r1.mm_video_tokens = (2, 3, 4)
+        r1.mm_token_counts_ready = True
+        self._decode_and_finish(r1, [])
+
+        r2 = self._create("r2", [2])
+        self.assertEqual(r2.get_mm_token_counts(), (2, 3, 4))
+        r2.mm_image_tokens = 5
+        self.session.abort_req()
+
+        r3 = self._create("r3", [3])
+        self.assertEqual(r3.get_mm_token_counts(), (2, 3, 4))
+
     def test_mid_turn_abort_then_continue(self):
         in1, out1 = list(range(200, 210)), [1, 2, 3]
         r1 = self._create("r1", in1)
@@ -115,7 +130,7 @@ class TestSessionTokenShare(CustomTestCase):
         r2 = self._create("r2", [50, 51])
         self.assertEqual(list(r2.origin_input_ids), in1 + out1 + [50, 51])
         r2.output_ids.extend([6, 7])
-        r2._refresh_fill_ids()
+        r2.refresh_fill_ids()
         self.session.abort_req()
         self.assertEqual(self.session.committed_origin_len, len(in1))
 
@@ -150,7 +165,7 @@ class TestSessionTokenShare(CustomTestCase):
         # array, then output trimmed to finished_len (like _trim_overshoot)
         # before finish.
         r1.output_ids.extend([1, 2, 3, 4, 5, 6])
-        r1._refresh_fill_ids()
+        r1.refresh_fill_ids()
         del r1.output_ids[4:]
         self.session.finish_req(r1)
         self.assertEqual(
@@ -162,7 +177,7 @@ class TestSessionTokenShare(CustomTestCase):
         r2 = self._create("r2", [50])
         self.assertEqual(list(r2.origin_input_ids), in1 + [1, 2, 3, 4] + [50])
         self.assertEqual(len(r2.full_untruncated_fill_ids), 0)  # carry skipped
-        r2._refresh_fill_ids()
+        r2.refresh_fill_ids()
         self.assertEqual(list(r2.full_untruncated_fill_ids), list(r2.origin_input_ids))
 
 

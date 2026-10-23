@@ -33,22 +33,17 @@ versions may pick a different work-group size, so callers must verify
 
 from __future__ import annotations
 
-import os
-
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.srt.environ import envs
+
 try:
     from triton.language.extra.intel import libdevice  # type: ignore
 except ImportError:  # non-XPU Triton build
-    # The kernels below reference ``libdevice``, but Triton resolves a jit
-    # function's globals when it compiles it, and these only compile on first
-    # launch -- which the ``is_xpu`` checks in the ``can_use_*`` predicates
-    # prevent off XPU. Importing this module must stay free of XPU-only
-    # dependencies: the package facade resolves ``_EXPORTS`` eagerly on
-    # attribute access, so a hard import here would make Intel Triton an
-    # import-time requirement for every caller of the facade, on every platform.
+    # The kernels only compile on launch, which selection prevents off XPU; a hard
+    # import here would make Intel Triton a requirement of the facade everywhere.
     libdevice = None
 
 # torch-xpu's vectorized LayerNorm geometry for rows with N / 4 > 1024.
@@ -57,8 +52,6 @@ _SIMD = 32
 _VEC = 4
 # 8-byte alignment is what torch-xpu requires to take the vectorized kernel for bf16.
 _ALIGN = _VEC * 2
-# Triton threads per program; the result does not depend on it (layout only).
-_NUM_WARPS = int(os.environ.get("SGLANG_XPU_LN_MOD_NUM_WARPS", "4"))
 
 
 @triton.jit
@@ -170,6 +163,10 @@ def _xpu_ln_modulate_kernel(
     o_ptr,
     ro_ptr,
     rcp_ptr,
+    seq_len,
+    g_stride,
+    s_stride,
+    b_stride,
     eps,
     N: tl.constexpr,
     WG: tl.constexpr,
@@ -178,6 +175,11 @@ def _xpu_ln_modulate_kernel(
 ):
     row = tl.program_id(0).to(tl.int64)
     row_off = row * N
+    # Modulation rows are per batch; offsets below are relative to row_off.
+    batch = row // seq_len
+    g_row = g_ptr + batch * g_stride - row_off
+    s_row = s_ptr + batch * s_stride - row_off
+    b_row = b_ptr + batch * b_stride - row_off
     t = tl.arange(0, WG)
     NVEC: tl.constexpr = N // 4
     ITERS: tl.constexpr = (NVEC + WG - 1) // WG
@@ -190,7 +192,7 @@ def _xpu_ln_modulate_kernel(
         live = vec < NVEC
         offs = row_off + vec * 4
         if GATED:
-            x0, x1, x2, x3 = _gated_value(x_ptr, u_ptr, g_ptr - row_off, offs, live)
+            x0, x1, x2, x3 = _gated_value(x_ptr, u_ptr, g_row, offs, live)
             _store_vec4(ro_ptr, offs, live, x0, x1, x2, x3)
         else:
             x0, x1, x2, x3 = _load_vec4(x_ptr, offs, live)
@@ -226,11 +228,11 @@ def _xpu_ln_modulate_kernel(
         live = vec < NVEC
         offs = row_off + vec * 4
         if GATED:
-            x0, x1, x2, x3 = _gated_value(x_ptr, u_ptr, g_ptr - row_off, offs, live)
+            x0, x1, x2, x3 = _gated_value(x_ptr, u_ptr, g_row, offs, live)
         else:
             x0, x1, x2, x3 = _load_vec4(x_ptr, offs, live)
-        s0, s1, s2, s3 = _load_vec4(s_ptr - row_off, offs, live)
-        b0, b1, b2, b3 = _load_vec4(b_ptr - row_off, offs, live)
+        s0, s1, s2, s3 = _load_vec4(s_row, offs, live)
+        b0, b1, b2, b3 = _load_vec4(b_row, offs, live)
         _store_vec4(
             o_ptr,
             offs,
@@ -268,97 +270,117 @@ def _native_recip_table(device: torch.device) -> torch.Tensor:
     return table
 
 
-def _row_vector(
-    t: torch.Tensor, hidden: int, device: torch.device
-) -> torch.Tensor | None:
-    """A contiguous per-channel ``[hidden]`` view of scale/shift/gate, else None."""
-    if not (
-        isinstance(t, torch.Tensor)
-        and t.dtype is torch.bfloat16
-        and t.device == device
-        and t.numel() == hidden
-        and t.shape[-1] == hidden
-        and t.is_contiguous()
-        and t.data_ptr() % _ALIGN == 0
-    ):
-        return None
-    return t.reshape(hidden)
-
-
-def _eligible_rows(x: torch.Tensor) -> bool:
-    hidden = x.shape[-1]
+def can_use_xpu_layernorm_modulate(dtype: torch.dtype, hidden: int) -> bool:
+    """Select the torch-xpu BF16 vectorized LayerNorm reduction replicated above."""
     return (
-        x.is_xpu
-        and x.dtype is torch.bfloat16
-        and x.numel() > 0
-        and x.is_contiguous()
-        and x.data_ptr() % _ALIGN == 0
+        libdevice is not None
+        and dtype is torch.bfloat16
         and hidden % _VEC == 0
-        and hidden // _VEC > _WG
+        and _WG < hidden // _VEC
         and hidden < _RECIP_TABLE_SIZE
     )
 
 
-def can_use_xpu_layernorm_modulate(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
-) -> bool:
-    if not _eligible_rows(x):
-        return False
-    hidden = x.shape[-1]
+def _rows_ok(x: torch.Tensor) -> bool:
+    # torch-xpu only takes the replicated vectorized path for aligned rows.
     return (
-        _row_vector(scale, hidden, x.device) is not None
-        and _row_vector(shift, hidden, x.device) is not None
+        x.is_xpu
+        and x.dim() == 3
+        and x.numel() > 0
+        and x.is_contiguous()
+        and x.data_ptr() % _ALIGN == 0
+        and can_use_xpu_layernorm_modulate(x.dtype, x.shape[-1])
+    )
+
+
+def _mod_rows(t: torch.Tensor, x: torch.Tensor) -> tuple[torch.Tensor, int] | None:
+    # (batch, hidden) rows with a packed last dim, possibly strided views of a
+    # chunked adaLN projection; a (batch, 1, hidden) view squeezes to the same.
+    batch, _, hidden = x.shape
+    rows = t.squeeze(1) if t.dim() == 3 and t.shape[1] == 1 else t
+    if (
+        rows.shape != (batch, hidden)
+        or rows.stride(1) != 1
+        or rows.dtype is not x.dtype
+        or rows.device != x.device
+    ):
+        return None
+    return rows, rows.stride(0) if batch > 1 else hidden
+
+
+def _update_ok(update: torch.Tensor, residual: torch.Tensor) -> bool:
+    return (
+        update.shape == residual.shape
+        and update.dtype is residual.dtype
+        and update.device == residual.device
+        and update.is_contiguous()
+        and update.data_ptr() % _ALIGN == 0
+    )
+
+
+def _checked_rows(x: torch.Tensor, name: str) -> None:
+    if not _rows_ok(x):
+        raise RuntimeError(
+            f"{name} must be a contiguous, 8-byte aligned BF16 XPU [B, S, D] "
+            "tensor with 4096 < D < 8192 and D divisible by 4"
+        )
+
+
+def _checked_mod(
+    t: torch.Tensor, x: torch.Tensor, name: str
+) -> tuple[torch.Tensor, int]:
+    mod = _mod_rows(t, x)
+    if mod is None:
+        raise RuntimeError(f"{name} must have packed BF16 [B, D] rows on x's device")
+    return mod
+
+
+def _launch(x, update, gate, scale, shift, out, residual_out, eps, *, gated):
+    (gate, g_stride), (scale, s_stride), (shift, b_stride) = gate, scale, shift
+    batch, seq_len, hidden = x.shape
+    _xpu_ln_modulate_kernel[(batch * seq_len,)](
+        x,
+        update,
+        gate,
+        scale,
+        shift,
+        out,
+        residual_out,
+        _native_recip_table(x.device),
+        seq_len,
+        g_stride,
+        s_stride,
+        b_stride,
+        float(eps),
+        N=hidden,
+        WG=_WG,
+        SIMD=_SIMD,
+        GATED=gated,
+        num_warps=envs.SGLANG_XPU_LN_MOD_NUM_WARPS.get(),
     )
 
 
 def xpu_layernorm_modulate(
     x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float
 ) -> torch.Tensor:
-    hidden = x.shape[-1]
-    rows = x.numel() // hidden
+    """``LN(x) * (1 + scale) + shift`` for BF16 XPU ``[B, S, D]``, bit-exact vs eager."""
+    _checked_rows(x, "x")
+    scale_rows = _checked_mod(scale, x, "scale")
+    shift_rows = _checked_mod(shift, x, "shift")
     out = torch.empty_like(x)
-    s = _row_vector(scale, hidden, x.device)
-    b = _row_vector(shift, hidden, x.device)
-    _xpu_ln_modulate_kernel[(rows,)](
-        x,
-        x,
-        x,
-        s,
-        b,
-        out,
-        out,
-        _native_recip_table(x.device),
-        float(eps),
-        N=hidden,
-        WG=_WG,
-        SIMD=_SIMD,
-        GATED=False,
-        num_warps=_NUM_WARPS,
-    )
+    _launch(x, x, scale_rows, scale_rows, shift_rows, out, out, eps, gated=False)
     return out
 
 
-def can_use_xpu_gated_resnorm(
-    residual: torch.Tensor,
-    update: torch.Tensor,
-    gate: torch.Tensor,
-    scale: torch.Tensor,
-    shift: torch.Tensor,
+def can_defer_xpu_gated_residual(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
-    if not (
-        _eligible_rows(residual)
-        and isinstance(update, torch.Tensor)
-        and update.shape == residual.shape
-        and update.dtype is residual.dtype
-        and update.device == residual.device
-        and update.is_contiguous()
-        and update.data_ptr() % _ALIGN == 0
-    ):
-        return False
-    hidden = residual.shape[-1]
-    return all(
-        _row_vector(t, hidden, residual.device) is not None
-        for t in (gate, scale, shift)
+    """Whether ``residual + update * gate`` can be left to the next block's norm."""
+    return (
+        not torch.compiler.is_compiling()
+        and _rows_ok(residual)
+        and _update_ok(update, residual)
+        and _mod_rows(gate, residual) is not None
     )
 
 
@@ -370,34 +392,33 @@ def xpu_gated_resnorm(
     shift: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    hidden = residual.shape[-1]
-    rows = residual.numel() // hidden
+    """``r = residual + update * gate`` then LN+modulate of ``r``; returns ``(out, r)``."""
+    _checked_rows(residual, "residual")
+    if not _update_ok(update, residual):
+        raise RuntimeError(
+            "update must match residual's shape, dtype, device and layout"
+        )
+    gate_rows = _checked_mod(gate, residual, "gate")
+    scale_rows = _checked_mod(scale, residual, "scale")
+    shift_rows = _checked_mod(shift, residual, "shift")
     out = torch.empty_like(residual)
     residual_out = torch.empty_like(residual)
-    g = _row_vector(gate, hidden, residual.device)
-    s = _row_vector(scale, hidden, residual.device)
-    b = _row_vector(shift, hidden, residual.device)
-    _xpu_ln_modulate_kernel[(rows,)](
+    _launch(
         residual,
         update,
-        g,
-        s,
-        b,
+        gate_rows,
+        scale_rows,
+        shift_rows,
         out,
         residual_out,
-        _native_recip_table(residual.device),
-        float(eps),
-        N=hidden,
-        WG=_WG,
-        SIMD=_SIMD,
-        GATED=True,
-        num_warps=_NUM_WARPS,
+        eps,
+        gated=True,
     )
     return out, residual_out
 
 
 __all__ = [
-    "can_use_xpu_gated_resnorm",
+    "can_defer_xpu_gated_residual",
     "can_use_xpu_layernorm_modulate",
     "xpu_gated_resnorm",
     "xpu_layernorm_modulate",
