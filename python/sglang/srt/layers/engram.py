@@ -14,6 +14,7 @@ import logging
 import mmap
 import os
 import re
+import socket
 import time
 from typing import Optional
 
@@ -877,15 +878,26 @@ class _PeerShards:
         meta = [None] * world
         dist.all_gather_object(
             meta,
-            (row_start, self.rows, self.size, fabric[0] if use_fabric else None),
+            (
+                row_start,
+                self.rows,
+                self.size,
+                fabric[0] if use_fabric else None,
+                socket.gethostname(),
+            ),
             group=cpu_group,
         )
         peer_fds = {}
         if not use_fabric:
+            if len({host for *_, host in meta}) > 1:
+                raise RuntimeError(
+                    "SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS needs CUDA FABRIC handles "
+                    "(one NVLink domain with IMEX) when the TP group spans hosts"
+                )
             peer_fds = exchange_posix_fds(cpu_group, rank, world, fds, [1] * world)
         bases = []
         try:
-            for r, (_, _, size, fabric_handle) in enumerate(meta):
+            for r, (_, _, size, fabric_handle, _) in enumerate(meta):
                 if r == rank:
                     bases.append(self.base)
                     continue
