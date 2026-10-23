@@ -16,8 +16,9 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -28,7 +29,7 @@ PHYSICAL_PAGE = 64
 WIDENED_PAGE = PHYSICAL_PAGE * DCP_SIZE
 
 
-def _fake_mla_device_pool(size: int = 1024) -> MLATokenToKVPool:
+def _fake_mla_device_pool(size: int = 1024, **kwargs) -> MLATokenToKVPool:
     return MLATokenToKVPool(
         size=size,
         page_size=PHYSICAL_PAGE,
@@ -38,6 +39,7 @@ def _fake_mla_device_pool(size: int = 1024) -> MLATokenToKVPool:
         layer_num=2,
         device="cpu",
         enable_memory_saver=False,
+        **kwargs,
     )
 
 
@@ -130,6 +132,38 @@ class TestDcpKernelIndices(CustomTestCase):
                 maybe_dcp_kernel_indices(host_sorted, DCP_SIZE, rank).numel(),
                 host.numel() // DCP_SIZE,
             )
+
+
+class TestRowsAreDcpCollapsed(CustomTestCase):
+    """The sidecar builder and PD transfer map a draft like the target only
+    when its rows are owner rows; a replicated MLA pool (the DSA MTP draft)
+    and an MHA pool keep raw widened locs."""
+
+    def test_sharded_mla_pool_is_collapsed_only_under_dcp(self):
+        pool = _fake_mla_device_pool()
+        with get_parallel().override(dcp_enabled=False, attn_dcp_size=1):
+            self.assertFalse(pool.rows_are_dcp_collapsed)
+        with get_parallel().override(dcp_enabled=True, attn_dcp_size=DCP_SIZE):
+            self.assertTrue(pool.rows_are_dcp_collapsed)
+
+    def test_replicated_mla_pool_stays_logical(self):
+        pool = _fake_mla_device_pool(dcp_replicated=True)
+        with get_parallel().override(dcp_enabled=True, attn_dcp_size=DCP_SIZE):
+            self.assertFalse(pool.rows_are_dcp_collapsed)
+
+    def test_mha_pool_stays_logical(self):
+        pool = MHATokenToKVPool(
+            size=64,
+            page_size=PHYSICAL_PAGE,
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=4,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        with get_parallel().override(dcp_enabled=True, attn_dcp_size=DCP_SIZE):
+            self.assertFalse(pool.rows_are_dcp_collapsed)
 
 
 class TestHostPoolSizingUnderDcp(CustomTestCase):
