@@ -929,12 +929,12 @@ class AscendAttnBackend(AttentionBackend):
                 torch.npu.current_stream(self.device), self.device
             )
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
-        if self.dsa_dcp_target:
+        if get_parallel().dcp_enabled:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
                 metadata.dcp_origin_out_cache_loc = self.graph_metadata[
                     "dcp_origin_out_cache_loc"
                 ][: out_cache_loc.shape[0]]
-            if "dcp_block_tables" in self.graph_metadata:
+            if not self.is_draft_worker and "dcp_block_tables" in self.graph_metadata:
                 metadata.dcp_block_tables = self.graph_metadata["dcp_block_tables"][:bs]
                 metadata.dcp_seq_lens = self.graph_metadata["dcp_seq_lens"][:bs]
         if (
