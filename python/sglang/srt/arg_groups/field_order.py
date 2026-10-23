@@ -552,5 +552,9 @@ POSITIONAL_FIELD_ORDER = (
     "enable_return_aux_hidden_states",
     "aux_hidden_state_capture",
     "return_aux_hidden_state_layer_ids",
+    "afd_role",
+    "afd_ffn_addr",
+    "afd_backend",
+    "afd_ffn_moe_backend",
 )
 # fmt: on

@@ -733,6 +733,10 @@ async def health_generate(request: Request) -> Response:
     if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
         return Response(status_code=503)
 
+    # FFN workers receive routed tokens from A and cannot generate independently.
+    if get_disagg().afd_role == "ffn":
+        return Response(status_code=200)
+
     # Let an external E2E driver establish a balanced DP batch before health traffic.
     if envs.SGLANG_DIAG_BYPASS_HEALTH_GENERATE.get() and request.url.path in (
         "/health",
@@ -2383,6 +2387,9 @@ def _execute_server_warmup(server_args: ServerArgs):
         kill_process_tree(os.getpid())
         return success
 
+    if get_disagg().afd_role == "ffn":
+        return True
+
     model_info = res.json()
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
@@ -2588,6 +2595,8 @@ def _wait_and_warmup(
         if not execute_warmup_func(server_args):
             return
     else:
+        if get_disagg().afd_role == "ffn" and not _execute_server_warmup(server_args):
+            return
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
     if post_warmup_callback is not None:

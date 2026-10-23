@@ -530,6 +530,26 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         return StandardCombineInput(hidden_states=output)
 
 
+def requires_post_expert_routed_scaling(experts) -> bool:
+    from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+        Mxfp4FlashinferCutlassMoEMethod,
+    )
+    from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+        Mxfp4MarlinMoEMethod,
+    )
+
+    return isinstance(
+        experts.quant_method,
+        (
+            Mxfp4FlashinferTrtllmMoEMethod,
+            Mxfp4FlashinferCutlassMoEMethod,
+            Mxfp4MarlinMoEMethod,
+            ExpertPackMoEMethod,
+        ),
+    )
+
+
 def maybe_fuse_routed_scale_and_shared_add(
     experts,
     routed: torch.Tensor,
@@ -541,24 +561,7 @@ def maybe_fuse_routed_scale_and_shared_add(
     # alpha=scale)`. With no shared output, the missing scale is applied
     # in-place. Otherwise `routed` is already scale-final and we just add
     # `shared` (or pass through if there is none).
-    from sglang.srt.layers.quantization.expert_pack import ExpertPackMoEMethod
-    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
-        Mxfp4FlashinferCutlassMoEMethod,
-    )
-    from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
-        Mxfp4MarlinMoEMethod,
-    )
-
-    fused = isinstance(
-        experts.quant_method,
-        (
-            Mxfp4FlashinferTrtllmMoEMethod,
-            Mxfp4FlashinferCutlassMoEMethod,
-            Mxfp4MarlinMoEMethod,
-            ExpertPackMoEMethod,
-        ),
-    )
-    if fused:
+    if requires_post_expert_routed_scaling(experts):
         already_scaled = experts.should_fuse_routed_scaling_factor_in_topk
         if shared is not None:
             alpha = 1.0 if already_scaled else routed_scaling_factor

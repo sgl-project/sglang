@@ -876,7 +876,7 @@ class TopK(BaseFusedOp):
                 num_token_non_padded, expert_location_dispatch_info
             )
         )
-        if dynamic_expert_bias is not None:
+        if get_moe_a2a_backend().is_afd_attn() or dynamic_expert_bias is not None:
             output_format = TopKOutputFormat.STANDARD
         elif self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format

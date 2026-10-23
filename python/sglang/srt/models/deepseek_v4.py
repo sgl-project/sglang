@@ -47,6 +47,7 @@ from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
+from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -3615,7 +3616,7 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
                 input_ids_global=transport.input_ids_global,
                 skip_shared_experts=transport.do_shared_local,
                 return_moe_output=transport.return_moe_output,
-                leave_output_sum=True,
+                leave_output_sum=not is_afd_attn_moe_scattered(),
             )
             return output.finish(hidden_states)
 
@@ -4133,7 +4134,14 @@ class DeepseekV4Model(nn.Module):
                     hidden_states = residual_batch.set_written(state, forward_batch)
                 input_ids = tail.rows(input_ids)
                 if not (
-                    get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
+                    get_parallel().attn_dp_size > 1
+                    and (
+                        get_moe_a2a_backend().is_none()
+                        or (
+                            get_moe_a2a_backend().is_afd_attn()
+                            and not is_afd_attn_moe_scattered()
+                        )
+                    )
                 ):
                     input_ids_global = tail.rows(input_ids_global)
                 positions = tail.positions
@@ -4435,7 +4443,10 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
-        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+        if get_parallel().attn_dp_size > 1 and (
+            get_moe_a2a_backend().is_none()
+            or (get_moe_a2a_backend().is_afd_attn() and not is_afd_attn_moe_scattered())
+        ):
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
@@ -5568,7 +5579,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                             )
                                             break
                                 if name not in params_dict:
-                                    if not name.startswith("mtp"):
+                                    if not name.startswith("mtp") and not (
+                                        get_moe_a2a_backend().is_afd_attn()
+                                        and ".mlp.experts." in name
+                                    ):
                                         logger.warning(
                                             f"{name} not found in params_dict."
                                         )

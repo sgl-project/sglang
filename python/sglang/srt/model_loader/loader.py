@@ -51,6 +51,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     register_memory_region,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -152,6 +153,10 @@ _is_npu = is_npu()
 # which contains the complete mapping of quantization config choices
 
 logger = logging.getLogger(__name__)
+
+
+def _keep_afd_attn_target_weight(name: str) -> bool:
+    return ".experts." not in name
 
 
 @contextmanager
@@ -631,6 +636,15 @@ class DefaultModelLoader(BaseModelLoader):
             hf_weights_files = list(resolved_source.weight_files)
             use_safetensors = resolved_source.use_safetensors
 
+        weight_name_filter = None
+        if (
+            use_safetensors
+            and source.model_config is not None
+            and get_disagg().afd_role == "attn"
+            and not source.model_config.is_draft_model
+        ):
+            weight_name_filter = _keep_afd_attn_target_weight
+
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -705,6 +719,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    weight_name_filter=weight_name_filter,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -713,6 +728,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    weight_name_filter=weight_name_filter,
                 )
 
         else:
