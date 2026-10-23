@@ -2403,7 +2403,10 @@ def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrat
 
 # Strategies that assemble from host_pool_decls(), so every declared pool has an
 # entry by construction. A miss here is a bug, not an unsupported combination.
-_DECLARATION_VERIFIED_STRATEGIES: tuple[type, ...] = (_DeclaredKvStrategy, _MambaStrategy)
+_DECLARATION_VERIFIED_STRATEGIES: tuple[type, ...] = (
+    _DeclaredKvStrategy,
+    _MambaStrategy,
+)
 
 
 def _check_declared_pools_present(

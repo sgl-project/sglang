@@ -548,8 +548,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if (
-            not self._uses_swa_tail_prealloc()
-            and not self._requires_fresh_swa_window()
+            not self._uses_swa_tail_prealloc() and not self._requires_fresh_swa_window()
         ) or seq_len <= 0:
             return max(seq_len, 0)
 
