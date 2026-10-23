@@ -377,10 +377,17 @@ support single-node, monolithic serving; other deployments may remain `queued`
 at 0 until completion. Job metadata is process-local and does not survive an
 HTTP server restart.
 
+When load balancing independent HTTP servers, route polling and content requests
+to the server that accepted the job. Scheduler DP replicas behind one HTTP server
+share its job store; independent HTTP servers do not. Restart recovery, durable
+job ownership, and queue admission limits require an external serving layer.
+
 An accepted job continues after the submitting client disconnects. For a bounded
 scheduler wait, set `--scheduler-rpc-timeout` in seconds; it includes queue time
 and generation. A timeout marks the job failed but does not cancel GPU work.
 Retrying creates another job, so clients should retain and poll the returned ID.
+Deleting a job removes its API record, but does not cancel GPU work or remove
+generated files. Manage output retention separately.
 
 **Python Example:**
 
