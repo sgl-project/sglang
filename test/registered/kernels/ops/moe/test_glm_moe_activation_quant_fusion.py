@@ -23,14 +23,21 @@ def _fused(x, *, round_to_bf16=True, rows_per_cta=4):
     out = torch.empty((rows, width // 2), device=x.device, dtype=torch.float8_e4m3fn)
     scale = torch.empty((rows, width // 256), device=x.device, dtype=torch.float32)
     silu_and_mul_contig_post_quant(
-        x, out, scale, 128, swiglu_limit=10,
-        round_to_bf16=round_to_bf16, rows_per_cta=rows_per_cta,
+        x,
+        out,
+        scale,
+        128,
+        swiglu_limit=10,
+        round_to_bf16=round_to_bf16,
+        rows_per_cta=rows_per_cta,
     )
     return out, scale
 
 
 def _reference(x):
-    activated = torch.empty((x.shape[0], x.shape[1] // 2), device=x.device, dtype=x.dtype)
+    activated = torch.empty(
+        (x.shape[0], x.shape[1] // 2), device=x.device, dtype=x.dtype
+    )
     silu_and_mul_clamp(x, activated, 10)
     return per_token_group_quant(activated, group_size=128)
 

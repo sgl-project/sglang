@@ -425,8 +425,15 @@ struct SiluMulQuantContigParams {
   uint32_t scale_row_stride_int32;  // only used when kTransposed=true
 };
 
-template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit,
-          bool kRoundToBF16, uint32_t kRowsPerCTA>
+template <
+    uint32_t kGroupSize,
+    bool kScaleUE8M0,
+    bool kTransposed,
+    bool kSwizzle,
+    bool kUsePDL,
+    bool kApplySwigluLimit,
+    bool kRoundToBF16,
+    uint32_t kRowsPerCTA>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     silu_mul_quant_contig_kernel(const SiluMulQuantContigParams __grid_constant__ params) {
   using namespace device;
@@ -525,15 +532,35 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   }
 }
 
-template <int64_t kGroupSize, bool kScaleUE8M0, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit,
-          bool kRoundToBF16 = false, uint32_t kRowsPerCTA = 1>
+template <
+    int64_t kGroupSize,
+    bool kScaleUE8M0,
+    bool kSwizzle,
+    bool kUsePDL,
+    bool kApplySwigluLimit,
+    bool kRoundToBF16 = false,
+    uint32_t kRowsPerCTA = 1>
 struct SiluAndMulContigPostQuantKernel {
   static_assert(kGroupSize == 32 || kGroupSize == 128);
   static_assert(kRowsPerCTA == 1 || kRowsPerCTA == 2 || kRowsPerCTA == 4 || kRowsPerCTA == 8);
-  static constexpr auto kernel_normal =
-      silu_mul_quant_contig_kernel<kGroupSize, kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit, kRoundToBF16, kRowsPerCTA>;
-  static constexpr auto kernel_transposed =
-      silu_mul_quant_contig_kernel<kGroupSize, true, true, kSwizzle, kUsePDL, kApplySwigluLimit, kRoundToBF16, kRowsPerCTA>;
+  static constexpr auto kernel_normal = silu_mul_quant_contig_kernel<
+      kGroupSize,
+      kScaleUE8M0,
+      false,
+      kSwizzle,
+      kUsePDL,
+      kApplySwigluLimit,
+      kRoundToBF16,
+      kRowsPerCTA>;
+  static constexpr auto kernel_transposed = silu_mul_quant_contig_kernel<
+      kGroupSize,
+      true,
+      true,
+      kSwizzle,
+      kUsePDL,
+      kApplySwigluLimit,
+      kRoundToBF16,
+      kRowsPerCTA>;
 
   static void
   run(const tvm::ffi::TensorView input,
