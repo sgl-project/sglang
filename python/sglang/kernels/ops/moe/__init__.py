@@ -29,6 +29,17 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="moe.bf16_mega_gate",
+        backend=KernelBackend.DEEPGEMM,
+        target="sglang.kernels.ops.moe.mega_gate:bf16_mega_gate",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.moe_align_block_size",
         backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",
@@ -55,6 +66,16 @@ register_kernel(
         op="moe.topk_softmax",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.moe.moe_topk_softmax:topk_softmax",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
+        op="moe.shuffle_weighted_sum",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.shuffle_weighted_sum:shuffle_weighted_sum",
         capabilities=CUDA_ONLY,
     )
 )
