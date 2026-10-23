@@ -8,6 +8,7 @@ from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     StructureInfo,
     ToolCallItem,
+    ToolCallParseError,
     _GetInfoFunc,
 )
 
@@ -76,6 +77,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
     invoke_tag_name = "invoke"
     parameter_tag_name = "parameter"
     strip_string_param_value: bool = True
+    raise_on_malformed_tool_calls: bool = False
 
     def __init__(self):
         super().__init__()
@@ -192,6 +194,15 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         return json.dumps(parameters, ensure_ascii=False)
 
+    def _reject_malformed_invoke(self, reason: str) -> None:
+        if self.raise_on_malformed_tool_calls:
+            raise ToolCallParseError(
+                f"Model generated a malformed DeepSeek tool call: {reason}. "
+                "The rejected call was not returned for execution; "
+                "its arguments were not repaired."
+            )
+        logger.warning(f"Dropping malformed DeepSeek invoke: {reason}")
+
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses tool calls in the provided text.
@@ -214,27 +225,39 @@ class DeepSeekV32Detector(BaseFormatDetector):
             sections = [text[start:]]
 
         if not sections:
+            if self.raise_on_malformed_tool_calls and self.invoke_start_token in text:
+                self._reject_malformed_invoke("incomplete calls block")
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         calls = []
         try:
             # Find all invoke blocks
             for function_calls_content in sections:
-                for invoke_match in re.finditer(
-                    self.invoke_regex, function_calls_content, re.DOTALL
-                ):
+                invoke_matches = list(
+                    re.finditer(self.invoke_regex, function_calls_content, re.DOTALL)
+                )
+                if self.raise_on_malformed_tool_calls:
+                    last_end = 0
+                    for match in invoke_matches:
+                        if (
+                            self.invoke_start_token
+                            in function_calls_content[last_end : match.start()]
+                        ):
+                            self._reject_malformed_invoke("malformed invoke header")
+                        last_end = match.end()
+                    if self.invoke_start_token in function_calls_content[last_end:]:
+                        self._reject_malformed_invoke("malformed invoke header")
+                for invoke_match in invoke_matches:
                     func_name, invoke_content, is_complete = self._unpack_invoke_match(
                         invoke_match
                     )
                     if not is_complete:
-                        logger.warning(
-                            f"Dropping unclosed DeepSeek invoke '{func_name}'"
-                        )
+                        self._reject_malformed_invoke("unclosed invoke")
                         continue
                     try:
                         func_args = self._parse_parameters_from_xml(invoke_content)
                     except ValueError as e:
-                        logger.warning(f"Dropping malformed DeepSeek invoke: {e}")
+                        self._reject_malformed_invoke(str(e))
                         continue
                     # construct match_result for parse_base_json
                     match_result = {
@@ -244,6 +267,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     calls.extend(self.parse_base_json(match_result, tools))
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
+        except ToolCallParseError:
+            raise
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")
             # Fail closed: keep the prose, never surface DSML as content.
@@ -304,6 +329,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if not invoke_match:
                     break
 
+                if (
+                    self.raise_on_malformed_tool_calls
+                    and self.invoke_start_token in current_text[: invoke_match.start()]
+                ):
+                    self._reject_malformed_invoke("malformed invoke header")
+
                 func_name, invoke_content, is_tool_end = self._unpack_invoke_match(
                     invoke_match
                 )
@@ -328,7 +359,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     current_params = self._parse_parameters_from_xml(invoke_content)
                 except ValueError as e:
                     # Fail closed: drop this invoke, keep going for the next one.
-                    logger.warning(f"Dropping malformed DeepSeek invoke: {e}")
+                    self._reject_malformed_invoke(str(e))
                     self._buffer = current_text[invoke_match.end() :]
                     current_text = self._buffer
                     continue
@@ -362,6 +393,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             # No more invoke blocks found
             return StreamingParseResult(normal_text=preamble, calls=all_calls)
 
+        except ToolCallParseError:
+            raise
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             # Fail closed: drop the buffer, keep any prose ahead of the DSML,
@@ -377,6 +410,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         buffered = self._buffer
         self._buffer = ""
+        if self.raise_on_malformed_tool_calls and self.invoke_start_token in buffered:
+            self._reject_malformed_invoke("unclosed or malformed invoke")
         if self.current_tool_id != -1:
             return StreamingParseResult()
 
