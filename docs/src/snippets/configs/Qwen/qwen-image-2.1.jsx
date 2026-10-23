@@ -1,7 +1,7 @@
 export const config = (() => {
 const sm12Hardware = ["rtx5090", "rtxpro6000", "dgx-spark"];
 const platformAttention = (s) => sm12Hardware.includes(s.hw) || s.hw === "a3" ? "sdpa" : "fa";
-const effectiveAttention = (s) => s.attention === "platform" || ((sm12Hardware.includes(s.hw) || s.hw === "a3") && s.attention === "fa") ? platformAttention(s) : s.attention;
+const effectiveAttention = (s) => s.attention === "platform" || (sm12Hardware.includes(s.hw) && s.attention === "fa") ? platformAttention(s) : s.attention;
 
 const config = {
   modelName: "Qwen-Image 2.1 / Turbo",
@@ -89,8 +89,8 @@ const config = {
         },
         {
           id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"],
-          disabled: (s) => s.hw === "a3",
-          disableReason: "FlashAttention is unavailable on Ascend NPU; this runtime uses Torch SDPA.",
+          soft: (s) => s.hw === "a3",
+          softReason: "On Ascend NPU, 'fa' runs the Ascend FlashAttention backend; this combination has not completed HTTP verification — the verified recipe uses Torch SDPA.",
           description: "Exact attention with a fused kernel. This runtime falls back to Torch SDPA on RTX PRO 6000, RTX 5090, and DGX Spark.",
         },
         {
