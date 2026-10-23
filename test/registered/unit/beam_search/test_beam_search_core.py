@@ -7,6 +7,7 @@ a naive walk-in-order loop written here, not the implementation under test.
 
 import random
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -147,7 +148,7 @@ class TestJointSelectGolden(CustomTestCase):
 
     def test_coordinator_preserves_generic_stop_candidate_pool(self):
         coordinator = BeamCoordinator(
-            model_config=None,
+            model_config=SimpleNamespace(beam_trie_config=None),
             spec_algorithm=None,
             dllm_enabled=False,
             max_req_len=0,

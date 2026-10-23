@@ -108,10 +108,18 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     tree_cache: BasePrefixCache
     future_map: FutureMap
-    trie_constraint: Optional[BeamTrieConstraint] = None
 
+    # Loaded from model_config.beam_trie_config in __post_init__.
+    trie_constraint: Optional[BeamTrieConstraint] = None
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
+
+    def __post_init__(self) -> None:
+        config = self.model_config.beam_trie_config
+        if config is not None:
+            self.trie_constraint = BeamTrieConstraint.load(
+                config, self.req_to_token_pool.device
+            )
 
     @staticmethod
     def request_beam_width(recv_req) -> int:

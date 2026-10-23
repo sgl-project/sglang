@@ -68,7 +68,6 @@ try:
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
 from sglang.srt.beam_search.coordinator import BeamCoordinator
-from sglang.srt.beam_search.trie_constraint import BeamTrieConstraint
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -2594,14 +2593,6 @@ class Scheduler(
         return SchedulerOutputStreamer
 
     def init_beam_coordinator(self) -> None:
-        trie_constraint = (
-            BeamTrieConstraint.load(
-                self.model_config.beam_trie_config,
-                self.req_to_token_pool.device,
-            )
-            if self.model_config.beam_trie_config is not None
-            else None
-        )
         self.beam_coordinator = BeamCoordinator(
             model_config=self.model_config,
             spec_algorithm=self.spec_algorithm,
@@ -2611,7 +2602,6 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             future_map=self.future_map,
-            trie_constraint=trie_constraint,
         )
 
     def init_batch_result_processor(self) -> None:
