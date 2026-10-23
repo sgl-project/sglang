@@ -292,6 +292,11 @@ class PipelineStage(StageDedupMixin, ABC):
         #     return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
 
+    def parallelism_type_for(self, batch: Req | list[Req]) -> StageParallelismType:
+        """The parallelism the executor runs ``batch`` with; every rank must
+        resolve the same type."""
+        return self.parallelism_type
+
     def cfg_parallel_local_batch_fields(
         self, batch: Req, server_args: ServerArgs
     ) -> tuple[str, ...]:

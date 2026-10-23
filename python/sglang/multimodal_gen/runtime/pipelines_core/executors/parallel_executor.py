@@ -54,7 +54,7 @@ class ParallelExecutor(PipelineExecutor):
         with self._component_residency_request(stages, batch, server_args):
             # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
             for stage_index, stage in enumerate(stages):
-                paradigm = stage.parallelism_type
+                paradigm = stage.parallelism_type_for(batch)
 
                 if paradigm == StageParallelismType.MAIN_RANK_ONLY:
                     if rank == 0:

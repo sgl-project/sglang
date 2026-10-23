@@ -26,6 +26,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+# stage-2 video tokens per rank from which Ulysses over the CFG ranks runs stage 2
+# faster than the main rank alone (LTX-2, 2xH200 eager: +10% at 1920, -7% at 2304)
+CFG_SP_MIN_TOKENS_PER_RANK = 2304
+
 
 class LTX2AVDenoisingStage(LTX2DenoisingStage):
     """
@@ -151,13 +155,10 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        # stage 2 is distilled and runs without CFG. Stage 1 leaves the same
-        # latents on every CFG rank, so pure-CFG ranks shard it as one Ulysses
-        # group; CFG ranks with SP of their own leave it to the main rank, which
-        # sends the result only when the decoder uses every rank
+        # stage 2 is distilled and runs without CFG, so under CFG parallel the
+        # main rank runs it and sends the result only when the decoder uses
+        # every rank
         if self.server_args.enable_cfg_parallel:
-            if get_cfg_sequence_parallel_group() is not None:
-                return StageParallelismType.SEQUENCE_PARALLEL_OVER_CFG_RANKS
             if (
                 model_parallel_is_initialized()
                 and get_decode_parallel_world_size() > 1
@@ -167,6 +168,18 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                 return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
             return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
+
+    def parallelism_type_for(self, batch: Req | list[Req]) -> StageParallelismType:
+        # stage 1 leaves the same latents on every CFG rank, so pure-CFG ranks
+        # can shard stage 2 as one Ulysses group once it is long enough
+        cfg_sp_group = get_cfg_sequence_parallel_group()
+        if self.server_args.enable_cfg_parallel and cfg_sp_group is not None:
+            reqs = batch if isinstance(batch, list) else [batch]
+            # packed stage-2 video latents [B, S, C], the same shape on every rank
+            tokens = min(req.latents.shape[1] for req in reqs)
+            if tokens // cfg_sp_group.world_size >= CFG_SP_MIN_TOKENS_PER_RANK:
+                return StageParallelismType.SEQUENCE_PARALLEL_OVER_CFG_RANKS
+        return self.parallelism_type
 
     @staticmethod
     def _reset_stage2_generators(batch: Req) -> None:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A stage without CFG shards its sequence over the CFG ranks as one Ulysses group."""
+"""A stage without CFG shards a long enough sequence over the CFG ranks as one Ulysses group."""
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.distributed import group_coordinator
 from sglang.multimodal_gen.runtime.distributed import parallel_state as ps
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
@@ -19,10 +20,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.parallel_executor im
     ParallelExecutor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-    StageParallelismType,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
+    CFG_SP_MIN_TOKENS_PER_RANK,
     LTX2RefinementStage,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -75,14 +74,11 @@ def _check_folded_topology(rank, rendezvous):
 
         stage = object.__new__(LTX2RefinementStage)
         stage.server_args = SimpleNamespace(enable_cfg_parallel=True)
-        assert (
-            stage.parallelism_type
-            == StageParallelismType.SEQUENCE_PARALLEL_OVER_CFG_RANKS
-        )
-
-        # the executor runs the stage on every CFG rank inside the folded scope
-        probe = SimpleNamespace(
-            parallelism_type=StageParallelismType.SEQUENCE_PARALLEL_OVER_CFG_RANKS
+        stage.vae = None
+        min_tokens = 2 * CFG_SP_MIN_TOKENS_PER_RANK
+        short, long = (
+            Req(sampling_params=SamplingParams(), latents=torch.empty(1, n, 1))
+            for n in (min_tokens - 2, min_tokens)
         )
         server_args = SimpleNamespace(
             enable_cfg_parallel=True, enable_layerwise_nvtx_marker=False
@@ -101,16 +97,23 @@ def _check_folded_topology(rank, rendezvous):
                 ),
             ),
         ):
-            seen = ParallelExecutor.__new__(ParallelExecutor)._execute_stages(
-                [probe],
-                None,
-                server_args,
-                lambda stage, batch: (
-                    ps.get_sp_world_size(),
-                    ps.get_sp_parallel_rank(),
-                ),
+            executor = ParallelExecutor.__new__(ParallelExecutor)
+            seen_short, seen_long = (
+                executor._execute_stages(
+                    [stage],
+                    batch,
+                    server_args,
+                    lambda *_: (ps.get_sp_world_size(), ps.get_sp_parallel_rank()),
+                )
+                for batch in (short, long)
             )
-        assert seen == (2, rank)
+        # a short stage 2 runs on the main rank alone; the other keeps its batch
+        if rank == 0:
+            assert seen_short == (1, 0)
+        else:
+            assert seen_short is short
+        # a long one runs on every CFG rank inside the folded scope
+        assert seen_long == (2, rank)
         assert ps.get_sp_world_size() == 1
 
         torch.manual_seed(0)
