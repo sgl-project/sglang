@@ -14,7 +14,14 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai_harmony import Conversation, Message, Role, ToolNamespaceConfig
-from utils import StreamFixture, engine_chunk, event_payloads, make_serving
+from utils import (
+    MockTemplateManager,
+    MockTokenizerManager,
+    StreamFixture,
+    engine_chunk,
+    event_payloads,
+    make_serving,
+)
 
 from sglang.srt.entrypoints.context import (
     HarmonyContext,
@@ -30,7 +37,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
-    _should_emit_normal_text_as_message,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
@@ -1132,16 +1138,6 @@ class ChatToolChoiceConversionTestCase(CustomTestCase):
         )
 
 
-class ShouldEmitNormalTextTestCase(CustomTestCase):
-    def test_whitespace_suppressed_only_while_a_tool_is_open(self):
-        emit = _should_emit_normal_text_as_message
-        self.assertFalse(emit("", any_tool_call_in_progress=False))
-        # whitespace between tool blocks is an inter-call separator, not content
-        self.assertFalse(emit("\n", any_tool_call_in_progress=True))
-        self.assertTrue(emit("\n", any_tool_call_in_progress=False))
-        self.assertTrue(emit("hello", any_tool_call_in_progress=True))
-
-
 class EnginePassthroughTestCase(CustomTestCase):
     """Both flags cross hops with no type contract, and dropping either fails
     silently."""
@@ -1601,6 +1597,62 @@ def test_active_stream_cancel_and_final_history(response_serving):
         assert len(serving.msg_store[request.request_id]) == 2
 
     asyncio.run(run())
+
+
+INLINE_SYSTEM_TEMPLATE = (
+    "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}{% endfor %}"
+)
+
+
+@pytest.mark.parametrize(
+    "encoding_spec, chat_template_name, jinja_template, preserve",
+    [
+        ("kimi_k3", None, None, True),
+        ("dsv32", None, INLINE_SYSTEM_TEMPLATE, False),
+        (None, None, INLINE_SYSTEM_TEMPLATE, True),
+        (None, "llama-3", INLINE_SYSTEM_TEMPLATE, False),
+        (None, None, "{{ messages[0]['content'] }}", False),
+    ],
+)
+def test_inline_instruction_keeps_history_prefix(
+    encoding_spec, chat_template_name, jinja_template, preserve
+):
+    """An appended developer instruction stays in place when the renderer supports
+    inline system; hoisting it rewrites the prompt prefix and defeats KV reuse."""
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+    tokenizer_manager = MockTokenizerManager()
+    tokenizer_manager.tokenizer.chat_template = jinja_template
+    template_manager = MockTemplateManager()
+    template_manager.chat_template_name = chat_template_name
+    with patch.object(
+        OpenAIServingResponses,
+        "_resolve_chat_encoding_spec",
+        return_value=encoding_spec,
+    ):
+        serving = OpenAIServingResponses(tokenizer_manager, template_manager)
+    history = [
+        {"role": "user", "content": "Existing conversation"},
+        {"role": "assistant", "content": "Previous answer"},
+    ]
+    appended = [
+        {"role": "developer", "content": "New instruction"},
+        {"role": "user", "content": "Next turn"},
+    ]
+    before = serving._construct_input_messages(
+        ResponsesRequest(model="x", instructions="Stable instructions", input=history)
+    )
+    after = serving._construct_input_messages(
+        ResponsesRequest(
+            model="x", instructions="Stable instructions", input=history + appended
+        )
+    )
+    if preserve:
+        assert after[: len(before)] == before
+        assert after[len(before)]["role"] == "system"
+        assert "New instruction" in after[len(before)]["content"]
+    else:
+        assert [m["role"] for m in after].count("system") == 1
+        assert "New instruction" in after[0]["content"]
 
 
 @pytest.mark.parametrize("stream", [False, True])

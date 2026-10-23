@@ -34,10 +34,13 @@ from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.ling3_detector import Ling3Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.utils import get_schema_properties
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
@@ -1721,7 +1724,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                             call.parameters
                         )
 
-        self.assertGreater(num_tool_call_chunks, 8)
+        self.assertEqual(num_tool_call_chunks, 1)
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
@@ -1776,7 +1779,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                             call.parameters
                         )
 
-        self.assertGreater(num_tool_call_chunks, 8)
+        self.assertEqual(num_tool_call_chunks, 1)
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
 
@@ -2131,7 +2134,7 @@ class TestDeepSeekV4Detector(unittest.TestCase):
                             call.parameters
                         )
 
-        self.assertGreater(num_tool_call_chunks, 8)
+        self.assertEqual(num_tool_call_chunks, 1)
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
@@ -6011,6 +6014,194 @@ class TestTopLevelCompositeToolSchema(unittest.TestCase):
         )
         self.assertEqual(name, "acme")
         self.assertEqual(json.loads(arguments), self.expected)
+
+
+class TestMuseSparkFunctionCallParser(CustomTestCase):
+    # Contract: meta-models/Muse-Spark-open-816B-A42B-NVFP4 at
+    # 7ea492f704b13336c1f7dab909c70d9e4a8beabc, tokenizer_config.json's
+    # response_template and chat_template.jinja. No checkpoint download needed.
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(name=name, parameters={"type": "object"}),
+            )
+            for name in ("report", "weather.lookup")
+        ]
+
+    def _assert_parses(self, text, expected_content, expected_calls):
+        parser = FunctionCallParser(self.tools, "muse")
+        content, calls = parser.parse_non_stream(text)
+        self.assertEqual(content, expected_content)
+        self.assertEqual(
+            [(c.tool_index, c.name, json.loads(c.parameters)) for c in calls],
+            expected_calls,
+        )
+        for size in (1, 7, len(text)):
+            with self.subTest(chunk_size=size):
+                parser = FunctionCallParser(self.tools, "muse")
+                content, calls = "", []
+                for i in range(0, len(text), size):
+                    delta, items = parser.parse_stream_chunk(text[i : i + size])
+                    content += delta
+                    calls.extend(items)
+                delta, items = parser.parse_stream_end()
+                content += delta
+                calls.extend(items)
+                self.assertEqual(content, expected_content)
+                self.assertEqual(
+                    [(c.tool_index, c.name, json.loads(c.parameters)) for c in calls],
+                    expected_calls,
+                )
+                self.assertEqual(parser.parse_stream_end(), ("", []))
+
+    def test_atem_parameter_types_and_multiline_strings(self):
+        # JSON values decode; non-JSON text must retain whitespace and Unicode.
+        text = (
+            ' to=report<|message|><atem:function_calls><atem:invoke name="report">'
+            '<atem:parameter name="text">  café\n"quoted"\n</atem:parameter>'
+            '<atem:parameter name="quoted">"hello"</atem:parameter>'
+            '<atem:parameter name="count">42</atem:parameter>'
+            '<atem:parameter name="ratio">1.5</atem:parameter>'
+            '<atem:parameter name="enabled">true</atem:parameter>'
+            '<atem:parameter name="disabled">false</atem:parameter>'
+            '<atem:parameter name="missing">null</atem:parameter>'
+            '<atem:parameter name="object">{"a": [1, false]}</atem:parameter>'
+            '<atem:parameter name="array">[1, "two", null]</atem:parameter>'
+            '<atem:parameter name="empty"></atem:parameter>'
+            "</atem:invoke></atem:function_calls><|eot|>"
+        )
+        self._assert_parses(
+            text,
+            "",
+            [
+                (
+                    0,
+                    "report",
+                    {
+                        "text": '  café\n"quoted"\n',
+                        "quoted": "hello",
+                        "count": 42,
+                        "ratio": 1.5,
+                        "enabled": True,
+                        "disabled": False,
+                        "missing": None,
+                        "object": {"a": [1, False]},
+                        "array": [1, "two", None],
+                        "empty": "",
+                    },
+                )
+            ],
+        )
+
+    def test_parallel_calls_use_separate_messages_and_keep_namespaces(self):
+        # The checkpoint template emits one invocation per assistant message.
+        text = (
+            " to=commentary<|message|>Checking.<|eom|>"
+            "<|start|>assistant to=report<|message|>"
+            '<atem:function_calls><atem:invoke name="report">'
+            "</atem:invoke></atem:function_calls><|eom|>"
+            "<|start|>assistant to=weather.lookup<|message|>"
+            '<atem:function_calls><atem:invoke name="weather.lookup">'
+            '<atem:parameter name="city">Paris</atem:parameter>'
+            "</atem:invoke></atem:function_calls><|eom|>"
+            "<|start|>assistant to=user<|message|>Done.<|eot|>"
+        )
+        self._assert_parses(
+            text,
+            "Checking.Done.",
+            [(0, "report", {}), (1, "weather.lookup", {"city": "Paris"})],
+        )
+
+    def test_quoted_atem_in_non_tool_channels_is_not_executed(self):
+        quoted = (
+            '<atem:function_calls><atem:invoke name="report">'
+            "</atem:invoke></atem:function_calls>"
+        )
+        for recipient in ("self", "user", "commentary"):
+            with self.subTest(recipient=recipient):
+                self._assert_parses(
+                    f" to={recipient}<|message|>{quoted}<|eom|>", quoted, []
+                )
+
+    def test_truncated_invocation_does_not_fabricate_a_call(self):
+        self._assert_parses(
+            ' to=report<|message|><atem:function_calls><atem:invoke name="report">'
+            '<atem:parameter name="count">42</atem:parameter>',
+            "",
+            [],
+        )
+
+    def test_reasoning_to_tool_pipeline_preserves_channel_boundaries(self):
+        quoted = '<atem:invoke name="report"></atem:invoke>'
+        text = (
+            f" to=self<|message|>Do not execute {quoted}.<|eom|>"
+            "<|start|>assistant to=commentary<|message|>Checking.<|eom|>"
+            "<|start|>assistant to=report<|message|>"
+            '<atem:function_calls><atem:invoke name="report">'
+            '<atem:parameter name="count">42</atem:parameter>'
+            "</atem:invoke></atem:function_calls><|eom|>"
+            f"<|start|>assistant to=user<|message|>Example: {quoted}<|eot|>"
+        )
+        expected = (
+            f"Do not execute {quoted}.",
+            f"Checking.Example: {quoted}",
+            [(0, "report", {"count": 42})],
+        )
+        rp = ReasoningParser("muse", tool_call_parser_active=True)
+        reasoning, remainder = rp.parse_non_stream(text)
+        content, calls = FunctionCallParser(self.tools, "muse").parse_non_stream(
+            remainder
+        )
+        self.assertEqual(
+            (
+                reasoning,
+                content,
+                [(c.tool_index, c.name, json.loads(c.parameters)) for c in calls],
+            ),
+            expected,
+        )
+        # Every possible two-chunk split, including inside headers and ATEM tags.
+        for split in range(1, len(text)):
+            with self.subTest(split=split):
+                rp = ReasoningParser("muse", tool_call_parser_active=True)
+                fp = FunctionCallParser(self.tools, "muse")
+                reasoning, content, calls = "", "", []
+                for chunk in (text[:split], text[split:]):
+                    thought, remainder = rp.parse_stream_chunk(chunk)
+                    reasoning += thought
+                    delta, items = fp.parse_stream_chunk(remainder)
+                    content += delta
+                    calls.extend(items)
+                thought, remainder = rp.parse_stream_end()
+                reasoning += thought
+                delta, items = fp.parse_stream_chunk(remainder)
+                content += delta
+                calls.extend(items)
+                delta, items = fp.parse_stream_end()
+                content += delta
+                calls.extend(items)
+                self.assertEqual(
+                    (
+                        reasoning,
+                        content,
+                        [
+                            (c.tool_index, c.name, json.loads(c.parameters))
+                            for c in calls
+                        ],
+                    ),
+                    expected,
+                )
+
+
+class TestToolCallParserNames(unittest.TestCase):
+    def test_matches_registry(self):
+        # `server_args` builds the --tool-call-parser choices from this list to
+        # keep the registry, and its dependencies, out of argument parsing.
+        self.assertEqual(
+            sorted(TOOL_CALL_PARSER_NAMES),
+            sorted(FunctionCallParser.ToolCallParserEnum),
+        )
 
 
 if __name__ == "__main__":

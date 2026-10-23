@@ -14,6 +14,8 @@
 """The baseclass of a backend for reasoner grammar-guided constrained decoding."""
 
 import logging
+from collections import OrderedDict
+from concurrent.futures import Future
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -30,6 +32,11 @@ from .base_grammar_backend import (
 )
 
 logger = logging.getLogger(__name__)
+
+_OPEN_ANSWER_VARIANT = "open_answer"
+_THINK_BUDGET_VARIANT = "think_budget="
+# Arbitrary bound; budgets are a per-request knob, so only recent variants stay cached.
+_BUDGET_VARIANT_CACHE_SIZE = 32
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
@@ -270,9 +277,8 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     ):
         super().__init__()
         self.grammar_backend = grammar_backend
-        think_end_ids = tokenizer.encode(
-            reasoning_parser.detector.think_end_token, add_special_tokens=False
-        )
+        self._budget_variant_keys: OrderedDict[Tuple[str, str], None] = OrderedDict()
+        think_end_ids = reasoning_parser.detector.get_think_end_token_ids(tokenizer)
         if not think_end_ids:
             raise ValueError(
                 f"think_end_token '{reasoning_parser.detector.think_end_token}' "
@@ -280,6 +286,11 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             )
         self.think_end_ids = think_end_ids
         self._enable_strict_thinking = enable_strict_thinking
+        self._answer_frame = reasoning_parser.detector.get_answer_frame()
+        if self._answer_frame is not None:
+            self.grammar_backend.reserve_framing_tokens(
+                self._answer_frame.framing_token_ids()
+            )
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
         )
@@ -346,12 +357,93 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             return None
         return self._make_grammar_object(None, reasoning)
 
+    def get_request_grammar_key(
+        self,
+        key: Tuple[str, str],
+        *,
+        input_ids: Sequence[int],
+        thinking_budget: Optional[int],
+    ) -> Tuple[str, str]:
+        key_type, key_string = key
+        if not self._is_framed(key_type):
+            return key
+        if self._answer_frame.ends_in_open_answer_block(input_ids):
+            return (f"{key_type}:{_OPEN_ANSWER_VARIANT}", key_string)
+        # Mirrors the strict wrapper, which applies a request budget only while filtering.
+        if not self.enable_token_filter or thinking_budget is None:
+            return key
+        budget = max(thinking_budget, -1)
+        if budget == max(self.max_think_tokens, -1):
+            return key
+        return (f"{key_type}:{_THINK_BUDGET_VARIANT}{budget}", key_string)
+
+    def _is_framed(self, key_type: str) -> bool:
+        return (
+            self._answer_frame is not None
+            and key_type in self._answer_frame.framed_key_types
+        )
+
+    def get_cached_or_future_value(
+        self, key: Tuple[str, str], require_reasoning: bool
+    ) -> Tuple[BaseGrammarObject | Future[BaseGrammarObject], bool]:
+        if key in self._budget_variant_keys:
+            self._budget_variant_keys.move_to_end(key)
+        return super().get_cached_or_future_value(key, require_reasoning)
+
+    def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
+        super().set_cache(key, value)
+        if _THINK_BUDGET_VARIANT not in key[0]:
+            return
+        self._budget_variant_keys[key] = None
+        self._budget_variant_keys.move_to_end(key)
+        while len(self._budget_variant_keys) > _BUDGET_VARIANT_CACHE_SIZE:
+            evicted, _ = self._budget_variant_keys.popitem(last=False)
+            self.cache.pop(evicted, None)
+
+    def reset(self):
+        super().reset()
+        self._budget_variant_keys.clear()
+
     def _init_value_dispatch(
         self, key: Tuple[str, str], reasoning: bool
     ) -> Optional[BaseGrammarObject]:
+        key_type, _, variant = key[0].partition(":")
+        key = (key_type, key[1])
         ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
         if key[0] == "full_assistant_ebnf":
             return ret
+        if self._is_framed(key[0]):
+            # The frame delimits thinking by message kind, so it owns the whole
+            # turn; strict thinking only caps the thinking message.
+            framed = self._frame_answer(ret, variant)
+            if framed is not None:
+                return framed
+        if (
+            not self.enable_strict_thinking
+            and key[0] == "structural_tag"
+            and self._answer_frame is not None
+            and self._answer_frame.owns_turn(key[1])
+        ):
+            return ret
         return self._make_grammar_object(ret, reasoning)
+
+    def _frame_answer(
+        self, grammar: BaseGrammarObject, variant: str
+    ) -> Optional[BaseGrammarObject]:
+        in_answer_block = variant == _OPEN_ANSWER_VARIANT
+        if variant.startswith(_THINK_BUDGET_VARIANT):
+            max_think_tokens = int(variant.removeprefix(_THINK_BUDGET_VARIANT))
+        elif self.enable_strict_thinking:
+            max_think_tokens = self.max_think_tokens
+        else:
+            max_think_tokens = -1
+        return self.grammar_backend.compile_framed_grammar(
+            grammar,
+            lambda content: self._answer_frame.structural_tag(
+                content,
+                in_answer_block=in_answer_block,
+                max_think_tokens=max_think_tokens,
+            ),
+        )

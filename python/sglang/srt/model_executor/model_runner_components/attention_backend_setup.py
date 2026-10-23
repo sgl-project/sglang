@@ -5,13 +5,13 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
-from sglang.srt.distributed import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import init_cublas
 
 if TYPE_CHECKING:
@@ -145,9 +145,9 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         lazy_init_zbal_gva_mem(
             model_runner.device,
             model_runner.gpu_id,
-            get_world_group().rank_in_group,
-            get_world_group().world_size,
-            get_world_group().cpu_group,
+            get_parallel().world_group.rank_in_group,
+            get_parallel().launch_world_size,
+            get_parallel().world_group.cpu_group,
         )
 
     # Record resolved per-mode backends on the backend for model dispatch.

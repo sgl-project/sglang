@@ -898,9 +898,22 @@ def post_reorder_for_cutlass_moe(
     )
 
 
+def _check_out_buffer(tensor, shape, device, name: str) -> None:
+    if (
+        tuple(tensor.shape) != tuple(shape)
+        or tensor.device != device
+        or not tensor.is_contiguous()
+    ):
+        raise ValueError(
+            f"{name} must be contiguous {tuple(shape)} on {device}; got "
+            f"{tensor.dtype} {tuple(tensor.shape)} on {tensor.device}"
+        )
+
+
 @triton.jit
 def post_reorder_deepgemm_triton_kernel(
     down_output_ptr,
+    lora_delta_ptr,
     output_ptr,
     src2dst_ptr,
     topk_ids_ptr,
@@ -909,10 +922,13 @@ def post_reorder_deepgemm_triton_kernel(
     num_tokens,
     hidden_size,
     routed_scaling_factor: float,
+    HAS_LORA_DELTA: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
-    """Accumulate valid permuted rows; routed_scaling_factor is folded into the store."""
+    """Sum weight * (base + delta) over valid pairs, then apply routed scaling.
+    Delta is unweighted and indexed by [token, top-k, hidden].
+    """
     OutDtype = output_ptr.dtype.element_ty
 
     offset = BLOCK_SIZE * tl.program_id(1) + tl.arange(0, BLOCK_SIZE)
@@ -939,6 +955,10 @@ def post_reorder_deepgemm_triton_kernel(
                 weight_scale = tl.load(token_topk_weights_ptr + idx).to(tl.float32)
                 load_ptr_offs = down_output_ptr_offs + dst_idx * hidden_size
                 in_data = tl.load(load_ptr_offs, mask=mask).to(tl.float32)
+                if HAS_LORA_DELTA:
+                    slot_idx = src_idx * topk + idx
+                    delta_ptr_offs = lora_delta_ptr + slot_idx * hidden_size + offset
+                    in_data += tl.load(delta_ptr_offs, mask=mask).to(tl.float32)
                 sum_vec += in_data * weight_scale
         sum_vec *= routed_scaling_factor
         store_ptr_offs = output_ptr_offs + src_idx * hidden_size
@@ -955,10 +975,19 @@ def post_reorder_deepgemm(
     num_tokens,
     hidden_size,
     routed_scaling_factor: float,
+    lora_delta=None,
 ):
+    if lora_delta is not None:
+        _check_out_buffer(
+            lora_delta,
+            (num_tokens, topk, hidden_size),
+            down_output.device,
+            "lora_delta",
+        )
     grid, block_dim = _get_launch_config_2d(down_output.device, num_tokens, hidden_size)
     post_reorder_deepgemm_triton_kernel[grid](
         down_output,
+        down_output if lora_delta is None else lora_delta,
         output,
         src2dst,
         topk_ids,
@@ -967,51 +996,10 @@ def post_reorder_deepgemm(
         num_tokens,
         hidden_size,
         float(routed_scaling_factor),
+        HAS_LORA_DELTA=lora_delta is not None,
         BLOCK_SIZE=block_dim,
         NUM_STAGES=3,
     )
-
-
-@triton.jit
-def post_reorder_triton_kernel(
-    down_output_ptr,
-    output_ptr,
-    src2dst_ptr,
-    topk_ids_ptr,
-    topk_weights_ptr,
-    topk,
-    hidden_size,
-    BLOCK_SIZE: tl.constexpr,
-):
-    InDtype = down_output_ptr.dtype.element_ty
-
-    src_idx_int32 = tl.program_id(0)
-    src_idx = src_idx_int32.to(tl.int64)
-    src2dst_ptr = src2dst_ptr + src_idx * topk
-    topk_ids_ptr = topk_ids_ptr + src_idx * topk
-    topk_weights_ptr = topk_weights_ptr + src_idx * topk
-
-    store_ptr = output_ptr + src_idx * hidden_size
-
-    vec = tl.arange(0, BLOCK_SIZE)
-
-    for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
-        offset = start_offset + vec
-        mask = offset < hidden_size
-
-        sum_vec = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-        for idx in range(topk):
-            expert_id = tl.load(topk_ids_ptr + idx)
-            if expert_id >= 0:
-                dst_idx_int32 = tl.load(src2dst_ptr + idx)
-                dst_idx = dst_idx_int32.to(tl.int64)
-                weigh_scale = tl.load(topk_weights_ptr + idx).to(tl.float32)
-                load_ptr = down_output_ptr + dst_idx * hidden_size
-                # accumulate expert outputs in fp32 for better precision
-                # before casting to the final output dtype.
-                in_data = tl.load(load_ptr + offset, mask=mask).to(tl.float32)
-                sum_vec += in_data * weigh_scale
-        tl.store(store_ptr + offset, sum_vec.to(InDtype), mask=mask)
 
 
 @triton.jit
@@ -1270,13 +1258,13 @@ def ep_scatter_from_psum(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
+    quant_block_size: int = 128,
 ):
     BLOCK_E = 128
-    BLOCK_D = 128
     num_warps = 8
     num_experts = psum_num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
-    scale_hidden_size = hidden_size // BLOCK_D
+    scale_hidden_size = hidden_size // quant_block_size
     if scale_ue8m0:
         scale_hidden_size = ceil_div(scale_hidden_size, 4)
 
@@ -1333,46 +1321,6 @@ def ep_scatter_from_psum(
         SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
         ATOMIC_ADD_SEM=None if not _is_musa else "relaxed",
         IS_FP8=is_fp8,
-    )
-    return
-
-
-@triton.jit
-def _fwd_kernel_ep_expand_m_indices_init(
-    psum_num_recv_tokens_per_expert,
-    m_indices,
-    BLOCK_E: tl.constexpr,
-):
-    cur_expert = tl.program_id(0)
-    cur_end = tl.load(psum_num_recv_tokens_per_expert + cur_expert)
-    prev_end = tl.load(
-        psum_num_recv_tokens_per_expert + cur_expert - 1,
-        mask=cur_expert > 0,
-        other=0,
-    )
-    cur_start = ((prev_end + BLOCK_E - 1) // BLOCK_E) * BLOCK_E
-    aligned_end = ((cur_end + BLOCK_E - 1) // BLOCK_E) * BLOCK_E
-
-    off_expert = tl.arange(0, BLOCK_E)
-    for start_m in tl.range(0, aligned_end - cur_start, BLOCK_E, num_stages=4):
-        idx = cur_start + start_m + off_expert
-        tl.store(m_indices + idx, cur_expert, mask=idx < aligned_end)
-
-
-@torch.no_grad()
-def ep_expand_init_m_indices_from_psum(
-    psum_num_recv_tokens_per_expert: torch.Tensor,
-    m_indices: torch.Tensor,
-):
-    BLOCK_E = 128
-    num_warps = 8
-    num_experts = psum_num_recv_tokens_per_expert.shape[0]
-    assert m_indices.shape[0] % BLOCK_E == 0
-    _fwd_kernel_ep_expand_m_indices_init[(num_experts,)](
-        psum_num_recv_tokens_per_expert,
-        m_indices,
-        num_warps=num_warps,
-        BLOCK_E=BLOCK_E,
     )
     return
 
@@ -1751,7 +1699,7 @@ def moe_ep_deepgemm_preprocess(
     from sglang.srt.layers import deep_gemm_wrapper
 
     if is_fp8 and (use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0):
-        from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
+        from sglang.kernels.ops.moe.minimax_quant_ue8m0 import (
             per_token_quant_fp8_ue8m0_scatter,
         )
 
@@ -2576,6 +2524,95 @@ def masked_slab_to_expand(
         num_warps=4,
     )
     return output_tensor
+
+
+@triton.jit
+def _fwd_kernel_fill_m_indices_from_psum(
+    psum_ptr,
+    m_indices_ptr,
+    total_rows,
+    ALIGN: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    # psum is DeepEP's inclusive per-expert count: psum[i] = align(psum[i-1]) +
+    # count_i (only earlier experts aligned), so both start and seg_end round up.
+    # Each expert's whole aligned segment gets its id, padding rows included --
+    # combine ignores them, so the junk the GEMM computes there is discarded.
+    # Only rows past the last segment keep the wrapper's -1 sentinel; with
+    # do_cpu_sync=True there are none, so that fill is pure insurance.
+    e = tl.program_id(0)
+    prev_end = tl.load(psum_ptr + e - 1, mask=e > 0, other=0)
+    start = ((prev_end + ALIGN - 1) // ALIGN) * ALIGN
+    end = tl.load(psum_ptr + e)
+    seg_end = ((end + ALIGN - 1) // ALIGN) * ALIGN
+    count = seg_end - start
+    off = tl.arange(0, BLOCK_M)
+    for base in tl.range(0, count, BLOCK_M):
+        idx = start + base + off
+        tl.store(m_indices_ptr + idx, e, mask=(base + off < count) & (idx < total_rows))
+
+
+@torch.no_grad()
+def fill_m_indices_from_psum(
+    psum_num_recv_tokens_per_expert: torch.Tensor,
+    num_local_experts: int,
+    total_rows: int,
+    expert_alignment: int,
+) -> torch.Tensor:
+    """Build contiguous-GEMM `m_indices` from the device psum (deepep_v2
+    `do_expand=True` prefill).
+
+    The psum from DeepEP is already the alignment-padded per-expert prefix sum,
+    so this only labels rows.
+    """
+    # do_cpu_sync=True sizes recv_x to align(psum[-1]); the last expert's segment
+    # therefore ends exactly at total_rows (no capacity tail to skip).
+    assert total_rows % expert_alignment == 0, (
+        f"total_rows {total_rows} not a multiple of expert_alignment {expert_alignment}"
+    )
+    # -1 is DeepGEMM's "empty token" sentinel: uncovered rows are zero-filled and
+    # skipped instead of indexing the weight tensor out of bounds.
+    m_indices = torch.full(
+        (total_rows,),
+        -1,
+        device=psum_num_recv_tokens_per_expert.device,
+        dtype=torch.int32,
+    )
+    _fwd_kernel_fill_m_indices_from_psum[(num_local_experts,)](
+        psum_num_recv_tokens_per_expert,
+        m_indices,
+        total_rows,
+        ALIGN=expert_alignment,
+        BLOCK_M=128,
+        num_warps=4,
+    )
+    return m_indices
+
+
+@torch.no_grad()
+def scale_expanded_rows_(
+    x: torch.Tensor,
+    row_weights: torch.Tensor,
+) -> torch.Tensor:
+    """In-place `x[r, :] *= row_weights[r]` for a 2D `x`, any strides.
+
+    deepep_v2 `do_expand=True` prefill folds the router weights into the
+    down-proj input scale here, because ElasticBuffer.combine ignores
+    topk_weights in expand mode. `row_weights` must be a 1-D `[rows]` tensor
+    (what DeepEP hands back). `x` must be fp32: a packed UE8M0 scale cannot
+    absorb the weight, and a lower-precision `x` would round it.
+    """
+    assert x.dim() == 2, f"expected 2D x, got {tuple(x.shape)}"
+    assert x.dtype == torch.float32, f"expected fp32 x, got {x.dtype}"
+    rows, _ = x.shape
+    assert row_weights.dim() == 1, (
+        f"expected 1-D row_weights, got {row_weights.dim()}-D {tuple(row_weights.shape)}"
+    )
+    assert row_weights.numel() == rows, (
+        f"row_weights has {row_weights.numel()} entries but x has {rows} rows"
+    )
+    x.mul_(row_weights.unsqueeze(1))
+    return x
 
 
 def _moe_permute_rows(

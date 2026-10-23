@@ -1,17 +1,21 @@
 """
 Usage:
-python3 -m sglang.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
+python3 -m sglang.test.run_eval --port 30000 --eval-name gsm8k --num-examples 10
 """
 
 import argparse
 import json
 import os
 import statistics
-import subprocess
 import time
-import uuid
-from pathlib import Path
+import warnings
 
+from sglang.test.sgl_eval_utils import (
+    SGL_EVAL_BENCHMARKS,
+    THINKING_MODE_CHOICES,
+    get_thinking_kwargs,
+    parse_json_object,
+)
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
     CompletionSampler,
@@ -20,30 +24,6 @@ from sglang.test.simple_eval_common import (
     make_report,
     set_ulimit,
 )
-
-
-def get_thinking_kwargs(args):
-    thinking_mode = getattr(args, "thinking_mode", None)
-    if thinking_mode in THINKING_MODE_CHOICES:
-        if thinking_mode in ["deepseek-v3", "kimi-k2"]:
-            thinking_param = "thinking"
-        else:
-            # All models other than dpsk v3/kimi_k2
-            thinking_param = "enable_thinking"
-        return {thinking_param: True}
-    return {}
-
-
-def parse_json_object(value: str) -> dict:
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as e:
-        raise argparse.ArgumentTypeError("must be a valid JSON object string") from e
-
-    if not isinstance(parsed, dict):
-        raise argparse.ArgumentTypeError("must be a JSON object")
-
-    return parsed
 
 
 def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
@@ -108,125 +88,6 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     return result, latency, sampler
 
 
-def _run_sgl_eval(eval_name, args) -> dict:
-    # Returns a metrics dict (score, latency, output_throughput) so the
-    # existing write_results_to_json + threshold gate keep working.
-    from sglang.test.test_utils import dump_metric
-
-    base_url = (
-        f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
-    )
-    out_parent = Path(
-        getattr(args, "sgl_eval_out_dir", None)
-        or (Path.home() / ".sgl_eval" / "sglang_run_eval" / uuid.uuid4().hex)
-    ).expanduser()
-    out_parent.mkdir(parents=True, exist_ok=True)
-
-    model_preset_id = getattr(args, "load_preset_from_model_id", None)
-    cmd = [
-        "sgl-eval",
-        "run",
-        eval_name,
-        "--base-url",
-        base_url,
-        "--out-dir",
-        str(out_parent),
-    ]
-    if model_preset_id:
-        cmd += ["--load-preset-from-model-id", model_preset_id]
-    if getattr(args, "model", None):
-        cmd += ["--model", args.model]
-    if getattr(args, "num_examples", None) is not None:
-        cmd += ["--num-examples", str(args.num_examples)]
-    if getattr(args, "num_threads", None) is not None:
-        cmd += ["--num-threads", str(args.num_threads)]
-    if getattr(args, "temperature", None) is not None:
-        cmd += ["--temperature", str(args.temperature)]
-    elif not model_preset_id:
-        cmd += ["--temperature", "0.0"]
-    if getattr(args, "top_p", None) is not None:
-        cmd += ["--top-p", str(args.top_p)]
-    elif not model_preset_id and getattr(args, "_sgl_eval_from_cli", False):
-        cmd += ["--top-p", "1.0"]
-    # Unset by default in sgl-eval; only a sampling caller (temperature > 0) needs it.
-    if getattr(args, "seed", None) is not None:
-        cmd += ["--seed", str(args.seed)]
-    # gpt-oss grades one score per effort tier, so dropping this collapses every
-    # tier onto the served model's default.
-    if getattr(args, "reasoning_effort", None) is not None:
-        cmd += ["--reasoning-effort", str(args.reasoning_effort)]
-    if getattr(args, "repeat", None) is not None:
-        cmd += ["--n-repeats", str(args.repeat)]
-    # Bound generation length so long-reasoning models don't stall the eval.
-    if getattr(args, "max_tokens", None) is not None:
-        cmd += ["--max-tokens", str(args.max_tokens)]
-    elif not model_preset_id:
-        cmd += ["--max-tokens", "2048"]
-    # Reasoning models (e.g. Qwen3.5) put their answer in the reasoning channel;
-    # without --thinking their message.content is empty and sgl-eval scores 0.
-    sgl_eval_thinking = getattr(args, "sgl_eval_thinking", None)
-    if sgl_eval_thinking is None:
-        if not model_preset_id:
-            model_l = (getattr(args, "model", None) or "").lower()
-            if "qwen3.5" in model_l or "qwen3-thinking" in model_l:
-                cmd += ["--thinking"]
-    elif sgl_eval_thinking:
-        cmd += ["--thinking"]
-
-    try:
-        completed = subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=getattr(args, "sgl_eval_timeout", None),
-        )
-    except subprocess.TimeoutExpired as e:
-        raise TimeoutError(
-            f"sgl-eval timed out after {e.timeout}s: {' '.join(cmd)}\n"
-            f"stdout:\n{e.stdout or ''}\nstderr:\n{e.stderr or ''}"
-        ) from e
-
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"sgl-eval failed with exit code {completed.returncode}: "
-            f"{' '.join(cmd)}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
-        )
-
-    metrics_files = sorted(out_parent.glob(f"sgl_eval_{eval_name}_*/metrics.json"))
-    if len(metrics_files) != 1:
-        raise FileNotFoundError(
-            f"Expected exactly one metrics.json under {out_parent}, "
-            f"found {len(metrics_files)}"
-        )
-    payload = json.loads(metrics_files[0].read_text())
-    aggregate = payload.get("aggregate")
-    if not isinstance(aggregate, dict) or "score" not in aggregate:
-        raise KeyError(f"{metrics_files[0]} missing aggregate.score")
-
-    metrics = dict(aggregate)
-    metrics["latency"] = payload.get("latency_seconds", 0.0)
-    metrics["output_throughput"] = payload.get("output_throughput_tps", 0.0)
-    metrics["sgl_eval_metrics_path"] = str(metrics_files[0])
-
-    model = payload.get("model") or getattr(args, "model", None)
-    dump_metric(
-        f"{eval_name}_score",
-        metrics["score"],
-        labels={"model": model, "eval": eval_name},
-    )
-    dump_metric(
-        f"{eval_name}_latency",
-        metrics["latency"],
-        labels={"model": model, "eval": eval_name},
-    )
-    print(f"Score: {metrics['score']:.3f}")
-    print(f"Total latency: {metrics['latency']:.3f} s")
-    print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
-    print(f"sgl-eval metrics: {metrics_files[0]}")
-    return metrics
-
-
 def print_accept_length_summary(samplers: list) -> None:
     accept_lengths = [
         m["spec_accept_length"]
@@ -255,6 +116,23 @@ def run_eval(args):
     # Lazy import to avoid circular dependency with test_utils
     from sglang.test.test_utils import dump_metric
 
+    warnings.warn(
+        "sglang.test.run_eval is deprecated; its legacy scorers will be removed. "
+        "Use sglang.test.sgl_eval_utils.run_sgl_eval or `sgl-eval run` instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if (
+        args.eval_name in SGL_EVAL_BENCHMARKS
+        or args.eval_name == "mmmu-pro"
+        or getattr(args, "api", None) == "sgl_eval"
+        or getattr(args, "load_preset_from_model_id", None)
+    ):
+        raise ValueError(
+            f"{args.eval_name} is scored by sgl-eval; call "
+            "sglang.test.sgl_eval_utils.run_sgl_eval instead of run_eval."
+        )
+
     set_ulimit()
 
     if "OPENAI_API_KEY" not in os.environ:
@@ -264,19 +142,10 @@ def run_eval(args):
         f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
     )
 
-    if args.eval_name == "mmlu":
-        # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
-        # caller's threshold has to be measured against it, not inherited.
-        # `simple_eval_mmlu` stays: the ascend eval imports its subject2category.
-        return _run_sgl_eval("mmlu", args)
-    elif args.eval_name == "mgsm_en":
+    if args.eval_name == "mgsm_en":
         from sglang.test.simple_eval_mgsm import MGSMEval
 
         eval_obj = MGSMEval(args.num_examples, args.num_threads, languages=["en"])
-    elif args.eval_name == "gpqa":
-        # Scored by sgl-eval (NeMo-Skills' mcq prompt + eval_mcq grader), so a
-        # caller's threshold has to be measured against it, not inherited.
-        return _run_sgl_eval("gpqa", args)
     elif args.eval_name == "humaneval":
         from sglang.test.simple_eval_humaneval import HumanEval
 
@@ -290,25 +159,7 @@ def run_eval(args):
             args.num_threads,
             response_answer_regex=getattr(args, "response_answer_regex", None),
         )
-    elif args.eval_name in ("mmmu_pro", "mmmu-pro"):
-        # Canonical sgl-eval name for MMMU-Pro's standard 10-option split.
-        return _run_sgl_eval("mmmu_pro", args)
-    elif args.eval_name == "mmmu_pro_vision":
-        # sgl-eval owns this benchmark's dataset, prompt and grader; there is no
-        # simple_eval implementation to fall back to.
-        return _run_sgl_eval("mmmu_pro_vision", args)
-    elif args.eval_name == "aime25":
-        return _run_sgl_eval("aime25", args)
-    elif args.eval_name == "aime26":
-        return _run_sgl_eval("aime26", args)
     elif args.eval_name == "gsm8k":
-        if getattr(args, "api", None) == "sgl_eval":
-            # Only the nightly correctness eval opts into sgl-eval (zero-shot
-            # chat, \boxed{}, math_verify). Every other gsm8k caller — spec
-            # decoding perf/accuracy, disaggregation, quant, model e2e — uses
-            # the 5-shot completion last-number scorer and relies on
-            # max_tokens/throughput behavior sgl-eval cannot provide.
-            return _run_sgl_eval("gsm8k", args)
         from sglang.test.simple_eval_mixed_prefix_gsm8k import GSM8KEval
 
         eval_obj = GSM8KEval(
@@ -427,8 +278,6 @@ def run_eval(args):
     return metrics
 
 
-THINKING_MODE_CHOICES = ["deepseek-v3", "qwen-3", "glm-45", "kimi-k2"]
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -451,15 +300,9 @@ if __name__ == "__main__":
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
     )
     parser.add_argument(
-        "--load-preset-from-model-id",
-        type=str,
-        default=None,
-        help="Load repository-maintained sgl-eval generation defaults for this model ID.",
-    )
-    parser.add_argument(
         "--repeat", type=int, default=1, help="repeat the evaluation n times"
     )
-    parser.add_argument("--eval-name", type=str, default="mmlu")
+    parser.add_argument("--eval-name", type=str, default="gsm8k")
     parser.add_argument(
         "--api",
         type=str,
@@ -520,6 +363,5 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    args._sgl_eval_from_cli = True
 
     run_eval(args)

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import functools
 import inspect
-import os
 
 import torch
 import torch.nn as nn
@@ -71,9 +70,15 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.precision import (
     autocast_context as precision_autocast_context,
 )
+from sglang.multimodal_gen.runtime.utils.precision import (
+    temporary_module_fp32_dtype,
+    temporary_modules_fp32_dtype,
+)
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.srt.utils.common import get_compiler_backend
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    resolve_torch_compile_kwargs,
+)
 
 _is_npu = current_platform.is_npu()
 logger = init_logger(__name__)
@@ -152,11 +157,6 @@ class MOVATimestepPreparationStage(PipelineStage):
 
 
 class MOVADenoisingStage(PipelineStage):
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        return num_inference_steps
-
     """Run MOVA dual-tower denoising loop."""
 
     def __init__(self, video_dit, video_dit_2, audio_dit, dual_tower_bridge, scheduler):
@@ -167,7 +167,6 @@ class MOVADenoisingStage(PipelineStage):
         self.dual_tower_bridge = dual_tower_bridge
         self.scheduler = scheduler
         self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._torch_compiled = False
 
     def component_uses(
@@ -265,29 +264,19 @@ class MOVADenoisingStage(PipelineStage):
                 module.__class__.__name__,
             )
             return
-        compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
-
+        compile_kwargs, mode = resolve_torch_compile_kwargs(
+            "SGLANG_TORCH_COMPILE_MODE",
+            config=model_config,
+            default="max-autotune-no-cudagraphs",
+            module=module,
+            enable_inductor_compute_comm_overlap=True,
+        )
         if current_platform.is_npu():
-            backend = get_compiler_backend()
-            compile_kwargs["backend"] = backend
-            compile_kwargs["dynamic"] = False
             logger.info(
                 "Compiling %s with torchair backend on NPU",
                 module.__class__.__name__,
             )
         else:
-            try:
-                import torch._inductor.config as _inductor_cfg
-
-                _inductor_cfg.reorder_for_compute_comm_overlap = True
-            except ImportError:
-                pass
-            mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE") or getattr(
-                model_config,
-                "torch_compile_mode",
-                "max-autotune-no-cudagraphs",
-            )
-            compile_kwargs["mode"] = mode
             logger.info("Compiling %s with mode: %s", module.__class__.__name__, mode)
 
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
@@ -696,9 +685,23 @@ class MOVADenoisingStage(PipelineStage):
 
         visual_context = context.to(device=device, dtype=model_dtype)
         audio_context = context.to(device=device, dtype=model_dtype)
-        with torch.autocast(
-            device_type=current_platform.device_type, dtype=torch.float32
-        ):
+
+        # See [Note] Use temporary_module_fp32_dtype for the upcast on CPU.
+        autocast_ctx = (
+            torch.autocast(
+                device_type=current_platform.device_type, dtype=torch.float32
+            )
+            if current_platform.device_type != "cpu"
+            else temporary_modules_fp32_dtype(
+                [
+                    visual_dit.time_embedding,
+                    visual_dit.time_projection,
+                    self.audio_dit.time_embedding,
+                    self.audio_dit.time_projection,
+                ]
+            )
+        )
+        with autocast_ctx:
             visual_t = visual_dit.time_embedding(
                 video_sinusoidal_embedding_1d(visual_dit.freq_dim, timestep)
             )
@@ -999,10 +1002,21 @@ class MOVADecodingStage(PipelineStage):
         ) as audio_vae:
             assert audio_vae is not None
             self.audio_vae = audio_vae
-            with torch.autocast(
-                device_type=current_platform.device_type, dtype=torch.float32
-            ):
-                audio = self.audio_vae.decode(batch.audio_latents)
+            # See [Note] Use temporary_module_fp32_dtype for the upcast on CPU.
+            audio_latents = (
+                batch.audio_latents.float()
+                if current_platform.device_type == "cpu"
+                else batch.audio_latents
+            )
+            autocast_ctx = (
+                torch.autocast(
+                    device_type=current_platform.device_type, dtype=torch.float32
+                )
+                if current_platform.device_type != "cpu"
+                else temporary_module_fp32_dtype(self.audio_vae)
+            )
+            with autocast_ctx:
+                audio = self.audio_vae.decode(audio_latents)
         output_batch = OutputBatch(
             output=video,
             audio=audio,
