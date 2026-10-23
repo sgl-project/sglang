@@ -296,6 +296,9 @@ class CommonKVManager(BaseKVManager):
     kv_status_msg_tag: Optional[bytes] = None
     kv_status_msg_carries_reason: bool = False
     sender_trace_module: Optional[str] = None
+    # Sender reports transfer_latency_s (first enqueue -> Success). Otherwise
+    # the metric keeps its last-chunk fallback, so dashboards do not move.
+    reports_transfer_latency: bool = False
 
     kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
@@ -2330,7 +2333,11 @@ class CommonKVSender(BaseKVSender):
                 status = timeout_status
         if status in (KVPoll.Success, KVPoll.Failed):
             self.conclude_state = status
-            if status == KVPoll.Success and self._transfer_start_time is not None:
+            if (
+                status == KVPoll.Success
+                and self.kv_mgr.reports_transfer_latency
+                and self._transfer_start_time is not None
+            ):
                 self._transfer_metric.transfer_latency_s = (
                     time.perf_counter() - self._transfer_start_time
                 )
@@ -2399,10 +2406,12 @@ class CommonKVSender(BaseKVSender):
             )
 
     def failure_exception(self):
+        self.conclude_state = KVPoll.Failed
+        # Clear first: a late failure for a cleared room is dropped, not
+        # re-recorded after the pop.
+        self.clear()
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
-        self.conclude_state = KVPoll.Failed
-        self.clear()
         self.trace_ctx.trace_req_finish()
         raise KVTransferError(
             self.bootstrap_room,
@@ -2898,9 +2907,10 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed
+        # Clear first, as in the sender.
+        self.clear()
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
-        self.clear()
         raise KVTransferError(
             self.bootstrap_room,
             failure_reason or "Failed due to an unknown reason from another rank",
