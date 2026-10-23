@@ -929,6 +929,24 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 except ValueError:
                     boundary = kv_pages
                 pool_restorable = list(range(1, boundary + 1))
+            elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+                # Compressed-block pools (DeepSeek-V4 C128) keep one key per
+                # block, not per FULL page, so only the block boundaries are
+                # meaningful. The pool reports how many leading complete blocks
+                # it holds as its own verdict and never gates the KV prefix.
+                block = max(1, int(transfer.block_pages))
+                boundary_idx = list(range(block - 1, kv_pages, block))
+                complete = 0
+                for idx in boundary_idx:
+                    if not page_exists[idx]:
+                        break
+                    complete += 1
+                boundary = complete * block
+                # Not intersected into `restorable`: a pool whose data lives on
+                # a subset of the pages must not shorten the KV hit.
+                if boundary:
+                    hit_count[transfer.name] = complete
+                continue
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 # A stop point works when the window ending there is complete,
                 # so scan every one instead of stopping at the longest.

@@ -59,6 +59,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
+    get_nextn_layer_id,
     is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.utils import bind_or_assign, log_info_on_rank0
@@ -70,6 +71,25 @@ logger = logging.getLogger(__name__)
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
+
+# Quantization sidecars a W8A8/W4A8 checkpoint ships next to a weight tensor.
+# A layer the model builds unquantized -- the NextN draft under
+# --speculative-draft-model-quantization unquant, and the fused shared-experts
+# copy -- has no such parameter, so the fused/sidecar name is legitimately
+# absent from params_dict instead of being a rename bug.
+_QUANT_SIDECAR_SUFFIXES = (
+    ".weight_scale",
+    ".weight_offset",
+    ".deq_scale",
+    ".input_scale",
+    ".input_offset",
+    ".scale",
+    ".offset",
+)
+
+
+def _is_absent_quant_sidecar(name: str, params_dict: Dict[str, torch.Tensor]) -> bool:
+    return name not in params_dict and name.endswith(_QUANT_SIDECAR_SUFFIXES)
 
 
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -361,6 +381,12 @@ class DeepseekV2WeightLoaderMixin:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    # Fused quant sidecars of a layer built unquantized (the
+                    # NextN draft) have no destination parameter. `break` skips
+                    # the expert/generic branches, which would only re-report
+                    # the absent name.
+                    if _is_absent_quant_sidecar(name, params_dict):
+                        break
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     maybe_executor_submit(
@@ -461,6 +487,19 @@ class DeepseekV2WeightLoaderMixin:
                                         "fused_qkv_a_proj_with_mqa",
                                     )
                                 )
+                                if param_name not in params_dict:
+                                    # The fused projection only exists when the
+                                    # layer is built with fused q/kv-a-proj. An
+                                    # unquantized NextN draft fuses the weights
+                                    # but a W8A8 checkpoint still ships the
+                                    # per-projection *_scale / deq_scale
+                                    # tensors, whose fused counterpart has no
+                                    # parameter. Drop the pair instead of
+                                    # raising KeyError (same contract as the
+                                    # "not found in params_dict" path below).
+                                    cached_a_proj.pop(q_a_proj_name, None)
+                                    cached_a_proj.pop(kv_a_proj_name, None)
+                                    continue
                                 param = params_dict[param_name]
 
                                 weight_loader = getattr(
@@ -527,10 +566,7 @@ class DeepseekV2WeightLoaderMixin:
         num_nextn_layers = self.config.num_nextn_predict_layers
         assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
 
-        # compatible with old design
-        nextn_layer_id = (
-            0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
-        )
+        nextn_layer_id = get_nextn_layer_id(self.config)
 
         return NextNEnabledConfig(
             num_nextn_layers=num_nextn_layers,
