@@ -28,6 +28,8 @@ def _startup_worker(spec):
     elif outcome == "ready":
         time.sleep(0.05)
         spec.pipe_writer.send({"status": "ready"})
+    else:
+        time.sleep(60)
     spec.pipe_writer.close()
     time.sleep(60)
 
