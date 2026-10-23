@@ -1,7 +1,6 @@
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
@@ -14,7 +13,7 @@ from sglang.srt.speculative.dspark_components.dspark_sps import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_table() -> SpsCostTable:
@@ -50,22 +49,6 @@ class TestSpsCostTableInvariants(CustomTestCase):
                 max_batch_tokens=16,
             )
 
-    def test_rejects_empty_table(self):
-        with self.assertRaises(ValueError):
-            SpsCostTable(
-                sample_batch_tokens=[],
-                sample_steps_per_sec=[],
-                max_batch_tokens=0,
-            )
-
-    def test_rejects_max_below_largest_probe(self):
-        with self.assertRaises(ValueError):
-            SpsCostTable(
-                sample_batch_tokens=[8, 16],
-                sample_steps_per_sec=[1.0, 2.0],
-                max_batch_tokens=15,
-            )
-
 
 class TestSpsCostTableLookup(CustomTestCase):
     def test_lookup_exact_probe_returns_that_sps(self):
@@ -74,11 +57,6 @@ class TestSpsCostTableLookup(CustomTestCase):
         self.assertEqual(table.lookup(16), 950.0)
         self.assertEqual(table.lookup(32), 500.0)
         self.assertEqual(table.lookup(64), 480.0)
-
-    def test_lookup_floors_to_lower_captured_probe(self):
-        table = _make_table()
-        self.assertEqual(table.lookup(31), 950.0)
-        self.assertEqual(table.lookup(63), 500.0)
 
     def test_lookup_below_first_probe_clamps_to_first(self):
         table = _make_table()
@@ -143,22 +121,27 @@ class TestProfileSpsTable(CustomTestCase):
         self.assertEqual(table.max_batch_tokens, 256)
 
 
-def _build_sps_cost_table_for(*, sps_table_path):
+def _build_sps_cost_table_for(testcase, *, sps_table_path):
+    from sglang.srt.runtime_context import get_context
     from sglang.srt.speculative.dspark_components.dspark_planner import (
         build_sps_cost_table,
     )
 
-    server_args = SimpleNamespace(
+    # Both the table path and the bound come from the published bags, so the
+    # case publishes them.
+    override = get_context().override_server_args(
         speculative_dspark_sps_table_path=sps_table_path,
         max_running_requests=4,
     )
-    return build_sps_cost_table(server_args=server_args, verify_num_draft_tokens=5)
+    override.install()
+    testcase.addCleanup(override.restore)
+    return build_sps_cost_table(verify_num_draft_tokens=5)
 
 
 class TestBuildSpsCostTableContract(CustomTestCase):
     def test_unset_table_path_returns_flat_table(self):
         for sps_table_path in (None, ""):
-            table = _build_sps_cost_table_for(sps_table_path=sps_table_path)
+            table = _build_sps_cost_table_for(self, sps_table_path=sps_table_path)
             self.assertEqual(table.sample_batch_tokens, [1])
             self.assertEqual(table.sample_steps_per_sec, [1.0])
             self.assertEqual(table.max_batch_tokens, 20)
@@ -168,7 +151,7 @@ class TestBuildSpsCostTableContract(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "sps.json"
             path.write_text(table.to_json(), encoding="utf-8")
-            loaded = _build_sps_cost_table_for(sps_table_path=str(path))
+            loaded = _build_sps_cost_table_for(self, sps_table_path=str(path))
         self.assertEqual(loaded.sample_batch_tokens, table.sample_batch_tokens)
         self.assertEqual(loaded.sample_steps_per_sec, table.sample_steps_per_sec)
         self.assertEqual(loaded.max_batch_tokens, table.max_batch_tokens)

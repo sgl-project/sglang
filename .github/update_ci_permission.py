@@ -35,6 +35,9 @@ Permissions are assigned according to the following rules:
     - For all other cases, preserve the original configuration unchanged.
 3. All other users receive no permissions and a 120-minute cooldown (they are omitted from the file).
 
+`cooldown_interval_minutes` is not only a rate limit: 0 also authorizes
+`/rerun-test` and `/rerun-group`, which never pass through `pr-gate.yml`.
+
 Usage:
     export GH_TOKEN="your_github_token"
     python3 update_ci_permission.py
@@ -203,7 +206,6 @@ def main():
         new_permissions[user] = {
             "can_tag_run_ci_label": True,
             "can_rerun_failed_ci": True,
-            "can_rerun_stage": True,
             "cooldown_interval_minutes": 0,
             "reason": "top contributor",
         }
@@ -221,7 +223,6 @@ def main():
             new_permissions[user] = {
                 "can_tag_run_ci_label": True,
                 "can_rerun_failed_ci": True,
-                "can_rerun_stage": True,
                 "cooldown_interval_minutes": 60,
                 "reason": "custom override",
             }

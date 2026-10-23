@@ -4,8 +4,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     from sgl_kernel.scalar_type import ScalarType
@@ -68,13 +68,17 @@ def moe_wna16_marlin_gemm(
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
 ) -> torch.Tensor:
+    """Project routes, preserving inactive rows in a caller-provided output.
+
+    Inactive rows are zero when this function allocates the output.
+    """
     device = a.device
 
     # Allocate output if not provided
     if c_or_none is not None:
         c = c_or_none
     else:
-        c = torch.empty((size_m * top_k, size_n), dtype=a.dtype, device=device)
+        c = torch.zeros((size_m * top_k, size_n), dtype=a.dtype, device=device)
 
     # Early return for zero-size M
     if size_m == 0:

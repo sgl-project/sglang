@@ -134,9 +134,9 @@ class DmdDenoisingStage(DenoisingStage):
                             ],
                             dim=2,
                         ).to(target_dtype)
-                    assert not torch.isnan(
-                        latent_model_input
-                    ).any(), "latent_model_input contains nan"
+                    assert not torch.isnan(latent_model_input).any(), (
+                        "latent_model_input contains nan"
+                    )
 
                     # Prepare inputs for transformer
                     t_expand = t.repeat(latent_model_input.shape[0])

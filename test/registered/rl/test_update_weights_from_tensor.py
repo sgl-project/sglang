@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=147, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=165, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
 
 import gc
@@ -39,7 +39,9 @@ def test_update_weights_from_tensor(tp_size):
     new_tensor = torch.full((16384, 2048), 1.5, device="cuda")
 
     time_start = time.perf_counter()
+    engine.begin_weight_update()
     engine.update_weights_from_tensor([(x, new_tensor) for x in param_names])
+    engine.end_weight_update()
     print(f"Time delta: {time.perf_counter() - time_start:.03f}")
 
     for param_name in param_names[:3]:
@@ -52,9 +54,9 @@ def test_update_weights_from_tensor(tp_size):
     torch.cuda.ipc_collect()
     torch.cuda.empty_cache()
     memory_after = torch.cuda.memory_allocated()
-    assert (
-        memory_after <= memory_before + 1024
-    ), f"Memory leak detected: {memory_after - memory_before} bytes"
+    assert memory_after <= memory_before + 1024, (
+        f"Memory leak detected: {memory_after - memory_before} bytes"
+    )
 
 
 class TestUpdateWeightsFromTensor(CustomTestCase):
@@ -82,6 +84,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
         )
 
         new_tensor = torch.full((3072, 2048), 1.5)
+        engine.begin_weight_update()
         engine.update_weights_from_tensor(
             [
                 (write_param_name, new_tensor.clone())
@@ -89,6 +92,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
             ],
             load_format="direct",
         )
+        engine.end_weight_update()
 
         for read_param_name in read_param_names[:3]:
             _check_param(engine, read_param_name, [1.5] * 5)
@@ -114,6 +118,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
         )
 
         new_tensor = torch.full((3072, 2048), 1.5)
+        engine.begin_weight_update()
         engine.update_weights_from_tensor(
             [
                 (write_param_name, new_tensor.clone())
@@ -121,6 +126,7 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
             ],
             load_format=custom_loader_name,
         )
+        engine.end_weight_update()
 
         for read_param_name in read_param_names[:3]:
             _check_param(engine, read_param_name, [1.5] * 5)
@@ -168,9 +174,11 @@ class TestUpdateWeightsFromTensor(CustomTestCase):
 
         # Update weights using flattened_bucket format
         time_start = time.perf_counter()
+        engine.begin_weight_update()
         engine.update_weights_from_tensor(
             named_tensors=serialized_bucket_list, load_format="flattened_bucket"
         )
+        engine.end_weight_update()
         update_time = time.perf_counter() - time_start
         print(f"Flattened bucket update time: {update_time:.03f}")
 
@@ -234,6 +242,7 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         return ret
 
     def run_update_weights(self, named_tensors, flush_cache=True):
+        requests.post(self.base_url + "/begin_weight_update", json={})
         response = requests.post(
             self.base_url + "/update_weights_from_tensor",
             json={
@@ -243,6 +252,7 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
                 "flush_cache": flush_cache,
             },
         )
+        requests.post(self.base_url + "/end_weight_update", json={})
         ret = response.json()
         return ret
 
@@ -283,9 +293,9 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
 
 def _check_param(engine, param_name, expect_values):
     actual_values = torch.tensor(engine.get_weights_by_name(param_name))[0, :5]
-    assert torch.allclose(
-        actual_values, torch.tensor(expect_values), atol=0.002
-    ), f"{actual_values=}"
+    assert torch.allclose(actual_values, torch.tensor(expect_values), atol=0.002), (
+        f"{actual_values=}"
+    )
 
 
 if __name__ == "__main__":

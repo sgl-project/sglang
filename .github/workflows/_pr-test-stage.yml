@@ -59,7 +59,10 @@ on:
         type: string
         default: ''
       skip_prebuilt_rust_ext:
-        description: 'Take neither the artifact nor the cache, and compile during install. For a stage no prebuild targets: the cache key is arch-blind, so an aarch64 stage would be handed x86_64 modules.'
+        description: >
+          Take neither the artifact nor the cache, and compile during install. No
+          stage sets it: both architectures have a prebuild. Kept as the opt-out for
+          a pool that gets one later than its stages do.
         type: boolean
         default: false
 
@@ -92,7 +95,7 @@ env:
   # default times out on a cold cache.
   HF_HUB_DOWNLOAD_TIMEOUT: 300
   HF_HUB_ETAG_TIMEOUT: 300
-  SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.scheduled || fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
@@ -100,8 +103,16 @@ jobs:
   run:
     name: ${{ inputs.self_name }} (${{ matrix.partition }})
     # Runs on schedule / parallel-dispatch / non-failed PR with main_package or sgl_kernel changes.
+    # `runner_filter` is matched here rather than in each caller's job `if`: a
+    # caller that declares its runners as a matrix cannot, since job-level `if`
+    # sees github/needs/vars/inputs but not `matrix`. Callers that never declare
+    # the input read back null and match every runner_config.
     if: |
       always() &&
+      (fromJson(inputs.caller_inputs).runner_filter == null ||
+       fromJson(inputs.caller_inputs).runner_filter == '' ||
+       fromJson(inputs.caller_inputs).runner_filter == 'all' ||
+       fromJson(inputs.caller_inputs).runner_filter == inputs.runner_config) &&
       ((github.event_name == 'schedule' || fromJson(inputs.caller_inputs).test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
       (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true')
     # runs-on resolved from runs_on_map; check-changes already substituted
@@ -136,7 +147,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Download artifacts (v6)
         if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6' }}
@@ -144,7 +155,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - uses: ./.github/actions/download-rust-ext
         if: ${{ !inputs.skip_prebuilt_rust_ext }}
@@ -205,6 +216,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ fromJson(inputs.check_changes).continue_on_error == 'true' && '--continue-on-error' || '' }}
           RUNNER_LABELS: ${{ fromJson(fromJson(inputs.check_changes).runs_on_map)[inputs.runner_config] }}
           GPU_CONFIG: ${{ inputs.runner_config }}
+          HF_MUSE_SPARK_TOKEN: ${{ (inputs.self_name == 'base-c-test-8-gpu-b300' || inputs.self_name == 'extra-b-test-8-gpu-b300') && secrets.HF_MUSE_SPARK_TOKEN || '' }}
           # Read only by test_runai_model_loader.py (nightly 1-gpu); inert elsewhere.
           # Left unconditional because an `env:` key cannot be omitted, and an empty
           # value would reach the runai streamer as a malformed limit.
