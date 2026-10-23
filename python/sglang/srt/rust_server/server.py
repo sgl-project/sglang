@@ -401,7 +401,9 @@ class RustServer:
         Python's ``TokenizerManager._handle_abort_req`` builds from the same
         ``AbortReq``: a one-request batch carrying no new tokens and the abort
         finish reason. The counts are the request's own, so the frame does not
-        reset the ones a stream already reported."""
+        reset the ones a stream already reported. The frame is marked as ended
+        outside the stream: like ``_handle_abort_req``, the frontend records no
+        request metrics for it."""
         finish_reason = abort.finished_reason or {
             "type": "abort",
             "message": abort.abort_message or "Abort in waiting queue",
@@ -414,9 +416,17 @@ class RustServer:
             [req.cached_tokens],
             [req.reasoning_tokens],
         ]
-        if abort.weight_versions is not None:
-            header_cols += [[]] * _EXTRAS_HEADER_COLS
-            header_cols.append([abort.weight_versions])
+        header_cols += [[]] * _EXTRAS_HEADER_COLS
+        header_cols += [
+            [abort.weight_versions] if abort.weight_versions is not None else [],
+            [],  # image_tokens
+            [],  # audio_tokens
+            [],  # video_tokens
+            [],  # decode_latencies
+            # Ended outside the output stream: `_handle_abort_req` records no
+            # request metrics for it.
+            [True],
+        ]
         header = msgspec.msgpack.encode(header_cols)
         if not self.server.push_decode_result_batch(header, [b""]):
             logger.warning(

@@ -553,7 +553,8 @@ mod tests {
     /// `build_rust_frame_metadata_fixture`): spans on a terminal frame, clipped
     /// to the completion the client received, the launch version before one,
     /// and only nonzero media counts, also behind a frame's logprob columns;
-    /// the scheduler's decode latency reaches its row.
+    /// the scheduler's decode latency reaches its row, and only the abort is
+    /// marked as ended outside the output stream.
     #[test]
     fn frame_metadata_matches_python() {
         let keys = |output: &CoreOutput| {
@@ -579,6 +580,7 @@ mod tests {
             assert_eq!(events.len(), 2);
             for event in events {
                 let rid = event.rid.as_str().to_owned();
+                assert!(!event.extras.as_deref().is_some_and(|e| e.abort_output));
                 let completion_tokens = event.token_ids.len() as u64;
                 let mut output = CoreOutput::from(event);
                 output.weight_version = launch.clone();
@@ -609,7 +611,9 @@ mod tests {
             completion_tokens: abort["completion_tokens"].as_u64().unwrap(),
             ..Default::default()
         };
-        let mut delta = CoreOutput::from(events.pop().unwrap());
+        let event = events.pop().unwrap();
+        assert!(event.extras.as_deref().is_some_and(|e| e.abort_output));
+        let mut delta = CoreOutput::from(event);
         delta.weight_version = launch;
         aborted.append_delta(&delta);
         assert_eq!(keys(&aborted), abort["meta_info"]);

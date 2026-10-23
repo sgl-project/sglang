@@ -127,6 +127,15 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
     let plan = plan_cores(&cfg);
+    // Validated before anything is spawned, so a bad bucket list fails startup
+    // cleanly.
+    let metrics = match &cfg.server_args.metrics {
+        Some(config) => Some(Arc::new(crate::api_server::core::FrontendMetrics::new(
+            config,
+            cfg.server_args.disaggregation_mode,
+        )?)),
+        None => None,
+    };
 
     // --- rings (Rust ↔ Python) ---
     let (to_scheduler_tx, to_scheduler_rx): (ToSchedulerTx, ToSchedulerRx) =
@@ -313,6 +322,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             is_disaggregation: cfg.server_args.is_disaggregation(),
             mm_limits: cfg.server_args.limit_mm_data_per_request.clone(),
             metadata: crate::api_server::core::CoreMetadata::from(cfg.server_args.as_ref()),
+            metrics,
         },
     );
 
@@ -584,9 +594,7 @@ mod tests {
             let mut cfg = test_config(addr, None);
             cfg.rust_server_args.metrics_listener = metrics_listener;
             cfg.server_args = Arc::new(ServerArgs {
-                metrics: Some(crate::message::config::MetricsConfig {
-                    multiproc_dir: dir.to_string_lossy().into_owned(),
-                }),
+                metrics: Some(crate::message::config::MetricsConfig::for_dir(&dir)),
                 ..test_server_args()
             });
             let rt = start(cfg, None).expect("start runtime");

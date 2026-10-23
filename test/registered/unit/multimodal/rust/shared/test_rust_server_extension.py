@@ -263,8 +263,9 @@ class TestRustServerExtension(CustomTestCase):
 
     def test_scheduler_aborts_reach_the_rust_egress(self):
         """An abort the scheduler sends outside the output stream becomes a
-        one-request terminal batch in Rust mode, keeping the request's counts;
-        without the Rust server it still goes to the tokenizer socket."""
+        one-request terminal batch in Rust mode, keeping the request's counts
+        and marked as outside the stream; without the Rust server it still
+        goes to the tokenizer socket."""
         import msgspec
 
         from sglang.srt.managers.io_struct import AbortReq
@@ -280,7 +281,9 @@ class TestRustServerExtension(CustomTestCase):
         header, cols = server.server.push_decode_result_batch.call_args.args
         self.assertEqual(
             msgspec.msgpack.decode(header),
-            [["r#1"], [{"type": "abort", "message": "gone"}], [3], [0], [2], [1]],
+            [["r#1"], [{"type": "abort", "message": "gone"}], [3], [0], [2], [1]]
+            + [[]] * 17
+            + [[True]],
         )
         self.assertEqual(cols, [b""])
         scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
