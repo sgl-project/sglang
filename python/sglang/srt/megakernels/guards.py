@@ -14,6 +14,7 @@ from sglang.srt.environ import envs
 from sglang.srt.megakernels.spec import (
     ENTRY_POINT,
     FLAG,
+    FLAG_SETS_ENV,
     Feature,
     MegakernelSpec,
     find_spec,
@@ -170,17 +171,38 @@ def _dtype_reasons(spec: Optional[MegakernelSpec], model_config: Any) -> list[st
     return [f"dtype {dtype!r} is not one of {sorted(spec.requires.dtypes)}"]
 
 
+def set_flag_env(spec: Optional[MegakernelSpec]) -> list[str]:
+    """Set each variable of FLAG_SETS_ENV that the spec requires and the user left
+    unset to the spec's value; return their names."""
+    if spec is None:
+        return []
+    names = [
+        name
+        for name in spec.requires.env
+        if name in FLAG_SETS_ENV and not getattr(envs, name).is_set()
+    ]
+    for name in names:
+        getattr(envs, name).set(spec.requires.env[name])
+    return names
+
+
 def handle_nvidia_megakernel(server_args: Any) -> None:
     """Resolution step: fail before the weights load when the flag cannot be served,
-    listing every reason."""
+    listing every reason. The model processes, started after it, inherit what it sets
+    for the spec (FLAG_SETS_ENV)."""
     cfg = resolving_view(server_args)
     if not cfg.enable_nvidia_megakernel:
         return
+    env_set = []
     reasons = plugin_reasons()
     if not reasons:
         model_config = model_config_of(server_args)
+        hf_config, isa = model_config.hf_config, device_isa()
+        env_set = set_flag_env(
+            find_spec(architectures=hf_config.architectures, isa=isa)[0]
+        )
         spec, reasons = megakernel_disable_reasons(
-            cfg=cfg, hf_config=model_config.hf_config, isa=device_isa()
+            cfg=cfg, hf_config=hf_config, isa=isa
         )
         reasons += _dtype_reasons(spec, model_config)
     if cfg.monokernel_backend is not None:
@@ -189,8 +211,15 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
             f"--monokernel-backend {cfg.monokernel_backend} is also set; use one of the two"
         )
     if reasons:
+        # a refused setup leaves the environment as it was
+        for name in env_set:
+            getattr(envs, name).clear()
         raise ValueError(
             f"{FLAG} cannot run this setup:\n  - " + "\n  - ".join(reasons)
         )
     logger.warning("%s is experimental. Its kernels and coverage may change.", FLAG)
     logger.info("%s: %s on %s", FLAG, spec.name, device_isa())
+    for name in env_set:
+        logger.info(
+            "%s: set %s=%s for %s", FLAG, name, getattr(envs, name).get(), spec.name
+        )

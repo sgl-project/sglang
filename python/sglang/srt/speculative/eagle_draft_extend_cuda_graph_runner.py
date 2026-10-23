@@ -347,6 +347,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         return is_bs_supported
 
+    def _run_capture_tail_hooks(self, out, forward_batch, num_tokens: int) -> None:
+        """The model runner's capture tail hooks, after the draft-extend forward of a
+        captured batch size (under the runner's own attention backend)."""
+        for capture_hook in self.model_runner.capture_tail_hooks:
+            capture_hook(self, out, forward_batch, num_tokens)
+
     def capture_one_shape(
         self,
         size: int,
@@ -479,6 +485,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            self._run_capture_tail_hooks(ret, forward_batch, num_tokens)
             return ret
 
         with forward_context(
