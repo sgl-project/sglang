@@ -38,7 +38,9 @@ import torch
 
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
+from sglang.srt.beam_search import shared_context_attention
 from sglang.srt.beam_search.shared_context_attention import BeamAttentionMetadata
+from sglang.srt.beam_search.trie_output_head import build_trie_row_levels
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
@@ -1010,37 +1012,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # block there). Use it directly.
         seq_lens_cpu = batch.seq_lens_cpu
 
-        beam_trie_levels = None
-        if (
-            batch.forward_mode.is_decode()
-            and batch.beam_tail is not None
-            and model_runner.beam_trie_compact_enabled
-            and batch.reqs
-            and all(req.beam_group is not None for req in batch.reqs)
-        ):
-            beam_trie_config = model_runner.model_config.beam_trie_config
-            assert beam_trie_config is not None
-            max_level = beam_trie_config.num_codebooks - 1
-            row_levels = [
-                min(req.beam_group.num_generated, max_level) for req in batch.reqs
-            ]
-            if batch.beam_tail is not None:
-                for entry in batch.beam_tail.entries:
-                    level = min(entry.group.num_generated, max_level)
-                    row_levels.extend([level] * (entry.end - entry.start))
-            assert len(row_levels) == len(batch.seq_lens)
-            beam_trie_levels = torch.tensor(
-                row_levels,
-                dtype=torch.int64,
-                device=batch.device,
-            )
-        beam_attention_metadata = None
-        if batch.forward_mode.is_decode() and batch.beam_tail is not None:
-            from sglang.srt.beam_search.shared_context_attention import (
-                build_metadata,
-            )
-
-            beam_attention_metadata = build_metadata(batch, model_runner)
+        beam_trie_levels = build_trie_row_levels(batch, model_runner)
+        beam_attention_metadata = shared_context_attention.build_metadata(
+            batch, model_runner
+        )
 
         # TODO(seq-lens-removal): the whole ScheduleBatch seq_lens family
         # (incl. seq_lens_sum) is slated for removal in favor of kv-committed

@@ -27,6 +27,7 @@ from sglang.srt.beam_search.shared_context_attention_kernel import (
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -115,6 +116,7 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
         ]
         seq_lens_cpu = torch.tensor([3, 2, 2, 3, 2, 2, 2], dtype=torch.int32)
         batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
             beam_tail=SimpleNamespace(entries=entries, num_base_rows=3),
             seq_lens=seq_lens_cpu,
             seq_lens_cpu=seq_lens_cpu,
@@ -191,7 +193,9 @@ class TestSharedContextAttentionMetadata(CustomTestCase):
             with self.subTest(unsupported=unsupported):
                 self.assertIsNone(
                     build_metadata(
-                        SimpleNamespace(beam_tail=object()),
+                        SimpleNamespace(
+                            forward_mode=ForwardMode.DECODE, beam_tail=object()
+                        ),
                         self.model_runner(**unsupported),
                     )
                 )

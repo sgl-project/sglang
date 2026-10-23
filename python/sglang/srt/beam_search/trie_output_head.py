@@ -16,13 +16,17 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 import torch
 
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.environ import envs
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 _DEFAULT_NORMALIZER_CHUNK_SIZE = 8192
 logger = logging.getLogger(__name__)
@@ -73,6 +77,37 @@ def configure_model_trie_output_heads(
             "generation model has no compatible LogitsProcessor"
         )
     return enabled
+
+
+def build_trie_row_levels(
+    batch: ScheduleBatch, model_runner: ModelRunner
+) -> Optional[torch.Tensor]:
+    """Per-row SID codebook depths of an all-beam decode batch on the compact
+    head; None runs the dense LM head."""
+    if (
+        batch.forward_mode.is_decode()
+        and batch.beam_tail is not None
+        and model_runner.beam_trie_compact_enabled
+        and batch.reqs
+        and all(req.beam_group is not None for req in batch.reqs)
+    ):
+        beam_trie_config = model_runner.model_config.beam_trie_config
+        assert beam_trie_config is not None
+        max_level = beam_trie_config.num_codebooks - 1
+        row_levels = [
+            min(req.beam_group.num_generated, max_level) for req in batch.reqs
+        ]
+        if batch.beam_tail is not None:
+            for entry in batch.beam_tail.entries:
+                level = min(entry.group.num_generated, max_level)
+                row_levels.extend([level] * (entry.end - entry.start))
+        assert len(row_levels) == len(batch.seq_lens)
+        return torch.tensor(
+            row_levels,
+            dtype=torch.int64,
+            device=batch.device,
+        )
+    return None
 
 
 class BeamTrieOutputHead:

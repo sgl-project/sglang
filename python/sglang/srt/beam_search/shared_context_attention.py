@@ -53,7 +53,7 @@ def build_metadata(
     batch: ScheduleBatch,
     model_runner: ModelRunner,
 ) -> Optional[BeamAttentionMetadata]:
-    if not enabled() or batch.beam_tail is None:
+    if batch.beam_tail is None or not batch.forward_mode.is_decode() or not enabled():
         return None
     from sglang.srt.configs.model_config import AttentionArch
 
