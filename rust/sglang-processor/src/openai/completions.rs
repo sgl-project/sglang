@@ -11,7 +11,7 @@ use super::request::{
     format_json_schema, lora_path, one, usage_flags, yes,
 };
 use super::wire::{
-    Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
+    Payload, Reply, StreamState, is_abort_status, malformed_output_reply, meta_u64, now,
     stream_error_event, unary_reply, without_nulls,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
@@ -314,7 +314,7 @@ impl CompletionResponder {
         for (index, item) in ret.iter().enumerate() {
             let meta = &item["meta_info"];
             let Some(text) = item["text"].as_str() else {
-                return Some(malformed_output_reply("text"));
+                return Some(malformed_output_reply());
             };
             let mut text = text.to_owned();
             if let Some(echo) = self.echo_prompts.get(index / self.n) {
@@ -437,13 +437,13 @@ impl CompletionResponder {
         // `HTTPStatus`, which `/generate` serializes as its integer.
         if finish_reason["type"] == "abort"
             && let Some(code) = finish_reason.get("status_code").and_then(Value::as_u64)
-            && let Some(name) = http_status_name(code)
+            && is_abort_status(code)
         {
             self.stream.stopped = true;
             let message = finish_reason["message"]
                 .as_str()
                 .unwrap_or("Generation aborted.");
-            return Some(stream_error_event(message, name, code as u16));
+            return Some(stream_error_event(message, code as u16));
         }
 
         let mut choice = json!({

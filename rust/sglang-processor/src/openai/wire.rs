@@ -13,59 +13,67 @@ pub struct Reply {
     pub body: String,
 }
 
-/// `ErrorResponse(...).model_dump()`.
-pub(super) fn error_body(message: &str, err_type: &str, code: u16) -> Value {
-    json!({"object": "error", "message": message, "type": err_type, "param": null, "code": code})
+/// `protocol.openai_error_type`: OpenAI's `error.type` for an HTTP status.
+fn openai_error_type(code: u16) -> &'static str {
+    match code {
+        401 => "authentication_error",
+        403 => "permission_error",
+        429 => "rate_limit_error",
+        503 => "service_unavailable_error",
+        500.. => "server_error",
+        _ => "invalid_request_error",
+    }
+}
+
+/// `protocol.openai_error_body`.
+pub(super) fn error_body(message: &str, code: u16) -> Value {
+    json!({"error": {"message": message, "type": openai_error_type(code), "param": null, "code": null}})
 }
 
 /// `OpenAIServingBase.create_error_response`.
-pub(super) fn error_reply(message: &str, err_type: &str, code: u16) -> Reply {
+pub(super) fn error_reply(message: &str, code: u16) -> Reply {
     Reply {
         status: code,
-        body: error_body(message, err_type, code).to_string(),
+        body: error_body(message, code).to_string(),
     }
 }
 
 /// `OpenAIServingBase.create_streaming_error_response`, as an SSE event.
-pub(super) fn stream_error_event(message: &str, err_type: &str, code: u16) -> String {
-    let error = json!({"error": error_body(message, err_type, code)});
-    format!("data: {}\n\n", python_json(&error, true))
+pub(super) fn stream_error_event(message: &str, code: u16) -> String {
+    format!(
+        "data: {}\n\n",
+        python_json(&error_body(message, code), true)
+    )
 }
 
 /// The OpenAI reply for a `/generate` error response. `None` passes the
-/// engine's reply through: SGLang answers its other errors, such as an
-/// `HTTPException`, in the OpenAI error shape on every route.
+/// engine's reply through.
 pub(super) fn engine_error_reply(body: &[u8]) -> Option<Reply> {
     let body: Value = serde_json::from_slice(body).ok()?;
     // A ValueError: `/generate` answers `{"error": {"message"}}`, OpenAI a 400.
-    let message = body.pointer("/error/message")?.as_str()?;
-    Some(error_reply(message, "BadRequestError", 400))
+    if let Some(message) = body.pointer("/error/message").and_then(Value::as_str) {
+        return Some(error_reply(message, 400));
+    }
+    // An `HTTPException`: `/generate` answers the flat `ErrorResponse`, the
+    // OpenAI servings the envelope with the same status.
+    let code = body["code"]
+        .as_u64()
+        .and_then(|code| u16::try_from(code).ok())?;
+    (body["object"] == "error" && (400..600).contains(&code))
+        .then(|| error_reply(body["message"].as_str().unwrap_or_default(), code))
 }
 
-/// Python's answer when the engine output lacks what the OpenAI layer reads.
-pub(super) fn malformed_output_reply(missing: &str) -> Reply {
-    let message = format!("Internal server error: '{missing}'");
-    error_reply(&message, "InternalServerError", 500)
+/// Python's catch-all 500, when the engine output lacks what the OpenAI layer reads.
+pub(super) fn malformed_output_reply() -> Reply {
+    error_reply("Internal server error", 500)
 }
 
-/// `HTTPStatus(code).name` for the codes SGLang aborts with.
-pub(super) fn http_status_name(code: u64) -> Option<&'static str> {
-    Some(match code {
-        400 => "BAD_REQUEST",
-        401 => "UNAUTHORIZED",
-        403 => "FORBIDDEN",
-        404 => "NOT_FOUND",
-        408 => "REQUEST_TIMEOUT",
-        413 => "REQUEST_ENTITY_TOO_LARGE",
-        422 => "UNPROCESSABLE_ENTITY",
-        429 => "TOO_MANY_REQUESTS",
-        500 => "INTERNAL_SERVER_ERROR",
-        501 => "NOT_IMPLEMENTED",
-        502 => "BAD_GATEWAY",
-        503 => "SERVICE_UNAVAILABLE",
-        504 => "GATEWAY_TIMEOUT",
-        _ => return None,
-    })
+/// Whether `code` is one of the `HTTPStatus` codes SGLang aborts with.
+pub(super) fn is_abort_status(code: u64) -> bool {
+    matches!(
+        code,
+        400 | 401 | 403 | 404 | 408 | 413 | 422 | 429 | 500 | 501 | 502 | 503 | 504
+    )
 }
 
 /// `UsageProcessor.calculate_token_usage`, dumped as `UsageInfo`.
@@ -163,14 +171,10 @@ impl StreamState {
         };
         if let Some(message) = content.pointer("/error/message").and_then(Value::as_str) {
             if !self.started {
-                return Err(error_reply(message, "BadRequestError", 400));
+                return Err(error_reply(message, 400));
             }
             self.failed = true;
-            return Ok(Payload::Events(vec![stream_error_event(
-                message,
-                "BadRequestError",
-                400,
-            )]));
+            return Ok(Payload::Events(vec![stream_error_event(message, 400)]));
         }
         self.started = true;
         Ok(Payload::Frame(content))
@@ -243,6 +247,33 @@ pub(super) fn meta_u64(meta: &Value, key: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_errors_become_the_envelope_with_their_status() {
+        let reply = |body: Value| engine_error_reply(body.to_string().as_bytes());
+        let envelope = |message: &str, error_type: &str| json!({"error": {"message": message, "type": error_type, "param": null, "code": null}});
+        // A ValueError from `/generate`.
+        let value_error = reply(json!({"error": {"message": "bad n"}})).unwrap();
+        assert_eq!(value_error.status, 400);
+        let body: Value = serde_json::from_str(&value_error.body).unwrap();
+        assert_eq!(body, envelope("bad n", "invalid_request_error"));
+        // An HTTPException's flat ErrorResponse keeps its status.
+        let flat = json!({"object": "error", "message": "The request queue is full.", "type": "503", "param": null, "code": 503});
+        let http_exception = reply(flat).unwrap();
+        assert_eq!(http_exception.status, 503);
+        let body: Value = serde_json::from_str(&http_exception.body).unwrap();
+        assert_eq!(
+            body,
+            envelope("The request queue is full.", "service_unavailable_error")
+        );
+        // Anything else passes through.
+        assert!(reply(json!({"detail": "not found"})).is_none());
+
+        let malformed = malformed_output_reply();
+        assert_eq!(malformed.status, 500);
+        let body: Value = serde_json::from_str(&malformed.body).unwrap();
+        assert_eq!(body, envelope("Internal server error", "server_error"));
+    }
 
     #[test]
     fn cache_report_keeps_zero_cached_tokens() {
