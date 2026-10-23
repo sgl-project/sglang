@@ -20,6 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.runner.base_cuda_graph_runner import freeze_gc
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -580,6 +581,14 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_cuda_graphs(self):
         if not self._hosts_draft:
             return
+        if self._verify_epilogue is not None:
+            # The target's verify graphs are captured by now; the epilogue reads them.
+            with freeze_gc(get_exec().graph.enable_cudagraph_gc):
+                captured_bs = self._verify_epilogue.capture_static_graphs()
+            if captured_bs and get_parallel().tp_rank == 0:
+                logger.info(
+                    "Captured the DSpark static verify epilogue for bs=%s.", captured_bs
+                )
         capture_decode_cuda_graph = self._decode_graph_allowed
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
@@ -1143,6 +1152,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                         else simulate_bonus_sampling_info.temperatures[:bs]
                     ),
                 )
+        folded_static = False
         prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
@@ -1158,10 +1168,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                     inject_gate=fold_eligible,
                 )
             else:
-                if (
+                static_epilogue = (
                     self._verify_epilogue is not None
                     and self._verify_planner.mode_value == "static"
-                ):
+                )
+                if static_epilogue:
                     self._verify_epilogue.begin_static_step(bs, fold_eligible)
                 target_verify = self._verify_executor.run_non_compact(
                     batch=batch,
@@ -1171,6 +1182,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     sampling_info=sampling_info,
                 )
                 hidden_strided = None
+                folded_static = static_epilogue and self._replay_static_epilogue(
+                    bs=bs, fold_eligible=fold_eligible, target_verify=target_verify
+                )
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
         if batch.has_grammar:
@@ -1188,9 +1202,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = (
-            fold_eligible
-            and can_run_cuda_graph
-            and (run_compact or self._verify_planner.mode_value == "static")
+            fold_eligible and can_run_cuda_graph and (run_compact or folded_static)
         )
         region_accept = None
         if (
@@ -1360,6 +1372,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             and verify_logits_adjustments_are_noop(sampling_info)
             and simulate_bonus_sampling_info is None
             and not batch.has_grammar
+        )
+
+    def _replay_static_epilogue(
+        self, *, bs: int, fold_eligible: bool, target_verify
+    ) -> bool:
+        """The epilogue is its own graph: replay it after the static verify graph
+        only on a step that takes its accept. Returns whether it served the step
+        (False: the step takes the eager accept)."""
+        return (
+            fold_eligible
+            and target_verify.can_run_cuda_graph
+            and self._verify_epilogue.replay_static_epilogue(
+                bs, target_verify.logits_output
+            )
         )
 
     def _future_relay_in_graph(self, *, run_compact: bool, folded_accept: bool):

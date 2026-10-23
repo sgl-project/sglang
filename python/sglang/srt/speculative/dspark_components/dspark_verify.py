@@ -35,6 +35,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_sample_graph,
 )
 from sglang.kernels.ops.speculative.dspark.static_accept_tail import static_accept_tail
+from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import (
@@ -43,6 +44,12 @@ from sglang.srt.managers.overlap_utils import (
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_capture_stream,
+    get_or_create_global_graph_memory_pool,
+    graph_pool_capture_scope,
+    graph_pool_replay_scope,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
@@ -63,11 +70,12 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cuda, is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
 
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
@@ -660,6 +668,15 @@ class DsparkVerifyEpilogue:
         self.folds_engram_commit = False
         # Per captured static batch size; the sampling-accept region's replays read them.
         self.static_io: dict[int, StaticVerifyIO] = {}
+        # Static verify graphs leave the epilogue out (unless
+        # _epilogue_in_verify_graph): it is captured on its own per verify graph
+        # (_epilogue_key) at startup and replayed only on steps that take its
+        # accept. None marks a key recorded with two different sets of input buffers.
+        self._epilogue_records: dict[tuple, Optional[tuple]] = {}
+        self._epilogue_graphs: dict[tuple, torch.cuda.CUDAGraph] = {}
+        self._epilogue_captured = False
+        self._logged_epilogue_replay = False
+        self._warned_epilogue_miss = False
 
     def capture_hook(self, runner, out, forward_batch, num_tokens) -> None:
         if (
@@ -674,7 +691,10 @@ class DsparkVerifyEpilogue:
         ):
             return
         if not runner.ragged_verify_mode:
-            self._static_epilogue(out, forward_batch)
+            if self._epilogue_in_verify_graph():
+                self._static_epilogue(out, forward_batch)
+            elif torch.cuda.is_current_stream_capturing():
+                self._record_epilogue(out, forward_batch)
             return
         self(
             compact_logits=out.next_token_logits,
@@ -716,9 +736,111 @@ class DsparkVerifyEpilogue:
         self.sim_temperatures_buf[:bs].copy_(temperatures.view(-1))
         self.sim_seed_buf.fill_(random.getrandbits(31))
 
-    def _static_epilogue(self, out, forward_batch) -> None:
+    def _epilogue_in_verify_graph(self) -> bool:
+        # The deferred commit forks its projection in the verify forward and joins
+        # it in the epilogue. ROCm keeps the in-graph epilogue (the split is untested).
+        return self.deferred_commit is not None or not _is_cuda
+
+    @staticmethod
+    def _epilogue_key(bs: int, out) -> tuple:
+        # Graph variants of one batch size can own their hidden states (DSv4.1's
+        # candidate variants concatenate the aux hidden states in the graph).
+        return (bs, out.next_token_logits.data_ptr(), out.hidden_states.data_ptr())
+
+    def _record_epilogue(self, out, forward_batch) -> None:
+        # As the in-graph epilogue does: the sampling-accept region reads these.
+        self.static_io[forward_batch.batch_size] = self._verify_io(out, forward_batch)
+        if self._epilogue_captured:
+            # The target graphs are captured again after startup (e.g. a weight
+            # update with recapture_cuda_graph). Nothing captures epilogue graphs
+            # for them, so all-greedy static steps take the eager accept from now
+            # on. Drop the records; keep the old graphs once (destroying a graph
+            # inside this capture invalidates it).
+            if self._epilogue_graphs:
+                self._retired_epilogue_graphs = self._epilogue_graphs
+            self._epilogue_records, self._epilogue_graphs = {}, {}
+            return
+        key = self._epilogue_key(forward_batch.batch_size, out)
+        inputs = tuple(
+            (t.data_ptr(), tuple(t.shape))
+            for t in (
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch.seq_lens,
+                forward_batch.out_cache_loc,
+                forward_batch.req_pool_indices,
+            )
+        )
+        recorded = self._epilogue_records.get(key, (inputs,))
+        self._epilogue_records[key] = (
+            (inputs, out, forward_batch)
+            if recorded is not None and recorded[0] == inputs
+            else None
+        )
+
+    def capture_static_graphs(self) -> list[int]:
+        """Capture the epilogue of each recorded static verify graph as its own
+        graph, once, after the target's startup capture and on every TP rank."""
+        self._epilogue_captured = True
+        if not self._epilogue_records:
+            return []
+        pool = get_or_create_global_graph_memory_pool(torch.cuda)
+        # The captures below write static_io again; keep the verify capture's entries.
+        static_io = dict(self.static_io)
+        # Disarmed (gate 0, verify lens 0): the warmups commit no KV.
+        self.begin_step(None, armed=False)
+        with graph_capture(stream=get_or_create_global_graph_capture_stream()) as ctx:
+            # In the verify graphs' capture order: largest size first, so smaller
+            # sizes reuse its pool memory.
+            for key, record in self._epilogue_records.items():
+                if record is None:
+                    continue
+                _, out, forward_batch = record
+                self._static_epilogue(out, forward_batch)
+                graph = torch.cuda.CUDAGraph()
+                with (
+                    graph_pool_capture_scope(),
+                    torch.cuda.graph(graph, pool=pool, stream=ctx.stream),
+                ):
+                    self._static_epilogue(out, forward_batch)
+                self._epilogue_graphs[key] = graph
+        torch.cuda.current_stream().wait_stream(ctx.stream)
+        self.static_io = static_io
+        return sorted({key[0] for key in self._epilogue_graphs})
+
+    def replay_static_epilogue(self, bs: int, out) -> bool:
+        """Run the epilogue of the static verify graph that just ran ``bs`` requests
+        and returned ``out`` (the runner pads to the smallest captured size).
+        Returns whether the step's accept buffers now hold its result: True when
+        the epilogue ran inside the verify graph (_epilogue_in_verify_graph), False
+        when the verify graph has no epilogue graph (the step accepts eagerly)."""
+        if self._epilogue_in_verify_graph():
+            return True
+        graph_bs = min(
+            (key[0] for key in self._epilogue_records if key[0] >= bs), default=0
+        )
+        graph = self._epilogue_graphs.get(self._epilogue_key(graph_bs, out))
+        if graph is None:
+            if not self._warned_epilogue_miss:
+                self._warned_epilogue_miss = True
+                logger.warning(
+                    "No DSpark static verify epilogue graph for the verify graph that "
+                    "ran bs=%d (expected only after the target's CUDA graphs are "
+                    "captured again after startup); such all-greedy steps take the "
+                    "eager accept.",
+                    bs,
+                )
+            return False
+        with graph_pool_replay_scope():
+            graph.replay()
+        if not self._logged_epilogue_replay:
+            self._logged_epilogue_replay = True
+            logger.info("Replayed the DSpark static verify epilogue graph (bs=%d).", bs)
+        return True
+
+    def _verify_io(self, out, forward_batch) -> StaticVerifyIO:
         bs = forward_batch.batch_size
-        io = StaticVerifyIO(
+        return StaticVerifyIO(
             candidates=forward_batch.input_ids.view(bs, self.stride),
             logits=out.next_token_logits,
             hidden=out.hidden_states,
@@ -727,6 +849,10 @@ class DsparkVerifyEpilogue:
             out_cache_loc=forward_batch.out_cache_loc,
             positions=forward_batch.positions,
         )
+
+    def _static_epilogue(self, out, forward_batch) -> None:
+        bs = forward_batch.batch_size
+        io = self._verify_io(out, forward_batch)
         capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
         )
