@@ -1733,7 +1733,7 @@ class Envs:
     # Opt-in: the scheduler stages each extend batch's rows of the shared table
     # on GPUs without ATS, where the forward's own gather of random host rows is
     # slow. Pays off for large prefill batches.
-    SGLANG_OPT_DSV41_ENGRAM_HOST_PREFETCH = EnvBool(False)
+    SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

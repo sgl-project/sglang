@@ -22,8 +22,7 @@ from sglang.srt.layers.engram import (
     Engram,
     EngramEmbedding,
     EngramHasher,
-    compute_engram_hash_ids,
-    mask_image_lookback,
+    engram_rows_stageable,
 )
 from sglang.srt.model_executor.encoder_swa_replay import replay_len
 from sglang.srt.runtime_context import get_parallel
@@ -37,20 +36,14 @@ StagedRows = list[tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]]
 _GATHER_THREADS = 16
 
 
-class EngramRowPrefetcher:
+class EngramRowStager:
     def __init__(
         self,
         hasher: EngramHasher,
         embeds: list[EngramEmbedding],
         device: torch.device,
     ):
-        self.n = hasher.max_ngram_size
-        self.pad_id = hasher.pad_id
-        self.image_token_id = hasher.image_token_id
-        self.token_map = hasher.token_map.cpu()
-        self.multipliers = hasher.multipliers.cpu()
-        self.primes = hasher.primes.cpu()
-        self.offsets = hasher.offsets.cpu()
+        self.hasher = hasher
         # fp8 and e8m0 have no CPU index_select; the gather moves bytes.
         self.tables = [
             (e.weight.data.view(torch.uint8), e.scale.data.view(torch.uint8))
@@ -65,11 +58,11 @@ class EngramRowPrefetcher:
     @classmethod
     def from_model(
         cls, model: torch.nn.Module, hasher: EngramHasher, device: torch.device
-    ) -> Optional[EngramRowPrefetcher]:
-        """A prefetcher when every engram table is the shared host layout on a GPU
+    ) -> Optional[EngramRowStager]:
+        """A stager when every engram table is the shared host layout on a GPU
         without ATS: only that layout maps every row in this process, and with
         ATS the forward-stream gather already runs at full speed."""
-        if not envs.SGLANG_OPT_DSV41_ENGRAM_HOST_PREFETCH.get():
+        if not envs.SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING.get():
             return None
         engrams = sorted(
             (m for m in model.modules() if isinstance(m, Engram)),
@@ -80,19 +73,22 @@ class EngramRowPrefetcher:
             not embeds
             # Prefill CP hashes the whole prompt and keeps this rank's rows.
             or get_parallel().attn_cp_size > 1
-            or not all(e._shared and e._sort_host_reads for e in embeds)
+            or not all(e.shared_host_table_without_ats for e in embeds)
         ):
             return None
         for e in embeds:
-            e.host_prefetch = True
+            e.enable_scheduler_staging()
         return cls(hasher, embeds, device)
 
-    def prefetch(self, batch: ScheduleBatch) -> Optional[StagedRows]:
+    def stage(self, batch: ScheduleBatch) -> Optional[StagedRows]:
         """Stage every engram layer's rows for an extend batch, None to leave the
         lookup to the forward."""
-        ids = self._hash_ids(batch)
-        if ids is None:
+        if not engram_rows_stageable(batch.forward_mode):
             return None
+        windows = self._windows(batch)
+        if windows is None:
+            return None
+        ids, _ = self.hasher.hash_windows(*windows)
         staged = []
         for layer, (weight, scale) in enumerate(self.tables):
             layer_ids = ids[:, layer].reshape(-1)
@@ -106,33 +102,14 @@ class EngramRowPrefetcher:
             staged.append((rows, scales, copied))
         return staged
 
-    def _hash_ids(self, batch: ScheduleBatch) -> Optional[torch.Tensor]:
-        """The forward's hash ids [T, n_engram_layers, n_hash_cols], on the CPU."""
-        if not batch.forward_mode.is_extend_without_speculative():
-            return None
-        windows = self._windows(batch)
-        if windows is None:
-            return None
-        tokens, blocked = windows
-        if self.image_token_id is not None:
-            tokens, blocked = mask_image_lookback(tokens, blocked, self.image_token_id)
-        return compute_engram_hash_ids(
-            tokens,
-            blocked,
-            self.pad_id,
-            self.token_map,
-            self.multipliers,
-            self.primes,
-            self.offsets,
-        )
-
     def _windows(
         self, batch: ScheduleBatch
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        """tokens [T, n], column s the s-th predecessor, and blocked [T, n], the
-        look-back past the sequence start. None unless every extend token is on
-        the host."""
-        n1 = self.n - 1
+        """The host twin of the windows EngramHasher builds on the device: tokens
+        [T, n], column s the s-th predecessor, and blocked [T, n], the look-back
+        past the sequence start. None unless every extend token is on the host."""
+        max_ngram_size = self.hasher.max_ngram_size
+        lookback = max_ngram_size - 1
         tokens, positions = [], []
         # The forward's rows: an encoder SWA replay hit extends from its replay
         # start (fold_encoder_swa_replay).
@@ -149,17 +126,17 @@ class EngramRowPrefetcher:
                 return None
             if length == 0:
                 continue
-            lo = max(0, start - n1)
+            lo = max(0, start - lookback)
             seg = np.asarray(fill_ids[lo : start + length], dtype=np.int64)
-            seg = np.concatenate([np.zeros(n1 - (start - lo), np.int64), seg])
+            seg = np.concatenate([np.zeros(lookback - (start - lo), np.int64), seg])
             tokens.append(
-                np.lib.stride_tricks.sliding_window_view(seg, self.n)[:, ::-1]
+                np.lib.stride_tricks.sliding_window_view(seg, max_ngram_size)[:, ::-1]
             )
             positions.append(np.arange(start, start + length))
         if not tokens:
             return None
         positions = torch.from_numpy(np.concatenate(positions))
-        blocked = positions.unsqueeze(-1) < torch.arange(self.n)
+        blocked = positions.unsqueeze(-1) < torch.arange(max_ngram_size)
         return torch.from_numpy(np.concatenate(tokens)), blocked
 
     def _gather(self, table: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:

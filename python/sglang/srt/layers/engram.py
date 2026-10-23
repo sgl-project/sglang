@@ -51,7 +51,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
 )
@@ -234,19 +234,6 @@ def compute_engram_hash_ids(
     return torch.cat(hashes, dim=-1) + offsets
 
 
-def mask_image_lookback(
-    tokens: torch.Tensor, blocked: torch.Tensor, image_token_id: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Read multimodal pad ids in tokens [T, n] as the image token, and block
-    each look-back from its first image on."""
-    tokens = tokens.masked_fill(tokens >= MM_PAD_SHIFT_VALUE, image_token_id)
-    # Once a lookback hits an image, every older predecessor is PAD.
-    blocked = (
-        (blocked | (tokens == image_token_id)).to(torch.int32).cummax(-1).values.bool()
-    )
-    return tokens, blocked
-
-
 class EngramHasher(nn.Module):
     """Hash ids for every token of a forward batch, [T, n_engram_layers, n_hash_cols]."""
 
@@ -279,6 +266,8 @@ class EngramHasher(nn.Module):
         self.image_token_id: Optional[int] = None
         self.history: Optional[torch.Tensor] = None
         self.pad_row = 0
+        # Host copies of the hash buffers, for windows built on the CPU.
+        self._cpu_hash_params: Optional[tuple[torch.Tensor, ...]] = None
         # typing only
         self.token_map: torch.Tensor
         self.multipliers: torch.Tensor
@@ -475,7 +464,9 @@ class EngramHasher(nn.Module):
         starts: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Non-CUDA fallback of the hash kernel: predecessor table [T, n] and hash ids.
-        ``history`` is already the per-request [bs, n - 1] rows of this batch."""
+        ``history`` is already the per-request [bs, n - 1] rows of this batch.
+        EngramRowStager builds the same windows on the host from the requests'
+        fill ids."""
         n = self.max_ngram_size
         num_tokens = input_ids.shape[0]
         device = input_ids.device
@@ -507,19 +498,43 @@ class EngramHasher(nn.Module):
         blocked = positions.unsqueeze(-1) < shifts
         if num_real < num_tokens:
             blocked[num_real:] = True
+        return self.hash_windows(tokens, blocked)
+
+    def hash_windows(
+        self, tokens: torch.Tensor, blocked: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Hash ids [T, n_engram_layers, n_hash_cols] of predecessor windows on the
+        device of ``tokens``: tokens [T, n] holds the s-th predecessor in column s,
+        blocked [T, n] the look-back past the sequence start. Also returns tokens
+        with multimodal pad ids read as the image token."""
         if self.image_token_id is not None:
             # Scheduler-provided history still carries the multimodal pad ids.
-            tokens, blocked = mask_image_lookback(tokens, blocked, self.image_token_id)
-        hash_ids = compute_engram_hash_ids(
-            tokens,
-            blocked,
-            self.pad_id,
-            self.token_map,
-            self.multipliers,
-            self.primes,
-            self.offsets,
-        )
-        return hash_ids, tokens
+            tokens = tokens.masked_fill(
+                tokens >= MM_PAD_SHIFT_VALUE, self.image_token_id
+            )
+            # Once a lookback hits an image, every older predecessor is PAD.
+            blocked = (
+                (blocked | (tokens == self.image_token_id))
+                .to(torch.int32)
+                .cummax(-1)
+                .values.bool()
+            )
+        if tokens.device == self.token_map.device:
+            params = (self.token_map, self.multipliers, self.primes, self.offsets)
+        else:
+            assert tokens.device.type == "cpu", tokens.device
+            if self._cpu_hash_params is None:
+                self._cpu_hash_params = tuple(
+                    t.cpu()
+                    for t in (
+                        self.token_map,
+                        self.multipliers,
+                        self.primes,
+                        self.offsets,
+                    )
+                )
+            params = self._cpu_hash_params
+        return compute_engram_hash_ids(tokens, blocked, self.pad_id, *params), tokens
 
     def commit_after_verify(
         self,
@@ -815,6 +830,24 @@ def shard_range(
     )
 
 
+def engram_rows_stageable(forward_mode: ForwardMode) -> bool:
+    """Whether the scheduler stages the engram rows of a batch in this mode
+    (EngramRowStager); decode and target verify gather them in the forward."""
+    return forward_mode.is_extend_without_speculative()
+
+
+_row_ranges: dict[torch.device, torch.Tensor] = {}
+
+
+def _row_range(n: int, device: torch.device) -> torch.Tensor:
+    """int32 [0, n) on ``device``, cut from one buffer grown on demand."""
+    rows = _row_ranges.get(device)
+    if rows is None or rows.numel() < n:
+        rows = torch.arange(n, dtype=torch.int32, device=device)
+        _row_ranges[device] = rows
+    return rows[:n]
+
+
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
@@ -842,8 +875,7 @@ class EngramEmbedding(nn.Module):
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
         self._sort_host_reads = False
-        # Set when the scheduler stages this table's rows (EngramRowPrefetcher).
-        self.host_prefetch = False
+        self.staged_by_scheduler = False
         if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
@@ -883,6 +915,18 @@ class EngramEmbedding(nn.Module):
     @property
     def _shared(self) -> bool:
         return self.host_table is not None and self.host_table.layout == "shared"
+
+    @property
+    def shared_host_table_without_ats(self) -> bool:
+        """The shared host layout, which maps every row in this process, on a GPU
+        without ATS, where the forward reads random host rows slowly."""
+        return self._shared and self._sort_host_reads
+
+    def enable_scheduler_staging(self) -> None:
+        """Read the rows the scheduler stages (EngramRowStager) instead of
+        gathering them in the forward."""
+        assert self.shared_host_table_without_ats
+        self.staged_by_scheduler = True
 
     def _table_ptrs(self) -> tuple[int, int]:
         if self.host_table is None:
@@ -943,22 +987,25 @@ class EngramEmbedding(nn.Module):
         rows: torch.Tensor,
         scales: torch.Tensor,
         copied: torch.cuda.Event,
-        indices: torch.Tensor,
+        hash_shape: torch.Size,
     ) -> torch.Tensor:
-        """Dequantize the rows the scheduler staged for `indices`, in their order.
-        Rows past the staged ones (prefill graph padding) are zero."""
+        """Dequantize the staged rows of this layer's hash ids, in their order, into
+        [*hash_shape, dim]. Rows past the staged ones (prefill graph padding) are
+        zero."""
         stream = torch.cuda.current_stream()
         stream.wait_event(copied)
         rows.record_stream(stream)
         scales.record_stream(stream)
-        out = self._empty(indices)
+        out = torch.empty(
+            *hash_shape, self.dim, dtype=torch.bfloat16, device=rows.device
+        )
         flat = out.view(-1, self.dim)
         n = rows.shape[0]
         assert n <= flat.shape[0], (n, flat.shape)
         engram_gather(
             rows.data_ptr(),
             scales.data_ptr(),
-            torch.arange(n, dtype=torch.int32, device=indices.device),
+            _row_range(n, rows.device),
             flat[:n],
             self.dim,
             FP8_BLOCK_SIZE,
@@ -1131,9 +1178,9 @@ class Engram(nn.Module):
         # The lookup runs first even for an idle DP-attention batch: under DP
         # attention it is a collective every rank has to join.
         if (
-            self.embed.host_prefetch
+            self.embed.staged_by_scheduler
             and forward_batch is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
+            and engram_rows_stageable(forward_batch.forward_mode)
             and is_in_breakable_cuda_graph()
         ):
             # Every replay stages new rows, so the lookup runs between segments.
@@ -1156,9 +1203,11 @@ class Engram(nn.Module):
         cp_all_tokens: bool,
     ) -> torch.Tensor:
         """The rows the scheduler staged for this batch, else the table lookup."""
-        staged = None if forward_batch is None else forward_batch.engram_prefetch
+        staged = None if forward_batch is None else forward_batch.engram_staged_rows
         if staged is not None:
-            return self.embed.dequant_staged(*staged[self.layer_hash_index], hash_ids)
+            return self.embed.dequant_staged(
+                *staged[self.layer_hash_index], hash_ids.shape
+            )
         return self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
 
 

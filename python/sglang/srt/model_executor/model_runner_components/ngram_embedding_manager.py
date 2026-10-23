@@ -16,7 +16,7 @@ from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.layers.engram import EngramHasher
-    from sglang.srt.layers.engram_prefetch import EngramRowPrefetcher
+    from sglang.srt.layers.engram_staging import EngramRowStager
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -28,7 +28,7 @@ class NgramEmbeddingManager:
     n: int
     # Draft runners have no hasher even when their config has engram layers.
     engram_hasher: Optional[EngramHasher] = None
-    engram_prefetcher: Optional[EngramRowPrefetcher] = None
+    engram_stager: Optional[EngramRowStager] = None
 
     @classmethod
     def from_model(
@@ -61,7 +61,7 @@ class NgramEmbeddingManager:
                     module.init_buffers(
                         max_running_requests, chunked_prefill_size, device
                     )
-        engram_hasher = engram_prefetcher = None
+        engram_hasher = engram_stager = None
         if model_config.use_engram:
             from sglang.srt.layers.engram import EngramHasher
 
@@ -71,9 +71,9 @@ class NgramEmbeddingManager:
                     module.init_history(req_to_token_pool.req_to_token.shape[0], device)
                     engram_hasher = module
             if engram_hasher is not None:
-                from sglang.srt.layers.engram_prefetch import EngramRowPrefetcher
+                from sglang.srt.layers.engram_staging import EngramRowStager
 
-                engram_prefetcher = EngramRowPrefetcher.from_model(
+                engram_stager = EngramRowStager.from_model(
                     model, engram_hasher, torch.device(device)
                 )
         return cls(
@@ -81,7 +81,7 @@ class NgramEmbeddingManager:
             table=token_table,
             n=model_config.ngram_embedding_n,
             engram_hasher=engram_hasher,
-            engram_prefetcher=engram_prefetcher,
+            engram_stager=engram_stager,
         )
 
     def update_after_decode(
@@ -125,8 +125,8 @@ class NgramEmbeddingManager:
             return batch
         if self.engram_hasher is not None:
             self._prepare_engram_history(batch)
-        if self.engram_prefetcher is not None:
-            batch.engram_prefetch = self.engram_prefetcher.prefetch(batch)
+        if self.engram_stager is not None:
+            batch.engram_staged_rows = self.engram_stager.stage(batch)
         if not self.enabled:
             return batch
         batch.ne_token_table = self.table
