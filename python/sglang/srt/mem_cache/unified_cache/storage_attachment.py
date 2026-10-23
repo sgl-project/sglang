@@ -45,11 +45,11 @@ class StorageAttachment:
 
     def __init__(self, cache: UnifiedRadixCache):
         self._cache = cache
-        self._cleanup_pending = False
         # Tree unlocks and multi-page release enqueueing are not transactional.
-        # Retain the pre-cleanup records after an exception; replay could unlock
-        # or free already-processed pages twice.
-        self._failed_bookkeeping = None
+        # After an exception the remaining records stay in place and this flag
+        # refuses further lifecycle calls: a replay could unlock or free
+        # already-processed pages twice.
+        self._bookkeeping_corrupted = False
 
     # ---- Lifecycle entry points ----
 
@@ -84,10 +84,8 @@ class StorageAttachment:
                 "launch with --enable-hierarchical-cache to attach a backend.",
             )
 
-        if self._failed_bookkeeping is not None:
+        if self._bookkeeping_corrupted:
             return False, _BOOKKEEPING_RESTART
-        if self._cleanup_pending:
-            return False, "HiCache storage cleanup is pending; retry detach first."
 
         # Write-back can retain auxiliary host rows without FULL, or backed
         # descendants below an unbacked FULL ancestor. Those states are invalid
@@ -122,6 +120,10 @@ class StorageAttachment:
                 "HiCache storage backend already enabled with same backend; "
                 "policies updated.",
             )
+
+        if controller.storage_backend is not None:
+            # Retained by a failed detach or attach rollback; never published.
+            return False, "HiCache storage cleanup is pending; retry detach first."
 
         logger.info(f"Attaching HiCache storage backend: {storage_backend}")
         try:
@@ -169,10 +171,6 @@ class StorageAttachment:
                 storage_backend_extra_config=extra_config,
             )
         except Exception as e:
-            # Failed registration or startup may also fail to stop workers or
-            # close native memory registrations. Track that retained backend
-            # even though the cache has never published enable_storage=True.
-            self._cleanup_pending = controller.storage_backend is not None
             (
                 cache.prefetch_stop_policy,
                 controller.write_policy,
@@ -215,16 +213,14 @@ class StorageAttachment:
         controller = cache.cache_controller
         if controller is None:
             return False, "HiCache storage backend is not initialized."
-        if self._failed_bookkeeping is not None:
+        if self._bookkeeping_corrupted:
             return False, _BOOKKEEPING_RESTART
 
-        self._cleanup_pending = True
-        pending_refs = self._pending_storage_refs()
         try:
             cache.drain_storage_control_queues_local()
         except Exception:
             logger.exception("Failed to drain storage bookkeeping before detach.")
-            self._failed_bookkeeping = pending_refs
+            self._bookkeeping_corrupted = True
             return False, _BOOKKEEPING_RESTART
         try:
             # Idempotent: ask the controller to clean up even when `enable_storage`
@@ -247,10 +243,9 @@ class StorageAttachment:
             cache.drain_storage_control_queues_local()
         except Exception:
             logger.exception("Failed post-detach cleanup of storage bookkeeping.")
-            self._failed_bookkeeping = pending_refs
+            self._bookkeeping_corrupted = True
             return False, _BOOKKEEPING_RESTART
 
-        self._cleanup_pending = False
         return True, "Detached HiCache storage backend successfully."
 
     def shutdown(self) -> None:
@@ -259,12 +254,12 @@ class StorageAttachment:
         Keeps startup and runtime behavior consistent: a backend attached either
         via CLI args or via the admin API is detached on exit.
         """
+        controller = self._cache.cache_controller
         try:
-            if (
-                self._cache.enable_storage
-                or self._cleanup_pending
-                or getattr(self._cache.cache_controller, "storage_backend", None)
-                is not None
+            # A backend retained by a failed detach or attach rollback still
+            # gets a final cleanup attempt even though storage never went live.
+            if self._cache.enable_storage or (
+                controller is not None and controller.storage_backend is not None
             ):
                 self.detach()
         except Exception:
@@ -432,12 +427,6 @@ class StorageAttachment:
             cache.is_write_back = hicache_write_policy == "write_back"
             logger.info(f"Set hicache_write_policy to {hicache_write_policy}")
 
-    def _pending_storage_refs(self):
-        return (
-            dict(getattr(self._cache, "ongoing_prefetch", {})),
-            dict(getattr(self._cache, "ongoing_backup", {})),
-        )
-
     def _release_pending_storage_ops(self) -> None:
         """Release the host pages and locks that still-tracked ops hold.
 
@@ -458,9 +447,8 @@ class StorageAttachment:
         """
         cache = self._cache
         controller = cache.cache_controller
-        if self._failed_bookkeeping is not None:
+        if self._bookkeeping_corrupted:
             raise RuntimeError(_BOOKKEEPING_RESTART)
-        pending_refs = self._pending_storage_refs()
         failures = 0
 
         for handle in list(cache.ongoing_prefetch):
@@ -496,8 +484,7 @@ class StorageAttachment:
                 cache.ongoing_backup.pop(ack_id)
 
         if failures:
-            self._failed_bookkeeping = pending_refs
-            self._cleanup_pending = True
+            self._bookkeeping_corrupted = True
             raise RuntimeError(_BOOKKEEPING_RESTART)
 
         for handle in list(cache._storage_prefetch_hit_remaining_by_reqid):

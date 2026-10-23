@@ -232,8 +232,9 @@ python3 -m sglang.launch_server \
 Dynamic loading does not automatically make a backend compatible with Decode
 Context Parallelism (DCP). For MLA KV storage with DCP, your `HiCacheStorage`
 subclass must declare the capabilities it implements in the class attribute
-`dcp_storage_capabilities` and override the class method
-`validate_dcp_config(storage_config, host_pools)`.
+`dcp_storage_capabilities`, using the `DCP_CAP_*` constants from
+`sglang.srt.mem_cache.hicache_storage`, and may override the class method
+`validate_dcp_config(storage_config, host_pools)` for backend-specific limits.
 
 | Host pools present | Required capability names |
 | --- | --- |

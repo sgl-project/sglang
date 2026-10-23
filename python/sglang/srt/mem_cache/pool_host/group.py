@@ -59,11 +59,15 @@ class HostPoolGroup:
         self.can_use_write_back_jit = all(child_write_back_jit)
         self.supports_per_pool_backup_indices = any(child_write_back_jit)
 
-    def add_entry(self, entry: PoolEntry) -> None:
+    def check_entry(self, entry: PoolEntry) -> None:
+        """Raise if ``add_entry`` would reject ``entry``."""
         if entry.name in self.entry_map:
             raise ValueError(f"Host pool {entry.name} is already registered.")
         if entry.is_primary_index_anchor:
             raise ValueError("Cannot replace the anchor of an existing HostPoolGroup.")
+
+    def add_entry(self, entry: PoolEntry) -> None:
+        self.check_entry(entry)
         self.entries.append(entry)
         self.entry_map[entry.name] = entry
         self._refresh_transfer_capabilities()

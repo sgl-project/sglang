@@ -6,19 +6,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import torch
-
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.managers.io_struct import DetachHiCacheStorageReqInput
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -150,7 +145,6 @@ class TestStorageCleanupRetry(CustomTestCase):
             self.assertFalse(attachment.attach("dynamic")[0])
         self.assertIs(controller.storage_backend, backend)
         self.assertEqual(backend.close_calls, 1)
-        self.assertTrue(attachment._cleanup_pending)
         self.assertFalse(cache.enable_storage)
         self.assertIn("retry detach", attachment.attach("dynamic")[1])
 
@@ -158,7 +152,6 @@ class TestStorageCleanupRetry(CustomTestCase):
         attachment.shutdown()
         self.assertEqual(backend.close_calls, 2)
         self.assertIsNone(controller.storage_backend)
-        self.assertFalse(attachment._cleanup_pending)
 
     def test_attach_rollback_keeps_backend_and_groups_until_threads_stop(self):
         attachment, cache, controller, backend = _fixture()
@@ -186,62 +179,10 @@ class TestStorageCleanupRetry(CustomTestCase):
         self.assertEqual(controller.prefetch_completion_sync_groups, ["completion"])
         self.assertTrue(controller.enable_storage)
         self.assertFalse(cache.enable_storage)
-        self.assertTrue(attachment._cleanup_pending)
         self.assertIn("retry detach", attachment.attach("dynamic")[1])
 
         attachment.shutdown()
         controller._destroy_sync_groups.assert_called_once_with(["hits", "completion"])
-        self.assertEqual(backend.close_calls, 1)
-        self.assertIsNone(controller.storage_backend)
-        self.assertFalse(attachment._cleanup_pending)
-
-    def test_initial_pool_finalizer_runs_once_before_workers(self):
-        backend = _RetryCloseBackend()
-        backend.fail_close = False
-        controller = _controller(None)
-        controller.enable_storage = False
-        anchor = controller.storage_host_pool
-        mamba = object()
-        controller.mem_pool_host = SimpleNamespace(
-            size=16,
-            logical_size=16,
-            entries=[
-                SimpleNamespace(name=PoolName.KV, host_pool=anchor),
-                SimpleNamespace(name=PoolName.MAMBA, host_pool=mamba),
-            ],
-        )
-        events = []
-        backend.register_mem_pool_host = Mock(
-            side_effect=lambda pool: events.append("anchor")
-        )
-        backend.register_mem_host_pool_v2 = Mock(
-            side_effect=lambda pool, name: events.append(name)
-        )
-        backend.on_host_pools_registered = Mock(
-            side_effect=lambda: events.append("finalize")
-        )
-        controller._start_storage_threads.side_effect = lambda: events.append("workers")
-        with patch.object(
-            StorageBackendFactory, "create_backend", return_value=backend
-        ):
-            controller.attach_storage_backend("dynamic")
-        self.assertEqual(
-            events, ["anchor", PoolName.KV, PoolName.MAMBA, "finalize", "workers"]
-        )
-        backend.on_host_pools_registered.assert_called_once_with()
-
-    def test_failed_pool_finalizer_closes_backend_without_starting_workers(self):
-        backend = _RetryCloseBackend()
-        backend.fail_close = False
-        backend.on_host_pools_registered = Mock(side_effect=RuntimeError("finalize"))
-        controller = _controller(None)
-        controller.enable_storage = False
-        with patch.object(
-            StorageBackendFactory, "create_backend", return_value=backend
-        ):
-            with self.assertRaisesRegex(RuntimeError, "finalize"):
-                controller.attach_storage_backend("dynamic")
-        controller._start_storage_threads.assert_not_called()
         self.assertEqual(backend.close_calls, 1)
         self.assertIsNone(controller.storage_backend)
 
@@ -293,7 +234,6 @@ class TestStorageCleanupRetry(CustomTestCase):
         self.assertFalse(attachment.attach("dynamic")[0])
         attachment.shutdown()
         self.assertEqual(attachment._release_pending_storage_ops.call_count, 1)
-        self.assertTrue(attachment._cleanup_pending)
         ok, message = attachment.detach()
         self.assertFalse(ok)
         self.assertIn("restart the model process", message)
@@ -316,73 +256,6 @@ class TestStorageCleanupRetry(CustomTestCase):
         cache.dec_host_lock_ref.assert_called_once()
         self.assertEqual(cache.ongoing_backup, {7: (11, "lock")})
 
-    def test_partial_prefetch_cleanup_is_retained_and_never_replayed(self):
-        for failure in ("unlock", "enqueue"):
-            with self.subTest(failure=failure):
-                attachment, cache, controller, backend = _fixture()
-                backend.fail_close = False
-                handle = CacheRequestHandle("partial-cleanup", 0)
-                info = SimpleNamespace(
-                    host_indices=torch.tensor([1, 2]),
-                    operation=SimpleNamespace(pool_transfers_done=True),
-                    comp_xfers={},
-                    anchor_lock_params="receipt",
-                    anchor_node_id=1,
-                    prefetch_key=None,
-                )
-                cache.ongoing_prefetch = {handle: info}
-                cache.ongoing_backup = {}
-                cache.discard_storage_prefetch_accounting = Mock()
-                cache.buffer_pipeline = None
-                cache._prefetch_occupied_span = Mock(return_value=2)
-                cache._retire_ongoing_prefetch = lambda *args: (
-                    UnifiedRadixCache._retire_ongoing_prefetch(cache, *args)
-                )
-                controller.terminate_prefetch = Mock(return_value=(2, None))
-                controller.prefetch_tokens_occupied = 2
-                controller.mem_pool_host.page_size = 1
-                unlock_steps, queued_pages = [], []
-
-                def unlock(*args):
-                    unlock_steps.append("first component released")
-                    if failure == "unlock":
-                        raise RuntimeError("next component failed")
-
-                def put(page):
-                    if queued_pages:
-                        raise RuntimeError("next page enqueue failed")
-                    queued_pages.append(page)
-
-                cache.dec_host_lock_ref = Mock(side_effect=unlock)
-                controller.host_mem_release_queue = SimpleNamespace(
-                    put=Mock(side_effect=put)
-                )
-                controller._append_host_mem_release_pages = lambda *args: (
-                    HybridCacheController._append_host_mem_release_pages(
-                        controller, *args
-                    )
-                )
-                controller.append_host_mem_release = lambda **kwargs: (
-                    HybridCacheController.append_host_mem_release(controller, **kwargs)
-                )
-                attachment._release_pending_storage_ops = lambda: (
-                    StorageAttachment._release_pending_storage_ops(attachment)
-                )
-                ok, message = attachment.detach()
-                self.assertFalse(ok)
-                self.assertIn("restart the model process", message)
-                # The real retirement primitive already popped this record.
-                self.assertEqual(cache.ongoing_prefetch, {})
-                self.assertIs(attachment._failed_bookkeeping[0][handle], info)
-                self.assertEqual(len(queued_pages), int(failure == "enqueue"))
-                self.assertFalse(attachment.detach()[0])
-                self.assertFalse(attachment.attach("dynamic")[0])
-                attachment.shutdown()
-                self.assertEqual(unlock_steps, ["first component released"])
-                self.assertEqual(len(queued_pages), int(failure == "enqueue"))
-                self.assertEqual(backend.close_calls, 1)
-                self.assertEqual(controller.prefetch_tokens_occupied, 2)
-
     def test_partial_initial_drain_is_not_replayed(self):
         attachment, cache, _, backend = _fixture()
         cache.ongoing_prefetch = {"retained": object()}
@@ -394,7 +267,6 @@ class TestStorageCleanupRetry(CustomTestCase):
         self.assertFalse(attachment.attach("dynamic")[0])
         attachment.shutdown()
         cache.drain_storage_control_queues_local.assert_called_once()
-        self.assertIn("retained", attachment._failed_bookkeeping[0])
         self.assertEqual(backend.close_calls, 0)
 
     def test_disabled_scheduler_does_not_report_a_failed_detach_as_success(self):

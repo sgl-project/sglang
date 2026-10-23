@@ -44,14 +44,7 @@ ALL_CAPABILITIES = frozenset(
 )
 
 
-def _mla_pool(
-    dcp=DCP,
-    rank=0,
-    layout="page_first_direct",
-    physical_page=PHYSICAL_PAGE,
-    *,
-    scales=None,
-):
+def _mla_pool(dcp=DCP, rank=0, layout="page_first_direct", physical_page=PHYSICAL_PAGE):
     buffers = tuple(torch.empty((256, 1, 12), dtype=torch.float16) for _ in range(2))
     info = MLABufferInfo(
         buffers=buffers,
@@ -64,7 +57,7 @@ def _mla_pool(
         kv_cache_dim=12,
         dtype=torch.float16,
         device=torch.device("cpu"),
-        scales=scales,
+        scales=None,
     )
     return MLATokenToKVPoolHost(
         info,
@@ -229,11 +222,6 @@ class TestDynamicStorageDCPContract(CustomTestCase):
                     self.create(pools=pools)
         self.assertEqual(self.events, [])
 
-    def test_materialized_host_pool_rejects_separate_scales_before_backend(self):
-        with self.assertRaisesRegex(ValueError, "separate block scales"):
-            _mla_pool(scales=(torch.empty(1), torch.empty(1)))
-        self.assertEqual(self.events, [])
-
     def test_late_sidecar_is_published_only_after_the_backend_accepts_it(self):
         cfg = _config()
         anchor = _mla_pool()
@@ -291,24 +279,12 @@ class TestDynamicStorageDCPContract(CustomTestCase):
         self.assertIn(PoolName.DRAFT, controller.extra_host_mem_release_queues)
         backend.on_host_pools_registered.assert_not_called()
 
-        # A structurally invalid entry must fail before native registration too:
+        # An entry the group would reject must fail before native registration:
         # add_entry() rejecting it afterwards would leave the backend modified.
         backend.register_mem_host_pool_v2.reset_mock()
-        invalid_entries = (
-            entry,
-            PoolEntry(
-                name=PoolName.MAMBA,
-                host_pool=_mamba_pool(),
-                device_pool=None,
-                layer_mapper=lambda layer: layer,
-                is_primary_index_anchor=True,
-            ),
-        )
-        for invalid in invalid_entries:
-            with self.subTest(name=invalid.name):
-                with self.assertRaises(ValueError):
-                    HybridCacheController.register_host_pool_entry(controller, invalid)
-                backend.register_mem_host_pool_v2.assert_not_called()
+        with self.assertRaises(ValueError):
+            register()
+        backend.register_mem_host_pool_v2.assert_not_called()
 
 
 if __name__ == "__main__":

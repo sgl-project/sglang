@@ -6,6 +6,11 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict
 
 from sglang.srt.mem_cache.hicache_storage import (
+    DCP_CAP_DRAFT_MLA_SHARDED,
+    DCP_CAP_EXACT_RESTORABLE_PREFIX_PAGES,
+    DCP_CAP_LOGICAL_PAGE_INDICES,
+    DCP_CAP_MAMBA_TP_SHARDED,
+    DCP_CAP_MLA_SHARDED,
     HiCacheStorage,
     HiCacheStorageConfig,
     PoolName,
@@ -72,69 +77,74 @@ class StorageBackendFactory:
     ):
         """Check the pool set against the backend before any native client I/O.
 
-        ``backend_class`` is required for the dynamic backend; it is also used
-        when a hybrid controller registers a sidecar after startup.
+        ``backend_class`` is the dynamic backend's class; registered backends
+        are validated by name alone. Also runs when a hybrid controller
+        registers a sidecar after startup.
         """
+        if storage_config.dcp_size > 1:
+            cls._validate_dcp_host_pools(backend_name, storage_config, host_pools)
+        if backend_name == "dynamic":
+            cls._validate_dynamic_backend(backend_class, storage_config, host_pools)
+
+    @staticmethod
+    def _validate_dcp_host_pools(backend_name, storage_config, host_pools):
+        if backend_name not in ("file", "mooncake", "dynamic"):
+            raise NotImplementedError("Backend does not support DCP storage.")
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        anchor = host_pools.get(PoolName.KV)
+        if anchor is None:
+            raise NotImplementedError("DCP storage requires a KV anchor.")
+        mla_pools = {PoolName.KV}
+        if backend_name == "dynamic":
+            mla_pools.add(PoolName.DRAFT)
+        for name, pool in host_pools.items():
+            if name == PoolName.MAMBA:
+                if not isinstance(pool, MambaPoolHost):
+                    raise NotImplementedError("Unsupported DCP storage sidecar.")
+                continue
+            if name not in mla_pools:
+                raise NotImplementedError("Unsupported DCP storage sidecar.")
+            if not isinstance(pool, MLATokenToKVPoolHost) or pool.kv_buffer is None:
+                raise NotImplementedError(
+                    "DCP storage requires materialized MLA pools."
+                )
+            if pool.layout not in ("layer_first", "page_first", "page_first_direct"):
+                raise NotImplementedError(
+                    "DCP storage requires generic MLA page layout."
+                )
+            # Materialized MLA host pools reject separate FP4 scales while
+            # capturing MLABufferInfo; they no longer retain a device_pool.
+            if backend_name == "dynamic" and (
+                pool.dcp_size != storage_config.dcp_size
+                or pool.dcp_rank != storage_config.dcp_rank
+                or pool.logical_page_size != storage_config.logical_page_size
+                or pool.page_size * storage_config.dcp_size != pool.logical_page_size
+                or pool.layout != anchor.layout
+            ):
+                raise NotImplementedError(
+                    "DCP storage pool geometry or layout mismatch."
+                )
+
+    @staticmethod
+    def _validate_dynamic_backend(backend_class, storage_config, host_pools):
         dcp = storage_config.dcp_size > 1
         if dcp:
-            if backend_name not in ("file", "mooncake", "dynamic"):
-                raise NotImplementedError("Backend does not support DCP storage.")
-            from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
-            from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-
-            anchor = host_pools.get(PoolName.KV)
-            if anchor is None:
-                raise NotImplementedError("DCP storage requires a KV anchor.")
-            for name, pool in host_pools.items():
-                if name == PoolName.MAMBA and isinstance(pool, MambaPoolHost):
-                    continue
-                if name != PoolName.KV and not (
-                    backend_name == "dynamic" and name == PoolName.DRAFT
-                ):
-                    raise NotImplementedError("Unsupported DCP storage sidecar.")
-                if not isinstance(pool, MLATokenToKVPoolHost) or pool.kv_buffer is None:
-                    raise NotImplementedError(
-                        "DCP storage requires materialized MLA pools."
-                    )
-                if pool.layout not in (
-                    "layer_first",
-                    "page_first",
-                    "page_first_direct",
-                ):
-                    raise NotImplementedError(
-                        "DCP storage requires generic MLA page layout."
-                    )
-                # Materialized MLA host pools reject separate FP4 scales while
-                # capturing MLABufferInfo; they no longer retain a device_pool.
-                if backend_name == "dynamic" and (
-                    pool.dcp_size != storage_config.dcp_size
-                    or pool.dcp_rank != storage_config.dcp_rank
-                    or pool.logical_page_size != storage_config.logical_page_size
-                    or pool.page_size * storage_config.dcp_size
-                    != pool.logical_page_size
-                    or pool.layout != anchor.layout
-                ):
-                    raise NotImplementedError(
-                        "DCP storage pool geometry or layout mismatch."
-                    )
-            if backend_name == "dynamic" and storage_config.should_split_heads:
-                raise NotImplementedError("DCP storage cannot split attention heads.")
-
-        if backend_name != "dynamic":
-            return
-        capabilities = backend_class.dcp_storage_capabilities
-        if dcp:
-            required = {"mla_sharded", "logical_page_indices"}
+            required = {DCP_CAP_MLA_SHARDED, DCP_CAP_LOGICAL_PAGE_INDICES}
             if PoolName.MAMBA in host_pools:
-                required.update(("mamba_tp_sharded", "exact_restorable_prefix_pages"))
+                required.update(
+                    (DCP_CAP_MAMBA_TP_SHARDED, DCP_CAP_EXACT_RESTORABLE_PREFIX_PAGES)
+                )
             if PoolName.DRAFT in host_pools:
-                required.add("draft_mla_sharded")
-            missing = required - capabilities
+                required.add(DCP_CAP_DRAFT_MLA_SHARDED)
+            missing = required - backend_class.dcp_storage_capabilities
             if missing:
                 raise NotImplementedError(
                     f"Dynamic backend lacks DCP storage capabilities: {sorted(missing)}"
                 )
-        if capabilities or dcp:
+        # Legacy plugins that declare nothing keep their DCP1 path untouched.
+        if dcp or backend_class.dcp_storage_capabilities:
             backend_class.validate_dcp_config(storage_config, host_pools)
 
     @classmethod
@@ -151,7 +161,8 @@ class StorageBackendFactory:
             backend_name: Name of the backend to create
             storage_config: Storage configuration
             mem_pool_host: Memory pool host object
-            storage_host_pools: PoolName -> host pool map; defaults to the KV anchor
+            storage_host_pools: PoolName -> host pool map validated against the
+                backend; defaults to ``{PoolName.KV: mem_pool_host}``
             **kwargs: Additional arguments passed to external backends
         Returns:
             Initialized storage backend instance

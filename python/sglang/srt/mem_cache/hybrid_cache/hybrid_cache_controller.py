@@ -356,10 +356,7 @@ class HybridCacheController(BaseHiCacheController):
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
-        if entry.name in self.mem_pool_host.entry_map:
-            raise ValueError(f"Host pool {entry.name} is already registered.")
-        if entry.is_primary_index_anchor:
-            raise ValueError("Cannot replace the anchor of an existing HostPoolGroup.")
+        self.mem_pool_host.check_entry(entry)
         if self.enable_storage:
             from sglang.srt.mem_cache.storage import StorageBackendFactory
 
