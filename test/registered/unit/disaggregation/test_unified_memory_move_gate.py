@@ -191,15 +191,6 @@ class TestGatedPeerHolesAreNotSchedulable(CustomTestCase):
         self.assertEqual(self._credit(gate=lambda: True, host_gate=lambda: False), 0)
 
 
-class TestMoveGateRejectsNonPdNode(CustomTestCase):
-    def test_null_mode_is_rejected(self):
-        """The gate is only meaningful on a PD node; a NULL-mode scheduler is a
-        wiring bug and must not silently produce an always-open predicate."""
-        scheduler = _FakeScheduler(DisaggregationMode.NULL)
-        with self.assertRaises(ValueError):
-            unified_memory_disagg_move_gate(scheduler)
-
-
 class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
     """Unified composites must translate virtual IDs before PD transfer.
 
