@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4StateHostPool,
     LogicalHostPool,
 )
+from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
@@ -33,6 +34,9 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.page_interleave import (
+    page_interleave_host_pool_cls,
+)
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -186,6 +190,11 @@ def build_kv_host_pool(
             kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
         )
     kwargs = {}
+    if isinstance(kv_pool, PageInterleaveKVPoolMixin):
+        # Transfer descriptors retain the rank's physical buffers; placement
+        # separately narrows logical transfers to that rank's owned rows.
+        kv_host_pool_cls = page_interleave_host_pool_cls(kv_host_pool_cls)
+        kwargs["placement"] = kv_pool.placement
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
@@ -2491,6 +2500,13 @@ def _apply_stack_result(
         cache.register_sidecar_pool(sidecar)
 
     kvcache.register_layer_transfer_counter(result.cache_controller.layer_done_counter)
+    if isinstance(kvcache, PageInterleaveKVPoolMixin):
+        # Packed draft KV and indexer loads finish before target layer zero is
+        # ready. Their independent gather streams must consume that same event.
+        for draft_pool in params.mtp_draft_device_pools:
+            draft_pool.register_layer_transfer_counter(
+                result.cache_controller.layer_done_counter
+            )
     if result.register_req_to_token_counter:
         params.req_to_token_pool.register_layer_transfer_counter(
             result.cache_controller.layer_done_counter

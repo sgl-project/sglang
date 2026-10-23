@@ -4039,7 +4039,8 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
 class TestKvCacheShardingCompatibility(CustomTestCase):
     def setUp(self):
         super().setUp()
-        # Sharding currently requires Python, independent of the default backend.
+        # Sharding requires a rotation-aware backend, independent of the
+        # default backend selection.
         enter_scope(
             self, envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python")
         )
@@ -4175,6 +4176,18 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "does not support --enable-hisparse"):
             handle_kv_cache_sharding(args)
 
+    def test_hicache_host_offload_is_accepted_but_not_storage(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.enable_hierarchical_cache = True
+        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+        args = self._args(
+            enable_hierarchical_cache=True, hicache_storage_backend="file"
+        )
+        with self.assertRaisesRegex(ValueError, "not --hicache-storage-backend"):
+            handle_kv_cache_sharding(args)
+
     def test_incompatible_cache_tree_modes_are_rejected(self):
         cases = (
             ({"radix_cache_backend": "custom"}, "built-in UnifiedRadixCache"),
@@ -4196,9 +4209,19 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     handle_kv_cache_sharding(self._args(**overrides))
 
-    def test_rust_unified_tree_core_is_rejected(self):
-        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
-            with self.assertRaisesRegex(ValueError, "requires the Python"):
+    def test_rust_unified_tree_core_is_accepted(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        with (
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"),
+            envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+        ):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+    def test_unsupported_unified_tree_core_is_rejected(self):
+        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("cpp"):
+            with self.assertRaisesRegex(
+                ValueError, "requires a rotation-aware UnifiedTreeCore"
+            ):
                 handle_kv_cache_sharding(self._args())
 
     def test_rust_tree_core_is_allowed_with_radix_disabled(self):

@@ -1111,6 +1111,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
         return self._binding.rotation_base_of(node_id)
 
+    def rotation_phase_of(self, node_id: NodeId) -> Optional[int]:
+        return self._binding.rotation_phase_of(node_id)
+
     def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
         return self._binding.dfs_weight_order(list(node_ids))
 
