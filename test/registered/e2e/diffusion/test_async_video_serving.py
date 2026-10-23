@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real HTTP/GPU lifecycle regression with a small Wan checkpoint.
 
-CI runs single/batch2 on diffusion partition 0. With two GPUs, pytest also runs
-DP2, Ulysses2, TP2 and CFG2; use ``-k dp2`` to select one topology.
+CI runs on diffusion partition 0. One GPU covers single/batch2; two GPUs also
+cover DP2, Ulysses2, TP2 and CFG2. Use ``-k dp2`` to select one topology.
 """
 
 import hashlib
@@ -25,6 +25,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import terminate_and_kill_process_tree
 
 register_cuda_ci(est_time=180, stage="base-b", runner_config="diffusion-1-gpu-h100")
+register_cuda_ci(est_time=600, stage="base-b", runner_config="diffusion-2-gpu-h100")
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
