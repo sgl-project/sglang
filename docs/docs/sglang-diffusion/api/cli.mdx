@@ -445,6 +445,20 @@ native NVIDIA CUDA serving. It is disabled by default. See
 [Asynchronous output saving](/docs/sglang-diffusion/performance-optimization#asynchronous-output-saving)
 for an example, eligible requests, and the response latency and memory tradeoffs.
 
+### Graceful shutdown
+
+Set `--http-graceful-shutdown-timeout 30` to allow up to 30 seconds for open HTTP
+connections and request tasks to finish after shutdown begins. At the deadline,
+unfinished HTTP tasks are cancelled, including uploads that have not sent their
+complete request body. The default is unset (wait indefinitely); `0` cancels
+outstanding HTTP tasks without waiting.
+
+This controls HTTP draining only, not the full process shutdown time or an
+inference deadline. Application cleanup and GPU worker teardown can take longer;
+allow for them in your orchestrator's termination grace period. It does not make
+asynchronous video jobs durable or guarantee that queued jobs finish before
+shutdown. Use `--scheduler-rpc-timeout` separately to bound scheduler reply waits.
+
 ### Health endpoints
 
 SGLang Diffusion separates process liveness from inference readiness:
