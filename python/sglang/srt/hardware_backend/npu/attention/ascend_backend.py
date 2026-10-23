@@ -818,8 +818,11 @@ class AscendAttnBackend(AttentionBackend):
             total_context_len += self.speculative_num_draft_tokens
         graph_num_pages = total_context_len // self.page_size
         if self.dense_mla_dcp_target:
-            dcp_page_size = self.page_size * self.dcp_size
-            graph_num_pages = (total_context_len + dcp_page_size - 1) // dcp_page_size
+            max_kv_len = self.max_context_len
+            if self.speculative_num_draft_tokens is not None:
+                max_kv_len += self.speculative_num_draft_tokens
+            dcp_cycle_size = self.page_size * self.dcp_size
+            graph_num_pages = (max_kv_len + dcp_cycle_size - 1) // dcp_cycle_size
         self.graph_metadata = {
             "block_tables": torch.empty(
                 (max_bs, graph_num_pages),
