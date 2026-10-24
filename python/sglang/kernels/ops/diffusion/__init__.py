@@ -292,6 +292,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.fused_rmsnorm_interleaved_rope",
+        KernelBackend.CUTE_DSL,
+        "rope.rmsnorm_interleaved_rope_cutedsl:fused_rmsnorm_interleaved_rope_",
+        _CUDA_SM90_PLUS,
+    ),
+    (
         "diffusion.vsa_block_sparse_sm100",
         KernelBackend.JIT,
         "attention.vsa_block_sparse_sm100_jit:vsa_block_sparse_sm100",
@@ -761,6 +767,8 @@ _EXPORTS: dict[str, str] = {
     "fused_ltx25_decoder_rope": "rope.ltx25_decoder_rope_jit",
     "can_use_fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
     "fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",
+    "can_use_fused_rmsnorm_interleaved_rope": "rope.rmsnorm_interleaved_rope_cutedsl",
+    "fused_rmsnorm_interleaved_rope_": "rope.rmsnorm_interleaved_rope_cutedsl",
     "fused_qknorm_rope_pack_kv": "rope.qknorm_rope_jit",
     "try_fused_qwen_qkv_epilogue": "rope.qwen_qkv_epilogue_jit",
     "can_use_fused_rope_rotate_half_fp32": "rope.rope_rotate_half_fp32",
