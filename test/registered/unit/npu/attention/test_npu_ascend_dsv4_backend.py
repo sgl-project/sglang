@@ -23,6 +23,7 @@ for mod in (
     "sgl_kernel_npu.norm",
     "sgl_kernel_npu.norm.add_rmsnorm_bias",
     "sglang.srt.speculative",
+    "sglang.srt.speculative.ragged_verify",
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
     "sglang.srt.speculative.eagle_info",
@@ -55,6 +56,17 @@ def _per_step_draft_out_cache_loc(out_cache_loc, batch_size, topk, num_steps):
 _eagle_stub.per_step_draft_out_cache_loc = _per_step_draft_out_cache_loc
 sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculative"))
 sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
+
+def _resolve_ragged_verify_layout(forward_batch):
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is None:
+        return None
+    return spec_info.ragged_verify_layout
+
+
+sys.modules[
+    "sglang.srt.speculative.ragged_verify"
+].resolve_ragged_verify_layout.side_effect = _resolve_ragged_verify_layout
 
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     C4IndexerAscendBackendMixin,
