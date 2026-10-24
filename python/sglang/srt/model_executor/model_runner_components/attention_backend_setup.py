@@ -11,6 +11,9 @@ from sglang.srt.layers.attention.attention_registry import (
     attn_backend_wrapper,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.model_executor.model_runner_components.misc_utils import (
+    supports_pp_aux_hidden_relay,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import init_cublas
 
@@ -45,12 +48,24 @@ def configure_aux_hidden_state_capture(
     dflash_use_aux_hidden_state: bool,
     dflash_target_layer_ids,
     is_dspark: bool,
+    pp_size: int,
 ) -> None:
     """Configure auxiliary hidden state capture for speculative decoding.
 
     Must be called before CUDA graph capture so the captured graphs
     include aux hidden state output paths.
     """
+    if (
+        pp_size > 1
+        and eagle_use_aux_hidden_state
+        and not supports_pp_aux_hidden_relay(model)
+    ):
+        # Capture layers on earlier stages would be dropped, and the draft
+        # would silently read an incomplete aux feature on the last stage.
+        raise ValueError(
+            f"Model {model.__class__.__name__} does not relay aux hidden states "
+            f"across pipeline stages, which EAGLE3 needs under pp_size={pp_size}."
+        )
     if eagle_use_aux_hidden_state:
         model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
     if dflash_use_aux_hidden_state:

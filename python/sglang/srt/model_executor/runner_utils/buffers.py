@@ -73,7 +73,7 @@ def allocate_pp_proxy_tensors(
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
-    pp_proxy_dspark_hidden_size: int = 0,
+    pp_proxy_aux_hidden_size: int = 0,
 ) -> Dict[str, torch.Tensor]:
     """Allocate the stable buffers consumed by an incoming PP proxy."""
     is_mhc = hc_hidden_size is not None
@@ -96,9 +96,9 @@ def allocate_pp_proxy_tensors(
         pp_proxy_tensors["topk_indices"] = torch.zeros(
             (max_num_tokens, pp_proxy_topk_size), dtype=torch.int32
         )
-    if pp_proxy_dspark_hidden_size:
-        pp_proxy_tensors["dspark_hidden_states"] = torch.zeros(
-            (max_num_tokens, pp_proxy_dspark_hidden_size), dtype=dtype
+    if pp_proxy_aux_hidden_size:
+        pp_proxy_tensors["aux_hidden_states"] = torch.zeros(
+            (max_num_tokens, pp_proxy_aux_hidden_size), dtype=dtype
         )
     return pp_proxy_tensors
 
@@ -151,7 +151,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
-        pp_proxy_dspark_hidden_size: int = 0,
+        pp_proxy_aux_hidden_size: int = 0,
         aux_hidden_states_width: int = 0,
     ) -> DecodeInputBuffers:
         with torch.device(device):
@@ -195,7 +195,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     hc_hidden_size=hc_hidden_size,
                     pp_proxy_topk_size=pp_proxy_topk_size,
                     pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
-                    pp_proxy_dspark_hidden_size=pp_proxy_dspark_hidden_size,
+                    pp_proxy_aux_hidden_size=pp_proxy_aux_hidden_size,
                 )
                 if pp_size > 1
                 else None
@@ -300,7 +300,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
-        pp_proxy_dspark_hidden_size: int = 0,
+        pp_proxy_aux_hidden_size: int = 0,
     ) -> PrefillInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_tokens,), dtype=torch.int64)
@@ -343,7 +343,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
                     hc_hidden_size=hc_hidden_size,
                     pp_proxy_topk_size=pp_proxy_topk_size,
                     pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
-                    pp_proxy_dspark_hidden_size=pp_proxy_dspark_hidden_size,
+                    pp_proxy_aux_hidden_size=pp_proxy_aux_hidden_size,
                 )
                 if pp_size > 1 and not is_first_pp_rank
                 else None

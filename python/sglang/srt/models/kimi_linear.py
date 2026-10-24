@@ -726,9 +726,9 @@ class KimiLinearModel(nn.Module):
         if (
             self.dspark_layers_to_capture is not None
             and not self.pp_group.is_first_rank
-            and "dspark_hidden_states" in pp_proxy_tensors.tensors
+            and "aux_hidden_states" in pp_proxy_tensors.tensors
         ):
-            aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
+            aux_hidden_states.append(pp_proxy_tensors["aux_hidden_states"])
         for i in range(self.start_layer, self.end_layer):
             ctx = get_global_expert_distribution_recorder().with_current_layer(i)
             with ctx:
@@ -749,7 +749,7 @@ class KimiLinearModel(nn.Module):
         if not self.pp_group.is_last_rank:
             proxy = residual_batch.to_pp(hidden_states, forward_batch)
             if aux_hidden_states:
-                proxy.tensors["dspark_hidden_states"] = torch.cat(
+                proxy.tensors["aux_hidden_states"] = torch.cat(
                     aux_hidden_states, dim=-1
                 )
             return proxy
@@ -794,7 +794,7 @@ class KimiLinearForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
-    def get_pp_proxy_dspark_hidden_size(self) -> int:
+    def get_pp_proxy_aux_hidden_size(self) -> int:
         layers = self.model.dspark_layers_to_capture or []
         return self.config.hidden_size * sum(
             layer < self.model.start_layer for layer in layers

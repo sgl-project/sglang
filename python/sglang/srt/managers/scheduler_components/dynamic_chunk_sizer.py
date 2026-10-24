@@ -214,6 +214,9 @@ class DynamicChunkSizer:
                     pp_proxy_residual_num_blocks=(
                         model_runner.get_pp_proxy_residual_num_blocks()
                     ),
+                    pp_proxy_aux_hidden_size=(
+                        model_runner.get_pp_proxy_aux_hidden_size()
+                    ),
                 )
 
             pp_proxy = PPProxyTensors(proxy_tensors)

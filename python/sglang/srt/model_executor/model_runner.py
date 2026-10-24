@@ -841,10 +841,10 @@ class ModelRunner:
 
             enable_batch_invariant_mode()
 
-    def get_pp_proxy_dspark_hidden_size(self) -> int:
+    def get_pp_proxy_aux_hidden_size(self) -> int:
         # Graph recapture reaches this outside the draft PP scope, so read the
         # runner's own PP group.
-        return misc_utils.resolve_pp_proxy_dspark_hidden_size(
+        return misc_utils.resolve_pp_proxy_aux_hidden_size(
             model=self.model,
             pp_size=self.pp_group.world_size,
             pp_rank=self.pp_group.rank_in_group,
@@ -1104,6 +1104,7 @@ class ModelRunner:
             dflash_use_aux_hidden_state=self.spec_aux_config.dflash_use_aux_hidden_state,
             dflash_target_layer_ids=self.spec_aux_config.dflash_target_layer_ids,
             is_dspark=self.spec_algorithm.is_dspark(),
+            pp_size=self.pp_group.world_size,
         )
         # Resolve before building: backends read the pair off the runner while
         # they construct (the FlashInfer KV-access check).
