@@ -121,18 +121,18 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
 
     @staticmethod
     def _truncate_rollout_schedule(batch: Req) -> None:
+        from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
+            truncate_rollout_sigmas,
+        )
+
         stop_step_index = batch.rollout_stop_step_index
         if not batch.rollout or stop_step_index is None:
             return
         sigmas = batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY]
-        num_steps = len(sigmas["video"]) - 1
-        if not 0 <= stop_step_index < num_steps:
-            raise ValueError(
-                f"rollout_stop_step_index must be in [0, {num_steps}), got {stop_step_index}"
-            )
-        end = stop_step_index + 1
         for modality in ("video", "audio"):
-            sigmas[modality] = sigmas[modality][:end] + sigmas[modality][-1:]
+            sigmas[modality] = truncate_rollout_sigmas(
+                sigmas[modality], stop_step_index=stop_step_index
+            )
 
     @staticmethod
     def _publish_native_timestep_state(batch: Req) -> None:
