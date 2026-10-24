@@ -264,6 +264,32 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     return backend
 
 
+def swa_gates_tree_prefix_match(token_to_kv_pool, token_to_kv_pool_allocator) -> bool:
+    # SWA the tree does not own must not gate prefix matching: a per-request ring,
+    # paged SWA beside the target's encoder-replay request window (only the draft
+    # uses it), or a PD decode that re-transfers the whole SWA tail.
+    return not (
+        is_swa_req_ring(token_to_kv_pool_allocator)
+        or (
+            isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            and token_to_kv_pool.request_window is not None
+        )
+        or (
+            get_disagg().disaggregation_mode == "decode"
+            and uses_swa_tail_prealloc(token_to_kv_pool, token_to_kv_pool_allocator)
+        )
+    )
+
+
+def uses_swa_tail_prealloc(token_to_kv_pool, token_to_kv_pool_allocator) -> bool:
+    """Whether PD decode allocates a fresh SWA tail that prefill always transfers."""
+    return (
+        isinstance(token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
+        and token_to_kv_pool_allocator.page_size > 1
+        and hasattr(token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+    )
+
+
 def validate_decode_radix_cache(
     *,
     model_config: ModelConfig,
@@ -349,15 +375,8 @@ def build_kv_cache(
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
-    # SWA the tree does not own must not gate prefix matching: a per-request ring,
-    # or paged SWA beside the target's encoder-replay request window, which then
-    # only the draft uses.
-    swa_gates_prefix_match = not (
-        is_swa_req_ring(token_to_kv_pool_allocator)
-        or (
-            isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-            and token_to_kv_pool.request_window is not None
-        )
+    swa_gates_prefix_match = swa_gates_tree_prefix_match(
+        token_to_kv_pool, token_to_kv_pool_allocator
     )
 
     retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
