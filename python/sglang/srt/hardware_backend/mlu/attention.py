@@ -1,5 +1,3 @@
-# Copyright (c) 2026 Cambricon Technologies Co., Ltd.
-# Licensed under the Apache License, Version 2.0.
 """BF16 paged GQA attention for Cambricon MLUs.
 
 Uses the vendor flash kernel for ragged prefill (including cached prefixes and
