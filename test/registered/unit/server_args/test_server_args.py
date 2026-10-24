@@ -137,21 +137,21 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             (95, "disable_attn_tp_gather"),
             (96, "enable_p2p_check"),
             (97, "device"),
-            (535, "grpc_response_timeout_secs"),
-            (536, "enable_paged_experts"),
-            (537, "paged_experts_num_resident"),
-            (538, "enable_nvidia_megakernel"),
-            (539, "enable_megamoe_for_layernorm_sp"),
+            (537, "grpc_response_timeout_secs"),
+            (538, "enable_paged_experts"),
+            (539, "paged_experts_num_resident"),
+            (540, "enable_nvidia_megakernel"),
+            (541, "enable_megamoe_for_layernorm_sp"),
         ):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
         # Surviving legacy inputs retain their slots after an intentional removal.
-        positional = [getattr(defaults, field.name) for field in fields[:536]]
+        positional = [getattr(defaults, field.name) for field in fields[:538]]
         positional[95] = True
         positional[96] = False
         positional[97] = "cpu"
-        positional[535] = 123.0
+        positional[537] = 123.0
 
         args = ServerArgs(*positional)
 
