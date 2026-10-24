@@ -933,6 +933,16 @@ class Envs:
     SGLANG_MORI_MOE_MAX_INPUT_TOKENS = EnvInt(0)
 
     # ===================================================================
+    # Mono: fused whole-layer decode kernels (--layer-backend mono)
+    # ===================================================================
+    # Debugging only: the first SGLANG_MONO_CHECK_STEPS eager mono steps also run
+    # every routed layer's module path and log the max |diff| against it.
+    SGLANG_MONO_CHECK = EnvBool(False)
+    SGLANG_MONO_CHECK_STEPS = EnvInt(4)
+    # Tests / benchmarks only: log a mono kernel's error words and keep serving.
+    SGLANG_MONO_UNSAFE_WARN = EnvBool(False)
+
+    # ===================================================================
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
@@ -957,6 +967,11 @@ class Envs:
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
+    # Use AITER block selection for supported gfx950 FP8 index caches.
+    SGLANG_M3_USE_AITER_INDEXER = EnvBool(True)
+    SGLANG_M3_USE_AITER_PREFILL_INDEXER = EnvBool(True)
+    # Use page16 SHUFFLE KV with AITER sparse attention on supported gfx950 pools.
+    SGLANG_M3_USE_AITER_SPARSE_PA = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
