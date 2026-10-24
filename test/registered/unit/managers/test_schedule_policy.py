@@ -2,9 +2,12 @@ import unittest
 from array import array
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -229,6 +232,52 @@ class TestShortestPrefillFirst(CustomTestCase):
                 ]
                 held = schedule_policy._compute_prefix_matches(queue, policy)
                 self.assertEqual(held, {"short"})
+
+    def test_cached_request_is_not_a_dedupe_candidate(self):
+        # A request whose cache hit is past the check threshold (32 tokens) takes
+        # no part in the dedupe, so the cold request that shares only the cached
+        # 32 tokens with it runs: holding it would save no prefill.
+        cached = list(range(64))
+        for policy in (
+            CacheAwarePolicy.SHORTEST_PREFILL_FIRST,
+            CacheAwarePolicy.LPM,
+            CacheAwarePolicy.HRRN,
+        ):
+            with self.subTest(policy=policy):
+                tree_cache = RadixCache.create_simulated()
+                tree_cache.insert(
+                    InsertParams(
+                        key=RadixKey(token_ids=array("q", cached)),
+                        value=torch.arange(len(cached)),
+                    )
+                )
+                schedule_policy = SchedulePolicy(
+                    policy=policy.value,
+                    tree_cache=tree_cache,
+                    enable_hierarchical_cache=True,
+                    enable_priority_scheduling=False,
+                    schedule_low_priority_values_first=False,
+                )
+                queue = [
+                    _make_req("warm", "", cached + list(range(1000, 1016))),
+                    _make_req("cold", "", cached[:32] + list(range(2000, 2400))),
+                ]
+                held = schedule_policy._compute_prefix_matches(queue, policy)
+                self.assertEqual([req.prefix_len for req in queue], [64, 32])
+                self.assertEqual(held, set())
+
+    def test_shared_prefix_group_counts_retracted_output_as_work(self):
+        # A retracted request prefills its output again, so with 1,000 retracted
+        # output tokens it is the longer member of its group and the one held,
+        # although its prompt is the shorter one.
+        shared = list(range(32))
+        retracted = _make_req("retracted", "", shared + list(range(1000, 1100)))
+        retracted.output_ids.extend(range(3000, 4000))
+        fresh = _make_req("fresh", "", shared + list(range(5000, 5500)))
+        held = self.policy._compute_prefix_matches(
+            [retracted, fresh], CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        )
+        self.assertEqual(held, {"retracted"})
 
     def test_retracted_output_is_part_of_uncached_work(self):
         replay = self.make_req("replay", 16, cached=1024)
