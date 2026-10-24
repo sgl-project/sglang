@@ -313,6 +313,65 @@ class TestKVCRStorage(CustomTestCase):
         self.stub.start()
         self.addCleanup(self.stub.stop)
 
+    def test_confirmed_mamba_boundary_is_not_shortened_by_host_capacity(self):
+        """A full-boundary Mamba claim cannot validate a smaller KV staging cut.
+
+        Under host pressure the smaller boundary may lack a checkpoint, as in
+        the unsalted GLM-5.3-Flash AgentX replay. Decline that partial hit;
+        ordinary non-trailing KV hits may still use partial staging.
+        """
+        controller = object.__new__(HybridCacheController)
+        controller.storage_backend = self.backend
+        controller.page_size = 2
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=SimpleNamespace(host_pool=self.pool),
+            available_size=lambda: 8,
+        )
+        partial_indices = torch.arange(8)
+
+        def allocate(_operation, tokens):
+            return partial_indices if tokens == 8 else None
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller."
+                "uses_shared_host_layout",
+                return_value=False,
+            ),
+            patch.object(
+                controller, "alloc_prefetch_host_buffers", side_effect=allocate
+            ),
+        ):
+            trailing = SimpleNamespace(
+                pool_transfers=[
+                    PoolTransfer(
+                        PoolName.MAMBA,
+                        keys=["checkpoint"],
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    )
+                ]
+            )
+            indices, span = controller.allocate_storage_hit(
+                trailing,
+                12,
+                allow_partial=True,
+                min_tokens=2,
+                evict_host=lambda _tokens: 0,
+            )
+            self.assertIsNone(indices)
+            self.assertEqual(span, 12)
+
+            ordinary = SimpleNamespace(pool_transfers=[])
+            indices, span = controller.allocate_storage_hit(
+                ordinary,
+                12,
+                allow_partial=True,
+                min_tokens=2,
+                evict_host=lambda _tokens: 0,
+            )
+            self.assertIs(indices, partial_indices)
+            self.assertEqual(span, 8)
+
     def test_whole_page_components_round_trip_to_different_slots(self):
         """A restore must move every unequal-sized component, not only primary KV."""
         for part, buffer in enumerate(self.pool.buffers):
@@ -672,6 +731,8 @@ class TestKVCRStorage(CustomTestCase):
     def test_advisory_mamba_hint_requires_source_checkpoint_and_held_copy(self):
         """A logical-page hint must not admit absent Mamba, and a confirmed
         checkpoint must survive source removal until host delivery completes.
+        A cancelled queued delivery must still release that held checkpoint.
+        Failed rank consensus must not leave a confirmed checkpoint claimed.
         """
         self.backend._runner = None
         source_pools = {
@@ -840,6 +901,21 @@ class TestKVCRStorage(CustomTestCase):
         self.assertFalse(transport.claims)
         self.assertFalse(reader._lookup_claims)
 
+        # Cancellation after enqueue still reaches the IO worker. It must
+        # release the source-backed claim even though no pool is delivered.
+        cancelled, confirmed = submit(4)
+        self.assertEqual(confirmed, 4)
+        cancelled.hash_value = hashes[:2]
+        cancelled.host_indices = torch.arange(8, 12)
+        controller.enqueue_prefetch_transfer(cancelled)
+        self.assertEqual(len(transport.claims), 1)
+        cancelled.mark_terminate()
+        reads_before = len(transport.reads)
+        controller._page_transfer(cancelled)
+        self.assertEqual(len(transport.reads), reads_before)
+        self.assertFalse(transport.claims)
+        self.assertFalse(reader._lookup_claims)
+
         # A rank that lacks the same trailing-pool requirement must not let
         # another rank admit the advisory boundary without confirmation.
         fetches_before = len(transport.fetches)
@@ -860,6 +936,20 @@ class TestKVCRStorage(CustomTestCase):
         self.assertEqual(confirmed, 0)
         self.assertEqual(failed.query_pool_hit_pages[PoolName.MAMBA], 0)
         self.assertFalse(transport.claims)
+
+        def fail_after_checkpoint_fetch(tensor, *_args, **_kwargs):
+            if tensor.numel() == 2 and transport.claims:
+                raise RuntimeError("rank consensus failed after Mamba fetch")
+
+        with (
+            patch.object(
+                controller, "_all_reduce", side_effect=fail_after_checkpoint_fetch
+            ),
+            self.assertRaisesRegex(RuntimeError, "rank consensus failed"),
+        ):
+            submit(4)
+        self.assertFalse(transport.claims)
+        self.assertFalse(reader._lookup_claims)
 
     def test_invalid_startup_budget_is_rejected_before_registration(self):
         """An invalid optional deadline must not reach native registration."""

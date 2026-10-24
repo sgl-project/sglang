@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -943,6 +944,61 @@ class TestPPPrefetchTicket(CustomTestCase):
                 self.submit(rid)
             with self.assertRaisesRegex(RuntimeError, "ticket thread exited"):
                 c.is_pp_prefetch_ready(rid)
+
+    def test_command_abort_releases_confirmed_unqueued_mamba_claim(self):
+        """A failure after checkpoint confirmation must not strand the source
+        claim when PP preparation aborts before host delivery is enqueued.
+        """
+        c = self.c
+        c.storage_backend.requires_lookup_confirmation = True
+        claims = set()
+        confirmed = []
+
+        def query_with_boundary(operation):
+            hashes, hit_count = self.query_hits(operation)
+            operation.pool_storage_result.restorable_prefix_pages = [1, 2]
+            return hashes, hit_count
+
+        def confirm(_keys, _transfers, _pages, _extra_info, scope):
+            confirmed.append(scope)
+            claims.add(scope)
+            return True
+
+        def allocate(_ticket, operation):
+            operation.host_indices = torch.arange(8)
+            return True
+
+        c._storage_hit_query.side_effect = query_with_boundary
+        c.storage_backend.confirm_lookup.side_effect = confirm
+        c.storage_backend.release_lookup.side_effect = claims.discard
+        with (
+            patch.object(c, "_allocate_pp_prefetch_buffers", side_effect=allocate),
+            patch.object(
+                c,
+                "_resolve_sidecar_kv_derived_pool_transfers",
+                side_effect=RuntimeError("pre-enqueue preparation failed"),
+            ),
+            patch(
+                f"{HybridCacheController.__module__}.broadcast_pyobj",
+                side_effect=lambda objects, *args, **kwargs: objects,
+            ),
+            self.assertLogs(level="ERROR"),
+        ):
+            operation = self.submit(
+                pools=[
+                    PoolTransfer(
+                        PoolName.MAMBA,
+                        keys=["checkpoint"],
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    )
+                ]
+            ).operation
+            c.pp_prefetch_command_thread_func()
+
+        self.assertEqual(confirmed, [operation.storage_lookup_scope])
+        self.assertFalse(claims)
+        self.assertFalse(operation.storage_transfer_enqueued)
+        self.assertTrue(c.prefetch_buffer.empty())
 
     def test_idle_source_broadcasts_empty_then_processes_ticket_and_stop(self):
         c = self.c

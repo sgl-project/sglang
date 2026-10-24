@@ -814,6 +814,12 @@ class HybridCacheController(BaseHiCacheController):
         min_tokens: int,
         evict_host: Callable[[int], int],
     ) -> tuple[Optional[torch.Tensor], int]:
+        if self._needs_lookup_confirmation(operation):
+            # The source claim covers the confirmed checkpoint boundary only.
+            # A shorter KV allocation would move a trailing Mamba/SWA read to
+            # an unconfirmed key. Decline instead of fetching that key and
+            # treating a KV-only partial hit as restorable.
+            allow_partial = False
         host_indices = self.alloc_prefetch_host_buffers(operation, hit_tokens)
         shared = uses_shared_host_layout(self.mem_pool_host.anchor_entry.host_pool)
         if host_indices is None and not shared:
@@ -1298,6 +1304,7 @@ class HybridCacheController(BaseHiCacheController):
 
         while True:
             objects = []
+            operation = None
             if is_source:
                 try:
                     objects = [self.pp_prefetch_command_queue.get(timeout=60)]
@@ -1389,6 +1396,13 @@ class HybridCacheController(BaseHiCacheController):
                 self.enqueue_prefetch_transfer(operation)
             except Exception:
                 logger.exception("PP HiCache ticket processing failed.")
+                if operation is not None:
+                    try:
+                        self.release_unqueued_prefetch_claims(operation)
+                    except Exception:
+                        logger.exception(
+                            "PP HiCache source checkpoint claim cleanup failed."
+                        )
                 # Query/allocation failures already follow the agreed ACK path.
                 # An unexpected failure cannot safely continue the collectives.
                 return
@@ -1610,11 +1624,17 @@ class HybridCacheController(BaseHiCacheController):
                         int(not local_error),
                     ]
                 )
-                self._all_reduce(
-                    accepted,
-                    torch.distributed.ReduceOp.MIN,
-                    self.prefetch_hits_sync_groups,
-                )
+                try:
+                    self._all_reduce(
+                        accepted,
+                        torch.distributed.ReduceOp.MIN,
+                        self.prefetch_hits_sync_groups,
+                    )
+                except Exception:
+                    # This boundary was not safely agreed across ranks. A
+                    # local fetch may already hold a checkpoint claim.
+                    self._release_lookup_claims(operation)
+                    raise
                 if not accepted[1].item():
                     break
                 if accepted[0].item():
