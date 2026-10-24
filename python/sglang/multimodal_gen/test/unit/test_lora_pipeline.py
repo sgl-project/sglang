@@ -1,10 +1,13 @@
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from prometheus_client import CollectorRegistry
 
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
@@ -18,6 +21,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
+from sglang.multimodal_gen.runtime.post_training.weights_updater import WeightsUpdater
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
 _RANK_PATCH = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline.dist.get_rank"
@@ -267,6 +271,36 @@ def test_merged_lora_still_uses_weight_update_context():
     assert pipeline.is_lora_merged["transformer"]
 
 
+def test_ipc_lora_sync_updates_pipeline_state():
+    """After an IPC LoRA sync, set_lora must reapply and unmerge must restore base."""
+    layer = _make_layer()
+    base_weight = layer.base_layer.weight.detach().clone()
+    pipeline = _make_pipeline(layer)
+    pipeline.server_args.lora_merge_mode = "merge"
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora(
+            "adapter", "/adapter", target="transformer", merge_mode="merge"
+        )
+    synced = [
+        ("linear.lora_A", torch.full((1, 2), 3.0)),
+        ("linear.lora_B", torch.ones(2, 1)),
+    ]
+    ok, message = WeightsUpdater(pipeline).update_weights_from_tensor(
+        {"transformer": synced}, weight_update_mode="lora_merge"
+    )
+    assert ok, message
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora(
+            "adapter", "/adapter", target="transformer", merge_mode="merge"
+        )
+    torch.testing.assert_close(layer.base_layer.weight, base_weight + 1)
+
+    pipeline.unmerge_lora_weights()
+    torch.testing.assert_close(layer.base_layer.weight, base_weight)
+
+
 def test_lora_alpha_override_updates_cached_adapter_scale():
     layer = _make_layer()
     pipeline = _make_pipeline(layer)
@@ -284,6 +318,43 @@ def test_lora_alpha_override_updates_cached_adapter_scale():
     assert pipeline.loaded_adapter_alphas["adapter"] == 8
     assert layer.lora_rank == 1
     assert layer.lora_alpha == 8
+
+
+def _rank0_download_fails(rank, init_method):
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=2,
+        init_method=init_method,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        pipeline = _make_pipeline(_make_layer())
+        pipeline.server_args.lora_path = None
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline.maybe_download_lora",
+                side_effect=(
+                    OSError("404 org/typo")
+                    if rank == 0
+                    else AssertionError("rank 1 must not download")
+                ),
+            ),
+            pytest.raises(OSError if rank == 0 else RuntimeError, match="404 org/typo"),
+        ):
+            pipeline.load_lora_adapter("org/typo", "typo", rank=rank)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_rank0_download_failure_raises_on_every_rank(tmp_path):
+    """A failed rank-0 LoRA download must fail every rank, not hang the others."""
+    mp.spawn(
+        _rank0_download_fails,
+        args=(f"file://{tmp_path / 'rendezvous'}",),
+        nprocs=2,
+        join=True,
+    )
 
 
 def test_lora_tree_url_selects_one_pinned_weight(tmp_path):
