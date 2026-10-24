@@ -1099,6 +1099,8 @@ class Envs:
     SGLANG_MLX_CLEAR_CACHE_STEPS = EnvInt(256)
     # MLX buffer-cache cap in GB.
     SGLANG_MLX_CACHE_LIMIT_GB = EnvFloat(None)
+    # Log MLX active, cache, and peak memory at request lifecycle points.
+    SGLANG_MLX_MEMORY_LOG = EnvBool(False)
 
     # ===================================================================
     # Ascend NPU

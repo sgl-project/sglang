@@ -131,6 +131,7 @@ class MlxTpModelWorker(TpModelWorker):
         if not self._mlx_pool_initialized:
             self._mlx_runner.init_cache_pools(self._model_runner.req_to_token_pool)
             self._mlx_pool_initialized = True
+            self._mlx_runner.log_memory("startup")
 
     def forward_batch_generation(
         self,
