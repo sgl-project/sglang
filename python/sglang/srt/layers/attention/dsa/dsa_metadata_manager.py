@@ -252,6 +252,9 @@ class DSAMetadataManagementMixin:
             # `src_backend` must have run the full recompute path for this bs
             # in this replay, so its derived buffers are fresh.
             or src_backend.forward_metadata is not src_metadata
+            # The copy below skips the token-level paged MQA schedule, which
+            # only KPool (index_kpool > 1) leaves unbuilt.
+            or self.needs_paged_mqa_schedule
             or not self._sibling_replay_metadata_compatible(metadata, src_metadata)
         ):
             self.init_forward_metadata_replay_cuda_graph_from_precomputed(
@@ -262,22 +265,9 @@ class DSAMetadataManagementMixin:
         self.set_dsa_prefill_impl(forward_batch=None)
         self._copy_base_replay_buffers(bs, metadata, precomputed, forward_mode)
 
-        if is_cuda():
-            if metadata.paged_mqa_schedule_metadata is not None:
-                metadata.paged_mqa_schedule_metadata.copy_(
-                    src_metadata.paged_mqa_schedule_metadata
-                )
-            if metadata.topk_v2_plan is not None:
-                metadata.topk_v2_plan.copy_(src_metadata.topk_v2_plan)
-            # Decode: the 2D ctx lens are a (bs, 1) view of this backend's own
-            # cache_seqlens_int32 (just refreshed by the base copy above); keep
-            # the exact refresh the recompute path performs -- it is a single
-            # small view/copy, not part of the duplicated derived work.
-            seqlens_32_2d = metadata.cache_seqlens_int32.contiguous().view(bs, 1)
-            if metadata.paged_mqa_ctx_lens_2d is None:
-                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
-            else:
-                metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+        # KPool-only path, so there is no token-level paged MQA schedule to copy.
+        if is_cuda() and metadata.topk_v2_plan is not None:
+            metadata.topk_v2_plan.copy_(src_metadata.topk_v2_plan)
 
         self._copy_kpool_metadata_from_sibling(metadata, src_metadata)
 

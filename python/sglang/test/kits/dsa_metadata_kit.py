@@ -35,6 +35,7 @@ def make_backend(mode, seq, req, *, fusion=True):
     backend.physical_page_size = 64
     backend.dsa_index_topk = TOPK
     backend.dsa_index_kpool = POOL
+    backend.needs_paged_mqa_schedule = POOL <= 1
     backend.speculative_num_draft_tokens = NEXT_N
     backend.dsa_drop_wide_page_table = False
     backend.dsa_decode_impl = "fa3"
@@ -88,6 +89,12 @@ def tensor_buffers(metadata):
             if isinstance(value, torch.Tensor):
                 result["kpool." + field.name] = value
     return result
+
+
+def assert_no_token_level_schedule(test, metadata):
+    # IndexerKPool reads only the pooled schedule, so KPool never builds these.
+    test.assertIsNone(metadata.paged_mqa_schedule_metadata)
+    test.assertIsNone(metadata.paged_mqa_ctx_lens_2d)
 
 
 def addresses(metadata):
