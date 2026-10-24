@@ -762,6 +762,79 @@ class TestQwen3_5Gate(_FusionGateCase):
             )
 
 
+class _StubExperts(torch.nn.Module):
+    def __init__(self, **kwargs):
+        super().__init__()
+
+
+class TestQwen2MoeSharedExpertUnderDwdp(_FusionGateCase):
+    """DWDP feeds the MoE block DP-local tokens and sums nothing after the
+    experts. A shared expert sharded over TP then adds only its partial output
+    on each rank, and a fused shared slot keeps the 1/ep_size weight meant for
+    an all-reduce that never runs, so the block needs a replicated, unfused
+    shared expert."""
+
+    def _block(self, dwdp_size, **kwargs):
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+        from sglang.srt.models import qwen2_moe
+        from sglang.srt.runtime_context import get_flags
+
+        self._seed()
+        config = SimpleNamespace(
+            model_type="qwen3_next",
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            hidden_size=8,
+            moe_intermediate_size=8,
+            shared_expert_intermediate_size=8,
+            hidden_act="silu",
+        )
+        with (
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE),
+            # DWDP's layout: DP attention, MoE EP over the whole TP group.
+            get_parallel().override(
+                tp_size=2,
+                tp_rank=1,
+                attn_tp_size=1,
+                attn_tp_rank=0,
+                attn_dp_size=2,
+                attn_dp_rank=1,
+                attn_cp_size=1,
+                moe_ep_size=2,
+                moe_ep_rank=1,
+                moe_tp_size=1,
+                moe_tp_rank=0,
+                moe_dp_size=1,
+                dwdp_size=dwdp_size,
+            ),
+            unittest.mock.patch.object(
+                qwen2_moe, "get_moe_impl_class", lambda quant_config: _StubExperts
+            ),
+            # Shared-expert fusion is a CUDA path.
+            unittest.mock.patch.object(qwen2_moe, "_is_cuda", True),
+        ):
+            return qwen2_moe.Qwen2MoeSparseMoeBlock(layer_id=0, config=config, **kwargs)
+
+    def test_dwdp_replicates_the_shared_expert(self):
+        # gate_up_proj holds 2 x 8 rows in full, half of them on a TP2 shard.
+        for dwdp_size, rows in ((2, 16), (1, 8)):
+            with self.subTest(dwdp_size=dwdp_size):
+                block = self._block(dwdp_size)
+                self.assertEqual(block.shared_expert.gate_up_proj.weight.shape[0], rows)
+
+    def test_dwdp_keeps_the_shared_expert_out_of_the_fused_moe(self):
+        for dwdp_size, fused in ((2, 0), (1, 1)):
+            with self.subTest(dwdp_size=dwdp_size):
+                block = self._block(
+                    dwdp_size,
+                    support_shared_expert_fusion=True,
+                    enable_cuda_shared_expert_fusion=True,
+                )
+                self.assertEqual(block.num_fused_shared_experts, fused)
+                self.assertEqual(block.shared_expert is None, fused == 1)
+
+
 class TestWrapperEntryClassGates(_FusionGateCase):
     """Wrapper gates must use the config and quantization of their nested model."""
 
