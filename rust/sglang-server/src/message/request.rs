@@ -311,7 +311,9 @@ pub fn into_requests(
         bootstrap_hosts,
         bootstrap_ports,
         bootstrap_rooms,
-    } = normalize_bootstrap_columns(bootstrap_host, bootstrap_port, bootstrap_room, n)?;
+        // The native API rejects `n > 1` in `sampling.rs`, so one choice per
+        // prompt; the OpenAI endpoints pass their per-choice count instead.
+    } = normalize_bootstrap_columns(bootstrap_host, bootstrap_port, bootstrap_room, n, 1)?;
     let bootstrap_pair_keys = flatten_column(fan_out(bootstrap_pair_key, n, "bootstrap_pair_key")?);
     let decode_tp_sizes = flatten_column(fan_out(decode_tp_size, n, "decode_tp_size")?);
     // Python `_normalize_extra_key` / `_normalize_cache_salt`: one key
@@ -918,29 +920,91 @@ pub(crate) struct BootstrapColumns {
 }
 
 /// Normalize native and OpenAI bootstrap fields after wire decoding.
-/// Missing values and null elements stay unset; lists must match the prompt count.
-/// Scalars broadcast, except rooms advance once per prompt.
+///
+/// Columns are indexed per engine request — `prompt_count * choices_per_prompt`
+/// entries in Python's sample-major flat order (`flat = choice * prompt_count +
+/// prompt`; `GenerateReqInput._normalize_bootstrap_params` over
+/// `num = batch_size * parallel_sample_num`). Missing values and null elements
+/// stay unset. Scalars broadcast to every request, except a scalar room, which
+/// advances once per request. Lists are per prompt (shared by that prompt's
+/// choices) when their length is `prompt_count`, or one room per request when
+/// their length is the full per-choice count — the PD router injects the latter
+/// for chat `n > 1` (`get_chat_batch_size` returns `n`).
 pub(crate) fn normalize_bootstrap_columns(
     hosts: Option<OneOrMany<Option<String>>>,
     ports: Option<OneOrMany<Option<i64>>>,
     rooms: Option<OneOrMany<Option<i64>>>,
     prompt_count: usize,
+    choices_per_prompt: usize,
 ) -> Result<BootstrapColumns, Error> {
-    let bootstrap_hosts = flatten_column(fan_out(hosts, prompt_count, "bootstrap_host")?);
-    let bootstrap_ports = flatten_column(fan_out(ports, prompt_count, "bootstrap_port")?);
+    let bootstrap_hosts =
+        expand_bootstrap_column(hosts, "bootstrap_host", prompt_count, choices_per_prompt)?;
+    let bootstrap_ports =
+        expand_bootstrap_column(ports, "bootstrap_port", prompt_count, choices_per_prompt)?;
     let bootstrap_rooms = match rooms {
         // Wrapping preserves distinct pairing keys at the i64 boundary;
         // saturating would make multiple requests share a room.
-        Some(OneOrMany::One(Some(room))) => (0..prompt_count)
+        Some(OneOrMany::One(Some(room))) => (0..prompt_count * choices_per_prompt)
             .map(|i| Some(room.wrapping_add(i as i64)))
             .collect(),
-        other => flatten_column(fan_out(other, prompt_count, "bootstrap_room")?),
+        other => {
+            expand_bootstrap_column(other, "bootstrap_room", prompt_count, choices_per_prompt)?
+        }
     };
     Ok(BootstrapColumns {
         bootstrap_hosts,
         bootstrap_ports,
         bootstrap_rooms,
     })
+}
+
+/// Expand one bootstrap column over the full per-choice request set, matching
+/// Python `_normalize_bootstrap_params` (`num = batch_size * n`, flat
+/// sample-major). A scalar broadcasts; a `prompt_count`-element list is per
+/// prompt (each prompt's choices share it — Python replicates the list `× n`);
+/// a `num`-element list passes through one value per request.
+fn expand_bootstrap_column<I: OneOrManyItem + Clone + Default + HeapBytes>(
+    value: Option<OneOrMany<I>>,
+    name: &str,
+    prompt_count: usize,
+    choices_per_prompt: usize,
+) -> Result<Vec<I>, Error> {
+    let num = prompt_count * choices_per_prompt;
+    let column = match value {
+        None => vec![I::default(); num],
+        Some(OneOrMany::One(value)) => vec![value; num],
+        Some(OneOrMany::Many(values)) => {
+            if values.len() == prompt_count {
+                // Per prompt: flat % prompt_count is the prompt index.
+                (0..num)
+                    .map(|flat| values[flat % prompt_count].clone())
+                    .collect()
+            } else if values.len() == num {
+                // One value per engine request, already in flat order.
+                values
+            } else {
+                return Err(Error::Validation(format!(
+                    "{name} list length {} matches neither the prompt count \
+                     ({prompt_count}) nor the per-choice count ({num} = {prompt_count} \
+                     prompts x {choices_per_prompt} choices)",
+                    values.len(),
+                )));
+            }
+        }
+    };
+    // The handlers clone each column entry into one engine request; bound the
+    // total like `fan_out` bounds a scalar broadcast (`check_broadcast_budget`).
+    if num > 1 {
+        let bytes: usize = column.iter().map(HeapBytes::heap_bytes).sum();
+        if bytes > MAX_BROADCAST_CLONE_BYTES {
+            return Err(Error::Validation(format!(
+                "{name} ({bytes} bytes) broadcast to {num} requests would allocate \
+                 more than the {MAX_BROADCAST_CLONE_BYTES}-byte limit; send a shorter \
+                 {name} or a smaller batch"
+            )));
+        }
+    }
+    Ok(column)
 }
 
 #[cfg(test)]
@@ -1580,5 +1644,57 @@ mod tests {
         assert_eq!(ps[0].bootstrap_host.as_deref(), Some("2.2.2.2"));
         assert_eq!(ps[0].bootstrap_room, Some(0));
         assert_eq!(ps[0].routed_dp_rank, Some(0));
+    }
+
+    /// The OpenAI endpoints pass their per-choice count: a scalar room fans
+    /// out over prompts × choices (one room per engine request, Python's
+    /// sample-major flat order), a full-length list passes through, a
+    /// per-prompt list is shared by each prompt's choices, and any other
+    /// length is a validation error.
+    #[test]
+    fn bootstrap_columns_expand_across_choices() {
+        let rooms = Some(OneOrMany::One(Some(100_i64)));
+        let columns = normalize_bootstrap_columns(None, None, rooms, 2, 3).unwrap();
+        assert_eq!(
+            columns.bootstrap_rooms,
+            vec![
+                Some(100),
+                Some(101),
+                Some(102),
+                Some(103),
+                Some(104),
+                Some(105)
+            ]
+        );
+
+        let hosts = Some(OneOrMany::One(Some("h".to_owned())));
+        let columns = normalize_bootstrap_columns(hosts, None, None, 2, 2).unwrap();
+        assert_eq!(
+            columns.bootstrap_hosts,
+            vec![
+                Some("h".to_owned()),
+                Some("h".to_owned()),
+                Some("h".to_owned()),
+                Some("h".to_owned())
+            ]
+        );
+        assert_eq!(columns.bootstrap_ports, vec![None; 4]);
+
+        let rooms = Some(OneOrMany::Many(vec![Some(10), Some(11), Some(12)]));
+        let columns = normalize_bootstrap_columns(None, None, rooms, 1, 3).unwrap();
+        assert_eq!(columns.bootstrap_rooms, vec![Some(10), Some(11), Some(12)]);
+
+        let rooms = Some(OneOrMany::Many(vec![Some(10), Some(11)]));
+        let columns = normalize_bootstrap_columns(None, None, rooms, 2, 2).unwrap();
+        assert_eq!(
+            columns.bootstrap_rooms,
+            vec![Some(10), Some(11), Some(10), Some(11)]
+        );
+
+        let rooms = Some(OneOrMany::Many(vec![Some(1), Some(2), Some(3)]));
+        let error = normalize_bootstrap_columns(None, None, rooms, 2, 2)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(error.to_string().contains("bootstrap_room"), "{error}");
     }
 }

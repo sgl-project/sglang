@@ -173,10 +173,11 @@ async fn chat_completions(
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
-    // Chat normalizes one prompt, so each bootstrap column has one entry.
-    let bootstrap_host = &routing.bootstrap.bootstrap_hosts[0];
-    let bootstrap_port = routing.bootstrap.bootstrap_ports[0];
-    let bootstrap_room = routing.bootstrap.bootstrap_rooms[0];
+    // Chat renders one prompt, so the bootstrap columns carry one entry per
+    // choice (Python's flat order degenerates to the choice index).
+    let bootstrap_host = &routing.bootstrap.bootstrap_hosts;
+    let bootstrap_ports = &routing.bootstrap.bootstrap_ports;
+    let bootstrap_rooms = &routing.bootstrap.bootstrap_rooms;
     let want_logprobs = request.logprobs.unwrap_or(false);
     let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
     let stream_tool_choice = request.tool_choice.clone();
@@ -215,9 +216,9 @@ async fn chat_completions(
             logprob_start_len: -1,
             top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
             return_text_in_logprobs: want_logprobs.then_some(true),
-            bootstrap_host: bootstrap_host.clone(),
-            bootstrap_port,
-            bootstrap_room,
+            bootstrap_host: bootstrap_host[index].clone(),
+            bootstrap_port: bootstrap_ports[index],
+            bootstrap_room: bootstrap_rooms[index],
             routed_dp_rank: routing.routed_dp_rank,
             disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
             ..Default::default()
@@ -1323,5 +1324,82 @@ mod tests {
             }
             responder.await.unwrap();
         }
+    }
+
+    /// The PD router sizes chat bootstrap lists by `n` (`get_chat_batch_size`
+    /// returns `n`), so chat `n > 1` arrives with an n-element `bootstrap_room`
+    /// list. Each choice must take its own room — a list-length check against
+    /// the prompt count 400'd every routed `n > 1` chat request.
+    #[tokio::test]
+    async fn chat_n_uses_one_bootstrap_room_per_choice() {
+        use super::super::test_utils::{body_json, post_json};
+        use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+        use crate::message::config::ServerArgs;
+        use crate::message::request::RequestKind;
+        use crate::tokenizer_manager::wiring::TmEvent;
+        use std::sync::Arc;
+
+        let args = Arc::new(ServerArgs {
+            served_model_name: "model".into(),
+            ..Default::default()
+        });
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let core = CoreHandle::new(
+            intake_tx,
+            flume::unbounded().0,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+                metadata: CoreMetadata::from(args.as_ref()),
+            },
+        );
+        let chatml = super::super::template::builtin_template("chatml").unwrap();
+        let state = Arc::new(super::super::AppState {
+            core,
+            server_args: args,
+            chat_formatter: Some(super::super::ChatFormatter::Legacy(Box::new(
+                super::super::template::LegacyFormatter { spec: chatml },
+            ))),
+        });
+        let responder = tokio::spawn(async move {
+            let mut rooms = Vec::new();
+            for _ in 0..2 {
+                let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected generation intake");
+                };
+                assert!(admission.try_accept());
+                let RequestKind::Generate(generate) = &request.kind else {
+                    panic!("expected generation");
+                };
+                rooms.push(generate.bootstrap_room);
+                request
+                    .sink
+                    .try_send(chunk(request.rid.as_str(), "Paris", true))
+                    .unwrap();
+            }
+            rooms
+        });
+        let response = post_json(
+            super::super::routes().with_state(state),
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "n": 2,
+                "bootstrap_host": "prefill-a",
+                "bootstrap_port": 8998,
+                "bootstrap_room": [101, 102],
+            }),
+        )
+        .await;
+        let body = body_json(response).await;
+        assert_eq!(body["choices"][0]["message"]["content"], "Paris", "{body}");
+        assert_eq!(body["choices"].as_array().map(Vec::len), Some(2), "{body}");
+        // The router's room list maps one room per choice, in order.
+        assert_eq!(responder.await.unwrap(), vec![Some(101), Some(102)]);
     }
 }

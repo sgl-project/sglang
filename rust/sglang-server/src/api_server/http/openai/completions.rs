@@ -154,10 +154,6 @@ async fn completions(
     let mut submitted = Vec::with_capacity(choice_count);
 
     for (prompt_index, prompt) in prompts.into_iter().enumerate() {
-        // Normalized routing is indexed by prompt, not by choice.
-        let bootstrap_host = &routing.bootstrap.bootstrap_hosts[prompt_index];
-        let bootstrap_port = routing.bootstrap.bootstrap_ports[prompt_index];
-        let bootstrap_room = routing.bootstrap.bootstrap_rooms[prompt_index];
         let (text, input_ids, mut prompt_echo) = match prompt {
             PromptSpec::Text(text) => {
                 let prompt_echo = if echo { text.clone() } else { String::new() };
@@ -167,6 +163,10 @@ async fn completions(
         };
         for sample_index in 0..choices_per_prompt {
             let index = prompt_index * choices_per_prompt + sample_index;
+            // Normalized routing is indexed per engine request in Python's
+            // sample-major flat order (`flat = sample * prompt_count + prompt`),
+            // not by the prompt-major response choice index.
+            let flat = sample_index * prompt_count + prompt_index;
             let rid = Rid::from_client(&format!("{response_id}-{index}"));
             if echo
                 && sample_index == 0
@@ -191,9 +191,9 @@ async fn completions(
                 },
                 top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
                 return_text_in_logprobs: request.logprobs.map(|_| true),
-                bootstrap_host: bootstrap_host.clone(),
-                bootstrap_port,
-                bootstrap_room,
+                bootstrap_host: routing.bootstrap.bootstrap_hosts[flat].clone(),
+                bootstrap_port: routing.bootstrap.bootstrap_ports[flat],
+                bootstrap_room: routing.bootstrap.bootstrap_rooms[flat],
                 routed_dp_rank: routing.routed_dp_rank,
                 disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
                 ..Default::default()
@@ -856,5 +856,84 @@ mod tests {
         assert_eq!(usage["usage"]["prompt_tokens"], 5);
         assert_eq!(usage["usage"]["completion_tokens"], 2);
         assert_eq!(frames[3], "[DONE]");
+    }
+
+    /// A scalar room fans out to one room per engine request in Python's
+    /// sample-major flat order (`room + flat`, `flat = choice * prompt_count +
+    /// prompt`), so every choice of a mixed Rust/Python prefill-decode pair
+    /// rendezvous instead of choices `1..n` timing out on a room the other
+    /// leg never created.
+    #[tokio::test]
+    async fn completions_scalar_room_fans_one_room_per_choice() {
+        use super::super::test_utils::{body_json, post_json};
+        use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+        use crate::message::config::ServerArgs;
+        use crate::message::request::RequestKind;
+        use crate::tokenizer_manager::wiring::TmEvent;
+        use std::sync::Arc;
+
+        let args = Arc::new(ServerArgs {
+            served_model_name: "model".into(),
+            ..Default::default()
+        });
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let core = CoreHandle::new(
+            intake_tx,
+            flume::unbounded().0,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+                metadata: CoreMetadata::from(args.as_ref()),
+            },
+        );
+        let state = Arc::new(super::super::AppState {
+            core,
+            server_args: args,
+            chat_formatter: None,
+        });
+        let responder = tokio::spawn(async move {
+            let mut rooms = Vec::new();
+            for _ in 0..4 {
+                let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected generation intake");
+                };
+                assert!(admission.try_accept());
+                let RequestKind::Generate(generate) = &request.kind else {
+                    panic!("expected generation");
+                };
+                rooms.push(generate.bootstrap_room);
+                request
+                    .sink
+                    .try_send(chunk(request.rid.as_str(), "x", true))
+                    .unwrap();
+            }
+            rooms
+        });
+        let response = post_json(
+            super::super::routes().with_state(state),
+            "/v1/completions",
+            serde_json::json!({
+                "model": "model",
+                "prompt": ["a", "b"],
+                "n": 2,
+                "max_tokens": 5,
+                "bootstrap_host": "prefill-a",
+                "bootstrap_port": 8998,
+                "bootstrap_room": 100,
+            }),
+        )
+        .await;
+        let body = body_json(response).await;
+        assert_eq!(body["choices"].as_array().map(Vec::len), Some(4), "{body}");
+        // Submission is prompt-major (p0c0, p0c1, p1c0, p1c1); rooms follow
+        // Python's sample-major numbering: flat = choice * 2 + prompt.
+        assert_eq!(
+            responder.await.unwrap(),
+            vec![Some(100), Some(102), Some(101), Some(103)]
+        );
     }
 }
