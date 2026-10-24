@@ -1020,6 +1020,13 @@ class ModelRunner:
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
             return
+        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+        if is_qwen_qsa(self.model_config.hf_config):
+            # QSA's pool owns a static host tier and needs no swap-in
+            # coordinator; `enable_hisparse` still sizes the logical capacity.
+            self.hisparse_coordinator = None
+            return
         from sglang.srt.managers.hisparse_coordinator import (
             HiSparseCoordinator,
             resolve_shared_index_layers,

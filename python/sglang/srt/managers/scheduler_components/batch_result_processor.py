@@ -124,7 +124,10 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                if get_memory().enable_hisparse:
+                if (
+                    get_memory().enable_hisparse
+                    and self.hisparse_coordinator is not None
+                ):
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache, checkpoint=True)
 
@@ -380,7 +383,10 @@ class SchedulerBatchResultProcessor:
                         if discard_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
-                        if get_memory().enable_hisparse:
+                        if (
+                            get_memory().enable_hisparse
+                            and self.hisparse_coordinator is not None
+                        ):
                             self.hisparse_coordinator.request_finished(req)
                         if batch.decoding_reqs and req in batch.decoding_reqs:
                             self._prepare_kv_cache_release(req)
@@ -392,7 +398,10 @@ class SchedulerBatchResultProcessor:
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         checkpoint_kv_cache(req, self.tree_cache)
-                        if get_memory().enable_hisparse:
+                        if (
+                            get_memory().enable_hisparse
+                            and self.hisparse_coordinator is not None
+                        ):
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
                     if discard_finish_reason is None:
@@ -1360,7 +1369,7 @@ class SchedulerBatchResultProcessor:
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.finalize_release_on_finish(req)
         else:
-            if get_memory().enable_hisparse:
+            if get_memory().enable_hisparse and self.hisparse_coordinator is not None:
                 self.hisparse_coordinator.request_finished(req)
             self._prepare_kv_cache_release(req)
             release_kv_cache(req, self.tree_cache, checkpoint=False)
@@ -1447,7 +1456,10 @@ class SchedulerBatchResultProcessor:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                if get_memory().enable_hisparse:
+                if (
+                    get_memory().enable_hisparse
+                    and self.hisparse_coordinator is not None
+                ):
                     self.hisparse_coordinator.request_finished(req)
                 self._prepare_kv_cache_release(req)
                 checkpoint = (

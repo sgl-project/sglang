@@ -527,6 +527,14 @@ class Scheduler(
         # Init model configs
         self.init_model_config()
 
+        # Qwen4-Exp QSA has no HiSparseCoordinator: its pool keeps a static
+        # host tier, so the scheduler must keep the plain batch path.
+        if self.enable_hisparse:
+            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+            if is_qwen_qsa(self.model_config.hf_config):
+                self.enable_hisparse = False
+
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
 

@@ -33,6 +33,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache = kvcache
         self._size_full = size * host_to_device_ratio
         self._size_hisparse = size
+        # QSA (P0): the pool owns a pinned host tier and a static resident
+        # window, so this allocator only hands out logical slots and never
+        # allocates device pages.  Without a coordinator nothing would ever
+        # swap, so device slots are addressed by the window mask instead.
+        self.host_tier_only = bool(getattr(kvcache, "is_hisparse_qsa", False))
         self.compress_ratio = 1
         self.dtype = dtype
         self.device = device
@@ -111,6 +116,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._size_full
 
     def available_size(self) -> int:
+        if self.host_tier_only:
+            # No device pages are handed out; the logical space is the limit.
+            return self.logical_attn_allocator.available_size()
         return min(
             self.logical_attn_allocator.available_size(),
             self.hisparse_attn_allocator.available_size(),
@@ -129,6 +137,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         logical_indices = self.logical_attn_allocator.alloc(need_size)
         if logical_indices is None:
             return None
+        if self.host_tier_only:
+            return logical_indices
 
         hisparse_indices = self.hisparse_attn_allocator.alloc(need_size)
         if hisparse_indices is None:
@@ -217,6 +227,20 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
         )
+        if self.host_tier_only:
+            if (
+                num_new_pages
+                > self.logical_attn_allocator.available_size() // self.page_size
+            ):
+                return None
+            return self.logical_attn_allocator.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+            )
         if (
             num_new_pages
             > self.logical_attn_allocator.available_size() // self.page_size
@@ -288,6 +312,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
         self.logical_attn_allocator.free(free_index)
+        if self.host_tier_only:
+            return
         self.free_hisparse(free_index)
         assert (
             self.logical_attn_allocator.available_size()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -387,8 +388,23 @@ class KVCacheConfigurator:
             return max_total_num_tokens
         # Target rows widen into attn_dcp_size ids; draft sizes already carry
         # loc_space_scale.
+        # HiSparse QSA: `max_total_num_tokens` is only the resident device
+        # window; requests are admitted against the logical pool, which is
+        # host_to_device_ratio times larger.  Without this the admission cap
+        # (max_req_input_len) is stuck at the device window and every prompt
+        # longer than it is refused.
+        hisparse_ratio = 1
+        if get_memory().enable_hisparse:
+            from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            if is_qwen_qsa(self.model_config.hf_config):
+                hisparse_ratio = parse_hisparse_config().host_to_device_ratio
         return (
-            max_total_num_tokens * get_parallel().attn_dcp_size // self.loc_space_scale
+            max_total_num_tokens
+            * hisparse_ratio
+            * get_parallel().attn_dcp_size
+            // self.loc_space_scale
         )
 
     def _resolve_kv_shard(self) -> None:
@@ -2630,6 +2646,27 @@ class KVCacheConfigurator:
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
                 qsa_indexer_dtype=resolve_qsa_indexer_dtype(qsa_indexer_dtype),
             )
+            if get_memory().enable_hisparse:
+                # QSA keeps the full-attention K/V in a pinned host tier and a
+                # static resident window; the indexer caches stay device
+                # resident and only grow their slot space with the ratio.
+                from sglang.srt.mem_cache.hisparse_memory_pool import (
+                    HiSparseMHAMainPool,
+                )
+                from sglang.srt.mem_cache.qsa_kv_pool import (
+                    HiSparseQSATokenToKVPool,
+                )
+                from sglang.srt.mem_cache.sparsity.factory import (
+                    parse_hisparse_config,
+                )
+
+                hisparse_cfg = parse_hisparse_config()
+                pool_class = HiSparseQSATokenToKVPool
+                full_pool_class = HiSparseMHAMainPool
+                extra_args.update(
+                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                    resident_tokens=_qsa_hisparse_resident_tokens(),
+                )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
@@ -3414,3 +3451,22 @@ def calculate_mla_kv_cache_dim(
         )
 
     return kv_cache_dim
+
+
+def _qsa_hisparse_resident_tokens() -> int | None:
+    """P0 residency window for the QSA host tier.
+
+    ``SGLANG_QSA_HISPARSE_RESIDENT_TOKENS`` sets how many leading logical slots
+    stay device resident (identity-mapped).  Unset keeps every device slot
+    resident, which is the no-op wiring baseline; ``0`` keeps the whole K/V on
+    the host tier (the P0 milestone configuration).
+    """
+    raw = os.environ.get("SGLANG_QSA_HISPARSE_RESIDENT_TOKENS")
+    if raw is None or raw == "":
+        return None
+    value = int(raw)
+    if value < 0:
+        raise ValueError(
+            f"SGLANG_QSA_HISPARSE_RESIDENT_TOKENS must be >= 0, got {value}"
+        )
+    return value

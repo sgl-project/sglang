@@ -1349,17 +1349,33 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _supports_fused_kv_pool(pool):
-        if type(pool) in (HybridLinearKVPool, QSATokenToKVPool):
+        if isinstance(pool, (HybridLinearKVPool, QSATokenToKVPool)):
             storage = pool.full_kv_pool
-        elif type(pool) is MHATokenToKVPool:
+        elif isinstance(pool, MHATokenToKVPool):
             storage = pool
         else:
             return False
         return (
-            type(storage) is MHATokenToKVPool
+            isinstance(storage, MHATokenToKVPool)
             and not storage.is_quantized_kv_cache
             and storage.dtype in (torch.bfloat16, torch.float8_e4m3fn)
         )
+
+    def _hisparse_tier_kwargs(self, layer) -> dict:
+        """Host-tier pointers for the QSA HiSparse pool, empty otherwise.
+
+        The three read kernels take ``host_k``/``host_v``/``resident_tokens``;
+        a slot below ``resident_tokens`` is read from the device tier at the
+        same row, everything else from the pinned host copy.
+        """
+        pool = self.token_to_kv_pool
+        if not getattr(pool, "is_hisparse_qsa", False):
+            return {}
+        return {
+            "host_k": pool.get_host_key_buffer(layer.layer_id),
+            "host_v": pool.get_host_value_buffer(layer.layer_id),
+            "resident_tokens": pool.hisparse_resident_tokens,
+        }
 
     def _can_defer_block_expansion(self, forward_mode):
         return (
@@ -1549,6 +1565,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             total_k=sum(sequence_lens),
             max_k=max(sequence_lens, default=1),
             output_dtype=q.dtype,
+            **self._hisparse_tier_kwargs(layer),
         )
         output = sparse_gqa_fwd_interface_triton_ck(
             q.contiguous(),
@@ -1804,6 +1821,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 ),
                 # trtllm_decode reads each row only up to valid_counts.
                 visible_page_size=page,
+                **self._hisparse_tier_kwargs(layer),
             )
         else:
             qwen_sparse_valid_counts_triton(
@@ -1826,6 +1844,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 batch,
                 topk,
                 zero_fill_cols=stride,
+                **self._hisparse_tier_kwargs(layer),
             )
         num_kv_heads = k_buffer.shape[1]
         head_dim = k_buffer.shape[2]
@@ -1972,6 +1991,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             packed_v,
             batch,
             topk,
+            **self._hisparse_tier_kwargs(layer),
         )
         if is_hip():
             relative_indices = torch.arange(

@@ -294,6 +294,10 @@ def _pack_qsa_prefill_kv(
     TOTAL_K,
     BS,
     COMPACT: tl.constexpr,
+    HK,
+    HV,
+    RW,
+    HOST: tl.constexpr,
 ):
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     token = offsets // (HEADS * DIM)
@@ -323,14 +327,43 @@ def _pack_qsa_prefill_kv(
     head = offsets // DIM % HEADS
     dim = offsets % DIM
     slot = tl.load(req_to_token + req * SR0 + token * SR1, valid, 0).to(tl.int64)
-    keys = tl.load(k + slot * SK0 + head * SK1 + dim * SK2, valid, 0.0)
-    values = tl.load(v + slot * SV0 + head * SV1 + dim * SV2, valid, 0.0)
+    if HOST:
+        # Same logical->device translation as the decode kernels: slots
+        # outside the resident window are read from the pinned host tier.
+        dslot = tl.where((slot > 0) & (slot < RW), slot, -1)
+        dev = valid & (dslot > 0)
+        hos = valid & (dslot <= 0)
+        ko = head * SK1 + dim * SK2
+        keys = tl.where(
+            dev,
+            tl.load(k + dslot * SK0 + ko, dev, 0.0),
+            tl.load(HK + slot * SK0 + ko, hos, 0.0),
+        )
+        values = tl.where(
+            dev,
+            tl.load(v + dslot * SV0 + ko, dev, 0.0),
+            tl.load(HV + slot * SV0 + ko, hos, 0.0),
+        )
+    else:
+        keys = tl.load(k + slot * SK0 + head * SK1 + dim * SK2, valid, 0.0)
+        values = tl.load(v + slot * SV0 + head * SV1 + dim * SV2, valid, 0.0)
     tl.store(packed_k + dst, keys, valid)
     tl.store(packed_v + dst, values, valid)
 
 
 def pack_qsa_prefill_kv(
-    *, k, v, req_to_token, req_indices, cu_k, total_k, max_k, output_dtype=None
+    *,
+    k,
+    v,
+    req_to_token,
+    req_indices,
+    cu_k,
+    total_k,
+    max_k,
+    output_dtype=None,
+    host_k=None,
+    host_v=None,
+    resident_tokens=0,
 ):
     heads, dim = k.shape[1:]
     packed_k = torch.empty(
@@ -366,6 +399,10 @@ def pack_qsa_prefill_kv(
         TOTAL_K=total_k,
         BS=batch_size,
         COMPACT=compact,
+        HK=host_k if host_k is not None else k,
+        HV=host_v if host_v is not None else v,
+        RW=resident_tokens,
+        HOST=host_k is not None,
     )
     return packed_k, packed_v
 
@@ -548,6 +585,10 @@ def _compact_kv(
     BLOCK_TOPK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     ZERO_FILL: tl.constexpr,
+    HK,
+    HV,
+    RW,
+    HOST: tl.constexpr,
 ):
     batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -566,7 +607,11 @@ def _compact_kv(
     # 64-bit element offsets: slot * heads * dim exceeds int32 once the pool holds
     # more than 2^31 / (heads * dim) tokens (~4.2M for 2 x 256), which an FP8 pool
     # on one GPU does reach.
-    src = slots.to(tl.int64)[:, None] * heads * dim + head * dim + dims[None, :]
+    if HOST:
+        dslot = tl.where((slots > 0) & (slots < RW), slots, -1)
+    else:
+        dslot = slots
+    src = dslot.to(tl.int64)[:, None] * heads * dim + head * dim + dims[None, :]
     dst = (
         (pack_start + cols).to(tl.int64)[:, None] * heads * dim
         + head * dim
@@ -586,16 +631,35 @@ def _compact_kv(
     # without per-tensor k/v scales (see set_kv_buffer calls in
     # qwen_sparse_attn_backend.py), so no scale is applied here either.
     out_dtype = out_k.dtype.element_ty
-    tl.store(
-        out_k + dst,
-        tl.load(k + src, mask=load_mask, other=0.0).to(out_dtype),
-        mask=store_mask,
-    )
-    tl.store(
-        out_v + dst,
-        tl.load(v + src, mask=load_mask, other=0.0).to(out_dtype),
-        mask=store_mask,
-    )
+    if HOST:
+        # Slots outside the resident window are gathered from the pinned host
+        # tier (zero-copy); the logical id indexes the host rows directly.
+        hsrc = slots.to(tl.int64)[:, None] * heads * dim + head * dim + dims[None, :]
+        dev_mask = load_mask & (dslot > 0)[:, None]
+        host_mask = load_mask & (dslot <= 0)[:, None]
+        k_vals = tl.where(
+            dev_mask,
+            tl.load(k + src, mask=dev_mask, other=0.0),
+            tl.load(HK + hsrc, mask=host_mask, other=0.0),
+        )
+        v_vals = tl.where(
+            dev_mask,
+            tl.load(v + src, mask=dev_mask, other=0.0),
+            tl.load(HV + hsrc, mask=host_mask, other=0.0),
+        )
+        tl.store(out_k + dst, k_vals.to(out_dtype), mask=store_mask)
+        tl.store(out_v + dst, v_vals.to(out_dtype), mask=store_mask)
+    else:
+        tl.store(
+            out_k + dst,
+            tl.load(k + src, mask=load_mask, other=0.0).to(out_dtype),
+            mask=store_mask,
+        )
+        tl.store(
+            out_v + dst,
+            tl.load(v + src, mask=load_mask, other=0.0).to(out_dtype),
+            mask=store_mask,
+        )
 
 
 def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
@@ -624,6 +688,9 @@ def qwen_sparse_kv_extraction_compact_triton(
     batch,
     topk,
     zero_fill_cols: int = 0,
+    host_k=None,
+    host_v=None,
+    resident_tokens=0,
 ):
     """Gather the selected K/V rows into ``out_k``/``out_v``.
 
@@ -664,6 +731,10 @@ def qwen_sparse_kv_extraction_compact_triton(
         BLOCK_TOPK=block_topk,
         BLOCK_D=triton.next_power_of_2(dim),
         ZERO_FILL=zero_fill,
+        HK=host_k if host_k is not None else k,
+        HV=host_v if host_v is not None else v,
+        RW=resident_tokens,
+        HOST=host_k is not None,
         num_warps=8,
     )
 
