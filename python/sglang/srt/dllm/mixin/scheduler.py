@@ -373,10 +373,15 @@ class SchedulerDllmMixin:
     ) -> AddReqResult:
         """Process incoming DLLM requests with resource allocation and preemption."""
         res = AddReqResult.CONTINUE
+        num_held_rows = 0
+        num_held_rows_scanned = 0
         for req in reqs:
             # Check if batch is full
             running_bs = len(running_batch.reqs)
-            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
+            # can_run_list is append-only: count only the newly admitted rows.
+            for r in adder.can_run_list[num_held_rows_scanned:]:
+                num_held_rows += r.kv.holds_kv
+            num_held_rows_scanned = len(adder.can_run_list)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
                 running_bs, num_held_rows=num_held_rows
             ):

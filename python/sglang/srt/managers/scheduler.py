@@ -4133,6 +4133,8 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
+        num_held_rows = 0
+        num_held_rows_scanned = 0
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
@@ -4154,7 +4156,10 @@ class Scheduler(
             candidate_beam_width = (
                 req.beam_group.beam_width if req.beam_group is not None else None
             )
-            num_held_rows = sum(r.kv.holds_kv for r in adder.can_run_list)
+            # can_run_list is append-only: count only the newly admitted rows.
+            for r in adder.can_run_list[num_held_rows_scanned:]:
+                num_held_rows += r.kv.holds_kv
+            num_held_rows_scanned = len(adder.can_run_list)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
                 running_bs,
                 candidate_beam_width,
