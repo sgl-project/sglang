@@ -1,6 +1,7 @@
 import unittest
 from array import array
 from collections import deque
+from concurrent.futures import Future
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
@@ -13,6 +14,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
@@ -21,10 +25,14 @@ from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
+    ReleaseMemoryOccupationReqInput,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    SchedulerWeightUpdaterManager,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -110,6 +118,85 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
         scheduler.kv_events_publisher = MagicMock()
         return scheduler
+
+    def _new_idle_scheduler(self):
+        scheduler = self._new_scheduler()
+        scheduler.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+        scheduler.enable_hisparse = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_lmcache = False
+        scheduler.draft_worker = None
+        scheduler.grammar_manager = GrammarManager.__new__(GrammarManager)
+        scheduler.grammar_manager.grammar_queue = []
+        scheduler.grammar_manager.grammar_backend = MagicMock()
+        return scheduler
+
+    def test_retract_release_preserves_pending_grammar(self):
+        """Pausing during compilation must allow release and preserve the request for resume."""
+        scheduler = self._new_idle_scheduler()
+        manager = scheduler.grammar_manager
+        req = self._make_req("compiling")
+        future = Future()
+        req.grammar = future
+        req.grammar_key = ("json", "{}")
+        manager.grammar_queue = [req]
+
+        Scheduler.pause_generation(scheduler, PauseGenerationReqInput(mode="retract"))
+        self.assertFalse(scheduler.is_fully_idle())
+        updater = SchedulerWeightUpdaterManager.__new__(SchedulerWeightUpdaterManager)
+        updater.scheduler = scheduler
+        updater.is_fully_idle = scheduler.is_fully_idle
+        updater.flush_cache = scheduler.flush_cache
+        updater.offload_tags = set()
+        updater.memory_saver_adapter = MagicMock()
+        with patch("torch.get_device_module"):
+            updater.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
+            )
+        updater.memory_saver_adapter.pause.assert_called_once_with(
+            GPU_MEMORY_TYPE_KV_CACHE
+        )
+        scheduler.tree_cache.reset.assert_called_once()
+        manager.grammar_backend.reset.assert_called_once()
+        self.assertEqual(manager.grammar_queue, [req])
+        self.assertIs(req.grammar, future)
+        self.assertFalse(future.cancelled())
+
+        compiled = BaseGrammarObject()
+        future.set_result(compiled)
+        manager.scheduler = scheduler
+        manager.pp_rank = 0
+        manager.pp_size = 1
+        manager.grammar_sync_size = 1
+        manager.SGLANG_GRAMMAR_POLL_INTERVAL = 0.01
+        manager.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 10
+        Scheduler.continue_generation(scheduler, ContinueGenerationReqInput())
+        self.assertFalse(scheduler._engine_paused)
+        self.assertEqual(manager.get_ready_grammar_requests(), [req])
+        self.assertIs(req.grammar, compiled)
+        self.assertEqual(manager.grammar_queue, [])
+
+    def test_ignored_grammar_queue_still_checks_kv_ownership(self):
+        """Ignoring queued compilation must not permit freeing an owned KV row."""
+        scheduler = self._new_idle_scheduler()
+        req = self._make_req("compiling")
+        scheduler.grammar_manager.grammar_queue = [req]
+        self.assertFalse(scheduler.is_fully_idle())
+        self.assertTrue(scheduler.is_fully_idle(ignore_waiting=True))
+        req.kv.req_pool_idx = 0
+        self.assertFalse(scheduler.is_fully_idle(ignore_waiting=True))
+
+    def test_ignored_grammar_queue_still_checks_hicache_operations(self):
+        """A paused compiler must not hide unfinished cache transfers."""
+        scheduler = self._new_idle_scheduler()
+        scheduler.grammar_manager.grammar_queue = [self._make_req("compiling")]
+        scheduler.enable_hierarchical_cache = True
+        scheduler.tree_cache = SimpleNamespace(
+            ongoing_write_through=[object()], ongoing_load_back=[], enable_storage=False
+        )
+        self.assertFalse(scheduler.is_fully_idle(ignore_waiting=True))
+        scheduler.tree_cache.ongoing_write_through.clear()
+        self.assertTrue(scheduler.is_fully_idle(ignore_waiting=True))
 
     def _make_req(self, rid: str, finished: bool = False) -> Req:
         req = Req(

@@ -5333,9 +5333,16 @@ class Scheduler(
             idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not for_health_check:
-            # Grammar queue and prefill inflight queue may not produce batch
-            # results instantly, but they still indicate the server is not idle.
-            idle &= len(self.grammar_manager.grammar_queue) == 0
+            # Grammar compilation is CPU-only waiting work. A retract pause
+            # leaves these requests queued until scheduling resumes, so treat
+            # them like waiting_queue when checking whether memory can be freed.
+            # Preserve the KV ownership check for requests that already own KV.
+            if not ignore_waiting:
+                idle &= len(self.grammar_manager.grammar_queue) == 0
+            else:
+                idle &= not any(
+                    r.kv.holds_kv for r in self.grammar_manager.grammar_queue
+                )
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
