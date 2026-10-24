@@ -462,7 +462,8 @@ def test_generate_session_respects_max_chunks():
     assert session.reached_max_chunks()
 
 
-def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
+@pytest.mark.parametrize("fail_next_chunk", [False, True])
+def test_generate_loop_overlaps_send_with_next_generation(monkeypatch, fail_next_chunk):
     events = []
 
     class _Adapter:
@@ -491,6 +492,8 @@ def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
     async def fake_process_generation_batch(client, batch):
         del client
         events.append(f"generate_start_{batch.block_idx}")
+        if fail_next_chunk and batch.block_idx == 1:
+            raise RuntimeError("next chunk failed")
         await asyncio.sleep(0.01)
         events.append(f"generate_end_{batch.block_idx}")
         return None, SimpleNamespace()
@@ -518,13 +521,17 @@ def test_generate_loop_overlaps_send_with_next_generation(monkeypatch):
 
     class _Ws:
         async def send_bytes(self, _message):
-            pass
+            if msgspec.msgpack.decode(_message)["type"] == "error":
+                events.append("error")
 
     asyncio.run(realtime_video_api._generate_loop(_Ws(), session))
 
     assert events.index("generate_start_1") < events.index("send_end_0")
-    assert events.index("send_end_0") < events.index("send_start_1")
-    assert events[-1] == "send_end_1"
+    if fail_next_chunk:
+        assert events.index("send_end_0") < events.index("error")
+    else:
+        assert events.index("send_end_0") < events.index("send_start_1")
+        assert events[-1] == "send_end_1"
 
 
 def test_send_output_emits_chunk_stats_message():
