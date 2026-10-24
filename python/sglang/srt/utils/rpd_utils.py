@@ -4,6 +4,7 @@ def rpd_to_chrome_trace(
     input_rpd, output_json=None, start="0%", end="100%", format="object"
 ):
     import gzip
+    import json
     import sqlite3
 
     if output_json is None:
@@ -125,8 +126,8 @@ def rpd_to_chrome_trace(
         try:
             name = row[0] if len(row[1]) == 0 else row[1]
             outfile.write(
-                ',{"pid":"%s","tid":"%s","name":"%s","ts":"%s","dur":"%s","ph":"X","args":{"desc":"%s"}}\n'
-                % (row[2], row[3], name, row[4], row[5], row[0])
+                ',{"pid":"%s","tid":"%s","name":%s,"ts":"%s","dur":"%s","ph":"X","args":{"desc":%s}}\n'
+                % (row[2], row[3], json.dumps(name), row[4], row[5], json.dumps(row[0]))
             )
         except ValueError:
             outfile.write("")
@@ -139,8 +140,15 @@ def rpd_to_chrome_trace(
         ):
             try:
                 outfile.write(
-                    ',{"pid":"%s","tid":"%s","name":"%s","ts":"%s","dur":"%s","ph":"X","args":{"kernels":"%s"}}\n'
-                    % (row[1], row[2], f"Graph {row[0]}", row[3], row[4], row[5])
+                    ',{"pid":"%s","tid":"%s","name":%s,"ts":"%s","dur":"%s","ph":"X","args":{"kernels":"%s"}}\n'
+                    % (
+                        row[1],
+                        row[2],
+                        json.dumps(f"Graph {row[0]}"),
+                        row[3],
+                        row[4],
+                        row[5],
+                    )
                 )
             except ValueError:
                 outfile.write("")
@@ -156,37 +164,37 @@ def rpd_to_chrome_trace(
             if row[0] == "UserMarker":
                 if row[6] == 0:  # instantanuous "mark" messages
                     outfile.write(
-                        ',{"pid":"%s","tid":"%s","name":"%s","ts":"%s","ph":"i","s":"p","args":{"desc":"%s"}}\n'
+                        ',{"pid":"%s","tid":"%s","name":%s,"ts":"%s","ph":"i","s":"p","args":{"desc":%s}}\n'
                         % (
                             row[2],
                             row[3],
-                            row[1].replace('"', ""),
+                            json.dumps(row[1]),
                             row[4],
-                            row[1].replace('"', ""),
+                            json.dumps(row[1]),
                         )
                     )
                 else:
                     outfile.write(
-                        ',{"pid":"%s","tid":"%s","name":"%s","ts":"%s","dur":"%s","ph":"X","args":{"desc":"%s"}}\n'
+                        ',{"pid":"%s","tid":"%s","name":%s,"ts":"%s","dur":"%s","ph":"X","args":{"desc":%s}}\n'
                         % (
                             row[2],
                             row[3],
-                            row[1].replace('"', ""),
+                            json.dumps(row[1]),
                             row[4],
                             row[5],
-                            row[1].replace('"', ""),
+                            json.dumps(row[1]),
                         )
                     )
             else:
                 outfile.write(
-                    ',{"pid":"%s","tid":"%s","name":"%s","ts":"%s","dur":"%s","ph":"X","args":{"desc":"%s"}}\n'
+                    ',{"pid":"%s","tid":"%s","name":%s,"ts":"%s","dur":"%s","ph":"X","args":{"desc":%s}}\n'
                     % (
                         row[2],
                         row[3],
-                        row[0],
+                        json.dumps(row[0]),
                         row[4],
                         row[5],
-                        row[1].replace('"', "").replace("\t", ""),
+                        json.dumps(row[1]),
                     )
                 )
         except ValueError:
@@ -217,14 +225,14 @@ def rpd_to_chrome_trace(
         ):
             try:
                 outfile.write(
-                    ',{"pid":"%s","tid":"%s","name":"%s","ts":"%s","dur":"%s","ph":"X","args":{"desc":"%s"}}\n'
+                    ',{"pid":"%s","tid":"%s","name":%s,"ts":"%s","dur":"%s","ph":"X","args":{"desc":%s}}\n'
                     % (
                         row[2],
                         row[3] + 1,
-                        row[0],
+                        json.dumps(row[0]),
                         row[4],
                         row[5],
-                        row[1].replace('"', ""),
+                        json.dumps(row[1]),
                     )
                 )
             except ValueError:
@@ -299,8 +307,8 @@ def rpd_to_chrome_trace(
             % (rangeStringMonitor)
         ):
             outfile.write(
-                ',{"pid":"%s","name":"%s","ph":"C","ts":%s,"args":{"%s":%s}}\n'
-                % (row[0], row[1], row[2], row[1], row[3])
+                ',{"pid":"%s","name":%s,"ph":"C","ts":%s,"args":{%s:%s}}\n'
+                % (row[0], json.dumps(row[1]), row[2], json.dumps(row[1]), row[3])
             )
         # Output the endpoints of the last range
         for row in connection.execute(
@@ -308,8 +316,8 @@ def rpd_to_chrome_trace(
             % (rangeStringMonitor)
         ):
             outfile.write(
-                ',{"pid":"%s","name":"%s","ph":"C","ts":%s,"args":{"%s":%s}}\n'
-                % (row[0], row[1], row[2], row[1], row[3])
+                ',{"pid":"%s","name":%s,"ph":"C","ts":%s,"args":{%s:%s}}\n'
+                % (row[0], json.dumps(row[1]), row[2], json.dumps(row[1]), row[3])
             )
     except:
         print("Did not find SMI data")
@@ -414,14 +422,16 @@ def rpd_to_chrome_trace(
                             for dest in gpuFrame.gpus:
                                 # print(f"2: OUTPUT: dest={dest} time={gpuFrame.start} -> {gpuFrame.end} Duration={gpuFrame.end - gpuFrame.start} TotalOps={gpuFrame.totalOps}")
                                 outfile.write(
-                                    ',{"pid":"%s","tid":"%s","name":"%s","ts":"%s","dur":"%s","ph":"X","args":{"desc":"%s"}}\n'
+                                    ',{"pid":"%s","tid":"%s","name":%s,"ts":"%s","dur":"%s","ph":"X","args":{"desc":%s}}\n'
                                     % (
                                         dest[0],
                                         dest[1],
-                                        gpuFrame.name.replace('"', ""),
+                                        json.dumps(gpuFrame.name),
                                         gpuFrame.start - 1,
                                         gpuFrame.end - gpuFrame.start + 1,
-                                        f"UserMarker frame: {gpuFrame.totalOps} ops",
+                                        json.dumps(
+                                            f"UserMarker frame: {gpuFrame.totalOps} ops"
+                                        ),
                                     )
                                 )
                             currentFrame.pop(key)
