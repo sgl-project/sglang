@@ -97,6 +97,46 @@ class TestModeloptFp4ScaleProcessing(unittest.TestCase):
         self.assertTrue(torch.equal(layer.weight_scale_interleaved, expected))
         self.assertTrue(layer.weight_scale_interleaved.is_cuda)
 
+    def test_dynamic_apply_uses_cached_weight_scale_2_max(self):
+        layer = torch.nn.Module()
+        layer.weight_scale_2 = torch.nn.Parameter(
+            torch.tensor([2.0, 5.0]), requires_grad=False
+        )
+        # Deliberately different from a fresh .max() call so falling back to
+        # recomputing it every forward is caught.
+        layer.weight_scale_2_max = torch.nn.Parameter(
+            torch.tensor(5.0), requires_grad=False
+        )
+        layer.input_scale_inv = torch.tensor(1.0)
+        layer.output_size_per_partition = 4
+        layer._accepts_prequantized_fp4 = False
+
+        method = ModelOptFp4LinearMethod.__new__(ModelOptFp4LinearMethod)
+        method.quant_config = MagicMock(dynamic_input_scale=True)
+
+        x = torch.randn(2, 8)
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant."
+                "_get_fp4_quantize_op",
+                return_value=lambda x, s: (x, s),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant."
+                "_dynamic_nvfp4_input_scale",
+                return_value=torch.tensor(3.0),
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant."
+                "apply_nvfp4_gemm_prequantized"
+            ) as mock_gemm,
+        ):
+            mock_gemm.return_value = torch.zeros(2, 4)
+            method.apply(layer, x)
+            _, kwargs = mock_gemm.call_args
+            # alpha = input_scale (3.0) * cached weight_scale_2_max (5.0).
+            self.assertAlmostEqual(kwargs["alpha"].item(), 15.0)
+
 
 if __name__ == "__main__":
     unittest.main()

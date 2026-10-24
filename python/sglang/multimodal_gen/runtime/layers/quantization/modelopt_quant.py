@@ -775,6 +775,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         copy_or_rebind_param(
             layer, "input_scale_inv", (1 / input_scale_2).to(torch.float32)
         )
+        copy_or_rebind_param(layer, "weight_scale_2_max", weight_scale_2)
 
         layer.output_size_per_partition = layer.weight.shape[0]
         return input_scale_2, weight_scale_2
@@ -897,7 +898,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             if self.quant_config.dynamic_input_scale:
                 input_scale = _dynamic_nvfp4_input_scale(layer, x)
                 input_scale_inv = 1.0 / input_scale
-                alpha = input_scale * layer.weight_scale_2.max().to(torch.float32)
+                alpha = input_scale * layer.weight_scale_2_max
             x_fp4, x_scale_interleaved = fp4_quantize(x, input_scale_inv)
         out = apply_nvfp4_gemm_prequantized(
             layer, x_fp4, x_scale_interleaved, output_dtype, bias, alpha=alpha
