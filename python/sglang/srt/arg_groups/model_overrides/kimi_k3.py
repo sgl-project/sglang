@@ -10,11 +10,15 @@ from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     attention_backends_of,
     is_attention_backend_not_set,
+    model_config_of,
     resolving_view,
 )
+from sglang.srt.arg_groups.overrides import register_post_process
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
+
+_KIMI_K3_ARCHS = ("KimiK3ForConditionalGeneration", "KimiK3LinearForCausalLM")
 
 
 def _require_kimi_k3_cutedsl_dcp_support() -> None:
@@ -188,3 +192,33 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
         "(FlashInfer SiTU kernels)."
     )
     return {"moe_runner_backend": "flashinfer_mxfp4"}
+
+
+@register_post_process
+def _kimi_k3_hip_symm_mem_under_graph(view: Any) -> dict:
+    from sglang.srt.connector import ConnectorType
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.utils import parse_connector_type
+
+    if not (get_platform().is_hip and view.enable_symm_mem):
+        return {}
+    if parse_connector_type(view.model_path) == ConnectorType.INSTANCE:
+        return {}
+    if model_config_of(view).hf_config.architectures[0] not in _KIMI_K3_ARCHS:
+        return {}
+    graph = view.cuda_graph_config
+    if (
+        graph.decode.backend == Backend.DISABLED
+        and graph.prefill.backend == Backend.DISABLED
+    ):
+        return {}
+    # Workaround: on ROCm a captured graph keeps per-forward symm-mem addresses that
+    # are neither held nor rank-aligned; drop once the pool pins them for the graph.
+    logger.warning(
+        "Kimi-K3 on ROCm: ignoring --enable-symm-mem because graph capture is on; "
+        "symmetric-memory buffers are allocated per forward, so a captured graph "
+        "replays stale addresses and corrupts the output. Set "
+        "--cuda-graph-backend-decode=disabled and "
+        "--cuda-graph-backend-prefill=disabled to keep symmetric memory."
+    )
+    return {"enable_symm_mem": False}

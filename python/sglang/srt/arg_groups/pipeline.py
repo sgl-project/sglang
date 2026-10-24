@@ -220,6 +220,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(handle_model_specific_adjustments, server_args)
+    from sglang.srt.arg_groups.model_overrides.kimi_k3 import (
+        _kimi_k3_hip_symm_mem_under_graph,
+    )
+
+    run_post_process_pass(server_args, _kimi_k3_hip_symm_mem_under_graph)
     run_hook(default_unset_prefill_decode_interval, server_args)
     # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     run_hook(handle_offload_compatibility, server_args)

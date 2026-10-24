@@ -150,13 +150,13 @@ class TestResolutionDeclarations(CustomTestCase):
 
         self.addCleanup(restore)
 
-    def _resolve(self, extra):
+    def _resolve(self, extra, config=_MINI_CONFIG):
         """A fully-resolved config: a real config.json, so the pipeline runs
         past its dummy-model early return."""
         path = tempfile.mkdtemp(prefix="declarations_")
         self.addCleanup(shutil.rmtree, path, ignore_errors=True)
         with open(os.path.join(path, "config.json"), "w") as handle:
-            json.dump(_MINI_CONFIG, handle)
+            json.dump(config, handle)
         fields = {"random_seed": 42}
         fields.update(extra)
         server_args = ServerArgs(model_path=path, device="cuda", **fields)
@@ -690,6 +690,38 @@ class TestResolutionDeclarations(CustomTestCase):
             "result, so the projection publishes what the operator passed "
             "instead of what the platform decided",
         )
+
+    def test_kimi_k3_rocm_drops_symm_mem_only_under_graph_capture(self):
+        """Kimi-K3 on ROCm drops symm-mem under graph capture, and leaves eager runs and CUDA alone."""
+        from sglang.srt.runtime_context import override_platform
+
+        k3_config = dict(
+            _MINI_CONFIG,
+            architectures=["KimiK3ForConditionalGeneration"],
+            kv_lora_rank=16,
+            q_lora_rank=None,
+            qk_nope_head_dim=8,
+            qk_rope_head_dim=8,
+            v_head_dim=8,
+        )
+        eager = {
+            "cuda_graph_backend_decode": "disabled",
+            "cuda_graph_backend_prefill": "disabled",
+        }
+        for is_hip, extra, expected in (
+            (True, {}, False),
+            (True, {**eager, "cuda_graph_backend_prefill": "breakable"}, False),
+            (True, eager, True),
+            (False, {}, True),
+        ):
+            with self.subTest(is_hip=is_hip, extra=extra):
+                with override_platform(is_hip=is_hip, is_cuda=not is_hip):
+                    server_args = self._resolve(
+                        {"enable_symm_mem": True, **extra}, config=k3_config
+                    )
+                self.assertEqual(
+                    resolution_result(server_args, "enable_symm_mem"), expected
+                )
 
 
 class TestDeclaredValuesAreNotEditedLater(CustomTestCase):
