@@ -1,6 +1,7 @@
 """MLU paged attention against a CPU GQA reference, including cached prefixes."""
 
 import unittest
+import weakref
 from types import SimpleNamespace as NS
 
 import torch
@@ -16,6 +17,53 @@ register_mlu_ci(est_time=60, suite="pr-test-1-mlu")
 
 
 class TestAttentionMLU(CustomTestCase):
+    def test_eager_metadata_released_and_capture_addresses_preserved(self):
+        """Varying eager batch sizes must not retain old page tables."""
+        backend = MLUAttnBackend(
+            NS(
+                device="mlu",
+                page_size=16,
+                model_config=NS(context_len=128),
+                req_to_token_pool=NS(
+                    req_to_token=torch.zeros(8, 128, device="mlu", dtype=torch.int64)
+                ),
+                token_to_kv_pool=None,
+                dtype=torch.bfloat16,
+                kv_cache_dtype=torch.bfloat16,
+            )
+        )
+
+        def batch(size):
+            return NS(
+                forward_mode=ForwardMode.DECODE,
+                batch_size=size,
+                req_pool_indices=torch.arange(size, device="mlu"),
+                seq_lens=torch.full((size,), 7, device="mlu", dtype=torch.int32),
+            )
+
+        previous = None
+        for size in range(1, 9):
+            backend.init_forward_metadata(batch(size))
+            if previous is not None:
+                self.assertIsNone(previous(), "Eager page tables were retained")
+            previous = weakref.ref(backend.forward_metadata.block_tables)
+
+        backend.init_forward_metadata_out_graph(batch(2), in_capture=True)
+        captured = backend.forward_metadata
+        addresses = (captured.block_tables.data_ptr(), captured.seq_lens.data_ptr())
+        backend.init_forward_metadata(batch(3))
+        replay = batch(2)
+        replay.seq_lens.fill_(11)
+        backend.init_forward_metadata_out_graph(replay)
+        self.assertEqual(
+            (
+                backend.forward_metadata.block_tables.data_ptr(),
+                backend.forward_metadata.seq_lens.data_ptr(),
+            ),
+            addresses,
+        )
+        torch.testing.assert_close(captured.seq_lens, replay.seq_lens)
+
     def test_paged_gqa(self):
         torch.manual_seed(42)
         pool = MLUMHATokenToKVPool(

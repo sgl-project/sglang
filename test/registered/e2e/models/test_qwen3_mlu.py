@@ -1,7 +1,9 @@
 """Qwen3 BF16 generation on MLU: eager/graph parity and TP/DP execution."""
 
 import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch_mlu  # noqa: F401
 
@@ -15,7 +17,42 @@ register_mlu_ci(est_time=500, suite="nightly-test-2-mlu", nightly=True)
 class TestQwen3MLU(CustomTestCase):
     model = os.environ.get("MLU_TEST_MODEL", "Qwen/Qwen3-8B")
 
+    @staticmethod
+    def _graph_passes(engine):
+        from prometheus_client import CollectorRegistry, multiprocess
+
+        # Synchronize with scheduler reporting after generation completes.
+        engine.get_server_info()
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        counts = {"decode_cuda_graph": 0, "prefill_cuda_graph": 0}
+        for metric in registry.collect():
+            for sample in metric.samples:
+                if sample.name == "sglang:cuda_graph_passes_total":
+                    mode = sample.labels.get("mode")
+                    if mode in counts:
+                        counts[mode] += sample.value
+        return counts
+
     def _generate(self, *, tp_size, dp_size, graphs):
+        from prometheus_client import REGISTRY
+
+        collectors_before = set(REGISTRY._collector_to_names)
+        # Each engine gets its own counter files. Unregister only its parent
+        # collectors so later engines can register the same metric names.
+        with (
+            tempfile.TemporaryDirectory() as metrics_dir,
+            patch.dict(os.environ, {"PROMETHEUS_MULTIPROC_DIR": metrics_dir}),
+        ):
+            try:
+                return self._generate_with_metrics(
+                    tp_size=tp_size, dp_size=dp_size, graphs=graphs
+                )
+            finally:
+                for collector in set(REGISTRY._collector_to_names) - collectors_before:
+                    REGISTRY.unregister(collector)
+
+    def _generate_with_metrics(self, *, tp_size, dp_size, graphs):
         config = (
             {
                 "decode": {"backend": "full", "bs": [1, 2, 4]},
@@ -41,9 +78,11 @@ class TestQwen3MLU(CustomTestCase):
             mem_fraction_static=float(os.environ.get("MLU_TEST_MEM_FRACTION", "0.8")),
             cuda_graph_config=config,
             skip_server_warmup=True,
+            enable_metrics=True,
             disable_overlap_schedule=True,
         )
         try:
+            before = self._graph_passes(engine)
             prefix = "List of world capitals. France: Paris. China: Beijing. Italy: Rome. Japan: Tokyo.\n"
             prompts = [prefix + "France:", prefix + "China:"]
             params = {"temperature": 0, "max_new_tokens": 16}
@@ -60,6 +99,12 @@ class TestQwen3MLU(CustomTestCase):
                 ["Hello. " * 150 + prompts[0]], sampling_params=params
             )
             self.assertTrue(long[0]["text"])
+            after = self._graph_passes(engine)
+            for mode in before:
+                if graphs:
+                    self.assertGreater(after[mode], before[mode], mode)
+                else:
+                    self.assertEqual(after[mode], before[mode], mode)
             return texts
         finally:
             engine.shutdown()

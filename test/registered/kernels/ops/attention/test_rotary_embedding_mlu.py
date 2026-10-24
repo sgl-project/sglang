@@ -22,10 +22,13 @@ class TestRotaryEmbeddingMLU(CustomTestCase):
                         64, rotary_dim, 128, 10000, neox, torch.bfloat16
                     ).to("mlu")
                     for offset in (0, 7):
-                        # Replace the source cache as happens when positions grow.
-                        # It must invalidate the vendor-layout copy.
-                        rope.cos_sin_cache = rope.cos_sin_cache.clone()
-                        pos = torch.arange(7, device="mlu")
+                        # On the second call, grow the warmed cache and query
+                        # new rows. Reusing the old vendor cache must fail.
+                        start = 0
+                        if offset:
+                            start = rope.cos_sin_cache.shape[0]
+                            rope._ensure_cos_sin_cache_length(start + offset + 6)
+                        pos = torch.arange(start, start + 7, device="mlu")
                         offsets = torch.full_like(pos, offset)
                         q = torch.randn(7, 256, device="mlu", dtype=torch.bfloat16)
                         k = torch.randn(7, 128, device="mlu", dtype=torch.bfloat16)

@@ -63,17 +63,20 @@ class MLUAttnBackend(AttentionBackend):
         seq_lens = fb.seq_lens.to(torch.int32)
         if fb.forward_mode.is_decode():
             bs = fb.batch_size
-            # Every captured shape owns stable tensor addresses. Updating them
-            # before replay also works for ordinary eager decode.
-            if bs not in self._graph_metadata:
-                self._graph_metadata[bs] = ForwardMetadata(
-                    torch.empty_like(tables),
-                    torch.empty_like(seq_lens),
+            # Only captured shapes need persistent addresses. Eager batches
+            # must not retain one full page table for every observed size.
+            meta = self._graph_metadata.get(bs)
+            if meta is None:
+                meta = ForwardMetadata(
+                    tables,
+                    seq_lens.clone() if in_capture else seq_lens,
                     max_seq_len_kv=self.max_context_len,
                 )
-            meta = self._graph_metadata[bs]
-            meta.block_tables.copy_(tables)
-            meta.seq_lens.copy_(seq_lens)
+                if in_capture:
+                    self._graph_metadata[bs] = meta
+            else:
+                meta.block_tables.copy_(tables)
+                meta.seq_lens.copy_(seq_lens)
         elif fb.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
             # Mixed scheduling already represents decode rows as one-token
             # extensions. Ragged causal flash attention preserves their request
