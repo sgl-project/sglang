@@ -20,6 +20,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestHcConsumer(unittest.TestCase):
     def test_dspark_tap_hands_materialized_stream_to_next_layer(self):
+        from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.models import deepseek_v4
@@ -58,7 +59,7 @@ class TestHcConsumer(unittest.TestCase):
             residual_stream=None,
         )
         source = torch.arange(24.0).reshape(3, 2, 4)
-        aux = []
+        aux = AuxHiddenStatePacker(1)
         recorder = SimpleNamespace(with_current_layer=lambda _: nullcontext())
         with (
             patch.object(deepseek_v4, "_is_cuda", True),
@@ -75,7 +76,7 @@ class TestHcConsumer(unittest.TestCase):
                 positions, source, batch, positions, positions, True, aux
             )
         torch.testing.assert_close(output, source + 3)
-        torch.testing.assert_close(aux[0], (source + 1).mean(1))
+        torch.testing.assert_close(aux.finalize(), (source + 1).mean(1))
         torch.testing.assert_close(pre, torch.ones(3, 2))
         self.assertIsNone(tail)
         self.assertIsNone(batch.residual_stream)

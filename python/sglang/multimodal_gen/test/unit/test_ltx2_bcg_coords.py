@@ -263,6 +263,8 @@ class TestLTX2GuidanceBCG(CustomTestCase):
         stage._maybe_get_bcg_runner = Mock(return_value=runner)
         stage._ltx2_model_forward_context = lambda *_: nullcontext()
         stage.post_forward_for_ti2v_task = lambda batch, args, mask, latents, z: latents
+        # the stub DiT reads the prompt itself instead of projecting cached K/V
+        stage._use_cached_ltx2_prompt_kv = lambda ctx, step, kwargs: kwargs
         args = SimpleNamespace(
             enable_cfg_parallel=False,
             pipeline_class_name=(

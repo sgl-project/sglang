@@ -9,7 +9,7 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional
 
 from sglang.srt.runtime_context import get_model, get_serving
 
@@ -42,9 +42,7 @@ from jsonschema import Draft202012Validator, SchemaError
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
     chat_encoding_adapters,
-    encoding_dsv4,
     encoding_dsv32,
-    encoding_dsv41,
 )
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     parallel_prompt_encode,
@@ -127,7 +125,6 @@ from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
-from sglang.srt.utils import ImageData
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
@@ -348,26 +345,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
         self.supports_inline_system = self._resolve_inline_system_support()
-        self._dsv4_reasoning_effort_profile = (
-            chat_encoding.resolve_dsv4_reasoning_effort_profile(
-                model_path=self.tokenizer_manager.model_path,
-                revision=get_model().revision,
-                override=self.tokenizer_manager.model_config.hf_config.to_dict().get(
-                    chat_encoding.DSV4_REASONING_EFFORT_PROFILE_OVERRIDE
-                ),
-            )
-            if self.chat_encoding_spec == "dsv4"
-            else None
-        )
-
         self._encoding_adapter = self._build_chat_encoding_adapter()
-        self._dsv41_default_reasoning_effort: Optional[Union[str, int]] = (
-            chat_encoding.default_dsv41_reasoning_effort_from_env(
-                envs.SGLANG_DSV41_REASONING_EFFORT.get()
-            )
-            if self.chat_encoding_spec == "dsv41"
-            else None
-        )
 
         # Per-request response parser for custom decoding (set by _encode_messages)
         self._response_parser: ResponseParserProtocol | None = None
@@ -500,6 +478,10 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_parser=self.tool_call_parser,
         )
 
+    @property
+    def encoding_adapter(self) -> Optional[chat_encoding_adapters.ChatEncodingAdapter]:
+        return self._encoding_adapter
+
     def _build_chat_encoding_adapter(
         self,
     ) -> Optional[chat_encoding_adapters.ChatEncodingAdapter]:
@@ -514,6 +496,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 reasoning_parser=self.reasoning_parser,
                 tool_call_parser=self.tool_call_parser,
                 chat_hooks=chat_encoding_adapters.ChatOutputHooks(
+                    thinking_requested=self._thinking_requested,
                     tool_call_parsing_active=self._tool_call_parsing_active,
                     history_tool_calls_count=self._get_history_tool_calls_cnt,
                     tool_call_id=self._process_tool_call_id,
@@ -521,6 +504,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 hf_config=self.tokenizer_manager.model_config.hf_config,
                 model_path=self.tokenizer_manager.model_path,
                 revision=get_model().revision,
+                default_chat_template_kwargs=get_serving().default_chat_template_kwargs,
             )
         )
 
@@ -625,6 +609,8 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         thinking_mode: ThinkingMode,
         tools: list[dict] | None = None,
+        *,
+        image_data: list,
     ) -> list[int] | None:
         """Encode messages for custom chat_encoding_spec values.
 
@@ -632,7 +618,11 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         if self._encoding_adapter is not None:
             return self._encoding_adapter.encode_messages(
-                messages=messages, request=request, tools=tools
+                messages=messages,
+                request=request,
+                tools=tools,
+                thinking=thinking_mode == ThinkingMode.THINKING,
+                image_data=image_data,
             )
         if self.chat_encoding_spec == "kimi_k3":
             messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
@@ -700,21 +690,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             return prompt_ids
         return None
-
-    def _resolve_dsv41_reasoning_effort(self, value: Any) -> Union[str, int]:
-        """Request effort for the V4.1 encoder; unsupported values warn and fall back."""
-        effort = chat_encoding.parse_dsv41_reasoning_effort(value)
-        if effort is not None:
-            return effort
-        if value is not None and value != "none":
-            logger.warning(
-                "DeepSeek-V4.1 does not support reasoning_effort=%r; using the "
-                "default %r (low/high/xhigh/max, a float in [0, 0.99], or an "
-                "integer budget in [1, 100] via chat_template_kwargs are accepted).",
-                value,
-                self._dsv41_default_reasoning_effort,
-            )
-        return self._dsv41_default_reasoning_effort
 
     def _decode_response(self, ret_item: dict[str, Any]) -> str | ErrorResponse:
         """Extract text from response."""
@@ -1584,16 +1559,20 @@ class OpenAIServingChat(OpenAIServingBase):
         template_content_format = self.template_manager.jinja_template_content_format
 
         # Try custom encoding first (override in subclass for custom renderers)
-        thinking_requested = (request.chat_template_kwargs or {}).get(
-            "thinking", envs.SGLANG_DEFAULT_THINKING.get()
-        )
         thinking_mode = (
-            ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
+            ThinkingMode.THINKING
+            if self._thinking_requested(request)
+            else ThinkingMode.CHAT
         )
         messages = [msg.model_dump() for msg in request.messages]
+        strict_tool_call_arguments = (
+            self._encoding_adapter.strict_tool_call_arguments
+            if self._encoding_adapter is not None
+            else self.chat_encoding_spec != "kimi_k3"
+        )
         for message in messages:
             normalize_assistant_tool_call_arguments(
-                message, strict=self.chat_encoding_spec != "kimi_k3"
+                message, strict=strict_tool_call_arguments
             )
 
         prompt_ids = self._encode_messages(
@@ -1601,9 +1580,12 @@ class OpenAIServingChat(OpenAIServingBase):
             request,
             thinking_mode,
             tools=tools,
+            image_data=image_data,
         )
 
         if prompt_ids is not None:
+            if image_data and not is_multimodal:
+                raise ValueError("image input is not supported for this model")
             collects_openai_media = (
                 self._encoding_adapter.collects_openai_media
                 if self._encoding_adapter is not None
@@ -1623,33 +1605,30 @@ class OpenAIServingChat(OpenAIServingBase):
                         modalities,
                     )
         elif self.chat_encoding_spec is not None:
-            # dsv4/dsv41/dsv32 encoding path
+            # dsv32 encoding path
             messages = copy.deepcopy(messages)
-            is_dsv41 = self.chat_encoding_spec == "dsv41"
             for msg in messages:
                 if msg.get("content") is None:
                     msg["content"] = ""
 
-            # The V4.1 encoder consumes OpenAI parts lists itself; dsv4/dsv32
-            # are text-only, so their parts-list content is flattened first.
-            if not is_dsv41:
-                for i, msg in enumerate(messages):
-                    if isinstance(msg.get("content"), list):
-                        messages[i] = process_content_for_template_format(
-                            msg, "string", [], [], [], []
-                        )
-
-                for msg in messages:
-                    processed_msg = process_content_for_template_format(
-                        msg,
-                        template_content_format,
-                        image_data,
-                        video_data,
-                        audio_data,
-                        modalities,
-                        use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
+            # The dsv32 encoder is text-only, so parts-list content is flattened first.
+            for i, msg in enumerate(messages):
+                if isinstance(msg.get("content"), list):
+                    messages[i] = process_content_for_template_format(
+                        msg, "string", [], [], [], []
                     )
-                    msg.update(processed_msg)
+
+            for msg in messages:
+                processed_msg = process_content_for_template_format(
+                    msg,
+                    template_content_format,
+                    image_data,
+                    video_data,
+                    audio_data,
+                    modalities,
+                    use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
+                )
+                msg.update(processed_msg)
 
             # Handle continue_final_message: separate final assistant message
             messages, assistant_prefix = self._handle_last_assistant_message(
@@ -1658,78 +1637,16 @@ class OpenAIServingChat(OpenAIServingBase):
 
             request_tools = request.tools if tools else None
 
-            # An empty system message hosts the request tools; dsv41 renders a
-            # system token for it, so it only gets one when tools need the host.
-            if messages[0]["role"] != "system" and (request_tools or not is_dsv41):
+            # An empty system message hosts the request tools.
+            if messages[0]["role"] != "system":
                 messages.insert(0, {"role": "system", "content": ""})
             if request_tools:
-                messages[0]["tools"] = [
-                    (
-                        chat_encoding.dsv41_tool_payload(tool)
-                        if is_dsv41
-                        else tool.model_dump()
-                    )
-                    for tool in request_tools
-                ]
+                messages[0]["tools"] = [tool.model_dump() for tool in request_tools]
 
-            # Default encoding (dsv4/dsv41/dsv32)
-            if self.chat_encoding_spec == "dsv4":
-                effort_source = request.reasoning_effort
-                if effort_source is None:
-                    env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
-                    if env_val:
-                        effort_source = env_val
-                reasoning_effort_profile = self._dsv4_reasoning_effort_profile
-                assert reasoning_effort_profile is not None
-                accepted_efforts = encoding_dsv4.REASONING_EFFORT_PROFILES[
-                    reasoning_effort_profile
-                ]
-                v4_reasoning_effort = (
-                    effort_source if effort_source in accepted_efforts else None
-                )
-                if request.task is not None:
-                    encoding_dsv4.attach_task_to_last_user_message(
-                        messages, request.task
-                    )
-                real_input = encoding_dsv4.encode_messages(
-                    messages,
-                    thinking_mode=thinking_mode,
-                    reasoning_effort=v4_reasoning_effort,
-                    reasoning_effort_profile=reasoning_effort_profile,
-                )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
-            elif is_dsv41:
-                if request.task is not None:
-                    encoding_dsv41.attach_task_to_last_user_message(
-                        messages, request.task
-                    )
-                real_input, media = encoding_dsv41.encode_messages(
-                    messages,
-                    thinking_mode=thinking_mode,
-                    reasoning_effort=self._resolve_dsv41_reasoning_effort(
-                        request.reasoning_effort
-                    ),
-                    return_multi_modal_data=True,
-                )
-                if media["images"]:
-                    if not is_multimodal:
-                        raise ValueError("image input is not supported for this model")
-                    image_data.extend(
-                        ImageData(url=image["url"]) for image in media["images"]
-                    )
-                    tokenizer = self.tokenizer_manager.tokenizer
-                    real_input = real_input.replace(
-                        encoding_dsv41.IMAGE_PLACEHOLDER,
-                        tokenizer.convert_ids_to_tokens(
-                            self.tokenizer_manager.image_token_id
-                        ),
-                    )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
-            else:
-                real_input = encoding_dsv32.encode_messages(
-                    messages, thinking_mode=thinking_mode
-                )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+            real_input = encoding_dsv32.encode_messages(
+                messages, thinking_mode=thinking_mode
+            )
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
@@ -3049,6 +2966,11 @@ class OpenAIServingChat(OpenAIServingBase):
         chat_template_kwargs = dict(request.chat_template_kwargs or {})
         chat_template_kwargs[toggle_param] = enabled
         request.chat_template_kwargs = chat_template_kwargs
+
+    def _thinking_requested(self, request: ChatCompletionRequest) -> bool:
+        return (request.chat_template_kwargs or {}).get(
+            "thinking", envs.SGLANG_DEFAULT_THINKING.get()
+        )
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Determine whether reasoning mode should be enabled for this request.

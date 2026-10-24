@@ -901,7 +901,9 @@ class TestIdleMetrics(CustomTestCase):
             disaggregation_mode=DisaggregationMode.NULL,
             pool_stats_observer=types.SimpleNamespace(
                 get_pool_stats=lambda: types.SimpleNamespace(
-                    update_scheduler_stats=lambda _: None
+                    update_scheduler_stats=lambda _: None,
+                    full_capacity=1,
+                    is_hybrid_swa=False,
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,
@@ -934,7 +936,9 @@ class TestIdleMetrics(CustomTestCase):
         self.reporter.current_scheduler_metrics_enabled = True
         self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
         self.scheduler.enable_priority_scheduling = True
-        self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(queue=[])
+        self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
+            queue=[], pre_allocated_token_counts=lambda: (0, 0)
+        )
         host_reqs = [
             types.SimpleNamespace(host_staged=True, priority=priority)
             for priority in (1, 2)

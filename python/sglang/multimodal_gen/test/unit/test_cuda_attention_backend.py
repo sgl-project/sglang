@@ -200,6 +200,49 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
                 "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.DynamicCudnnSDPABackend",
             )
 
+    def test_blackwell_serves_fa4_head_sizes_outside_the_fa3_list(self):
+        FakeCudaPlatform.is_blackwell_device = True
+        fa_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
+        dynamic_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.DynamicCudnnSDPABackend"
+
+        with patch.object(
+            FakeCudaPlatform,
+            "_prepare_flash_attention_for_blackwell",
+            return_value=True,
+        ):
+            for head_size in (72, 80):
+                with self.subTest(head_size=head_size):
+                    self.assertEqual(
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            None, head_size, torch.bfloat16
+                        ),
+                        dynamic_cls_str,
+                    )
+                    self.assertEqual(
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            AttentionBackendEnum.FA, head_size, torch.bfloat16
+                        ),
+                        fa_cls_str,
+                    )
+            for head_size in (68, 136):
+                with self.subTest(head_size=head_size):
+                    self.assertEqual(
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            None, head_size, torch.bfloat16
+                        ),
+                        SDPA_BACKEND_CLS_STR,
+                    )
+
+    def test_pre_blackwell_keeps_torch_sdpa_for_head_size_72(self):
+        for selected_backend in (None, AttentionBackendEnum.FA):
+            with self.subTest(selected_backend=selected_backend):
+                self.assertEqual(
+                    FakeCudaPlatform.get_attn_backend_cls_str(
+                        selected_backend, 72, torch.bfloat16
+                    ),
+                    SDPA_BACKEND_CLS_STR,
+                )
+
     def test_invalid_backend_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
             self.resolve(AttentionBackendEnum.AITER_SAGE)

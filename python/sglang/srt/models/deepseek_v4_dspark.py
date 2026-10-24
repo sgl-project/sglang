@@ -468,6 +468,17 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
                 "Disable SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD."
             )
         self._shard_group = shard_group
+        self._tp_shard = MarkovW2ShardGeometry(
+            tp_size=tp_size,
+            org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
+            org_vocab_end=int(lm_head.shard_indices.org_vocab_end_index),
+            num_embeddings_per_partition=per_partition,
+            num_embeddings_padded=num_padded,
+        )
+        # A rank holding the whole unpadded vocab has nothing to gather, so the
+        # draft step adds the bias, keeps the logits and selects in one pass.
+        if per_partition == self.vocab_size:
+            return
         vocab_gather = make_vocab_gather(
             shard_group,
             local_width=per_partition,
@@ -477,13 +488,6 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
         if shard_group.rank == 0:
             cls_name = type(vocab_gather).__name__
             logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
-        self._tp_shard = MarkovW2ShardGeometry(
-            tp_size=tp_size,
-            org_vocab_start=int(lm_head.shard_indices.org_vocab_start_index),
-            org_vocab_end=int(lm_head.shard_indices.org_vocab_end_index),
-            num_embeddings_per_partition=per_partition,
-            num_embeddings_padded=num_padded,
-        )
         self.vocab_shard = VocabShard(
             start=self._tp_shard.org_vocab_start, gather=vocab_gather
         )

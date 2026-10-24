@@ -583,62 +583,62 @@ class MOVADenoisingStage(PipelineStage):
                                 batch,
                             )
 
-                            visual_noise_pred = self._cfg_combine(
-                                pos[0] if pos[0] is not None else neg[0],
-                                neg[0] if neg[0] is not None else pos[0],
-                                batch.guidance_scale,
+                        visual_noise_pred = self._cfg_combine(
+                            pos[0] if pos[0] is not None else neg[0],
+                            neg[0] if neg[0] is not None else pos[0],
+                            batch.guidance_scale,
+                            cfg_rank,
+                            enable_cfg_parallel,
+                        )
+                        audio_noise_pred = self._cfg_combine(
+                            pos[1] if pos[1] is not None else neg[1],
+                            neg[1] if neg[1] is not None else pos[1],
+                            batch.guidance_scale,
+                            cfg_rank,
+                            enable_cfg_parallel,
+                        )
+
+                        if batch.guidance_rescale > 0.0:
+                            visual_noise_pred = self._apply_guidance_rescale(
+                                visual_noise_pred,
+                                pos[0] if pos[0] is not None else None,
+                                batch.guidance_rescale,
                                 cfg_rank,
                                 enable_cfg_parallel,
                             )
-                            audio_noise_pred = self._cfg_combine(
-                                pos[1] if pos[1] is not None else neg[1],
-                                neg[1] if neg[1] is not None else pos[1],
-                                batch.guidance_scale,
+                            audio_noise_pred = self._apply_guidance_rescale(
+                                audio_noise_pred,
+                                pos[1] if pos[1] is not None else None,
+                                batch.guidance_rescale,
                                 cfg_rank,
                                 enable_cfg_parallel,
                             )
 
-                            if batch.guidance_rescale > 0.0:
-                                visual_noise_pred = self._apply_guidance_rescale(
-                                    visual_noise_pred,
-                                    pos[0] if pos[0] is not None else None,
-                                    batch.guidance_rescale,
-                                    cfg_rank,
-                                    enable_cfg_parallel,
-                                )
-                                audio_noise_pred = self._apply_guidance_rescale(
-                                    audio_noise_pred,
-                                    pos[1] if pos[1] is not None else None,
-                                    batch.guidance_rescale,
-                                    cfg_rank,
-                                    enable_cfg_parallel,
-                                )
-
-                        if idx_step + 1 < total_steps:
-                            next_pair_t = paired_timesteps[idx_step + 1]
-                            if getattr(next_pair_t, "shape", None) == (2,):
-                                next_timestep, next_audio_timestep = next_pair_t
-                            else:
-                                next_timestep = next_pair_t
-                                next_audio_timestep = next_pair_t
+                    if idx_step + 1 < total_steps:
+                        next_pair_t = paired_timesteps[idx_step + 1]
+                        if getattr(next_pair_t, "shape", None) == (2,):
+                            next_timestep, next_audio_timestep = next_pair_t
                         else:
-                            next_timestep = None
-                            next_audio_timestep = None
+                            next_timestep = next_pair_t
+                            next_audio_timestep = next_pair_t
+                    else:
+                        next_timestep = None
+                        next_audio_timestep = None
 
-                        batch.latents = scheduler.step_from_to(
-                            visual_noise_pred,
-                            timestep,
-                            next_timestep,
-                            batch.latents,
-                            **extra_step_kwargs,
-                        )
-                        batch.audio_latents = scheduler.step_from_to(
-                            audio_noise_pred,
-                            audio_timestep,
-                            next_audio_timestep,
-                            batch.audio_latents,
-                            **extra_step_kwargs,
-                        )
+                    batch.latents = scheduler.step_from_to(
+                        visual_noise_pred,
+                        timestep,
+                        next_timestep,
+                        batch.latents,
+                        **extra_step_kwargs,
+                    )
+                    batch.audio_latents = scheduler.step_from_to(
+                        audio_noise_pred,
+                        audio_timestep,
+                        next_audio_timestep,
+                        batch.audio_latents,
+                        **extra_step_kwargs,
+                    )
 
                     if progress_bar is not None:
                         progress_bar.update()

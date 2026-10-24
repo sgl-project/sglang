@@ -497,7 +497,9 @@ class DecoderReplayTail:
     def _bridge_outputs(
         self, block_rows: int, outputs: List[Optional[torch.Tensor]]
     ) -> Tuple[Optional[torch.Tensor], ...]:
-        """Block-sized bridge views of the tail rows; rows past the tail are zero."""
+        """Block-sized bridge views of the tail rows. Rows past the tail hold stale
+        values, which reach only rows that _scatter_tail_rows and the
+        real_rows_count cut drop."""
         key = tuple(None if t is None else (t.dtype, t.shape[1:]) for t in outputs)
         sets = self._bridge_buffers.setdefault(key, [])
         if not sets or sets[0][0].shape[0] < block_rows:
@@ -515,7 +517,6 @@ class DecoderReplayTail:
                 continue
             view = buf[:block_rows]
             view[: t.shape[0]].copy_(t)
-            view[t.shape[0] :].zero_()
             views.append(view)
         return tuple(views)
 
@@ -587,8 +588,10 @@ class DecoderReplayTail:
                     hidden_states = state = hc_boundary.materialize(
                         hidden_states, forward_batch, next=next_boundary
                     )
+                    from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
+
                     # The draft head reads the attention input of its target layers.
-                    aux.append(state.residual.mean(dim=1))
+                    aux.append(mhc_stream_mean(state.residual))
                 ctx = (
                     nullcontext()
                     if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)

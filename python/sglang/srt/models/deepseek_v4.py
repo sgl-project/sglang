@@ -72,6 +72,7 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
@@ -200,6 +201,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    ceil_align,
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx942_supported,
@@ -461,6 +463,17 @@ def _fused_wo_a_arch_supported() -> bool:
     return _is_cuda and torch.cuda.get_device_capability()[0] == 10
 
 
+def _wo_a_bf16_bmm_token_major(o: torch.Tensor, wo_a: torch.Tensor) -> torch.Tensor:
+    result = torch.empty(
+        (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
+    )
+    # The strided destination keeps the einsum reduction while producing the
+    # layout wo_b consumes; draft warmup/capture can enter with grad enabled.
+    with torch.no_grad():
+        torch.bmm(o.transpose(0, 1), wo_a.transpose(1, 2), out=result.transpose(0, 1))
+    return result
+
+
 def _apply_wo_a_bf16_matmul(
     o: torch.Tensor,
     wo_a: torch.Tensor,
@@ -525,16 +538,20 @@ def _apply_wo_a_bf16_matmul(
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
-        result = torch.empty(
-            (o.shape[0], wo_a.shape[0], wo_a.shape[1]), dtype=o.dtype, device=o.device
-        )
-        # The strided destination keeps the einsum reduction while producing the
-        # layout wo_b consumes; draft warmup/capture can enter with grad enabled.
-        with torch.no_grad():
-            torch.bmm(
-                o.transpose(0, 1), wo_a.transpose(1, 2), out=result.transpose(0, 1)
-            )
-        return result
+        return _wo_a_bf16_bmm_token_major(o, wo_a)
+    # The DSpark draft runs its block as target verify past 384 rows and with any
+    # group count (8 without attention TP); the strided bmm still matches einsum.
+    if (
+        fast_path
+        and _is_cuda
+        and is_target_verify
+        and o.shape[0] > 0
+        and get_platform().is_blackwell
+        and o.dtype == wo_a.dtype == torch.bfloat16
+        and o.stride(2) == 1
+        and wo_a.is_contiguous()
+    ):
+        return _wo_a_bf16_bmm_token_major(o, wo_a)
     # the 16-row decode kernels also serve V4.1's target-verify rows
     if (is_decode or is_target_verify) and hip_fast_path:
         y = _hip.wo_a_fp8_grid_matmul(o, wo_a, fp8_grid, emit_fp8=emit_fp8)
@@ -814,6 +831,38 @@ def deepseek_v4_mega_attention_with_output(layer, query, output, attn_sink) -> N
 
 bcg_deepseek_v4_mega_attention_with_output = eager_on_graph(True)(
     deepseek_v4_mega_attention_with_output
+)
+
+
+def deepseek_v4_mega_attention_with_mxfp8_output(
+    layer, query, data, scale, attn_sink
+) -> None:
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if real_num_tokens:
+        # DeepGEMM writes the scales at the TMA-aligned stride of the live rows,
+        # while the captured wo_b reads them at the stride of the padded rows.
+        restride = scale.stride(-1) != ceil_align(real_num_tokens, 4)
+        live_scale = (
+            mhc.empty_deepgemm_mxfp8_scales(real_num_tokens, data.shape[1], data.device)
+            if restride
+            else scale[:real_num_tokens]
+        )
+        layer._mega_core(
+            query[:real_num_tokens],
+            attn_sink,
+            forward_batch,
+            get_attn_backend(),
+            out=(data[:real_num_tokens], live_scale),
+        )
+        if restride:
+            scale[:real_num_tokens].copy_(live_scale)
+    data[real_num_tokens:].zero_()
+    scale[real_num_tokens:].zero_()
+
+
+bcg_deepseek_v4_mega_attention_with_mxfp8_output = eager_on_graph(True)(
+    deepseek_v4_mega_attention_with_mxfp8_output
 )
 
 
@@ -1537,12 +1586,24 @@ class MQALayer(MqaAttentionBase):
         if not self.mega_wq_b_permuted:
             q = pack_query(q, kernel_num_heads)
         if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
-            o = q.new_empty((q.shape[0], self.n_local_groups, self.o_lora_rank))
+            rows = q.shape[0]
+            if self._mega_mxfp8_output(rows):
+                y, y_sf = mhc.empty_deepgemm_mxfp8_pair(
+                    rows, self.n_local_groups * self.o_lora_rank, q.device
+                )
+                bcg_deepseek_v4_mega_attention_with_mxfp8_output(
+                    self, q, y, y_sf, attn_sink
+                )
+                return y, y_sf
+            o = q.new_empty((rows, self.n_local_groups, self.o_lora_rank))
             bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
             return o
         return self._mega_core(
             q, attn_sink, forward_batch, attn_backend, allow_mxfp8_output=True
         )
+
+    def _mega_mxfp8_output(self, rows: int) -> bool:
+        return self.wo_b.deepgemm_mxfp8_input and mhc.fused_mxfp8_rows(rows)
 
     def _mega_core(
         self,
@@ -1551,8 +1612,9 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         attn_backend,
         allow_mxfp8_output: bool = False,
-        out: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor | Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        """``out`` is a bf16 tensor or an (fp8, DeepGEMM-packed scale) pair."""
         data, scale = attn_backend.forward(
             q=q,
             k=q,
@@ -1567,14 +1629,12 @@ class MQALayer(MqaAttentionBase):
         groups = self.n_local_groups
         rows = data.shape[0]
         o_fp8, o_s = data[:, :groups], scale[:, :groups]
-        if (
-            allow_mxfp8_output
-            and self.wo_b.deepgemm_mxfp8_input
-            and mhc.fused_mxfp8_rows(rows)
-        ):
-            y, y_sf = mhc.empty_deepgemm_mxfp8_pair(
+        if out is None and allow_mxfp8_output and self._mega_mxfp8_output(rows):
+            out = mhc.empty_deepgemm_mxfp8_pair(
                 rows, groups * self.o_lora_rank, data.device
             )
+        if isinstance(out, tuple):
+            y, y_sf = out
             _fp8_wo_a_einsum(
                 o_fp8,
                 o_s,
@@ -3887,7 +3947,7 @@ class DeepseekV4Model(nn.Module):
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
-        dspark_aux_hidden_states: List[torch.Tensor],
+        dspark_aux_hidden_states: Optional[AuxHiddenStatePacker],
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
         hash_ids = None
@@ -4035,7 +4095,8 @@ class DeepseekV4Model(nn.Module):
                                 ),
                             )
                         )
-                        dspark_aux_hidden_states.extend(aux)
+                        if capture_dspark:
+                            dspark_aux_hidden_states.extend(aux)
                         residual_batch.clear(forward_batch)
                         bcg_deepseek_v4_exit_late_layer_tail(tail_sentinel)
                         return residual, pre, tail
@@ -4062,7 +4123,8 @@ class DeepseekV4Model(nn.Module):
                         capture_dspark=capture_dspark,
                         dp_rows=tail_graph_dp_rows,
                     )
-                    dspark_aux_hidden_states.extend(aux)
+                    if capture_dspark:
+                        dspark_aux_hidden_states.extend(aux)
                     residual_batch.clear(forward_batch)
                     attn_backend.exit_late_layer_tail(saved_full, forward_batch)
                     return residual, pre, tail
@@ -4076,7 +4138,8 @@ class DeepseekV4Model(nn.Module):
                     capture_dspark=capture_dspark,
                     dp_rows=tail_graph_dp_rows,
                 )
-                dspark_aux_hidden_states.extend(aux)
+                if capture_dspark:
+                    dspark_aux_hidden_states.extend(aux)
                 residual_batch.clear(forward_batch)
                 return residual, pre, None
             if late_dp_counts is not None and i == self.late_layer_start:
@@ -4103,11 +4166,13 @@ class DeepseekV4Model(nn.Module):
                 if _is_cuda:
                     hidden_states = residual_batch.set_written(state, forward_batch)
             if capture_dspark and i in self.dspark_layers_to_capture:
+                from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
+
                 # The draft head reads the attention input of its target layers.
                 aux = state.residual
                 if tail is not None and i < self.late_layer_start:
                     aux = tail.rows(aux)
-                dspark_aux_hidden_states.append(aux.mean(dim=1))
+                mhc_stream_mean(aux, out=dspark_aux_hidden_states.slot(aux[:, 0]))
                 del aux
             ctx = (
                 nullcontext()
@@ -4346,7 +4411,11 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
         capture_dspark = self.dspark_layers_to_capture is not None
-        dspark_aux_hidden_states: List[torch.Tensor] = []
+        dspark_aux_hidden_states = (
+            AuxHiddenStatePacker(len(self.dspark_layers_to_capture))
+            if capture_dspark
+            else None
+        )
 
         attn_backend = get_attn_backend()
         if _is_npu and forward_batch.attn_cp_metadata is not None:
@@ -4438,6 +4507,8 @@ class DeepseekV4Model(nn.Module):
                             prev_comb=prev_comb,
                         )
                 if capture_dspark and i in self.dspark_layers_to_capture:
+                    from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
+
                     if _is_cuda:
                         completed = hc_boundary.materialize(
                             hidden_states, forward_batch, consume=False
@@ -4448,7 +4519,9 @@ class DeepseekV4Model(nn.Module):
                         )
                     else:
                         completed = hidden_states
-                    dspark_aux_hidden_states.append(completed.mean(dim=1))
+                    mhc_stream_mean(
+                        completed, out=dspark_aux_hidden_states.slot(completed[:, 0])
+                    )
             if _is_cuda:
                 hidden_states = residual_batch.read_output(
                     hidden_states, forward_batch, hc_boundary.FinalRead(), None
@@ -4488,7 +4561,7 @@ class DeepseekV4Model(nn.Module):
             )
 
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states
+            return (hidden_states, pre_hc_head), dspark_aux_hidden_states.finalize()
 
         return hidden_states, pre_hc_head
 
@@ -4843,7 +4916,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 hidden_states = hidden_states[:n]
                 pre_hc_head = pre_hc_head[:n]
                 if aux_hidden_states is not None:
-                    aux_hidden_states = [a[:n] for a in aux_hidden_states]
+                    aux_hidden_states = aux_hidden_states[:n]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
             logits_metadata.extend_seq_lens = tail.extend_seq_lens
             logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu

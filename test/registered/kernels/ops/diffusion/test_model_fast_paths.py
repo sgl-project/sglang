@@ -54,6 +54,7 @@ from sglang.kernels.ops.diffusion import (
     wan_rmsnorm_silu,
 )
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
     QwenImage21VAEArchConfig,
     QwenImage21VAEConfig,
@@ -144,8 +145,9 @@ from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=110, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=8, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=100, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# backend-specific: preserve ROCm eager fallback coverage for CUDA-only fusions.
+register_amd_ci(est_time=6, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -1264,7 +1266,7 @@ def test_wan_vae_conv_epilogue_wiring_is_bit_exact() -> None:
     wan_vae_cuda_opt._install_norm_silu(
         dec,
         gate,
-        residual_block_cls=wanvae.WanResidualBlock,
+        residual_block_cls=(wanvae.WanResidualBlock,),
         rms_norm_cls=WanRMS_norm,
         label="test",
     )
@@ -1342,7 +1344,7 @@ def test_wan_vae_decoder_install_wires_resample_gate() -> None:
     n_norm = wan_vae_cuda_opt._install_norm_silu(
         dec,
         gate,
-        residual_block_cls=wanvae.WanResidualBlock,
+        residual_block_cls=(wanvae.WanResidualBlock,),
         rms_norm_cls=WanRMS_norm,
         label="test",
     )
@@ -1471,7 +1473,7 @@ def test_qwen_vae_decoder_install_is_gated_and_close() -> None:
     n_norm = wan_vae_cuda_opt._install_norm_silu(
         dec,
         gate,
-        residual_block_cls=qwen_vae.QwenImageResidualBlock,
+        residual_block_cls=(qwen_vae.QwenImageResidualBlock,),
         rms_norm_cls=qwen_vae.QwenImageRMS_norm,
         label="test",
     )

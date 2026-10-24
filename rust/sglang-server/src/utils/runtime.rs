@@ -44,6 +44,8 @@ pub struct Runtime {
     pub from_scheduler_tx: FromSchedulerTx,
     /// Wiring for the late-spawned MM pool ([`Runtime::start_mm_workers`]).
     mm_wiring: crate::multi_modality::worker::MmWiring,
+    /// The shared core, which runs the MM pool processor's media hooks.
+    core: crate::api_server::core::CoreHandle,
     /// Worker join handles, joined by `request_shutdown` / `Drop`.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
@@ -91,6 +93,9 @@ impl Runtime {
     }
 
     fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::MmContext>) {
+        if !self.core.set_mm_processor(ctx.processor.clone()) {
+            tracing::warn!("MM workers started again; admission keeps the first processor");
+        }
         let mut threads = self.threads.lock().unwrap();
         spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
             crate::multi_modality::worker::MmWorker::new(
@@ -321,6 +326,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         let cfg = cfg.clone();
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let shutdown_rx = shutdown_rx.clone();
+        let core = core.clone();
         let hicache_manager = Arc::new(api_server::core::HiCacheManager::new(
             core.clone(),
             &cfg.server_args,
@@ -381,6 +387,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             mm_rx: mm_worker_rx,
             tm_tx: tok_manager_tx,
         },
+        core,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })
