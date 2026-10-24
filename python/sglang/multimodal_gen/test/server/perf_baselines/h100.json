@@ -76,6 +76,15 @@
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 108.4
         },
+        "sana_sprint_1.6b_t2i": {
+            "expected_load_ms": 61764.99,
+            "stages_ms": {},
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 389.33,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 86.1
+        },
         "pi05_action_http": {
             "expected_load_ms": 25954.41,
             "stages_ms": {},
