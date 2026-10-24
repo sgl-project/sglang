@@ -763,6 +763,7 @@ def recompute_w_u_fwd(
         for num_stages in [2, 3, 4]
     ],
     key=["BT", "IS_VARLEN"],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
@@ -942,6 +943,7 @@ def softplus_fwd(x):
         for num_warps in [2, 4, 8]
     ],
     key=["H", "S", "BT", "IS_VARLEN", "HAS_BETA"],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
 def kda_gate_chunk_cumsum_vector_kernel(

@@ -3,10 +3,13 @@ from unittest import mock
 
 import torch
 
+from sglang.kernels.jit.cute_aot_cache import JITCache, persistent_compile_cache
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
+    _FlashInferGDNCache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -38,7 +41,7 @@ def _make_kernel_without_flashinfer() -> FlashInferGDNKernel:
     return kernel
 
 
-class TestFlashInferGDNAlignment(unittest.TestCase):
+class TestFlashInferGDNAlignment(CustomTestCase):
     def test_extend_writes_directly_to_preallocated_output(self):
         kernel = _make_kernel_without_flashinfer()
         kernel.use_state_pool = True
@@ -408,6 +411,43 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
         self.assertEqual(captured_ptrs[0], captured_ptrs[1])
         torch.testing.assert_close(first_pool, torch.ones_like(first_pool))
         torch.testing.assert_close(second_pool, torch.full_like(second_pool, 2))
+
+
+class TestFlashInferGDNCache(CustomTestCase):
+    def test_flashinfer_bridge_reuses_aot_cache(self):
+        kernel = type("Kernel", (), {"__module__": "flashinfer.gdn_kernels.test"})
+        ffi_option = type("EnableTVMFFI", (), {})
+        key = (((kernel, object), ("head_dim", 128)), ((ffi_option, True),))
+        aot = JITCache()
+        first = _FlashInferGDNCache({}, aot)
+        assert first.get(key) is None
+        compiled = object()
+        first[key] = compiled
+        assert aot[key] is compiled
+        second = _FlashInferGDNCache({}, aot)
+        assert second.get(key) is compiled
+        assert second[key] is compiled
+        other_key = ("non-GDN", ())
+        second[other_key] = compiled
+        assert second.get(other_key) is compiled
+        assert other_key not in aot
+
+        # Pure compile factories (e.g. the DSA indexer's LayerNorm) use the
+        # same cache through a decorator, without serializing launch state.
+        with mock.patch(
+            "sglang.kernels.jit.cute_aot_cache.get_jit_cache", return_value=JITCache()
+        ):
+            factory = mock.Mock(return_value=compiled)
+            cached = persistent_compile_cache("test", source_paths=())(factory)
+            assert cached(128, dtype="bf16") is compiled
+            assert cached(128, dtype="bf16") is compiled
+            factory.assert_called_once()
+            restored = persistent_compile_cache("test", source_paths=())(
+                mock.Mock(side_effect=AssertionError("unexpected compilation"))
+            )
+            assert restored(128, dtype="bf16") is compiled
+            cached(256, dtype="bf16")
+            assert factory.call_count == 2
 
 
 if __name__ == "__main__":
