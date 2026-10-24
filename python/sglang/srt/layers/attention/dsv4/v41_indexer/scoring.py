@@ -343,6 +343,7 @@ class ChunkScores(msgspec.Struct, frozen=True):
     tok: torch.Tensor
     lens: torch.Tensor
     scores: torch.Tensor  # [rows, lc] bf16, -inf past each row's length
+    candidate_only: bool = False
 
 
 class DecodeScores(msgspec.Struct, frozen=True):
@@ -357,13 +358,25 @@ def prefill_requests(
     *,
     inputs: PrefillInputs,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    candidate_block_size: int = 8,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
     """Requests with nothing visible yet are skipped."""
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
-    assert req is not None, "the torch indexer needs the batch's rows"
+    if req is None:
+        # CP query rows are rank-local and remain grouped by request.
+        assert inputs.rows_per_request is not None
+        repeats = inputs.rows_per_request_device
+        if repeats is None:
+            repeats = async_h2d(
+                inputs.rows_per_request, dtype=torch.int32, device=pos.device
+            )
+        req = torch.repeat_interleave(
+            inputs.req_pool_indices, repeats, output_size=pos.numel()
+        )
     assert inputs.seq_lens_cpu is not None
     # First flattened-K column of each request row, as inputs.k_slots lays them out.
     k_starts = dict(
@@ -394,7 +407,13 @@ def prefill_requests(
         yield (
             request,
             _score_chunks(
-                indexer=indexer, q=q, weights=weights, index_k=index_k, request=request
+                indexer=indexer,
+                q=q,
+                weights=weights,
+                index_k=index_k,
+                request=request,
+                candidate_blocks=candidate_blocks,
+                candidate_block_size=candidate_block_size,
             ),
         )
 
@@ -406,16 +425,48 @@ def _score_chunks(
     weights: torch.Tensor,
     index_k: torch.Tensor,
     request: RequestScores,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    candidate_block_size: int = 8,
 ) -> Iterator[ChunkScores]:
     lc, j = request.lc, request.columns
-    # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
-    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * lc * 2))
+    candidate_width = (
+        candidate_blocks.shape[1] * candidate_block_size
+        if candidate_blocks is not None
+        else 0
+    )
+    candidate_only = (
+        candidate_width > 0
+        and candidate_width * 2 <= lc
+        and q.is_cuda
+        and torch.version.hip is None
+        and q.dtype == index_k.dtype == weights.dtype == torch.bfloat16
+        and q.shape[1] <= 64
+        and q.shape[2] == 128
+    )
+    score_width = candidate_width if candidate_only else lc
+    rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * score_width * 2))
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
         tok_c, lens_c = request.tok[rows], request.lens[rows]
-        s = indexer.scores(q[tok_c], index_k, weights[tok_c])
-        s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
-        yield ChunkScores(rows=rows, tok=tok_c, lens=lens_c, scores=s)
+        if candidate_only:
+            from sglang.kernels.ops.attention.dsv4.candidate_scores import (
+                candidate_scores,
+            )
+
+            s = candidate_scores(
+                q[tok_c],
+                index_k,
+                weights[tok_c],
+                candidate_blocks[tok_c],
+                lens_c,
+                candidate_block_size,
+            )
+        else:
+            s = indexer.scores(q[tok_c], index_k, weights[tok_c])
+            s = s.masked_fill(j[None, :] >= lens_c[:, None], -torch.inf)
+        yield ChunkScores(
+            rows=rows, tok=tok_c, lens=lens_c, scores=s, candidate_only=candidate_only
+        )
 
 
 def write_prefill(
