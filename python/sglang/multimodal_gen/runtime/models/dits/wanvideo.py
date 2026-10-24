@@ -422,6 +422,26 @@ def _wan_temb_table_slices(
     return _eager_temb_table_slices(table, temb)
 
 
+def _rows_of_one_buffer(parts: list[torch.Tensor]) -> torch.Tensor | None:
+    """``torch.cat(parts)`` without a copy, when the parts are consecutive equal-shape
+    rows of one buffer"""
+    first = parts[0]
+    start, nbytes = first.data_ptr(), first.nbytes
+    storage = first.untyped_storage()
+    if start + len(parts) * nbytes > storage.data_ptr() + storage.nbytes():
+        return None
+    for i, part in enumerate(parts):
+        if (
+            part.data_ptr() != start + i * nbytes
+            or part.shape != first.shape
+            or not part.is_contiguous()
+        ):
+            return None
+    return first.as_strided(
+        (len(parts) * first.shape[0], *first.shape[1:]), first.stride()
+    )
+
+
 class WanTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -619,22 +639,22 @@ class WanTransformerBlock(nn.Module):
         )
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-        # [3 * dim, dim] weight / [3 * dim] bias whose row blocks back to_q, to_k, to_v
-        self.qkv_weight: torch.Tensor | None = None
-        self.qkv_bias: torch.Tensor | None = None
+        # set by fuse_qkv_weights: to_q / to_k / to_v are plain unquantized linears
+        self.qkv_fusable = False
 
     def fuse_qkv_weights(self) -> None:
-        """Back to_q / to_k / to_v with one weight and one bias, so a single GEMM
-        projects all three while each layer keeps a view of its own rows"""
+        """Move to_q / to_k / to_v into consecutive rows of one weight and one bias, so a
+        single GEMM projects all three (``_fused_qkv``)"""
         layers = (self.to_q, self.to_k, self.to_v)
-        if not all(
+        self.qkv_fusable = all(
             type(layer) is ColumnParallelLinear
             and isinstance(layer.quant_method, UnquantizedLinearMethod)
             and layer.bias is not None
             and not layer.skip_bias_add
             and not layer.gather_output
             for layer in layers
-        ):
+        )
+        if not self.qkv_fusable:
             return
         with torch.no_grad():
             weight = torch.cat([layer.weight for layer in layers])
@@ -643,22 +663,27 @@ class WanTransformerBlock(nn.Module):
         for i, layer in enumerate(layers):
             layer.weight.data = weight[i * rows : (i + 1) * rows]
             layer.bias.data = bias[i * rows : (i + 1) * rows]
-        self.qkv_weight, self.qkv_bias = weight, bias
 
-    def _qkv_fused(self, x: torch.Tensor) -> bool:
-        # the layers still read views of the fused weight (offload or a LoRA wrapper undo it)
-        weight, bias = self.qkv_weight, self.qkv_bias
-        if weight is None or weight.device != x.device:
-            return False
+    def _fused_qkv(
+        self, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The [3 * dim, dim] weight and [3 * dim] bias of ``fuse_qkv_weights``, read back
+        from the layers while they still share them on ``device``. Only the layers hold
+        the shared buffers, so moving the module or offloading or swapping a layer's
+        weight frees them."""
         layers = (self.to_q, self.to_k, self.to_v)
-        w_step = self.to_q.weight.numel() * weight.element_size()
-        b_step = self.to_q.bias.numel() * bias.element_size()
-        return all(
-            type(layer) is ColumnParallelLinear
-            and layer.weight.data_ptr() == weight.data_ptr() + i * w_step
-            and layer.bias.data_ptr() == bias.data_ptr() + i * b_step
-            for i, layer in enumerate(layers)
-        )
+        if (
+            not self.qkv_fusable
+            or torch.compiler.is_compiling()
+            or not all(type(layer) is ColumnParallelLinear for layer in layers)
+            or self.to_q.weight.device != device
+        ):
+            return None
+        weight = _rows_of_one_buffer([layer.weight for layer in layers])
+        bias = _rows_of_one_buffer([layer.bias for layer in layers])
+        if weight is None or bias is None:
+            return None
+        return weight, bias
 
     def _qkv(
         self, norm_hidden_states: torch.Tensor, local_heads: int
@@ -673,10 +698,9 @@ class WanTransformerBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
         """q, k, v as [B, S, heads, head_dim], and whether q and k already carry the
         RoPE of rope_cos_sin_cache (applied in the q/k norm pass)"""
-        if self._qkv_fused(norm_hidden_states):
-            qkv = apply_unquantized_linear(
-                norm_hidden_states, self.qkv_weight, self.qkv_bias
-            )
+        fused = self._fused_qkv(norm_hidden_states.device)
+        if fused is not None:
+            qkv = apply_unquantized_linear(norm_hidden_states, *fused)
             query, key, value = qkv.split(self.to_q.weight.shape[0], dim=-1)
         else:
             query, _ = self.to_q(norm_hidden_states)
@@ -1256,7 +1280,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if isinstance(block, WanTransformerBlock):
                 block.fuse_qkv_weights()
         fused = sum(
-            isinstance(block, WanTransformerBlock) and block.qkv_weight is not None
+            isinstance(block, WanTransformerBlock)
+            and block._fused_qkv(block.to_q.weight.device) is not None
             for block in self.blocks
         )
         logger.info(
