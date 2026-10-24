@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutDenoisingEnv,
     RolloutDitTrajectory,
     RolloutTrajectoryData,
     concat_rollout_trajectory_data,
@@ -12,9 +13,17 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 _STEPS = 4
 
 
-def _per_output_trajectory(output_index: int) -> RolloutTrajectoryData:
+def _per_output_trajectory(
+    output_index: int, with_env: bool = False
+) -> RolloutTrajectoryData:
     """One per-output forward's trajectory: batch dim 1, values tagged by index."""
     tag = float(output_index + 1)
+    env = None
+    if with_env:
+        env = RolloutDenoisingEnv(
+            pos_cond_kwargs={"encoder_hidden_states": torch.full((1, 3), tag)},
+            guidance=torch.full((1,), tag),
+        )
     return RolloutTrajectoryData(
         rollout_log_probs=torch.full((1, _STEPS), tag),
         dit_trajectory=RolloutDitTrajectory(
@@ -22,6 +31,7 @@ def _per_output_trajectory(output_index: int) -> RolloutTrajectoryData:
             timesteps=torch.arange(_STEPS).float(),
             sigmas=torch.linspace(1.0, 0.0, _STEPS + 1),
         ),
+        denoising_env=env,
     )
 
 
@@ -89,6 +99,42 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
 
     def test_select_tolerates_missing_trajectory(self):
         self.assertIsNone(select_output_rollout_trajectory(None, 0))
+
+    def test_merge_concatenates_per_output_conditioning_env(self):
+        """Dynamic batching must not collapse every output's conditioning onto
+        output 0's (regression: concat used to keep only ``first.denoising_env``,
+        so a trainer replaying request k's DiT got request 0's prompt)."""
+        merged = concat_rollout_trajectory_data(
+            [_per_output_trajectory(i, with_env=True) for i in range(3)]
+        )
+
+        env = merged.denoising_env
+        self.assertEqual(
+            env.pos_cond_kwargs["encoder_hidden_states"][:, 0].tolist(),
+            [1.0, 2.0, 3.0],
+        )
+        self.assertEqual(env.guidance.tolist(), [1.0, 2.0, 3.0])
+
+    def test_select_output_index_slices_its_own_conditioning_env(self):
+        merged = concat_rollout_trajectory_data(
+            [_per_output_trajectory(i, with_env=True) for i in range(3)]
+        )
+
+        selected = [
+            select_output_rollout_trajectory(merged, index) for index in range(3)
+        ]
+
+        values = [
+            entry.denoising_env.pos_cond_kwargs["encoder_hidden_states"]
+            .flatten()[0]
+            .item()
+            for entry in selected
+        ]
+        self.assertEqual(values, [1.0, 2.0, 3.0])
+        self.assertEqual(
+            [entry.denoising_env.guidance.item() for entry in selected],
+            [1.0, 2.0, 3.0],
+        )
 
 
 if __name__ == "__main__":
