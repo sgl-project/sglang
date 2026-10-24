@@ -1777,6 +1777,11 @@ class Envs:
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
+    # Keep each rank's engram row shard in exportable device memory (CUDA VMM,
+    # FABRIC handles across an NVLink domain) mapped by every rank of the TP group:
+    # a rank reads its own tokens' rows from the owning shard, with no id gather
+    # and no reduce-scatter. Takes precedence over the host table.
+    SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
