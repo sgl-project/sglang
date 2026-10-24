@@ -73,6 +73,18 @@ def _row_bf16(t, device: torch.device):
     return row if _aligned(row) else None
 
 
+def _per_token_bf16(t, x):
+    """``t`` as an ``[N, D]`` view when it holds one row per token of ``x``."""
+    if (
+        not isinstance(t, torch.Tensor)
+        or t.shape not in (x.shape, x.shape[1:])
+        or not t.is_contiguous()
+        or not _nss_activation(t.view(x.shape), x)
+    ):
+        return None
+    return t.view(-1, _HIDDEN)
+
+
 @cache_once
 def norm_scale_shift_module() -> Module:
     device = torch.device("cuda", torch.cuda.current_device())
@@ -87,6 +99,10 @@ def norm_scale_shift_module() -> Module:
             (
                 "nss_bf16_row",
                 "norm_scale_shift::NormScaleShiftKernel::run",
+            ),
+            (
+                "nss_bf16_token",
+                "norm_scale_shift::NormScaleShiftPerTokenKernel::run",
             ),
             (
                 "srnss_bf16_row",
@@ -178,14 +194,21 @@ def try_fused_norm_scale_shift(x, weight, bias, scale, shift, norm_type, eps):
     if not _nss_activation(x) or not _blackwell_or_newer(x.device):
         return None
 
-    scale = _row_bf16(scale, x.device)
-    shift = _row_bf16(shift, x.device)
-    if scale is None or shift is None:
-        return None
-
     y = torch.empty_like(x)
-    _module().nss_bf16_row(
-        y.view(-1, _HIDDEN), x.view(-1, _HIDDEN), scale, shift, float(eps)
+    row_scale = _row_bf16(scale, x.device)
+    row_shift = _row_bf16(shift, x.device)
+    if row_scale is not None and row_shift is not None:
+        _module().nss_bf16_row(
+            y.view(-1, _HIDDEN), x.view(-1, _HIDDEN), row_scale, row_shift, float(eps)
+        )
+        return y
+
+    token_scale = _per_token_bf16(scale, x)
+    token_shift = _per_token_bf16(shift, x)
+    if token_scale is None or token_shift is None:
+        return None
+    _module().nss_bf16_token(
+        y.view(-1, _HIDDEN), x.view(-1, _HIDDEN), token_scale, token_shift, float(eps)
     )
     return y
 

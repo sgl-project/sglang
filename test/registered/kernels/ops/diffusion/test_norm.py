@@ -508,6 +508,45 @@ def test_cutedsl_scale_residual_gate_index_modes(norm_type, index_mode):
     _run_cute(True, norm_type=norm_type, gate_mode=index_mode)
 
 
+def _native_norm_scale_shift():
+    fused_norm_scale_shift, _ = _import_cutedsl()
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("native norm-scale-shift requires SM100+")
+    from sglang.kernels.kda_kernels import norm_scale_shift_jit
+
+    return fused_norm_scale_shift, norm_scale_shift_jit.try_fused_norm_scale_shift
+
+
+@pytest.mark.parametrize("tokens", [160, 8352])  # FLUX.3 text / 1024^2 joint stream
+@pytest.mark.parametrize("mod_rank", [2, 3])
+@torch.no_grad()
+def test_native_norm_scale_shift_per_token_modulation(tokens, mod_rank):
+    fused_norm_scale_shift, try_native = _native_norm_scale_shift()
+    x = torch.randn(1, tokens, 3072, device=DEVICE, dtype=torch.bfloat16)
+    mod_shape = x.shape if mod_rank == 3 else x.shape[1:]
+    scale = 0.1 * torch.randn(mod_shape, device=DEVICE, dtype=torch.bfloat16)
+    shift = 0.1 * torch.randn(mod_shape, device=DEVICE, dtype=torch.bfloat16)
+
+    y = try_native(x, None, None, scale, shift, "layer", EPS)
+    assert y is not None
+    y_ref, _ = _cute_reference(
+        None, x, None, None, None, scale.view_as(x), shift.view_as(x), "layer", EPS
+    )
+    torch.testing.assert_close(y, y_ref, atol=5e-2, rtol=5e-2)
+    assert torch.equal(
+        fused_norm_scale_shift(x, None, None, scale, shift, "layer", EPS), y
+    )
+
+
+@torch.no_grad()
+def test_native_norm_scale_shift_rejects_strided_per_token_modulation():
+    _, try_native = _native_norm_scale_shift()
+    x = torch.randn(1, 256, 3072, device=DEVICE, dtype=torch.bfloat16)
+    packed = torch.randn(1, 256, 2 * 3072, device=DEVICE, dtype=torch.bfloat16)
+    scale, shift = packed.chunk(2, dim=-1)
+    assert try_native(x, None, None, scale, shift, "layer", EPS) is None
+
+
 def test_validate_scale_shift_rejects_non_divisible_frames():
     _import_cutedsl()
     from sglang.kernels.ops.diffusion import validate_scale_shift
