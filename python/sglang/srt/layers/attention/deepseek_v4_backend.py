@@ -1688,9 +1688,8 @@ class DeepseekV4AttnBackend(
             metadata.low_ratio_pos_i64 = core_attn_metadata.positions_casual.to(
                 torch.int64
             )
-            # A captured launch spans every request slot the bucket can hold. DP
-            # padding extends extend_seq_lens but not extend_start_loc; its rows
-            # belong to no request.
+            # One slot per request the bucket can hold. DP padding extends
+            # extend_seq_lens past the requests; those rows belong to no slot.
             num_reqs = extend_start_loc.shape[0]
             offsets = torch.zeros(
                 (2, min(self.req_to_token.shape[0], padded_num_tokens)),
