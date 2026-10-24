@@ -835,6 +835,9 @@ jobs:
 
       - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 90
+        env:
+          # Keep equal to timeout-minutes above.
+          STEP_TIMEOUT_MINUTES: 90
         run: |
           # AMD CI: All 1-GPU tests except FLUX.2 (FLUX.1 covers same code path)
           # Tests: T2V, T2I, I2V, LoRA
@@ -842,7 +845,14 @@ jobs:
           # HF download env vars:
           # - HF_HUB_ENABLE_HF_TRANSFER=1: Use faster hf_transfer for downloads (if available)
           # - HF_HUB_DISABLE_SYMLINKS_WARNING=1: Suppress symlink warnings
+          #
+          # The runner retries failed cases only while another attempt still
+          # fits before this deadline, so a case that fails every time ends
+          # the step with its failure summary instead of a step timeout.
+          # pr-test-multimodal-gen.yml sets the same variable.
+          RETRY_DEADLINE=$(( $(date +%s) + (STEP_TIMEOUT_MINUTES - 5) * 60 ))
           docker exec \
+            -e SGLANG_DIFFUSION_RETRY_DEADLINE="${RETRY_DEADLINE}" \
             -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
@@ -993,6 +1003,8 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
+          # Keep equal to timeout-minutes above.
+          STEP_TIMEOUT_MINUTES: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 180 || 150 }}
         run: |
           # AMD CI: All 2-GPU tests including LoRA
           # Tests: T2V, T2I, I2V, LoRA
@@ -1005,7 +1017,11 @@ jobs:
           # finished warmup inside the 1200s startup deadline, and the harness
           # retries that TimeoutError six times, running the shard into the
           # step timeout.
+          #
+          # Retry deadline: see the 1-GPU job.
+          RETRY_DEADLINE=$(( $(date +%s) + (STEP_TIMEOUT_MINUTES - 5) * 60 ))
           docker exec \
+            -e SGLANG_DIFFUSION_RETRY_DEADLINE="${RETRY_DEADLINE}" \
             -e HF_TOKEN \
             -e HUGGING_FACE_HUB_TOKEN \
             -e SGLANG_E2E_TOLERANCE=0.3 \
