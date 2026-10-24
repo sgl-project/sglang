@@ -387,6 +387,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         reporter.scheduler_status_logger = None
         reporter.forward_ct_decode = 0
         reporter.decode_log_interval = 1
+        reporter.enable_prefix_cache_hit_rate_window = False
         reporter.last_decode_stats_tic = 0.0
         reporter.num_generated_tokens = 0
         reporter.num_retracted_reqs = 0
