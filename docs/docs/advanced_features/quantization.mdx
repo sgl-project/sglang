@@ -567,6 +567,9 @@ If a model is already quantized (e.g., from Hugging Face), you can load it direc
         --port 30000
     ```
 
+* **Mixed-precision models with CSF-compressed scales:**
+    Some ModelOpt `MIXED_PRECISION` checkpoints, such as `nvidia/Qwen3.8-Flash-Next-FP4-Local`, mark NVFP4 layers with `"weight_scale_encoding": "csf"` in `quantized_layers`. Those layers store their E4M3 block scales losslessly as a `weight_scale.nvfp4_csf_fixed` and `weight_scale.nvfp4_csf_exceptions` pair instead of `weight_scale`. SGLang decodes each pair back to the plain `weight_scale` while loading, so every NVFP4 kernel and tensor-parallel size works unchanged, and the scales take the same GPU memory as an uncompressed checkpoint. No extra flag is needed; the checkpoint resolves to `modelopt_mixed`. Shards stored in a subfolder that `model.safetensors.index.json` names, as in this checkpoint, are found automatically. For Qwen4-Exp checkpoints such as this one, the vision tower's MXFP8 and `W4A16_NVFP4` linears are dequantized to BF16 while loading, since the tower runs in BF16, and the MTP draft reads only the shards that hold its own tensors.
+
 ##### Creating Your Own Quantized Checkpoints
 
 If a pre-quantized checkpoint is not available for your model, you can create one using NVIDIA Model Optimizer's `hf_ptq.py` script.

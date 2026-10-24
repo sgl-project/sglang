@@ -46,6 +46,17 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+# The checkpoint names of the token embedding the draft loads its own copy of
+EMBED_TOKENS_CHECKPOINT_NAMES = (
+    "model.embed_tokens.weight",
+    "model.language_model.embed_tokens.weight",
+)
+
+
+def is_mtp_draft_weight(name: str) -> bool:
+    """Whether Qwen3_5ForCausalLMMTP.load_weights uses the checkpoint tensor NAME."""
+    return name in EMBED_TOKENS_CHECKPOINT_NAMES or "mtp" in name
+
 
 def _mtp_quant_config(quant_config):
     """The quantization the MTP module itself is built with.
@@ -341,10 +352,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             # The last-stage MTP draft cannot share the target embedding on PP0.
             # Load the checkpoint embedding into its retained local copy instead
             # of leaving the torch.empty() allocation uninitialized.
-            if name in (
-                "model.embed_tokens.weight",
-                "model.language_model.embed_tokens.weight",
-            ):
+            if name in EMBED_TOKENS_CHECKPOINT_NAMES:
                 param_name = "model.embed_tokens.weight"
                 if param_name in params_dict:
                     param = params_dict[param_name]
@@ -359,7 +367,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 continue
 
             # Only process MTP branch weights
-            if "mtp" not in name:
+            if not is_mtp_draft_weight(name):
                 continue
 
             if name.startswith("mtp."):

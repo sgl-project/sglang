@@ -56,6 +56,7 @@ from sglang.srt.layers.quantization.marlin_utils_fp4 import (
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.nvfp4_csf import CSF_ENCODING
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
@@ -802,6 +803,37 @@ class ModelOptNvFp4EmbeddingMethod(QuantizeMethodBase):
 # per-block ``weight_scale_inv``) ``FP8_BLOCK_SCALES``; keep it as an alias.
 _BLOCK_FP8_ALGOS = ("FP8_PB_WO", "FP8_BLOCK_SCALES")
 
+# The quant algos whose scales may carry a `weight_scale_encoding`, and their group size
+_CSF_QUANT_ALGOS = ("NVFP4", "W4A16_NVFP4")
+_CSF_GROUP_SIZE = 16
+
+
+def _validate_weight_scale_encodings(
+    quantized_layers: Dict[str, Dict[str, Any]],
+) -> None:
+    """Raise, naming the layer, for a `weight_scale_encoding` SGLang cannot decode."""
+    for layer_name, info in quantized_layers.items():
+        encoding = info.get("weight_scale_encoding")
+        if encoding is None:
+            continue
+        if encoding != CSF_ENCODING:
+            raise ValueError(
+                f"{layer_name}: unknown weight_scale_encoding {encoding!r}; "
+                f"only {CSF_ENCODING!r} is supported."
+            )
+        quant_algo = info.get("quant_algo", "").upper()
+        if quant_algo not in _CSF_QUANT_ALGOS:
+            raise ValueError(
+                f"{layer_name}: weight_scale_encoding {encoding!r} needs quant_algo "
+                f"in {_CSF_QUANT_ALGOS}, got {quant_algo!r}."
+            )
+        group_size = int(info.get("group_size", _CSF_GROUP_SIZE))
+        if group_size != _CSF_GROUP_SIZE:
+            raise ValueError(
+                f"{layer_name}: weight_scale_encoding {encoding!r} needs group_size "
+                f"{_CSF_GROUP_SIZE}, got {group_size}."
+            )
+
 
 class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     """Configuration for ModelOpt MIXED_PRECISION checkpoints."""
@@ -819,7 +851,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         fp8_block_config: Fp8Config,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
+        _validate_weight_scale_encodings(quantized_layers)
         self.quantized_layers = quantized_layers
+        self.has_csf_scales = any(
+            info.get("weight_scale_encoding") == CSF_ENCODING
+            for info in quantized_layers.values()
+        )
         self.fp8_config = fp8_config
         self.mxfp8_config = mxfp8_config
         self.fp8_block_config = fp8_block_config
@@ -1032,6 +1069,18 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
 
     def resolve_quant_algo(self, prefix: str) -> Optional[str]:
         return self._resolve_quant_algo(prefix)
+
+    def scale_encoding_of(self, prefix: str) -> Optional[str]:
+        """The scale encoding of the closest quantized layer at or above PREFIX."""
+        # Walk up, since per-expert names (`...experts.7.gate_proj`) are not keys.
+        name = prefix
+        while name:
+            for candidate in self._quantized_layer_prefix_candidates(name):
+                if candidate in self.quantized_layers:
+                    layer_info = self.quantized_layers[candidate]
+                    return layer_info.get("weight_scale_encoding")
+            name = name.rpartition(".")[0]
+        return None
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
