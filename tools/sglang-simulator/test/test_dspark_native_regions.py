@@ -4,7 +4,6 @@ Attestation strings below are protocol fixtures, not a constructed/admitted
 execution profile. No SDK prospective projector or factory activation is faked.
 """
 
-import hashlib
 import json
 from dataclasses import replace
 
@@ -33,7 +32,7 @@ CASES = (
 def prepared(mode, phase, region, *, batch_size=1):
     sdk = pytest.importorskip("infercast.sdk.native_segment_module")
     from infercast.sdk.models.umd.templates.deepseek_v41_segments import (
-        prepare_native_segment_modules,
+        prepare_native_dspark_phase,
     )
     from infercast.sdk.native_forward_input import NativeForwardInput
     from infercast.sdk.native_sampling import SAMPLING_FIELDS
@@ -110,22 +109,13 @@ def prepared(mode, phase, region, *, batch_size=1):
             ),
         ),
     )
-    description, point = prepare_native_segment_modules((query,))
-    description = replace(
-        description,
-        extra={
-            **description.extra,
-            "complete_dspark_worker_phase": phase,
-            "native_segment_profile_id": query.execution_profile_id,
-            "native_segment_runtime_profile_sha256": hashlib.sha256(
-                before.runtime_profile_json.encode()
-            ).hexdigest(),
-        },
+    description, point, graph_phase = prepare_native_dspark_phase(
+        query=query, phase=phase, runtime_profile_json=before.runtime_profile_json
     )
     return dict(
         description=description,
         point=point,
-        graph_phase="context" if mode == "EXTEND" else "generation",
+        graph_phase=graph_phase,
         phase=phase,
         step=before,
     )
