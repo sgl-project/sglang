@@ -1695,7 +1695,12 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     block_tables = self.forward_metadata.block_tables
                 if self.use_fia:
-                    if self._can_use_tnd(layer):
+                    # GPT-OSS has D=64 and scalar sinks. The BSND fallback
+                    # below does not preserve sinks, so use the TND sink path.
+                    if self._can_use_tnd(layer) or (
+                        sinks is not None
+                        and layer.qk_head_dim == layer.v_head_dim == 64
+                    ):
                         num_token_padding = q.shape[0]
                         if (
                             num_token_padding
@@ -3152,13 +3157,19 @@ class AscendAttnBackend(AttentionBackend):
                             layer.sliding_window_size,
                         )
 
+                    # Learnable sinks require TND; each decode sequence has one query.
+                    use_tnd = sinks is not None
+                    query = q.view(
+                        forward_batch.batch_size,
+                        -1,
+                        layer.tp_q_head_num,
+                        layer.qk_head_dim,
+                    )
+                    if use_tnd:
+                        query = query.flatten(0, 1).contiguous()
+
                     attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                        q.view(
-                            forward_batch.batch_size,
-                            -1,
-                            layer.tp_q_head_num,
-                            layer.qk_head_dim,
-                        ),
+                        query,
                         k_cache.view(
                             -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
                         ),
@@ -3167,15 +3178,29 @@ class AscendAttnBackend(AttentionBackend):
                         ),
                         num_query_heads=layer.tp_q_head_num,
                         num_key_value_heads=layer.tp_k_head_num,
-                        input_layout="BSND",
+                        input_layout="TND" if use_tnd else "BSND",
                         block_size=block_size,
-                        atten_mask=(mask if layer.sliding_window_size != -1 else None),
-                        sparse_mode=4 if layer.sliding_window_size != -1 else 0,
+                        atten_mask=(
+                            mask if use_tnd or layer.sliding_window_size != -1 else None
+                        ),
+                        sparse_mode=(
+                            4
+                            if layer.sliding_window_size != -1
+                            else (3 if use_tnd else 0)
+                        ),
                         softmax_scale=layer.scaling,
                         block_table=block_tables,
-                        actual_seq_qlen=[1] * len(self.forward_metadata.seq_lens),
+                        actual_seq_qlen=(
+                            list(range(1, len(self.forward_metadata.seq_lens) + 1))
+                            if use_tnd
+                            else [1] * len(self.forward_metadata.seq_lens)
+                        ),
                         actual_seq_kvlen=actual_seq_len_kv,
-                        pre_tokens=layer.sliding_window_size,
+                        pre_tokens=(
+                            layer.sliding_window_size
+                            if layer.sliding_window_size != -1
+                            else FULL_ATTENTION_WINDOW
+                        ),
                         next_tokens=0,
                         learnable_sink=sinks,
                     )
