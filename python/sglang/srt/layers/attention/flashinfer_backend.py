@@ -1059,6 +1059,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     not self.enable_deterministic
                     and not is_in_tc_piecewise_cuda_graph()
                     and not self.use_paged
+                    # The single ragged wrapper serves every layer and is planned
+                    # without a window; the window_left passed at run time does not
+                    # change the planned kernel, so sliding-window layers would
+                    # attend the whole prompt. Use the per-dispatch paged wrappers,
+                    # which are planned with the window.
+                    and self.dispatch_reason != WrapperDispatch.SLIDING_WINDOW
                 )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
