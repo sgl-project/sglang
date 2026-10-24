@@ -264,6 +264,49 @@ class TestNormalizeRopeScalingCompat(CustomTestCase):
 
 
 class TestGetRopeConfig(CustomTestCase):
+    def test_v5_gemma_layer_types(self):
+        from transformers import Gemma3TextConfig
+
+        cfg = Gemma3TextConfig()
+        theta, params = get_rope_config(cfg)
+        self.assertEqual(theta, 1000000.0)
+        self.assertIs(params, cfg.rope_parameters["full_attention"])
+        theta, params = get_rope_config(cfg, layer_type="sliding_attention")
+        self.assertEqual(theta, 10000.0)
+        self.assertIs(params, cfg.rope_parameters["sliding_attention"])
+
+    def test_v5_deepseek_layer_types(self):
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.for_model(
+            "deepseek_v4",
+            rope_parameters={
+                "main": {"rope_type": "default", "rope_theta": 20000.0},
+                "compress": {
+                    "rope_type": "yarn",
+                    "rope_theta": 320000.0,
+                    "factor": 8.0,
+                    "original_max_position_embeddings": 65536,
+                },
+            },
+        )
+        theta, params = get_rope_config(cfg)
+        self.assertEqual(theta, 20000.0)
+        self.assertIs(params, cfg.rope_parameters["main"])
+        theta, params = get_rope_config(cfg, layer_type="compress")
+        self.assertEqual(theta, 320000.0)
+        self.assertEqual(params["factor"], 8.0)
+        self.assertEqual(params["original_max_position_embeddings"], 65536)
+        self.assertIs(params, cfg.rope_parameters["compress"])
+
+    def test_layer_selection_preserves_flat_configs(self):
+        from transformers import LlamaConfig
+
+        cfg = LlamaConfig(rope_theta=500000.0)
+        theta, params = get_rope_config(cfg, layer_type="full_attention")
+        self.assertEqual(theta, 500000.0)
+        self.assertIs(params, cfg.rope_parameters)
+
     def test_v5_rope_parameters(self):
         cfg = PretrainedConfig()
         cfg.rope_parameters = {"rope_theta": 10000.0, "rope_type": "default"}

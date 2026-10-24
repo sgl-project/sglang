@@ -1099,16 +1099,22 @@ class MqaAttentionBase(nn.Module):
 
         from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 
-        rope_theta, rope_scaling = get_rope_config(config)
+        rope_theta, rope_scaling = get_rope_config(config, layer_type="main")
+        self.rope_base = rope_theta
+        if self.compress_ratio:
+            rope_params = getattr(config, "rope_parameters", None)
+            if rope_params is not None and "compress" in rope_params:
+                self.rope_base, rope_scaling = get_rope_config(
+                    config, layer_type="compress"
+                )
+            else:
+                self.rope_base = config.compress_rope_theta
         self.rope_scaling = dict(rope_scaling) if rope_scaling else None
         scaling = self.rope_scaling or {}
 
         # RoPE is selected at layer granularity in the reference model. Pure
         # SWA layers use the main unscaled RoPE, while C4/C128 layers use the
         # compressed YaRN RoPE for Q, their SWA branch, and compressed KV.
-        self.rope_base = (
-            config.compress_rope_theta if self.compress_ratio else rope_theta
-        )
         original_seq_len: int = (
             rope_original_seq_len
             if rope_original_seq_len is not None

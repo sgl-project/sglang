@@ -68,7 +68,7 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
             },
         )
 
-    def _make_layer(self, compress_ratio):
+    def _make_layer(self, compress_ratio, config=None):
         parallel = SimpleNamespace(attn_tp_rank=0, attn_tp_size=1, tp_size=1)
         device = SimpleNamespace(device=torch.device("cpu"))
         with (
@@ -96,9 +96,50 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
             patch.object(deepseek_v4, "RadixAttention", _ModuleStub),
         ):
             return deepseek_v4.MQALayer(
-                config=self._config(compress_ratio),
+                config=config if config is not None else self._config(compress_ratio),
                 layer_id=0,
             )
+
+    def test_nested_rope_config_selects_the_layer_parameters(self):
+        from transformers import AutoConfig
+
+        for compress_ratio in (0, 4, 128):
+            with self.subTest(compress_ratio=compress_ratio):
+                config_kwargs = vars(self._config(compress_ratio))
+                config_kwargs.pop("rope_scaling")
+                config = AutoConfig.for_model(
+                    "deepseek_v4",
+                    **config_kwargs,
+                    num_hidden_layers=1,
+                    rope_parameters={
+                        "main": {"rope_type": "default", "rope_theta": 20000.0},
+                        "compress": {
+                            "rope_type": "yarn",
+                            "rope_theta": 320000.0,
+                            "factor": 8.0,
+                            "original_max_position_embeddings": 65536,
+                            "beta_fast": 32,
+                            "beta_slow": 1,
+                        },
+                    },
+                )
+                config.compress_ratios = [compress_ratio]
+                layer = self._make_layer(compress_ratio, config=config)
+                expected = precompute_freqs_cis(
+                    dim=64,
+                    seqlen=128,
+                    original_seq_len=65536 if compress_ratio else 0,
+                    base=320000.0 if compress_ratio else 20000.0,
+                    factor=8.0 if compress_ratio else 1.0,
+                    beta_fast=32,
+                    beta_slow=1,
+                )
+                torch.testing.assert_close(layer.freqs_cis, expected)
+                if compress_ratio:
+                    self.assertEqual(layer.rotary_emb.rope_scaling["factor"], 8.0)
+                    self.assertEqual(layer.rope_base, 320000.0)
+                else:
+                    self.assertIsNone(layer.rotary_emb.rope_scaling)
 
     def test_pure_swa_layer_uses_unscaled_main_rope(self):
         layer = self._make_layer(0)
