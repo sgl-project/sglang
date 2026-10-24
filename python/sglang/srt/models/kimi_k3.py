@@ -7,7 +7,6 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
-import os
 import re
 from array import array
 from collections.abc import Iterable
@@ -147,7 +146,6 @@ from sglang.srt.utils import is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
-    get_bool_env_var,
     rank0_log,
     set_weight_attrs,
 )
@@ -159,7 +157,7 @@ logger = logging.getLogger(__name__)
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
-_aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_aiter_k3_opt = envs.SGLANG_OPT_HIP_K3_AITER.get()
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -1620,7 +1618,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self._qkvgbfa_layer: Optional[SimpleNamespace] = None
                 self._qkvgbfa_sizes: Optional[list[int]] = None
                 self._qkvgbfa_bs_limit = (
-                    envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS.get()
+                    envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ_MAX_TOKENS.get()
                 )
         elif self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
@@ -1891,7 +1889,7 @@ class KimiK3DeltaAttention(nn.Module):
         plain unquantized 2-D tensors of one dtype and width -- the checkpoint
         keeps attention in bf16, but a quantized variant would carry scales
         that a raw row-cat would silently drop."""
-        if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
+        if not (_is_hip and envs.SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ.get()):
             return False
         if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
             return False
@@ -1923,7 +1921,7 @@ class KimiK3DeltaAttention(nn.Module):
             layer = self.attn
             w = layer.conv_weights
             f_b_weight = self.f_b_proj.weight
-            backend = os.environ.get("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "").lower()
+            backend = envs.SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND.get().lower()
             backend_available = (
                 backend == "aiter"
                 and kda_fused_decode_aiter_hip.available(f_b_weight.device)
@@ -2024,7 +2022,7 @@ class KimiK3DeltaAttention(nn.Module):
                 ):
                     # ROCm only. One GEMM for the whole in-proj: the [f_a|b]
                     # tail rides the wide projection's bandwidth (~30% of the
-                    # in-proj at decode on gfx950, SGLANG_ROCM_K3_FUSE_KDA_INPROJ).
+                    # in-proj at decode on gfx950, SGLANG_OPT_HIP_K3_FUSE_KDA_INPROJ).
                     fused_states = self.fused_qkvg_proj.quant_method.apply(
                         self._qkvgbfa_layer, hidden_states, None
                     )

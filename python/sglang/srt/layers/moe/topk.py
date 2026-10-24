@@ -2111,7 +2111,7 @@ def biased_grouped_topk_gpu(
         bias = correction_bias.to(dtype=gating_output.dtype)
         scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
 
-        if envs.SGLANG_K3_RADIX4_TOPK.get():
+        if envs.SGLANG_OPT_HIP_K3_RADIX4_TOPK.get():
             from sglang.kernels.ops.moe import moe_route_radix4
 
             # Gated on the routing shape. Kimi-K3 (896 experts, top-16,
