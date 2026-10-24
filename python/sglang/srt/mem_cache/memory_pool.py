@@ -5263,6 +5263,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
     index_k_with_scale_buffer_dtype = torch.uint8
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
+    def pd_kv_layout(self) -> str:
+        """The MLA row width, which differs between DSA backends for the same dtype."""
+        return f"dsa_mla_row:{self.kv_cache_dim}"
+
     def __init__(
         self,
         size: int,

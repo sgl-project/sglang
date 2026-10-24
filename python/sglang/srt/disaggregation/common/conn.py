@@ -1320,7 +1320,10 @@ class CommonKVManager(BaseKVManager):
             raise RuntimeError(
                 f"KV layout mismatch: prefill server has kv_layout={info.kv_layout}, "
                 f"but decode server has kv_layout={self.kv_layout}. Both servers "
-                f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
+                f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT "
+                f"(DeepSeek-V4), or DSA backends that store the same row "
+                f"(DSA: e.g. --dsa-prefill-backend flashmla_kv --dsa-decode-backend "
+                f"flashmla_kv on a prefill paired with a HiSparse decode)."
             )
 
         local_layout = self.dsv41_spec_layout
