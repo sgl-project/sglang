@@ -38,6 +38,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -63,6 +64,144 @@ class TestCompletionRequest(unittest.TestCase):
 
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model")  # missing prompt
+
+
+class TestAllowedTools(CustomTestCase):
+    def _tool(self, name):
+        return {"type": "function", "function": {"name": name, "parameters": {}}}
+
+    def _choice(self, names, mode="auto"):
+        return {
+            "type": "allowed_tools",
+            "allowed_tools": {"mode": mode, "tools": [self._tool(n) for n in names]},
+        }
+
+    def _request(self, names, **kwargs):
+        return ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[self._tool("keep"), self._tool("drop")],
+            tool_choice=self._choice(names),
+            **kwargs,
+        )
+
+    def test_subset_is_normalized_before_generation(self):
+        request = self._request(["keep"])
+        self.assertEqual(request.tool_choice, "auto")
+        self.assertEqual([t.function.name for t in request.tools], ["keep"])
+        self.assertEqual(
+            ChatCompletionRequest.model_validate(request.model_dump()).model_dump(),
+            request.model_dump(),
+        )
+        empty = self._request([])
+        self.assertEqual(empty.tool_choice, "auto")
+        self.assertEqual(empty.tools, [])
+
+    def test_message_declarations_are_filtered_without_rewriting_history(self):
+        messages = [
+            {"role": "system", "content": "", "tools": [self._tool("drop")]},
+            {"role": "developer", "content": "", "tools": [self._tool("keep")]},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "old",
+                        "type": "function",
+                        "function": {"name": "drop", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "old", "content": "done"},
+        ]
+        request = ChatCompletionRequest(
+            messages=messages, tool_choice=self._choice(["keep"], mode="required")
+        )
+        self.assertEqual(request.tool_choice, "required")
+        self.assertEqual(request.messages[0].tools, [])
+        self.assertEqual(request.messages[1].tools[0].function.name, "keep")
+        self.assertEqual(request.messages[2].tool_calls[0].function.name, "drop")
+        self.assertEqual(messages[0]["tools"][0]["function"]["name"], "drop")
+        params = request.to_sampling_params([], {}, ("json_schema", {"type": "object"}))
+        self.assertIn("json_schema", params)
+
+    def test_root_declarations_keep_only_allowed_tools_and_schema_fields(self):
+        for strict in (None, False):
+            with self.subTest(strict=strict):
+                function = {"parameters": {"type": "object"}}
+                if strict is not None:
+                    function["strict"] = strict
+                function.update(name="keep", description="kept schema")
+                tools = [
+                    {"type": "function", "function": function},
+                    self._tool("drop"),
+                ]
+                request = ChatCompletionRequest(
+                    messages=[{"role": "root", "content": "", "tools": tools}],
+                    tool_choice=self._choice(["keep"], mode="required"),
+                )
+                self.assertEqual(request.tool_choice, "required")
+                self.assertEqual(
+                    [tool.function.name for tool in request.messages[0].tools],
+                    ["keep"],
+                )
+                serialized = request.messages[0].tools[0].function.model_dump()
+                self.assertEqual(serialized, function)
+                self.assertEqual(list(serialized), list(function))
+                self.assertEqual(len(tools), 2)
+
+    def test_root_and_request_declarations_are_both_filtered(self):
+        messages = [{"role": "root", "content": "", "tools": [self._tool("drop")]}]
+        tools = [self._tool("keep"), self._tool("drop")]
+        request = ChatCompletionRequest(
+            messages=messages,
+            tools=tools,
+            tool_choice=self._choice(["keep"]),
+        )
+        self.assertEqual([tool.function.name for tool in request.tools], ["keep"])
+        self.assertEqual(request.messages[0].tools, [])
+        self.assertEqual(messages[0]["tools"][0]["function"]["name"], "drop")
+        self.assertEqual(len(tools), 2)
+
+    def test_allowed_mode_is_preserved_for_template_rendering(self):
+        for mode in ("auto", "required"):
+            for template_kwargs in (
+                None,
+                {},
+                {"tool_choice": None},
+                {"tool_choice": mode},
+            ):
+                with self.subTest(mode=mode, template_kwargs=template_kwargs):
+                    original = (
+                        None if template_kwargs is None else dict(template_kwargs)
+                    )
+                    request = ChatCompletionRequest(
+                        messages=[{"role": "user", "content": "Hi"}],
+                        tools=[self._tool("keep"), self._tool("drop")],
+                        tool_choice=self._choice(["keep"], mode),
+                        chat_template_kwargs=template_kwargs,
+                    )
+                    self.assertEqual(request.tool_choice, mode)
+                    self.assertEqual(request.chat_template_kwargs["tool_choice"], mode)
+                    self.assertEqual(template_kwargs, original)
+                    self.assertEqual(
+                        [tool.function.name for tool in request.tools], ["keep"]
+                    )
+
+    def test_invalid_subsets_are_rejected(self):
+        for names, mode, expected in [
+            (["missing"], "auto", "undeclared"),
+            (["keep", "keep"], "auto", "unique"),
+            ([], "required", "must not be empty"),
+        ]:
+            with self.subTest(names=names, mode=mode):
+                with self.assertRaisesRegex(ValidationError, expected):
+                    ChatCompletionRequest(
+                        messages=[{"role": "user", "content": "Hi"}],
+                        tools=[self._tool("keep")],
+                        tool_choice=self._choice(names, mode),
+                    )
+        with self.assertRaisesRegex(ValidationError, "conflicts"):
+            self._request(["keep"], chat_template_kwargs={"tool_choice": "required"})
 
 
 class TestChatCompletionRequest(unittest.TestCase):

@@ -869,6 +869,26 @@ class ToolChoice(BaseModel):
     type: Literal["function"] = Field(default="function", examples=["function"])
 
 
+class AllowedToolReference(BaseModel):
+    """A function selected from tools already declared by the request."""
+
+    class FunctionName(BaseModel):
+        name: str = Field(min_length=1)
+
+    type: Literal["function"]
+    function: FunctionName
+
+
+class AllowedTools(BaseModel):
+    mode: Literal["auto", "required"]
+    tools: List[AllowedToolReference]
+
+
+class AllowedToolChoice(BaseModel):
+    type: Literal["allowed_tools"]
+    allowed_tools: AllowedTools
+
+
 # OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
 # none/minimal/low/medium/high/xhigh/max, plus DeepSeek's ultra. Used as-is by
 # /v1/responses.
@@ -943,9 +963,9 @@ class ChatCompletionRequest(PDRoutingFields):
     # renders these, while ``tools`` (flattened to ``<namespace>.<function>``) still
     # drives tool-call parsing.
     _template_tools: Optional[List[Dict[str, Any]]] = PrivateAttr(default=None)
-    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
-        default="auto", examples=["none"]
-    )  # noqa
+    tool_choice: Union[
+        ToolChoice, AllowedToolChoice, Literal["auto", "required", "none"]
+    ] = Field(default="auto", examples=["none"])  # noqa
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
@@ -1143,6 +1163,64 @@ class ChatCompletionRequest(PDRoutingFields):
             values["chat_template_kwargs"] = ctk
 
         return values
+
+    @model_validator(mode="after")
+    def resolve_allowed_tools(self):
+        if not isinstance(self.tool_choice, AllowedToolChoice):
+            return self
+        allowed = self.tool_choice.allowed_tools
+        names = [tool.function.name for tool in allowed.tools]
+        if len(names) != len(set(names)):
+            raise ValueError("allowed_tools function names must be unique")
+        declared = list(self.tools or [])
+        for message in self.messages:
+            if isinstance(
+                message, ChatCompletionMessageGenericParam
+            ) and message.role in ("root", "system", "developer"):
+                declared.extend(message.tools or [])
+        unknown = set(names) - {tool.function.name for tool in declared}
+        if unknown:
+            raise ValueError(
+                "allowed_tools references undeclared functions: "
+                + ", ".join(sorted(unknown))
+            )
+        if allowed.mode == "required" and not names:
+            raise ValueError("allowed_tools must not be empty in required mode")
+        template_kwargs = dict(self.chat_template_kwargs or {})
+        template_choice = template_kwargs.get("tool_choice")
+        if template_choice is not None and template_choice != allowed.mode:
+            raise ValueError(
+                "chat_template_kwargs.tool_choice conflicts with allowed_tools.mode"
+            )
+        # Carry the explicit mode into rendering too: null template hints and
+        # server defaults must not replace the choice used by output parsers.
+        template_kwargs["tool_choice"] = allowed.mode
+        self.chat_template_kwargs = template_kwargs
+        # Normalize once, before prompt encoders, grammars and output parsers
+        # consume the request. Historical tool calls are left intact.
+        allowed_names = set(names)
+        if self.tools is not None:
+            self.tools = [
+                tool for tool in self.tools if tool.function.name in allowed_names
+            ]
+        self.messages = [
+            message.model_copy(
+                update={
+                    "tools": [
+                        tool
+                        for tool in message.tools
+                        if tool.function.name in allowed_names
+                    ]
+                }
+            )
+            if isinstance(message, ChatCompletionMessageGenericParam)
+            and message.role in ("root", "system", "developer")
+            and message.tools is not None
+            else message
+            for message in self.messages
+        ]
+        self.tool_choice = allowed.mode
+        return self
 
     @model_validator(mode="before")
     @classmethod
