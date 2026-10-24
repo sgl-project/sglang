@@ -151,7 +151,9 @@ def _update_expert_weights_raw(
 
     world_size = torch.distributed.get_world_size()
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
-    num_gpu_per_node = world_size // nnodes
+    original_world_size = old_expert_location_metadata.ep_size
+    assert original_world_size % nnodes == 0
+    num_gpu_per_node = original_world_size // nnodes
 
     missing_logical_experts_by_layers: Dict[int, List[int]] = {}
 
