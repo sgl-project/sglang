@@ -384,6 +384,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.wo_a_bf16_mxfp8_gfx95",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv4_wo_a:wo_a_bf16_mxfp8_gfx95",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.hopper_bf16_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.hopper_bf16_gemv:hopper_bf16_gemv",

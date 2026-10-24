@@ -37,7 +37,9 @@ from sglang.kernels.ops.attention.dsv4.wo_a import (
 )
 from sglang.kernels.ops.attention.flash_mla_sm120 import SM120_DECODE_MAX_TOKENS
 from sglang.kernels.ops.gemm.dsv4_wo_a import (
+    WO_A_MXFP8_GFX95_MAX_M,
     wo_a_bf16_gemv,
+    wo_a_bf16_mxfp8_gfx95,
     wo_a_bf16_small_batch,
     wo_a_bf16_small_batch_mxfp8,
 )
@@ -534,6 +536,8 @@ def _apply_wo_a_bf16_matmul(
     ):
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
+        if emit_fp8 and hip_decode_verify and o.shape[0] <= WO_A_MXFP8_GFX95_MAX_M:
+            return wo_a_bf16_mxfp8_gfx95(o, wo_a)
         if 2 <= o.shape[0] <= 8:
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))

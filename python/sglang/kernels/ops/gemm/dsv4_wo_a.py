@@ -4,6 +4,15 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.gemm.gfx95_batched_gemm_bf16_fp8_grid import (
+    _batched_gemm_bf16_fp8_grid_kernel,
+    _batched_gemm_bf16_split_k_partial_kernel,
+    _batched_gemm_split_k_reduce_kernel,
+)
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    Mxfp8Activation,
+    fp8_grid_quant,
+)
 from sglang.kernels.ops.quantization.mxfp8_epilogue import ue8m0_scale
 
 
@@ -135,3 +144,120 @@ def wo_a_bf16_small_batch_mxfp8(x: torch.Tensor, weight: torch.Tensor):
         x, weight, partial, m, x.stride(0), num_warps=4, num_stages=3
     )
     return _quantize_partial(partial)
+
+
+@triton.jit
+def _wo_a_reduce_mxfp8(P, Q, S, E: tl.constexpr):
+    # round to bf16 first, as the bf16 route does before wo_b's quant
+    i = tl.program_id(0) * 256 + tl.arange(0, 256)
+    split = tl.arange(0, 8)
+    values = tl.load(P + split[:, None] * E + i[None, :], i[None, :] < E, 0)
+    y = tl.sum(values, 0).to(tl.bfloat16).to(tl.float32)
+    q, e = fp8_grid_quant(tl.reshape(y, (8, 32)))
+    tl.store(Q + i, tl.reshape(q, (256,)))
+    tl.store(S + tl.program_id(0) * 8 + tl.arange(0, 8), e.to(tl.uint8))
+
+
+WO_A_MXFP8_GFX95_MAX_M = 256
+# (max rows, BLOCK_M, SPLIT_K, BLOCK_K, num_warps); BLOCK_N is one 32-group for the epilogue quant
+_MXFP8_GFX95_CONFIGS = (
+    (16, 16, 8, 256, 2),
+    (64, 32, 4, 256, 4),
+    (128, 32, 1, 512, 4),
+    (WO_A_MXFP8_GFX95_MAX_M, 32, 1, 256, 4),
+)
+
+
+def wo_a_bf16_mxfp8_gfx95(x: torch.Tensor, weight: torch.Tensor) -> Mxfp8Activation:
+    """TP4 wo_a at 2-256 rows, emitting wo_b's gfx950 MXFP8 input (fp8 [M, 2048], ue8m0 [M, 64])."""
+    m = x.shape[0]
+    assert 2 <= m <= WO_A_MXFP8_GFX95_MAX_M and x.shape[1:] == (2, 4096)
+    assert weight.shape == (2, 1024, 4096) and weight.is_contiguous()
+    assert x.dtype == weight.dtype == torch.bfloat16
+    assert x.is_cuda and x.device == weight.device
+    assert x.stride(2) == 1 and x.stride(1) == 4096 and x.stride(0) >= 8192
+    q = torch.empty((m, 2048), dtype=torch.float8_e4m3fn, device=x.device)
+    scale = torch.empty((m, 64), dtype=torch.uint8, device=x.device)
+    if m <= 8:
+        partial = torch.empty((8, m, 2, 1024), dtype=torch.float32, device=x.device)
+        _wo_a_partial[(16, 2, 8)](
+            x, weight, partial, m, x.stride(0), num_warps=4, num_stages=3
+        )
+        _wo_a_reduce_mxfp8[(m * 8,)](partial, q, scale, m * 2048, num_warps=4)
+        return Mxfp8Activation(q, scale)
+    _, block_m, split_k, block_k, num_warps = next(
+        c for c in _MXFP8_GFX95_CONFIGS if m <= c[0]
+    )
+    row_tiles = triton.cdiv(m, block_m)
+    strides = (
+        x.stride(1),
+        x.stride(0),
+        x.stride(2),
+        weight.stride(0),
+        weight.stride(2),
+        weight.stride(1),
+    )
+    tuning = dict(num_stages=2, waves_per_eu=2, matrix_instr_nonkdim=16)
+    if split_k == 1:
+        _batched_gemm_bf16_fp8_grid_kernel[(2, row_tiles * 32)](
+            x,
+            weight,
+            q,
+            m,
+            1024,
+            4096,
+            *strides,
+            1024,
+            2048,
+            1,
+            scale,
+            32,
+            64,
+            BLOCK_SIZE_M=block_m,
+            BLOCK_SIZE_N=32,
+            BLOCK_SIZE_K=block_k,
+            EVEN_K=True,
+            FP8_GRID=False,
+            EMIT_FP8=True,
+            cache_modifier=".cg",
+            num_warps=num_warps,
+            **tuning,
+        )
+        return Mxfp8Activation(q, scale)
+    partial = torch.empty(
+        (2, split_k, row_tiles * block_m, 1024), dtype=torch.float32, device=x.device
+    )
+    _batched_gemm_bf16_split_k_partial_kernel[(2, row_tiles * 32, split_k)](
+        x,
+        weight,
+        partial,
+        m,
+        1024,
+        4096,
+        *strides,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=32,
+        BLOCK_SIZE_K=block_k,
+        SPLIT_K=split_k,
+        cache_modifier=".cg",
+        num_warps=num_warps,
+        **tuning,
+    )
+    _batched_gemm_split_k_reduce_kernel[(2, row_tiles * 32)](
+        partial,
+        q,
+        m,
+        1024,
+        1024,
+        2048,
+        scale,
+        32,
+        64,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=32,
+        SPLIT_K=split_k,
+        FP8_GRID=False,
+        EMIT_FP8=True,
+        num_warps=num_warps,
+    )
+    return Mxfp8Activation(q, scale)
