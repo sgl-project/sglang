@@ -14,6 +14,7 @@
 
 """Inference-only DeepSeek NextN Speculative Decoding."""
 
+import copy
 import logging
 import os
 from contextlib import ExitStack
@@ -287,6 +288,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = get_num_fused_shared_experts()
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
+        # The draft layer stays in checkpoint precision. Copy so a config shared with
+        # the target model keeps its own exclusions.
+        if hasattr(nextn_quant_config, "update_online_fp8_exclude_modules"):
+            nextn_quant_config = copy.copy(nextn_quant_config)
+            nextn_quant_config.update_online_fp8_exclude_modules(("*",))
 
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)

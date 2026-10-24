@@ -3237,6 +3237,16 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
+    # Kept in checkpoint precision under --enable-nvfp4-ckpt-fp8-dense:
+    # - kv_b_proj: post_load_weights copies it into w_kc / w_vc for the absorbed
+    #   MLA bmm before quant methods post-process weights, so the decode and
+    #   long-prefill path stays BF16 either way; converting it would only move
+    #   the short-prefill MHA path to FP8 (two numerics, negligible gain).
+    # - DSA indexer wk / weights_proj (fused into wk_weights_proj on CUDA): the
+    #   fused parameter is BF16 by construction and the loader dequantizes FP8
+    #   wk into it. Excluding wk keeps the unfused path identical, and listing
+    #   all three keeps that true if the indexer starts passing a quant config.
+    online_fp8_exclude_modules = ("kv_b_proj", "wk_weights_proj", "wk", "weights_proj")
     # for quark model load
     packed_modules_mapping = {}
 
@@ -3264,6 +3274,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         # checkpoint's source layer names.
         if quant_config is not None:
             quant_config.update_packed_modules_mapping(self.packed_modules_mapping)
+            if hasattr(quant_config, "update_online_fp8_exclude_modules"):
+                quant_config.update_online_fp8_exclude_modules(
+                    self.online_fp8_exclude_modules
+                )
 
         self.pp_group = get_parallel().pp_group
         self.config = config

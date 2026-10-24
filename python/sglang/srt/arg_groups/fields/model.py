@@ -194,6 +194,16 @@ class Model(msgspec.Struct):
             type_parser=nullable_str,
         ),
     ] = None
+    enable_nvfp4_ckpt_fp8_dense: A[
+        bool,
+        (
+            "For ModelOpt NVFP4 checkpoints (modelopt_fp4 / modelopt_mixed): quantize "
+            "the linear layers the checkpoint leaves in BF16 to block-FP8 (E4M3, "
+            "128x128 block scales, dynamic per-token-group activations) while loading. "
+            "lm_head, NextN / MTP draft layers and modules a model marks as "
+            "precision-sensitive stay in checkpoint precision."
+        ),
+    ] = False
     kv_cache_dtype: A[
         str,
         Arg(

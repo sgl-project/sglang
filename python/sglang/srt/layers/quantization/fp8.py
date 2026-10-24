@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -60,6 +60,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_fp8_scale_to_mxfp8_e8m0,
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
+    ceil_to_ue8m0,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     deepgemm_w8a8_mxfp8_linear_with_fallback,
@@ -98,6 +99,7 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.utils import (
+    ceil_div,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_capability,
@@ -1459,6 +1461,107 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
         )
+
+
+def quant_weight_block_fp8_online(
+    weight: torch.Tensor,
+    block_size: List[int],
+    pow2_scale: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 2-D BF16/FP16 weight to E4M3 with one FP32 scale per block.
+
+    scale = amax(block) / 448 (rounded up to a power of two when `pow2_scale`),
+    the layout `Fp8LinearMethod` loads from block-FP8 checkpoints as
+    `weight_scale_inv` (dequant multiplier). Ragged edge blocks are zero-padded
+    for the amax only.
+    """
+    block_n, block_k = block_size
+    n, k = weight.shape
+    pn, pk = ceil_div(n, block_n) * block_n, ceil_div(k, block_k) * block_k
+    w = weight
+    if (pn, pk) != (n, k):
+        w = torch.zeros((pn, pk), dtype=weight.dtype, device=weight.device)
+        w[:n, :k] = weight
+    w = w.view(pn // block_n, block_n, pk // block_k, block_k).float()
+    amax = w.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-12)
+    scale = amax / torch.finfo(torch.float8_e4m3fn).max
+    if pow2_scale:
+        scale = ceil_to_ue8m0(scale)
+    q = (w / scale).clamp_(-448.0, 448.0).to(torch.float8_e4m3fn)
+    q = q.view(pn, pk)[:n, :k].contiguous()
+    return q, scale.view(pn // block_n, pk // block_k).contiguous()
+
+
+class Fp8OnlineBlockLinearMethod(Fp8LinearMethod):
+    """Block-FP8 linear for a BF16/FP16 checkpoint layer, quantized at load.
+
+    Weights are created and loaded in the checkpoint dtype, so every model
+    weight-loading path (fused projections, TP sharding) is the unquantized
+    one. `process_weights_after_loading` quantizes to E4M3 with 128x128 block
+    scales (`quant_weight_block_fp8_online`) and hands the layer to the regular
+    block-FP8 path, which also requantizes scales to UE8M0 for DeepGEMM on
+    Blackwell. Scales are already powers of two in that case, so the requant
+    is exact and the weight is rounded once.
+
+    `quant_config` must be an Fp8Config with `is_checkpoint_fp8_serialized=True`
+    and `weight_block_size=[128, 128]` (the serialized block-FP8 runtime
+    contract); only weight creation differs.
+    """
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        skip_block_quant_check: bool = False,
+        **extra_weight_attrs,
+    ):
+        Fp8LinearMethod.create_fp8_weight_(
+            layer,
+            block_quant=True,
+            quant_config=self.quant_config,
+            use_mxfp8=False,
+            output_size_per_partition=sum(output_partition_sizes),
+            input_size_per_partition=input_size_per_partition,
+            output_partition_sizes=output_partition_sizes,
+            weight_loader=extra_weight_attrs.get("weight_loader"),
+            skip_block_quant_check=skip_block_quant_check,
+            input_size=input_size,
+            output_size=output_size,
+            is_checkpoint_fp8_serialized=False,  # BF16 weight, no scale params
+            params_dtype=params_dtype,
+        )
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        weight = layer.weight.data
+        if weight.dtype == torch.float8_e4m3fn:  # already quantized (re-entry)
+            return super().process_weights_after_loading(layer)
+        from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
+
+        pow2_scale = (
+            getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
+            is deepgemm_w8a8_block_fp8_linear_with_fallback
+            and should_deepgemm_weight_requant_ue8m0(
+                weight_block_size=self.weight_block_size,
+                output_dtype=getattr(layer, "orig_dtype", None),
+                weight_shape=weight.shape,
+            )
+        )
+        qweight, scale = quant_weight_block_fp8_online(
+            weight, self.weight_block_size, pow2_scale
+        )
+        del weight
+        # Keep the Parameter object (weight_loader attrs), as _quantize_mxfp8_weights does.
+        layer.weight.data = qweight
+        layer.weight.requires_grad_(False)
+        layer.register_parameter(
+            "weight_scale_inv", Parameter(scale, requires_grad=False)
+        )
+        layer.input_scale = None
+        super().process_weights_after_loading(layer)
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):
