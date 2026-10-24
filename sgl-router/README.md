@@ -287,7 +287,8 @@ and [rerank](REFERENCE.md#rerank).
 
 ### Native gRPC
 
-`--grpc-port` serves the engine's `sglang.runtime.v1.SglangService`. Each RPC is
+`--grpc-port` serves native `sglang.api.v1.SglangService/Generate` alongside the
+existing `sglang.runtime.v1.SglangService`. Each RPC is
 routed like its HTTP route and forwarded to the same RPC on the engine's own
 native gRPC port, so engines must run with `--grpc-port` too. See
 [native gRPC](REFERENCE.md#native-grpc).

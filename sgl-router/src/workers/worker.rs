@@ -3,7 +3,6 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
 use sglang_processor::openai::OpenAiSettings;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -68,19 +67,15 @@ impl From<WireProtocol> for EngineProfile {
 /// rust/sglang-grpc), so the router never rejects what the engine accepts.
 pub const GRPC_MAX_MESSAGE_BYTES: usize = 64 << 20;
 
-/// A client that dials on first use; only an unparsable address yields `None`.
-fn grpc_client(host: &str, port: u16) -> Option<SglangServiceClient<tonic::transport::Channel>> {
+/// A shared channel that dials on first use; only an unparsable address yields `None`.
+fn grpc_channel(host: &str, port: u16) -> Option<tonic::transport::Channel> {
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{host}:{port}"))
         .map_err(|error| tracing::warn!(host, port, %error, "invalid engine gRPC address"))
         .ok()?
         .connect_timeout(Duration::from_secs(5))
         .http2_keep_alive_interval(Duration::from_secs(30))
         .keep_alive_while_idle(true);
-    Some(
-        SglangServiceClient::new(endpoint.connect_lazy())
-            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES),
-    )
+    Some(endpoint.connect_lazy())
 }
 
 /// Holds one router in-flight slot on a DP rank; see [`Worker::dp_rank_guard`].
@@ -226,7 +221,7 @@ pub struct Worker {
     /// worker was constructed. Immutable: see [`WireProtocol`].
     protocol: WireProtocol,
     /// Reaches the engine's native gRPC server, for requests that arrived over gRPC.
-    grpc: Option<SglangServiceClient<tonic::transport::Channel>>,
+    grpc: Option<tonic::transport::Channel>,
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
@@ -282,7 +277,7 @@ impl Worker {
             None => Arc::new(CircuitBreaker::disabled()),
         };
         let bootstrap_host = parse_bootstrap_host(&spec.url);
-        let grpc = grpc_port.and_then(|port| grpc_client(&bootstrap_host, port));
+        let grpc = grpc_port.and_then(|port| grpc_channel(&bootstrap_host, port));
         let active_requests = Arc::new(AtomicUsize::new(0));
         let slots = SlotRegistry::new();
         Self {
@@ -387,7 +382,7 @@ impl Worker {
         self.protocol
     }
 
-    pub fn grpc(&self) -> Option<SglangServiceClient<tonic::transport::Channel>> {
+    pub fn grpc(&self) -> Option<tonic::transport::Channel> {
         self.grpc.clone()
     }
 

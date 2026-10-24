@@ -10,12 +10,13 @@ use super::{breaker_outcome, stream_breaker_outcome, BreakerOutcome, Proxy};
 use crate::config::SamplingField;
 use crate::server::error::{router_grpc_status, ApiError};
 use crate::server::header_utils::should_forward_request_header;
-use crate::workers::Worker;
+use crate::workers::{Worker, GRPC_MAX_MESSAGE_BYTES};
 use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use serde_json::Value;
+use sglang_api_types::api::v1 as api;
 use sglang_api_types::runtime::v1 as proto;
 use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
 use std::collections::HashMap;
@@ -23,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
-use tonic::{Code, Status};
+use tonic::{Code, Request, Status};
 
 pub type Replies<T> = BoxStream<'static, Result<T, Status>>;
 
@@ -41,15 +42,100 @@ pub trait EngineRpc: Send + Sync + 'static {
     /// Call the engine: OpenAI RPCs send the prepared `body`, typed ones apply `additions`.
     fn call(
         &self,
-        client: SglangServiceClient<Channel>,
+        channel: Channel,
         body: Bytes,
         additions: &Additions,
         trace_headers: HashMap<String, String>,
     ) -> RpcFuture<Self::Reply>;
 
+    /// Cancel with the same protocol used for generation.
+    fn abort(channel: Channel, rid: String) -> BoxFuture<'static, Result<(), Status>> {
+        Box::pin(async move {
+            legacy_client(channel)
+                .abort(proto::AbortRequest {
+                    rid,
+                    abort_all: false,
+                })
+                .await?;
+            Ok(())
+        })
+    }
+
     /// The HTTP status a reply carries, for RPCs that report one.
     fn status(_reply: &Self::Reply) -> Option<StatusCode> {
         None
+    }
+}
+
+fn legacy_client(channel: Channel) -> SglangServiceClient<Channel> {
+    SglangServiceClient::new(channel)
+        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+}
+
+impl PumpItem for api::GenerateStreamItem {
+    fn is_error_event(&self, _: &mut ErrorEventScanner) -> bool {
+        match &self.item {
+            Some(api::generate_stream_item::Item::Error(_)) => true,
+            Some(api::generate_stream_item::Item::Frame(frame)) => frame
+                .meta_info
+                .as_ref()
+                .and_then(|meta| meta.finish_reason.as_ref())
+                .is_some_and(|reason| reason.abort_status().is_some()),
+            None => false,
+        }
+    }
+}
+
+/// Token-in/token-out generation. The api.v1 schema also accepts text and batches.
+#[derive(Clone, Copy)]
+pub struct GenerateRpc;
+
+impl EngineRpc for GenerateRpc {
+    type Reply = api::GenerateStreamItem;
+
+    fn call(
+        &self,
+        channel: Channel,
+        body: Bytes,
+        _: &Additions,
+        trace_headers: HashMap<String, String>,
+    ) -> RpcFuture<Self::Reply> {
+        // HTTP preparation has applied sampling defaults, tokenization, rid,
+        // and PD/DP fields. Schema-driven serde preserves the same contract.
+        let mut client = api::sglang_service_client::SglangServiceClient::new(channel)
+            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+        let body = serde_json::from_slice::<api::GenerateRequest>(&body);
+        Box::pin(async move {
+            let mut request =
+                Request::new(body.map_err(|error| Status::invalid_argument(error.to_string()))?);
+            // Forward trace and routing context, not HTTP credentials.
+            for (name, value) in trace_headers
+                .into_iter()
+                .filter(|(name, _)| name != "authorization")
+            {
+                if let (Ok(name), Ok(value)) = (
+                    name.parse::<tonic::metadata::MetadataKey<_>>(),
+                    value.parse(),
+                ) {
+                    request.metadata_mut().insert(name, value);
+                }
+            }
+            Ok(client.generate(request).await?.into_inner().boxed())
+        })
+    }
+
+    fn abort(channel: Channel, rid: String) -> BoxFuture<'static, Result<(), Status>> {
+        Box::pin(async move {
+            api::sglang_service_client::SglangServiceClient::new(channel)
+                .abort(api::AbortRequest {
+                    rid,
+                    abort_all: false,
+                })
+                .await?;
+            Ok(())
+        })
     }
 }
 
@@ -100,11 +186,12 @@ impl EngineRpc for OpenAiRpc {
 
     fn call(
         &self,
-        mut client: SglangServiceClient<Channel>,
+        channel: Channel,
         body: Bytes,
         _: &Additions,
         trace_headers: HashMap<String, String>,
     ) -> RpcFuture<Self::Reply> {
+        let mut client = legacy_client(channel);
         let request = proto::OpenAiRequest {
             json_body: body.into(),
             trace_headers,
@@ -137,11 +224,12 @@ impl EngineRpc for OpenAiUnaryRpc {
 
     fn call(
         &self,
-        mut client: SglangServiceClient<Channel>,
+        channel: Channel,
         body: Bytes,
         _: &Additions,
         trace_headers: HashMap<String, String>,
     ) -> RpcFuture<Self::Reply> {
+        let mut client = legacy_client(channel);
         let request = proto::OpenAiRequest {
             json_body: body.into(),
             trace_headers,
@@ -204,7 +292,7 @@ impl<T: TypedRpc> EngineRpc for T {
 
     fn call(
         &self,
-        client: SglangServiceClient<Channel>,
+        channel: Channel,
         _: Bytes,
         additions: &Additions,
         trace_headers: HashMap<String, String>,
@@ -218,7 +306,7 @@ impl<T: TypedRpc> EngineRpc for T {
         for (name, value) in forwarded {
             request.trace_headers().entry(name).or_insert(value);
         }
-        request.send(client)
+        request.send(legacy_client(channel))
     }
 }
 
@@ -516,12 +604,12 @@ fn into_status(error: std::io::Error) -> Status {
 /// Aborts the engine request by the router's rid unless disarmed, as
 /// `/abort_request` does over HTTP. A dropped call alone is not enough: the
 /// engine's OpenAI RPCs abort an id of their own, not the request's rid.
-struct AbortOnDrop(Option<(SglangServiceClient<Channel>, String)>);
+struct AbortOnDrop(Option<BoxFuture<'static, Result<(), Status>>>);
 
 impl AbortOnDrop {
-    fn new(client: &SglangServiceClient<Channel>, rid: Option<&str>) -> Self {
+    fn new<R: EngineRpc>(channel: &Channel, rid: Option<&str>) -> Self {
         let rid = rid.filter(|rid| !rid.is_empty());
-        Self(rid.map(|rid| (client.clone(), rid.to_owned())))
+        Self(rid.map(|rid| R::abort(channel.clone(), rid.to_owned())))
     }
 
     fn disarm(&mut self) {
@@ -531,15 +619,11 @@ impl AbortOnDrop {
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        let Some((mut client, rid)) = self.0.take() else {
+        let Some(abort) = self.0.take() else {
             return;
         };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let abort = client.abort(proto::AbortRequest {
-                    rid,
-                    abort_all: false,
-                });
                 match tokio::time::timeout(Duration::from_secs(5), abort).await {
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => tracing::warn!(%error, "engine abort failed"),
@@ -587,7 +671,7 @@ impl Proxy {
         let permit = breaker.acquire().ok_or_else(|| ApiError::BreakerOpen {
             worker: worker.url.clone(),
         })?;
-        let mut abort = AbortOnDrop::new(&client, abort_rid);
+        let mut abort = AbortOnDrop::new::<R>(&client, abort_rid);
         let call = rpc.call(client, body, additions, trace_headers(headers));
         let failed = |status: &Status| status_breaker_outcome(status.code()).record(breaker);
         let respond = |status, replies: Vec<_>, mut abort: AbortOnDrop| {

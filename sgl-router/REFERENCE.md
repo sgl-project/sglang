@@ -625,6 +625,17 @@ is re-registered; its circuit breaker will open in the meantime.
 
 ## Native gRPC
 
+`--grpc-port` also serves `sglang.api.v1.SglangService/Generate`
+(`proto/sglang/api/v1/service.proto`) for native Rust engines. It uses the same
+`GenerateRequest` and `GenerateStreamItem` types as the engine. Requests use HTTP
+`/generate` preparation and routing, including text tokenization, sampling
+overrides, PD bootstrap, and DP-rank selection. Replies preserve native token IDs,
+batches, and per-item errors. Non-streaming requests are buffered until completion.
+Metadata supplies routing and trace headers; HTTP credentials are not forwarded.
+Cancellation uses `api.v1.Abort`. Other `api.v1` methods answer `UNIMPLEMENTED`.
+The selected worker must expose the matching service on its discovered gRPC port.
+The existing `runtime.v1` RPCs below remain available for workers that serve them.
+
 `--grpc-port` serves the engine's own gRPC API, `sglang.runtime.v1.SglangService`
 (`proto/sglang/runtime/v1/sglang.proto`), so a gRPC client can point at the
 router or at an engine. A call is routed exactly like its HTTP route and sent to

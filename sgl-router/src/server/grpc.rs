@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The engine's native gRPC interface (`sglang.runtime.v1.SglangService`),
+//! Native `api.v1.Generate` and the existing `runtime.v1.SglangService`,
 //! served so a gRPC client can point at the router or at an engine. Each served
 //! RPC is routed like its HTTP route and forwarded to the same RPC on an engine.
 
 use crate::proxy::grpc::{
-    embed_to_text, generate_to_text, text_to_embed, text_to_generate, GrpcResponse, OpenAiRpc,
-    OpenAiUnaryRpc, Replies,
+    embed_to_text, generate_to_text, text_to_embed, text_to_generate, GenerateRpc, GrpcResponse,
+    OpenAiRpc, OpenAiUnaryRpc, Replies,
 };
 use crate::server::app::pod_id;
 use crate::server::app_context::AppContext;
@@ -20,6 +20,7 @@ use crate::workers::GRPC_MAX_MESSAGE_BYTES;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
 use futures::StreamExt;
+use sglang_api_types::api::v1 as api;
 use sglang_api_types::runtime::v1 as proto;
 use sglang_api_types::runtime::v1::sglang_service_server::{SglangService, SglangServiceServer};
 use std::collections::HashMap;
@@ -43,11 +44,16 @@ pub async fn serve(
     ctx: Arc<AppContext>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let service = SglangServiceServer::new(RouterGrpc { ctx })
+    let router = Arc::new(RouterGrpc { ctx });
+    let native = api::sglang_service_server::SglangServiceServer::from_arc(Arc::clone(&router))
+        .max_decoding_message_size(MAX_CHAT_BODY_BYTES)
+        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+    let service = SglangServiceServer::from_arc(router)
         .max_decoding_message_size(MAX_CHAT_BODY_BYTES)
         .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
     tonic::transport::Server::builder()
         .add_service(service)
+        .add_service(native)
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
             shutdown,
@@ -120,8 +126,24 @@ impl RouterGrpc {
         headers: HeaderMap,
         call: impl Future<Output = Routed<T>>,
     ) -> Result<Replies<T>, Status> {
+        self.finish_service(
+            proto::sglang_service_server::SERVICE_NAME,
+            rpc,
+            headers,
+            call,
+        )
+        .await
+    }
+
+    async fn finish_service<T: Send + 'static>(
+        &self,
+        service: &str,
+        rpc: &str,
+        headers: HeaderMap,
+        call: impl Future<Output = Routed<T>>,
+    ) -> Result<Replies<T>, Status> {
         let started = Instant::now();
-        let route = format!("/sglang.runtime.v1.SglangService/{rpc}");
+        let route = format!("/{service}/{rpc}");
         let metrics = &self.ctx.metrics;
         metrics.record_ingress(&route, "POST");
         let inflight = self.ctx.inflight_http.enter();
@@ -332,4 +354,48 @@ sglang_service! {
     unserved_streams {
         watch_engine_state(WatchEngineStateRequest) -> WatchEngineStateStream<EngineStateSnapshot>;
     }
+}
+
+macro_rules! native_service {
+    ($($method:ident($request:ident) -> $response:ident;)*) => {
+        #[tonic::async_trait]
+        impl api::sglang_service_server::SglangService for RouterGrpc {
+            type GenerateStream = Replies<api::GenerateStreamItem>;
+
+            async fn generate(
+                &self,
+                request: Request<api::GenerateRequest>,
+            ) -> RpcResult<Self::GenerateStream> {
+                let (metadata, _, request) = request.into_parts();
+                let headers = metadata.into_headers();
+                let body = serde_json::to_vec(&request)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                let call = route_grpc(
+                    &self.ctx, Endpoint::Generate, GenerateRpc, headers.clone(), body.into(),
+                );
+                self.finish_service(
+                    api::sglang_service_server::SERVICE_NAME, "Generate", headers, call,
+                ).await.map(Response::new)
+            }
+
+            $(
+                async fn $method(&self, _: Request<api::$request>) -> RpcResult<api::$response> {
+                    Err(Status::unimplemented(concat!(stringify!($method), " is not served by sgl-router")))
+                }
+            )*
+        }
+    };
+}
+
+native_service! {
+    health_check(HealthCheckRequest) -> HealthCheckResponse;
+    get_model_info(GetModelInfoRequest) -> GetModelInfoResponse;
+    get_server_info(GetServerInfoRequest) -> GetServerInfoResponse;
+    get_hi_cache_storage(GetHiCacheStorageRequest) -> HiCacheStatus;
+    attach_hi_cache_storage(AttachHiCacheStorageRequest) -> HiCacheStorageResponse;
+    detach_hi_cache_storage(DetachHiCacheStorageRequest) -> HiCacheStorageResponse;
+    clear_hi_cache_storage(ClearHiCacheStorageRequest) -> HiCacheStorageResponse;
+    list_models(ListModelsRequest) -> ListModelsResponse;
+    detokenize(DetokenizeRequest) -> DetokenizeResponse;
+    abort(AbortRequest) -> AbortResponse;
 }
