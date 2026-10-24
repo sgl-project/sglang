@@ -69,6 +69,9 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95 = _is_hip and is_gfx95_supported()
+# AITER picks the GEMM kernel, tile and split-K by the number of tokens, so
+# initialize_bf16_gemm_config turns this off on gfx95 in deterministic mode.
+_use_aiter_unquant = _use_aiter
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -305,6 +308,11 @@ def initialize_bf16_gemm_config() -> None:
     global _run_direct_dense
     global _warp_splitk_tactic, _run_warp_splitk_dense
     global _enable_bf16_splitk_gemm
+    global _use_aiter_unquant
+
+    _use_aiter_unquant = _use_aiter and not (
+        _is_gfx95 and get_exec().deterministic.enable_deterministic_inference
+    )
 
     backend_str = get_exec().kernel.bf16_gemm_backend
     if backend_str == "auto" and get_platform().is_sm100:
@@ -589,7 +597,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
 
-        elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+        elif _use_aiter_unquant and type(layer.weight.data) is torch.Tensor:
             if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
@@ -754,6 +762,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
+        if (
+            _use_aiter
+            and not _use_aiter_unquant
+            and get_moe_runner_backend().is_aiter()
+        ):
+            raise ValueError(
+                "--moe-runner-backend aiter is batch-size dependent and cannot be "
+                "combined with --enable-deterministic-inference on gfx95"
+            )
         self._cache_permute_indices = dict({})
         self.runner: Optional[MoeRunner] = None
         self._aiter_runner: Optional[MoeRunner] = None
@@ -836,7 +853,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         _should_use_aiter_moe = (
-            _use_aiter
+            _use_aiter_unquant
             and (
                 get_moe_runner_backend().is_auto()
                 or get_moe_runner_backend().is_aiter()
@@ -1126,7 +1143,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # aiter CK fused-MoE only supports some shapes / activations; else use triton.
         self._aiter_runner: Optional[MoeRunner] = None
         if (
-            _use_aiter
+            _use_aiter_unquant
             and (
                 get_moe_runner_backend().is_auto()
                 or get_moe_runner_backend().is_aiter()
