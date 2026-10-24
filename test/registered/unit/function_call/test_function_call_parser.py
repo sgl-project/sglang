@@ -2507,6 +2507,44 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertTrue(full_text.startswith("Let me"))
         self.assertGreater(len(all_calls), 0)
 
+    def _stream_arguments(self, text):
+        detector = Qwen3CoderDetector()
+        results = [detector.parse_streaming_increment(ch, self.tools) for ch in text]
+        results.append(detector.finish(self.tools))
+        return "".join(
+            call.parameters
+            for result in results
+            for call in result.calls
+            if call.parameters
+        )
+
+    def test_streaming_closes_arguments_when_function_end_omitted(self):
+        """A call closed by </tool_call> without </function> must still stream
+        complete arguments, the same JSON as detect_and_parse."""
+        head = "<tool_call>\n<function=get_current_weather>\n"
+        cases = [
+            (head + "<parameter=days>\n0\n</parameter>\n</tool_call>", {"days": 0}),
+            (head + "<parameter=days>\n0\n</tool_call>", {"days": 0}),
+            (head + "</tool_call>", {}),
+        ]
+        for text, expected_args in cases:
+            with self.subTest(text=text):
+                streamed = self._stream_arguments(text)
+                one_shot = self.detector.detect_and_parse(text, self.tools)
+                self.assertEqual(streamed, one_shot.calls[0].parameters)
+                self.assertEqual(json.loads(streamed), expected_args)
+
+    def test_streaming_keeps_tool_call_end_inside_parameter_value(self):
+        """A </tool_call> inside a value that </parameter> closes later is value
+        text; it must not end the parameter or the call."""
+        text = (
+            "<tool_call>\n<function=get_current_weather>\n"
+            "<parameter=location>\na</tool_call>b\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        streamed = self._stream_arguments(text)
+        self.assertEqual(json.loads(streamed), {"location": "a</tool_call>b"})
+
     # ==================== Parameter Type Tests ====================
 
     def test_integer_parameter_conversion(self):
