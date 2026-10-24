@@ -2233,6 +2233,47 @@ class TestCosmos3VideoPreprocess(CustomTestCase):
                 outputs.append(actual[:, :, :5].cpu())
         self.assertTrue(torch.equal(outputs[0], outputs[1]))
 
+    def test_vae_cache_key(self):
+        """Video content and VAE settings distinguish Cosmos3 cache entries."""
+        from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+
+        from sglang.multimodal_gen.runtime.cache import conditioning
+
+        class VAE(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = types.SimpleNamespace(
+                    latents_mean=[0, 0, 0], latents_std=[1, 1, 1]
+                )
+                self.calls = 0
+                self.use_tiling = False
+
+            @conditioning.cached_vae_encode
+            def encode(self, pixels):
+                self.calls += 1
+                mean = pixels * (2 if self.use_tiling else 1)
+                return DiagonalGaussianDistribution(
+                    torch.cat([mean, torch.zeros_like(mean)], dim=1)
+                )
+
+        stage = Cosmos3LatentPreparationStage.__new__(Cosmos3LatentPreparationStage)
+        stage.vae = VAE().eval()
+        cache = conditioning.ConditioningCache(1024 * 1024)
+        video = torch.zeros(1, 3, 5, 16, 16, device="cuda")
+        video[:, :, 0] = 1
+        with torch.no_grad(), cache.scope():
+            self.assertTrue(torch.equal(stage._vae_encode(video), video))
+            hit = stage._vae_encode(video.clone())
+            self.assertTrue(torch.equal(hit, video))
+            self.assertEqual(stage.vae.calls, 1)
+            changed = video.clone()
+            changed[:, :, -1] = 0.5
+            self.assertTrue(torch.equal(stage._vae_encode(changed), changed))
+            self.assertEqual(stage.vae.calls, 2)
+            stage.vae.use_tiling = True
+            self.assertTrue(torch.equal(stage._vae_encode(video), video * 2))
+            self.assertEqual(stage.vae.calls, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="memory.gpu_tensor_blake3",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.gpu_tensor_hash_blake3:gpu_tensor_blake3",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="memory.memcpy_triton",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.memory.memcpy_triton:memcpy_triton",
