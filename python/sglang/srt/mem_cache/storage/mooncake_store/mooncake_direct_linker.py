@@ -4,6 +4,7 @@ import hashlib
 import logging
 import threading
 from queue import Empty, Queue
+from typing import Optional
 
 import torch
 
@@ -27,7 +28,6 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
-    get_memory,
     get_model,
     get_parallel,
 )
@@ -54,6 +54,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         params: CacheInitParams,
         *,
         components,
+        storage_backend_extra_config: Optional[str] = None,
         storage=None,
         forward_stream=None,
     ):
@@ -78,7 +79,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
-            get_memory().hicache_storage_backend_extra_config
+            storage_backend_extra_config
         )
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
@@ -139,8 +140,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.num_layers,
             self._broadcast_loaded_layers if self.mla_broadcaster else None,
         )
+        self.req_to_token_pool = None
         if PoolName.MAMBA in self.pools:
-            params.req_to_token_pool.register_layer_transfer_counter(
+            self.req_to_token_pool = params.req_to_token_pool
+            self.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
@@ -440,3 +443,5 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.storage.close()
         if self.mla_broadcaster is not None:
             self.mla_broadcaster.destroy()
+        if self.req_to_token_pool is not None:
+            self.req_to_token_pool.register_layer_transfer_counter(None)

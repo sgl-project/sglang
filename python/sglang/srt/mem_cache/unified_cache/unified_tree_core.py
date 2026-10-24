@@ -433,7 +433,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.enable_hicache = False
         self.is_host_memory_buffer_only = False
         self.enable_storage = False
-        self.enable_external_cache_linker = False
+        self._enable_external_cache_linker = False
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
@@ -549,6 +549,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         TODO(Jialin): Make TreeCore-internal after the Unified Radix Cache split.
         """
         return self._node_arena[node_id]
+
+    @property
+    def enable_external_cache_linker(self) -> bool:
+        return self._enable_external_cache_linker
+
+    @enable_external_cache_linker.setter
+    def enable_external_cache_linker(self, value: bool) -> None:
+        # Stored marks describe the store being detached, not the next one.
+        if not value:
+            for node in self._node_arena.values():
+                node.external_cache_stored = False
+        self._enable_external_cache_linker = value
 
     def is_write_through_compatible(self) -> bool:
         for node in self._node_arena.values():

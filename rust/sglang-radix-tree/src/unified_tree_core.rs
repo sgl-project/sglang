@@ -3511,6 +3511,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         value: bool,
     ) -> Result<(), TreeCoreRuntimeError> {
+        // Stored marks describe the store being detached, not the next one.
+        if !value {
+            for node_id in self.collect_all_nodes_() {
+                self.arena.node_mut(node_id).external_cache_stored = false;
+            }
+        }
         self.enable_external_cache_linker = value;
         Ok(())
     }

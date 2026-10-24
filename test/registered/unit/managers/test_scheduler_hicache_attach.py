@@ -8,6 +8,7 @@ and the published instance stays as the launcher left it.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.managers.io_struct import (
@@ -23,6 +24,15 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestSchedulerHiCacheAttach(CustomTestCase):
+    def test_linker_detach_failure_escapes_admin_handler(self):
+        scheduler = self._scheduler(enable_linker_mla_dedup=False)
+        scheduler.enable_unified_cache_external_linker = True
+        scheduler.tree_cache.detach_cache_linker = Mock(
+            side_effect=RuntimeError("scheduler must stop")
+        )
+        with self.assertRaisesRegex(RuntimeError, "scheduler must stop"):
+            scheduler.detach_hicache_storage_wrapped(DetachHiCacheStorageReqInput())
+
     def _scheduler(self, **fields):
         override = get_context().override_server_args(
             enable_hierarchical_cache=True, **fields
@@ -33,6 +43,7 @@ class TestSchedulerHiCacheAttach(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.server_args = self.server_args
         scheduler.enable_hierarchical_cache = True
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.enable_hicache_storage = False
         scheduler.is_fully_idle = lambda: True
         scheduler.tree_cache = SimpleNamespace(

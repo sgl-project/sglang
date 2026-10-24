@@ -216,8 +216,6 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             self.assertIs(result, fake_radix.UnifiedRadixCache.return_value)
 
     def test_unified_radix_cache_with_mori_external_linker(self):
-        from sglang.srt.mem_cache.storage.umbp import umbp_direct_linker
-
         ctx = _make_ctx(self)
         # The factory reads the linker settings from the bags.
         enter_override(
@@ -225,46 +223,32 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             get_context().override_server_args(
                 enable_unified_cache_external_linker=True,
                 unified_cache_external_linker_backend="mori",
+                hicache_storage_backend_extra_config='{"a": 1}',
             ),
         )
         fake_components = MagicMock()
         fake_components.ComponentType.FULL = "full"
         fake_radix = MagicMock()
         cache = fake_radix.UnifiedRadixCache.return_value
-        cache.components = ("full",)
-        counter = MagicMock(name="layer_done_counter")
-        cache.linker.layer_done_counter = counter
-        linker = MagicMock(name="linker")
 
-        with (
-            patch.dict(
-                "sys.modules",
-                {
-                    "sglang.srt.mem_cache.unified_cache.components": fake_components,
-                    "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
-                },
-            ),
-            patch.object(
-                umbp_direct_linker,
-                "UMBPDirectLinker",
-                return_value=linker,
-            ) as linker_cls,
+        with patch.dict(
+            "sys.modules",
+            {
+                "sglang.srt.mem_cache.unified_cache.components": fake_components,
+                "sglang.srt.mem_cache.unified_radix_cache": fake_radix,
+            },
         ):
             result = default_radix_cache_factory(ctx)
 
-        linker_cls.assert_called_once_with(
-            ctx.server_args,
-            ctx.params,
-            components={"full"},
+        cache.init_linker_attachment.assert_called_once_with(
+            server_args=ctx.server_args,
+            params=ctx.params,
+            register_layer_transfer_counter=(
+                ctx.tp_worker.register_hicache_layer_transfer_counter
+            ),
             forward_stream=ctx.tp_worker.model_runner.forward_stream,
         )
-        cache.init_cache_linker.assert_called_once_with(linker)
-        ctx.params.token_to_kv_pool_allocator.get_kvcache.return_value.register_layer_transfer_counter.assert_called_once_with(
-            counter
-        )
-        ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once_with(
-            counter
-        )
+        cache.attach_cache_linker.assert_called_once_with("mori", '{"a": 1}')
         self.assertIs(result, cache)
 
     def test_custom_unified_cache_keeps_host_pool_setup(self):

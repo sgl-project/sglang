@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
+from sglang.srt.mem_cache.unified_cache import linker_attachment
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     UpdatePendingBackupOnNodeSplit,
 )
@@ -595,6 +596,116 @@ class TestUnifiedCacheLinkerPythonBackend(
         cache.sanity_check()
         cache.reset()
         cache.sanity_check()
+
+    def _init_linker_attachment(
+        self, cache, allocator, build_linker, forward_stream=None
+    ):
+        counters = []
+        cache.init_linker_attachment(
+            server_args=SimpleNamespace(),
+            params=SimpleNamespace(token_to_kv_pool_allocator=allocator),
+            register_layer_transfer_counter=counters.append,
+            forward_stream=forward_stream,
+        )
+        patcher = patch.object(
+            linker_attachment, "_linker_class", lambda backend: build_linker
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return counters
+
+    def test_detach_unlinks_the_tree_and_reattach_offloads_it_again(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        kvcache = allocator.get_kvcache()
+        threshold = cache.write_through_threshold
+        forward_stream = object()
+        linkers = []
+
+        def build_linker(server_args, params, *, components, **kwargs):
+            self.assertIs(kwargs["forward_stream"], forward_stream)
+            linkers.append(_InMemoryUnifiedCacheLinker())
+            return linkers[-1]
+
+        counters = self._init_linker_attachment(
+            cache, allocator, build_linker, forward_stream
+        )
+        tokens = list(range(1, 9))
+
+        cache.attach_cache_linker("mooncake")
+        first = linkers[0]
+        self.assertIs(cache.linker.cache_linker, first)
+        self.assertIs(kvcache.layer_transfer_counter, first.layer_done_counter)
+        self.assertEqual(counters, [first.layer_done_counter])
+        self.assertIn("already attached", cache.attach_cache_linker("mooncake"))
+        with self.assertRaisesRegex(RuntimeError, "detach it before"):
+            cache.attach_cache_linker("mori")
+        node = self._insert(cache, allocator, req_to_token_pool, tokens)
+        node = node.last_device_node
+        ((first_offload,),) = first.offload_calls
+        first.complete_next_offload(True)
+        cache.check_hicache_events()
+        self.assertTrue(cache.tree_core.is_external_cache_stored(node))
+
+        cache.detach_cache_linker()
+        self.assertIsNone(cache.linker)
+        self.assertFalse(cache.tree_core.enable_external_cache_linker)
+        self.assertFalse(cache.tree_core.is_external_cache_stored(node))
+        self.assertEqual(cache.write_through_threshold, threshold)
+        self.assertIsNone(kvcache.layer_transfer_counter)
+        self.assertIsNone(counters[-1])
+        tail = self._insert(cache, allocator, req_to_token_pool, tokens + [9, 10])
+        tail = tail.last_device_node
+        cache.check_hicache_events()
+
+        cache.attach_cache_linker("mooncake")
+        second = linkers[1]
+        self._insert(cache, allocator, req_to_token_pool, tokens + [9, 10])
+        self.assertEqual(
+            [transfer.keys for (transfer,) in second.offload_calls],
+            [first_offload.keys, cache.tree_core.get_hash_values(tail)],
+        )
+        for _ in second.offload_calls:
+            second.complete_next_offload(True)
+        cache.check_hicache_events()
+        cache.detach_cache_linker()
+        cache.sanity_check()
+
+    def test_attach_links_no_rank_when_any_rank_fails(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        cache, allocator, _ = build_fixture(cfg)
+        built = []
+
+        def build_linker(server_args, params, *, components, **kwargs):
+            if not built:
+                built.append(None)
+                raise ConnectionError("store unreachable")
+            built.append(_InMemoryUnifiedCacheLinker())
+            built[-1].close = MagicMock(wraps=built[-1].close)
+            return built[-1]
+
+        def remote_rank_failed(tensor, op):
+            tensor.zero_()
+
+        counters = self._init_linker_attachment(cache, allocator, build_linker)
+        with (
+            self.assertLogs(linker_attachment.logger, "ERROR"),
+            self.assertRaisesRegex(RuntimeError, "store unreachable"),
+        ):
+            cache.attach_cache_linker("mooncake")
+        with (
+            patch.object(cache, "_all_reduce_attn_groups", remote_rank_failed),
+            self.assertRaisesRegex(RuntimeError, "failed on another rank"),
+        ):
+            cache.attach_cache_linker("mooncake")
+
+        built[-1].close.assert_called_once_with()
+        self.assertIsNone(cache.linker)
+        self.assertFalse(cache.tree_core.enable_external_cache_linker)
+        self.assertEqual(counters, [])
+        self.assertIn("not attached", cache.detach_cache_linker())
 
     def test_swa_hit_loads_private_tail_and_dedups_on_insert(self):
         self._run_swa_hit(load_landed=True)

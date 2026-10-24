@@ -87,6 +87,7 @@ from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import (
     get_disagg,
     get_lora,
+    get_memory,
     get_parallel,
     get_serving,
     get_spec,
@@ -359,7 +360,15 @@ class TokenizerControlMixin:
         all_success, all_message = FanOutCommunicator.merge_results(results)
         out = AttachHiCacheStorageReqOutput(success=all_success, message=all_message)
         # TODO: partial rollback if failed
-        if all_success:
+        if all_success and get_memory().enable_unified_cache_external_linker:
+            self.record_config_updates(
+                "tokenizer.attach_cache_linker",
+                unified_cache_external_linker_backend=hicache_storage_backend,
+                hicache_storage_backend_extra_config=(
+                    hicache_storage_backend_extra_config_json
+                ),
+            )
+        elif all_success:
             # Keep tokenizer side server_info consistent with scheduler side.
             hicache_fields = {"hicache_storage_backend": hicache_storage_backend}
             if hicache_storage_backend_extra_config_json is not None:
@@ -387,7 +396,13 @@ class TokenizerControlMixin:
         all_success, all_message = FanOutCommunicator.merge_results(results)
         out = DetachHiCacheStorageReqOutput(success=all_success, message=all_message)
         # TODO: partial rollback if failed
-        if all_success:
+        if all_success and get_memory().enable_unified_cache_external_linker:
+            self.record_config_updates(
+                "tokenizer.detach_cache_linker",
+                unified_cache_external_linker_backend=None,
+                hicache_storage_backend_extra_config=None,
+            )
+        elif all_success:
             self.record_config_updates(
                 "tokenizer.detach_hicache",
                 hicache_storage_backend=None,

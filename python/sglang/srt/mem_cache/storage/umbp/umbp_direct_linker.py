@@ -6,7 +6,7 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -26,7 +26,6 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
-    get_memory,
     get_model,
     get_parallel,
 )
@@ -151,6 +150,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         params: CacheInitParams,
         *,
         components,
+        storage_backend_extra_config: Optional[str] = None,
         _storage=None,
         forward_stream=None,
     ):
@@ -207,9 +207,7 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise ValueError(
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
-        extra_config = _parse_storage_extra_config(
-            get_memory().hicache_storage_backend_extra_config
-        )
+        extra_config = _parse_storage_extra_config(storage_backend_extra_config)
         extra_config = dict(extra_config)
         standalone_requested = bool(
             extra_config.get("standalone_address")
@@ -352,8 +350,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             raise
 
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
+        self._req_to_token_pool = None
         if PoolName.MAMBA in self.pools:
-            params.req_to_token_pool.register_layer_transfer_counter(
+            self._req_to_token_pool = params.req_to_token_pool
+            self._req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
             )
         self._pending: dict[str, list[PoolTransfer]] = {}
@@ -1022,4 +1022,6 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             self.storage.client.deregister_memory(self._registered[0][0])
         logger.info("UMBP direct linker stats: %s", self._stats)
         self.storage.close()
+        if self._req_to_token_pool is not None:
+            self._req_to_token_pool.register_layer_transfer_counter(None)
         self._closed = True
