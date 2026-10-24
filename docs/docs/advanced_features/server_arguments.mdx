@@ -1895,6 +1895,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--moe-load-balancer-algorithm`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>EvenMoE expert routing pipeline for redundant experts: `static`, `lplb`, `waterfill`, `ultraep`, or a composition such as `lplb+waterfill`. Mutually exclusive with `--ep-dispatch-algorithm` and `--enable-waterfill`; `waterfill` requires a fused-shared-expert model and DeepEP, `lplb` requires `--ep-num-redundant-experts &gt; 0` with a recorded placement in `--init-expert-location`. Requires the `evenmoe` package.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ep-dispatch-algorithm`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The algorithm to choose ranks for redundant experts in expert parallel.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>

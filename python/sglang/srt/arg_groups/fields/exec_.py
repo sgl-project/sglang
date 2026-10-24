@@ -880,6 +880,15 @@ class ExecMoe(msgspec.Struct):
     ep_num_redundant_experts: A[
         int, "Allocate this number of redundant experts in expert parallel."
     ] = 0
+    moe_load_balancer_algorithm: A[
+        Optional[str],
+        Arg(
+            help="EvenMoE expert routing pipeline for redundant experts (static, "
+            "lplb, waterfill, ultraep, or a composition such as lplb+waterfill). "
+            "Requires the evenmoe package.",
+            resolvable=True,
+        ),
+    ] = None
     ep_dispatch_algorithm: A[
         Optional[Literal["static", "dynamic", "fake", "lp"]],
         "The algorithm to choose ranks for redundant experts in expert parallel.",

@@ -719,10 +719,29 @@ class TopK(BaseFusedOp):
         self.is_draft = (
             get_flags().moe.in_speculative_scope if is_draft is None else is_draft
         )
+        # The MoE load balancer (see sglang.srt.eplb.moe_load_balancer_glue)
+        # routes after TopK when its pipeline asks for it; ModelRunner attaches
+        # the shared MoELoadBalancer to every target TopK before the first
+        # forward. Draft layers keep the native path.
+        from sglang.srt.eplb.moe_load_balancer_glue import (
+            get_configured_moe_load_balancer_pipeline,
+        )
+
+        pipeline = get_configured_moe_load_balancer_pipeline()
+        self.mlb_requires_post_topk_routing = (
+            pipeline is not None
+            and pipeline.capabilities.requires_post_topk_routing
+            and not self.is_draft
+        )
+        self.moe_load_balancer = None
         self._runner_backend_bound = False
 
         shared_experts = get_model().shared_experts
-        self.enable_waterfill = shared_experts.use_waterfill
+        # Draft layers are not attached to the load balancer, so when it owns
+        # the shared-expert slot on the target they expand it with Waterfill.
+        self.enable_waterfill = shared_experts.use_waterfill or (
+            self.is_draft and shared_experts.routed_by_load_balancer
+        )
         self.waterfill_balancer = None
         num_shared_slots = shared_experts.num_shared_topk_slots
 
@@ -742,9 +761,11 @@ class TopK(BaseFusedOp):
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
-            # Waterfill expands a standard top-k output.
+            # Waterfill and the MoE load balancer expand a standard top-k output.
             output_format=(
-                TopKOutputFormat.STANDARD if self.enable_waterfill else output_format
+                TopKOutputFormat.STANDARD
+                if self.enable_waterfill or self.mlb_requires_post_topk_routing
+                else output_format
             ),
             scoring_func=scoring_func,
             sqrtsoftplus_log1p=sqrtsoftplus_log1p,
@@ -806,6 +827,38 @@ class TopK(BaseFusedOp):
             output_format = TopKOutputFormat.STANDARD
         self.topk_config.output_format = output_format
 
+    def _apply_moe_load_balancer(
+        self,
+        topk_output: TopKOutput,
+        num_tokens: int,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+    ) -> TopKOutput:
+        if self.moe_load_balancer is None:
+            if self.mlb_requires_post_topk_routing:
+                raise RuntimeError(
+                    "MoE load balancer routing is enabled but ModelRunner did not "
+                    "attach MoELoadBalancer to this TopK."
+                )
+            return self._apply_waterfill(topk_output, num_tokens)
+        if not TopKOutputChecker.format_is_standard(topk_output):
+            raise RuntimeError("MoE load balancer routing requires StandardTopKOutput.")
+
+        from sglang.srt.eplb.moe_load_balancer_glue import route_topk_with_mlb
+
+        return route_topk_with_mlb(
+            moe_load_balancer=self.moe_load_balancer,
+            layer_id=self.layer_id,
+            topk_output=topk_output,
+            num_tokens=num_tokens,
+            num_token_non_padded=num_token_non_padded,
+            routed_scaling_factor=(
+                self.topk_config.routed_scaling_factor
+                if self.topk_config.routed_scaling_factor is not None
+                else 1.0
+            ),
+        )
+
     def _apply_waterfill(self, topk_output: TopKOutput, num_tokens: int) -> TopKOutput:
         if self.enable_waterfill and self.waterfill_balancer is None:
             raise RuntimeError(
@@ -854,8 +907,13 @@ class TopK(BaseFusedOp):
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
             dynamic_expert_bias=dynamic_expert_bias,
+            moe_load_balancer=self.moe_load_balancer,
         )
-        return self._apply_waterfill(topk_output, hidden_states.shape[0])
+        return self._apply_moe_load_balancer(
+            topk_output,
+            hidden_states.shape[0],
+            num_token_non_padded=num_token_non_padded,
+        )
 
     def forward_cuda(
         self,
@@ -876,7 +934,7 @@ class TopK(BaseFusedOp):
                 num_token_non_padded, expert_location_dispatch_info
             )
         )
-        if dynamic_expert_bias is not None:
+        if self.moe_load_balancer is not None or dynamic_expert_bias is not None:
             output_format = TopKOutputFormat.STANDARD
         elif self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
@@ -947,9 +1005,14 @@ class TopK(BaseFusedOp):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                     dynamic_expert_bias=dynamic_expert_bias,
+                    moe_load_balancer=self.moe_load_balancer,
                     router_logits_partials=router_logits_partials,
                 )
-        return self._apply_waterfill(topk_output, hidden_states.shape[0])
+        return self._apply_moe_load_balancer(
+            topk_output,
+            hidden_states.shape[0],
+            num_token_non_padded=num_token_non_padded,
+        )
 
     def forward_cpu(
         self,
@@ -973,8 +1036,13 @@ class TopK(BaseFusedOp):
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
             dynamic_expert_bias=dynamic_expert_bias,
+            moe_load_balancer=self.moe_load_balancer,
         )
-        return self._apply_waterfill(topk_output, hidden_states.shape[0])
+        return self._apply_moe_load_balancer(
+            topk_output,
+            hidden_states.shape[0],
+            num_token_non_padded=num_token_non_padded,
+        )
 
     def forward_npu(
         self,
@@ -990,6 +1058,32 @@ class TopK(BaseFusedOp):
                 num_token_non_padded, expert_location_dispatch_info
             )
         )
+        if self.moe_load_balancer is not None:
+            from dataclasses import replace
+
+            from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
+
+            router_logits, bias = self.moe_load_balancer.transform_topk_inputs(
+                router_logits,
+                (
+                    self.topk_config.correction_bias
+                    if dynamic_expert_bias is None
+                    else dynamic_expert_bias
+                ),
+            )
+            output = fused_topk_npu(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                topk_config=replace(self.topk_config, correction_bias=bias),
+                num_token_non_padded=num_token_non_padded,
+                layer_id=self.layer_id,
+                defer_expert_recording=True,
+            )
+            return self._apply_moe_load_balancer(
+                output,
+                hidden_states.shape[0],
+                num_token_non_padded=num_token_non_padded,
+            )
         if dynamic_expert_bias is not None:
             self.topk_config.torch_native = False
             return select_experts(
@@ -1057,7 +1151,7 @@ class TopK(BaseFusedOp):
                     (0, topk_output.topk_weights.shape[-1] + n)
                 ),
             )
-        return self._apply_waterfill(topk_output, 0)
+        return self._apply_moe_load_balancer(topk_output, 0)
 
     def forward_xpu(
         self,
@@ -1081,7 +1175,7 @@ class TopK(BaseFusedOp):
             self.topk_config.top_k <= 8 and router_logits.shape[1] <= 256
         )
 
-        return select_experts(
+        topk_output = select_experts(
             hidden_states=hidden_states,
             layer_id=self.layer_id,
             router_logits=router_logits,
@@ -1089,6 +1183,14 @@ class TopK(BaseFusedOp):
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
             dynamic_expert_bias=dynamic_expert_bias,
+            moe_load_balancer=self.moe_load_balancer,
+        )
+        if self.moe_load_balancer is None:
+            return topk_output
+        return self._apply_moe_load_balancer(
+            topk_output,
+            hidden_states.shape[0],
+            num_token_non_padded=num_token_non_padded,
         )
 
 
@@ -2554,6 +2656,7 @@ def _post_process_topk_ids(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     padded_rows_masked: bool = False,
+    defer_expert_recording: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_shared_topk_slots = topk_config.num_shared_topk_slots
     use_per_rank_shared_slots = has_per_rank_fused_shared_slots(num_shared_topk_slots)
@@ -2571,7 +2674,8 @@ def _post_process_topk_ids(
     routed_topk_ids = (
         topk_ids[:, :-num_shared_topk_slots] if _gate_appended else topk_ids
     )
-    capture_routed_experts_if_allowed(topk_config, layer_id, routed_topk_ids)
+    if not defer_expert_recording:
+        capture_routed_experts_if_allowed(topk_config, layer_id, routed_topk_ids)
     recorder_topk_ids = None
     _aiter_append = (
         num_shared_topk_slots > 0
@@ -2828,6 +2932,8 @@ def select_experts(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     dynamic_expert_bias: Optional[torch.Tensor] = None,
     router_logits_partials: Optional[torch.Tensor] = None,
+    moe_load_balancer=None,
+    defer_expert_recording: bool = False,
 ) -> StandardTopKOutput:
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
@@ -2880,14 +2986,23 @@ def select_experts(
         rocm_router_reduce_partials(router_logits_partials, router_logits)
         router_logits_partials = None
 
-    (
-        router_logits,
-        correction_bias,
-    ) = expert_location_dispatch.transform_select_experts_inputs(
-        router_logits=router_logits,
-        correction_bias=correction_bias,
-        info=expert_location_dispatch_info,
-    )
+    if moe_load_balancer is not None:
+        # The load balancer maps logical ids to physical replicas after TopK
+        # and records the physical ids itself (moe_load_balancer_glue).
+        router_logits, correction_bias = moe_load_balancer.transform_topk_inputs(
+            router_logits, correction_bias
+        )
+        expert_location_dispatch_info = None
+        defer_expert_recording = True
+    else:
+        (
+            router_logits,
+            correction_bias,
+        ) = expert_location_dispatch.transform_select_experts_inputs(
+            router_logits=router_logits,
+            correction_bias=correction_bias,
+            info=expert_location_dispatch_info,
+        )
 
     # Only aiter_biased_grouped_topk wants the bias in the gating dtype. The JIT
     # router returns before it in biased_grouped_topk_gpu and upcasts the bias
@@ -3132,9 +3247,10 @@ def select_experts(
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
         padded_rows_masked=padded_rows_masked,
+        defer_expert_recording=defer_expert_recording,
     )
 
-    if recorder_topk_ids is not None:
+    if recorder_topk_ids is not None and not defer_expert_recording:
         get_global_expert_distribution_recorder().on_select_experts(
             topk_ids=recorder_topk_ids
         )

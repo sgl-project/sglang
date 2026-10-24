@@ -9,11 +9,16 @@ class SharedExpertsConfig(msgspec.Struct, frozen=True):
     fusion_disabled: bool = False
     num_fused_shared_experts: int = 0
     use_waterfill: bool = False
+    # The MoE load balancer (--moe-load-balancer-algorithm) appends the shared
+    # slot after routing, like Waterfill; the router emits routed experts only.
+    routed_by_load_balancer: bool = False
 
     @property
     def num_shared_topk_slots(self) -> int:
-        """Shared id/weight slots emitted before Waterfill expansion."""
-        return 0 if self.use_waterfill else self.num_fused_shared_experts
+        """Shared id/weight slots emitted before Waterfill / load-balancer expansion."""
+        if self.use_waterfill or self.routed_by_load_balancer:
+            return 0
+        return self.num_fused_shared_experts
 
 
 def default_shared_experts_config(args) -> SharedExpertsConfig:

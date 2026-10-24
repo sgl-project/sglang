@@ -1,9 +1,11 @@
 import argparse
+import importlib.util
 import json
 import os
 import pickle
 import shutil
 import socket
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -54,6 +56,7 @@ from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
+    handle_moe_load_balancer,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
 )
@@ -93,6 +96,7 @@ from sglang.srt.entrypoints.sidecar import (
     start_sidecar,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb.moe_load_balancer_glue import get_moe_load_balancer_pipeline
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
@@ -2042,6 +2046,65 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
             with envs.SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE.override("1"):
                 with self.assertRaisesRegex(ValueError, "incompatible"):
                     handle_a2a_moe(self._make_args())
+
+
+class TestMoELoadBalancerAlgorithm(unittest.TestCase):
+    def test_native_eplb_path_does_not_import_evenmoe(self):
+        server_args = ServerArgs(model_path="dummy", enable_eplb=True, ep_size=2)
+        with patch.dict(sys.modules, {"evenmoe": None}):
+            handle_moe_load_balancer(server_args)
+        self.assertIsNone(resolution_result(server_args, "moe_load_balancer_algorithm"))
+
+    def test_flag_without_evenmoe_installed_is_a_clear_error(self):
+        server_args = ServerArgs(
+            model_path="dummy", moe_load_balancer_algorithm="static"
+        )
+        with (
+            patch.dict(sys.modules, {"evenmoe": None}),
+            self.assertRaisesRegex(ImportError, "evenmoe"),
+        ):
+            handle_moe_load_balancer(server_args)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
+    )
+    def test_one_parameter_selects_composed_pipeline(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_load_balancer_algorithm="lplb+waterfill",
+        )
+
+        handle_moe_load_balancer(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "moe_load_balancer_algorithm"),
+            "lplb+waterfill",
+        )
+        capabilities = get_moe_load_balancer_pipeline(
+            resolution_result(server_args, "moe_load_balancer_algorithm")
+        ).capabilities
+        self.assertTrue(capabilities.requires_placement_state)
+        self.assertTrue(capabilities.routes_shared_expert)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
+    )
+    def test_bare_waterfill_gets_default_replica_routing(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_load_balancer_algorithm="waterfill",
+        )
+
+        handle_moe_load_balancer(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "moe_load_balancer_algorithm"),
+            "static+waterfill",
+        )
+        capabilities = get_moe_load_balancer_pipeline(
+            resolution_result(server_args, "moe_load_balancer_algorithm")
+        ).capabilities
+        self.assertTrue(capabilities.requires_rank_dispatch_map)
 
 
 class TestPortArgs(unittest.TestCase):

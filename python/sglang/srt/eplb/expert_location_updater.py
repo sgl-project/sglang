@@ -38,6 +38,47 @@ _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
 class ExpertLocationUpdater:
     def __init__(self):
         self._first_execution = True
+        self._layer_temp_buffers = None
+
+    def update_layer(
+        self,
+        routed_experts_weights: List[torch.Tensor],
+        new_expert_location_metadata: ExpertLocationMetadata,
+        layer_id: int,
+        nnodes: int,
+        rank: int,
+    ):
+        """Commit a one-layer placement (``new_expert_location_metadata`` holds
+        that single layer) with the P2P mover, then publish it as ``layer_id``."""
+        live = get_global_expert_location_metadata()
+        assert live is not None and new_expert_location_metadata.num_layers == 1
+        if self._layer_temp_buffers is None:
+            # The mover uses the default process group: initialize its NCCL
+            # communicator on every rank before a subset first runs P2P.
+            torch.distributed.barrier()
+            self._layer_temp_buffers = create_temp_buffers(routed_experts_weights)
+        world_size = torch.distributed.get_world_size()
+        missing: List[int] = []
+        update_expert_weights_single_layer(
+            routed_experts_weights=routed_experts_weights,
+            temp_buffers=self._layer_temp_buffers,
+            old_physical_to_logical_map=live.physical_to_logical_map_cpu[
+                layer_id
+            ].tolist(),
+            new_physical_to_logical_map=new_expert_location_metadata.physical_to_logical_map_cpu[
+                0
+            ].tolist(),
+            num_local_physical_experts=live.num_local_physical_experts,
+            num_gpu_per_node=world_size // nnodes,
+            rank=rank,
+            world_size=world_size,
+            missing_logical_experts_info=missing,
+        )
+        if missing:
+            raise RuntimeError(
+                f"Layer {layer_id} refresh lost expert weights: {missing}"
+            )
+        live.update(new_expert_location_metadata, update_layer_ids=[layer_id])
 
     def update(
         self,

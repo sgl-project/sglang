@@ -764,7 +764,7 @@ def handle_eplb_and_dispatch(server_args: Any):
     needs_rank_invariant_dispatch = resolved_view(server_args).moe_a2a_backend == "none"
 
     if (cfg.enable_eplb or (cfg.init_expert_location != "trivial")) and (
-        cfg.ep_dispatch_algorithm is None
+        cfg.ep_dispatch_algorithm is None and cfg.moe_load_balancer_algorithm is None
     ):
         declare_resolution(
             server_args,

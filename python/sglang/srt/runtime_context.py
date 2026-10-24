@@ -641,6 +641,11 @@ class Resources(_FlagGroupBase):
     # (owning accessors live in sglang.srt.eplb).
     expert_distribution_recorder: Any = None
     expert_location_metadata: Any = None
+    # Model expert counts published by ModelRunner before EvenMoE construction.
+    mlb_model_info: dict[str, int | None] | None = None
+    # Coupled EvenMoE placement: EPLBManager.refresh_layer, run by the routing glue
+    # ahead of each layer's dispatch. None unless placement refreshes per layer.
+    mlb_placement_refresh: Any = None
     # LPLB: layer_id -> solver.
     lplb_solvers: dict = msgspec.field(default_factory=dict)
     # Named side streams (see RuntimeContext.get_stream): name -> stream.
