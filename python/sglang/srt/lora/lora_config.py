@@ -22,6 +22,11 @@ from huggingface_hub import snapshot_download
 logger = logging.getLogger(__name__)
 
 
+def _pattern_overrides(*, hf_config: Dict, field: str, default) -> Dict:
+    pattern = hf_config.get(field) or {}
+    return {key: value for key, value in pattern.items() if value != default}
+
+
 class LoRAConfig:
     def __init__(
         self,
@@ -42,6 +47,15 @@ class LoRAConfig:
         self.target_modules = self.hf_config["target_modules"]
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
+        # PEFT lets rank_pattern and alpha_pattern override r and lora_alpha for
+        # the modules they match. Admission reads only this config, so keep every
+        # entry that could change a value.
+        self.rank_overrides = _pattern_overrides(
+            hf_config=self.hf_config, field="rank_pattern", default=self.r
+        )
+        self.alpha_overrides = _pattern_overrides(
+            hf_config=self.hf_config, field="alpha_pattern", default=self.lora_alpha
+        )
         self.use_dora = self.hf_config.get("use_dora", False)
 
         # Filter fake added tokens: tokens with ID < base_vocab_size are already
