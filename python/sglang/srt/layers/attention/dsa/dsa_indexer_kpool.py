@@ -1138,7 +1138,10 @@ class IndexerKPool(MultiPlatformOp):
                     weights=weights[rows].contiguous(),
                     starts=logits_starts[rows],
                     ends=logits_ends[rows],
-                    clean_logits=True,
+                    # The KPool top-k reads only [row_starts, row_starts + lengths),
+                    # so clearing the rest of this potentially multi-GiB matrix is
+                    # redundant.
+                    clean_logits=False,
                 )
             topk_chunk = self._topk_from_kpool_logits(
                 logits=logits,
