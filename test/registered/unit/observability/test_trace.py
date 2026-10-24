@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import sglang.srt.observability.trace as mod
+from sglang.srt.environ import envs
 from sglang.srt.observability.trace import (
     SpanAttributes,
     TraceEvent,
@@ -44,6 +45,16 @@ class TestTraceFunctions(unittest.TestCase):
 
     def test_extract_trace_headers_missing(self):
         self.assertEqual(extract_trace_headers({}), {})
+
+    def test_extract_trace_headers_adds_configured_headers(self):
+        headers = {
+            "traceparent": "abc",
+            "x-request-id": "6f97ea7f",
+            "x-other": "skip",
+        }
+        with envs.SGLANG_TRACE_REQUEST_HEADERS.override("X-Request-Id"):
+            result = extract_trace_headers(headers)
+        self.assertEqual(result, {"traceparent": "abc", "x-request-id": "6f97ea7f"})
 
     def test_set_global_trace_level(self):
         from sglang.srt.runtime_context import get_resources
@@ -279,11 +290,41 @@ class TestTraceReqContextEnabled(unittest.TestCase):
         ctx.trace_req_finish(ts=4000, attrs={"tokens": 42})
         self.assertIsNone(ctx.root_span)
 
+    def test_root_span_records_configured_headers_up_to_1024_chars(self):
+        with envs.SGLANG_TRACE_REQUEST_HEADERS.override("x-request-id,x-session-id"):
+            ctx = TraceReqContext(
+                rid="req-1",
+                external_trace_header={"X-Request-Id": "a" * 5000, "x-session-id": ""},
+            )
+            ctx.trace_req_start(ts=1000)
+        attrs = ctx.root_span.attributes
+        ctx.trace_req_finish(ts=2000)
+
+        self.assertEqual(attrs["http.request.header.x-request-id"], "a" * 1024)
+        self.assertNotIn("http.request.header.x-session-id", attrs)
+
     def test_trace_req_start_with_bootstrap_room(self):
         ctx = TraceReqContext(rid="req-1", bootstrap_room=0xFF, role="prefill")
         ctx.trace_req_start(ts=1000)
         self.assertIsNotNone(ctx.root_span)
         ctx.trace_req_finish(ts=2000)
+
+    def test_span_names_leave_out_request_and_process_ids(self):
+        """Span names stay low-cardinality; the rid is recorded unchanged."""
+        pid = threading.get_native_id()
+        mod.threads_info[pid] = TraceThreadInfo(
+            "host", pid, "Scheduler", tp_rank=0, dp_rank=1, pp_rank=None
+        )
+        for role, root_name in [("unified", "Req"), ("decode", "decode Req")]:
+            ctx = TraceReqContext(rid="req_abc_123", role=role)
+            ctx.trace_req_start(ts=1000)
+
+            self.assertEqual(ctx.root_span.name, root_name)
+            self.assertEqual(ctx.root_span.attributes["rid"], "req_abc_123")
+            self.assertEqual(
+                ctx.thread_context.thread_span.name, "Scheduler [TP 0] [DP 1]"
+            )
+            ctx.trace_req_finish(ts=2000)
 
     def test_trace_slice_combined(self):
         """trace_slice() creates and ends a span in one call."""

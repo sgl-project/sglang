@@ -70,6 +70,17 @@ This section explains how to configure the request tracing and export the trace 
 
     **Note**: You must set the parameter `--enable-trace`; otherwise, the trace capability will not be enabled regardless of any dynamic adjustments to the trace level.
 
+## Finding a Request's Trace
+
+To find the trace of a given request, name the request headers that carry its IDs. Each named header present on a request is recorded on its root span as `http.request.header.<name>`, cut to 1024 characters:
+```bash Command
+export SGLANG_TRACE_REQUEST_HEADERS=x-request-id,x-correlation-id
+```
+
+| Environment Variable | Description | Default |
+| --- | --- | --- |
+| `SGLANG_TRACE_REQUEST_HEADERS` | Comma-separated request headers recorded on each request's root span | Not set |
+
 ## Async Tracing (Reducing Performance Overhead)
 
 When batch sizes are large, synchronous OTel span creation can degrade inference throughput due to thread-safe locking and background export threads. Async tracing moves all span creation to a dedicated exporter process via ZMQ, keeping the scheduler and tokenizer hot paths free of OTel overhead.
@@ -143,6 +154,10 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
         ```python Example
         trace_ctx.rebuild_thread_context()
         ```
+
+## Span Names
+
+Each request's root span is named `Req` (`prefill Req` or `decode Req` under PD disaggregation) and records SGLang's request ID as the `rid` attribute. Thread spans are named after the thread and its ranks, e.g. `Scheduler [TP 0] [DP 1]`; the host and pid are attributes.
 
 ## How to Extend the Tracing Framework to Support Complex Tracing Scenarios
 

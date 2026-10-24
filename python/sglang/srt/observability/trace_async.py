@@ -688,27 +688,14 @@ class TraceReqContextAsync:
 
         ts = ts or _trace_mod.get_cur_time_ns()
 
-        external_trace_context = _trace_mod._trace_context_propagator.extract(
-            self._init_args.get("external_trace_header") or {}
-        )
-
-        orig_rid = self.rid.split("_")[-1]
-        role = self._init_args.get("role", "unified")
-        role_prefix = "" if role == "unified" else role
-        attrs = {
-            "rid": orig_rid,
-            "module": f"sglang::{self._init_args.get('module_name', '')}",
-        }
-        bootstrap_room = self._init_args.get("bootstrap_room")
-        if bootstrap_room:
-            attrs["bootstrap_room"] = str(hex(bootstrap_room))
-
         # Create root span in THIS process — cheap (one per request).
-        self.root_span = _trace_mod.tracer.start_span(
-            name=f"{role_prefix} Req {orig_rid[:8]}",
-            start_time=ts,
-            context=external_trace_context,
-            attributes=attrs,
+        self.root_span = _trace_mod.start_root_span(
+            rid=self.rid,
+            role=self._init_args["role"],
+            module_name=self._init_args["module_name"],
+            bootstrap_room=self._init_args["bootstrap_room"],
+            external_trace_header=self._init_args["external_trace_header"],
+            ts=ts,
         )
         self.root_span_context = trace.set_span_in_context(self.root_span)
 
