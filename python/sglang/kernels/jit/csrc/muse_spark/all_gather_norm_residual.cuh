@@ -20,9 +20,10 @@ struct Params {
   Counter* counter;       // per-block phase counters
   uint32_t num_counters;  // PushPlane::num_blocks
   uint32_t half_bytes;    // world_size * slot_bytes
+  uint8_t* ws_peers[device::distributed::kMaxWorldSize];
   uint32_t rank;
   uint32_t num_rows;
-  const bf16_t* local;  // [M, H / world]
+  const bf16_t* local;  // [M, kNLocal]
   NormResidualParams norm;
 };
 
@@ -48,7 +49,7 @@ SGL_DEVICE uint32_t begin_phase(const Params& params) {
   return phase;
 }
 
-template <uint32_t kNLocal, int kNumThreads>
+template <uint32_t kWorld, uint32_t kNLocal, int kNumThreads, bool kReduce>
 SGL_DEVICE void push_local_slice(const Params& params, uint32_t half_off) {
   const uint32_t num_local = params.num_rows * kNLocal;
   const uint32_t worker = blockIdx.x * kNumThreads + threadIdx.x;
@@ -62,7 +63,14 @@ SGL_DEVICE void push_local_slice(const Params& params, uint32_t half_off) {
       if ((w[j] >> 16) == 0) w[j] |= 0x80000000u;
     }
     const uint32_t byte_off = half_off + (params.rank * num_local + elem) * sizeof(bf16_t);
-    device::ptx::st_multimem_16B(raw, params.ws_mc + byte_off, 0);
+    if constexpr (kReduce) {
+#pragma unroll
+      for (uint32_t r = 0; r < kWorld; ++r) {
+        device::ptx::st_relaxed_16B(raw, params.ws_peers[r] + byte_off, 0);
+      }
+    } else {
+      device::ptx::st_multimem_16B(raw, params.ws_mc + byte_off, 0);
+    }
   }
 }
 
@@ -112,6 +120,40 @@ receive_pack(bf16_t* gathered, uint32_t num_rows, uint32_t row, uint32_t col, in
   return cache[pack % 2];
 }
 
+// Matches 1shot push order.
+template <uint32_t kWorld, int64_t kHidden>
+SGL_DEVICE uint4 take_reduced(bf16_t* slots, uint32_t num_rows, uint32_t row, uint32_t col) {
+  bf16_t* src[kWorld];
+#pragma unroll
+  for (uint32_t r = 0; r < kWorld; ++r) {
+    src[r] = slots + (static_cast<int64_t>(r) * num_rows + row) * kHidden + col;
+  }
+  uint4 raw[kWorld];
+  bool pending;
+  do {
+    pending = false;
+#pragma unroll
+    for (uint32_t r = 0; r < kWorld; ++r) {
+      device::ptx::ld_relaxed_16B(raw[r], src[r], 0);
+      pending |= vector_pending(raw[r]);
+    }
+  } while (pending);
+  device::AlignedVector<uint32_t, 4> zero;
+  zero.fill(0);
+#pragma unroll
+  for (uint32_t r = 0; r < kWorld; ++r) {
+    zero.store(src[r]);
+  }
+  using BF16Vec = device::AlignedVector<bf16x2_t, 4>;
+  BF16Vec partials[kWorld];
+#pragma unroll
+  for (uint32_t r = 0; r < kWorld; ++r) {
+    partials[r] = *reinterpret_cast<const BF16Vec*>(&raw[r]);
+  }
+  const BF16Vec sum = device::reduce_vec(partials);
+  return *reinterpret_cast<const uint4*>(&sum);
+}
+
 }  // namespace muse_ag_norm
 
 // C > 1: one cluster per row; muse_spark_norm_residual_cluster's arithmetic.
@@ -123,7 +165,9 @@ template <
     bool kUsePDL,
     bool kPostNormIsInputScale,
     bool kPostWeight,
-    bool kGate>
+    bool kGate,
+    bool kReduce,
+    bool kRouter>
 __global__ void __launch_bounds__(kNumThreads)
     muse_spark_all_gather_norm_residual_cluster_kernel(const __grid_constant__ muse_ag_norm::Params params) {
   using namespace device;
@@ -134,7 +178,7 @@ __global__ void __launch_bounds__(kNumThreads)
   constexpr int kPacks = kHidden / (kTotalThreads * kVec);
   constexpr int kNumWarps = kNumThreads / kWarpThreads;
   constexpr float kInvHidden = 1.0f / static_cast<float>(kHidden);
-  constexpr uint32_t kNLocal = static_cast<uint32_t>(kHidden) / kWorld;
+  constexpr uint32_t kNLocal = static_cast<uint32_t>(kHidden) / (kReduce ? 1 : kWorld);
   static_assert(kClusterSize == 2 || kClusterSize == 4 || kClusterSize == 8 || kClusterSize == 16);
   static_assert(kHidden % (kTotalThreads * kVec) == 0);
   static_assert(kNLocal % kVec == 0, "a vector must never cross a rank block");
@@ -149,6 +193,7 @@ __global__ void __launch_bounds__(kNumThreads)
   const auto stream = static_cast<const fp32_t*>(norm.stream) + base;
   const auto out = static_cast<bf16_t*>(norm.output) + base;
   const auto new_stream = static_cast<fp32_t*>(norm.new_stream) + base;
+  const auto router = static_cast<fp32_t*>(norm.router_out) + (kRouter ? base : 0);
   const auto post_weight = static_cast<const bf16_t*>(norm.post_weight);
   const auto pre_weight = static_cast<const bf16_t*>(norm.pre_weight);
   const auto alpha_ptr = static_cast<const fp32_t*>(norm.alpha);
@@ -167,7 +212,7 @@ __global__ void __launch_bounds__(kNumThreads)
   PDLWaitPrimary<kUsePDL>();
   const uint32_t phase = muse_ag_norm::begin_phase<kNumThreads>(params);
   const uint32_t half_off = phase * params.half_bytes;
-  muse_ag_norm::push_local_slice<kNLocal, kNumThreads>(params, half_off);
+  muse_ag_norm::push_local_slice<kWorld, kNLocal, kNumThreads, kReduce>(params, half_off);
   PDLTriggerSecondary<kUsePDL>();
 
   const auto gathered = reinterpret_cast<bf16_t*>(params.ws_local + half_off);
@@ -210,8 +255,14 @@ __global__ void __launch_bounds__(kNumThreads)
         }
       }
     }
-    const uint4 raw = muse_ag_norm::take_gathered<kNLocal>(
-        gathered, params.num_rows, static_cast<uint32_t>(row), static_cast<uint32_t>(index) * kVec);
+    uint4 raw;
+    if constexpr (kReduce) {
+      raw = muse_ag_norm::take_reduced<kWorld, kHidden>(
+          gathered, params.num_rows, static_cast<uint32_t>(row), static_cast<uint32_t>(index) * kVec);
+    } else {
+      raw = muse_ag_norm::take_gathered<kNLocal>(
+          gathered, params.num_rows, static_cast<uint32_t>(row), static_cast<uint32_t>(index) * kVec);
+    }
     const auto& branch_values = *reinterpret_cast<const BF16Vec*>(&raw);
 
 #pragma unroll
@@ -269,6 +320,7 @@ __global__ void __launch_bounds__(kNumThreads)
     const int index = cluster_rank * kNumThreads + threadIdx.x + pack * kTotalThreads;
     BF16Vec output_values;
     F32Vec new_stream_values[kFParts];
+    F32Vec router_values[kFParts];
 #pragma unroll
     for (int pair = 0; pair < kPairs; ++pair) {
       const int part = pair / kFPairs;
@@ -290,11 +342,13 @@ __global__ void __launch_bounds__(kNumThreads)
         normalized = muse_ag_norm::mul_pair(normalized, weight);
       }
       output_values[pair] = cast<bf16x2_t>(normalized);
+      if constexpr (kRouter) router_values[part][lane] = normalized;
     }
     output_values.store(out, index);
 #pragma unroll
     for (int part = 0; part < kFParts; ++part) {
       new_stream_values[part].store(new_stream, index * kFParts + part);
+      if constexpr (kRouter) router_values[part].store(router, index * kFParts + part);
     }
   }
 
@@ -343,7 +397,7 @@ __global__ void __launch_bounds__(kNumThreads)
   PDLWaitPrimary<kUsePDL>();
   const uint32_t phase = muse_ag_norm::begin_phase<kNumThreads>(params);
   const uint32_t half_off = phase * params.half_bytes;
-  muse_ag_norm::push_local_slice<kNLocal, kNumThreads>(params, half_off);
+  muse_ag_norm::push_local_slice<kWorld, kNLocal, kNumThreads, false>(params, half_off);
   PDLTriggerSecondary<kUsePDL>();
 
   const auto gathered = reinterpret_cast<bf16_t*>(params.ws_local + half_off);
@@ -511,10 +565,13 @@ template <
     bool kPostNormIsInputScale,
     bool kPrefetchWeights,
     bool kHasPostWeight,
-    bool kHasGate>
+    bool kHasGate,
+    bool kReduce = false,
+    bool kHasRouter = false>
 struct MuseSparkAllGatherNormResidual {
   static_assert(kClusterSize == 1 || kClusterSize == 2 || kClusterSize == 4 || kClusterSize == 8 || kClusterSize == 16);
-  static constexpr int64_t kNLocal = kHidden / kWorld;
+  static_assert(kClusterSize > 1 || !(kReduce || kHasRouter), "the row kernel only gathers");
+  static constexpr int64_t kNLocal = kReduce ? kHidden : kHidden / kWorld;
 
   static void
   run(CommunicatorRef ref,
@@ -522,6 +579,7 @@ struct MuseSparkAllGatherNormResidual {
       const tvm::ffi::TensorView stream,
       const tvm::ffi::TensorView output,
       const tvm::ffi::TensorView new_stream,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> router_out,
       const tvm::ffi::Optional<tvm::ffi::TensorView> post_weight,
       const tvm::ffi::Optional<tvm::ffi::TensorView> pre_weight,
       const tvm::ffi::Optional<tvm::ffi::TensorView> alpha,
@@ -542,6 +600,10 @@ struct MuseSparkAllGatherNormResidual {
     TensorMatcher({M, H}).with_dtype<fp32_t>().with_device(device_).verify(stream);
     TensorMatcher({M, H}).with_dtype<bf16_t>().with_device(device_).verify(output);
     TensorMatcher({M, H}).with_dtype<fp32_t>().with_device(device_).verify(new_stream);
+    RuntimeCheck(router_out.has_value() == kHasRouter, "router_out presence must match kHasRouter");
+    if constexpr (kHasRouter) {
+      TensorMatcher({M, H}).with_dtype<fp32_t>().with_device(device_).verify(router_out.value());
+    }
     if (post_weight.has_value()) {
       TensorMatcher({H}).with_dtype<bf16_t>().with_device(device_).verify(post_weight.value());
     }
@@ -577,7 +639,7 @@ struct MuseSparkAllGatherNormResidual {
           "M * cluster_size exceeds the push plane's block counters");
     }
 
-    const auto params = muse_ag_norm::Params{
+    auto params = muse_ag_norm::Params{
         .ws_local = push.workspaces[push.rank],
         .ws_mc = push.mc_workspace,
         .counter = push.counter,
@@ -592,7 +654,7 @@ struct MuseSparkAllGatherNormResidual {
                 .stream = stream.data_ptr(),
                 .output = output.data_ptr(),
                 .new_stream = new_stream.data_ptr(),
-                .router_out = nullptr,
+                .router_out = kHasRouter ? router_out.value().data_ptr() : nullptr,
                 .post_weight = post_weight.has_value() ? post_weight.value().data_ptr() : nullptr,
                 .pre_weight = pre_weight.has_value() ? pre_weight.value().data_ptr() : nullptr,
                 .alpha = gate ? alpha.value().data_ptr() : nullptr,
@@ -605,6 +667,8 @@ struct MuseSparkAllGatherNormResidual {
                 .pre_norm_bf16 = false,
             },
     };
+    for (uint32_t r = 0; r < kWorld; ++r)
+      params.ws_peers[r] = push.workspaces[r];
     const auto device = device_.unwrap();
     if constexpr (kClusterSize == 1) {
       LaunchKernel(grid, kNumThreads, device)
@@ -628,7 +692,9 @@ struct MuseSparkAllGatherNormResidual {
           kUsePDL,
           kPostNormIsInputScale,
           kHasPostWeight,
-          kHasGate>;
+          kHasGate,
+          kReduce,
+          kHasRouter>;
       [[maybe_unused]] static const bool cluster_configured = [kernel] {
         if constexpr (kClusterSize > 8) {
           RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));

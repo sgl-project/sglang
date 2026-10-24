@@ -26,6 +26,7 @@ from sglang.kernels.ops.communication.muse_spark_all_gather import (
 from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import (
     all_gather_norm_residual,
     all_gather_norm_residual_supported,
+    all_reduce_norm_residual,
 )
 from sglang.kernels.ops.gemm.muse_spark_router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
@@ -103,6 +104,9 @@ from sglang.srt.utils.common import get_device_capability, is_cuda
 _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
+
+# Measured on B300 TP4.
+_ATTN_AR_FUSION_MAX_TOKENS = 16
 
 # FusedMoE shard ids that expert weight loaders expect per checkpoint projection.
 _EXPERT_SHARD_IDS = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}
@@ -406,6 +410,7 @@ class MuseSpark1xAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_all_reduce: bool = False,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -433,7 +438,7 @@ class MuseSpark1xAttention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
         output = self.attn(q, k, v, forward_batch, save_kv_cache=kv_store is None)
         output = self._fused_o_norm_gate(output, o_gate)
-        output, _ = self.o_proj(output)
+        output, _ = self.o_proj(output, skip_all_reduce=skip_all_reduce)
         return output
 
 
@@ -988,6 +993,12 @@ class MuseSpark1xDecoderLayer(nn.Module):
             self.pre_feedforward_layernorm,
         )
         self._fused_ffn_boundary = None
+        parallel = get_parallel()
+        self._attn_ar_fusion = (
+            self.operator_dtype == torch.bfloat16
+            and parallel.tp_size == parallel.attn_tp_size == 4
+            and get_device_capability() == (10, 3)
+        )
 
     @staticmethod
     def _is_moe_layer(config: MuseSparkTextConfig, layer_idx: int) -> bool:
@@ -1014,16 +1025,28 @@ class MuseSpark1xDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Returns the updated residual stream and the next layer's attention input."""
-        attn_output = self.self_attn(positions, attn_input, forward_batch)
+        ar_comm = self._attn_all_reduce_comm(attn_input.shape[0])
+        attn_output = self.self_attn(
+            positions, attn_input, forward_batch, skip_all_reduce=ar_comm is not None
+        )
         router_dtype = self._router_dtype
         if router_dtype is not None and _use_split_bf16_router(attn_output.shape[0]):
             router_dtype = None
-        ffn_input, stream, router_input = self._fused_attn_boundary(
-            stream,
-            attn_output,
-            branch_dtype=self.operator_dtype,
-            router_dtype=router_dtype,
-        )
+        if ar_comm is not None:
+            ffn_input, stream, router_input = all_reduce_norm_residual(
+                comm=ar_comm,
+                partial=attn_output,
+                stream=stream,
+                want_router=router_dtype is not None,
+                **self._fused_attn_boundary.jit_kernel_kwargs(),
+            )
+        else:
+            ffn_input, stream, router_input = self._fused_attn_boundary(
+                stream,
+                attn_output,
+                branch_dtype=self.operator_dtype,
+                router_dtype=router_dtype,
+            )
         if self.is_moe_layer:
             ffn_output = self.mlp(ffn_input, router_input, forward_batch)
         else:
@@ -1045,6 +1068,20 @@ class MuseSpark1xDecoderLayer(nn.Module):
             stream, ffn_output, branch_dtype=self.operator_dtype
         )
         return stream, next_attn_input
+
+    def _attn_all_reduce_comm(self, num_tokens: int):
+        comm = get_parallel().tp_group.ca_comm
+        if (
+            self._attn_ar_fusion
+            and num_tokens <= _ATTN_AR_FUSION_MAX_TOKENS
+            and not get_forward().sp_active
+            and self._fused_attn_boundary.jit_selected()
+            and all_gather_norm_residual_supported(
+                comm=comm, num_tokens=num_tokens, hidden_size=self.self_attn.hidden_size
+            )
+        ):
+            return comm
+        return None
 
     def self_attn_input_norm(self, stream: torch.Tensor) -> torch.Tensor:
         return self.input_layernorm(stream).to(self.operator_dtype)
