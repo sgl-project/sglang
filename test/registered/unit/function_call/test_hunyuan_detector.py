@@ -647,6 +647,56 @@ class TestHunyuanDetectorStreaming(CustomTestCase):
         self.assertEqual(len(collected), 1)
         self.assertEqual(collected[0]["name"], "get_current_date")
 
+    def test_streaming_unknown_tool_skipped(self):
+        """Streaming must skip undefined tools like detect_and_parse does."""
+        detector = self._new_detector()
+        deltas = [
+            "<tool_calls>",
+            "<tool_call>",
+            "nonexistent_func",
+            "<tool_sep>",
+            "<arg_key>",
+            "x",
+            "</arg_key>",
+            "<arg_value>",
+            "1",
+            "</arg_value>",
+            "</tool_call>",
+            "</tool_calls>",
+        ]
+        all_calls = []
+        for d in deltas:
+            all_calls.extend(detector.parse_streaming_increment(d, self.tools).calls)
+        self.assertEqual(all_calls, [])
+
+    def test_streaming_mixed_known_and_unknown_tools(self):
+        """Unknown tools must not take a tool_index from the known ones."""
+        detector = self._new_detector()
+        text = (
+            "<tool_calls>"
+            "<tool_call>get_current_date<tool_sep></tool_call>"
+            "<tool_call>nonexistent<tool_sep>"
+            "<arg_key>x</arg_key><arg_value>1</arg_value></tool_call>"
+            "<tool_call>search<tool_sep>"
+            "<arg_key>query</arg_key><arg_value>test</arg_value>"
+            "</tool_call>"
+            "</tool_calls>"
+        )
+        for chunks in ([text], list(text)):
+            detector = self._new_detector()
+            all_calls = []
+            for chunk in chunks:
+                result = detector.parse_streaming_increment(chunk, self.tools)
+                all_calls.extend(result.calls)
+            self.assertEqual(
+                sorted({c.tool_index for c in all_calls}), [0, 1], msg=len(chunks)
+            )
+            collected = _collect_streamed_tool_calls(all_calls)
+            self.assertEqual(
+                [(c["name"], json.loads(c["parameters"])) for c in collected],
+                [("get_current_date", {}), ("search", {"query": "test"})],
+            )
+
 
 class TestHunyuanDetectorStructureInfo(CustomTestCase):
     def setUp(self):
