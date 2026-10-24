@@ -3,7 +3,7 @@ title: Cambricon MLUs
 description: "Install SGLang on Cambricon MLUs with matching vendor runtime packages."
 ---
 
-This guide describes how to prepare the Cambricon software environment, install SGLang, and serve Qwen3 models on MLU.
+This guide describes how to prepare the Cambricon software environment and install SGLang on MLU.
 
 ## Prerequisites
 
@@ -143,56 +143,11 @@ These suites validate MLU operators, paged attention, and SGLang communicator co
 
 ## Serve Qwen3 on MLU
 
-The MLU backend provides BF16 GQA inference with paged KV caching, Radix Cache
-prefix reuse, chunked prefill, and CNCL tensor parallelism. Use the same vendor
-software environment as the installation steps above. Install SGLang itself;
-the separate `sglang-mlu` platform plugin is not required for this backend.
-
-Launch Qwen3-8B on one MLU:
+Launch Qwen3-8B in BF16 with tensor parallelism across two MLUs:
 
 ```bash
 python -m sglang.launch_server \
   --model-path Qwen/Qwen3-8B \
   --device mlu --dtype bfloat16 \
-  --tp 1 --port 30000
-```
-
-For two-device tensor parallelism, use `--tp 2`. For two independent replicas,
-use `--tp 1 --dp 2`. Combining `--tp 2 --dp 2` requires four devices.
-
-MLU defaults select the `mlu` attention backend, page size 16, and `pytorch`
-sampling. Decode uses MLU graphs. To enable prefill breakable graphs as well,
-add the following argument:
-
-```bash
---cuda-graph-backend-prefill breakable
-```
-
-To run both phases eagerly, set
-`--cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled`.
-Unsupported prefill graph shapes fall back to eager execution. MLU graph
-execution does not support memory saver or graph deduplication.
-
-### Collect a profile
-
-Use the existing profiling API with `MLU` activity to include device kernels:
-
-```bash
-curl -X POST http://localhost:30000/start_profile \
-  -H 'Content-Type: application/json' \
-  -d '{"output_dir":"/tmp/sglang-mlu-profile","activities":["CPU","MLU"]}'
-
-# Send inference requests before stopping the profile.
-curl -X POST http://localhost:30000/stop_profile
-```
-
-The default `GPU` activity also selects the MLU profiler on this platform.
-
-### Run model tests
-
-The two-device nightly suite checks BF16 eager and graph generation, TP1/TP2,
-DP replicas, cached prefixes, and chunked prefill:
-
-```bash
-python test/run_suite.py --hw mlu --suite nightly-test-2-mlu --nightly
+  --tp 2 --port 30000
 ```
