@@ -1550,6 +1550,45 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
+    # H20-3e: the block-32 kernel beats DeepGEMM at M <= 8 and loses above that.
+    # Only this DeepGEMM entry is redirected; an explicit Triton backend is unchanged.
+    if (
+        input_scale is None
+        and output_dtype == torch.bfloat16
+        and list(block_size) == [32, 32]
+        and 1 <= input_2d.shape[0] <= 8
+        and weight_scale.dtype == torch.float32
+    ):
+        from sglang.kernels.ops.gemm.fp8_block32_sm90 import (
+            _is_h20_3e,
+            fp8_block32_gemm,
+            use_fp8_block32_gemm,
+        )
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+        device_index = weight.device.index if weight.device.index is not None else 0
+        if _is_h20_3e(device_index) and not is_batch_invariant_mode_enabled():
+            if act_scale_ue8m0:
+                q_small, x_scale_small = sglang_per_token_group_quant_fp8(
+                    input_2d, block_size[1], scale_ue8m0=True
+                )
+            else:
+                q_small, x_scale_small = per_token_group_quant_fp8(
+                    input_2d, block_size[1], column_major_scales=False
+                )
+            if use_fp8_block32_gemm(
+                q_small,
+                weight,
+                x_scale_small,
+                weight_scale,
+                block_size,
+                output_dtype,
+            ):
+                output = fp8_block32_gemm(q_small, weight, x_scale_small, weight_scale)
+                if bias is not None:
+                    output += bias
+                return output.to(dtype=output_dtype).view(*output_shape)
+
     if get_platform().is_sm90 and act_scale_ue8m0:
         # Keep the checkpoint's power-of-two activation quantization. SM90
         # consumes fp32 scales; DeepGEMM aligns their storage for TMA.
@@ -1804,9 +1843,28 @@ def triton_w8a8_block_fp8_linear(
                 input_2d, block_size[1], column_major_scales=False
             )
 
+    from sglang.kernels.ops.gemm.fp8_block32_sm90 import (
+        fp8_block32_gemm,
+        use_fp8_block32_gemm,
+    )
     from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
+    # NVIDIA H20-3e only. On the Triton backend the new kernel wins through M=32;
+    # larger M stays on w8a8_block_fp8_matmul_triton.
     if (
+        not is_batch_invariant_mode_enabled()
+        and q_input.shape[0] <= 32
+        and use_fp8_block32_gemm(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            block_size,
+            output_dtype,
+        )
+    ):
+        output = fp8_block32_gemm(q_input, weight, x_scale, weight_scale)
+    elif (
         weight_bf16 is not None
         and input_scale is None
         and act_scale_ue8m0
