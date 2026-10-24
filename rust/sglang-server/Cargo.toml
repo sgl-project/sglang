@@ -47,7 +47,7 @@ dynamo-tokenizers = "3.1.0"
 dynamo-parsers = "=9.2.8"
 dynamo-protocols = "7.0.0"
 dynamo-renderer = "7.1.1"
-sglang-processor = { path = "../sglang-processor", default-features = false, features = ["mm", "parser"] }
+sglang-processor = { path = "../sglang-processor", default-features = false, features = ["mm", "parser", "render"] }
 minijinja = "2.24"
 flume = "0.12.0"
 hf-hub = { version = "0.4", default-features = false }

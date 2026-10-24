@@ -14,6 +14,7 @@ use thiserror::Error;
 
 mod legacy;
 mod loader;
+mod media;
 mod models;
 mod reasoning;
 mod selection;
@@ -21,6 +22,7 @@ mod thinking;
 
 use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
+pub use self::media::{MediaModality, MediaRef, extract_media};
 pub use self::models::DeepSeekV4Profile;
 use self::models::{
     deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, is_qwen38,

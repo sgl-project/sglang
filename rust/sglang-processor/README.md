@@ -68,6 +68,7 @@ ChatFormatter::resolve_thinking(&mut kwargs, tools_enabled, named_tool_choice) -
 ChatFormatter::stop_strs() -> Option<OneOrMany<String>>
 requested_effort(&body) -> Option<&Value>
 requested_thinking(&body) -> Option<bool>
+extract_media(&messages) -> Vec<MediaRef>
 ```
 
 `select_chat_formatter` (`selection.rs`) picks a formatter from
@@ -116,6 +117,11 @@ once, for the renderer and DeepSeek-V4 and V4.1 alike. The SGLang additions hook
 | `models/kimi_k25.rs` | the Kimi K2.5 checkpoint's tool encoder | Adds `tools_ts_str` (TypeScript tool declarations) to the kwargs before the Jinja render. |
 | `models/kimi_k3.rs` | `serving_chat.py` (`_prepare_kimi_k3_messages`, `_encode_messages`), the checkpoint's `encoding_k3.py` | Replaces the OAI formatter's request handling. It prepares the messages, tools, thinking effort, `tool_choice` and `response_format` as SGLang does, then calls Dynamo's `KimiK3Formatter`. Shapes Dynamo renders differently are left to the engine. |
 | `models/qwen38.rs` | `serving_chat.py` (`_process_messages`, `_apply_jinja_template`), `jinja_template_utils.py` | Picked by the template. Builds the template context SGLang builds (message, tool and tool-call dumps, content as the template's content format takes it, kwargs over the effort, server defaults), then renders it with Dynamo's Jinja formatter. A later system turn fails as the template makes it fail, where Dynamo would demote it. Media, a `chat_template` kwarg, and text or numbers that Python's `trim` or `json.dumps` treat unlike Dynamo's are left to the engine. |
+
+`extract_media` (`media.rs`) lists a chat's media parts (`image_url`, `input_image`,
+`video_url`, `audio_url`) in message then part order, any role, as Python's
+`process_content_for_template_format` collects `image_data`, so a host can hand
+them to `mm` in the order the rendered placeholders appear.
 
 `stop_strs` returns the legacy template's stop strings; Jinja and native
 formatters have none, as in Python.
