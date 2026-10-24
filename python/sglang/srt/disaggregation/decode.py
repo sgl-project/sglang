@@ -57,6 +57,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
+    all_reduce_flags,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -77,6 +78,10 @@ from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     NextBatchPlan,
     ScheduleBatch,
+)
+from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    kv_private_swa_tokens,
+    kv_private_tokens,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
@@ -1583,6 +1588,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+            if self.scheduler.enable_decode_hicache:
+                # Prefill is promised only the L3 span the prefetch took.
+                self._start_hicache_prefetch(decode_req.req, prefix_match)
+                if prefix_match is not None:
+                    total_prefix_len = prefix_match.decode_prefix_len
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1590,8 +1600,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len,
             )
             decode_req.prefix_match = prefix_match
-            if self.scheduler.enable_decode_hicache:
-                self._start_hicache_prefetch(decode_req.req, prefix_match)
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
@@ -1978,6 +1986,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             for decode_req in self.transfer_queue.queue
             if not decode_req.host_staged
         )
+
+    def pre_allocated_token_counts(self) -> Tuple[int, int]:
+        """(full, SWA) KV slots held by transfer-queue requests: KV reserved
+        for an incoming transfer, not yet in the running batch. Pages are
+        charged the way the pool stats charge a request's private KV."""
+        page_size = self.token_to_kv_pool_allocator.page_size
+        full_tokens = swa_tokens = 0
+        for decode_req in self.transfer_queue.queue:
+            if decode_req.host_staged:
+                continue
+            full_tokens += kv_private_tokens(decode_req.req.kv, page_size)
+            swa_tokens += kv_private_swa_tokens(decode_req.req.kv, page_size)
+        return full_tokens, swa_tokens
 
     def _need_space_for_single_req(
         self, retractable_tokens: Optional[int] = None
@@ -2738,18 +2759,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         kv_manager._staging_handler = self.staging_handler
 
     def _release_request(self, decode_req: DecodeRequest) -> None:
+        # HiSparse host pages are the transfer destination; free them with the KV.
+        if self.scheduler.enable_hisparse:
+            self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
         if self.enable_host_receive:
             discard_kv_cache_backup(decode_req.req, self.tree_cache, "host_pool")
             if decode_req.host_staged:
                 return
         release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
 
+    def _is_host_destination(self, decode_req: DecodeRequest) -> bool:
+        return self.enable_host_receive and decode_req.host_staged
+
     def _record_transfer_failure(self, failure_reason: str) -> None:
         if self.scheduler.metrics_reporter.enable_metrics:
             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
 
     def _abort_failed_transfer(self, decode_req: DecodeRequest) -> None:
-        if self.enable_host_receive and decode_req.host_staged:
+        if self._is_host_destination(decode_req):
             decode_req.kv_receiver.abort()
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
@@ -2813,11 +2840,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                if self.scheduler.enable_hisparse:
-                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                requires_host_drain = (
-                    self.enable_host_receive and decode_req.host_staged
-                )
+                requires_host_drain = self._is_host_destination(decode_req)
                 deferrable = (
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.kv_mgr.enable_deferred_decode_kv_release
@@ -2842,7 +2865,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._record_transfer_failure(failure_reason)
                 continue
             elif poll == KVPoll.Success:
-                if self.enable_host_receive and decode_req.host_staged:
+                if self._is_host_destination(decode_req):
                     if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                         self.scheduler.output_streamer.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
@@ -2864,10 +2887,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         [decode_req.req],
                         decode_req.req.return_logprob,
                     )
-                    if self.scheduler.enable_hisparse:
-                        self.scheduler.hisparse_coordinator.request_finished(
-                            decode_req.req
-                        )
                     self._clean_hicache_prefetch_resources(decode_req)
                     self._release_request(decode_req)
                     self._record_transfer_failure(
@@ -2886,8 +2905,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         # Notification state is rank-local. If any rank must hold a failed
         # transfer, all must retain its capacity so admission stays identical.
-        held = self._all_reduce_release_flags(
-            [hold for _, _, hold in failed], torch.distributed.ReduceOp.MAX
+        held = all_reduce_flags(
+            flags=[hold for _, _, hold in failed],
+            group=self.gloo_group,
+            op=torch.distributed.ReduceOp.MAX,
         )
         for (i, decode_req, _), hold in zip(failed, held):
             if hold:
@@ -2929,7 +2950,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # A rank that only holds for a peer has no local acknowledgements to await.
         required_acks = (
             0
-            if (self.enable_host_receive and decode_req.host_staged)
+            if self._is_host_destination(decode_req)
             or not decode_req.kv_receiver.abort_notified
             else len(decode_req.kv_receiver.bootstrap_infos)
         )
@@ -2951,7 +2972,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._release_request(decode_req)
         self.metadata_buffers.bootstrap_room[idx] = 0
         self.req_to_metadata_buffer_idx_allocator.free(idx)
-        if not (self.enable_host_receive and decode_req.host_staged):
+        if not self._is_host_destination(decode_req):
             decode_req.kv_receiver.kv_mgr.clear_deferred_abort_state(room)
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
@@ -2971,45 +2992,31 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 outcome=outcome,
             )
 
-    def _all_reduce_release_flags(
-        self, flags: List[bool], op: torch.distributed.ReduceOp
-    ) -> List[bool]:
-        # Failures come from reduced polls and deferred entries from agreed holds,
-        # so every rank supplies the same entries in the same order, even if empty.
-        if not flags or torch.distributed.get_world_size(self.gloo_group) == 1:
-            return flags
-        reduced = torch.tensor(flags, dtype=torch.int32, device="cpu")
-        torch.distributed.all_reduce(reduced, op=op, group=self.gloo_group)
-        return [bool(flag) for flag in reduced.tolist()]
-
     def resolve_deferred_releases(self) -> None:
         """Release drained transfers; device destinations may also time out."""
         if not self._deferred_releases:
             return
         now = time.monotonic()
-        drained = [
-            decode_req.kv_receiver.is_abort_release_safe()
-            if self.enable_host_receive and decode_req.host_staged
-            else decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
-                decode_req.req.bootstrap_room, required_acks
-            )
-            for decode_req, _, _, _, required_acks in self._deferred_releases
-        ]
+        drained = []
+        ready = []
+        for decode_req, _, deadline, _, required_acks in self._deferred_releases:
+            if self._is_host_destination(decode_req):
+                # A timeout cannot prove that a remote write has stopped.
+                is_drained = decode_req.kv_receiver.is_abort_release_safe()
+                is_ready = is_drained
+            else:
+                is_drained = decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
+                    decode_req.req.bootstrap_room, required_acks
+                )
+                is_ready = is_drained or now >= deadline
+            drained.append(is_drained)
+            ready.append(is_ready)
         # Acks and deadlines are rank-local. Releasing only on some ranks would
         # diverge admission and the sizes of subsequent polling collectives.
-        # Host pages still require a drain: a timeout cannot rule out remote writes.
-        ready = self._all_reduce_release_flags(
-            [
-                is_drained
-                or (
-                    not (self.enable_host_receive and decode_req.host_staged)
-                    and now >= deadline
-                )
-                for (decode_req, _, deadline, _, _), is_drained in zip(
-                    self._deferred_releases, drained
-                )
-            ],
-            torch.distributed.ReduceOp.MIN,
+        # Entries are appended from agreed holds, so every rank reduces the same
+        # list in the same order.
+        ready = all_reduce_flags(
+            flags=ready, group=self.gloo_group, op=torch.distributed.ReduceOp.MIN
         )
         still_held = []
         to_release = []

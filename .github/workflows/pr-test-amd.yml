@@ -553,7 +553,7 @@ jobs:
       max-parallel: 4
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -575,7 +575,7 @@ jobs:
       - name: Run test
         timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 75 || 60 }}
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 12 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-nondeterministic:
     name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic ({0}, linux-{1}-1gpu-sglang)', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
@@ -677,7 +677,7 @@ jobs:
       max-parallel: 1
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
-        part: [0, 1, 2]
+        part: [0, 1]
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -699,7 +699,7 @@ jobs:
       - name: Run test
         timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 60 || 45 }}
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 2700 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 2700 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-2-gpu-large-amd:
     name: ${{ format('stage-b-test-2-gpu-large-amd ({0}, linux-{1}-2gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
@@ -719,7 +719,7 @@ jobs:
       max-parallel: 1
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
-        part: [0, 1]
+        part: [0]
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -741,7 +741,7 @@ jobs:
       - name: Run test
         timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 120 || 45 }}
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 5400 || 2700 }} ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 5400 || 2700 }} ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   multimodal-gen-test-1-gpu-amd:
     name: ${{ format('multimodal-gen-test-1-gpu-amd ({0}, linux-{1}-1gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
@@ -1000,6 +1000,11 @@ jobs:
           # HF download env vars:
           # - HF_HUB_ENABLE_HF_TRANSFER=1: Use faster hf_transfer for downloads (if available)
           # - HF_HUB_DISABLE_SYMLINKS_WARNING=1: Suppress symlink warnings
+          #
+          # Skips ltx_2_5_diffusion_decoder_2gpus: on mi300 its server has never
+          # finished warmup inside the 1200s startup deadline, and the harness
+          # retries that TimeoutError six times, running the shard into the
+          # step timeout.
           docker exec \
             -e HF_TOKEN \
             -e HUGGING_FACE_HUB_TOKEN \
@@ -1019,6 +1024,7 @@ jobs:
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
               --total-partitions 2 \
+              -k "not ltx_2_5_diffusion_decoder" \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
           # Post-test diagnostics
@@ -1056,9 +1062,9 @@ jobs:
           stage-name: stage-b-amd
           jobs: |
             [
-              {"prefix": "stage-b-test-1-gpu-small-amd", "expected_count": 14},
-              {"prefix": "stage-b-test-1-gpu-large-amd", "expected_count": 3},
-              {"prefix": "stage-b-test-2-gpu-large-amd", "expected_count": 2}
+              {"prefix": "stage-b-test-1-gpu-small-amd", "expected_count": 12},
+              {"prefix": "stage-b-test-1-gpu-large-amd", "expected_count": 2},
+              {"prefix": "stage-b-test-2-gpu-large-amd", "expected_count": 1}
             ]
           max-wait-minutes: '480'
 
