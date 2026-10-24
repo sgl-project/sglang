@@ -18,7 +18,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=15, suite="stage-a-test-1-gpu-small-amd")
+register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
 
 
 def _make_proj(weight_dtype, weight_scale_shape=None):
