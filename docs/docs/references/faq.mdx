@@ -26,6 +26,24 @@ This error may result from kernel errors or out-of-memory issues:
       you can try to decrease `--mem-fraction-static`, decrease `--cuda-graph-max-bs-decode`, or decrease `--chunked-prefill-size`.
 - Other bugs, please file an issue on GitHub.
 
+### JIT kernels fail to compile with rsqrt errors
+
+On distributions with glibc 2.42 or newer (Ubuntu 25.10, Fedora 43, Arch), every JIT kernel build can fail with nvcc errors like:
+
+```text
+/usr/include/x86_64-linux-gnu/bits/mathcalls.h: error: exception specification is
+incompatible with that of previous function "rsqrt"
+(declared at .../include/crt/math_functions.h)
+```
+
+glibc 2.42 added host `rsqrt`/`rsqrtf` declarations that conflict with the ones in the CUDA headers (still present in CUDA 13.1). This affects every GPU generation. SGLang falls back to Triton/PyTorch implementations after each failed build, so generation still works, but the first request pays for the failed compile attempts.
+
+Until NVIDIA ships fixed headers, you can:
+
+- Run SGLang in a container whose base image has glibc older than 2.42.
+- Patch `crt/math_functions.h` in your CUDA installation to add `noexcept (true)` to the `rsqrt` and `rsqrtf` declarations, as several distributions do ([Gentoo's patch](https://gitweb.gentoo.org/repo/gentoo.git/tree/dev-util/nvidia-cuda-toolkit/files/nvidia-cuda-toolkit-glibc-2.42.patch)).
+
+Also note that the fused diffusion JIT kernels require compute capability 8.0 (Ampere) or newer; on older GPUs SGLang skips the JIT build and uses the fallback implementations directly.
 
 ## Frequently Asked Questions
 

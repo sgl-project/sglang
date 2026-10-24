@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.ops.diffusion.common.jit_arch import require_sm80
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -28,6 +29,7 @@ _SPATIAL_MULTIPLE = 8
 
 @cache_once
 def _jit_module() -> Module:
+    require_sm80()
     return load_jit(
         "channel_rmsnorm_finish_silu",
         cuda_files=["diffusion/channel_rmsnorm_finish_silu.cuh"],

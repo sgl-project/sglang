@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.kernels.ops.diffusion.common.jit_arch import require_sm80
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_timestep_embedding_module(dtype: torch.dtype) -> Module:
+    require_sm80()
     args = make_cpp_args(dtype)
     return load_jit(
         "timestep_embedding",

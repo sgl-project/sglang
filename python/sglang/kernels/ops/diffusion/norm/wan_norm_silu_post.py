@@ -4,11 +4,13 @@
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.ops.diffusion.common.jit_arch import require_sm80
 from sglang.srt.utils.custom_op import register_custom_op
 
 
 @cache_once
 def _module(x_dtype, affine_dtype, channels_last):
+    require_sm80()
     args = make_cpp_args(x_dtype, affine_dtype, channels_last)
     return load_jit(
         "wan_norm_silu_post",

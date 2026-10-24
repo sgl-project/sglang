@@ -8,6 +8,7 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kda_kernels import _cuda_source
+from sglang.kernels.ops.diffusion.common.jit_arch import require_sm80
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -23,6 +24,7 @@ _TRANSPOSED = -1  # route: the Triton kernel for the transposed-dense layout
 
 @cache_once
 def _jit_residual_gate_add_module(dtype: torch.dtype) -> Module:
+    require_sm80()
     if dtype not in _SUPPORTED_DTYPES:
         raise RuntimeError(f"Unsupported residual_gate_add dtype: {dtype}")
     args = make_cpp_args(dtype)

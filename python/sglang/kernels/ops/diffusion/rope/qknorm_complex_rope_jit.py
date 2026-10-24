@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.jit.utils import cache_once, device_guard, load_jit, make_cpp_args
+from sglang.kernels.ops.diffusion.common.jit_arch import require_sm80
 from sglang.kernels.ops.diffusion.rope.complex_rope_triton import _fuse_real_sin
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -37,6 +38,7 @@ _HEAD_DIM = 128
 
 @cache_once
 def _jit_module(fuse_real_sin: bool, copy_v: bool) -> Module:
+    require_sm80()
     args = make_cpp_args(fuse_real_sin, copy_v)
     return load_jit(
         "qknorm_complex_rope",
