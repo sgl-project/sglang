@@ -1,6 +1,10 @@
 use super::*;
+use crate::cache_action::{
+    BackupKV, FreeComponentHostSlot, FreeDeviceKV, FreeDeviceKVFullOnly, RebuildFullToSwaMapping,
+    RecoverSwaWithLockedFull, SwaRebuild, UpdatePendingBackupOnNodeSplit,
+};
 use crate::components::{ComponentSet, FULL, MAMBA, SWA};
-use crate::test_utils::{accumulate_step, action_kinds, matched_device_indices};
+use crate::test_utils::{accumulate_step, action_kinds, expect_action, matched_device_indices};
 use crate::unified_tree_core::CacheInitParams;
 
 #[test]
@@ -76,7 +80,7 @@ fn swa_window_attach_splits_both_edges_preserving_full_and_pending_actions() {
     assert_eq!(actions.len(), 2);
     for action in &actions {
         assert!(
-            matches!(action, CacheAction::UpdatePendingBackupOnNodeSplit { ack_id: Some(91), old_node_id, new_child_node_id, .. } if *old_node_id == leaf_id && *new_child_node_id == leaf_id)
+            matches!(action.as_any().downcast_ref::<UpdatePendingBackupOnNodeSplit>(), Some(UpdatePendingBackupOnNodeSplit { ack_id: Some(91), old_node_id, new_child_node_id, .. }) if *old_node_id == leaf_id && *new_child_node_id == leaf_id)
         );
     }
     let head = child_of(&tc, tc.arena.root(), &[1, 2]);
@@ -904,15 +908,13 @@ fn insert_new_leaf_in_window_emits_one_leaf_rebuild() {
     assert_eq!(result.prefix_len, 0);
     let root = tc.arena.root();
     let leaf = child_of(&tc, root, &[1]);
-    let [
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one SwaRebuild action");
     };
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action.as_ref());
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     assert!(source_value.equal(&Tensor::from_slice(&[10i64, 11, 12])));
     // The rebuild is deferred to apply time: the leaf is still an SWA tombstone.
@@ -940,15 +942,13 @@ fn insert_new_leaf_straddling_the_boundary_splits_and_rebuilds_the_tail() {
             .device_value(parent, FULL)
             .equal(&Tensor::from_slice(&[10i64, 11]))
     );
-    let [
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one SwaRebuild action");
     };
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action.as_ref());
     assert_eq!(*node_id, tc.arena.node(child).id);
     assert!(source_value.equal(&Tensor::from_slice(&[12i64, 13])));
 }
@@ -984,19 +984,17 @@ fn insert_long_leaf_caps_the_window_and_rebuilds_the_older_prefix_first() {
     let tail = child_of(&tc, capped, &[5]);
     assert_eq!(tc.arena.node(capped).key, vec![1, 2, 3, 4]);
     assert_eq!(tc.arena.node(tail).key, vec![5, 6]);
-    let [
-        CacheAction::SwaRebuild {
-            node_id: first_id,
-            source_value: first_value,
-        },
-        CacheAction::SwaRebuild {
-            node_id: second_id,
-            source_value: second_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1] = result.cache_actions.as_slice() else {
         panic!("expected two SwaRebuild actions");
     };
+    let SwaRebuild {
+        node_id: first_id,
+        source_value: first_value,
+    } = expect_action::<SwaRebuild>(action0.as_ref());
+    let SwaRebuild {
+        node_id: second_id,
+        source_value: second_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
     assert_eq!(*first_id, tc.arena.node(capped).id);
     assert!(first_value.equal(&Tensor::from_slice(&[10i64, 11, 12, 13])));
     assert_eq!(*second_id, tc.arena.node(tail).id);
@@ -1035,9 +1033,10 @@ fn insert_overlap_with_live_swa_frees_the_whole_duplicate() {
     .expect("live test node");
     let result = tc.insert(&insert_params_swa(&vec![1, 2, 3], &[20, 21, 22], 0, 0));
     assert_eq!(result.prefix_len, 3);
-    let [CacheAction::FreeDeviceKV(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one FreeDeviceKV action");
     };
+    let FreeDeviceKV { indices: freed } = expect_action::<FreeDeviceKV>(action.as_ref());
     assert_eq!(freed.len(), 1);
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     // The node keeps its original Full and SWA values.
@@ -1071,16 +1070,15 @@ fn insert_overlap_recovers_a_tombstone_inside_the_window() {
             .device_value(leaf, FULL)
             .equal(&Tensor::from_slice(&[20i64, 21, 22]))
     );
-    let [
-        CacheAction::FreeDeviceKVFullOnly(freed),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1] = result.cache_actions.as_slice() else {
         panic!("expected FreeDeviceKVFullOnly then SwaRebuild");
     };
+    let FreeDeviceKVFullOnly { indices: freed } =
+        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
     assert!(freed[0].equal(&Tensor::from_slice(&[10i64, 11, 12])));
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     assert!(source_value.equal(&Tensor::from_slice(&[20i64, 21, 22])));
@@ -1110,12 +1108,10 @@ fn insert_overlap_recovers_a_locked_swa_tombstone() {
             .device_value(leaf, FULL)
             .equal(&Tensor::from_slice(&[10i64, 11, 12]))
     );
-    assert!(
-        result
-            .cache_actions
-            .iter()
-            .any(|action| matches!(action, CacheAction::RecoverSwaWithLockedFull { .. }))
-    );
+    assert!(result.cache_actions.iter().any(|action| matches!(
+        action.as_any().downcast_ref::<RecoverSwaWithLockedFull>(),
+        Some(RecoverSwaWithLockedFull { .. })
+    )));
 }
 
 #[test]
@@ -1147,16 +1143,14 @@ fn insert_overlap_can_preserve_unlocked_full_ids() {
         assert_eq!(consumed_from, window_start);
         assert_eq!(tc.arena.node(leaf).id, original_id);
         assert_eq!(tc.arena.node(leaf).device_lock_ref(FULL), 0);
-        let [
-            CacheAction::RecoverSwaWithLockedFull {
-                node_id,
-                kept_full,
-                incoming_full,
-            },
-        ] = actions.as_slice()
-        else {
+        let [action] = actions.as_slice() else {
             panic!("expected recovery with canonical FULL IDs");
         };
+        let RecoverSwaWithLockedFull {
+            node_id,
+            kept_full,
+            incoming_full,
+        } = expect_action::<RecoverSwaWithLockedFull>(action.as_ref());
         assert_eq!(*node_id, original_id);
         assert!(kept_full.equal(&Tensor::from_slice(&[10i64, 11, 12, 13][window_start..])));
         assert!(incoming_full.equal(&Tensor::from_slice(&[20i64, 21, 22, 23][window_start..])));
@@ -1187,16 +1181,14 @@ fn insert_overlap_with_a_locked_full_emits_the_recover_action() {
             .device_value(leaf, FULL)
             .equal(&Tensor::from_slice(&[10i64, 11, 12]))
     );
-    let [
-        CacheAction::RecoverSwaWithLockedFull {
-            node_id,
-            kept_full,
-            incoming_full,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one RecoverSwaWithLockedFull action");
     };
+    let RecoverSwaWithLockedFull {
+        node_id,
+        kept_full,
+        incoming_full,
+    } = expect_action::<RecoverSwaWithLockedFull>(action.as_ref());
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     assert!(kept_full.equal(&Tensor::from_slice(&[10i64, 11, 12])));
     assert!(incoming_full.equal(&Tensor::from_slice(&[20i64, 21, 22])));
@@ -1238,20 +1230,21 @@ fn insert_overlap_straddling_the_boundary_splits_and_recovers_the_tail() {
             .device_value(node, FULL)
             .equal(&Tensor::from_slice(&[22i64, 23]))
     );
-    let [
-        CacheAction::FreeDeviceKVFullOnly(old_tail),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-        CacheAction::FreeDeviceKVFullOnly(duplicates),
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1, action2] = result.cache_actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKVFullOnly, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKVFullOnly { indices: old_tail } =
+        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: duplicates,
+    } = expect_action::<FreeDeviceKVFullOnly>(action2.as_ref());
     assert!(old_tail[0].equal(&Tensor::from_slice(&[12i64, 13])));
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(source_value.equal(&Tensor::from_slice(&[22i64, 23])));
@@ -1285,17 +1278,17 @@ fn insert_overlap_straddling_with_a_locked_full_defers_the_tail() {
             .device_value(node, FULL)
             .equal(&Tensor::from_slice(&[12i64, 13]))
     );
-    let [
-        CacheAction::RecoverSwaWithLockedFull {
-            node_id,
-            kept_full,
-            incoming_full,
-        },
-        CacheAction::FreeDeviceKVFullOnly(duplicates),
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1] = result.cache_actions.as_slice() else {
         panic!("expected RecoverSwaWithLockedFull then FreeDeviceKVFullOnly");
     };
+    let RecoverSwaWithLockedFull {
+        node_id,
+        kept_full,
+        incoming_full,
+    } = expect_action::<RecoverSwaWithLockedFull>(action0.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: duplicates,
+    } = expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(kept_full.equal(&Tensor::from_slice(&[12i64, 13])));
     assert!(incoming_full.equal(&Tensor::from_slice(&[22i64, 23])));
@@ -1313,9 +1306,11 @@ fn insert_overlap_entirely_outside_the_window_is_all_duplicate() {
         /* prev_prefix_len = */ 0,
         /* swa_evicted_seqlen = */ 3,
     ));
-    let [CacheAction::FreeDeviceKVFullOnly(freed)] = result.cache_actions.as_slice() else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one FreeDeviceKVFullOnly action");
     };
+    let FreeDeviceKVFullOnly { indices: freed } =
+        expect_action::<FreeDeviceKVFullOnly>(action.as_ref());
     assert!(freed[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
 }
 
@@ -1365,20 +1360,21 @@ fn insert_overlap_boundary_at_the_node_start_recovers_the_whole_node() {
             .device_value(b, FULL)
             .equal(&Tensor::from_slice(&[23i64, 24]))
     );
-    let [
-        CacheAction::FreeDeviceKVFullOnly(duplicates),
-        CacheAction::FreeDeviceKVFullOnly(old_full),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1, action2] = result.cache_actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly, FreeDeviceKVFullOnly, SwaRebuild, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKVFullOnly {
+        indices: duplicates,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly { indices: old_full } =
+        expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action2.as_ref());
     assert!(duplicates[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     assert!(old_full[0].equal(&Tensor::from_slice(&[13i64, 14])));
     assert_eq!(*node_id, tc.arena.node(b).id);
@@ -1420,21 +1416,24 @@ fn insert_overlap_straddling_a_second_level_node_recovers_the_tail() {
             .device_value(b, FULL)
             .equal(&Tensor::from_slice(&[24i64]))
     );
-    let [
-        CacheAction::FreeDeviceKVFullOnly(duplicates_head),
-        CacheAction::FreeDeviceKVFullOnly(old_tail),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-        CacheAction::FreeDeviceKVFullOnly(duplicates_tail),
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1, action2, action3] = result.cache_actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly, FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKVFullOnly, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKVFullOnly {
+        indices: duplicates_head,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let FreeDeviceKVFullOnly { indices: old_tail } =
+        expect_action::<FreeDeviceKVFullOnly>(action1.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action2.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: duplicates_tail,
+    } = expect_action::<FreeDeviceKVFullOnly>(action3.as_ref());
     assert!(duplicates_head[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     assert!(old_tail[0].equal(&Tensor::from_slice(&[14i64])));
     assert_eq!(*node_id, tc.arena.node(b).id);
@@ -1473,21 +1472,23 @@ fn insert_overlap_straddling_a_second_level_locked_node_defers_the_tail() {
             .device_value(b, FULL)
             .equal(&Tensor::from_slice(&[14i64]))
     );
-    let [
-        CacheAction::FreeDeviceKVFullOnly(duplicates_head),
-        CacheAction::RecoverSwaWithLockedFull {
-            node_id,
-            kept_full,
-            incoming_full,
-        },
-        CacheAction::FreeDeviceKVFullOnly(duplicates_tail),
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1, action2] = result.cache_actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly, RecoverSwaWithLockedFull, FreeDeviceKVFullOnly, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKVFullOnly {
+        indices: duplicates_head,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let RecoverSwaWithLockedFull {
+        node_id,
+        kept_full,
+        incoming_full,
+    } = expect_action::<RecoverSwaWithLockedFull>(action1.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: duplicates_tail,
+    } = expect_action::<FreeDeviceKVFullOnly>(action2.as_ref());
     assert!(duplicates_head[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     assert_eq!(*node_id, tc.arena.node(b).id);
     assert!(kept_full.equal(&Tensor::from_slice(&[14i64])));
@@ -1518,10 +1519,7 @@ fn insert_overlap_prev_prefix_strictly_inside_the_node_still_recovers() {
             .device_value(node, FULL)
             .equal(&Tensor::from_slice(&[20i64, 21, 22, 23]))
     );
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, .. } if *node_id == tc.arena.node(node).id
-    )));
+    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, .. }) if *node_id == tc.arena.node(node).id)));
 }
 
 #[test]
@@ -1551,15 +1549,13 @@ fn reinsert_after_full_eviction_rebuilds_swa_from_the_fresh_kv() {
             .device_value(leaf, FULL)
             .equal(&Tensor::from_slice(&[20i64, 21, 22]))
     );
-    let [
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one SwaRebuild action");
     };
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action.as_ref());
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     assert!(source_value.equal(&Tensor::from_slice(&[20i64, 21, 22])));
 }
@@ -1592,15 +1588,13 @@ fn reinsert_straddling_the_boundary_splits_before_the_rebuild() {
             .equal(&Tensor::from_slice(&[20i64, 21]))
     );
     assert!(!tc.arena.has_device_value(parent, SWA));
-    let [
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!("expected one SwaRebuild action");
     };
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action.as_ref());
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(source_value.equal(&Tensor::from_slice(&[22i64, 23])));
 }
@@ -1641,15 +1635,9 @@ fn reinsert_straddling_the_boundary_at_a_second_level_node_splits_before_the_reb
             .equal(&Tensor::from_slice(&[24i64]))
     );
     assert!(!tc.arena.has_device_value(p, SWA));
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(b).id && source_value.equal(&Tensor::from_slice(&[24i64]))
-    )));
-    assert!(!result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, .. } if *node_id == tc.arena.node(p).id
-    )));
+    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+            if *node_id == tc.arena.node(b).id && source_value.equal(&Tensor::from_slice(&[24i64])))));
+    assert!(!result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, .. }) if *node_id == tc.arena.node(p).id)));
 }
 
 #[test]
@@ -1715,19 +1703,19 @@ fn reinsert_boundary_at_the_node_start_rebuilds_the_whole_node() {
         /* swa_evicted_seqlen = */ 3,
     ));
     assert_eq!(tc.arena.node(b).key, vec![4, 5]);
-    let [
-        CacheAction::FreeDeviceKVFullOnly(duplicates),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1] = result.cache_actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly then SwaRebuild, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKVFullOnly {
+        indices: duplicates,
+    } = expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
     assert!(duplicates[0].equal(&Tensor::from_slice(&[20i64, 21, 22])));
     assert_eq!(*node_id, tc.arena.node(b).id);
     assert!(source_value.equal(&Tensor::from_slice(&[23i64, 24])));
@@ -1768,16 +1756,16 @@ fn walk_split_redistributes_the_live_swa_value() {
     );
     assert!(tc.device_lru_list(SWA).in_list(Some(parent)));
     assert!(tc.device_lru_list(SWA).in_list(Some(node)));
-    let [
-        CacheAction::FreeDeviceKV(duplicates),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1] = result.cache_actions.as_slice() else {
         panic!("expected FreeDeviceKV then SwaRebuild");
     };
+    let FreeDeviceKV {
+        indices: duplicates,
+    } = expect_action::<FreeDeviceKV>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
     assert!(duplicates[0].equal(&Tensor::from_slice(&[20i64, 21])));
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     assert!(source_value.equal(&Tensor::from_slice(&[29i64])));
@@ -3968,15 +3956,9 @@ fn new_leaf_after_a_cached_prefix_splits_at_the_leaf_relative_boundary() {
             .device_value(leaf, FULL)
             .equal(&Tensor::from_slice(&[24i64, 25]))
     );
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[24i64, 25]))
-    )));
-    assert!(!result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, .. } if *node_id == tc.arena.node(p).id
-    )));
+    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+            if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[24i64, 25])))));
+    assert!(!result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, .. }) if *node_id == tc.arena.node(p).id)));
 }
 
 #[test]
@@ -4006,41 +3988,42 @@ fn new_leaf_boundary_split_and_window_cap_compose_in_one_commit() {
         let rebuilds: Vec<NodeId> = result
             .cache_actions
             .iter()
-            .filter_map(|action| match action {
-                CacheAction::SwaRebuild { node_id, .. } => Some(*node_id),
-                _ => None,
-            })
+            .filter_map(
+                |action| match action.as_any().downcast_ref::<SwaRebuild>() {
+                    Some(SwaRebuild { node_id, .. }) => Some(*node_id),
+                    _ => None,
+                },
+            )
             .collect();
         assert_eq!(
             rebuilds,
             vec![tc.arena.node(capped).id, tc.arena.node(leaf).id]
         );
-        assert!(result.cache_actions.iter().any(|action| matches!(
-            action,
-            CacheAction::SwaRebuild { node_id, source_value }
-                if *node_id == tc.arena.node(capped).id && source_value.equal(&Tensor::from_slice(&[23i64, 24]))
-        )));
-        assert!(result.cache_actions.iter().any(|action| matches!(
-            action,
-            CacheAction::SwaRebuild { node_id, source_value }
-                if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[25i64, 26]))
-        )));
+        assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+                if *node_id == tc.arena.node(capped).id && source_value.equal(&Tensor::from_slice(&[23i64, 24])))));
+        assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+                if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[25i64, 26])))));
         let split_ids: Vec<NodeId> = result
             .cache_actions
             .iter()
-            .filter_map(|action| match action {
-                CacheAction::UpdatePendingBackupOnNodeSplit {
-                    ack_id,
-                    old_node_id,
-                    new_node_id,
-                    new_child_node_id,
-                } => {
-                    assert_eq!(*ack_id, None);
-                    assert_eq!(*old_node_id, tc.arena.node(leaf).id);
-                    assert_eq!(*new_child_node_id, tc.arena.node(leaf).id);
-                    Some(*new_node_id)
+            .filter_map(|action| {
+                match action
+                    .as_any()
+                    .downcast_ref::<UpdatePendingBackupOnNodeSplit>()
+                {
+                    Some(UpdatePendingBackupOnNodeSplit {
+                        ack_id,
+                        old_node_id,
+                        new_node_id,
+                        new_child_node_id,
+                    }) => {
+                        assert_eq!(*ack_id, None);
+                        assert_eq!(*old_node_id, tc.arena.node(leaf).id);
+                        assert_eq!(*new_child_node_id, tc.arena.node(leaf).id);
+                        Some(*new_node_id)
+                    }
+                    _ => None,
                 }
-                _ => None,
             })
             .collect();
         if buffer_only {
@@ -4051,13 +4034,23 @@ fn new_leaf_boundary_split_and_window_cap_compose_in_one_commit() {
             let first_rebuild = result
                 .cache_actions
                 .iter()
-                .position(|action| matches!(action, CacheAction::SwaRebuild { .. }))
+                .position(|action| {
+                    matches!(
+                        action.as_any().downcast_ref::<SwaRebuild>(),
+                        Some(SwaRebuild { .. })
+                    )
+                })
                 .unwrap();
             assert_eq!(
                 result.cache_actions[..first_rebuild]
                     .iter()
                     .filter(|action| {
-                        matches!(action, CacheAction::UpdatePendingBackupOnNodeSplit { .. })
+                        matches!(
+                            action
+                                .as_any()
+                                .downcast_ref::<UpdatePendingBackupOnNodeSplit>(),
+                            Some(UpdatePendingBackupOnNodeSplit { .. })
+                        )
                     })
                     .count(),
                 2,
@@ -4199,11 +4192,8 @@ fn new_leaf_with_the_boundary_above_its_start_skips_the_split() {
     // in-window and stays unsplit.
     let leaf = child_of(&tc, a, &[4]);
     assert_eq!(tc.arena.node(leaf).key, vec![4, 5]);
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[23i64, 24]))
-    )));
+    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+            if *node_id == tc.arena.node(leaf).id && source_value.equal(&Tensor::from_slice(&[23i64, 24])))));
 }
 
 #[test]
@@ -4237,20 +4227,21 @@ fn insert_overlap_straddling_with_a_partial_prev_prefix_recovers_the_tail() {
             .device_value(node, FULL)
             .equal(&Tensor::from_slice(&[22i64, 23]))
     );
-    let [
-        CacheAction::FreeDeviceKVFullOnly(old_tail),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-        CacheAction::FreeDeviceKVFullOnly(duplicates),
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action0, action1, action2] = result.cache_actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly, SwaRebuild, FreeDeviceKVFullOnly, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let FreeDeviceKVFullOnly { indices: old_tail } =
+        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
+    let FreeDeviceKVFullOnly {
+        indices: duplicates,
+    } = expect_action::<FreeDeviceKVFullOnly>(action2.as_ref());
     assert!(old_tail[0].equal(&Tensor::from_slice(&[12i64, 13])));
     assert_eq!(*node_id, tc.arena.node(node).id);
     assert!(source_value.equal(&Tensor::from_slice(&[22i64, 23])));
@@ -4284,11 +4275,8 @@ fn insert_overlap_straddling_recovers_across_page_two() {
             .device_value(node, FULL)
             .equal(&Tensor::from_slice(&[22i64, 23]))
     );
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(node).id && source_value.equal(&Tensor::from_slice(&[22i64, 23]))
-    )));
+    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+            if *node_id == tc.arena.node(node).id && source_value.equal(&Tensor::from_slice(&[22i64, 23])))));
 }
 
 #[test]
@@ -4322,15 +4310,9 @@ fn reinsert_straddling_recovers_across_page_two() {
             .device_value(node, FULL)
             .equal(&Tensor::from_slice(&[22i64, 23]))
     );
-    assert!(result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, source_value }
-            if *node_id == tc.arena.node(node).id && source_value.equal(&Tensor::from_slice(&[22i64, 23]))
-    )));
-    assert!(!result.cache_actions.iter().any(|action| matches!(
-        action,
-        CacheAction::SwaRebuild { node_id, .. } if *node_id == tc.arena.node(parent).id
-    )));
+    assert!(result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, source_value })
+            if *node_id == tc.arena.node(node).id && source_value.equal(&Tensor::from_slice(&[22i64, 23])))));
+    assert!(!result.cache_actions.iter().any(|action| matches!(action.as_any().downcast_ref::<SwaRebuild>(), Some(SwaRebuild { node_id, .. }) if *node_id == tc.arena.node(parent).id)));
 }
 
 #[test]
@@ -4362,12 +4344,10 @@ fn reinsert_rebuilds_a_locked_tombstone() {
         .node_mut(node)
         .set_lock_ref_(ValueSlotIdx::device(SWA), 1);
     let result = tc.insert(&insert_params_swa(&vec![1, 2], &[20, 21], 0, 0));
-    assert!(
-        result
-            .cache_actions
-            .iter()
-            .any(|action| matches!(action, CacheAction::SwaRebuild { .. }))
-    );
+    assert!(result.cache_actions.iter().any(|action| matches!(
+        action.as_any().downcast_ref::<SwaRebuild>(),
+        Some(SwaRebuild { .. })
+    )));
 }
 
 fn set_full_host(tc: &mut UnifiedTreeCore<Vec<i64>>, node: NodeIdx_) {
@@ -4955,13 +4935,10 @@ fn load_back_commit_attaches_chunks_and_emits_the_rebuild_action() {
     assert!(tc.device_lru_list(SWA).in_list(Some(b)));
     assert_eq!(tc.swa_evictable_size(), 2);
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::RebuildFullToSwaMapping {
+    let RebuildFullToSwaMapping {
         full_indices,
         swa_indices,
-    } = &cache_actions[0]
-    else {
-        panic!("expected a RebuildFullToSwaMapping action");
-    };
+    } = expect_action::<RebuildFullToSwaMapping>(cache_actions[0].as_ref());
     assert_eq!(full_indices.len(), 2);
     assert!(full_indices[0].equal(&Tensor::from_slice(&[40i64])));
     assert!(full_indices[1].equal(&Tensor::from_slice(&[41i64])));
@@ -5196,9 +5173,8 @@ fn prefetch_commit_drops_the_whole_window_when_underloaded() {
     );
     assert!(!tc.arena.node(a).has_host_value(SWA));
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::FreeComponentHostSlot { host_indices, .. } = &cache_actions[0] else {
-        panic!("expected a host free");
-    };
+    let FreeComponentHostSlot { host_indices, .. } =
+        expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64, 31])));
 }
 
@@ -5227,9 +5203,8 @@ fn prefetch_commit_without_a_target_releases_the_whole_buffer() {
         Some(&storage_result),
     );
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::FreeComponentHostSlot { host_indices, .. } = &cache_actions[0] else {
-        panic!("expected a host free");
-    };
+    let FreeComponentHostSlot { host_indices, .. } =
+        expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64, 31])));
 
     // An insert result without an inserted host node releases the same way.
@@ -5253,9 +5228,8 @@ fn prefetch_commit_without_a_target_releases_the_whole_buffer() {
         Some(&storage_result),
     );
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::FreeComponentHostSlot { host_indices, .. } = &cache_actions[0] else {
-        panic!("expected a host free");
-    };
+    let FreeComponentHostSlot { host_indices, .. } =
+        expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64, 31])));
     assert!(!tc.arena.node(a).has_host_value(SWA));
 }
@@ -5294,9 +5268,8 @@ fn prefetch_commit_releases_a_shortened_window_under_a_non_root_anchor() {
     assert!(!tc.arena.node(a).has_host_value(SWA));
     assert!(!tc.host_lru_list(SWA).in_list(Some(c)));
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::FreeComponentHostSlot { host_indices, .. } = &cache_actions[0] else {
-        panic!("expected a host free");
-    };
+    let FreeComponentHostSlot { host_indices, .. } =
+        expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64, 31])));
 }
 
@@ -5346,9 +5319,8 @@ fn prefetch_commit_fills_tombstoned_nodes_and_releases_covered_ones() {
             .equal(&Tensor::from_slice(&[40i64]))
     );
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::FreeComponentHostSlot { host_indices, .. } = &cache_actions[0] else {
-        panic!("expected a host free");
-    };
+    let FreeComponentHostSlot { host_indices, .. } =
+        expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert!(host_indices[0].equal(&Tensor::from_slice(&[31i64])));
 }
 
@@ -5405,13 +5377,10 @@ fn release_swa_host_queues_a_free_action_for_non_empty_indices() {
     let mut cache_actions = Vec::new();
     swa_component(4).release_swa_host_(Tensor::from_slice(&[7i64]), &mut cache_actions);
     assert_eq!(cache_actions.len(), 1);
-    let CacheAction::FreeComponentHostSlot {
+    let FreeComponentHostSlot {
         component_type,
         host_indices,
-    } = &cache_actions[0]
-    else {
-        panic!("expected a FreeComponentHostSlot action");
-    };
+    } = expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert_eq!(*component_type, SWA);
     assert_eq!(host_indices.len(), 1);
     assert!(host_indices[0].equal(&Tensor::from_slice(&[7i64])));
@@ -5499,8 +5468,10 @@ fn build_load_back_spec_includes_the_swa_transfers() {
     );
     assert_eq!(actions.len(), 1);
     assert!(matches!(
-        actions[0],
-        CacheAction::RebuildFullToSwaMapping { .. }
+        (actions[0])
+            .as_any()
+            .downcast_ref::<RebuildFullToSwaMapping>(),
+        Some(RebuildFullToSwaMapping { .. })
     ));
 }
 
@@ -5642,16 +5613,14 @@ fn check_swa_device_restored_during_full_load_back(pin_ancestor: bool) {
     // A is outside the loaded SWA window. A new request emits the normal
     // locked-Full repair action; resolve only its allocator/mapping boundary.
     let inserted = tc.insert(&insert_params_swa(&vec![1], &[90], 0, 0));
-    let [
-        CacheAction::RecoverSwaWithLockedFull {
-            node_id,
-            kept_full,
-            incoming_full,
-        },
-    ] = inserted.cache_actions.as_slice()
-    else {
+    let [action] = inserted.cache_actions.as_slice() else {
         panic!("expected one RecoverSwaWithLockedFull action");
     };
+    let RecoverSwaWithLockedFull {
+        node_id,
+        kept_full,
+        incoming_full,
+    } = expect_action::<RecoverSwaWithLockedFull>(action.as_ref());
     assert_eq!(*node_id, a_id);
     assert!(kept_full.equal(&Tensor::from_slice(&[50i64])));
     assert!(incoming_full.equal(&Tensor::from_slice(&[90i64])));
@@ -6009,9 +5978,11 @@ fn write_through_offloads_a_boundary_split_leaf() {
     let backups: Vec<_> = result
         .cache_actions
         .iter()
-        .filter_map(|action| match action {
-            CacheAction::BackupKV(backup) => Some(backup.node_ids.clone()),
-            _ => None,
+        .filter_map(|action| {
+            action
+                .as_any()
+                .downcast_ref::<BackupKV>()
+                .map(|backup| backup.node_ids.clone())
         })
         .collect();
     assert_eq!(
@@ -6083,10 +6054,10 @@ fn deep_request_ring_tree_survives_full_backup_evict_and_load_back_rounds() {
         let result = tc.insert(&insert_params_swa(&key, &kv, 0, swa_evicted_seqlen));
         // Apply the emitted rebuilds the way the cache would.
         for action in &result.cache_actions {
-            if let CacheAction::SwaRebuild {
+            if let Some(SwaRebuild {
                 node_id,
                 source_value,
-            } = action
+            }) = action.as_any().downcast_ref::<SwaRebuild>()
             {
                 tc.set_component_device_value(*node_id, SWA, source_value.copy())
                     .expect("live test node");
@@ -6198,18 +6169,16 @@ fn recovered_swa_span_evicts_before_the_window_leaf() {
     let prefix = child_of(&tc, root, &[1]);
     let leaf = child_of(&tc, prefix, &[9]);
     assert_eq!(tc.arena.node(prefix).key, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-    let [
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one SwaRebuild action, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action.as_ref());
     assert_eq!(*node_id, tc.arena.node(leaf).id);
     tc.set_component_device_value(*node_id, SWA, source_value.copy())
         .expect("live test node");
@@ -6225,19 +6194,18 @@ fn recovered_swa_span_evicts_before_the_window_leaf() {
         /* swa_evicted_seqlen = */ 0,
     ));
     assert!(step.result.is_none());
-    let [
-        CacheAction::FreeDeviceKVFullOnly(old_full),
-        CacheAction::SwaRebuild {
-            node_id,
-            source_value,
-        },
-    ] = step.actions.as_slice()
-    else {
+    let [action0, action1] = step.actions.as_slice() else {
         panic!(
             "expected FreeDeviceKVFullOnly then SwaRebuild, got {:?}",
             action_kinds(&step.actions)
         );
     };
+    let FreeDeviceKVFullOnly { indices: old_full } =
+        expect_action::<FreeDeviceKVFullOnly>(action0.as_ref());
+    let SwaRebuild {
+        node_id,
+        source_value,
+    } = expect_action::<SwaRebuild>(action1.as_ref());
     assert!(old_full[0].equal(&Tensor::from_slice(&[
         100i64, 101, 102, 103, 104, 105, 106, 107
     ])));
@@ -6613,7 +6581,7 @@ fn write_back_reinsert_defers_swa_backup_while_write_through_publishes() {
         !result
             .cache_actions
             .iter()
-            .any(|action| matches!(action, CacheAction::BackupKV(_)))
+            .any(|action| action.as_any().is::<BackupKV>())
     );
 
     tc.is_write_back = false;
@@ -6621,9 +6589,11 @@ fn write_back_reinsert_defers_swa_backup_while_write_through_publishes() {
     let backups: Vec<_> = result
         .cache_actions
         .iter()
-        .filter_map(|action| match action {
-            CacheAction::BackupKV(backup) => Some(backup.node_ids.clone()),
-            _ => None,
+        .filter_map(|action| {
+            action
+                .as_any()
+                .downcast_ref::<BackupKV>()
+                .map(|backup| backup.node_ids.clone())
         })
         .collect();
     assert_eq!(backups, vec![vec![leaf]]);
