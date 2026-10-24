@@ -11,7 +11,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana_sprint import (
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_sprint import SanaSprintSamplingParams
-from sglang.multimodal_gen.registry import get_model_info
+from sglang.multimodal_gen.registry import _get_config_info, get_model_info
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_scm import (
     SCMScheduler,
 )
@@ -119,6 +119,11 @@ def test_sana_sprint_registry_and_guidance_distilled_defaults(monkeypatch):
             SanaSprintPipelineConfig,
             SanaSprintSamplingParams,
         ),
+        "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers": (
+            "SanaSprintPipeline",
+            SanaSprintPipelineConfig,
+            SanaSprintSamplingParams,
+        ),
         # Unregistered mirrors resolve through detectors, where "sana" also matches.
         "my-org/Sana_Sprint_0.6B_1024px_mirror": (
             "SanaSprintPipeline",
@@ -145,6 +150,29 @@ def test_sana_sprint_registry_and_guidance_distilled_defaults(monkeypatch):
     sampling = SanaSprintSamplingParams(negative_prompt="blurry")
     assert (sampling.num_inference_steps, sampling.guidance_scale) == (2, 4.5)
     assert not sampling.should_use_classifier_free_guidance()
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
+        "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers",
+    ],
+)
+def test_sana_sprint_checkpoint_ids_are_registered_exactly(monkeypatch, model_id):
+    """A registered id resolves from the path table alone, without the
+    model_index.json fetch the detector fallback needs, and `--model-id` finds it."""
+
+    def _no_model_index(_):
+        raise AssertionError("registered id fell through to the detector fallback")
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.registry.maybe_download_model_index", _no_model_index
+    )
+    for kwargs in ({}, {"model_id": model_id.split("/")[-1]}):
+        config_info = _get_config_info(model_id, **kwargs)
+        assert config_info.pipeline_config_cls is SanaSprintPipelineConfig
+        assert config_info.sampling_param_cls is SanaSprintSamplingParams
 
 
 def test_sana_qk_norm_follows_checkpoint_config():

@@ -90,6 +90,7 @@ def register():
         pipeline_config_cls=SanaSprintPipelineConfig,
         hf_model_paths=[
             "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
+            "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers",
         ],
         model_detectors=[
             lambda hf_id: (

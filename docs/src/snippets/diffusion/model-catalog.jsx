@@ -109,7 +109,10 @@ export const DiffusionModelCatalog = ({ category }) => {
     },
     {
       name: "SANA-Sprint",
-      modelIds: ["Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers"],
+      modelIds: [
+        "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
+        "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers",
+      ],
       note: "Few-step (1-4) guidance-distilled; guidance_scale feeds the embedded guidance, and negative prompts are ignored.",
     },
     {
