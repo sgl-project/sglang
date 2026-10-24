@@ -924,17 +924,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 )
             stream.synchronize()
 
-    def release_cache_if_idle(self) -> None:
+    def release_cache_if_idle(self) -> float | None:
         """Release the allocator cache once no request has finished for a while.
 
-        The scheduler calls this only with nothing queued or in flight.
+        The scheduler calls this only with nothing queued or in flight. Returns
+        the seconds until a pending release is due, or None when none is pending.
         """
         due = self._cache_release_due
-        if due is None or time.monotonic() < due:
-            return
+        if due is None:
+            return None
+        wait_s = due - time.monotonic()
+        if wait_s > 0:
+            return wait_s
         self._cache_release_due = None
         with maybe_record_function("EMPTY_CACHE"):
             torch.get_device_module().empty_cache()
+        return None
 
     def take_deferred_finalize(self) -> Callable[[], None] | None:
         deferred = self._deferred_finalize
