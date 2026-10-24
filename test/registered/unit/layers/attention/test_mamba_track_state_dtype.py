@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, sentinel
 
 import torch
 
@@ -13,6 +13,8 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNKernelDispatcher,
 )
 from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+from sglang.srt.layers.attention.linear.kernels import gdn_triton
+from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -241,6 +243,54 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     self.assertTrue(torch.all(ssm_states[[6, 2, 5]] == 5))
                     expected = DOUBLE_ROUND_PROBE if snapshot else 2.0
                     self.assertTrue(torch.all(ssm_states[4] == expected))
+
+
+class TestTritonGDNTrackSnapshot(CustomTestCase):
+    """The Triton GDN kernel hands the fp32 track snapshot to the chunk kernel.
+
+    Without the snapshot, prefix-cache checkpoints fall back to the per-chunk
+    states ``h``, which are rounded to the activation dtype. The CPU, NPU and
+    XPU paths use other chunk kernels and keep that fallback.
+    """
+
+    def _extend(self, kernel):
+        chunk = Mock(return_value=sentinel.output)
+        x = torch.zeros(1, 2, 1, 2)
+        with (
+            patch.object(gdn_triton, "chunk_gated_delta_rule", chunk),
+            patch.object(gdn_triton, "is_cpu", return_value=False),
+            patch.object(gdn_triton, "is_npu", return_value=False),
+        ):
+            output = kernel.extend(
+                x,
+                x,
+                x,
+                x[..., 0],
+                x[..., 0],
+                ssm_states=torch.zeros(4, 1, 2, 2),
+                cache_indices=torch.tensor([3]),
+                query_start_loc=torch.tensor([0, 2]),
+                track_state=sentinel.track_state,
+                track_chunk_idx=sentinel.track_chunk_idx,
+            )
+        self.assertIs(output, sentinel.output)
+        chunk.assert_called_once()
+        return chunk.call_args.kwargs
+
+    def test_gpu_kernel_supports_the_snapshot(self):
+        self.assertTrue(TritonGDNKernel.supports_track_state_snapshot)
+
+    def test_extend_passes_the_snapshot_to_the_chunk_kernel(self):
+        kwargs = self._extend(TritonGDNKernel())
+        self.assertIs(kwargs["track_state"], sentinel.track_state)
+        self.assertIs(kwargs["track_chunk_idx"], sentinel.track_chunk_idx)
+
+    def test_extend_without_snapshot_support_passes_nothing(self):
+        kernel = TritonGDNKernel()
+        kernel.supports_track_state_snapshot = False
+        kwargs = self._extend(kernel)
+        self.assertNotIn("track_state", kwargs)
+        self.assertNotIn("track_chunk_idx", kwargs)
 
 
 if __name__ == "__main__":

@@ -74,6 +74,51 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         )
         return o, pool
 
+    def test_resume_from_track_snapshot_matches_full_prefill(self):
+        """Resuming a prefill from the fp32 track snapshot must give bitwise the same
+        output and final state as one prefill over the whole sequence; resuming from the
+        per-chunk state h (rounded to bf16) does not, which made prefix-cache hits on
+        hybrid GDN models change their decode results."""
+        device = get_device()
+        Hk, Hv, K, V, L = 16, 48, 128, 128, 128
+        torch.manual_seed(0)
+        q = torch.randn(1, L, Hk, K, dtype=torch.bfloat16, device=device)
+        k = torch.randn(1, L, Hk, K, dtype=torch.bfloat16, device=device)
+        v = torch.randn(1, L, Hv, V, dtype=torch.bfloat16, device=device)
+        g = -torch.rand(1, L, Hv, dtype=torch.float32, device=device) * 0.5
+        beta = torch.rand(1, L, Hv, dtype=torch.bfloat16, device=device)
+        idx = torch.zeros(1, dtype=torch.int32, device=device)
+
+        def run(lo, state, **track):
+            cu_seqlens = torch.tensor([0, L - lo], dtype=torch.long, device=device)
+            o, _, h = chunk_gated_delta_rule(
+                *(t[:, lo:] for t in (q, k, v, g, beta)),
+                initial_state=state,
+                initial_state_indices=idx,
+                cu_seqlens=cu_seqlens,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+                **track,
+            )
+            return o, h
+
+        full_state = torch.zeros(1, Hv, V, K, dtype=torch.float32, device=device)
+        snapshot = torch.empty_like(full_state)
+        o_full, h_full = run(
+            0,
+            full_state,
+            track_state=snapshot,
+            track_chunk_idx=torch.ones(1, dtype=torch.int32, device=device),
+        )
+        resumed_state = snapshot.clone()
+        o_resumed, _ = run(64, resumed_state)
+        self.assertTrue(torch.equal(o_resumed, o_full[:, 64:]))
+        self.assertTrue(torch.equal(resumed_state, full_state))
+
+        rounded_state = h_full[0, 1].float().unsqueeze(0).contiguous()
+        run(64, rounded_state)
+        self.assertFalse(torch.equal(rounded_state, full_state))
+
     def _check_shape(
         self, B, T_per_seq, H, K, V, pool_size, sequential_indices=False, seed=42
     ):
