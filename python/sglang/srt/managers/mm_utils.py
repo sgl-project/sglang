@@ -549,12 +549,9 @@ def embed_mm_inputs(
 
     # 3. Get input embeddings
     vocab_size = input_embedding.num_embeddings
-    # Important: clamp after getting original multimodal regions
-    # Clamp input ids. This is because the input_ids for the multimodal tokens are
-    # filled with the hash values of the multimodal for the prefix matching in the radix attention.
-    # There values are useless because their embeddings will be replaced by vision embeddings anyway.
-    input_ids.clamp_(min=0, max=vocab_size - 1)
-    input_embeds = input_embedding(input_ids)
+    # Multimodal hash IDs can exceed the vocabulary. Clamp only the embedding
+    # input; the caller's IDs must retain those placeholders for later calls.
+    input_embeds = input_embedding(input_ids.clamp(min=0, max=vocab_size - 1))
 
     # deepstack embedding
     if use_deepstack:
