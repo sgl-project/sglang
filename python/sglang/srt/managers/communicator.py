@@ -22,6 +22,9 @@ class FanOutCommunicator(Generic[T]):
     Only one request is in-flight at any time in either mode.
     """
 
+    _STRAGGLER_WINDOW_S = 0.05
+    _STRAGGLER_POLL_S = 0.005
+
     def __init__(
         self,
         send: Callable[[T], None],
@@ -50,11 +53,21 @@ class FanOutCommunicator(Generic[T]):
             self._result_event = asyncio.Event()
             self._result_values = []
             self._result_fan_out = self._fan_out
-            await self._result_event.wait()
-            result_values = self._result_values
-            self._result_event = self._result_values = None
-            self._result_fan_out = None
-            return result_values
+            requested = self._fan_out
+            try:
+                await self._result_event.wait()
+                # Snapshot: a straggler absorbed below must not reach the caller.
+                result_values = list(self._result_values)
+                # Absorb replies a set_fan_out shrink left owed, so the next call never
+                # sees them; one slower than the window still reaches handle_recv.
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + self._STRAGGLER_WINDOW_S
+                while len(self._result_values) < requested and loop.time() < deadline:
+                    await asyncio.sleep(self._STRAGGLER_POLL_S)
+                return result_values
+            finally:
+                self._result_event = self._result_values = None
+                self._result_fan_out = None
 
     async def watching_call(self, obj):
         if self._result_event is None:
@@ -85,7 +98,12 @@ class FanOutCommunicator(Generic[T]):
             return await self.watching_call(obj)
 
     def set_fan_out(self, fan_out: int):
+        # Shrink mid-call: lower in-flight expected replies (retirees already exited).
         self._fan_out = fan_out
+        if self._result_fan_out is not None and fan_out < self._result_fan_out:
+            self._result_fan_out = fan_out
+            if len(self._result_values) >= fan_out:
+                self._result_event.set()
 
     def handle_recv(self, recv_obj: T):
         if (
@@ -99,7 +117,8 @@ class FanOutCommunicator(Generic[T]):
             )
             return
         self._result_values.append(recv_obj)
-        if len(self._result_values) == self._result_fan_out:
+        # >=, not ==: set_fan_out can lower the target below what already arrived.
+        if len(self._result_values) >= self._result_fan_out:
             self._result_event.set()
 
     @staticmethod

@@ -2316,13 +2316,19 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     # DPC capacity and worker activation use logical DP slots.
     slot_offset: int = 0
     slot_count: int = 0
+    direction: str = "grow"  # "grow" adds DPC routing slots; "shrink" removes them.
     error: Optional[str] = None
+
+
+class ElasticDrainClearReq(BaseReq, kw_only=True):
+    """Tell the DPC to route to the retiring slots again: the shrink is off."""
 
 
 class ScaleElasticEPReqInput(BaseReq, kw_only=True):
     """Request to scale EP by changing the effective EP size (dp_attention mode)."""
 
     new_ep_size: int
+    operation_id: Optional[str] = None  # Caller tag echoed by /is_scaling_elastic_ep.
 
 
 class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
@@ -2332,6 +2338,8 @@ class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     new_ep_size: int = 0
     pending_ep_size: Optional[int] = None
     scale_phase: str = "idle"
+    required_ep_size: Optional[int] = None  # Width a waiting recover joiner sized for.
+    retry_when_joiner_announces: bool = False  # No joiner announced yet; resend later.
 
 
 class GetInternalStateReq(BaseReq, kw_only=True):

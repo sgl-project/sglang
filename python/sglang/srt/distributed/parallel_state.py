@@ -58,6 +58,7 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.runtime_context import (
     derive_parallel_widths,
+    get_exec,
     get_flags,
     get_global_dwdp_manager,
     get_parallel,
@@ -98,6 +99,19 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
+
+
+# WORLD active_ranks handle (WORLD PG has no GroupCoordinator wrapper).
+_WORLD_BACKEND_ACTIVE_RANKS: Optional[torch.Tensor] = None
+_WORLD_BACKEND_RANKS: List[int] = []
+
+
+def get_world_backend_active_ranks() -> Optional[torch.Tensor]:
+    return _WORLD_BACKEND_ACTIVE_RANKS
+
+
+def get_world_backend_ranks() -> List[int]:
+    return list(_WORLD_BACKEND_RANKS)
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -354,18 +368,14 @@ class GroupCoordinator:
                 pg_active_ranks_cpu = torch.zeros(pg_active_size, dtype=torch.int32)
                 pg_active_ranks_cpu[: len(ranks)] = 1
 
-                if max_world_size is not None:
-                    dev_opts = MooncakeBackendOptions(
-                        pg_active_ranks, recovered_rank, max_world_size
-                    )
-                    cpu_opts = MooncakeBackendOptions(
-                        pg_active_ranks_cpu, recovered_rank, max_world_size
-                    )
-                else:
-                    dev_opts = MooncakeBackendOptions(pg_active_ranks, recovered_rank)
-                    cpu_opts = MooncakeBackendOptions(
-                        pg_active_ranks_cpu, recovered_rank
-                    )
+                # AttachOrExtend needs a live group whose rank order prefixes this one,
+                # so only WORLD (rank_offset 0) qualifies; others fall back to {self}.
+                is_extension = recovered_rank and rank_offset == 0
+                extra = () if max_world_size is None else (max_world_size,)
+                dev_opts = MooncakeBackendOptions(pg_active_ranks, is_extension, *extra)
+                cpu_opts = MooncakeBackendOptions(
+                    pg_active_ranks_cpu, is_extension, *extra
+                )
 
                 active_ranks = pg_active_ranks[: len(ranks)]
                 active_ranks_cpu = pg_active_ranks_cpu[: len(ranks)]
@@ -2504,6 +2514,8 @@ def init_distributed_environment(
             from mooncake.pg import MooncakeBackendOptions
 
             use_max_ws = max_world_size and max_world_size > world_size
+            # Recover path also uses max_ws when equal to world_size (attach to pool).
+            use_max_ws = use_max_ws or (recovered_rank and max_world_size == world_size)
             ar_size = max_world_size if use_max_ws else world_size
             active_ranks = torch.zeros(ar_size, dtype=torch.int32, device="cuda")
             active_ranks[:world_size] = 1
@@ -2526,8 +2538,14 @@ def init_distributed_environment(
             pg_options=pg_options,
         )
 
-        # Create a global TCPStore for coordination (used by NIXL)
-        if moe_a2a_backend == "nixl":
+        # Publish WORLD active_ranks handle for elastic-EP mask flips (no wrapper).
+        if backend == "mooncake":
+            global _WORLD_BACKEND_ACTIVE_RANKS, _WORLD_BACKEND_RANKS
+            _WORLD_BACKEND_ACTIVE_RANKS = active_ranks
+            _WORLD_BACKEND_RANKS = list(range(ar_size))
+
+        # Global TCPStore for NIXL and for the elastic-EP cohort barriers.
+        if moe_a2a_backend == "nixl" or backend == "mooncake":
             _create_global_tcp_store(
                 rank,
                 world_size,
@@ -2564,6 +2582,17 @@ def init_distributed_environment(
         )
     # Publish WORLD before model-parallel initialization reads its local rank.
     get_parallel().override_permanently(world_group=_WORLD)
+
+
+def _use_message_queue_broadcaster() -> bool:
+    """Whether the shm broadcaster may back the TP-family groups: not if the width can
+    change, as the queue has no remove_reader and a retiree's exit deadlocks readers."""
+    if not envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get():
+        return False
+    return not (
+        get_exec().moe.elastic_ep_backend == "mooncake"
+        and get_parallel().max_ep_size is not None
+    )
 
 
 def initialize_model_parallel(
@@ -2690,7 +2719,7 @@ def initialize_model_parallel(
         group_ranks,
         get_world_group().local_rank,
         backend,
-        use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+        use_message_queue_broadcaster=_use_message_queue_broadcaster(),
         group_name="tp",
         recovered_rank=recovered_rank,
         rank_offset=rank_offset,
@@ -2706,7 +2735,7 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            use_message_queue_broadcaster=_use_message_queue_broadcaster(),
             group_name="pdmux_prefill_tp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
@@ -2730,7 +2759,7 @@ def initialize_model_parallel(
             dcp_group_ranks,
             get_world_group().local_rank,
             backend,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            use_message_queue_broadcaster=_use_message_queue_broadcaster(),
             group_name="dcp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
@@ -2783,7 +2812,7 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            use_message_queue_broadcaster=_use_message_queue_broadcaster(),
             group_name="attn_cp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
@@ -2823,7 +2852,7 @@ def initialize_model_parallel(
             # select a custom communicator or fall back.
             use_custom_allreduce=None,
             use_torch_symm_mem_allreduce=False,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            use_message_queue_broadcaster=_use_message_queue_broadcaster(),
             group_name="attention_tp",
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
@@ -2984,6 +3013,7 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="self_pp",
             recovered_rank=recovered_rank,
+            # A joiner's world_size is local, so singletons would miss its global rank.
             rank_offset=rank_offset,
             max_world_size=max_world_size,
         )

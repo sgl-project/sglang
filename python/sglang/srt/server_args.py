@@ -37,7 +37,7 @@ from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
 )
-from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
+from sglang.srt.arg_groups.model_override_base import ep_joiner_of
 from sglang.srt.arg_groups.overrides import (
     model_config_of,
     remote_instance_transfer_engine_of,
@@ -833,7 +833,8 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + num_dp_ranks_of(cfg)
-            if ep_scale_joiner_of(resolving_view(server_args)):
+            if is_joiner := ep_joiner_of(resolving_view(server_args)):
+                # Any joiner may share node 0's host, so skip the shared dist_init_port.
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
@@ -857,7 +858,6 @@ class PortArgs:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
-            is_joiner = ep_joiner_of(resolving_view(server_args))
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
             # dist_init_port / nccl_port (rendezvous uses the externally-managed
             # store; see distributed/bootstrap.py:_resolve_dist_init_method), so

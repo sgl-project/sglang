@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.arg_groups.model_override_base import (
-    ep_scale_joiner_of,
+    ep_offset_joiner_of,
     resolving_view,
 )
 from sglang.srt.distributed import (
@@ -79,16 +79,26 @@ def dp_slot_in(per_rank) -> int:
     The sequence carries one entry per replica of the gather this process
     takes part in, so its length is the gather width. Length one is the
     all-gather-skipped batch, which carries this process's entry alone.
+
+    Under elastic EP it may be wider (dp_capacity_for); retirees are the tail.
     """
     if len(per_rank) == 1:
         return 0
     width = dp_gather_width()
-    if len(per_rank) != width:
+    if len(per_rank) != width and not (
+        len(per_rank) > width and get_exec().moe.elastic_ep_backend is not None
+    ):
         raise ValueError(
             f"a per-replica sequence of {len(per_rank)} entries does not "
             f"belong to a DP gather of width {width}"
         )
-    return dp_gather_slot()
+    slot = dp_gather_slot()
+    if slot >= len(per_rank):
+        raise ValueError(
+            f"DP slot {slot} is outside a per-replica sequence of "
+            f"{len(per_rank)} entries"
+        )
+    return slot
 
 
 def dp_gather_slot() -> int:
@@ -430,7 +440,8 @@ def initialize_dp_attention_flags(server_args: ServerArgs):
     dp.enabled = get_parallel().attn_dp_enabled
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
-        if ep_scale_joiner_of(resolving_view(server_args)):
+        # Resolved, since this process's publish may not have happened yet.
+        if ep_offset_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
 
 
@@ -538,6 +549,16 @@ def reject_attn_tp_shard_with_tp_reduce(
 
 def is_allocation_symmetric() -> bool:
     return not is_dp_attention_enabled() or is_dp_max_padding()
+
+
+def dp_capacity_for(dp_size: int) -> int:
+    """Graph-facing DP buffer width: the max_ep_size pool ceiling, not the live width.
+
+    Same in every process, joiners included; callable before DP attention is set up."""
+    max_ep_size = get_parallel().max_ep_size
+    if not max_ep_size or get_exec().moe.elastic_ep_backend is None:
+        return dp_size
+    return max(dp_size, max_ep_size)
 
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:

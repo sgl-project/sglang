@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from enum import Enum, auto
 from functools import cache
 
@@ -8,7 +9,12 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed.utils import get_global_tcp_store
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.elastic_ep.elastic_ep import (
+    ElasticEPStateManager,
+    beat_heartbeat,
+    nixl_wired_barrier_via_store,
+    read_heartbeats,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -25,11 +31,17 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_resources,
 )
+from sglang.srt.utils.common import is_device_stream_capturing
 
 logger = logging.getLogger(__name__)
+
+_FAULT_POLL_INTERVAL_S = 1.0  # Wall clock: captured graph replays run no python.
+_FAULT_POLL_SETTLE_S = 30.0  # A width must hold this long before its marks are read.
+_FAULT_HEARTBEAT_STALE_S = 10.0  # A peer tick unchanged this long counts as stopped.
 
 NixlEPDispatchOutput = DeepEPLLDispatchOutput
 NixlEPCombineInput = DeepEPLLCombineInput
@@ -74,22 +86,191 @@ class NixlEPBuffer:
                 connected_ep_size=None,
                 scale_to=None,
                 dispatch_ep_size=None,
+                reuse_graphs=False,  # Read from --elastic-ep-reuse-cuda-graph at build.
+                # Peer-fault state: one per process, since there is one transport mask.
+                mask_buffer=None,
+                mask_width=None,
+                mask_settled_at=0.0,
+                mask_cleared=False,
+                last_fault_poll=0.0,
+                heartbeats={},
+                held_marks=set(),
             )
             buffers["nixl_ep_state"] = state
         return state
+
+    @classmethod
+    def poll_rank_faults(cls) -> None:
+        """Fold the transport's peer mask into the elastic active-rank mask. Host side
+        after a forward only: the query leaves stream work and the read is a sync."""
+        state = cls._state()
+        buffer = state.buffer
+        if buffer is None:
+            return
+        inst = ElasticEPStateManager.instance()
+        if inst is None or inst.active_ranks is None:
+            return
+        # Reading the mask is a device sync, which a graph capture cannot take.
+        if is_device_stream_capturing(inst.active_ranks.device):
+            return
+        # Until a resize commits the mask belongs to the scale path, and the query can
+        # leave work on a stream a half-arrived or half-departed peer never joins.
+        if ElasticEPStateManager.is_scale_pending():
+            return
+        n = ElasticEPStateManager.get_data_plane_ep_size()
+        if not n or state.connected_ep_size is None:
+            return
+        width = (state.connected_ep_size, n)
+        now = time.monotonic()
+        if state.mask_width != width:
+            state.mask_width = width
+            state.mask_settled_at = now
+            state.mask_cleared = False
+            state.held_marks.clear()
+            # Nobody beats while a scale is pending, so old ticks would all read stale.
+            state.heartbeats.clear()
+            return
+        if state.mask_buffer is None:
+            state.mask_buffer = torch.zeros(
+                inst.active_ranks.numel(), dtype=torch.int32, device="cuda"
+            )
+        if not state.mask_cleared:
+            # Marks from wiring up stay latched, so erase them once the width settles;
+            # a peer that really is gone is marked again by its next combine.
+            if now - state.mask_settled_at < _FAULT_POLL_SETTLE_S:
+                return
+            cls._clear_marks(buffer, n, inst.active_ranks_cpu)
+            state.mask_cleared = True
+            state.last_fault_poll = now
+            return
+        if now - state.last_fault_poll < _FAULT_POLL_INTERVAL_S:
+            return
+        if now - state.last_fault_poll > _FAULT_HEARTBEAT_STALE_S:
+            # This rank paused, so every peer tick reads old too: start the window over.
+            state.heartbeats.clear()
+        state.last_fault_poll = now
+        buffer.query_mask_buffer(state.mask_buffer)
+        marks = state.mask_buffer[:n].tolist()
+
+        # Beat before reading, and read only the marked peers' ticks.
+        beat_heartbeat()
+        suspects = [rank for rank in range(n) if marks[rank]]
+        for rank, tick in read_heartbeats(suspects).items():
+            seen = state.heartbeats.get(rank)
+            if seen is None or seen[0] != tick:
+                state.heartbeats[rank] = (tick, now)
+
+        # A rank that finds most of the width marked is describing its own transport
+        # (e.g. a cold joiner), so retire only a minority. The local rank is never
+        # marked, so a width of two retires nobody.
+        marked = sum(marks)
+        if marked * 2 >= n:
+            logger.warning(
+                "[Elastic EP][nixl] %d of %d ranks masked by the transport; too many "
+                "to be peers failing, so retiring none of them",
+                marked,
+                n,
+            )
+            return
+
+        for rank in suspects:
+            # Both sides of a stall mark each other, so a mark alone would partition
+            # the cohort. Retire only once the peer's scheduler has stopped beating.
+            tick, since = state.heartbeats.get(rank, (0, now))
+            if not tick or now - since < _FAULT_HEARTBEAT_STALE_S:
+                if rank not in state.held_marks:
+                    state.held_marks.add(rank)
+                    logger.warning(
+                        "[Elastic EP][nixl] rank %d masked by the transport but still "
+                        "running; leaving it in the active mask",
+                        rank,
+                    )
+                continue
+            # Retire on the first mark that outlives the peer: the transport has stopped
+            # exchanging with it, so each forward until the rebalance lacks its experts.
+            logger.warning(
+                "[Elastic EP][nixl] rank %d masked by the transport; retiring it "
+                "from the active mask",
+                rank,
+            )
+            # Clear only, never set: re-admitting a rank is the scale path's decision,
+            # not a fault detector's, and dp_attention builds its collectives on this.
+            inst.active_ranks[rank].zero_()
+
+    @staticmethod
+    def _clear_marks(buffer, n: int, live) -> None:
+        """Erase the marks at a settled width; retired ranks stay masked (a departed
+        peer back in the a2a hangs it)."""
+        for rank in range(n):
+            if live is not None and not int(live[rank]):
+                continue
+            try:
+                buffer.update_mask_buffer(rank, False)
+            except Exception:
+                # The local rank and unconnected ranks refuse an unmask.
+                logger.debug(
+                    "[Elastic EP][nixl] could not clear the mark on rank %d",
+                    rank,
+                    exc_info=True,
+                )
 
     @classmethod
     def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
         """Schedule connections for newly admitted ranks."""
         state = cls._state()
         state.scale_to = to_ep_size
-        state.dispatch_ep_size = to_ep_size
+        # Under graph reuse the width stays at capacity; see _mask_unwired.
+        if not state.reuse_graphs:
+            state.dispatch_ep_size = to_ep_size
         logger.debug(
             "[Elastic EP][nixl] scheduling rank connections: old_ep_size=%d "
             "new_ep_size=%d",
             from_ep_size,
             to_ep_size,
         )
+
+    @classmethod
+    def on_retire(cls, retiree_ranks: list) -> None:
+        """Survivor NIXL disconnect (drops peer QPs; contiguous tail assumed)."""
+        state = cls._state()
+        # Lazy connections: the vendor asserts on disconnecting a peer never connected.
+        connected = state.connected_ep_size or 0
+        tail = min(retiree_ranks)
+        if stale := [r for r in retiree_ranks if r < connected]:
+            cls._disconnect_ranks(state, stale)
+        state.connected_ep_size = min(connected, tail)
+        state.scale_to = tail
+        if state.reuse_graphs:
+            cls._mask_unwired(state, retiree_ranks)
+        else:
+            state.dispatch_ep_size = tail
+
+    @classmethod
+    def _mask_unwired(cls, state, ranks: list) -> None:
+        """Mask peerless slots so a capacity-wide dispatch does not wait on them."""
+        if not ranks:
+            return
+        for rank in ranks:
+            try:
+                state.buffer.update_mask_buffer(rank, True)
+            except Exception:
+                # A disconnect may already have masked it; the readback decides.
+                logger.debug(
+                    "[Elastic EP][nixl] could not mask rank %d", rank, exc_info=True
+                )
+        # The readback syncs, which a capture cannot take.
+        if is_device_stream_capturing(torch.device("cuda")):
+            return
+        width = state.buffer.group_size
+        mask = torch.zeros(width, dtype=torch.int32, device="cuda")
+        state.buffer.query_mask_buffer(mask)
+        unmasked = [r for r in ranks if r < width and not int(mask[r])]
+        if unmasked:
+            logger.warning(
+                "[Elastic EP][nixl] ranks %s are still unmasked; a capacity-wide "
+                "dispatch will wait on them",
+                unmasked,
+            )
 
     @classmethod
     def _connect_ranks(cls, state, ranks: list, *, tag: str) -> None:
@@ -106,10 +287,23 @@ class NixlEPBuffer:
         )
 
     @classmethod
+    def _disconnect_ranks(cls, state, ranks: list) -> None:
+        current_store = get_global_tcp_store()
+        if current_store is not None:
+            state.buffer.set_tcp_store_group(current_store)
+        state.buffer.disconnect_ranks(ranks)
+
+    @classmethod
     def _update_connections(cls, state, scale_to: int) -> None:
+        if scale_to < state.connected_ep_size:
+            # No wired barrier: a narrowing is ranks leaving, and they never arrive.
+            cls._disconnect_ranks(state, list(range(scale_to, state.connected_ep_size)))
+            state.connected_ep_size = scale_to
+            return
         new_ranks = list(range(state.connected_ep_size, scale_to))
         cls._connect_ranks(state, new_ranks, tag="update")
         state.connected_ep_size = scale_to
+        nixl_wired_barrier_via_store(scale_to)
 
     @classmethod
     def get_nixl_buffer(
@@ -126,7 +320,7 @@ class NixlEPBuffer:
             if (
                 state.scale_to is not None
                 and state.connected_ep_size is not None
-                and state.scale_to > state.connected_ep_size
+                and state.scale_to != state.connected_ep_size
             ):
                 cls._update_connections(state, state.scale_to)
             return state.buffer
@@ -189,7 +383,13 @@ class NixlEPBuffer:
         cls._connect_ranks(state, list(range(scale_to)), tag="initial")
         state.connected_ep_size = scale_to
         state.scale_to = scale_to
-        state.dispatch_ep_size = scale_to
+        state.reuse_graphs = get_exec().moe.elastic_ep_reuse_cuda_graph
+        if state.reuse_graphs:
+            state.dispatch_ep_size = nixl_max_ranks
+            cls._mask_unwired(state, list(range(scale_to, nixl_max_ranks)))
+        else:
+            state.dispatch_ep_size = scale_to
+        nixl_wired_barrier_via_store(scale_to)
         return state.buffer
 
     @classmethod
@@ -236,13 +436,6 @@ class _NixlEPDispatcherImplBase:
             elastic_state.active_ranks if elastic_state is not None else None
         )
         self._active_world_size = dist.get_world_size(group)
-
-        _max_ep = get_parallel().max_ep_size or self._active_world_size
-        self._mask_buffer = (
-            torch.zeros(_max_ep, dtype=torch.int32, device="cuda")
-            if self.active_ranks is not None
-            else None
-        )
 
         self.handle = None
         self.quant_config = None
@@ -419,12 +612,6 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
             async_finish=not self.return_recv_hook,
             return_recv_hook=self.return_recv_hook,
         )
-        if self._mask_buffer is not None:
-            buffer.query_mask_buffer(self._mask_buffer)
-
-            n = ElasticEPStateManager.get_data_plane_ep_size()
-            self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
-
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
 

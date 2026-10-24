@@ -905,8 +905,9 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
+        # Elastic EP offset joiners always use the DPC; the primary owns the tokenizer.
         use_dp_controller = (
-            get_parallel().num_dp_ranks > 1 or get_exec().moe.ep_join_mode == "scale"
+            get_parallel().num_dp_ranks > 1 or get_exec().moe.is_ep_offset_joiner
         )
         prelaunch_dp_schedulers = (
             use_dp_controller
