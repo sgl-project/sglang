@@ -455,6 +455,39 @@ _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 _SCHEDULER_EXIT_TIMEOUT_SECS = 15
 
 
+def _wrap_tokenizer_with_toktier(tokenizer):
+    """Wrap a loaded tokenizer so its encode calls run on toktier (CPU).
+
+    The wrapper delegates everything else to the tokenizer and reads its
+    settings from TOKTIER_SGLANG_* (see toktier.integrations.sglang).
+    """
+    try:
+        from toktier.integrations.sglang import wrap_tokenizer
+    except ImportError:
+        raise ImportError(
+            "The toktier package is required when --tokenizer-backend=toktier. "
+            "Install it with: pip install 'sglang[toktier]'"
+        ) from None
+
+    wrapped = wrap_tokenizer(tokenizer)
+    logger.info("toktier backend enabled - %r", wrapped)
+    return wrapped
+
+
+def _toktier_session_scope(obj: Union[GenerateReqInput, EmbeddingReqInput]):
+    """The request's session key, bound while toktier encodes.
+
+    toktier keeps per-session tokenizer state keyed by the request's
+    session_id (else cache_salt) and reads the key from a context variable.
+    Any other backend gets a no-op scope.
+    """
+    if get_serving().tokenizer_backend != "toktier":
+        return nullcontext()
+    from toktier.integrations.sglang import bind_session_key, session_key_from_request
+
+    return bind_session_key(session_key_from_request(obj))
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -645,6 +678,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     revision=get_model().revision,
                     tokenizer_backend=get_serving().tokenizer_backend,
                 )
+
+        if get_serving().tokenizer_backend == "toktier" and self.tokenizer is not None:
+            # Wrapped here, not in get_tokenizer, so only this process (the
+            # one that encodes request text) holds the wrapper; the scheduler,
+            # TP worker and detokenizer keep the plain tokenizer. The dynamic
+            # batch tokenizer built below then encodes through it as well.
+            self.tokenizer = _wrap_tokenizer_with_toktier(self.tokenizer)
 
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
@@ -1158,9 +1198,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
-                input_ids, token_type_ids = await self._tokenize_texts(
-                    input_text, is_cross_encoder_request
-                )
+                with _toktier_session_scope(obj):
+                    input_ids, token_type_ids = await self._tokenize_texts(
+                        input_text, is_cross_encoder_request
+                    )
 
         if contains_mm_input and get_disagg().language_model_only:
             raise ValueError(

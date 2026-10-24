@@ -42,9 +42,12 @@ class Serving(msgspec.Struct):
         str,
         Arg(
             help="Tokenizer backend. 'huggingface' uses the default HuggingFace "
-            "tokenizers library, and 'fastokens' uses the fastokens library "
-            "for faster tokenization. Requires the fastokens package to be installed.",
-            choices=["huggingface", "fastokens"],
+            "tokenizers library, 'fastokens' uses the fastokens library "
+            "for faster tokenization (requires the fastokens package), and "
+            "'toktier' uses the toktier library, which re-encodes only what a "
+            "session appends between turns and encodes long prompts in parallel "
+            "on the CPU (requires the toktier package).",
+            choices=["huggingface", "fastokens", "toktier"],
         ),
     ] = "huggingface"
     tokenizer_worker_num: A[
