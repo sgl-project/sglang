@@ -220,6 +220,24 @@ class OpenAIServingBase(ABC):
         )
         return ORJSONResponse(content=error.model_dump(), status_code=status_code)
 
+    def pre_stream_error(self, first_chunk: str) -> Optional[ORJSONResponse]:
+        """An abort that arrived before any output (queue full, waiting timeout, scheduler
+        validation) carries an HTTP status; answer with it instead of a 200 stream."""
+        if not first_chunk.startswith("data: "):
+            return None
+        try:
+            event = orjson.loads(first_chunk[len("data: ") :])
+        except orjson.JSONDecodeError:
+            return None
+        error = event.get("error") if isinstance(event, dict) else None
+        if not isinstance(error, dict) or not isinstance(error.get("code"), int):
+            return None
+        return self.create_error_response(
+            error.get("message", "Generation aborted."),
+            error.get("type", "InternalServerError"),
+            error["code"],
+        )
+
     def create_streaming_error_response(
         self,
         message: str,

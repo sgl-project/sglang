@@ -3227,6 +3227,53 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    def test_streaming_abort_before_any_output_answers_with_its_status(self):
+        """A pre-first-output abort carries an HTTP status; answer with it,
+        as the non-streaming path does."""
+        err_msg = "The request queue is full."
+        err_code = HTTPStatus.SERVICE_UNAVAILABLE
+
+        async def _mock_generate_abort():
+            yield {
+                "text": "",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": err_code,
+                        "message": err_msg,
+                    },
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_abort()
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                self.stream_req, self.fastapi_request
+            )
+
+        loop = get_or_create_event_loop()
+        response = loop.run_until_complete(
+            self.chat._handle_streaming_request(
+                adapted_request, self.stream_req, self.fastapi_request
+            )
+        )
+
+        self.assertEqual(response.status_code, err_code.value)
+        body = json.loads(response.body)
+        self.assertEqual(body["message"], err_msg)
+        self.assertEqual(body["code"], err_code.value)
+
     def test_streaming_abort_with_ids_enabled(self):
         """Test that a terminal abort with input/output ids enabled yields only an error and [DONE]."""
         err_msg = "Aborted by scheduler"
