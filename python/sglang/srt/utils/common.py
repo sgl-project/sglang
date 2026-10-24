@@ -3843,6 +3843,18 @@ def get_quantization_config(hf_config) -> str | None:
     return None
 
 
+def get_mixed_precision_moe_quant_algos(hf_config) -> set:
+    """quant_algo values ModelOpt MIXED_PRECISION assigns to `*.experts` layers."""
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        return set()
+    return {
+        str(info.get("quant_algo", "")).upper()
+        for name, info in quantization_config.get("quantized_layers", {}).items()
+        if ".experts" in name and isinstance(info, dict)
+    }
+
+
 def has_fp8_weights_in_checkpoint(model_path: str) -> bool:
     """Check if a model checkpoint actually contains FP8 (float8_e4m3fn) expert
     weight tensors by reading safetensors metadata headers.

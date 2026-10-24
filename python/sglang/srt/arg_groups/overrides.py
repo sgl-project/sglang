@@ -68,6 +68,7 @@ from sglang.srt.runtime_context import (
     num_dp_ranks_of,
 )
 from sglang.srt.utils.common import (
+    get_mixed_precision_moe_quant_algos,
     get_quantization_config,
     is_fi_a2a_supported,
     is_gfx95_supported,
@@ -1510,16 +1511,29 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 moe_runner_backend,
             )
             moe_runner_backend = mxfp8_default
-    if (
-        moe_runner_backend == "auto"
-        and view.quantization == "modelopt_fp4"
-        and (get_platform().is_sm120 or get_platform().is_sm110)
+    if moe_runner_backend == "auto" and (
+        get_platform().is_sm120 or get_platform().is_sm110
     ):
-        moe_runner_backend = "flashinfer_cutlass"
-        logger.info(
-            "Use flashinfer_cutlass as MoE runner backend on SM110/SM120 for "
-            "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
-        )
+        # trtllm-gen MoE kernels are SM100-only.
+        quantization = view.quantization
+        if quantization is None and not view._quantization_explicitly_unset:
+            # --quantization is usually unset, so use what the checkpoint declares.
+            quantization = model_config_of(view).quantization
+        if quantization == "modelopt_mixed":
+            expert_algos = get_mixed_precision_moe_quant_algos(
+                model_config_of(view).hf_config
+            )
+            if "W4A16_NVFP4" in expert_algos:
+                moe_runner_backend = "marlin"
+            elif "NVFP4" in expert_algos:
+                moe_runner_backend = "flashinfer_cutlass"
+        elif quantization == "modelopt_fp4":
+            moe_runner_backend = "flashinfer_cutlass"
+        if moe_runner_backend != "auto":
+            logger.info(
+                f"Use {moe_runner_backend} as MoE runner backend on SM110/SM120 "
+                f"for {quantization} (trtllm-gen MoE kernels are SM100-only)"
+            )
     if moe_runner_backend != view.moe_runner_backend:
         return {"moe_runner_backend": moe_runner_backend}
     return {}
