@@ -1557,7 +1557,14 @@ def setup_state_kv_args(
             ):
                 npu_kv_pool = full_kv_pool
                 kv_layer_count = len(full_attention_layer_ids)
-                draft_layer_count = kv_args.num_draft_entries // 2
+                draft_kv_pool = draft_token_to_kv_pool
+                if isinstance(draft_kv_pool, HybridLinearKVPool):
+                    draft_kv_pool = draft_kv_pool.full_kv_pool
+                draft_layer_count = (
+                    draft_kv_pool.layer_num
+                    if draft_kv_pool is not None and kv_args.num_draft_entries
+                    else 0
+                )
             conv_shard_groups = (
                 token_to_kv_pool.get_state_conv_shard_groups()
                 if hasattr(token_to_kv_pool, "get_state_conv_shard_groups")
