@@ -55,6 +55,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
     # Pending-ring dtype: the raw keys are averaged from here, so it stays bf16.
     index_state_dtype = torch.bfloat16
 
+    @property
+    def prefill_chunk_alignment(self) -> int:
+        return self.page_size
+
     @classmethod
     def qsa_bytes_per_token(
         cls,
