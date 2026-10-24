@@ -554,6 +554,21 @@ python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.
 Run the two files as separate pytest commands because the runner test installs
 process-global simulator hooks and state.
 
+The native DSPark CPU type/allocation check is
+`tools/sglang-simulator/test/test_dspark_native_results.py`. In the ROCm image
+`lmsysorg/sglang-rocm@sha256:b28fe77ae3d1c6022da1b579687a5f5ecec08269081301a4887d2093cfd34ae9`,
+AITER imports can require an explicit target architecture even when no GPU
+devices are mounted. For a known MI355X target, use `GPU_ARCHS=gfx950` and
+`AITER_JIT_DIR=/sgl-workspace/aiter/aiter/jit` to select its packaged read-only
+JIT directory. Set `USER` and `LOGNAME` to the intended account name if the
+container UID has no passwd entry. Keep all GPU device mounts absent, enable
+both `SGLANG_SIMULATOR_BOOTSTRAP=1` and `SGLANG_USE_CPU_ENGINE=1`, and check
+`torch.cuda.is_initialized()` remains false before and after the smoke. These
+are explicit import settings for the declared target; they do not detect or
+establish available GPU hardware. The check exercises real native result types,
+CPU request-table buffers and the public allocation seam with protocol fixture
+costs; it does not validate measured latency or a full Simulator run.
+
 Run repository checks before submitting:
 
 ```bash
