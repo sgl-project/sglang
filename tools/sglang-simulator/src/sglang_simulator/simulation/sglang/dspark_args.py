@@ -78,7 +78,15 @@ def _validate(native, server_args, cfg):
     ):
         value = getattr(cfg, name, None)
         _require(type(value) is int and value == 1, f"requires physical {name}=1")
-    _require(cfg.disable_overlap_schedule is True, "requires overlap disabled")
+    from sglang_simulator.compat import native_reference_requested
+
+    native_reference = native_reference_requested()
+    _require(
+        cfg.disable_overlap_schedule is (not native_reference),
+        "requires source overlap for native regions"
+        if native_reference
+        else "requires overlap disabled",
+    )
     _require(cfg.disable_cuda_graph is True, "requires physical CUDA graphs disabled")
     for phase in ("decode", "prefill"):
         backend = getattr(cfg, "cuda_graph_backend_" + phase, None)

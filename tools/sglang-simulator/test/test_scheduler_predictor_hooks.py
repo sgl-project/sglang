@@ -56,8 +56,17 @@ def hooked_scheduler(monkeypatch):
         def _prefetch_kvcache(self, req):
             pass
 
+        def _release_aborted_request(self, req):
+            self.released_request_id = req.rid
+
         def get_new_batch_prefill(self):
             return None
+
+        def get_next_batch_to_run(self, **kwargs):
+            return self.plan
+
+        def is_disable_overlap_for_batch(self, batch, **kwargs):
+            return self.disable_overlap
 
         def run_batch(self, batch):
             advance(0.2)
@@ -77,9 +86,14 @@ def hooked_scheduler(monkeypatch):
             advance(0.01)
             if getattr(self, "process_error", None) is not None:
                 raise self.process_error
+            if getattr(self, "after_process", None) is not None:
+                self.after_process(batch, result)
 
         def event_loop_normal(self):
             pass
+
+        def event_loop_overlap(self):
+            return "native overlap"
 
         def on_idle(self):
             pass

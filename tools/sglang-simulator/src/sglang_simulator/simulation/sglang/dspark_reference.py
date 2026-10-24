@@ -166,7 +166,8 @@ class DSparkReferenceLedger:
     Preparation precedes optional synchronization/settlement. Current publication
     precedes ordinary previous-result settlement, so the FIFO may transiently hold
     two entries. Callers retain the original ledger when cost or publication fails.
-    Native CPU requests/mirrors are never mutated. No factory opts into this API.
+    Native CPU requests/mirrors are never mutated. The native-policy factory's
+    source event driver owns production activation.
     """
 
     requests: tuple[ReferenceRequestKV, ...] = ()

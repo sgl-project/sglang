@@ -636,6 +636,69 @@ def test_full_phase_coverage_reaches_missing_perfdb_before_progress_or_history(
     assert transaction.base_ledger.last_forward_id == -1
 
 
+def test_production_native_worker_driver_reaches_real_sdk_and_missing_perfdb(
+    source_case, monkeypatch
+):
+    from sglang_simulator.simulation.sglang.dspark_runtime import DSparkNativeRuntime
+    from sglang_simulator.simulation.sglang.dspark_worker import C_DSparkWorkerHook
+    from sglang_simulator.simulation.sglang.scheduler import C_SchedulerHook
+
+    model = UMDDSparkCostModel(
+        source_case.database, native_source_policy=source_case.policy
+    )
+
+    class NoProgress:
+        calls = 0
+
+        def predict_progress(self, _step):
+            self.calls += 1
+            pytest.fail("missing native costs reached progress")
+
+    progress = NoProgress()
+    runtime = DSparkNativeRuntime(
+        session=DSparkSession(model, progress),
+        topology=DSparkTopology(2, 1),
+        runtime_profile_json=source_case.policy.runtime_profile_json,
+        output_token_id=1,
+        reference_events=True,
+    )
+    _, native, _ = before("EXTEND", source_case)
+    native.seq_lens = list(native.seq_lens_cpu)
+    native.prefix_lens = [7680]
+    native.extend_lens = [512]
+    native.chunked_req = None
+    native.spec_info = None
+    native.token_to_kv_pool_allocator = NS(page_size=256)
+    native.reqs[0].output_ids = []
+    native.reqs[0].grammar = None
+    native.reqs[0].kv = NS(kv_committed_len=8192)
+    driver = runtime.reference_driver
+    driver.selected(NS(enable_overlap=True), native)
+    driver.overlap_decision(native, False)
+    base = driver.adapter
+    monkeypatch.setattr(
+        C_SchedulerHook,
+        "INFERENCE_PREDICTOR",
+        NS(supports_dspark=True, dspark_runtime=runtime),
+    )
+
+    class Worker:
+        pass
+
+    C_DSparkWorkerHook.hook(Worker)
+    worker = Worker.__new__(Worker)
+    worker.query_token_num = 5
+    worker.verify_num_draft_tokens = 6
+    with pytest.raises(
+        PredictorError, match="missing qualified DSPark cost for phase: worker_preamble"
+    ):
+        worker.forward_batch_generation(native)
+    assert driver.adapter is base
+    assert driver.failure["event"] == "worker preparation/cost/build"
+    assert runtime.session._history == {} and progress.calls == 0
+    assert runtime._forward_id == runtime._draft_buffer_capacity == 0
+
+
 @pytest.mark.parametrize("change", ["original_input", "reference_view", "runtime"])
 def test_missing_causal_inputs_do_not_become_default_native_facts(source_case, change):
     model = UMDDSparkCostModel(

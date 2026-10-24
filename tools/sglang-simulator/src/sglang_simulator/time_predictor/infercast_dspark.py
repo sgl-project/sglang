@@ -786,6 +786,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             topology=DSparkTopology(2, 1, 1),
             runtime_profile_json=runtime_text,
             output_token_id=output_token_id,
+            reference_events=native_policy is not None,
         )
         self._identity = {
             "model_id": model_id,
@@ -836,6 +837,17 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                 ("decode", _DECODE_PHASES),
             )
         }
+        driver = self.dspark_runtime.reference_driver
+        reference_policy_available = (
+            type(
+                getattr(
+                    self.dspark_runtime.session.cost_model.native_source_policy,
+                    "reference_needs_cpu_seq_lens",
+                    None,
+                )
+            )
+            is bool
+        )
         return {
             "infercast_dspark": {
                 **copy.deepcopy(self._identity),
@@ -846,7 +858,11 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                     else "proposal_capture_only"
                 ),
                 "unresolved_source_facts": (
-                    ["source_ordered_reference_driver_inputs"]
+                    (
+                        []
+                        if reference_policy_available
+                        else ["reference_backend_cpu_mirror_policy"]
+                    )
                     if self._identity["native_segment_profile_id"] is not None
                     else [
                         "target_graph_key",
@@ -854,6 +870,18 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
                         "target_epilogue_folding",
                         "target_monokernel_source_state_ledger",
                     ]
+                ),
+                "reference_event_driver": (
+                    None
+                    if driver is None
+                    else {
+                        "implementation": "native_scheduler_events_v1",
+                        "scheduler_bound": driver.owner is not None,
+                        "reference_backend_policy_available": reference_policy_available,
+                        "published_forwards": self.dspark_runtime._forward_id,
+                        "pending_results": len(driver.adapter.ledger.pending),
+                        "failure": copy.deepcopy(driver.failure),
+                    }
                 ),
                 "complete_worker_costs": False,
                 "timing_qualified": False,

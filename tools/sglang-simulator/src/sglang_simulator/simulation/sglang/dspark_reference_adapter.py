@@ -1,4 +1,4 @@
-"""Explicit reference lifecycle and cost preparation; no scheduler activation."""
+"""Reference lifecycle and transactional source-event cost preparation."""
 
 from __future__ import annotations
 
@@ -18,8 +18,7 @@ from sglang_simulator.time_predictor.base import PredictorError
 class DSparkReferenceAdapter:
     """Consume source-owned events, deferring retirement until ownership drains.
 
-    G's synchronous finish/idle callbacks cannot supply reference event order or
-    membership. No factory or scheduler hook constructs this adapter.
+    The source event driver supplies native selection and settlement order.
     """
 
     ledger: DSparkReferenceLedger = field(default_factory=DSparkReferenceLedger)
@@ -153,7 +152,7 @@ class ReferenceStepTransaction:
             "reference transaction does not bind its exact prepared step and prior result",
         )
 
-    def complete(self, result, *, current_ledger):
+    def complete(self, result, *, current_ledger, process_previous_after=True):
         """Publish current, then retire only the frozen prior FIFO entry.
 
         Calculate this candidate before committing external publication/session
@@ -164,8 +163,16 @@ class ReferenceStepTransaction:
             current_ledger is self.base_ledger,
             "reference transaction is stale relative to its current ledger owner",
         )
+        _require(
+            type(process_previous_after) is bool,
+            "reference post-publication settlement policy is unknown",
+        )
         candidate = self.prepared_ledger.publish(result)
-        if self.previous_forward_id is not None and not self.process_previous_before:
+        if (
+            process_previous_after
+            and self.previous_forward_id is not None
+            and not self.process_previous_before
+        ):
             candidate = candidate.process_result(
                 self.previous_forward_id,
                 skipped_request_ids=self.skipped_previous_ids,
@@ -186,6 +193,7 @@ def prepare_reference_step(
     native_batch,
     buffer_capacity,
     buffer_device_matches,
+    allocation_ledger=None,
 ):
     """Bind one explicit reference preparation to the existing resolver inputs.
 
@@ -204,7 +212,41 @@ def prepare_reference_step(
         and type(buffer_device_matches) is bool,
         "reference bridge requires explicit before-proposal buffer metadata",
     )
-    prepared = ledger.prepare(unresolved_step, page_size=page_size)
+    if allocation_ledger is None:
+        prepared = ledger.prepare(unresolved_step, page_size=page_size)
+    else:
+        # Selection/allocation happened before a possible native sync boundary.
+        # Only output count may advance between that event and worker entry.
+        _require(
+            type(allocation_ledger) is DSparkReferenceLedger
+            and allocation_ledger.prepared is not None,
+            "reference allocation snapshot is absent",
+        )
+        selected = allocation_ledger.prepared.step
+        rebound = replace(
+            unresolved_step,
+            groups=(
+                replace(
+                    unresolved_step.groups[0],
+                    requests=tuple(
+                        replace(now, output_tokens_before=then.output_tokens_before)
+                        for now, then in zip(
+                            unresolved_step.requests, selected.requests, strict=True
+                        )
+                    ),
+                ),
+            ),
+        )
+        _require(
+            rebound == selected
+            and allocation_ledger.pending == ledger.pending
+            and allocation_ledger.last_forward_id == ledger.last_forward_id,
+            "reference worker input differs from its frozen selection",
+        )
+        prepared = replace(
+            allocation_ledger,
+            prepared=replace(allocation_ledger.prepared, step=unresolved_step),
+        )
     if process_previous_before:
         prepared = prepared.process_result(
             previous, skipped_request_ids=skipped_previous_ids

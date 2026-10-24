@@ -1,5 +1,6 @@
 """CPU argument compatibility only; no device execution or performance claims."""
 
+import json
 import os
 import subprocess
 import sys
@@ -114,6 +115,33 @@ assert install_cpu_dspark_args() is False
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_native_region_config_activates_original_overlap_before_cpu_resolution(
+    native, monkeypatch, tmp_path
+):
+    from sglang_simulator.compat import apply_simulator_server_args
+
+    config = tmp_path / "native.json"
+    config.write_text(
+        json.dumps(
+            {
+                "predictor": {
+                    "name": "infercast_dspark",
+                    "native_segment_profile_id": "b" * 64,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SGLANG_SIMULATOR_CONFIG_PATH", "")
+    args = arguments(sim_config_path=str(config))
+    apply_simulator_server_args(args)
+    assert args.disable_overlap_schedule is False
+    assert install_cpu_dspark_args() is True
+    native._handle_dspark(args)
+    assert native.calls == []
+    assert len(native.declarations) == 1
 
 
 @pytest.mark.parametrize(

@@ -431,6 +431,47 @@ def test_generic_forward_never_substitutes_an_ordinary_model_cost(factory):
         factory.build().predict_infer_time(object())
 
 
+def test_native_factory_installs_one_source_event_driver(factory, monkeypatch):
+    from sglang_simulator.simulation.sglang.dspark_reference_driver import (
+        DSparkReferenceDriver,
+    )
+    from sglang_simulator.time_predictor import dspark_umd, infercast_dspark
+
+    decode = ModuleType("infercast.sdk.decode_forward")
+    decode.DecodeExecutionProfile = NS(from_dict=lambda value: NS(profile_id="d" * 64))
+    artifacts = ModuleType("infercast.sdk.perf_database.dsv41_dspark")
+    artifacts.decode_dspark_artifact = lambda raw: json.loads(raw)
+    monkeypatch.setitem(sys.modules, decode.__name__, decode)
+    monkeypatch.setitem(sys.modules, artifacts.__name__, artifacts)
+    policy = NS(
+        runtime_profile_json=Path(factory.kwargs["runtime_profile"]["path"]).read_text()
+    )
+    monkeypatch.setattr(infercast_dspark, "_native_source_policy", lambda *args: policy)
+    # Source-policy/PerfDB qualification has its real-SDK integration tests.
+    # This isolates the actual predictor constructor's native activation seam.
+    monkeypatch.setattr(
+        dspark_umd,
+        "UMDDSparkCostModel",
+        lambda *args, **kwargs: NS(
+            execution_for=lambda **kwargs: {}, preparers={}, native_source_policy=policy
+        ),
+    )
+    predictor = factory.build(
+        proposal_profile_id=None,
+        native_segment_profile_id="e" * 64,
+        native_capture_profile=factory.asset(
+            "capture.json", raw({"scope": "CPU fixture"})
+        ),
+    )
+    assert type(predictor.dspark_runtime.reference_driver) is DSparkReferenceDriver
+    assert predictor.dspark_runtime.reference_driver.runtime is predictor.dspark_runtime
+    metrics = predictor.get_metrics()["infercast_dspark"]
+    assert (
+        metrics["reference_event_driver"]["reference_backend_policy_available"] is False
+    )
+    assert metrics["unresolved_source_facts"] == ["reference_backend_cpu_mirror_policy"]
+
+
 @pytest.mark.parametrize(
     "field", ["phase_preparers", "phase_costs", "callback", "database_mode", "typo"]
 )

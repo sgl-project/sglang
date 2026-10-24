@@ -378,17 +378,104 @@ class C_SchedulerHook(BaseHook):
         original_run_batch = target.run_batch
         original_process_batch_result = target.process_batch_result
         original_event_loop_normal = target.event_loop_normal
+        original_event_loop_overlap = getattr(target, "event_loop_overlap", None)
+        original_get_next_batch = getattr(target, "get_next_batch_to_run", None)
+        original_overlap_decision = getattr(
+            target, "is_disable_overlap_for_batch", None
+        )
         original_init_request_dispatcher = target.init_request_dispatcher
         original_on_idle = target.on_idle
+        original_release_aborted = getattr(target, "_release_aborted_request", None)
         from sglang_simulator.simulation.sglang.coordinated import (
             install_prefill_cadence_hooks,
         )
 
         install_prefill_cadence_hooks(target, lambda: C_SchedulerHook.COORDINATOR)
 
+        def reference_driver():
+            runtime = getattr(
+                C_SchedulerHook.INFERENCE_PREDICTOR, "dspark_runtime", None
+            )
+            return getattr(runtime, "reference_driver", None)
+
         def override_event_loop_overlap(self, *args, **kwargs):
+            driver = reference_driver()
+            if driver is not None:
+                driver.bind(self)
+                if original_event_loop_overlap is None:
+                    raise PredictorError(
+                        "invalid_reference_state", "native overlap loop is unavailable"
+                    )
+                return original_event_loop_overlap(self, *args, **kwargs)
             # To reduce the complexity of the simulation, the overlapping schedule is not needed.
             return original_event_loop_normal(self, *args, **kwargs)
+
+        def wrapped_get_next_batch(self, *args, **kwargs):
+            driver = reference_driver()
+            prior_requests = ()
+            if driver is not None:
+                prior_requests = tuple(
+                    req
+                    for native_batch in (
+                        kwargs.get("running_batch"),
+                        kwargs.get("last_batch"),
+                        *args,
+                    )
+                    if native_batch is not None
+                    for req in getattr(native_batch, "reqs", ())
+                )
+            plan = original_get_next_batch(self, *args, **kwargs)
+            if driver is not None:
+                started = time.perf_counter()
+                try:
+                    driver.selected(
+                        self, plan.batch_to_run, prior_requests=prior_requests
+                    )
+                except Exception as error:
+                    driver.fail("native selection/preparation", error)
+                    raise
+                setattr(
+                    self,
+                    _DSPARK_WALL_CREDIT,
+                    getattr(self, _DSPARK_WALL_CREDIT, 0.0)
+                    + time.perf_counter()
+                    - started,
+                )
+            return plan
+
+        def wrapped_overlap_decision(self, batch, *args, **kwargs):
+            decision = original_overlap_decision(self, batch, *args, **kwargs)
+            driver = reference_driver()
+            if driver is not None:
+                started = time.perf_counter()
+                try:
+                    driver.overlap_decision(batch, decision)
+                except Exception as error:
+                    driver.fail("native overlap decision", error)
+                    raise
+                setattr(
+                    self,
+                    _DSPARK_WALL_CREDIT,
+                    getattr(self, _DSPARK_WALL_CREDIT, 0.0)
+                    + time.perf_counter()
+                    - started,
+                )
+            return decision
+
+        def wrapped_release_aborted(self, req, *args, **kwargs):
+            result = original_release_aborted(self, req, *args, **kwargs)
+            driver = reference_driver()
+            if driver is not None:
+                # Native queued/chunk abort release can happen without another
+                # result, and prefill does not use the decode finish callback.
+                try:
+                    C_SchedulerHook.INFERENCE_PREDICTOR.dspark_runtime.note_request_finished(
+                        rid=req.rid, natural_stop=False
+                    )
+                except Exception as error:
+                    driver.fail("native abort release", error)
+                    raise
+            return result
 
         def wrapped_init(self, *args, **kwargs):
             logger.info(simulation_mode_log_message(C_SchedulerHook.SIM_MODE))
@@ -520,7 +607,13 @@ class C_SchedulerHook(BaseHook):
 
         def wrapped_run_batch(self, *args, **kwargs):
             C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST = 0
-            ret = original_run_batch(self, *args, **kwargs)
+            try:
+                ret = original_run_batch(self, *args, **kwargs)
+            except Exception as error:
+                driver = reference_driver()
+                if driver is not None:
+                    driver.fail("native run_batch", error)
+                raise
 
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
@@ -718,7 +811,33 @@ class C_SchedulerHook(BaseHook):
                     ),
                 )
             process_batch_result_start = time.perf_counter()
-            ret = original_process_batch_result(self, *args, **kwargs)
+            driver = reference_driver()
+            reference_wall = 0.0
+            if driver is not None:
+                started = time.perf_counter()
+                try:
+                    driver.before_result(batch, native_result)
+                except Exception as error:
+                    driver.fail("native result preparation", error)
+                    raise
+                reference_wall += time.perf_counter() - started
+            try:
+                ret = original_process_batch_result(self, *args, **kwargs)
+                if driver is not None:
+                    started = time.perf_counter()
+                    driver.after_result()
+                    reference_wall += time.perf_counter() - started
+                    reference_wall += driver.take_callback_wall_seconds()
+            except Exception as error:
+                if driver is not None:
+                    driver.fail("native result processing", error)
+                raise
+            if driver is not None:
+                setattr(
+                    self,
+                    _DSPARK_WALL_CREDIT,
+                    getattr(self, _DSPARK_WALL_CREDIT, 0.0) + reference_wall,
+                )
             process_batch_result_end = time.perf_counter()
 
             if batch is not None:
@@ -933,6 +1052,12 @@ class C_SchedulerHook(BaseHook):
 
         target.on_idle = wrapped_on_idle
         target.event_loop_overlap = override_event_loop_overlap
+        if original_get_next_batch is not None:
+            target.get_next_batch_to_run = wrapped_get_next_batch
+        if original_overlap_decision is not None:
+            target.is_disable_overlap_for_batch = wrapped_overlap_decision
+        if original_release_aborted is not None:
+            target._release_aborted_request = wrapped_release_aborted
         target.__init__ = wrapped_init
         target.get_new_batch_prefill = wrapped_get_new_batch_prefill
         target.run_batch = wrapped_run_batch

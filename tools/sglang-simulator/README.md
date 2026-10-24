@@ -132,8 +132,8 @@ records the stack digest; this does not certify its manifest or complete table
 coverage. Asset paths resolve from the configuration directory. The
 legacy `proposal_profile_id` selection prepares only the existing proposal
 module. The explicit native-region selection below prepares all four prefill
-and five decode regions through the SDK. Constructing either selection does
-not establish measured coverage, a reference event driver or accuracy admission.
+and five decode regions through the SDK and installs the source event driver
+described below. Construction does not establish measured coverage or accuracy.
 
 The before-work resolver receives the original native CPU batch and authoritative
 proposal-buffer capacity/device state before costs are queried. The optional
@@ -686,13 +686,17 @@ costs; it does not validate measured latency or a full Simulator run.
 
 CPU DSPark argument compatibility is installed only with both explicit bootstrap
 flags above. It preserves `device=cpu` and delegates non-CPU calls to the native
-handler. The initial path requires physical single-rank execution, overlap and
-physical graphs disabled, static draft Q5 / target Q6, an explicit draft path
+handler. The path requires physical single-rank execution, physical graphs
+disabled, static draft Q5 / target Q6, an explicit draft path
 and full draft revision commit, and positive explicit `max_running_requests`.
 Target TP topology remains part of the cost/runtime profile. Unsupported ragged,
 adaptive, coordinated and constrained paths fail before simulator declarations.
 This removes native accelerator-only argument rejection; complete cost/progress
 assets and predictor launch wiring remain necessary for a full run.
+The native-region predictor selection enables the original overlap scheduler;
+other selections retain disabled overlap. The CLI config path is established
+before native argument resolution, so CLI and environment config selection use
+the same rule.
 Native `ServerArgs.from_cli_args()` only constructs the raw record. The simulator
 launcher explicitly calls `resolve_once()` before launch; the native engine's
 later call is idempotent. Resolution declarations preserve the raw argument
@@ -709,8 +713,9 @@ The ordinary scheduler path binds DSPark shape and timing accounting to the exac
 returned result. Offline accounting excludes replacement-worker wall time once
 in the host interval containing its launches, including multiple launches before
 result processing. Pending results must drain before profiling resets accounting.
-Coordinator delegation retains its existing clock contract; this change does not
-enable overlap. SGLang Simulator owns scheduling, batching, cache/lifecycle behavior
+Coordinator delegation retains its existing clock contract. The native-region
+driver uses the original overlap loop; other predictors retain their existing
+loop behavior. SGLang Simulator owns scheduling, batching, cache/lifecycle behavior
 and virtual time; InferCast supplies cost queries and performance interpolation.
 
 `simulation.sglang.dspark_reference.DSparkReferenceLedger` provides an explicit,
@@ -739,14 +744,27 @@ cache state. Prefill allocation sets committed/reserved lengths before forward,
 and prefill publication adds no sampled bonus to the KV prefix. Chunk completion
 is carried by the existing request's `emits_output` flag.
 
-This seam is not installed by the predictor factory or attached to G's synchronous
-scheduler callbacks. The source adapter still must establish overlap/backend
-policy, relay presence, idle/synchronization/retraction events and reference
-batch membership. In particular, native overlap may launch an extra forward
-before a pending multi-token result finishes a request; G's synchronous finish
-callback alone cannot reproduce that behavior. The ledger neither chooses that
-membership nor proves reference equivalence, qualified costs or serving accuracy.
-G's actual CPU lengths, allocations and native request objects remain unchanged.
+The native-region factory installs `dspark_reference_driver.DSparkReferenceDriver`.
+Scheduler hooks retain the native `event_loop_overlap`, `get_next_batch_to_run`,
+`is_disable_overlap_for_batch`, `run_batch` and `process_batch_result` methods.
+The driver freezes ordered selection/allocation before the native synchronization
+decision, then captures worker-before output counts after optional previous-result
+processing. Ordinary previous results settle at the actual post-publication FIFO
+processing event. A launch can therefore precede the finish of an earlier result.
+The driver has no membership selection algorithm. CPU request/cache allocation
+and FutureMap publication remain native operations.
+
+Physical reference backend policy remains a required source gate. A present relay
+requires `reference_needs_cpu_seq_lens` on the SDK-verified native source policy.
+The current SDK does not expose that verified field, so decode relay activation
+fails explicitly with `reference_backend_cpu_mirror_policy`. CPU `torch_native`
+FutureMap policy validates only the simulator's own mirror; it cannot supply the
+physical HIP backend OR/TBO decision. Original observed null mirrors are not a
+global policy proof. No JSON option or guessed boolean bypasses this gate.
+Prefill/absent-relay preparation can still reach the existing SDK cost path.
+Predictor metrics report driver binding, published/pending counts, this missing
+source fact, and terminal failure. These are execution diagnostics, not performance
+qualification or accuracy evidence.
 
 The opt-in `dspark_reference_adapter.DSparkReferenceAdapter` consumes those
 explicit events and defers request retirement. A source finish or retraction
@@ -759,7 +777,13 @@ retirement before processing represents an existing finish/retraction/abort.
 It does not equate G's finish callback with that source event: native prefill
 finish and retraction do not uniformly pass through the worker callback. An idle
 event must process the actual pending FIFO; reset requires an already drained
-ledger. No hook installs this adapter automatically.
+ledger. The production driver uses these same adapter transitions. It observes
+finished state around native result processing for both prefill and decode,
+including prefill finishes that have no draft-worker callback. Never-admitted
+queued cancellation owns no reference row. Retraction or retained-output re-entry
+fails explicitly until a source-backed rebootstrap transition exists.
+The native `_release_aborted_request` hook also retires an admitted queued chunk
+when no later result exists to carry its cleanup event.
 
 The same module's pure `prepare_reference_step` bridges a provisional typed step
 to a source-aware execution resolver. Callers explicitly provide page size,
@@ -779,7 +803,12 @@ pending. It accepts no new synchronization or skip decisions from current
 acceptance. Compute this candidate before external publication/session commit
 and install it only after those operations succeed; the pure helper does not
 perform or roll back external side effects. The native factory's existing cost
-model can now serve as this resolver:
+model serves as this resolver. The production driver additionally passes its
+frozen `allocation_ledger`, computes the completion candidate before publication,
+and leaves ordinary previous settlement to the actual native event by calling
+`complete(..., process_previous_after=False)`. An external callback failure is
+terminal and recorded; its effects cannot be rolled back or silently retried.
+The standalone pure bridge remains available for explicit source-event tests:
 
 ```python
 transaction = prepare_reference_step(
@@ -804,8 +833,24 @@ IDs, budgets and complete normalized sampling must match the step. The SDK gets
 reference CPU vectors, including known absence, separately from synchronous
 simulator mirrors. EXTEND's SDK decode-only arguments are None; the outer step
 still retains its real persistent buffer state. Unknown inputs reject explicitly.
-The ordinary runtime callback supplies no reference event driver and therefore
-cannot activate this path by itself. No scheduler or cost lookup is duplicated.
+The ordinary non-native runtime callback retains its existing behavior. Native
+workers require their matching source selection and overlap decision; directly
+calling a native worker without those events fails. Costs still precede progress,
+and result construction/stale-owner failures install no current session/reference
+success. Idle preserves history; a drained cache reset clears both histories while
+preserving proposal capacity and monotonic forward IDs. Reference event emulation
+outside the worker is excluded once from offline host timing, alongside the full
+replacement-worker wall interval. No scheduler or cost lookup is duplicated.
+
+CPU regressions include the native overlap loop body loaded from this checkout,
+installed scheduler/worker hooks, cached chunks/final bonus, dynamic membership,
+both settlement orders, retirement/cancellation, callback/stale failures and
+missing real SDK costs before progress. Protocol costs and source-policy fixtures
+are explicitly synthetic test inputs. The next native smoke must use a verified
+physical backend policy, native SGLang/torch types, exact runtime/progress/cost
+assets, and the unchanged AgentX 1.0.7 client. It must preserve warmup handoff,
+DAG/credit completion and native response pacing. No complete 13/priority-10
+configuration or 393-trace Pareto result is established by these CPU checks.
 
 Run repository checks before submitting:
 

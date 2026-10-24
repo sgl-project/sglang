@@ -349,6 +349,7 @@ class DSparkNativeRuntime:
         output_token_id: int,
         execution_resolver=None,
         result_factory=None,
+        reference_events=False,
     ):
         self.session = session
         self.topology = topology
@@ -365,8 +366,15 @@ class DSparkNativeRuntime:
         )
         self._forward_id = 0
         self._draft_buffer_capacity = 0
+        self.reference_driver = None
+        if reference_events:
+            from sglang_simulator.simulation.sglang.dspark_reference_driver import (
+                DSparkReferenceDriver,
+            )
 
-    def capture(self, batch):
+            self.reference_driver = DSparkReferenceDriver(self)
+
+    def capture(self, batch, *, resolve=True, reference=False):
         if str(batch.device) != "cpu":
             raise PredictorError(
                 "invalid_batch", "DSPark simulator requires native CPU scheduler state"
@@ -392,7 +400,11 @@ class DSparkNativeRuntime:
                 "DSPark runtime needs its homogeneous native prefill or decode batch",
             )
         requests = tuple(batch.reqs)
-        seq = cpu_vector(batch.seq_lens_cpu, len(requests), "seq_lens_cpu")
+        seq = cpu_vector(
+            batch.seq_lens if reference else batch.seq_lens_cpu,
+            len(requests),
+            "seq_lens" if reference else "seq_lens_cpu",
+        )
         if not requests:
             raise PredictorError(
                 "invalid_batch", "single-DP DSPark cannot execute an empty batch"
@@ -408,8 +420,16 @@ class DSparkNativeRuntime:
                     "native prefill sequence differs from actual prefix plus chunk",
                 )
         else:
-            prefix, extend = seq, (6,) * len(requests)
-            if any(
+            prefix = (
+                tuple(
+                    self.session.history_for(req.rid).target_prefix_len
+                    for req in requests
+                )
+                if reference
+                else seq
+            )
+            extend = (6,) * len(requests)
+            if not reference and any(
                 cpu_int(req.kv.kv_committed_len, "kv_committed_len") != p
                 for req, p in zip(requests, prefix, strict=True)
             ):
@@ -469,13 +489,23 @@ class DSparkNativeRuntime:
                     recipe,
                     emits_output=(
                         mode == "DECODE"
-                        or cpu_int(req.inflight_middle_chunks, "inflight_middle_chunks")
-                        == 0
+                        or (
+                            batch.chunked_req is not req
+                            if reference
+                            else cpu_int(
+                                req.inflight_middle_chunks, "inflight_middle_chunks"
+                            )
+                            == 0
+                        )
                     ),
                 )
             )
         internal_mode = "EXTEND" if mode == "EXTEND" else "TARGET_VERIFY"
         group = DSparkGroup(0, internal_mode, tuple(work), '{"selection":"pending"}')
+        if not resolve:
+            return DSparkStep(
+                self._forward_id, self.topology, (group,), self.runtime_profile_json
+            )
         buffer_capacity = self._draft_buffer_capacity
         buffer_device_matches = buffer_capacity > 0
         execution = self.execution_resolver(
@@ -502,14 +532,39 @@ class DSparkNativeRuntime:
                 "unsupported_execution_profile",
                 "DSPark worker width differs from runtime",
             )
-        before = self.capture(batch)
-        prediction = self.session.predict(before)
-        result = self.results.build(batch=batch, prediction=prediction)
-        # Native synchronous scheduling will later update req.kv by accept_lens.
+        driver = self.reference_driver
+        transaction = None
+        try:
+            if driver is None:
+                before = self.capture(batch)
+            else:
+                transaction = driver.prepare_worker(batch)
+                before = transaction.step
+            prediction = self.session.predict(before)
+            result = self.results.build(batch=batch, prediction=prediction)
+            candidate = (
+                None
+                if transaction is None
+                else driver.complete_candidate(transaction, prediction)
+            )
+        except Exception as error:
+            if driver is not None:
+                driver.fail("worker preparation/cost/build", error)
+            raise
+        # Native result processing will later update req.kv by accept_lens.
         # Our draft/history ledger is independent of that pending native update.
-        if on_publish is not None:
-            on_publish(result.new_seq_lens)
-        self.session.commit(prediction)
+        try:
+            if on_publish is not None:
+                on_publish(result.new_seq_lens)
+            if driver is not None:
+                driver.validate_owner(transaction)
+            self.session.commit(prediction)
+        except Exception as error:
+            if driver is not None:
+                driver.fail("publication/session commit", error)
+            raise
+        if driver is not None:
+            driver.install(candidate)
         if prediction.local_group.forward_mode == "TARGET_VERIFY":
             self._draft_buffer_capacity = max(
                 self._draft_buffer_capacity, len(batch.reqs)
@@ -531,9 +586,24 @@ class DSparkNativeRuntime:
         return result
 
     def note_request_finished(self, *, rid, natural_stop):
-        self.session.forget(rid)
+        if self.reference_driver is None:
+            self.session.forget(rid)
+        else:
+            started = time.perf_counter()
+            try:
+                self.reference_driver.retire(rid)
+            finally:
+                self.reference_driver.callback_wall_seconds += (
+                    time.perf_counter() - started
+                )
 
     def clear_cache_pool(self):
-        self.session.clear()
+        if self.reference_driver is not None:
+            started = time.perf_counter()
+            self.reference_driver.drained_reset()
+            self.session.clear()
+            self.reference_driver.callback_wall_seconds += time.perf_counter() - started
+        else:
+            self.session.clear()
         # Native clear_cache_pool clears KV, not the proposer's persistent
         # mask-token buffer. Preserve its capacity across the same worker run.
