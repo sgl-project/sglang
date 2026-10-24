@@ -431,9 +431,11 @@ class ViTCudaGraphRunner:
 
         # Optional output reordering (Qwen2.5-VL window permutation inverse)
         if output_indices is not None:
-            out = out.index_select(0, output_indices)
+            return out.index_select(0, output_indices)
 
-        return out
+        # The next replay of this graph overwrites block_output, but callers cache
+        # the result and may encode again before consuming it.
+        return out.clone()
 
     def run(
         self,
