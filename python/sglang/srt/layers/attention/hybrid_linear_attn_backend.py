@@ -1572,6 +1572,45 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        # ReplaySSM-GDN (the request cursors exist only there): the verify
+        # appended this window's drafts to the compact request ring and wrote
+        # no snapshots. Fold every accepted window, so `temporal` is the
+        # committed state after each step as with the KDA fold above; radix
+        # donation and state copies read the slot directly. Chain layout only.
+        if getattr(mamba_pool, "replayssm_cache_base", None) is not None:
+            assert req_pool_indices is not None, (
+                "the GDN ReplaySSM commit needs the request rows of the ring"
+            )
+            if request_number == 0:
+                return
+            from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+                commit_gdn_replayssm_after_verify,
+            )
+
+            commit_gdn_replayssm_after_verify(
+                spec_state=mamba_caches,
+                write_pos=mamba_pool.replayssm_spec_write_pos,
+                cache_base=mamba_pool.replayssm_cache_base,
+                is_flush=mamba_pool.replayssm_is_flush,
+                state_batch_indices=state_indices_tensor,
+                replay_indices=req_pool_indices[:request_number],
+                accept_lens=last_correct_step_indices + 1,
+                last_correct_step_indices=last_correct_step_indices,
+                fold_every_commit=True,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                src_indices_raw=src_indices_raw,
+                null_block_id=-1,
+            )
+            self._update_ple_state_after_mtp_verify(
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw,
+            )
+            return
+
         # KDA fused-accept: the next verify seeds itself in-kernel from the
         # accepted checkpoint slot (recurrent_kda's num_accepted_tokens), so the
         # SSM state never round-trips through `temporal` and only the conv
@@ -1598,6 +1637,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        assert (
+            mamba_caches.temporal.numel() == 0
+            or mamba_caches.intermediate_ssm is not None
+        ), (
+            "per-draft SSM snapshots are not allocated (ReplaySSM spec verify), "
+            "but no ReplaySSM commit handled this pool"
+        )
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,
