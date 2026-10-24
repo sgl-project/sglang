@@ -147,6 +147,21 @@ class TestFlux2XpuNormFusions(CustomTestCase):
         # Rows narrower than torch-xpu's 1024-wide work-group take another dispatch.
         self.assertFalse(can_use_xpu_layernorm_modulate(torch.bfloat16, 3072))
 
+    def test_swiglu_into_out_projection_input_matches_cat(self):
+        # The single-stream block writes SwiGLU straight into the to_out input
+        # buffer (row stride 1536 + 4608); it must equal the old cat input.
+        torch.manual_seed(4)
+        attn = torch.randn(1, 64, 1536, device="xpu", dtype=torch.bfloat16)
+        mlp_proj = torch.randn(1, 64, 9216, device="xpu", dtype=torch.bfloat16)
+        expected = torch.cat([attn, flux2._flux2_swiglu(mlp_proj)], dim=-1)
+
+        gemm_input = torch.full_like(expected, float("nan"))
+        returned = flux2._flux2_swiglu(mlp_proj, out=gemm_input[..., 1536:])
+        gemm_input[..., :1536].copy_(attn)
+
+        self.assertEqual(returned.data_ptr(), gemm_input[..., 1536:].data_ptr())
+        self.assertTrue(torch.equal(gemm_input, expected))
+
     def test_launchers_reject_layouts_they_do_not_replicate(self):
         x, update, gate, scale, shift = _inputs(16, 1.0, 4)
         strided = x.transpose(1, 2).contiguous().transpose(1, 2)
