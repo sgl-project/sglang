@@ -5032,6 +5032,21 @@ class MLATokenToKVPool(KVCache):
             cache_k_rope,
         )
 
+    def set_mla_kv_buffer_prefix_valid(
+        self,
+        layer: RadixAttention,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        # Rows past commit_lens go to padding slot 0: static shapes, no host sync.
+        offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+        loc = torch.where(offsets < commit_lens[:, None], loc_2d, 0).reshape(-1)
+        self.set_mla_kv_buffer(
+            layer, KVWriteLoc(loc, physical=True), cache_k_nope, cache_k_rope
+        )
+
     def get_mla_kv_buffer(
         self,
         layer: RadixAttention,

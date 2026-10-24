@@ -43,7 +43,7 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
-    DSV4_DRAFT_ATTENTION_BACKEND,
+    draft_attention_backend_override,
     draft_is_deepseek_v4,
     resolve_runtime_config,
 )
@@ -221,8 +221,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DSPARK",
-                attention_backend_override=(
-                    DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
+                attention_backend_override=draft_attention_backend_override(
+                    draft_is_moe=self._draft_is_moe
                 ),
                 draft_worker_cls=draft_worker_cls,
                 random_seed=target_worker.random_seed,

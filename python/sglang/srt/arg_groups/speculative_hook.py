@@ -875,7 +875,10 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
-        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
+        from sglang.srt.speculative.dflash_utils import (
+            get_dflash_layer_types,
+            parse_dflash_draft_config,
+        )
         from sglang.srt.utils.hf_transformers_utils import get_config
 
         draft_hf_config = get_config(
@@ -895,7 +898,15 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             and set(layer_types) == {"sliding_attention"}
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
-        if not (all_sliding or all_causal):
+        if parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
+            # trtllm_mha serves only MHA/GQA layers.
+            fallback_backend = get_fallback_backend()
+            logger.warning(
+                "DFLASH MLA drafts cannot use 'trtllm_mha'. Falling back to '%s'.",
+                fallback_backend,
+            )
+            draft_backend = fallback_backend
+        elif not (all_sliding or all_causal):
             fallback_backend = get_fallback_backend()
             # Preserve the CUDA FA4 path without overriding out-of-tree defaults.
             if not current_platform.is_out_of_tree() and get_platform().is_sm100:

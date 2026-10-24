@@ -31,21 +31,41 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
     return bool(_cfg_get(draft_hf_config, "sample_from_anchor", True))
 
 
-def draft_is_deepseek_v4() -> bool:
-    from sglang.srt.configs.model_config import is_deepseek_v4
+def _load_draft_hf_config() -> Optional[Any]:
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     draft_model_path = get_spec().speculative_draft_model_path
     if not draft_model_path:
-        return False
-    draft_hf_config = get_config(
+        return None
+    return get_config(
         draft_model_path,
         trust_remote_code=get_model().trust_remote_code,
         revision=get_spec().speculative_draft_model_revision,
         model_override_args=json.loads(get_model().json_model_override_args),
         model_config_parser=get_model().model_config_parser,
     )
+
+
+def draft_is_deepseek_v4() -> bool:
+    from sglang.srt.configs.model_config import is_deepseek_v4
+
+    draft_hf_config = _load_draft_hf_config()
     return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
+
+
+def draft_attention_backend_override(*, draft_is_moe: bool) -> Optional[str]:
+    if draft_is_moe:
+        return DSV4_DRAFT_ATTENTION_BACKEND
+    from sglang.srt.speculative.draft_worker_common import (
+        resolve_draft_worker_attention_backend,
+    )
+
+    # trtllm_mha serves only MHA/GQA layers and implies CUDA.
+    if resolve_draft_worker_attention_backend() == "trtllm_mha":
+        draft_hf_config = _load_draft_hf_config()
+        if parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
+            return "flashinfer"
+    return None
 
 
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
