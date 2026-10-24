@@ -142,6 +142,9 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.state_capturer.routed_experts_forcing import (
+    get_global_routed_experts_forcing,
+)
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
@@ -154,6 +157,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+    from sglang.srt.state_capturer.routed_experts_forcing import ForcingState
+    from sglang.srt.state_capturer.routed_experts_store import ForcingBatch
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -1305,6 +1310,8 @@ class Req(ReqDllmMixin):
         self.indexer_topk: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, num_indexer_layers, index_topk)
         )
+        # Set for a request with a routed_experts_session_key; kept across retracts.
+        self.routed_experts_forcing_state: Optional[ForcingState] = None
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
@@ -2270,6 +2277,9 @@ def release_req(
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
+    # Before the release: the snapshot reads rows through the request's KV slots.
+    if (forcing := get_global_routed_experts_forcing()) is not None:
+        forcing.snapshot_on_retract(req, req_to_token=req_to_token_pool.req_to_token)
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, checkpoint=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -2417,6 +2427,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Token replacement embeddings and absolute positions (optional).
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
+
+    # Held routes this extend recomputes, on the host (None: nothing forced).
+    forced_routes: Optional[ForcingBatch] = None
 
     # Read by ForwardBatch ngram embedding init
     ne_token_table: torch.Tensor = None
@@ -2958,6 +2971,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.replace_embeds = replace_embeds_tensor
         self.replace_positions = replace_positions_tensor
+        forcing = get_global_routed_experts_forcing()
+        self.forced_routes = (
+            None
+            if forcing is None
+            else forcing.build_batch(
+                reqs=reqs, prefix_lens=prefix_lens, extend_lens=extend_lens
+            )
+        )
         for mm_input in multimodal_inputs:
             if mm_input is None:
                 continue
@@ -3217,6 +3238,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.extend_logprob_start_lens + [0] * running_bs
         )
         self.is_prefill_only = False
+        if self.forced_routes is not None:
+            # The decode tails follow the extend rows and are never forced.
+            self.forced_routes = self.forced_routes.padded_to(self.extend_num_tokens)
 
     def convert_decode_to_extend(self):
         """View every decode request as a 1-token extend with its context as
@@ -3572,6 +3596,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
+        # Decode computes only new positions.
+        self.forced_routes = None
 
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None

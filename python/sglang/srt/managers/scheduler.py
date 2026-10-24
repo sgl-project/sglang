@@ -342,6 +342,10 @@ from sglang.srt.speculative.spec_sampling_mask import (
 from sglang.srt.speculative.uno_validation import validate_uno_request
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
+from sglang.srt.state_capturer.routed_experts_forcing import (
+    admit_forcing_request,
+    get_global_routed_experts_forcing,
+)
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
@@ -1873,6 +1877,8 @@ class Scheduler(
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
         }
+        if (forcing := get_global_routed_experts_forcing()) is not None:
+            result_dict["routed_experts_forcing"] = forcing.capability()
 
         if get_serving().grpc_port is not None and not (
             get_serving().smg_grpc_mode or get_serving().grpc_mode
@@ -3212,6 +3218,16 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if recv_req.routed_experts_session_key is not None:
+            # Every TP rank admits in the same order against an identical store.
+            error_msg = admit_forcing_request(
+                req, key=recv_req.routed_experts_session_key
+            )
+            if error_msg is not None:
+                self._release_aborted_request(req)
+                self._abort_unqueued_request(req, error_msg)
+                return
+
         if get_parallel().pp_rank == 0 and getattr(
             self.tree_cache.cache_controller, "pp_prefetch_command_group", None
         ):
@@ -3407,8 +3423,16 @@ class Scheduler(
     def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
         """Return a sampling-mask validation error without running the model."""
         logger.error(f"{error_msg}, {req.rid=}")
+        self._abort_unqueued_request(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+
+    def _abort_unqueued_request(
+        self, req: Req, error_msg: str, *, status_code: Optional[HTTPStatus] = None
+    ) -> None:
+        """Finish a request before it is queued, without running the model. With
+        no status code the abort is graceful: finish_reason "abort" and the
+        request's meta_info, rather than an HTTP error."""
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
-        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        prepare_abort(req, error_msg, status_code=status_code)
         self.output_streamer.stream_output([req], req.return_logprob)
 
     def _set_or_validate_priority(self, req: Req) -> bool:

@@ -35,6 +35,9 @@ from sglang.srt.runtime_context import get_observability, get_parallel, get_serv
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.state_capturer.routed_experts_forcing import (
+    get_global_routed_experts_forcing,
+)
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
@@ -162,6 +165,14 @@ class SchedulerOutputStreamer:
         return_sampling_mask = any(
             req.return_sampling_mask for req in reqs if req is not skip_req
         )
+        return_routed_experts_forcing = (
+            get_global_routed_experts_forcing() is not None
+            and any(
+                req.routed_experts_forcing_state is not None
+                for req in reqs
+                if req is not skip_req
+            )
+        )
 
         acc = _GenerationStreamAccumulator(
             return_logprob=return_logprob,
@@ -169,6 +180,7 @@ class SchedulerOutputStreamer:
             return_routed_experts=return_routed_experts,
             return_indexer_topk=return_indexer_topk,
             return_sampling_mask=return_sampling_mask,
+            return_routed_experts_forcing=return_routed_experts_forcing,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             default_stream_interval=get_serving().stream_interval,
@@ -328,6 +340,7 @@ class _GenerationStreamAccumulator:
     return_routed_experts: bool
     return_indexer_topk: bool
     return_sampling_mask: bool = False
+    return_routed_experts_forcing: bool = False
     spec_algorithm: Any
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
@@ -368,6 +381,7 @@ class _GenerationStreamAccumulator:
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
+    routed_experts_forcing: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
     beam_search_output: list = field(default_factory=list)
     time_stats: list = field(default_factory=list)
@@ -402,6 +416,8 @@ class _GenerationStreamAccumulator:
             self.routed_experts = []
         if self.return_indexer_topk:
             self.indexer_topk = []
+        if self.return_routed_experts_forcing:
+            self.routed_experts_forcing = []
 
         if self.return_logprob:
             self.input_token_logprobs_val = []
@@ -673,6 +689,11 @@ class _GenerationStreamAccumulator:
             self.indexer_topk.append(
                 req.indexer_topk if req.return_indexer_topk else None
             )
+        if self.return_routed_experts_forcing:
+            state = req.routed_experts_forcing_state
+            self.routed_experts_forcing.append(
+                state.meta_info() if state is not None and req.finished() else None
+            )
 
         current_output_len = len(self.output_ids[-1])
         if req.customized_info is not None:
@@ -781,6 +802,7 @@ class _GenerationStreamAccumulator:
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
             indexer_topk_num_layers=indexer_topk_num_layers,
+            routed_experts_forcing=self.routed_experts_forcing,
             customized_info=(
                 wrap_as_pickle(self.customized_info) if self.customized_info else None
             ),

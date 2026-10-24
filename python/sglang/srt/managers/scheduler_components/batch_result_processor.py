@@ -52,6 +52,9 @@ from sglang.srt.sampling.sampling_params import (
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.state_capturer.routed_experts_forcing import (
+    get_global_routed_experts_forcing,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
@@ -147,6 +150,9 @@ class SchedulerBatchResultProcessor:
 
         Logs a soft warning if the resulting tensor's row count differs from
         the expected `seqlen - 1 - start_len`, to catch silent regressions.
+
+        With routed-experts forcing, also commits the collected routes for the
+        session's next turn.
         """
         if not req.return_routed_experts:
             return
@@ -179,6 +185,9 @@ class SchedulerBatchResultProcessor:
                 req.cached_tokens,
                 req.routed_experts_start_len,
             )
+        forcing = get_global_routed_experts_forcing()
+        if forcing is not None and not isinstance(req.finished_reason, FINISH_ABORT):
+            forcing.commit_on_finish(req)
 
     def _maybe_collect_indexer_topk(self, req: Req):
         capturer = get_global_indexer_capturer()

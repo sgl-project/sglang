@@ -124,6 +124,18 @@ class ExecFeatures(msgspec.Struct):
     enable_return_routed_experts: A[
         bool, "Enable returning routed experts of each layer with responses."
     ] = False
+    enable_routed_experts_forcing: A[
+        bool,
+        "Reuse a session's first-computed routed experts when the engine recomputes "
+        "its tokens (see the routed_experts_session_key request field). Requires "
+        "--enable-return-routed-experts and --moe-runner-backend triton, "
+        "flashinfer_cutlass or flashinfer_trtllm_routed.",
+    ] = False
+    routed_experts_forcing_max_tokens: A[
+        int,
+        "Maximum tokens of held routed experts per TP rank, in host memory; the "
+        "least recently used sessions are evicted first.",
+    ] = 4_000_000
     enable_return_indexer_topk: A[
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",

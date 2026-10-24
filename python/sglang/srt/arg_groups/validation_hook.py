@@ -19,7 +19,12 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    attn_tp_size_of,
+    get_platform,
+    num_dp_ranks_of,
+)
 from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     parse_watermark_key,
@@ -103,6 +108,79 @@ def check_watermark_server_args(server_args: Any) -> None:
         )
     if envs.SGLANG_RUST_SERVER.get():
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
+
+
+# MoE runners that run select_experts' top-k; the others route inside their kernels.
+_ROUTED_EXPERTS_FORCING_MOE_RUNNERS = (
+    "triton",
+    "flashinfer_cutlass",
+    "flashinfer_trtllm_routed",
+)
+
+
+def check_routed_experts_forcing_server_args(server_args: Any) -> None:
+    """Reject server options that routed-experts forcing does not support."""
+    cfg = resolving_view(server_args)
+    if not cfg.enable_routed_experts_forcing:
+        return
+    if not cfg.enable_return_routed_experts:
+        raise ValueError(
+            "--enable-routed-experts-forcing requires --enable-return-routed-experts"
+        )
+    if cfg.moe_runner_backend not in _ROUTED_EXPERTS_FORCING_MOE_RUNNERS:
+        raise ValueError(
+            "--enable-routed-experts-forcing requires --moe-runner-backend in "
+            f"{', '.join(_ROUTED_EXPERTS_FORCING_MOE_RUNNERS)}, "
+            f"got {cfg.moe_runner_backend!r}"
+        )
+    conflicts = []
+    if cfg.enable_return_indexer_topk:
+        conflicts.append("--enable-return-indexer-topk (indexers are not forced)")
+    if attn_dp_enabled_of(cfg):
+        conflicts.append("DP attention")
+    if cfg.dp_size > 1:
+        # Each replica's scheduler keeps its own held routes, and the DP
+        # controller can send a session's turns to different replicas.
+        conflicts.append("--dp-size > 1")
+    if cfg.pp_size > 1:
+        conflicts.append("pipeline parallelism")
+    if cfg.attn_cp_size > 1:
+        conflicts.append("context parallelism")
+    if cfg.dcp_size > 1:
+        conflicts.append("decode context parallelism")
+    if cfg.speculative_algorithm is not None:
+        conflicts.append("speculative decoding")
+    if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+        conflicts.append("two- or single-batch overlap")
+    if cfg.disaggregation_mode != "null" or cfg.enable_pdmux:
+        conflicts.append("PD disaggregation or multiplexing")
+    if attn_tp_size_of(cfg) > 1 and (
+        cfg.moe_a2a_backend != "none"
+        or cfg.dwdp_size > 1
+        or cfg.enable_attn_tp_input_scattered
+        or cfg.moe_dense_tp_size is not None
+    ):
+        # Each attention-TP rank would route only its own slice of the tokens.
+        conflicts.append(
+            "attention TP > 1 with its tokens split across ranks (an MoE "
+            "all-to-all backend, DWDP, --enable-attn-tp-input-scattered or "
+            "--moe-dense-tp-size)"
+        )
+    if envs.SGLANG_RUST_SERVER.get():
+        conflicts.append("SGLANG_RUST_SERVER")
+    if envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get():
+        from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
+
+        if lora_envs.SGLANG_OPT_LORA_FUSED_TOPK_PACK.get():
+            conflicts.append(
+                "SGLANG_EXPERIMENTAL_LORA_OPTI's packed top-k "
+                "(set SGLANG_OPT_LORA_FUSED_TOPK_PACK=0)"
+            )
+    if conflicts:
+        raise ValueError(
+            "--enable-routed-experts-forcing is not supported with "
+            + "; ".join(conflicts)
+        )
 
 
 def validate_response_store(server_args: Any) -> None:
@@ -376,6 +454,8 @@ def check_server_args(server_args: Any):
         )
 
     check_watermark_server_args(server_args)
+
+    check_routed_experts_forcing_server_args(server_args)
 
     check_load_publish_args(server_args)
 

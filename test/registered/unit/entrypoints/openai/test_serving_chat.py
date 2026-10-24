@@ -614,6 +614,7 @@ class ServingChatTestCase(CustomTestCase):
             self.basic_req.return_indexer_topk = True
             self.basic_req.return_outputs_via_store = True
             self.basic_req.return_meta_info = True
+            self.basic_req.routed_experts_session_key = "rollout-7"
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
@@ -621,6 +622,7 @@ class ServingChatTestCase(CustomTestCase):
             self.assertEqual(adapted.sampling_logprobs_mode, "support")
             self.assertTrue(adapted.return_indexer_topk)
             self.assertTrue(adapted.return_outputs_via_store)
+            self.assertEqual(adapted.routed_experts_session_key, "rollout-7")
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 

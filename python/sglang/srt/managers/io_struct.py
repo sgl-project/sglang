@@ -271,6 +271,9 @@ class GenerateReqInput:
     # Return routed experts, indexer top-k, and sampling mask via --output-store-backend
     # as meta_info.output_store_ref; one prompt, n=1, no streaming or beam search.
     return_outputs_via_store: bool = False
+    # Routed-experts forcing: the session whose held routed experts are reused for
+    # recomputed positions below routed_experts_start_len.
+    routed_experts_session_key: Optional[str] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -446,6 +449,11 @@ class GenerateReqInput:
             raise ValueError(
                 "return_outputs_via_store supports one prompt with n=1 "
                 "and no beam search."
+            )
+        if self.routed_experts_session_key is not None and not self.is_single:
+            raise ValueError(
+                "routed_experts_session_key is not supported with batch requests "
+                "or n > 1."
             )
 
         if self.is_single:
@@ -1016,6 +1024,7 @@ class GenerateReqInput:
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
             return_outputs_via_store=self.return_outputs_via_store,
+            routed_experts_session_key=self.routed_experts_session_key,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -1189,6 +1198,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Shape of output_token_sampling_logprobs for each output token. This is a
     # defaulted tail field so older IPC senders decode as selected mode.
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # See GenerateReqInput.routed_experts_session_key; a defaulted tail field for
+    # the same reason.
+    routed_experts_session_key: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1742,6 +1754,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
+    # Routed-experts forcing counters per finished keyed request.
+    routed_experts_forcing: Optional[List[Optional[dict]]] = None
+
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
@@ -1842,6 +1857,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # --output-store-backend is set; TokenizerManager encodes them per request.
     routed_experts_raw: Optional[List[Optional[torch.Tensor]]] = None
     indexer_topk_raw: Optional[List[Optional[torch.Tensor]]] = None
+    # See BatchTokenIDOutput.routed_experts_forcing.
+    routed_experts_forcing: Optional[List[Optional[dict]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

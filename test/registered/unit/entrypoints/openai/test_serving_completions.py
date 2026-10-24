@@ -91,9 +91,15 @@ class ServingCompletionTestCase(unittest.TestCase):
 
     # ---------- prompt-handling ----------
     def test_single_token_ids_prompt(self):
-        req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
+        req = CompletionRequest(
+            model="x",
+            prompt=[1, 2, 3, 4],
+            max_tokens=100,
+            routed_experts_session_key="rollout-7",
+        )
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.input_ids, [1, 2, 3, 4])
+        self.assertEqual(internal.routed_experts_session_key, "rollout-7")
 
     def test_cache_salt_and_extra_key_remain_distinct(self):
         req = CompletionRequest(
