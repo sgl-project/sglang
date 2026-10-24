@@ -32,6 +32,9 @@ if TYPE_CHECKING:
 
 SMALL_PROJECTION_MAX_TOKENS = 8
 MAX_TOKENS = 512
+# SM90 pays the [M, N] gather inline (no cluster boundary to defer it into);
+# measured on H200 TP8, the 8192-wide gather outgrows the GEMM saving past 64 rows.
+_SM90_MAX_TOKENS = {4096: MAX_TOKENS, 8192: 64}
 _VEC = 8
 
 
@@ -45,6 +48,17 @@ def _jit_module(n: int, world_size: int) -> Module:
         cuda_wrappers=[("run", f"MuseSparkAllGather<{args}>::run")],
         extra_cuda_cflags=["-O3"],
     )
+
+
+def projection_max_tokens(world_size: int, n: int, device: torch.device) -> int:
+    """Largest M that runs as slice GEMM + all-gather instead of a replicated GEMM."""
+    if world_size in (4, 8) and n in (4096, 8192):
+        capability = torch.cuda.get_device_capability(device)
+        if capability == (10, 3):
+            return MAX_TOKENS
+        if capability == (9, 0):
+            return _SM90_MAX_TOKENS[n]
+    return SMALL_PROJECTION_MAX_TOKENS
 
 
 def gemm_ag_supported(
@@ -66,15 +80,7 @@ def gemm_ag_supported(
     m, k = x.shape
     n = weight.shape[0]
     return (
-        1 <= m <= MAX_TOKENS
-        and (
-            m <= SMALL_PROJECTION_MAX_TOKENS
-            or (
-                comm.world_size in (4, 8)
-                and n in (4096, 8192)
-                and torch.cuda.get_device_capability(x.device) == (10, 3)
-            )
-        )
+        1 <= m <= projection_max_tokens(comm.world_size, n, x.device)
         and weight.shape[1] == k
         and n % (comm.world_size * _VEC) == 0
         and m * n * 2 <= comm.max_push_size
