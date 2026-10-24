@@ -16,11 +16,25 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 @dataclass
 class ForwardMetadata:
+    # Physical KV page indices, shape [batch_size, max_num_blocks_per_seq].
     block_tables: torch.Tensor
+
+    # Total KV lengths including cached prefixes, shape [batch_size].
     seq_lens: torch.Tensor
+
+    # Cumulative query lengths starting at zero, shape [batch_size + 1].
+    # Used for extend/mixed batches; None for decode.
     cu_seqlens_q: torch.Tensor | None = None
+
+    # Cumulative KV lengths starting at zero, shape [batch_size + 1].
+    # Includes cached prefixes; used for extend/mixed batches, None for decode.
     cu_seqlens_kv: torch.Tensor | None = None
+
+    # Maximum query length in the batch; only consumed by extend/mixed attention.
     max_seq_len_q: int = 1
+
+    # Maximum KV length including cached prefixes for extend/mixed attention.
+    # Set to the context limit for decode, where this field is not consumed.
     max_seq_len_kv: int = 0
 
 
