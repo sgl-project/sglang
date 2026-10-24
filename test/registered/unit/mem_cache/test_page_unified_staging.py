@@ -35,14 +35,14 @@ def _device_pool(is_mla, *, layer_num=4, dtype=torch.bfloat16):
     return MHATokenToKVPool(head_num=4, head_dim=16, enable_alt_stream=False, **kwargs)
 
 
-def _geometry(is_mla, *, layer_num=4):
+def _geometry(is_mla, *, layer_num=4, head_group_num=2, itemsize=2):
     return PageUnifiedLayout(
         page_size=PAGE_SIZE,
         layer_num=layer_num,
         head_num=1 if is_mla else 4,
-        head_group_num=1 if is_mla else 2,
+        head_group_num=1 if is_mla else head_group_num,
         head_dim=32 if is_mla else 16,
-        itemsize=torch.bfloat16.itemsize,
+        itemsize=itemsize,
         is_mla=is_mla,
     )
 
@@ -166,6 +166,7 @@ class TestPageUnifiedStaging(CustomTestCase):
                                 mtp_draft_device_pools=drafts,
                             )
                         self.assertIs(pool.hicache_write_back_staging, prepared)
+                        self.assertEqual(host.page_unified_layout, geometry)
                         self.assertEqual(host.staging_page_capacity, 9)
                         self.assertEqual(
                             host.staging_buffer.shape, geometry.page_dims(9)
@@ -208,6 +209,7 @@ class TestPageUnifiedStaging(CustomTestCase):
                         kv_pool=pool, page_size=PAGE_SIZE
                     )
                 self.assertEqual(host.staging_page_capacity, 33)
+                self.assertEqual(host.page_unified_layout, _geometry(is_mla))
                 self.assertEqual(host.staging_buffer.data_ptr(), prepared.data_ptr())
 
     def test_fp8_staging_uses_physical_storage_dtype(self):
@@ -226,6 +228,9 @@ class TestPageUnifiedStaging(CustomTestCase):
                         kv_pool=pool, page_size=PAGE_SIZE
                     )
                 self.assertEqual(host.staging_buffer.data_ptr(), prepared.data_ptr())
+                self.assertEqual(
+                    host.page_unified_layout, _geometry(is_mla, itemsize=1)
+                )
                 self.assertEqual(
                     prepared.nbytes, host.page_unified_layout.bytes_per_page * 17
                 )
@@ -247,7 +252,83 @@ class TestPageUnifiedStaging(CustomTestCase):
                     kv_pool=pool, page_size=PAGE_SIZE * 2
                 )
             self.assertEqual(host.page_size, PAGE_SIZE)
+            self.assertEqual(host.page_unified_layout, _geometry(is_mla=True))
             self.assertEqual(host.staging_buffer.data_ptr(), prepared.data_ptr())
+
+    def test_mha_head_groups_match_staging_and_host_layout(self):
+        for key_scheme, head_partition, head_group_num in (
+            ("rank-suffix", None, 1),
+            ("rank-suffix", 2, 1),
+            ("unified", None, 1),
+            ("unified", 1, 4),
+            ("unified", 2, 2),
+            ("unified", 4, 1),
+        ):
+            with (
+                self.subTest(key_scheme=key_scheme, head_partition=head_partition),
+                _cpu_staging_environment(
+                    hicache_storage_key_scheme=key_scheme,
+                    hicache_storage_head_partition=head_partition,
+                ),
+            ):
+                pool = _device_pool(is_mla=False)
+                geometry = _geometry(False, head_group_num=head_group_num)
+                kv_cache_builder.prepare_hicache_staging(tp_worker=_worker(pool))
+                prepared = pool.hicache_write_back_staging
+                self.assertEqual(prepared.shape, geometry.page_dims(17))
+                with mock.patch.object(
+                    torch,
+                    "empty",
+                    side_effect=AssertionError("late staging allocation"),
+                ):
+                    host = hybrid_pool_assembler.build_kv_host_pool(
+                        kv_pool=pool, page_size=PAGE_SIZE
+                    )
+                self.assertEqual(host.page_unified_layout, geometry)
+                self.assertEqual(host.staging_buffer.data_ptr(), prepared.data_ptr())
+
+    def test_uneven_mla_layer_shards_reserve_equal_host_geometry(self):
+        """The shorter shard retains the reserved target row before draft layers."""
+        for owned_range in ((0, 3), (3, 5)):
+            for draft_layers in (0, 2):
+                with (
+                    self.subTest(owned_range=owned_range, draft_layers=draft_layers),
+                    _cpu_staging_environment(),
+                ):
+                    pool = _device_pool(is_mla=True, layer_num=5)
+                    pool.layer_shard_enabled = True
+                    pool.layer_shard_size = 2
+                    drafts = tuple(
+                        _device_pool(is_mla=True, layer_num=1)
+                        for _ in range(draft_layers)
+                    )
+                    geometry = _geometry(True, layer_num=3 + draft_layers)
+                    with mock.patch.object(
+                        pool,
+                        "_owned_local_layer_range",
+                        return_value=owned_range,
+                        create=True,
+                    ):
+                        kv_cache_builder.prepare_hicache_staging(
+                            tp_worker=_worker(pool, drafts)
+                        )
+                        prepared = pool.hicache_write_back_staging
+                        self.assertEqual(prepared.shape, geometry.page_dims(17))
+                        with mock.patch.object(
+                            torch,
+                            "empty",
+                            side_effect=AssertionError("late staging allocation"),
+                        ):
+                            host = hybrid_pool_assembler.build_kv_host_pool(
+                                kv_pool=pool,
+                                page_size=PAGE_SIZE,
+                                mtp_draft_device_pools=drafts,
+                            )
+                    self.assertEqual(host.target_layer_num, 3)
+                    self.assertEqual(host.page_unified_layout, geometry)
+                    self.assertEqual(
+                        host.staging_buffer.data_ptr(), prepared.data_ptr()
+                    )
 
     def test_disabled_hicache_or_other_layout_does_not_allocate(self):
         for is_mla in (False, True):

@@ -43,7 +43,6 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
-from sglang.srt.mem_cache.hicache_key_scheme import resolve_head_group_num
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     MHATokenToKVPool,
@@ -54,7 +53,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     prepare_page_unified_write_back_staging,
 )
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
-from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -116,23 +115,16 @@ def prepare_hicache_staging(
                     int(capacity_tokens * memory.hicache_ratio) // page_size + 1
                 )
             info = pool.get_device_pool_infos()[0].buffer_info
-            layer_num = pool.layer_num + len(packed_drafts)
             if memory.hicache_mem_layout == "page_unified":
-                if is_mla and pool.layer_shard_enabled:
-                    layer_num = (
-                        pool.layer_num + pool.layer_shard_size - 1
-                    ) // pool.layer_shard_size + len(packed_drafts)
-                geometry = PageUnifiedLayout(
+                geometry = resolve_kv_host_geometry(
+                    pool,
                     page_size=page_size,
-                    layer_num=layer_num,
-                    head_num=1 if is_mla else info.head_num,
-                    head_group_num=1
-                    if is_mla
-                    else resolve_head_group_num(info.head_num),
-                    head_dim=info.kv_cache_dim if is_mla else info.head_dim,
-                    itemsize=info.dtype.itemsize,
-                    is_mla=is_mla,
-                )
+                    layout=memory.hicache_mem_layout,
+                    use_mla=is_mla,
+                    draft_layer_num=len(packed_drafts),
+                ).page_unified_layout
+                assert geometry is not None
+                layer_num = geometry.layer_num
                 staging = prepare_page_unified_write_back_staging(
                     geometry,
                     dtype=info.dtype,
@@ -142,6 +134,7 @@ def prepare_hicache_staging(
                 )
                 buffers = (staging,)
             else:
+                layer_num = pool.layer_num + len(packed_drafts)
                 staging = prepare_mha_write_back_staging(
                     info,
                     layer_num=layer_num,

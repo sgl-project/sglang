@@ -159,6 +159,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         | None = None,
         pool_label: str = "kv",
         head_group_num: int = 1,
+        page_unified_layout: PageUnifiedLayout | None = None,
     ):
         if _is_xpu:
             require_kvcacheio_ops(
@@ -214,6 +215,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         self._buffer_infos = infos
         self.head_group_num = head_group_num
         self.page_size = page_size
+        self.page_unified_layout = page_unified_layout
         super().__init__(
             dtype=self.dtype,
             device_capacity_tokens=device_capacity_tokens,
@@ -334,7 +336,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.head_dim,
             )
         elif self.layout == "page_unified":
-            self.page_unified_layout = PageUnifiedLayout(
+            self.page_unified_layout = self.page_unified_layout or PageUnifiedLayout(
                 page_size=self.page_size,
                 layer_num=self.layer_num,
                 head_num=self.head_num,

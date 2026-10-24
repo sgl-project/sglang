@@ -124,6 +124,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         layer_shard_enabled: bool = False,
         pool_label: str = "kv",
         write_back_staging: torch.Tensor | None = None,
+        page_unified_layout: PageUnifiedLayout | None = None,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
         self.override_kv_cache_dim = override_kv_cache_dim
@@ -133,6 +134,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             )
         self.dtype = buffer_info.dtype
         self.layout = layout
+        self.page_unified_layout = page_unified_layout
         self.kv_lora_rank = buffer_info.kv_lora_rank
         self.qk_rope_head_dim = buffer_info.qk_rope_head_dim
         # Existing builders explicitly resolve packed row width before construction.
@@ -350,7 +352,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             # grid never cuts a head axis and there is nothing to permute. It
             # is still its own layout so the L3 namespace, the transfer arms
             # and the MHA side all name one thing.
-            self.page_unified_layout = PageUnifiedLayout(
+            self.page_unified_layout = self.page_unified_layout or PageUnifiedLayout(
                 page_size=self.page_size,
                 layer_num=self.layer_num,
                 head_num=1,
