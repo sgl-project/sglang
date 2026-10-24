@@ -28,7 +28,8 @@ pub use multi_modality::encoded::{
     MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
 };
 pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
-pub use multi_modality::worker::{MmProcessOutput, MmProcessor};
+pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor};
+pub use sglang_mm::common::fetch::ByteBudget as MediaByteBudget;
 pub use sglang_mm::pipeline::{Tensor, TensorData};
 
 use std::sync::Arc;
@@ -260,6 +261,12 @@ impl Server {
     /// `False` only on shutdown.
     pub fn push_error(&self, py: Python<'_>, rid: &str, message: &str) -> bool {
         self.push_frame(py, crate::message::response::frame_error(rid, message))
+    }
+
+    /// Acknowledge health probes the scheduler skipped while busy, after the
+    /// step that followed them. Blocks for backpressure; `False` only on shutdown.
+    pub fn push_health_ack(&self, py: Python<'_>) -> bool {
+        self.push_frame(py, crate::message::response::frame_health_ack())
     }
 
     /// Spawn the MM worker pool for the pipeline in `spec` (built from the

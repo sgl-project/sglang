@@ -186,6 +186,13 @@ class HcReadCall(HcRead):
             accepts_mxfp8=self.attention
             and self.layer.self_attn.accepts_mxfp8_swizzled_input(),
             hc=hc,
+            accepts_mxfp8_deepgemm=self.attention
+            and self.layer.self_attn.accepts_deepgemm_mxfp8_input(),
+            mega_moe_input=(
+                None
+                if self.attention
+                else mhc.mega_moe_input_of(self.layer, self.batch)
+            ),
         )
 
     def _after_post(self, residual, norm):
