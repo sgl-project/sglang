@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import logging
 import math
 import tempfile
@@ -64,6 +65,11 @@ _SPEC_DECODE_SNAPSHOT_ALGORITHMS = (
 )
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
+LOG_IDLE_BATCH_STATS = envs.SGLANG_LOG_IDLE_BATCH_STATS.get()
+# Arbitrary; follows load-dependent batch durations within about ten lines.
+_IDLE_LOG_GAP_EMA_ALPHA = 0.1
+# Arbitrary spacing of idle lines until a gap between batch lines is measured.
+_IDLE_LOG_DEFAULT_INTERVAL_S = 1.0
 # gen_throughput is computed only on decode-stats ticks; when decode is starved
 # (e.g. long chunked-prefill stretches) the last window's value would otherwise
 # be re-exported indefinitely. 30s is far above any healthy decode-stats gap,
@@ -193,6 +199,55 @@ class _SchedulerTimeAccountingSnapshot:
         self.is_idle = is_idle
 
 
+class _StatsLineKind(enum.Enum):
+    BATCH = enum.auto()
+    # An attention-DP idle forward, paced by the busy peers it syncs with.
+    IDLE_FORWARD = enum.auto()
+    # No forward ran for one typical gap between lines.
+    IDLE_TIMED = enum.auto()
+    # The first decode step without a forward, closing the forwards since the
+    # previous line.
+    IDLE_START = enum.auto()
+    # Right before the forward that ends a stretch of timed lines.
+    IDLE_END = enum.auto()
+
+
+_FORWARD_PACED_LINE_KINDS = frozenset(
+    {_StatsLineKind.BATCH, _StatsLineKind.IDLE_FORWARD}
+)
+
+
+class _IdleLogCadence(msgspec.Struct):
+    """Spaces timed idle lines like forward-paced lines, so each stats line
+    of one role covers about the same wall time."""
+
+    gap_ema_s: Optional[float] = None
+    # Startup counts as idle time covered by timed lines.
+    last_kind: _StatsLineKind = _StatsLineKind.IDLE_TIMED
+
+    def on_line(self, gap_s: float, kind: _StatsLineKind) -> None:
+        # Other gaps span idle time or a window cut short at an idle boundary.
+        if (
+            kind in _FORWARD_PACED_LINE_KINDS
+            and self.last_kind in _FORWARD_PACED_LINE_KINDS
+        ):
+            self.gap_ema_s = (
+                gap_s
+                if self.gap_ema_s is None
+                else self.gap_ema_s + _IDLE_LOG_GAP_EMA_ALPHA * (gap_s - self.gap_ema_s)
+            )
+        self.last_kind = kind
+
+    @property
+    def after_timed_line(self) -> bool:
+        return self.last_kind is _StatsLineKind.IDLE_TIMED
+
+    def interval_s(self) -> float:
+        if self.gap_ema_s is None:
+            return _IDLE_LOG_DEFAULT_INTERVAL_S
+        return self.gap_ema_s
+
+
 class _ForwardOccupancyLogWindow(msgspec.Struct):
     start_ns: int
     gpu_seconds: float = 0.0
@@ -260,6 +315,18 @@ class SchedulerMetricsReporter:
         # cache_hit_rate stats keep their per-report semantics.
         self.recent_cache_hit_rate = 0.0
 
+    @property
+    def _idle_lines_enabled(self) -> bool:
+        # Read per call: the scheduler sets its mode after building the reporter.
+        return (
+            LOG_IDLE_BATCH_STATS
+            and self.scheduler.disaggregation_mode != DisaggregationMode.NULL
+        )
+
+    @property
+    def _closes_decode_windows(self) -> bool:
+        return self.is_stats_logging_rank or self.current_scheduler_metrics_enabled
+
     def _current_gen_throughput(self, now: float) -> float:
         """last_gen_throughput, decayed to 0 once decode-stats stop arriving.
 
@@ -273,11 +340,15 @@ class SchedulerMetricsReporter:
     def _init_metrics(self):
         # Basic stats
         self.forward_ct_decode = 0
+        # forward_ct_decode when the decode-stats window last closed.
+        self._decode_window_start_ct = 0
         self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
+        self._prefill_idle_cadence = _IdleLogCadence()
+        self._decode_idle_cadence = _IdleLogCadence()
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
         self.stats = SchedulerStats()
         self._graph_backend_label = {
@@ -703,7 +774,11 @@ class SchedulerMetricsReporter:
         return ""
 
     def reset_metrics(self):
-        self.forward_ct_decode = 0
+        # A flush reaches attention-DP ranks at different forwards, so with idle
+        # lines a reset would put their decode lines on different forwards.
+        if not self._idle_lines_enabled:
+            self.forward_ct_decode = 0
+            self._decode_window_start_ct = 0
         self.num_generated_tokens = 0
         self.spec_num_accept_tokens = 0
         self.spec_num_correct_drafts = 0
@@ -729,6 +804,10 @@ class SchedulerMetricsReporter:
         now = time.perf_counter()
         gap_latency = now - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = now
+        if self._idle_lines_enabled:
+            self._prefill_idle_cadence.on_line(
+                gap_s=gap_latency, kind=_StatsLineKind.BATCH
+            )
         self.last_input_throughput = (
             (prefill_stats.log_input_tokens + prefill_stats.log_replay_tokens)
             / gap_latency
@@ -737,66 +816,15 @@ class SchedulerMetricsReporter:
         )
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
-        token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
-
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
-        batch_iter = (
-            batch.forward_iter
-            if batch is not None and batch.forward_iter is not None
-            else self.scheduler.forward_ct
+        msg = self._prefill_stats_msg(
+            batch=batch,
+            prefill_stats=prefill_stats,
+            can_run_cuda_graph=can_run_cuda_graph,
+            gap_latency=gap_latency,
+            pool_stats=pool_stats,
+            kind=_StatsLineKind.BATCH,
         )
-        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
-
-        msg = (
-            f"Prefill batch{iter_msg}, "
-            f"#new-seq: {prefill_stats.num_new_seqs}, "
-            f"#new-token: {prefill_stats.log_input_tokens}, "
-            f"#cached-token: {prefill_stats.log_hit_tokens}, "
-            f"{token_usage_msg}"
-            f"#running-req: {prefill_stats.num_running_reqs.total}, "
-            f"#queue-req: {len(self.scheduler.waiting_queue)}, "
-            f"#pending-token: {prefill_stats.num_pending_tokens}, "
-        )
-
-        if prefill_stats.log_replay_tokens:
-            msg += f"#replay-token: {prefill_stats.log_replay_tokens}, "
-        if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-            msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
-            msg += (
-                f"#inflight-req: {len(self.scheduler.disagg_prefill_inflight_queue)}, "
-            )
-            num_optimistic = sum(1 for r in batch.reqs if r.pending_bootstrap)
-            msg += f"#optimistic-req: {num_optimistic}, "
-
-        if (
-            get_disagg().language_only
-            and get_disagg().encoder_transfer_backend == "zmq_to_scheduler"
-        ):
-            msg += (
-                f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
-            )
-
-        msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
-        msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
-
-        if self.enable_mfu_metrics and gap_latency > 0:
-            # Prefer the SoL suffix when it carries content: it scores FLOPs against
-            # each forward's actual GPU span (device timer). The wall-clock est.
-            # TFLOPS below divides FLOPs by gap_latency -- the inter-log interval on
-            # the async scheduler loop, which is decoupled from this forward's
-            # execution -- so it disagrees with the SoL. Omit it when SoL is present.
-            sol_suffix = self._prefill_sol_suffix(batch, gap_latency)
-            if sol_suffix:
-                msg += sol_suffix
-            else:
-                flops, _, _ = self._estimate_prefill_perf(batch)
-                tflops_per_s = flops / gap_latency / 1e12
-                msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
-
-        if ENABLE_METRICS_DEVICE_TIMER:
-            # Poll completed forward events before formatting, without synchronizing.
-            self.forward_pass_device_timer._report()
-            msg += ", " + self.forward_occupancy_log_string()
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -895,6 +923,210 @@ class SchedulerMetricsReporter:
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
 
+    def _prefill_stats_msg(
+        self,
+        batch: Optional[ScheduleBatch],
+        prefill_stats: PrefillStats,
+        can_run_cuda_graph: bool,
+        gap_latency: float,
+        pool_stats,
+        kind: _StatsLineKind,
+    ) -> str:
+        token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
+        batch_iter = (
+            batch.forward_iter
+            if batch is not None and batch.forward_iter is not None
+            else self.scheduler.forward_ct
+        )
+        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
+
+        msg = (
+            f"Prefill batch{iter_msg}, "
+            f"#new-seq: {prefill_stats.num_new_seqs}, "
+            f"#new-token: {prefill_stats.log_input_tokens}, "
+            f"#cached-token: {prefill_stats.log_hit_tokens}, "
+            f"{token_usage_msg}"
+            f"#running-req: {prefill_stats.num_running_reqs.total}, "
+            f"#queue-req: {len(self.scheduler.waiting_queue)}, "
+            f"#pending-token: {prefill_stats.num_pending_tokens}, "
+        )
+
+        if prefill_stats.log_replay_tokens:
+            msg += f"#replay-token: {prefill_stats.log_replay_tokens}, "
+        if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
+            msg += (
+                f"#inflight-req: {len(self.scheduler.disagg_prefill_inflight_queue)}, "
+            )
+            num_optimistic = (
+                0
+                if batch is None
+                else sum(1 for r in batch.reqs if r.pending_bootstrap)
+            )
+            msg += f"#optimistic-req: {num_optimistic}, "
+
+        if (
+            get_disagg().language_only
+            and get_disagg().encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            msg += (
+                f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
+            )
+
+        msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
+        msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
+
+        if self.enable_mfu_metrics and gap_latency > 0:
+            # Prefer the SoL suffix when it carries content: it scores FLOPs against
+            # each forward's actual GPU span (device timer). The wall-clock est.
+            # TFLOPS below divides FLOPs by gap_latency -- the inter-log interval on
+            # the async scheduler loop, which is decoupled from this forward's
+            # execution -- so it disagrees with the SoL. Omit it when SoL is present.
+            # The SoL hook reads the batch's prefill shapes, which idle lines lack.
+            sol_suffix = (
+                self._prefill_sol_suffix(batch, gap_latency)
+                if kind is _StatsLineKind.BATCH
+                else ""
+            )
+            if sol_suffix:
+                msg += sol_suffix
+            else:
+                flops, _, _ = self._estimate_prefill_perf(batch)
+                tflops_per_s = flops / gap_latency / 1e12
+                msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
+
+        if ENABLE_METRICS_DEVICE_TIMER:
+            # Poll completed forward events before formatting, without synchronizing.
+            self.forward_pass_device_timer._report()
+            msg += ", " + self.forward_occupancy_log_string()
+        return msg
+
+    def _log_idle_prefill_stats(
+        self,
+        batch: Optional[ScheduleBatch],
+        can_run_cuda_graph: bool,
+        kind: _StatsLineKind,
+    ) -> None:
+        now = time.perf_counter()
+        gap_latency = now - self.last_prefill_stats_tic
+        self.last_prefill_stats_tic = now
+        self._prefill_idle_cadence.on_line(gap_s=gap_latency, kind=kind)
+        self.last_input_throughput = 0.0
+        prefill_stats = PrefillStats(
+            log_input_tokens=0,
+            log_hit_tokens=0,
+            new_token_ratio=self.stats.new_token_ratio,
+            num_running_reqs=QueueCount.from_reqs(self.scheduler.running_batch.reqs),
+            num_new_seqs=0,
+            num_pending_tokens=self.scheduler.load_inquirer._get_num_pending_tokens(),
+        )
+        logger.info(
+            self._prefill_stats_msg(
+                batch=batch,
+                prefill_stats=prefill_stats,
+                can_run_cuda_graph=can_run_cuda_graph,
+                gap_latency=gap_latency,
+                pool_stats=self.scheduler.pool_stats_observer.get_pool_stats(),
+                kind=kind,
+            )
+        )
+
+    def report_idle_forward_stats(
+        self, batch: ScheduleBatch, can_run_cuda_graph: bool
+    ) -> None:
+        """Log an attention-DP idle forward as a batch without work, so an idle
+        rank keeps the line cadence of its busy peers."""
+        if not self._idle_lines_enabled:
+            return
+        mode = self.scheduler.disaggregation_mode
+        if mode == DisaggregationMode.PREFILL:
+            if self.is_stats_logging_rank:
+                self._log_idle_prefill_stats(
+                    batch=batch,
+                    can_run_cuda_graph=can_run_cuda_graph,
+                    kind=_StatsLineKind.IDLE_FORWARD,
+                )
+        elif mode == DisaggregationMode.DECODE:
+            # Every rank counts, so ranks that only export close their windows on
+            # the forwards their logging rank does.
+            self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
+            if self.forward_ct_decode % self.decode_log_interval == 0:
+                self._log_decode_stats(
+                    can_run_cuda_graph=can_run_cuda_graph,
+                    batch=batch,
+                    kind=_StatsLineKind.IDLE_FORWARD,
+                )
+
+    def maybe_report_idle_stats(self) -> None:
+        """Log a line for a step without a forward: on decode, at once while the
+        window still holds forwards; otherwise once no stats line has been
+        logged for about one gap between batch lines."""
+        if not self._idle_lines_enabled:
+            return
+        now = time.perf_counter()
+        mode = self.scheduler.disaggregation_mode
+        if mode == DisaggregationMode.PREFILL:
+            if (
+                self.is_stats_logging_rank
+                and now - self.last_prefill_stats_tic
+                >= self._prefill_idle_cadence.interval_s()
+            ):
+                self._log_idle_prefill_stats(
+                    batch=None,
+                    can_run_cuda_graph=False,
+                    kind=_StatsLineKind.IDLE_TIMED,
+                )
+        elif mode == DisaggregationMode.DECODE:
+            if not self._closes_decode_windows:
+                return
+            if self.forward_ct_decode != self._decode_window_start_ct:
+                # Close the forwards since the previous line now, so the idle
+                # stretch starts at a line.
+                kind = _StatsLineKind.IDLE_START
+            elif (
+                now - self.last_decode_stats_tic
+                >= self._decode_idle_cadence.interval_s()
+            ):
+                kind = _StatsLineKind.IDLE_TIMED
+            else:
+                return
+            # Keep forward_ct_decode: a reset on each rank's own timer would put
+            # attention-DP ranks' batch lines on different forwards.
+            self._log_decode_stats(
+                can_run_cuda_graph=False,
+                batch=self.scheduler.running_batch,
+                kind=kind,
+            )
+
+    def maybe_report_idle_end(self) -> None:
+        """Right before a forward, log a line that ends an idle stretch covered by
+        timed lines, so the next line's window starts at the forward."""
+        if not self._idle_lines_enabled:
+            return
+        mode = self.scheduler.disaggregation_mode
+        if mode == DisaggregationMode.PREFILL:
+            if (
+                self.is_stats_logging_rank
+                and self._prefill_idle_cadence.after_timed_line
+            ):
+                self._log_idle_prefill_stats(
+                    batch=None,
+                    can_run_cuda_graph=False,
+                    kind=_StatsLineKind.IDLE_END,
+                )
+        elif mode == DisaggregationMode.DECODE:
+            if (
+                self._closes_decode_windows
+                and self._decode_idle_cadence.after_timed_line
+            ):
+                # The forward's batch is already formed, but none of its requests
+                # ran in the idle window this line closes.
+                self._log_decode_stats(
+                    can_run_cuda_graph=False,
+                    batch=None,
+                    kind=_StatsLineKind.IDLE_END,
+                )
+
     def report_decode_stats(
         self,
         can_run_cuda_graph: bool,
@@ -930,23 +1162,50 @@ class SchedulerMetricsReporter:
         # Periodic work: log + heavy metrics at decode_log_interval
         if self.forward_ct_decode % self.decode_log_interval != 0:
             return
-        if (
-            not self.is_stats_logging_rank
-            and not self.current_scheduler_metrics_enabled
-        ):
+        self._log_decode_stats(
+            can_run_cuda_graph=can_run_cuda_graph,
+            batch=batch,
+            kind=_StatsLineKind.BATCH,
+        )
+
+    def _log_decode_stats(
+        self,
+        can_run_cuda_graph: bool,
+        batch: Optional[ScheduleBatch],
+        kind: _StatsLineKind,
+    ) -> None:
+        """Close the decode-stats window since the previous line: log it and
+        export it. ``batch`` None means no request ran in the window."""
+        if not self._closes_decode_windows:
             return
 
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.perf_counter()
-        self.last_gen_throughput = self.num_generated_tokens / gap_latency
+        # Timed lines close a window without advancing forward_ct_decode.
+        window_forward_ct = (self.forward_ct_decode - self._decode_window_start_ct) % (
+            1 << 30
+        )
+        self._decode_window_start_ct = self.forward_ct_decode
+        if self._idle_lines_enabled:
+            self._decode_idle_cadence.on_line(gap_s=gap_latency, kind=kind)
+        gen_throughput = self.num_generated_tokens / gap_latency
+        # last_gen_throughput keeps the last busy rate, which /server_info reports
+        # after a run.
+        if kind is _StatsLineKind.BATCH:
+            self.last_gen_throughput = gen_throughput
 
         self.num_generated_tokens = 0
-        num_running_reqs = len(batch.reqs)
+        running_reqs = batch.reqs if batch is not None else []
+        num_running_reqs = len(running_reqs)
 
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
 
-        if RECORD_STEP_TIME:
+        if (
+            RECORD_STEP_TIME
+            and kind is _StatsLineKind.BATCH
+            and window_forward_ct == self.decode_log_interval
+        ):
             self.step_time_dict[num_running_reqs].append(
                 gap_latency / self.decode_log_interval
             )
@@ -961,7 +1220,12 @@ class SchedulerMetricsReporter:
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0
-        if self.scheduler.spec_algorithm.is_none():
+        # A window of idle forwards has no acceptance to report.
+        spec_window_empty = (
+            not self.scheduler.spec_algorithm.is_none()
+            and self.spec_num_forward_ct == 0
+        )
+        if self.scheduler.spec_algorithm.is_none() or spec_window_empty:
             spec_accept_length = 0
             spec_accept_rate = 0
             spec_cap_length = 0
@@ -1035,7 +1299,7 @@ class SchedulerMetricsReporter:
 
         msg += (
             f"{self._graph_backend_label}: {can_run_cuda_graph}, "
-            f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+            f"gen throughput (token/s): {gen_throughput:.2f}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}"
         )
 
@@ -1051,10 +1315,12 @@ class SchedulerMetricsReporter:
                 f"est. read BW (GB/s per GPU): {read_gb_per_s:.2f}, "
                 f"est. write BW (GB/s per GPU): {write_gb_per_s:.2f}"
             )
-            msg += self._decode_sol_suffix(
-                batch,
-                gap_latency / max(1, self.decode_log_interval),
-            )
+            # The hook takes per-iteration time; a timed line's window may hold none.
+            if window_forward_ct > 0:
+                msg += self._decode_sol_suffix(
+                    batch,
+                    gap_latency / window_forward_ct,
+                )
             self._mfu_log_flops = 0.0
             self._mfu_log_read_bytes = 0.0
             self._mfu_log_write_bytes = 0.0
@@ -1071,28 +1337,33 @@ class SchedulerMetricsReporter:
 
             # Basics
             self.stats.num_running_reqs = QueueCount.from_reqs(
-                batch.reqs, priority_enabled
+                running_reqs, priority_enabled
             )
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
-            self.stats.gen_throughput = self.last_gen_throughput
+            self.stats.gen_throughput = gen_throughput
             # cache_hit_rate is prefill-owned (per-report semantics); decode
             # ticks must not reset it, or the exported gauge reads 0 whenever
             # a decode report lands between prefill reports.
-            self.stats.decode_sum_seq_lens = _decode_total_seq_lens(batch)
+            # A batch whose requests all finished keeps its stale seq_lens tensors.
+            self.stats.decode_sum_seq_lens = (
+                _decode_total_seq_lens(batch) if running_reqs else 0
+            )
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
 
-            # Speculative decoding
-            self.stats.spec_accept_length = spec_accept_length
-            self.stats.spec_accept_rate = spec_accept_rate
-            self.stats.spec_cap_length = spec_cap_length
-            self.stats.spec_block_accept_length = spec_block_accept_length
-            self.stats.spec_num_steps = spec_num_steps
-            self.stats.spec_num_draft_tokens = spec_num_draft_tokens
+            # Speculative decoding; a window without spec forwards keeps the last
+            # values, since 0 would read as a collapse in acceptance.
+            if not spec_window_empty:
+                self.stats.spec_accept_length = spec_accept_length
+                self.stats.spec_accept_rate = spec_accept_rate
+                self.stats.spec_cap_length = spec_cap_length
+                self.stats.spec_block_accept_length = spec_block_accept_length
+                self.stats.spec_num_steps = spec_num_steps
+                self.stats.spec_num_draft_tokens = spec_num_draft_tokens
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
@@ -1119,8 +1390,13 @@ class SchedulerMetricsReporter:
 
             # Routing key metrics
             # (to reduce the overhead, we only compute this when all requests have routing_key)
-            if all(r.routing_key is not None for r in batch.reqs):
-                running_routing_keys = [r.routing_key for r in batch.reqs]
+            # The running+waiting distribution counts live requests, including those
+            # the forward after an idle-end line already admitted.
+            live_reqs = (
+                running_reqs if batch is not None else self.scheduler.running_batch.reqs
+            )
+            if all(r.routing_key is not None for r in live_reqs):
+                running_routing_keys = [r.routing_key for r in running_reqs]
                 waiting_routing_keys = [
                     r.routing_key for r in self.scheduler.waiting_queue
                 ]
@@ -1129,7 +1405,7 @@ class SchedulerMetricsReporter:
                     self.stats.routing_key_running_req_counts,
                 ) = compute_routing_key_stats(running_routing_keys)
                 _, self.stats.routing_key_all_req_counts = compute_routing_key_stats(
-                    running_routing_keys + waiting_routing_keys
+                    [r.routing_key for r in live_reqs] + waiting_routing_keys
                 )
 
             # Utilization / LoRA / HiCache
@@ -1303,9 +1579,16 @@ class SchedulerMetricsReporter:
             if accounting is not None and accounting.is_idle
             else 0
         )
-        return self._forward_occupancy_log_window.log_string(
+        msg = self._forward_occupancy_log_window.log_string(
             now_ns=now_ns, ongoing_idle_ns=ongoing_idle_ns
         )
+        if self._idle_lines_enabled:
+            # Each stats line covers the time since the previous one. Sampling first
+            # keeps the idle time so far out of the next window.
+            if accounting is not None:
+                accounting.sample(now_ns, accounting.is_idle)
+            self._forward_occupancy_log_window.reset(now_ns)
+        return msg
 
     def update_device_timer(self):
         if self.forward_pass_device_timer is not None:
@@ -1333,7 +1616,11 @@ class SchedulerMetricsReporter:
 
         window = self._forward_occupancy_log_window
         window.batch_count += 1
-        if window.batch_count >= self.decode_log_interval:
+        # With idle lines, the stats lines close the log window instead.
+        if (
+            not self._idle_lines_enabled
+            and window.batch_count >= self.decode_log_interval
+        ):
             # Close the log window after this batch's log. The next window
             # starts now, before its first forward.
             window.reset(time.monotonic_ns())
@@ -1382,10 +1669,11 @@ class SchedulerMetricsReporter:
         # Clamp delayed events to the still-unaccounted wall-time range.
         event_ns = max(accounting.last_sample_ns, min(event_ns, now_wall_ns))
         if ENABLE_METRICS_DEVICE_TIMER and is_idle and not accounting.is_idle:
-            # Drain the completed burst once, then retain the new idle
-            # window across polls so the next request includes its idle gap.
+            # Drain the completed burst once. Without idle lines, start a log window
+            # kept across polls, so the next request includes its idle gap.
             self.forward_pass_device_timer._report()
-            self._forward_occupancy_log_window.reset(event_ns)
+            if not self._idle_lines_enabled:
+                self._forward_occupancy_log_window.reset(event_ns)
 
         idle_ns_before = accounting.accumulate_idle_ns
         accounting.sample(event_ns, is_idle)
@@ -1493,7 +1781,12 @@ class SchedulerMetricsReporter:
         self.stats.num_running_reqs = QueueCount.from_reqs(
             self.scheduler.running_batch.reqs, priority_enabled
         )
-        self.stats.gen_throughput = 0
+        # An idle-start line just exported the rate of the last burst's tail.
+        if not (
+            self._idle_lines_enabled
+            and self._decode_idle_cadence.last_kind is _StatsLineKind.IDLE_START
+        ):
+            self.stats.gen_throughput = 0
         self.stats.num_queue_reqs = QueueCount.from_reqs(
             self.scheduler.waiting_queue, priority_enabled
         )
