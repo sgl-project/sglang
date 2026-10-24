@@ -376,8 +376,12 @@ class OpenAIServingChat(OpenAIServingBase):
         the control token that frames the tool block. Encoding straight to ids
         is the only faithful route on such tokenizers, so compare the two here
         once and remember which to trust.
+
+        The probe message spells out a control token. A tokenizer that maps
+        such text to ids (the multimodal path needs that) cannot tell it from
+        the real token, so text-only requests keep the ids route.
         """
-        probe = [{"role": "user", "content": "x"}]
+        probe = [{"role": "user", "content": "[INST]"}]
         try:
             tokenizer = self.tokenizer_manager.tokenizer
             rendered = tokenizer.apply_chat_template(
