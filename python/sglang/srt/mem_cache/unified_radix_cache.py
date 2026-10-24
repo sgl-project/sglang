@@ -420,6 +420,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Full reset: destroy entire tree and all state."""
         self.tree_core.reset()
         self.session_refs.reset()
+        self._drop_deferred_ready_sync()
 
         # Reset Controller.
         self.session.slots.clear()
@@ -3634,6 +3635,114 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         return failed
 
+    # ---- HiCache: deferred ready-count sync (--hicache-async-ready-sync) ----
+    #
+    # The ready-count all_reduce in _sync_hicache_ready_counts keeps the ranks'
+    # radix trees in lockstep: every rank consumes the same number of completed
+    # write / load acks per step. With the opt-in flag it is issued
+    # asynchronously on a dedicated gloo group in step N and consumed in step
+    # N + 1 instead of blocking the scheduler in every step. This stays in
+    # lockstep: acks complete in queue order and queues only grow at the tail,
+    # so a prefix that was ready on every rank in step N is still ready in step
+    # N + 1. Each rank remembers which ack ends its ready prefix in step N; in
+    # step N + 1 it consumes up to the agreed one if a blocking drain has not
+    # consumed it already, so a drain in between is safe. One op per step on
+    # its own group keeps the op order identical on every rank.
+
+    def _deferred_ready_sync_group(self):
+        """The dedicated group, or None when the plain synchronous path applies."""
+        state = getattr(self, "_hcs_state", None)
+        if state is not None:
+            return state or None
+        self._hcs_state = False
+        if not get_memory().hicache_async_ready_sync:
+            return None
+        cc = self.cache_controller
+        cp = self.attn_cp_group
+        group = self.attn_tp_group if self.attn_tp_group is not None else self.tp_group
+        reason = None
+        if cc is None or self.linker is not None:
+            reason = "no host cache controller"
+        elif self.pp_size > 1:
+            reason = "pipeline parallelism"
+        elif self.enable_storage or self.host_memory_mode != "cache":
+            reason = "a storage backend / buffer-only host memory"
+        elif cp is not None and torch.distributed.get_world_size(group=cp) > 1:
+            reason = "attention context parallelism"
+        elif group is None or torch.distributed.get_world_size(group=group) <= 1:
+            reason = "a single attention rank"
+        if reason is not None:
+            logger.warning(
+                "--hicache-async-ready-sync: not applied (%s); the ready-count "
+                "sync stays synchronous",
+                reason,
+            )
+            return None
+        ranks = torch.distributed.get_process_group_ranks(group)
+        self._hcs_state = torch.distributed.new_group(
+            ranks, backend="gloo", use_local_synchronization=True
+        )
+        self._hcs_pending = None
+        logger.info(
+            "--hicache-async-ready-sync: deferred ready-count sync on its own "
+            "gloo group over ranks %s",
+            ranks,
+        )
+        return self._hcs_state
+
+    def _drop_deferred_ready_sync(self) -> None:
+        pending = getattr(self, "_hcs_pending", None)
+        if pending is not None:
+            pending[0].wait()
+        self._hcs_pending = None
+
+    @staticmethod
+    def _deferred_consume_count(queue, snapshot, agreed: int) -> int:
+        """How many acks to pop from the head of ``queue`` now: up to and
+        including the agreed last ready ack of step N (``snapshot[agreed - 1]``),
+        or 0 if a blocking drain consumed it in between."""
+        if agreed <= 0:
+            return 0
+        target = snapshot[agreed - 1]
+        for i, ack in enumerate(queue):
+            if ack is target:
+                return i + 1
+        return 0
+
+    def _check_hicache_events_deferred(self, group) -> None:
+        cc = self.cache_controller
+        pending = self._hcs_pending
+        if pending is not None:
+            work, counts, write_snap, load_snap = pending
+            self._hcs_pending = None
+            work.wait()
+            write_n, load_n, digest_min, neg_digest_max = map(int, counts.tolist())
+            assert digest_min == -neg_digest_max, (
+                "write_back duplicate-reclaim victims diverged across TP ranks"
+            )
+            self.writing_check(
+                finish_count=self._deferred_consume_count(
+                    cc.ack_write_queue, write_snap, write_n
+                )
+            )
+            self.loading_check(
+                finish_count=self._deferred_consume_count(
+                    cc.ack_load_queue, load_snap, load_n
+                )
+            )
+        write_snap = cc.ack_write_queue[: self._count_ready_acks(cc.ack_write_queue)]
+        load_snap = cc.ack_load_queue[: self._count_ready_acks(cc.ack_load_queue)]
+        digest = self.tree_core.write_back_duplicate_reclaim_digest
+        counts = torch.tensor(
+            [len(write_snap), len(load_snap), digest, -digest],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        work = torch.distributed.all_reduce(
+            counts, op=torch.distributed.ReduceOp.MIN, group=group, async_op=True
+        )
+        self._hcs_pending = (work, counts, write_snap, load_snap)
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
@@ -3658,6 +3767,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
+
+        deferred_group = self._deferred_ready_sync_group()
+        if deferred_group is not None:
+            self._check_hicache_events_deferred(deferred_group)
+            if self.buffer_pipeline is not None:
+                self.buffer_pipeline.flush_pending_writes()
+            return
 
         (
             write_finish_count,

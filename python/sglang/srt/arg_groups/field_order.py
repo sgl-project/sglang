@@ -363,6 +363,7 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_write_policy",
     "hicache_io_backend",
     "hicache_mem_layout",
+    "hicache_async_ready_sync",
     "hicache_storage_backend",
     "hicache_storage_prefetch_policy",
     "hicache_storage_backend_extra_config",
