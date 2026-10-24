@@ -189,6 +189,38 @@ def _use_rocm_triton_softmax_topk(
     )
 
 
+_use_aiter_topk_gating = not envs.SGLANG_ROCM_DISABLE_AITER_TOPK_GATING.get()
+
+# Above this, topk_gating is slower than fused_topk on GPU time.
+_AITER_TOPK_GATING_MAX_ROWS = 4096
+
+
+def _use_aiter_topk_gating_softmax(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: Optional[torch.Tensor],
+    num_fused_shared_experts: int,
+    packed_out: Optional[torch.Tensor],
+) -> bool:
+    # fused_topk has no ASM router for (512, 10); topk_gating has an E=512
+    # kernel since aiter#5334. Hidden sizes 8192 (Qwen3.8) and 2560
+    # (Qwen3.8-Flash-Next) limit this to those two models.
+    return (
+        _use_aiter
+        and _use_aiter_topk_gating
+        and _is_gfx95
+        and hidden_states.shape[1] in (2560, 8192)
+        and hidden_states.dtype == torch.bfloat16
+        and gating_output.shape[1] == 512
+        and gating_output.dtype == torch.bfloat16
+        and gating_output.is_contiguous()
+        and gating_output.shape[0] <= _AITER_TOPK_GATING_MAX_ROWS
+        and correction_bias is None
+        and num_fused_shared_experts == 0
+        and packed_out is None
+    )
+
+
 if _is_cuda:
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
@@ -1266,15 +1298,34 @@ def fused_topk(
             packed_out,
         )
         if _use_aiter and not use_rocm_triton:
-            # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
-            topk_weights, topk_ids = aiter_fused_topk(
+            if _use_aiter_topk_gating_softmax(
                 hidden_states,
                 gating_output,
-                topk,
-                renormalize,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-            )
+                correction_bias,
+                num_fused_shared_experts,
+                packed_out,
+            ):
+                from aiter import topk_gating
+
+                topk_gating(
+                    topk_weights,
+                    topk_ids,
+                    gating_output,
+                    correction_bias=None,
+                    need_renorm=renormalize,
+                    routed_scaling_factor=1.0,
+                    score_func="softmax",
+                )
+            else:
+                # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
+                topk_weights, topk_ids = aiter_fused_topk(
+                    hidden_states,
+                    gating_output,
+                    topk,
+                    renormalize,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                )
         # ===== TO BE REFACTORED ====
         elif packed_out is not None:
             # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): one JIT kernel
