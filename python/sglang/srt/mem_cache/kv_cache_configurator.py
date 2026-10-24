@@ -135,11 +135,11 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     # The NPU HiCache host pool has no compact index-K layout.
     if _is_npu and memory_config.enable_hierarchical_cache:
         return False
-    return (
-        not memory_config.enable_hisparse
-        and not is_draft_worker
-        and not memory_config.enable_unified_cache_external_linker
-    )
+    # The NPU pool drops the placeholders, which the linker's layer mapping does
+    # not model.
+    if _is_npu and memory_config.enable_unified_cache_external_linker:
+        return False
+    return not memory_config.enable_hisparse and not is_draft_worker
 
 
 _is_hip = is_hip()

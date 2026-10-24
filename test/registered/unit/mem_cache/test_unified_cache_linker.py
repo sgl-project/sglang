@@ -27,6 +27,8 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
+    _check_stage_pools,
+    _pipeline_stage_storages,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     UpdatePendingBackupOnNodeSplit,
@@ -1308,9 +1310,10 @@ def test_check_hicache_events_commits_common_rank_results():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.linker = SimpleNamespace(
         num_completed_offloads=lambda: 3,
-        take_completed_offloads=lambda count: [True] * count,
+        take_completed_offloads=lambda count, block: [True] * count,
         commit_completed_offloads=committed.append,
     )
+    cache.pp_size = 1
 
     reduce_calls = 0
 
@@ -1328,6 +1331,146 @@ def test_check_hicache_events_commits_common_rank_results():
     cache.check_hicache_events()
 
     assert committed == [[False]]
+
+
+@pytest.mark.parametrize("pp_rank", [0, 2])
+def test_pipeline_stages_restore_pp0_lookup(pp_rank):
+    pp0_mask = torch.tensor([0, 1, 1, 0, 0], dtype=torch.int)
+
+    def all_reduce(mask, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        if pp_rank > 0:
+            mask.copy_(pp0_mask)
+
+    linker = _FakeLinker()
+    linker.restorable = [1, 2, 3, 4]  # this stage alone could restore more
+    linker.lookup_pipeline_stages = MagicMock(return_value=[1, 2])
+    cache = _cache_for_wrapper(
+        pp_size=4,
+        pp_rank=pp_rank,
+        _all_reduce=all_reduce,
+        _all_reduce_attn_groups=MagicMock(),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+
+    restorable = wrapper._lookup("rid", [])
+    hit_pages = wrapper._sync_restorable_prefix(
+        restorable, num_pages=4, device_hit_pages=0
+    )
+
+    assert hit_pages == 2
+    if pp_rank == 0:
+        linker.lookup_pipeline_stages.assert_called_once_with("rid", [], 4)
+    else:
+        linker.lookup_pipeline_stages.assert_not_called()
+    cache._all_reduce_attn_groups.assert_not_called()
+
+
+def test_finish_loads_fails_stop_under_pipeline_parallelism():
+    linker = _FakeLinker()
+    linker.load_landed = False
+    wrapper = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(pp_size=2, _all_reduce_attn_groups=lambda value, op: None),
+        linker,
+    )
+    wrapper.inflight_load_rids = ["a"]
+    wrapper.start_layer_wise_loading()
+
+    with pytest.raises(RuntimeError, match="pipeline parallelism"):
+        wrapper.finish_loads()
+
+
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_pipeline_stages_commit_pp0_offload_results(pp_rank):
+    pp0_results = iter([torch.tensor([2]), torch.tensor([1, 0])])
+
+    def all_reduce(value, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        received = next(pp0_results)
+        if pp_rank > 0:
+            value.copy_(received)
+
+    taken = []
+    committed = []
+
+    def take_completed_offloads(count, block):
+        taken.append((count, block))
+        return [True, False] if pp_rank == 0 else [True] * count
+
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.pp_size = 2
+    cache.pp_rank = pp_rank
+    cache._drain_async_work = MagicMock()
+    cache._all_reduce = all_reduce
+    cache._all_reduce_attn_groups = MagicMock()
+    cache.linker = SimpleNamespace(
+        # A later stage may not have seen its copies complete yet.
+        num_completed_offloads=lambda: 2 if pp_rank == 0 else 0,
+        take_completed_offloads=take_completed_offloads,
+        commit_completed_offloads=committed.append,
+    )
+
+    cache.check_hicache_events()
+
+    assert taken == [(2, pp_rank > 0)]
+    assert committed == [[True, False]]
+    cache._drain_async_work.assert_called_once_with()
+    cache._all_reduce_attn_groups.assert_not_called()
+
+
+def test_mooncake_pipeline_lookup_intersects_every_stage():
+    def storage_with(pages):
+        storage = MagicMock()
+        storage.batch_exists_v2.return_value = SimpleNamespace(
+            restorable_prefix_pages=pages
+        )
+        return storage
+
+    kv_pages = PoolTransfer(name=PoolName.KV, keys=["p0", "p1", "p2"])
+    indexer_pages = PoolTransfer(name=PoolName.COMPACT_INDEXER, keys=["p0", "p1", "p2"])
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    linker.pool_group = MagicMock()
+    linker.pool_group.resolve_transfers.return_value = [kv_pages, indexer_pages]
+    linker.stats = {"lookup": 0}
+    linker.storage = storage_with([1, 2, 3])
+    linker.stage_storages = [storage_with([1, 2]), storage_with([1, 2, 3])]
+    both = frozenset({PoolName.KV, PoolName.COMPACT_INDEXER})
+    # Stage 1 stores no index-K, so its lookup must not ask the store for one.
+    linker.stage_pools = [both, frozenset({PoolName.KV}), both]
+
+    assert linker.lookup_pipeline_stages("rid", [kv_pages], pp_size=3) == [1, 2]
+    for storage, expanded in zip(
+        (linker.storage, *linker.stage_storages),
+        ([kv_pages, indexer_pages], [kv_pages], [kv_pages, indexer_pages]),
+    ):
+        storage.batch_exists_v2.assert_called_once_with(["p0", "p1", "p2"], expanded)
+    assert linker.lookup("rid", [kv_pages]) == [1, 2, 3]
+
+
+def test_stage_pools_beyond_pp0_are_rejected():
+    """PP0 builds every stage's lookup keys from its own pools, so a pool only a
+    later stage stores would never be checked or leased."""
+    kv = frozenset({PoolName.KV})
+    _check_stage_pools([kv | {PoolName.COMPACT_INDEXER}, kv])
+    with pytest.raises(ValueError, match="stage 1"):
+        _check_stage_pools([kv, kv | {PoolName.DRAFT}])
+
+
+def test_mooncake_stage_storages_key_each_later_stage():
+    storage = SimpleNamespace(
+        store=object(), mla_suffix="cp0_pp0", mha_suffix="cp0_pp0"
+    )
+
+    views = _pipeline_stage_storages(
+        storage, rank_replicated=True, tp_rank=0, attn_cp_rank=0, pp_size=3
+    )
+
+    assert [(view.mla_suffix, view.mha_suffix) for view in views] == [
+        ("cp0_pp1", "cp0_pp1"),
+        ("cp0_pp2", "cp0_pp2"),
+    ]
+    assert all(view.store is storage.store for view in views)
+    assert storage.mla_suffix == "cp0_pp0"
 
 
 @pytest.mark.parametrize(

@@ -2338,6 +2338,20 @@ class TestHiCacheArgs(CustomTestCase):
                 else:
                     handle_hicache(args)
 
+    def test_pipeline_parallel_linker_requires_mooncake(self):
+        for pp_size, backend in ((1, "mori"), (2, "mooncake"), (2, "mori")):
+            with self.subTest(pp_size=pp_size, backend=backend):
+                args = self._make_args(
+                    pp_size=pp_size,
+                    enable_unified_cache_external_linker=True,
+                    unified_cache_external_linker_backend=backend,
+                )
+                if pp_size > 1 and backend != "mooncake":
+                    with self.assertRaisesRegex(ValueError, "requires the Mooncake"):
+                        handle_hicache(args)
+                else:
+                    handle_hicache(args)
+
     def _make_args(self, **overrides) -> ServerArgs:
         # Not resolved: a dummy model path takes the pipeline's early return,
         # so `_handle_hicache` would never run. Its one prerequisite (the

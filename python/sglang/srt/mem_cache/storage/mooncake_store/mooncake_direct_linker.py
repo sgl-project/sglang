@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import logging
 import threading
 from queue import Empty, Queue
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -27,11 +29,17 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_memory,
     get_model,
     get_parallel,
 )
 from sglang.srt.utils import freeze_gc, get_device_module
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+        MooncakeStore,
+    )
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
@@ -45,6 +53,36 @@ def _storage_suffix(
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
+
+
+def _pipeline_stage_storages(
+    storage, *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_size: int
+) -> list:
+    # Shallow copies share the store client; only the key suffix differs.
+    views = []
+    for pp_rank in range(1, pp_size):
+        view = copy.copy(storage)
+        view.mla_suffix = view.mha_suffix = _storage_suffix(
+            rank_replicated=rank_replicated,
+            tp_rank=tp_rank,
+            attn_cp_rank=attn_cp_rank,
+            pp_rank=pp_rank,
+        )
+        views.append(view)
+    return views
+
+
+def _check_stage_pools(stage_pools: list[frozenset[PoolName]]) -> None:
+    # PP0 builds every stage's lookup keys from its own pools.
+    for pp_rank, pools in enumerate(stage_pools):
+        missing = pools - stage_pools[0]
+        if missing:
+            raise ValueError(
+                f"Pipeline stage {pp_rank} has external linker pools "
+                f"{[str(pool) for pool in sorted(missing)]} that stage 0 lacks; "
+                "pipeline parallelism needs stage 0 to hold every pool a later "
+                "stage stores."
+            )
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -114,6 +152,29 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
+        # PP0 looks up the later stages' pages through views under their suffixes.
+        self.stage_storages = (
+            _pipeline_stage_storages(
+                self.storage,
+                rank_replicated=rank_replicated,
+                tp_rank=tp_rank,
+                attn_cp_rank=params.attn_cp_rank,
+                pp_size=params.pp_size,
+            )
+            if params.pp_rank == 0
+            else []
+        )
+        # Stages can hold different pools, e.g. a stage whose DSA layers all
+        # reuse another layer's top-k stores no index-K. A PD decode never looks
+        # pages up, so it has nothing to check.
+        self.stage_pools = [frozenset(self.pools)]
+        if params.pp_size > 1 and get_disagg().disaggregation_mode != "decode":
+            gathered = [None] * params.pp_size
+            torch.distributed.all_gather_object(
+                gathered, sorted(self.pools), group=params.pp_cache_group
+            )
+            self.stage_pools = [frozenset(pools) for pools in gathered]
+            _check_stage_pools(self.stage_pools)
         logger.info(
             "Mooncake direct linker storage topology: "
             "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
@@ -183,6 +244,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        return self._lookup(
+            rid, transfers, stages=((self.storage, self.stage_pools[0]),)
+        )
+
+    def lookup_pipeline_stages(
+        self, rid: str, transfers: list[PoolTransfer], pp_size: int
+    ) -> list[int]:
+        assert len(self.stage_storages) == pp_size - 1
+        storages = (self.storage, *self.stage_storages)
+        return self._lookup(
+            rid, transfers, stages=tuple(zip(storages, self.stage_pools))
+        )
+
+    def _lookup(
+        self,
+        rid: str,
+        transfers: list[PoolTransfer],
+        stages: tuple[tuple[MooncakeStore, frozenset[PoolName]], ...],
+    ) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
@@ -190,8 +270,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         page_keys = list(kv.keys)
         if not page_keys:
             return []
-        result = self.storage.batch_exists_v2(page_keys, expanded)
-        restorable = result.restorable_prefix_pages or []
+        restorable = None
+        for storage, pools in stages:
+            # Mooncake's existence query also leases each page it finds (master
+            # default_kv_lease_ttl), keeping another stage's pages until it loads.
+            result = storage.batch_exists_v2(
+                page_keys, [transfer for transfer in expanded if transfer.name in pools]
+            )
+            found = result.restorable_prefix_pages or []
+            if restorable is not None:
+                stage_found = set(found)
+                found = [pages for pages in restorable if pages in stage_found]
+            restorable = found
+            if not restorable:
+                break
         self.stats["lookup"] += 1
         if restorable:
             logger.info(
@@ -415,8 +507,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
     def num_completed_offloads(self) -> int:
         return self.offload_results.qsize()
 
-    def pop_completed_offload(self) -> bool:
-        return self.offload_results.get_nowait()
+    def pop_completed_offload(self, block: bool = False) -> bool:
+        return self.offload_results.get(block=block)
 
     def reset(self) -> None:
         self.pending_loads.clear()
