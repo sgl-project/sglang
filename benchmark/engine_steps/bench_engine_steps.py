@@ -351,8 +351,10 @@ async def batch(
     on_complete=None,
 ):
     """n_each requests per rank, submitted round-robin over the ranks so none starts
-    ahead, about eight steps' worth in flight on each."""
-    in_flight = max(1, args.tokens_per_step // args.new_tokens) * 8 + 1
+    ahead, with the configured steps' worth in flight on each."""
+    in_flight = (
+        max(1, args.tokens_per_step // args.new_tokens) * args.in_flight_steps + 1
+    )
     limits = [asyncio.Semaphore(in_flight) for _ in range(args.dp)]
 
     async def collect(r):
@@ -634,6 +636,12 @@ OPTIONS = [  # flag, type, default, help
     ("--new-tokens", pos_int, 4096, "random, uncached suffix tokens per request"),
     ("--tokens-per-step", pos_int, 65536, "prefill: new tokens per rank per step"),
     ("--requests", pos_int, None, "prefill: requests per rank (31B/new, max 512)"),
+    (
+        "--in-flight-steps",
+        pos_int,
+        8,
+        "steps worth of requests in flight per rank, plus one; keep fixed across comparisons",
+    ),
     ("--batch-per-rank", pos_int, 64, "decode: running requests per rank"),
     ("--output-len", pos_int, 2048, "decode: max new tokens; must outlast the run"),
     ("--warmup-steps", int, None, "steps before the window (prefill 5, decode 50)"),

@@ -77,6 +77,53 @@ class TestPromptInputs(unittest.TestCase):
         self.assertNotEqual(seen, self.inputs([0, 1, 0, 1, 0, 1], seed=18))
 
 
+class TestInFlightDepth(unittest.IsolatedAsyncioTestCase):
+    async def test_each_rank_respects_the_explicit_depth(self):
+        for steps, per_step in ((8, 1), (32, 1), (8, 8), (32, 8)):
+            with self.subTest(steps=steps, per_step=per_step):
+                limit = steps * per_step + 1
+                release = asyncio.Event()
+                saturated = asyncio.Event()
+                active, peak = [0, 0], [0, 0]
+
+                class Transport:
+                    async def generate(self, ids, params, rank, stream):
+                        active[rank] += 1
+                        peak[rank] = max(peak[rank], active[rank])
+                        if active == [limit, limit]:
+                            saturated.set()
+                        try:
+                            await release.wait()
+                            yield 1.0, {"prompt_tokens": 2, "cached_tokens": 1}
+                        finally:
+                            active[rank] -= 1
+
+                args = SimpleNamespace(
+                    tokens_per_step=per_step,
+                    new_tokens=1,
+                    in_flight_steps=steps,
+                    dp=2,
+                    timeout=5,
+                )
+                done = []
+                task = asyncio.create_task(
+                    bench.batch(
+                        args, Transport(), lambda r: [], limit + 3, {}, done, "test"
+                    )
+                )
+                try:
+                    await asyncio.wait_for(saturated.wait(), timeout=2)
+                    # Pending requests must not acquire either rank's semaphore.
+                    await asyncio.sleep(0)
+                    self.assertEqual(active, [limit, limit])
+                finally:
+                    release.set()
+                    await task
+                self.assertEqual(peak, [limit, limit])
+                self.assertEqual(active, [0, 0])
+                self.assertEqual(len(done), 2 * (limit + 3))
+
+
 class TestStepWindow(unittest.TestCase):
     def test_window_spans_whole_steps(self):
         # 30 steps of 100 ms with two completions each; a 1 s stall precedes step 3,
@@ -280,6 +327,9 @@ class TestWorkloadGuards(unittest.TestCase):
         common = ["bench", "prefill", "--dp", "1", "--base-url", "http://localhost"]
         for extra in (
             ["--new-tokens", "0"],
+            ["--in-flight-steps", "0"],
+            ["--in-flight-steps", "-1"],
+            ["--in-flight-steps", "1.5"],
             ["--num-gpus", "0"],
             ["--timeout", "nan"],
             ["--context", "1"],
@@ -301,7 +351,9 @@ class TestWorkloadGuards(unittest.TestCase):
                 finally:
                     cancelled.append(True)
 
-        args = SimpleNamespace(tokens_per_step=1, new_tokens=1, dp=1, timeout=0.01)
+        args = SimpleNamespace(
+            tokens_per_step=1, new_tokens=1, in_flight_steps=8, dp=1, timeout=0.01
+        )
         with self.assertRaises(asyncio.TimeoutError):
             asyncio.run(
                 bench.batch(args, StalledTransport(), lambda rank: [], 2, {}, [], "x")
@@ -406,6 +458,7 @@ class TestPrefillProfiling(unittest.IsolatedAsyncioTestCase):
     def args(self, **changes):
         values = dict(
             tokens_per_step=2,
+            in_flight_steps=8,
             new_tokens=1,
             dp=2,
             timeout=2,
@@ -809,6 +862,13 @@ class TestPrefixFromL3(unittest.TestCase):
                     2,
                     True,
                 )
+
+    def test_in_flight_depth_is_recorded_and_default_is_unchanged(self):
+        default = run_main(LinkerServer())
+        explicit = run_main(LinkerServer(), "--in-flight-steps", "32")
+        self.assertEqual(default["workload"]["in_flight_steps"], 8)
+        self.assertEqual(explicit["workload"]["in_flight_steps"], 32)
+        self.assertEqual(default["result"], explicit["result"])
 
     def test_device_mode_keeps_one_shared_prefix(self):
         server = LinkerServer()
