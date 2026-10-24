@@ -52,6 +52,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._eplb_capture_states: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
@@ -136,6 +137,13 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        from sglang.srt.eplb.expert_distribution import (
+            get_global_expert_distribution_recorder,
+        )
+
+        self._eplb_capture_states[shape_key] = (
+            get_global_expert_distribution_recorder().get_graph_capture_state()
+        )
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -150,8 +158,19 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        self._prepare_eplb_replay(shape_key)
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
+
+    def _prepare_eplb_replay(self, shape_key):
+        state = self._eplb_capture_states[shape_key]
+        if not state:
+            return
+        from sglang.srt.eplb.expert_distribution import (
+            get_global_expert_distribution_recorder,
+        )
+
+        get_global_expert_distribution_recorder().on_graph_replay_forward_start(state)
 
     def replay_with_input_update(
         self,
@@ -185,6 +204,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         update_future = self._update_executor.submit(
             graph.update, cpu_update_input=cpu_update_input
         )
+        self._prepare_eplb_replay(shape_key)
         graph.replay()
         update_future.result()
 
@@ -197,4 +217,5 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._update_executor.shutdown(wait=True, cancel_futures=True)
         self._graphs.clear()
         self._outputs.clear()
+        self._eplb_capture_states.clear()
         self._pool = None

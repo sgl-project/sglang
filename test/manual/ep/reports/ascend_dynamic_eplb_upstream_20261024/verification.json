@@ -156,5 +156,10 @@
     "npu_initialized": false,
     "production_code_changed": false,
     "reason": "Initialize is_draft_worker in the constructor-bypassing PD role-switch test fixture"
+  },
+  "initial_port_revision": "1c2a94228a52d82cc047693d2de50dd60fe84694",
+  "optimization_followup": {
+    "manifest": "optimization.json",
+    "scope": "The top-level files/cpu/npu_graph sections describe the initial port. optimization.json identifies the optimized source snapshot and its follow-up validation."
   }
 }

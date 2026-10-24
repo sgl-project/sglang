@@ -8,6 +8,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.eplb import expert_distribution as distribution
+from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
+    NPUCudaGraphBackend,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -65,6 +68,103 @@ class TestNpuBatchedStatistics(unittest.TestCase):
             self.gatherer(capacity=8),
             [(1, torch.arange(-1, 12).reshape(1, -1))],
         )
+
+    def test_overflow_only_pass_skips_batch_work(self):
+        gatherer = self.gatherer(capacity=8)
+        calls = [(layer, torch.arange(18) % 8) for layer in range(2)]
+        with (
+            patch.object(
+                gatherer._data, "scatter_add_", wraps=gatherer._data.scatter_add_
+            ) as batch,
+            patch.object(
+                gatherer._batched_routes, "fill_", wraps=gatherer._batched_routes.fill_
+            ) as clear,
+        ):
+            for _ in range(2):
+                gatherer.reset()
+                self.check_counts(gatherer, calls)
+            batch.assert_not_called()
+            clear.assert_not_called()
+
+    def test_graph_and_eager_shapes_restore_capture_state(self):
+        gatherer = self.gatherer(capacity=8)
+        recorder = distribution._ExpertDistributionRecorderReal.__new__(
+            distribution._ExpertDistributionRecorderReal
+        )
+        recorder._disable_all = False
+        recorder._single_pass_gatherers = {"primary": gatherer}
+        backend = NPUCudaGraphBackend.__new__(NPUCudaGraphBackend)
+        backend._graphs, backend._outputs, backend._eplb_capture_states = {}, {}, {}
+        calls = {
+            "small": [(0, torch.tensor([1, 2, 2]))],
+            "large": [(1, torch.arange(18) % 8)],
+        }
+        for key, routes in calls.items():
+            recorder.on_graph_capture_forward_start()
+            for layer, ids in routes:
+                gatherer.on_select_experts(layer, ids)
+            backend._eplb_capture_states[key] = recorder.get_graph_capture_state()
+
+            def replay(routes=routes):
+                # Emulate captured tensor writes without executing Python hooks.
+                for layer, ids in routes:
+                    if ids.numel() <= 8:
+                        gatherer._batched_routes[layer, : ids.numel()].copy_(ids)
+                    else:
+                        gatherer._data[layer].copy_(self.oracle([(layer, ids)])[layer])
+
+            backend._graphs[key] = SimpleNamespace(replay=replay)
+            backend._outputs[key] = key
+        self.assertEqual(
+            backend._eplb_capture_states,
+            {"small": {"primary": True}, "large": {"primary": False}},
+        )
+        with patch.object(
+            distribution,
+            "get_global_expert_distribution_recorder",
+            return_value=recorder,
+        ):
+            for key in ("large", "small", "large", "small", "small"):
+                gatherer.reset()
+                backend.replay(key, None)
+                torch.testing.assert_close(
+                    gatherer.collect()["global_physical_count"], self.oracle(calls[key])
+                )
+                # The next eager overflow must not reuse captured routes.
+                gatherer.reset()
+                self.check_counts(gatherer, calls["large"])
+            gatherer.reset()
+            gatherer.on_select_experts(0, torch.tensor([7]))
+            backend.replay("large", None)
+            torch.testing.assert_close(
+                gatherer.collect()["global_physical_count"],
+                self.oracle([(0, torch.tensor([7])), *calls["large"]]),
+            )
+            gatherer.reset()
+            with recorder.disable_this_region():
+                self.assertEqual(recorder.get_graph_capture_state(), {})
+                recorder.on_graph_replay_forward_start({"primary": True})
+            self.assertFalse(gatherer._has_batched_routes)
+
+    def test_generated_sequences_match_independent_histogram(self):
+        generator = torch.Generator().manual_seed(910)
+        for capacity in (8, 96):
+            gatherer = self.gatherer(capacity)
+            for _ in range(30):
+                gatherer.reset()
+                calls = [
+                    (
+                        int(torch.randint(2, (), generator=generator)),
+                        torch.randint(
+                            -2,
+                            10,
+                            (int(torch.randint(130, (), generator=generator)),),
+                            generator=generator,
+                        ),
+                    )
+                    for _ in range(8)
+                ]
+                self.check_counts(gatherer, calls)
 
     def test_capture_boundaries_do_not_accumulate_python_offsets(self):
         gatherer = self.gatherer()

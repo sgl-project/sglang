@@ -3,12 +3,38 @@
 ## Source and validation scope
 
 Community base: `de7055f59645ebe03784b0980e1f222789f468a3`.
-The [verification manifest](ascend_dynamic_eplb_upstream_20261024/verification.json) binds the original 17 Python files to their SHA-256 values and separately records the CI fixture follow-up.
-Seven production files are changed; the existing community TopK padding and shared-expert masking implementation is retained.
+The [initial verification manifest](ascend_dynamic_eplb_upstream_20261024/verification.json) binds the original 17 Python files and separately records the CI fixture follow-up. The [optimization manifest](ascend_dynamic_eplb_upstream_20261024/optimization.json) identifies the later optimized source, including exact snapshot and canonical LF SHA-256 values.
+Eight production files are changed; the existing community TopK padding and shared-expert masking implementation is retained.
 
 The current community port passed the CPU and bounded NPU graph checks below. Full-model, disaggregated P/D and AIS measurements come from the earlier integration described separately below; they have **not** been rerun on this community base.
 
-## Current community-port tests
+## Optimization follow-up
+
+Two unnecessary-work paths were removed after reviewing upstream revision `a7ae5d1f345630e9df51415b4e175dbf103bcea6`:
+
+- Globally unchanged NPU layers are skipped before allocating or converting migration workspaces. The full CPU placement map is compared on every rank, because a rank with unchanged local destinations can still be a remote sender. Elastic recovery and other devices retain their existing path.
+- Overflow-only forwards skip the unused batched statistics reduction. The route buffer is cleared only after a forward that could write it. Each NPU graph saves its own batching state; normal replay and replay with input updates restore that state before graph execution. This avoids relying on Python routing hooks during replay.
+
+| Follow-up scenario | Result |
+|---|---|
+| Ten CPU files, including the NPU backend orchestration fixture | 46 tests PASS; NPU initialization forbidden |
+| Generated repeated-layer, invalid, empty and overflowing routes | 60 sequences matched independent bincount oracles within the unit suite |
+| Actual NPU backend capture and replay, 43 layers / 272 physical experts / six routes per token | Ten replay cases matched physical and logical counts exactly |
+| Actual NPU eager execution after mixed graph sizes | Four cases matched physical counts exactly |
+| Large graph and eager overflow-only forwards | 43 original per-layer scatter calls retained; extra batch scatter eliminated |
+| Two-rank NPU/HCCL, real W8A8 postprocessing and NZ weights | 18 layer updates PASS; globally unchanged layouts, remote senders, replicated experts and shared slots covered |
+
+The graph check captures descending token sizes 128/16/8/1 using the actual NPU backend and actual decode `run_once` callback with model/attention stubs. Replay alternates large fallback-only and small batched graphs, including zero valid rows. Route values and storage pointers remain unchanged. The input-update replay entry point is additionally checked by the CPU backend fixture.
+
+For an unchanged layer with six tensors, the former workspace path performed 12 whole-tensor copy calls; the new path skips the allocation and copies. This is an operation-count observation. No end-to-end throughput or latency gain is claimed for this optimization.
+
+Two initial migration-test exits are retained in the evidence: first an overwritten CANN Python path prevented `acl` import; then the default NPU HCCL port was already occupied by an existing service. Preserving the CANN path and using OS-assigned test ports allowed the same production source to pass. The test used a 32 MiB communication buffer. These are test-environment/communication-setup failures, not successful migration runs.
+
+![Optimization validation scenarios and results](ascend_dynamic_eplb_upstream_20261024/optimization_verification.png)
+
+This is a browser-rendered screenshot of the verified result summary. Full-model requests, PD integration and AIS performance have not been rerun on the optimized community source. The earlier results below retain their original scope.
+
+## Initial community-port tests
 
 Runtime: Ascend 910C, CANN 9.1.0, PyTorch 2.10.0, torch_npu 2.10.0.post6.
 

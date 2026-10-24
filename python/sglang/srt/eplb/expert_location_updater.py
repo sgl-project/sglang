@@ -146,6 +146,20 @@ def _update_expert_weights_raw(
 ):
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
+    if get_device().device == "npu" and ElasticEPStateManager.instance() is None:
+        # Compare the full CPU maps, not this rank's destinations: an unchanged
+        # local rank may still need to send an expert to another rank.
+        update_layer_ids = [
+            layer_id
+            for layer_id in update_layer_ids
+            if not torch.equal(
+                old_expert_location_metadata.physical_to_logical_map_cpu[layer_id],
+                new_expert_location_metadata.physical_to_logical_map_cpu[layer_id],
+            )
+        ]
+        if not update_layer_ids:
+            return {}
+
     temp_buffers = create_temp_buffers(
         routed_experts_weights_of_layer[update_layer_ids[0]]
     )
