@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 
 """
 end to end attention solution with aiter kernels
@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.kv_indices import (
     spec_kv_index_token_blocks,
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
+from sglang.srt.layers.attention.aiter_gluon_mla_decode import GluonMlaDecode
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
@@ -36,7 +37,12 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_used_len,
     generate_draft_decode_kv_indices,
 )
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import (
+    get_device_core_count,
+    is_gfx95_supported,
+    is_gfx1250_supported,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -153,6 +159,26 @@ _MLA_REDUCE_V1_HEADS = {
 # fake non-ps, intra_batch_mode needs to be True for non-ps-mode
 fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
+
+
+_MLA_DECODE_MIN_BLOCK_KV = 32
+
+
+def _mla_decode_kv_splits_cap(
+    base_max_kv_splits: int, sm_count: int, max_context_len: int
+) -> int:
+    """Same cap the Triton MLA decode kernel uses for its partial-output buffer."""
+    if sm_count <= 0:
+        return base_max_kv_splits
+    sm_cap = next_power_of_2(sm_count)
+    ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _MLA_DECODE_MIN_BLOCK_KV))
+    return max(base_max_kv_splits, min(sm_cap, ctx_cap))
+
+
+def _layer_logit_soft_cap(layer) -> float:
+    if getattr(layer, "logit_capping_method", None) == "tanh":
+        return float(layer.logit_cap or 0.0)
+    return 0.0
 
 
 class WrapperDispatch(Enum):
@@ -510,6 +536,36 @@ class AiterAttnBackend(AttentionBackend):
         self.use_sliding_window_kv_pool = (
             self.swa_kv_pool is not None and self.swa_kv_pool.swa_layer_nums > 0
         )
+        # Paged Gluon MLA decode reads the same attributes the Triton backend
+        # used to pass in. DCP keeps aiter's own CP path.
+        self.dcp_size = self.dcp_world_size
+        self.enable_deterministic = (
+            get_exec().deterministic.enable_deterministic_inference
+        )
+        self.sliding_window_size = model_runner.sliding_window_size
+        kv_lora_rank = getattr(model_runner.model_config, "kv_lora_rank", None)
+        qk_rope_head_dim = getattr(model_runner.model_config, "qk_rope_head_dim", None)
+        self.gluon_mla_decode = (
+            GluonMlaDecode.create(self, kv_lora_rank, qk_rope_head_dim)
+            if (
+                self.use_mla
+                and is_gfx1250_supported()
+                and kv_lora_rank
+                and qk_rope_head_dim
+            )
+            else None
+        )
+        self.gfx1250_mla_max_kv_splits = 0
+        self.cuda_graph_mla_attn_logits = None
+        self.cuda_graph_mla_attn_lse = None
+        self.cuda_graph_mla_num_kv_splits = None
+        if self._gfx1250_mla_skips_asm_decode():
+            base_splits = get_exec().kernel.triton_attention_num_kv_splits
+            self.gfx1250_mla_max_kv_splits = _mla_decode_kv_splits_cap(
+                base_splits,
+                get_device_core_count(model_runner.gpu_id),
+                self.max_context_len,
+            )
 
         # Detect SHUFFLE 5D ("vectorized") KV cache layout. When active
         # we (a) skip the launch_reshape_and_cache_flash shortcut and always go
@@ -2135,7 +2191,10 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.kv_last_page_len[:bs]
                 max_q_len = 1
 
-                if self._use_mla_decode_persist_metadata():
+                if (
+                    self._use_mla_decode_persist_metadata()
+                    and not self._gfx1250_mla_skips_asm_decode()
+                ):
                     metadata_fast_mode, metadata_intra_batch_mode = (
                         self._mla_decode_metadata_modes()
                     )
@@ -2730,6 +2789,7 @@ class AiterAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        self._alloc_gfx1250_triton_mla_graph_buffers(max(max_bs, max_num_tokens))
         # PR #20978 pads max_bs beyond pool_size for higher cuda-graph
         # coverage. Reallocate indptr buffers so they fit the padded max_bs.
         # See: https://github.com/sgl-project/sglang/pull/20978
@@ -3056,7 +3116,10 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = 1
 
-                if self._use_mla_decode_persist_metadata():
+                if (
+                    self._use_mla_decode_persist_metadata()
+                    and not self._gfx1250_mla_skips_asm_decode()
+                ):
                     metadata_fast_mode, metadata_intra_batch_mode = (
                         self._mla_decode_metadata_modes()
                     )
@@ -4646,6 +4709,146 @@ class AiterAttnBackend(AttentionBackend):
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    def _gfx1250_mla_skips_asm_decode(self) -> bool:
+        """gfx1250 MLA decode with one CP rank never calls the ASM kernel."""
+        return is_gfx1250_supported() and self.use_mla and self.dcp_world_size <= 1
+
+    def _alloc_gfx1250_triton_mla_graph_buffers(self, n_tokens: int) -> None:
+        if not self._gfx1250_mla_skips_asm_decode() or n_tokens <= 0:
+            return
+        splits = self.gfx1250_mla_max_kv_splits
+        self.cuda_graph_mla_attn_logits = torch.empty(
+            (n_tokens, self.num_head, splits, self.v_head_dim),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.cuda_graph_mla_attn_lse = torch.empty(
+            (n_tokens, self.num_head, splits),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.cuda_graph_mla_num_kv_splits = torch.empty(
+            (n_tokens,), dtype=torch.int32, device=self.device
+        )
+
+    def _gfx1250_triton_mla_buffers(self, n_tokens: int):
+        """Partial-output buffers for the Triton MLA decode fallback.
+
+        CUDA graph capture must reuse the storage allocated in
+        ``init_cuda_graph_state``. Replay does not re-enter this method.
+        """
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        logits = self.cuda_graph_mla_attn_logits
+        if get_is_capture_mode():
+            if logits is None or logits.shape[0] < n_tokens:
+                self._alloc_gfx1250_triton_mla_graph_buffers(n_tokens)
+                logits = self.cuda_graph_mla_attn_logits
+            return (
+                logits[:n_tokens],
+                self.cuda_graph_mla_attn_lse[:n_tokens],
+                self.cuda_graph_mla_num_kv_splits[:n_tokens],
+            )
+        splits = self.gfx1250_mla_max_kv_splits
+        return (
+            torch.empty(
+                (n_tokens, self.num_head, splits, self.v_head_dim),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            torch.empty(
+                (n_tokens, self.num_head, splits),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            torch.empty((n_tokens,), dtype=torch.int32, device=self.device),
+        )
+
+    def _forward_gfx1250_triton_mla_decode(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        sinks,
+        logits_soft_cap: float,
+    ) -> Optional[torch.Tensor]:
+        """Triton ``decode_attention_fwd`` for gfx1250 MLA the paged kernel skips.
+
+        aiter's decode indices are token slots even when the pool is paged, so
+        the kernel is called with ``page_size=1``.
+        """
+        fm = self.forward_metadata
+        if fm is None or fm.kv_indptr is None or fm.kv_indices is None:
+            return None
+        if fm.kv_indices.dim() != 1:
+            return None
+        n_tokens = q.shape[0]
+        n_seq = fm.kv_indptr.shape[0] - 1
+        if n_tokens > n_seq:
+            return None
+        from sglang.kernels.ops.attention.decode_attention import decode_attention_fwd
+
+        attn_logits, attn_lse, num_kv_splits = self._gfx1250_triton_mla_buffers(
+            n_tokens
+        )
+        num_kv_splits.fill_(self.gfx1250_mla_max_kv_splits)
+        if layer.k_scale is not None and layer.v_scale is not None:
+            k_scale = getattr(layer, "k_scale_float", None)
+            v_scale = getattr(layer, "v_scale_float", None)
+            if k_scale is None:
+                k_scale = 1.0
+            if v_scale is None:
+                v_scale = 1.0
+        else:
+            k_scale = 1.0
+            v_scale = 1.0
+        o = q.new_empty((n_tokens, layer.tp_q_head_num * layer.v_head_dim))
+        decode_attention_fwd(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            fm.kv_indptr[: n_tokens + 1],
+            fm.kv_indices,
+            attn_logits,
+            attn_lse,
+            num_kv_splits,
+            self.gfx1250_mla_max_kv_splits,
+            layer.scaling,
+            k_scale,
+            v_scale,
+            logit_cap=logits_soft_cap,
+            sinks=sinks,
+            xai_temperature_len=(
+                -1 if layer.xai_temperature_len is None else layer.xai_temperature_len
+            ),
+            has_mla=True,
+            page_size=1,
+            enable_lean=False,
+        )
+        return o
+
+    def _forward_gfx1250_mla_decode(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        sinks,
+    ) -> Optional[torch.Tensor]:
+        """Paged Gluon when it fits, else the Triton decode kernel. None keeps ASM."""
+        if not self._gfx1250_mla_skips_asm_decode():
+            return None
+        logits_soft_cap = _layer_logit_soft_cap(layer)
+        gluon = self.gluon_mla_decode
+        if gluon is not None and gluon.accepts(
+            layer, forward_batch, logits_soft_cap, sinks
+        ):
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            gluon.forward(q=q, o=o, layer=layer, forward_batch=forward_batch)
+            return o
+        return self._forward_gfx1250_triton_mla_decode(q, layer, sinks, logits_soft_cap)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -4742,10 +4945,14 @@ class AiterAttnBackend(AttentionBackend):
 
         if self.use_mla:
             if self.dcp_world_size > 1 and not forward_batch.forward_mode.is_idle():
+                # CP combine stays on aiter's DCP path. The paged kernel and the
+                # single-rank Triton fallback do not gather LSE across ranks.
                 k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 return self._forward_decode_dcp(q, k_buffer, layer, k_descale)
 
-            o = self._forward_mla_decode(q, layer, forward_batch, k_descale)
+            o = self._forward_gfx1250_mla_decode(q, layer, forward_batch, sinks)
+            if o is None:
+                o = self._forward_mla_decode(q, layer, forward_batch, k_descale)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
             self.logits_soft_cap = layer.logit_cap
