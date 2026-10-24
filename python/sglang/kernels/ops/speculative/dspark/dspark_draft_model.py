@@ -8,6 +8,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
 _IDX_SENTINEL = tl.constexpr(2147483647)
 _MARKOV_BLOCK_V = 256
 _MARKOV_BLOCK_R = 32
@@ -195,7 +197,11 @@ class CommitKvProj:
         wkv_linears: list[torch.nn.Module],
         allow_strided_output: bool = False,
     ) -> list[torch.Tensor]:
-        if main_x.is_cuda and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears):
+        if (
+            main_x.is_cuda
+            and _fused_commit_kv_proj_supported(wkv_linears=wkv_linears)
+            and not is_npu_arch35()
+        ):
             return cls.triton(
                 main_x=main_x,
                 wkv_linears=wkv_linears,
