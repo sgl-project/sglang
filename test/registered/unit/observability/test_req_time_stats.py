@@ -133,6 +133,18 @@ class TestConvertToGenAiSpanAttrs(CustomTestCase):
         )
 
 
+class TestInitTraceCtx(CustomTestCase):
+    def test_health_checks_are_not_traced(self):
+        with mock.patch.object(rts, "TraceReqContext") as trace_req_context:
+            stats = rts.APIServerReqTimeStats()
+            stats.init_trace_ctx(rid="HEALTH_CHECK_1f2e", bootstrap_room=None)
+            self.assertIsInstance(stats.trace_ctx, rts.TraceNullContext)
+            trace_req_context.assert_not_called()
+
+            stats.init_trace_ctx(rid="req-1", bootstrap_room=None)
+            trace_req_context.assert_called_once()
+
+
 class TestSetFinishedTimeSpanAttrs(CustomTestCase):
     def _tracing_stats(self) -> rts.APIServerReqTimeStats:
         stats = rts.APIServerReqTimeStats()

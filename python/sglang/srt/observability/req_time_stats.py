@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from typing_extensions import Self
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
@@ -291,6 +292,8 @@ class ReqTimeStatsBase:
         bootstrap_room: Optional[int],
         external_trace_header: Optional[Dict[str, str]] = None,
     ):
+        if rid.startswith(HEALTH_CHECK_RID_PREFIX):
+            return
         if is_async_tracing_available():
             self.trace_ctx = TraceReqContextAsync(
                 rid=rid,
