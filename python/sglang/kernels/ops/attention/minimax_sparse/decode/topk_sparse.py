@@ -32,7 +32,7 @@ from ..common.utils import (
         for nw in [4, 8]
         for ns in [2, 3, 4, 5]
     ],
-    key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "block_size", "HAS_SINK"],
+    key=["BATCH_SIZE_BUCKET", "gqa_group_size", "head_dim", "HAS_SINK"],
 )
 @triton.jit
 def _gqa_share_sparse_decode_kernel(

@@ -8,6 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
+import sglang.kernels.ops.attention.triton_block_ptr_compat  # noqa: F401
+
 _tma_keep_alive_buf = deque(maxlen=200)
 
 # The paged main K/V cache may be fp8 (unit-scaled) under --kv-cache-dtype
