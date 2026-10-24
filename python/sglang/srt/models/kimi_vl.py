@@ -126,6 +126,8 @@ def _fused_moe_text_config(hf_config):
 
 
 class KimiVLForConditionalGeneration(nn.Module):
+    supports_batched_image_encoding = True
+
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         text_config = _fused_moe_text_config(hf_config)

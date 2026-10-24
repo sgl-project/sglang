@@ -10,6 +10,7 @@ CPU-only: exercises mm_schedule internals directly, no engine or GPU.
 """
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -50,7 +51,9 @@ HIDDEN = 16
 
 @pytest.fixture(autouse=True)
 def single_process_runtime_context():
-    # Exercise the embedding path without starting an engine.
+    # These mm_utils unit tests exercise cache-hit paths that acknowledge
+    # deferred CUDA IPC through runtime_context. They do not start an engine, so
+    # pin the runtime topology to a single-process CPU setup.
     server_args_override = get_context().override_server_args(tp_size=1)
     server_args_override.install()
     try:
@@ -70,6 +73,12 @@ TOTAL_LEN = 30
 CHUNKS = [(0, 8), (8, 8), (16, 8), (24, 6)]
 
 _CPU = torch.device("cpu")
+
+
+@pytest.fixture(autouse=True)
+def _default_cuda_platform(monkeypatch):
+    """CPU tests default to the CUDA batching path unless a test opts into NPU."""
+    monkeypatch.setattr(mm_schedule, "_is_npu", False)
 
 
 def _num_tokens(item: MultimodalDataItem) -> int:
@@ -95,7 +104,7 @@ def _make_items():
         MultimodalDataItem(
             modality=Modality.IMAGE,
             hash=1000 + i,
-            feature=torch.zeros(1),
+            feature=torch.zeros(8, 2),
             offsets=[offset],
         )
         for i, offset in enumerate(ITEM_OFFSETS)
@@ -313,6 +322,430 @@ def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
     assert embeddings[first_key].shape == (_num_tokens(items[0]), HIDDEN)
     assert embeddings[second_key].shape == (_num_tokens(items[1]), HIDDEN)
     encoder.assert_called_once()
+
+
+@pytest.mark.parametrize("budget", [8, 16384])
+@pytest.mark.parametrize("cache_bytes", [0, 1 << 30])
+def test_npu_qwen3_vl_batches_cross_request_image_misses(
+    monkeypatch, budget, cache_bytes
+):
+    """NPU Qwen3-VL must batch misses without mixing request-owned embeddings."""
+    monkeypatch.setattr(mm_schedule, "_is_hip", False)
+    monkeypatch.setattr(mm_schedule, "_is_npu", True)
+    monkeypatch.setattr(mm_schedule, "_is_xpu", False)
+    monkeypatch.setenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES", str(budget))
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "0")
+    mm_schedule.init_mm_embedding_cache(cache_bytes)
+
+    # Qwen3-VL-30B-A3B, the documented NPU deployment target, uses the MoE
+    # wrapper while inheriting the same packed-image implementation.
+    class Qwen3VLMoeForConditionalGeneration:
+        supports_batched_image_encoding = True
+
+        def __init__(self):
+            self.calls = []
+
+        def get_image_feature(self, items):
+            self.calls.append(list(items))
+            return torch.cat(
+                [
+                    torch.arange(_num_tokens(item), dtype=torch.float32)
+                    .unsqueeze(1)
+                    .expand(-1, HIDDEN)
+                    + item.hash
+                    for item in items
+                ]
+            )
+
+    first = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=101,
+        feature=torch.zeros(8, 2),
+        offsets=[(1, 2)],
+    )
+    second = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=202,
+        feature=torch.zeros(12, 2),
+        offsets=[(0, 2)],
+    )
+    model = Qwen3VLMoeForConditionalGeneration()
+
+    embedding, _ = mm_schedule._get_chunked_prefill_embedding(
+        model.get_image_feature,
+        [first, second],
+        [0, 1, 2],
+        [0, 0],
+        [4, 4],
+        [[(1, 2)], [(0, 2)]],
+        torch.zeros(8, dtype=torch.long),
+    )
+
+    expected_calls = [[first], [second]] if budget == 8 else [[first, second]]
+    assert model.calls == expected_calls
+    expected = torch.tensor([101, 102, 202, 203, 204], dtype=torch.float32)
+    expected = expected.unsqueeze(1).expand(-1, HIDDEN)
+    torch.testing.assert_close(embedding, expected, rtol=0, atol=0)
+
+    cached, _ = mm_schedule._get_chunked_prefill_embedding(
+        model.get_image_feature,
+        [first, second],
+        [0, 1, 2],
+        [0, 0],
+        [4, 4],
+        [[(1, 2)], [(0, 2)]],
+        torch.zeros(8, dtype=torch.long),
+    )
+    torch.testing.assert_close(cached, expected, rtol=0, atol=0)
+    assert model.calls == expected_calls * (2 if cache_bytes == 0 else 1)
+
+    # A continuation chunk starts inside each image's placeholder span.
+    partial, _ = mm_schedule._get_chunked_prefill_embedding(
+        model.get_image_feature,
+        [first, second],
+        [0, 1, 2],
+        [2, 1],
+        [1, 1],
+        [[(1, 2)], [(0, 2)]],
+        torch.zeros(2, dtype=torch.long),
+    )
+    torch.testing.assert_close(partial, expected[[1, 3]], rtol=0, atol=0)
+    assert model.calls == expected_calls * (3 if cache_bytes == 0 else 1)
+
+
+@pytest.mark.parametrize("budget,sizes", [(0, [4]), (16, [2, 1, 1])])
+def test_input_patch_budget_not_output_tokens(budget, sizes):
+    items = [SimpleNamespace(feature=torch.empty(n, 2)) for n in (8, 8, 24, 4)]
+    groups = mm_schedule._chunk_misses_by_patch_budget(items, [2, 2, 6, 1], budget)
+    assert [len(group) for group, _ in groups] == sizes
+    assert [n for _, counts in groups for n in counts] == [2, 2, 6, 1]
+    assert mm_schedule._chunk_misses_by_patch_budget([], [], 16) == []
+
+
+def test_unknown_patch_count_is_isolated():
+    items = [
+        SimpleNamespace(feature=f) for f in (torch.empty(4, 2), None, torch.empty(4, 2))
+    ]
+    groups = mm_schedule._chunk_misses_by_patch_budget(items, [1, 2, 1], 16)
+    assert [len(group) for group, _ in groups] == [1, 1, 1]
+
+
+def test_npu_batching_mode_guards(monkeypatch):
+    monkeypatch.setattr(mm_schedule, "_is_npu", True)
+    monkeypatch.setattr(mm_schedule, "_is_hip", False)
+    monkeypatch.setattr(mm_schedule, "_is_xpu", False)
+    monkeypatch.setenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES", "16384")
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "0")
+    owner = type(
+        "Qwen3VLForConditionalGeneration",
+        (),
+        {"supports_batched_image_encoding": True},
+    )()
+    encoder = SimpleNamespace(__self__=owner, __name__="get_image_feature")
+    assert mm_schedule._can_batch_cross_request_image_misses(encoder)
+    unflagged_encoder = SimpleNamespace(__self__=object(), __name__="get_image_feature")
+    assert not mm_schedule._can_batch_cross_request_image_misses(unflagged_encoder)
+    with monkeypatch.context() as m:
+        m.delenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES")
+        assert not mm_schedule._can_batch_cross_request_image_misses(encoder)
+    with get_parallel().override(tp_size=2, attn_tp_size=2, moe_tp_size=2):
+        assert mm_schedule._can_batch_cross_request_image_misses(encoder)
+    setattr(owner, "use_data_parallel", True)
+    assert not mm_schedule._can_batch_cross_request_image_misses(encoder)
+    delattr(owner, "use_data_parallel")
+    # Quantized ViT validated on w8a8s GLM-4.1V (byte-identical outputs):
+    # quant_config no longer blocks batching.
+    setattr(owner, "quant_config", object())
+    assert mm_schedule._can_batch_cross_request_image_misses(encoder)
+    delattr(owner, "quant_config")
+    for name, value in (
+        ("SGLANG_NPU_VIT_MAX_BATCH_PATCHES", "0"),
+        ("SGLANG_VIT_ENABLE_CUDA_GRAPH", "1"),
+    ):
+        with monkeypatch.context() as m:
+            m.setenv(name, value)
+            assert not mm_schedule._can_batch_cross_request_image_misses(encoder)
+    monkeypatch.setattr(mm_schedule, "_is_npu", False)
+    monkeypatch.setenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES", "0")
+    assert mm_schedule._can_batch_cross_request_image_misses(encoder)
+
+
+def test_npu_qwen25_vl_batches_cross_request_image_misses(monkeypatch):
+    """Qwen2.5-VL on NPU shares the same packed get_image_feature contract:
+    one call for two requests' misses, outputs split back per request."""
+    monkeypatch.setattr(mm_schedule, "_is_hip", False)
+    monkeypatch.setattr(mm_schedule, "_is_npu", True)
+    monkeypatch.setattr(mm_schedule, "_is_xpu", False)
+    monkeypatch.setenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES", "16384")
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "0")
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+
+    class Qwen2_5_VLForConditionalGeneration:
+        supports_batched_image_encoding = True
+
+        def __init__(self):
+            self.calls = []
+
+        def get_image_feature(self, items):
+            self.calls.append(list(items))
+            return torch.cat(
+                [
+                    torch.full(
+                        (_num_tokens(item), HIDDEN),
+                        item.hash,
+                        dtype=torch.float32,
+                    )
+                    for item in items
+                ]
+            )
+
+    first = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=101,
+        feature=torch.zeros(8, 2),
+        offsets=[(1, 2)],
+    )
+    second = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=202,
+        feature=torch.zeros(8, 2),
+        offsets=[(0, 2)],
+    )
+    model = Qwen2_5_VLForConditionalGeneration()
+
+    embedding, _ = mm_schedule._get_chunked_prefill_embedding(
+        model.get_image_feature,
+        [first, second],
+        [0, 1, 2],
+        [0, 0],
+        [4, 4],
+        [[(1, 2)], [(0, 2)]],
+        torch.zeros(8, dtype=torch.long),
+    )
+
+    assert model.calls == [[first, second]]
+    expected = torch.cat(
+        [
+            torch.full((2, HIDDEN), first.hash, dtype=torch.float32),
+            torch.full((3, HIDDEN), second.hash, dtype=torch.float32),
+        ]
+    )
+    torch.testing.assert_close(embedding, expected, rtol=0, atol=0)
+
+
+def test_npu_kimi_vl_batches_cross_request_image_misses(monkeypatch):
+    """Kimi-VL on NPU shares the same packed get_image_feature contract:
+    one call for two requests' misses, outputs split back per request."""
+    monkeypatch.setattr(mm_schedule, "_is_hip", False)
+    monkeypatch.setattr(mm_schedule, "_is_npu", True)
+    monkeypatch.setattr(mm_schedule, "_is_xpu", False)
+    monkeypatch.setenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES", "16384")
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "0")
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+
+    class KimiVLForConditionalGeneration:
+        supports_batched_image_encoding = True
+
+        def __init__(self):
+            self.calls = []
+
+        def get_image_feature(self, items):
+            self.calls.append(list(items))
+            return torch.cat(
+                [
+                    torch.full(
+                        (_num_tokens(item), HIDDEN),
+                        item.hash,
+                        dtype=torch.float32,
+                    )
+                    for item in items
+                ]
+            )
+
+    first = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=101,
+        feature=torch.zeros(8, 2),
+        offsets=[(1, 2)],
+    )
+    second = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=202,
+        feature=torch.zeros(8, 2),
+        offsets=[(0, 2)],
+    )
+    model = KimiVLForConditionalGeneration()
+
+    embedding, _ = mm_schedule._get_chunked_prefill_embedding(
+        model.get_image_feature,
+        [first, second],
+        [0, 1, 2],
+        [0, 0],
+        [4, 4],
+        [[(1, 2)], [(0, 2)]],
+        torch.zeros(8, dtype=torch.long),
+    )
+
+    assert model.calls == [[first, second]]
+    expected = torch.cat(
+        [
+            torch.full((2, HIDDEN), first.hash, dtype=torch.float32),
+            torch.full((3, HIDDEN), second.hash, dtype=torch.float32),
+        ]
+    )
+    torch.testing.assert_close(embedding, expected, rtol=0, atol=0)
+
+
+def test_npu_glm4v_batches_cross_request_image_misses(monkeypatch):
+    """GLM-4.1V on NPU shares the same packed get_image_feature contract:
+    one call for two requests' misses, outputs split back per request."""
+    monkeypatch.setattr(mm_schedule, "_is_hip", False)
+    monkeypatch.setattr(mm_schedule, "_is_npu", True)
+    monkeypatch.setattr(mm_schedule, "_is_xpu", False)
+    monkeypatch.setenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES", "16384")
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "0")
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+
+    class Glm4vForConditionalGeneration:
+        supports_batched_image_encoding = True
+
+        def __init__(self):
+            self.calls = []
+
+        def get_image_feature(self, items):
+            self.calls.append(list(items))
+            return torch.cat(
+                [
+                    torch.full(
+                        (_num_tokens(item), HIDDEN),
+                        item.hash,
+                        dtype=torch.float32,
+                    )
+                    for item in items
+                ]
+            )
+
+    first = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=101,
+        feature=torch.zeros(8, 2),
+        offsets=[(1, 2)],
+    )
+    second = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=202,
+        feature=torch.zeros(8, 2),
+        offsets=[(0, 2)],
+    )
+    model = Glm4vForConditionalGeneration()
+
+    embedding, _ = mm_schedule._get_chunked_prefill_embedding(
+        model.get_image_feature,
+        [first, second],
+        [0, 1, 2],
+        [0, 0],
+        [4, 4],
+        [[(1, 2)], [(0, 2)]],
+        torch.zeros(8, dtype=torch.long),
+    )
+
+    assert model.calls == [[first, second]]
+    expected = torch.cat(
+        [
+            torch.full((2, HIDDEN), first.hash, dtype=torch.float32),
+            torch.full((3, HIDDEN), second.hash, dtype=torch.float32),
+        ]
+    )
+    torch.testing.assert_close(embedding, expected, rtol=0, atol=0)
+
+
+def _run_npu_cross_request_batch_case(monkeypatch, model):
+    monkeypatch.setattr(mm_schedule, "_is_hip", False)
+    monkeypatch.setattr(mm_schedule, "_is_npu", True)
+    monkeypatch.setattr(mm_schedule, "_is_xpu", False)
+    monkeypatch.setenv("SGLANG_NPU_VIT_MAX_BATCH_PATCHES", "16384")
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "0")
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+
+    first = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=101,
+        feature=torch.zeros(8, 2),
+        offsets=[(1, 2)],
+    )
+    second = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        hash=202,
+        feature=torch.zeros(8, 2),
+        offsets=[(0, 2)],
+    )
+
+    embedding, _ = mm_schedule._get_chunked_prefill_embedding(
+        model.get_image_feature,
+        [first, second],
+        [0, 1, 2],
+        [0, 0],
+        [4, 4],
+        [[(1, 2)], [(0, 2)]],
+        torch.zeros(8, dtype=torch.long),
+    )
+
+    assert model.calls == [[first, second]]
+    expected = torch.cat(
+        [
+            torch.full((2, HIDDEN), first.hash, dtype=torch.float32),
+            torch.full((3, HIDDEN), second.hash, dtype=torch.float32),
+        ]
+    )
+    torch.testing.assert_close(embedding, expected, rtol=0, atol=0)
+
+
+class _PackedImageFeatureMock:
+    def __init__(self):
+        self.calls = []
+
+    def get_image_feature(self, items):
+        self.calls.append(list(items))
+        return torch.cat(
+            [
+                torch.full(
+                    (_num_tokens(item), HIDDEN),
+                    item.hash,
+                    dtype=torch.float32,
+                )
+                for item in items
+            ]
+        )
+
+
+def test_npu_minicpmo_batches_cross_request_image_misses(monkeypatch):
+    """MiniCPM-O on NPU shares the same packed get_image_feature contract:
+    one call for two requests' misses, outputs split back per request."""
+
+    class MiniCPMO(_PackedImageFeatureMock):
+        supports_batched_image_encoding = True
+
+    _run_npu_cross_request_batch_case(monkeypatch, MiniCPMO())
+
+
+def test_npu_phi4mm_batches_cross_request_image_misses(monkeypatch):
+    """Phi-4-multimodal on NPU shares the same packed get_image_feature
+    contract: one call for two requests' misses, split back per request."""
+
+    class Phi4MMForCausalLM(_PackedImageFeatureMock):
+        supports_batched_image_encoding = True
+
+    _run_npu_cross_request_batch_case(monkeypatch, Phi4MMForCausalLM())
+
+
+def test_npu_janus_pro_batches_cross_request_image_misses(monkeypatch):
+    """Janus-Pro (MultiModalityCausalLM) on NPU shares the same packed
+    get_image_feature contract: one call for two requests' misses."""
+
+    class MultiModalityCausalLM(_PackedImageFeatureMock):
+        supports_batched_image_encoding = True
+
+    _run_npu_cross_request_batch_case(monkeypatch, MultiModalityCausalLM())
 
 
 def test_full_mismatched_cache_entry_is_reencoded(caplog):

@@ -668,6 +668,8 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
 
 class Qwen2_5_VLForConditionalGeneration(nn.Module):
+    supports_batched_image_encoding = True
+
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_up_proj.",
