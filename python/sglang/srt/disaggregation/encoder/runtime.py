@@ -1868,7 +1868,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
     atexit.register(_kill_workers)
 
     for dp_rank in range(num_dp_ranks):
-        gpu_id = get_device().base_gpu_id + dp_rank
+        gpu_id = get_device().base_gpu_id + dp_rank * get_device().gpu_id_step
         # Pin the device parent-side around spawn (same convention as the
         # scheduler launcher and DP controller) so the child inherits
         # CUDA_VISIBLE_DEVICES from its first instruction, before any import
