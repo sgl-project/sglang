@@ -140,8 +140,8 @@ class SparsePrefillChunkCache:
     """Cache prefill-chunk metadata shared across layers.
 
     Fields depend on request/token mappings and compressed page tables, not
-    per-layer k_cache; per-layer top-k combinations are recomputed into reused
-    buffers.
+    per-layer k_cache. Large eager layers may reuse a top-k combination until
+    the next index producer explicitly invalidates it; other paths recompute.
     """
 
     # Geometry computed once per chunk.
@@ -178,6 +178,11 @@ class SparsePrefillChunkCache:
     # Per-layer scratch only: combine overwrites all entries before attention.
     # c0/c128 are cached across layers and must retain separate storage.
     low_ratio_combined: dict = field(default_factory=dict)
+    # One writer owns the shared c1/c2 output, including its lengths. A producer
+    # invalidates this even when it overwrites the same raw-index allocation.
+    _combined_generation: int = 0
+    _combined_key: Optional[tuple] = None
+    _combined_source: Optional[torch.Tensor] = None
     swa_indices: Optional[torch.Tensor] = None
     swa_lengths: Optional[torch.Tensor] = None
     # Host lengths avoid a device synchronization when sizing ragged gathers.
@@ -282,11 +287,18 @@ class SparsePrefillChunkCache:
         swa_base = (self.num_reqs * c_max + self.swa_offsets[:-1]).to(torch.int32)
         return compressed_base, swa_base
 
+    def invalidate_combined_indices(self) -> None:
+        self._combined_generation += 1
+        self._combined_key = None
+        self._combined_source = None
+
     def layer_inputs(
         self,
         compress_ratio: int,
         core_attn_metadata,
         c_page_size: int,
+        *,
+        reuse_combined: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(flat_token_ids, combined_indices, combined_lens)`` for one compressed
         layer. c128 gathers every block and combines once per chunk; a top-k ratio
@@ -306,7 +318,9 @@ class SparsePrefillChunkCache:
             compress_ratio, core_attn_metadata.page_table, c_page_size
         )
         combined_indices, combined_lens = self.combine_compressed(
-            compress_ratio, raw_indices[: self.num_qo_tokens]
+            compress_ratio,
+            raw_indices[: self.num_qo_tokens],
+            reuse_source=raw_indices if reuse_combined else None,
         )
         return gather.flat_token_ids, combined_indices, combined_lens
 
@@ -436,6 +450,8 @@ class SparsePrefillChunkCache:
         self,
         compress_ratio: int,
         sparse_raw_indices: torch.Tensor,
+        *,
+        reuse_source: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``sparse_raw_indices`` is the top-k as request-local compressed
         positions, already the workspace coordinate ``combine_topk_swa_indices``
@@ -464,7 +480,24 @@ class SparsePrefillChunkCache:
                 gather.combined_indices,
                 gather.combined_lens,
             )
-        return combine_topk_swa_indices(
+        key = None
+        if reuse_source is not None and compress_ratio in (1, 2):
+            key = (
+                self._combined_generation,
+                compress_ratio,
+                sparse_raw_indices.data_ptr(),
+                tuple(sparse_raw_indices.shape),
+                tuple(sparse_raw_indices.stride()),
+                gather.combined_indices.data_ptr(),
+                gather.combined_lens.data_ptr(),
+            )
+            if self._combined_source is reuse_source and self._combined_key == key:
+                return gather.combined_indices, gather.combined_lens
+        # Every non-reused write invalidates the shared output, including writes
+        # from another ratio or a path that does not permit eager reuse.
+        self._combined_key = None
+        self._combined_source = None
+        result = combine_topk_swa_indices(
             topk_indices=sparse_raw_indices,
             query_start_loc=self.query_start_loc,
             query_pos=self.query_pos,
@@ -480,3 +513,7 @@ class SparsePrefillChunkCache:
             swa_indices=self.swa_indices,
             swa_lengths=self.swa_lengths,
         )
+        if key is not None:
+            self._combined_key = key
+            self._combined_source = reuse_source
+        return result
