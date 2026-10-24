@@ -71,6 +71,8 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     # Quantize the activations of MXFP4 experts to MXFP8 at any token count
     fp8_activations: bool = False
     fused_moe_kwargs: Optional[dict[str, Any]] = None
+    # w13 preshuffled gate/up-interleaved (shuffle_weight_a16w4(w13, 16, True)).
+    gate_up_interleaved: bool = False
 
 
 @dataclass
@@ -165,6 +167,91 @@ def _aiter_fused_moe_supports_output() -> bool:
     return "output" in inspect.signature(fused_moe).parameters
 
 
+@functools.lru_cache(maxsize=64)
+def _situ_a4w4_interleave_resolves(
+    padded_m: int,
+    model_dim: int,
+    inter_dim: int,
+    num_experts: int,
+    topk: int,
+    beta: float,
+    linear_beta: float,
+) -> bool:
+    """Whether aiter's a4w4 config for this bucket runs the mxmoe stage 1, the one
+    stage-1 family that honors a runtime INTERLEAVE layout; other FlyDSL a4w4
+    stage-1 kernels bake in the separated layout and would misread the weights."""
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.fused_moe import get_2stage_cfgs
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    metadata = get_2stage_cfgs(
+        padded_m,
+        model_dim,
+        inter_dim,
+        num_experts,
+        topk,
+        dtypes.bf16,
+        dtypes.fp4x2,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        ActivationType.Situv2,
+        False,
+        0,
+        0,
+        True,
+        GateMode.INTERLEAVE.value,
+        situ_beta=beta,
+        situ_linear_beta=linear_beta,
+        opus_weights_shuffled=True,
+        input_dtype=torch.bfloat16,
+    )
+    stage1 = metadata.stage1
+    return (
+        isinstance(stage1, functools.partial)
+        and stage1.keywords.get("interleave") is True
+    )
+
+
+def _use_situ_a4w4(
+    runner_input: AiterRunnerInput,
+    quant_info: AiterMoeQuantInfo,
+    beta: float,
+    linear_beta: float,
+) -> bool:
+    """MXFP4 activations for a prefill-sized SiTU batch over a8w4-layout weights."""
+    x = runner_input.hidden_states
+    min_tokens = envs.SGLANG_ROCM_K3_PREFILL_MOE_A4W4_MIN_TOKENS.get()
+    if not (
+        0 < min_tokens <= x.shape[0]
+        and quant_info.gate_up_interleaved
+        and quant_info.quant_type == AiterQuantType.PER_1X32
+        and x.dtype == torch.bfloat16
+        and runner_input.a1_scale is None
+        and runner_input.num_local_tokens is None
+        and quant_info.expert_mask is None
+        and quant_info.b13 is None
+        and quant_info.b2 is None
+        and quant_info.hidden_pad == 0
+        and quant_info.intermediate_pad == 0
+        and not quant_info.doweight_stage1
+        and is_gfx95_supported()
+    ):
+        return False
+    from aiter.fused_moe import get_padded_M
+
+    w13, w2 = quant_info.w13_weight, quant_info.w2_weight
+    return _situ_a4w4_interleave_resolves(
+        get_padded_M(x.shape[0]),
+        w2.shape[1],
+        w13.shape[1] // 2,
+        w13.shape[0],
+        runner_input.topk_ids.shape[1],
+        beta,
+        linear_beta,
+    )
+
+
 class AiterRunnerCore(MoeRunnerCore):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -223,6 +310,18 @@ class AiterRunnerCore(MoeRunnerCore):
                 extra["beta"] = float(self.config.gemm1_alpha)
             if self.config.gemm1_clamp_limit is not None:
                 extra["linear_beta"] = float(self.config.gemm1_clamp_limit)
+            if _use_situ_a4w4(
+                runner_input,
+                quant_info,
+                extra.get("beta", 1.0),
+                extra.get("linear_beta", 1.0),
+            ):
+                from aiter import dtypes
+
+                # The a8w4 stage-1 kernels carry the layout in their names; the
+                # a4w4 mxmoe stage 1 takes it from gate_mode.
+                extra["gate_mode"] = GateMode.INTERLEAVE.value
+                extra["quant_dtype_a"] = dtypes.fp4x2
         elif is_gfx95 and quant_info.swiglu_limit > 0 and "gate_mode" in extra:
             extra["swiglu_limit"] = quant_info.swiglu_limit
         elif quant_info.swiglu_limit > 0:

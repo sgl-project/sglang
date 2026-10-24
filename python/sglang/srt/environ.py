@@ -2090,6 +2090,24 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Kimi-K3 prefill MoE on gfx950. SiTU MXFP4 MoE calls of at least this many tokens
+    # quantize activations to MXFP4 (aiter a4w4 on the gate/up-interleaved a8w4 weights)
+    # instead of MXFP8; 0 disables. 1025: aiter's K3 a4w4 table has an
+    # interleave-capable stage 1 from the 2048 bucket.
+    SGLANG_ROCM_K3_PREFILL_MOE_A4W4_MIN_TOKENS = EnvInt(1025)
+    # Run the merged MoE front of the prefill sizes where it is faster
+    # (kernels/ops/gemm/kimi_k3_front_situ.py) as one GEMM with the shared experts'
+    # SiTU in its epilogue.
+    SGLANG_ROCM_K3_FRONT_SITU = EnvBool(True)
+    # Batches of at least this many tokens reduce-scatter the MoE's [latent | shared]
+    # partials by rows, run the latent tail on this rank's rows and all-gather the
+    # stream; 0 disables.
+    SGLANG_ROCM_K3_ROW_SHARDED_TAIL_MIN_TOKENS = EnvInt(4096)
+    # With the row-sharded tail, also complete the attention output's sum on this
+    # rank's rows (reduce-scatter), read the FFN input there and all-gather it.
+    SGLANG_ROCM_K3_ROW_SHARDED_ATTN_READ = EnvBool(True)
+    # Row-shard the attention side only from this many tokens (0: with the tail).
+    SGLANG_ROCM_K3_ROW_SHARDED_ATTN_MIN_TOKENS = EnvInt(0)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
