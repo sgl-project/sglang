@@ -483,6 +483,40 @@ class TestLongContext(CustomTestCase):
 class TestResetAndReinsert(CustomTestCase):
     """Verify that reset followed by new inserts works correctly."""
 
+    def test_reset_drains_pending_inserts(self):
+        for match_type in ("BFS", "PROB"):
+            with self.subTest(match_type=match_type):
+                corpus = _make_corpus(match_type)
+                corpus.batch_put([[1, 2, 3, 4, 5, 6, 7, 8]] * 4096)
+                # Unlike the regular reset control, do not synchronize first:
+                # reset itself must fence inserts admitted before it.
+                corpus.reset()
+                corpus.synchronize()
+
+                ids, _ = _batch_get(corpus, [[1, 2, 3]])
+                self.assertEqual(ids.tolist(), [3, 0, 0, 0, 0, 0, 0, 0])
+
+                corpus.batch_put([[10, 20, 30, 40]])
+                corpus.synchronize()
+                ids, _ = _batch_get(corpus, [[10, 20, 30]])
+                self.assertIn(40, ids.tolist())
+
+    def test_reset_pending_inserts_preserves_external_corpus(self):
+        corpus = _make_corpus(
+            "BFS",
+            external_sam_budget=4,
+            external_corpus_documents=[[100, 200, 300, 400]],
+        )
+        corpus.batch_put([[1, 2, 3, 4, 5, 6, 7, 8]] * 4096)
+        corpus.reset()
+        corpus.synchronize()
+
+        ids, _ = _batch_get(corpus, [[1, 2, 3]])
+        self.assertEqual(ids.tolist(), [3, 0, 0, 0, 0, 0, 0, 0])
+        self.assertEqual(corpus.list_external_corpora(), {"test_corpus": 4})
+        ids, _ = _batch_get(corpus, [[100, 200]])
+        self.assertIn(300, ids.tolist())
+
     def test_reset_then_reinsert(self):
         corpus = _make_corpus("BFS")
         corpus.batch_put([[1, 2, 3, 4, 5]])
