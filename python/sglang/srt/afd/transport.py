@@ -329,7 +329,7 @@ class AFDPairedP2PTransport:
         self._retime_control_store(config.rendezvous_timeout_seconds)
         self._close_timeout_seconds = config.close_timeout_seconds
         self._closed = False
-        self.direct = None
+        self.ffn_backend = None
         self._stats = {
             "a2e_send": 0,
             "a2e_recv": 0,
@@ -386,7 +386,7 @@ class AFDPairedP2PTransport:
         if any(direct_offers):
             if not all(direct_offers):
                 raise AFDError("AFD_DIRECT_PROTOCOL_MISMATCH")
-            from .expert_exchange import negotiate_direct_capabilities
+            from .ffn_backend import negotiate_direct_capabilities
 
             plan = negotiate_direct_capabilities(descriptors)
             self.direct_enabled = plan["enabled"]
@@ -909,7 +909,7 @@ class AFDPairedP2PTransport:
         if self._closed:
             return dict(self._stats)
         backend_error = None
-        backend = getattr(self, "direct", None)
+        backend = getattr(self, "ffn_backend", None)
         if backend is not None:
             try:
                 backend.close(seconds=self._close_timeout_seconds)
@@ -964,7 +964,7 @@ class AFDPairedP2PTransport:
         self._a2e = None
         self._e2a = None
         self._control = None
-        self.direct = None
+        self.ffn_backend = None
         self._closed = True
         if timed_out:
             raise AFDError(

@@ -15,7 +15,7 @@ from sglang.srt.runtime_context import get_exec
 from .config import AFDConfig
 from .connector import AFDConnector
 from .contracts import AFDError, AFDModelAdapter, AFDRole, contract_digest
-from .expert_exchange import build_direct_exchange, validate_direct_backend
+from .ffn_backend import build_ffn_backend, validate_ffn_backend
 from .pipeline import AFDAttentionPipeline, AFDFFNPipeline
 from .profiles import (
     ROLE_GRAPH_STRATEGY_ID,
@@ -126,7 +126,7 @@ def _build_connector(
     base_hbm_bytes: int,
     capture_sizes: tuple[int, ...],
 ) -> AFDConnector:
-    direct_capability = validate_direct_backend(
+    direct_capability = validate_ffn_backend(
         config=config,
         adapter=adapter,
         model_family=factories.profile.model_family,
@@ -157,7 +157,7 @@ def _build_connector(
     if not hasattr(transport, "direct_selection_reason"):
         transport.direct_selection_reason = direct_capability["reason"]
     try:
-        backend = build_direct_exchange(
+        backend = build_ffn_backend(
             transport=transport, adapter=adapter, config=config, device=device
         )
         if backend is not None:

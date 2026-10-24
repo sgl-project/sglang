@@ -76,7 +76,7 @@ class RetainedGraph(EagerGraph):
 class TraceTransport:
     def __init__(self, descriptor, lane=0, capturing=False, group=1):
         self.descriptor = descriptor
-        self.direct = None
+        self.ffn_backend = None
         self.lane = lane
         self.timeline = []
         self.recv_widths = []

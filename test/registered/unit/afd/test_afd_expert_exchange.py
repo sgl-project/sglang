@@ -173,7 +173,7 @@ def test_backend_attention_preserves_layer_order_and_shared_output(shared_value)
         finish_layer=finish_layer,
     )
     transport = SimpleNamespace(
-        direct=SimpleNamespace(first_layer=0, dispatch=dispatch),
+        ffn_backend=SimpleNamespace(first_layer=0, dispatch=dispatch),
         wait=lambda event: trace.append(("wait", event[1])),
     )
     stages = [

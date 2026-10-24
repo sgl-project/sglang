@@ -12,7 +12,8 @@ from sglang.srt.afd.contracts import (
     AFDRole,
     AFDStepDescriptor,
 )
-from sglang.srt.afd.expert_exchange import AFDDirectExchange, direct_step_reason
+from sglang.srt.afd.expert_exchange import AFDDirectExchange
+from sglang.srt.afd.ffn_backend import direct_step_reason
 from sglang.srt.afd.transport import AFDPairedP2PTransport
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -236,7 +237,7 @@ def test_actual_capability_uses_model_geometry_and_role_native_placement(
     import sys
     from types import ModuleType
 
-    from sglang.srt.afd.expert_exchange import validate_direct_backend
+    from sglang.srt.afd.ffn_backend import validate_ffn_backend
 
     # Only process-global backend lookup is supplied; capability admission and
     # per-layer native metadata checks execute unchanged.
@@ -258,7 +259,7 @@ def test_actual_capability_uses_model_geometry_and_role_native_placement(
         ),
     )
     config = AFDConfig(lanes=f, attention_lanes=a)
-    result = validate_direct_backend(
+    result = validate_ffn_backend(
         config=config,
         adapter=adapter,
         model_family="qwen3_moe",
@@ -273,7 +274,7 @@ def test_actual_capability_uses_model_geometry_and_role_native_placement(
         experts.reduce_results = True
     else:
         del mlp.route
-    result = validate_direct_backend(
+    result = validate_ffn_backend(
         config=config,
         adapter=adapter,
         model_family="qwen3_moe",
@@ -285,7 +286,7 @@ def test_actual_capability_uses_model_geometry_and_role_native_placement(
         "native_expert_placement" if role == AFDRole.FFN else "non_routed_layer"
     )
     with pytest.raises(AFDError, match="SCOPE_UNSUPPORTED"):
-        validate_direct_backend(
+        validate_ffn_backend(
             config=AFDConfig(lanes=f, attention_lanes=a, ffn_backend="direct"),
             adapter=adapter,
             model_family="qwen3_moe",
@@ -306,6 +307,9 @@ def test_router_retention_respects_backend_priority_and_legacy_false(monkeypatch
     args.moe_a2a_backend = "none"
     args.afd_config = AFDConfig(experimental_direct=False)
     assert not model_hooks.afd_a_router_enabled(model_family="qwen3_moe")
+
+    args.afd_config = SimpleNamespace(experimental_m2n=True, experimental_direct=False)
+    assert model_hooks.afd_a_router_enabled(model_family="qwen3_moe")
 
 
 if __name__ == "__main__":

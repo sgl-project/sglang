@@ -14,7 +14,7 @@ from .contracts import (
     AFDShapeFactory,
     AFDStepDescriptor,
 )
-from .expert_exchange import direct_step_reason, select_direct_step
+from .ffn_backend import direct_step_reason, select_direct_step
 from .layer_executor import execute_layer_operations
 from .model_adapters.base import stage_forward_context
 
@@ -50,6 +50,21 @@ def _stage_participation(
         any(vector[stage] for vector in lane_stage_rows)
         for stage in range(len(lane_stage_rows[0]))
     )
+
+
+def _finish_backend_warmup(connector: AFDConnector) -> None:
+    backend = connector.transport.ffn_backend
+    if not backend.needs_warmup_barrier:
+        return
+    import torch
+
+    # Full backend runs its warmups through this closure, then captures it.
+    # Complete the two-sided work before capture; never record a CPU barrier.
+    if (
+        connector.graph_strategy.capturing
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        backend.finish_warmup()
 
 
 class AFDAttentionPipeline:
@@ -153,7 +168,7 @@ class AFDAttentionPipeline:
             and not is_extend_in_batch
             and all(all(stage_rows) for stage_rows in lane_rows)
         )
-        backend = self._connector.transport.direct
+        backend = self._connector.transport.ffn_backend
         reason = direct_step_reason(
             self._config, lane_rows, is_extend_in_batch, backend=backend
         )
@@ -290,7 +305,7 @@ class AFDAttentionPipeline:
         recv_events: list[Any] = [None] * len(stages)
         shared_outputs: list[Any] = [None] * len(stages)
         first_backend_layer = (
-            self._connector.transport.direct.first_layer
+            self._connector.transport.ffn_backend.first_layer
             if uses_backend
             else self._adapter.num_layers
         )
@@ -341,7 +356,7 @@ class AFDAttentionPipeline:
                     else:
                         import torch
 
-                        k = self._connector.transport.direct.top_k
+                        k = self._connector.transport.ffn_backend.top_k
                         ids = torch.empty(
                             (0, k), dtype=torch.int64, device=stage.hidden_states.device
                         )
@@ -350,7 +365,7 @@ class AFDAttentionPipeline:
                             dtype=torch.float32,
                             device=stage.hidden_states.device,
                         )
-                    recv_events[index] = self._connector.transport.direct.dispatch(
+                    recv_events[index] = self._connector.transport.ffn_backend.dispatch(
                         hidden=stage.hidden_states,
                         ids=ids,
                         weights=weights,
@@ -445,6 +460,8 @@ class AFDAttentionPipeline:
             # Last thing in the region: the send side never rejoins on its own,
             # and an unjoined stream leaves its work outside the graph's order.
             self._connector.transport.rejoin_streams()
+            if uses_backend:
+                _finish_backend_warmup(self._connector)
             return tuple((stage.hidden_states, stage.residual) for stage in stages)
 
         result = self._connector.graph_strategy.execute_step(
@@ -514,7 +531,7 @@ class AFDFFNPipeline:
             tokens_per_request=descriptor.tokens_per_request,
         )
         if descriptor.uses_direct:
-            self._connector.transport.direct.prepare_step(shape=shape)
+            self._connector.transport.ffn_backend.prepare_step(shape=shape)
         # One block per (stage, lane) this rank serves, stage-major, which at k == 1
         # is the per-stage vector the symmetric path always allocated.
         capacities = shape.group_bucket_rows(ffn_ordinal=lane)
@@ -674,7 +691,7 @@ class AFDFFNPipeline:
             # tensor it wrote, or nothing can distinguish it from a graph that
             # captured no work at all.
             if uses_backend:
-                first_layer = self._connector.transport.direct.first_layer
+                first_layer = self._connector.transport.ffn_backend.first_layer
                 if first_layer:
                     self._run_layers(
                         stages=stages,
@@ -683,7 +700,7 @@ class AFDFFNPipeline:
                         num_layers=first_layer,
                     )
                     self._connector.transport.rejoin_streams()
-                outputs = self._connector.transport.direct.run_ffn_step()
+                outputs = self._connector.transport.ffn_backend.run_ffn_step()
             else:
                 outputs = self._run_layers(
                     stages=stages,
@@ -693,6 +710,8 @@ class AFDFFNPipeline:
             # Last thing in the region: the send side never rejoins on its own,
             # and an unjoined stream leaves its work outside the graph's order.
             self._connector.transport.rejoin_streams()
+            if uses_backend:
+                _finish_backend_warmup(self._connector)
             return outputs
 
         self._connector.graph_strategy.execute_step(
@@ -709,11 +728,11 @@ class AFDFFNPipeline:
             self._config,
             descriptor.lane_stage_rows,
             descriptor.is_extend_in_batch,
-            backend=self._connector.transport.direct,
+            backend=self._connector.transport.ffn_backend,
         ):
             raise AFDError("AFD_DIRECT_MODE_MISMATCH")
         if (
-            self._connector.transport.direct is not None
+            self._connector.transport.ffn_backend is not None
             and not descriptor.uses_direct
             and descriptor.graph_eligible
         ):

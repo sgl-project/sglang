@@ -26,6 +26,8 @@ def afd_a_router_enabled(*, model_family: str | None = None) -> bool:
     config = getattr(args, "afd_config", None)
     if config is None:
         return False
+    if getattr(config, "experimental_m2n", False):
+        return True
     mode = getattr(
         config,
         "direct_mode",

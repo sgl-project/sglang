@@ -1029,7 +1029,7 @@ def test_routed_mode_survives_ffn_receive_reconstruction(
         },
     )
     pipeline._adapter = SimpleNamespace(hidden_size=4096, num_layers=94)
-    transport.direct = SimpleNamespace(max_rows=stage_rows)
+    transport.ffn_backend = SimpleNamespace(max_rows=stage_rows)
     pipeline._connector = SimpleNamespace(transport=transport)
     pipeline._validate_descriptor(descriptor=received)
     assert received == sent
