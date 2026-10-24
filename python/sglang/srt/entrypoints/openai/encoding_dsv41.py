@@ -134,9 +134,17 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
     P_dsml_strs = []
 
     raw_arguments = tool_call["arguments"]
-    arguments = (
-        json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
-    )
+    try:
+        arguments = (
+            json.loads(raw_arguments)
+            if isinstance(raw_arguments, str)
+            else raw_arguments
+        )
+    except json.JSONDecodeError:
+        # Preserve a rejected historical call alongside the client's parse
+        # error, without repairing arguments or inventing parameters. This
+        # renders history, not a call to execute.
+        return raw_arguments
     if not isinstance(arguments, dict):
         raise ValueError(
             "Assistant tool call function.arguments must be a JSON object."
