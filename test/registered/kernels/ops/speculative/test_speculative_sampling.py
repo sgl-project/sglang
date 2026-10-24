@@ -217,5 +217,111 @@ def test_target_only_sampling_cdf_boundaries(
     assert accept_token_num.item() == expected_accept_token_num
 
 
+@pytest.mark.parametrize(
+    "top_ks,temperature,top_p",
+    [
+        ([20], 1.0, 0.95),
+        ([1, 5, 20, 64], 0.7, 0.8),
+        ([40, 40, 40], 1.3, None),
+    ],
+    ids=["single-req", "mixed-top-k", "no-top-p"],
+)
+def test_chain_topk_sampling_matches_dense(top_ks, temperature, top_p):
+    """The top-k support kernel must reproduce the dense chain rejection sampler
+    (softmax -> top_k_renorm -> top_p_renorm) token for token under the same coins,
+    including bf16 logits tied at the top-k boundary, which top_k_renorm keeps."""
+    from flashinfer import top_k as flashinfer_top_k
+    from flashinfer.sampling import top_k_renorm_probs, top_p_renorm_probs
+
+    from sglang.kernels.ops.speculative.reject_sampling import (
+        chain_speculative_sampling_topk_triton,
+        chain_speculative_sampling_triton,
+        topk_support_width,
+    )
+
+    device = "cuda"
+    bs, num_slots, vocab = len(top_ks), 4, 32000
+    gen = torch.Generator(device=device).manual_seed(0)
+    top_ks_t = torch.tensor(top_ks, dtype=torch.int32, device=device)
+    temperatures = torch.full((bs, 1), temperature, device=device)
+    top_ps = None if top_p is None else torch.full((bs,), top_p, device=device)
+
+    # A draft close to the target, so the accept, reject and bonus paths all run.
+    logits = torch.randn(bs * num_slots, vocab, device=device, generator=gen) * 2
+    logits = logits.to(torch.bfloat16).float()
+    draft_logits = logits.view(bs, num_slots, vocab)[:, :-1]
+    draft_logits = draft_logits + 0.5 * torch.randn(
+        draft_logits.shape, device=device, generator=gen
+    )
+    draft_probs = torch.softmax(draft_logits * 1.5, dim=-1).contiguous()
+    retrive_index = torch.arange(bs * num_slots, device=device).view(bs, num_slots)
+
+    target_probs = torch.softmax(logits / temperature, dim=-1)
+    target_probs = top_k_renorm_probs(
+        target_probs, top_ks_t.repeat_interleave(num_slots)
+    )
+    if top_p is not None:
+        target_probs = top_p_renorm_probs(
+            target_probs, top_ps.repeat_interleave(num_slots)
+        )
+    target_probs = target_probs.view(bs, num_slots, vocab)
+    topk_logits, topk_ids = flashinfer_top_k(
+        logits, topk_support_width(max(top_ks), vocab), sorted=True, deterministic=True
+    )
+
+    accepted = 0
+    for _ in range(64):
+        candidates = torch.zeros(bs, num_slots, dtype=torch.int64, device=device)
+        for step in range(1, num_slots):
+            candidates[:, step] = torch.multinomial(
+                draft_probs[:, step - 1], 1, generator=gen
+            ).squeeze(1)
+        coins = torch.rand(bs, num_slots, device=device, generator=gen)
+        coins_final = torch.rand(bs, device=device, generator=gen)
+
+        outputs = []
+        for dense in (True, False):
+            predicts = torch.zeros(bs * num_slots, dtype=torch.int32, device=device)
+            accept_index = torch.full(
+                (bs, num_slots), -1, dtype=torch.int32, device=device
+            )
+            accept_token_num = torch.zeros(bs, dtype=torch.int32, device=device)
+            common = dict(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates,
+                retrive_index=retrive_index,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_final,
+                draft_probs=draft_probs,
+            )
+            if dense:
+                chain_speculative_sampling_triton(
+                    **common,
+                    retrive_next_token=None,
+                    retrive_next_sibling=None,
+                    target_probs=target_probs,
+                    threshold_single=1.0,
+                    threshold_acc=1.0,
+                    deterministic=True,
+                )
+            else:
+                chain_speculative_sampling_topk_triton(
+                    **common,
+                    topk_logits=topk_logits,
+                    topk_ids=topk_ids,
+                    temperatures=temperatures,
+                    top_ks=top_ks_t,
+                    top_ps=top_ps,
+                )
+            outputs.append((predicts, accept_index, accept_token_num))
+
+        for dense_out, topk_out in zip(*outputs):
+            assert torch.equal(dense_out, topk_out)
+        accepted += outputs[0][2].sum().item()
+    assert accepted > 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
