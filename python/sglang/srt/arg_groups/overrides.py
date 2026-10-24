@@ -1099,6 +1099,23 @@ def _deterministic_rocm_rccl_check(view: Any) -> dict:
 
 
 @register_post_process
+def _deterministic_rocm_fp8_gemm_backend(view: Any) -> dict:
+    # On ROCm, auto runs block-FP8 linears through AITER, which switches kernels and
+    # split-K settings with the number of tokens and can differ run to run. The Triton
+    # block-FP8 GEMM uses one tile configuration per weight shape and no split-K.
+    if (
+        view.enable_deterministic_inference
+        and get_platform().is_hip
+        and view.fp8_gemm_runner_backend == "auto"
+    ):
+        logger.warning(
+            "FP8 GEMM backend is set to triton for deterministic inference on ROCm."
+        )
+        return {"fp8_gemm_runner_backend": "triton"}
+    return {}
+
+
+@register_post_process
 def _deterministic_attention_backend(view: Any) -> dict:
     if not view.enable_deterministic_inference:
         return {}
