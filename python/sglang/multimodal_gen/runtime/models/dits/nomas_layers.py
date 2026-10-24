@@ -26,7 +26,6 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
-    get_tp_rank,
     get_tp_world_size,
     get_ulysses_ctx,
     model_parallel_is_initialized,
@@ -131,8 +130,8 @@ class PatchEmbed(nn.Module):
         return self.proj(x).flatten(2).transpose(1, 2)
 
 
-def timestep_embedding(t, dim, max_period=10000):
-    """Sinusoidal embedding of fractional timesteps, (*t.shape, dim)."""
+def timestep_embedding(t, dim=256, max_period=10000):
+    """Sinusoidal embedding of fractional timesteps, (*t.shape, dim); dim is even."""
     half = dim // 2
     freqs = torch.exp(
         -math.log(max_period)
@@ -141,27 +140,18 @@ def timestep_embedding(t, dim, max_period=10000):
     ).to(device=t.device)
     args = t.flatten()[:, None].float() * freqs[None]
     embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
     return embedding.view(*t.shape, dim)
 
 
 class TimestepEmbedder(nn.Module):
-    def __init__(
-        self, hidden_size, act_layer, frequency_embedding_size=256, max_period=10000
-    ):
+    def __init__(self, hidden_size):
         super().__init__()
-        self.frequency_embedding_size = frequency_embedding_size
-        self.max_period = max_period
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size),
-            act_layer(),
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(256, hidden_size), nn.SiLU(), nn.Linear(hidden_size, hidden_size)
         )
 
     def forward(self, t):
-        t_freq = timestep_embedding(t, self.frequency_embedding_size, self.max_period)
-        return self.mlp(t_freq.type(self.mlp[0].weight.dtype))
+        return self.mlp(timestep_embedding(t).type(self.mlp[0].weight.dtype))
 
 
 class FinalLayerPerBlock(nn.Module):
@@ -216,30 +206,12 @@ class IndividualTokenRefiner(nn.Module):
         return x
 
 
-def _to_tuple(x, dim):
-    if isinstance(x, int):
-        return (x,) * dim
-    if len(x) != dim:
-        raise ValueError(f"Expected length {dim} or int, but got {x}")
-    return x
-
-
-def get_meshgrid_nd(start, *args, dim=2, device=None):
-    """[dim, *sizes] grid: ``(num)`` counts from 0, ``(start, stop)`` steps by 1."""
-    if len(args) == 0:
-        num = _to_tuple(start, dim)
-        start, stop = (0,) * dim, num
-    elif len(args) == 1:
-        start, stop = _to_tuple(start, dim), _to_tuple(args[0], dim)
-        num = [stop[i] - start[i] for i in range(dim)]
-    else:
-        raise ValueError(f"len(args) should be 0 or 1, but got {len(args)}")
+def get_meshgrid_nd(start, stop, device=None):
+    """[len(start), *sizes] grid stepping by 1 from ``start`` up to ``stop``."""
     # torch.linspace(a, b, n+1)[:n] is upstream's np.linspace(endpoint=False).
     axes = [
-        torch.linspace(
-            start[i], stop[i], num[i] + 1, dtype=torch.float32, device=device
-        )[: num[i]]
-        for i in range(dim)
+        torch.linspace(a, b, b - a + 1, dtype=torch.float32, device=device)[: b - a]
+        for a, b in zip(start, stop)
     ]
     return torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=0)
 
@@ -306,13 +278,6 @@ def rms_norm_rotate(norm, x, freqs_cis, dtype):
         )
 
 
-def apply_rotary_emb(xq, xk, freqs_cis):
-    """Rotate [B, S, H, D] queries and keys with (cos, sin) tables of shape [S, D]."""
-    return apply_rotary_emb_single(xq, freqs_cis), apply_rotary_emb_single(
-        xk, freqs_cis
-    )
-
-
 def get_1d_rotary_pos_embed(dim, pos, theta=10000.0):
     """(cos, sin) of shape [S, dim] for float positions ``pos`` [S]."""
     freqs = 1.0 / (
@@ -325,9 +290,9 @@ def get_1d_rotary_pos_embed(dim, pos, theta=10000.0):
     )
 
 
-def get_nd_rotary_pos_embed(rope_dim_list, start, *args, theta=10000.0, device=None):
-    """n-D RoPE tables (cos, sin) of shape [prod(sizes), sum(rope_dim_list)]."""
-    grid = get_meshgrid_nd(start, *args, dim=len(rope_dim_list), device=device)
+def get_nd_rotary_pos_embed(rope_dim_list, start, stop, theta, device=None):
+    """n-D RoPE tables (cos, sin) of shape [prod(stop - start), sum(rope_dim_list)]."""
+    grid = get_meshgrid_nd(start, stop, device=device)
     embs = [
         get_1d_rotary_pos_embed(dim, grid[i].reshape(-1), theta)
         for i, dim in enumerate(rope_dim_list)
@@ -337,19 +302,8 @@ def get_nd_rotary_pos_embed(rope_dim_list, start, *args, theta=10000.0, device=N
     )
 
 
-def get_rotary_pos_embed_with_offset(
-    rope_sizes, time_offset, rope_dim_list, rope_theta
-):
-    """Tables for a segment whose first frame sits at ``time_offset`` of the clip."""
-    tt, th, tw = rope_sizes
-    return get_nd_rotary_pos_embed(
-        rope_dim_list, (time_offset, 0, 0), (time_offset + tt, th, tw), theta=rope_theta
-    )
-
-
 class ParallelInfo(Struct, frozen=True):
     tp_size: int = 1
-    tp_rank: int = 0
     sp_size: int = 1  # Ulysses degree; ring attention is not supported
     sp_rank: int = 0
 
@@ -364,35 +318,23 @@ def current_parallel_info() -> ParallelInfo:
     if get_ring_parallel_world_size() > 1:
         raise ValueError("Nomas supports Ulysses sequence parallelism only, not ring")
     sp_size, sp_rank = get_ulysses_ctx()
-    return ParallelInfo(get_tp_world_size(), get_tp_rank(), sp_size, sp_rank)
+    return ParallelInfo(get_tp_world_size(), sp_size, sp_rank)
 
 
-def seq_to_heads(x: torch.Tensor, info: ParallelInfo) -> torch.Tensor:
-    """[1, S_local, H, D] -> [1, S_global, H/U, D] (Ulysses input exchange)."""
+def ulysses_all_to_all(x, info: ParallelInfo, scatter_dim: int, gather_dim: int):
+    """Ulysses exchange: (2, 1) local tokens -> local heads, (1, 2) back."""
     if info.sp_size == 1:
         return x
-    return sequence_model_parallel_all_to_all_4D(x, scatter_dim=2, gather_dim=1)
+    return sequence_model_parallel_all_to_all_4D(
+        x, scatter_dim=scatter_dim, gather_dim=gather_dim
+    )
 
 
-def heads_to_seq(x: torch.Tensor, info: ParallelInfo) -> torch.Tensor:
-    """[1, S_global, H/U, D] -> [1, S_local, H, D] (Ulysses output exchange)."""
+def sp_all_gather(x, info: ParallelInfo, dim: int):
+    """Gather heads (dim 2, replicated text) or tokens (dim 1, final output)."""
     if info.sp_size == 1:
         return x
-    return sequence_model_parallel_all_to_all_4D(x, scatter_dim=1, gather_dim=2)
-
-
-def gather_heads(x: torch.Tensor, info: ParallelInfo) -> torch.Tensor:
-    """[1, S, H/U, D] -> [1, S, H, D] for the replicated text stream."""
-    if info.sp_size == 1:
-        return x
-    return sequence_model_parallel_all_gather(x, dim=2)
-
-
-def gather_seq(x: torch.Tensor, info: ParallelInfo) -> torch.Tensor:
-    """[1, S_local, C] -> [1, S_global, C]."""
-    if info.sp_size == 1:
-        return x
-    return sequence_model_parallel_all_gather(x, dim=1)
+    return sequence_model_parallel_all_gather(x, dim=dim)
 
 
 def local_token_range(num_tokens: int, info: ParallelInfo) -> tuple[int, int]:

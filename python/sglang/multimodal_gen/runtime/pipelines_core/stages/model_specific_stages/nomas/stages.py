@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.n
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.request_validation import (
     action_metadata,
+    cache_budget_bytes,
     cache_bytes_per_token,
     canonical_caption,
     check_cache_budget,
@@ -111,11 +112,6 @@ class NomasLatentPreparationStage(LatentPreparationStage):
         )
         batch.raw_latent_shape = batch.latents.shape
         return batch
-
-    def run_grouped_requests(self, batches, server_args):
-        if any(batch.session is not None for batch in batches):
-            return [self(batch, server_args) for batch in batches]
-        return super().run_grouped_requests(batches, server_args)
 
 
 class NomasTextEncodingStage(TextEncodingStage):
@@ -257,16 +253,7 @@ class NomasDenoisingStage(PipelineStage):
             camera_embedding = (
                 model.embed_camera(camera[None]) if camera is not None else None
             )
-            session = NomasLatentSession(
-                model,
-                cache_capacity=capacity,
-                seed=batch.seed,
-                steps=batch.num_inference_steps,
-                shift=config.flow_shift,
-                cache_noise_sigma=config.cache_noise_sigma,
-                generator=generator,
-                sigmas=batch.scheduler.sigmas,
-            )
+            session = self._new_session(model, batch, config, capacity, generator)
             segments = []
             for index, (condition, segment) in enumerate(
                 zip(conditions, plan, strict=True)
@@ -307,10 +294,6 @@ class NomasDenoisingStage(PipelineStage):
         ) as model:
             if batch.block_idx == 0 or state.session is None:
                 self._start_session(state, model, batch, server_args, condition)
-            if state.num_inference_steps != batch.num_inference_steps:
-                raise ValueError(
-                    "num_inference_steps cannot change within a Nomas realtime session"
-                )
             noise = self._noise_slice(state, server_args.pipeline_config, latent, batch)
             camera = _canonical_camera(batch, frames)
             if camera is not None:
@@ -348,11 +331,7 @@ class NomasDenoisingStage(PipelineStage):
         check_cache_budget(
             config, first_tokens, free_bytes=free_bytes, head_shards=shards
         )
-        limit = config.max_cache_gib * 2**30
-        if free_bytes is not None:
-            limit = min(
-                limit, max(0, free_bytes - config.cache_free_memory_reserve_gib * 2**30)
-            )
+        limit = cache_budget_bytes(config, free_bytes)
         max_capacity = max(first_tokens, int(limit // bytes_per_token))
         capacity = min(
             max_capacity, max(first_tokens, config.interactive_kv_cache_initial_tokens)
@@ -361,20 +340,16 @@ class NomasDenoisingStage(PipelineStage):
         # seeded with the request seed: bank first, then per segment any bank
         # growth followed by that segment's cache noise.
         state.noise_generator = torch.Generator(device="cpu").manual_seed(batch.seed)
-        state.session = NomasLatentSession(
+        state.session = self._new_session(
             model,
-            cache_capacity=capacity,
-            seed=batch.seed,
-            steps=batch.num_inference_steps,
-            shift=config.flow_shift,
-            cache_noise_sigma=config.cache_noise_sigma,
-            generator=state.noise_generator,
-            sigmas=batch.scheduler.sigmas,
+            batch,
+            config,
+            capacity,
+            state.noise_generator,
             max_cache_segments=config.max_cache_segments,
             max_cache_capacity=max_capacity,
             cache_growth_factor=config.interactive_kv_cache_growth_factor,
         )
-        state.num_inference_steps = batch.num_inference_steps
         logger.info(
             "Nomas session %s: cache %d tokens initial, %d max (%.2f GiB), max_cache_segments=%s",
             batch.realtime_session_id,
@@ -382,6 +357,20 @@ class NomasDenoisingStage(PipelineStage):
             max_capacity,
             max_capacity * bytes_per_token / 2**30,
             config.max_cache_segments,
+        )
+
+    @staticmethod
+    def _new_session(model, batch, config, capacity, generator, **options):
+        return NomasLatentSession(
+            model,
+            cache_capacity=capacity,
+            seed=batch.seed,
+            steps=batch.num_inference_steps,
+            shift=config.flow_shift,
+            cache_noise_sigma=config.cache_noise_sigma,
+            generator=generator,
+            sigmas=batch.scheduler.sigmas,
+            **options,
         )
 
     @staticmethod
@@ -496,7 +485,6 @@ class NomasDecodingStage(DecodingStage):
         output = server_args.pipeline_config.post_decoding(
             _to_unit_range(raw), server_args
         )
-        state.emitted_frames += output.shape[2]
         return OutputBatch(output=output, metrics=batch.metrics, usage=batch.usage)
 
     @staticmethod

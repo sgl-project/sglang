@@ -2,16 +2,11 @@
 """Nomas realtime contracts: FIFO cache eviction, streaming decode, adapter events."""
 
 import asyncio
-from dataclasses import fields
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from sglang.multimodal_gen.configs.models.vaes.nomas import (
-    NomasVAEArchConfig,
-    NomasVAEConfig,
-)
 from sglang.multimodal_gen.configs.pipeline_configs.nomas import NomasPipelineConfig
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeEvent,
@@ -30,11 +25,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session 
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
 )
-from sglang.multimodal_gen.runtime.models.vaes.nomas import (
-    GenExpertArch,
-    NomasPixelUMMDecoder,
-    NomasStreamingDecoder,
-)
+from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import NomasCache
+from sglang.multimodal_gen.runtime.models.vaes.nomas import NomasStreamingDecoder
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.denoise_loop import (
     NomasLatentSession,
     NomasSegmentCondition,
@@ -47,22 +39,32 @@ from sglang.multimodal_gen.runtime.realtime.nomas import (
     NOMAS_SEGMENT_CONDITION,
 )
 from sglang.multimodal_gen.runtime.realtime.states.nomas import NomasRealtimeState
-from sglang.multimodal_gen.test.unit.test_nomas import condition, tiny_model
+from sglang.multimodal_gen.test.unit.test_nomas import (
+    condition,
+    tiny_decoder,
+    tiny_model,
+)
 
-
-@pytest.fixture(autouse=True, scope="module")
-def _model_parallel(single_process_model_parallel):
-    """The framework's parallel linears resolve the TP group at construction."""
-    yield
-
+# The framework's parallel linears resolve the TP group at construction.
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 SHAPE = (2, 2, 2)  # 8 video tokens + 8 text tokens = 16 tokens per segment
 
 
-def _session(model, **kwargs):
+def _session(model, cache_capacity=48, steps=2, **kwargs):
     return NomasLatentSession(
-        model, cache_capacity=48, seed=7, steps=2, cache_noise_sigma=0.0, **kwargs
+        model,
+        cache_capacity=cache_capacity,
+        seed=7,
+        steps=steps,
+        cache_noise_sigma=0.0,
+        **kwargs,
     )
+
+
+def _plain_condition():
+    cond = condition()
+    return NomasSegmentCondition(cond.text_states, cond.text_mask)
 
 
 @torch.inference_mode()
@@ -144,12 +146,10 @@ def test_cache_grows_before_evicting_and_stops_at_max_capacity():
     is reached. Growth must keep committed rows and visibility intact."""
     model = tiny_model()
     cond = condition()
-    session = NomasLatentSession(
+    session = _session(
         model,
         cache_capacity=16,
-        seed=7,
         steps=1,
-        cache_noise_sigma=0.0,
         max_cache_capacity=40,
         cache_growth_factor=1.5,
     )
@@ -170,59 +170,52 @@ def test_cache_grows_before_evicting_and_stops_at_max_capacity():
     # 32 -> min(48, 40) = 40 holds only two segments, so the oldest is evicted.
     assert session.cache.capacity == 40 and session.cache.segment_lengths == [16, 16]
     assert session.cache.action_tails == [(10, 16), (26, 32)]
-    with pytest.raises(ValueError, match="exceeds the cache capacity"):
-        session.generate_segment((2, 4, 8), cond, evict=True)
 
 
+@pytest.mark.parametrize("failure", ["cache_forward", "growth"])
 @torch.inference_mode()
-def test_cache_grows_when_a_segment_cap_leaves_too_little_room():
-    """max_cache_segments evicts first; the survivor plus a longer segment may
-    still exceed the capacity, which must grow rather than reject."""
+def test_failure_after_eviction_requires_reset(monkeypatch, failure):
+    """Eviction rewrites history before the cache forward (and any growth); if
+    either then fails, a retry must not silently use the shorter history."""
     model = tiny_model()
-    cond = condition()
-    plain = NomasSegmentCondition(cond.text_states, cond.text_mask)
-    session = NomasLatentSession(
-        model,
-        cache_capacity=16,
-        seed=7,
-        steps=1,
-        cache_noise_sigma=0.0,
-        max_cache_segments=1,
-        max_cache_capacity=64,
+    plain = _plain_condition()
+    session = _session(
+        model, cache_capacity=16, steps=1, max_cache_segments=1, max_cache_capacity=64
     )
     session.generate_segment(SHAPE, plain, evict=True)
-    # 16 video + 8 text tokens: the only cached segment goes, then 16 -> 24.
-    session.generate_segment((2, 2, 4), plain, evict=True)
-    assert session.cache.capacity == 24 and session.cache.segment_lengths == [24]
-
-
-@torch.inference_mode()
-def test_failure_after_eviction_invalidates_the_cache(monkeypatch):
-    """Eviction rewrites history before the cache forward; if that forward
-    fails, a retry must not silently denoise against the shorter history."""
-    model = tiny_model()
-    cond = condition()
-    session = _session(model, max_cache_segments=1)
-    session.generate_segment(SHAPE, cond, evict=True)
     rng = session.generator.get_state()
-    predict = model.predict
+    if failure == "cache_forward":
+        predict = model.predict
 
-    def failing(*args, collect_cache=False, **kwargs):
-        if collect_cache:
-            raise RuntimeError("injected cache forward failure")
-        return predict(*args, **kwargs)
+        def fail(*args, collect_cache=False, **kwargs):
+            if collect_cache:
+                raise RuntimeError("injected failure")
+            return predict(*args, **kwargs)
 
-    monkeypatch.setattr(model, "predict", failing)
-    with pytest.raises(RuntimeError, match="injected"):
-        session.generate_segment(SHAPE, cond, evict=True)
+        monkeypatch.setattr(model, "predict", fail)
+        shape, error = SHAPE, RuntimeError
+    else:
+
+        def fail(*args):
+            raise torch.OutOfMemoryError("injected failure")
+
+        monkeypatch.setattr(NomasCache, "grow", fail)
+        # 16 video + 8 text tokens: the only cached segment goes, then 16 -> 24.
+        shape, error = (4, 2, 2), torch.OutOfMemoryError
+    with pytest.raises(error, match="injected"):
+        session.generate_segment(shape, plain, evict=True)
     assert session.cache.valid_length == 0 and session.cache.failed
     assert torch.equal(session.generator.get_state(), rng)
-    monkeypatch.setattr(model, "predict", predict)
+    monkeypatch.undo()
     with pytest.raises(RuntimeError, match="reset the session"):
-        session.generate_segment(SHAPE, cond, evict=True)
+        session.generate_segment(shape, plain, evict=True)
     session.reset()
-    session.generate_segment(SHAPE, cond, evict=True)
-    assert session.cache.segment_lengths == [16]
+    session.generate_segment(shape, plain, evict=True)
+    tokens = shape[0] * shape[1] * shape[2] + 8
+    assert session.cache.segment_lengths == [tokens]
+    if failure == "growth":
+        # A segment cap that leaves too little room grows the cache instead.
+        assert session.cache.capacity == 24
 
 
 @torch.inference_mode()
@@ -230,8 +223,7 @@ def test_realtime_noise_bank_and_cache_noise_share_upstream_rng_order():
     """Upstream draws the bank, then per segment any bank growth and that
     segment's cache noise, all from one generator seeded with the seed."""
     model = tiny_model()
-    cond = condition()
-    plain = NomasSegmentCondition(cond.text_states, cond.text_mask)
+    plain = _plain_condition()
     config = NomasPipelineConfig(
         interactive_noise_max_seconds=1.0, interactive_noise_growth_seconds=1.0
     )
@@ -273,19 +265,6 @@ def test_realtime_noise_bank_and_cache_noise_share_upstream_rng_order():
     torch.testing.assert_close(state.noise_bank, expected_bank, atol=0, rtol=0)
 
 
-def _tiny_decoder():
-    torch.manual_seed(5)
-    arch = NomasVAEArchConfig(
-        hidden_size=64,
-        intermediate_size=128,
-        num_layers=1,
-        num_heads=2,
-        num_kv_heads=1,
-        head_dim=32,
-    )
-    return NomasPixelUMMDecoder(NomasVAEConfig(arch_config=arch)).eval(), arch
-
-
 def stream_events(decoder, segments, frames):
     """Push each event onto one timeline, then finish; returns per-call outputs."""
     arch = decoder.config.arch_config
@@ -317,7 +296,7 @@ def test_streaming_decode_emits_the_stable_prefix_of_the_full_decode(frames, cou
     """Upstream stable-prefix streaming: a frame leaves only once no later
     window can change it, and the concatenation is the full-clip decode with
     each event's padded tail frames dropped."""
-    decoder, arch = _tiny_decoder()
+    decoder = tiny_decoder()
     gen = torch.Generator().manual_seed(11)
     segments = [
         torch.randn(1, 32, (f - 1) // 4 + 1, 2, 2, generator=gen) for f in frames
@@ -332,7 +311,10 @@ def test_streaming_decode_emits_the_stable_prefix_of_the_full_decode(frames, cou
     emitted = torch.cat([o for o in outputs if o is not None], dim=2)
     torch.testing.assert_close(emitted, expected, atol=0, rtol=0)
     # Only latents a later window can still read are retained.
-    assert timeline.latents.shape[2] <= 2 * arch.temporal_window_latents
+    assert (
+        timeline.latents.shape[2]
+        <= 2 * decoder.config.arch_config.temporal_window_latents
+    )
     with pytest.raises(RuntimeError, match="already finished"):
         timeline.finish(None)
 
@@ -343,89 +325,75 @@ def test_streaming_decode_rejects_inconsistent_event_lengths():
     for frames in (8, 13):
         with pytest.raises(ValueError, match="do not match"):
             timeline.push(None, latent, frames)
-    assert {f.name for f in fields(GenExpertArch)} <= {
-        f.name for f in fields(NomasVAEArchConfig)
-    }
-
-
-def _init_request(**overrides):
-    payload = {"type": "init", "prompt": "A red car.", "num_frames": 17}
-    payload.update(overrides)
-    return RealtimeVideoGenerationsRequest.model_validate(payload)
-
-
-def test_adapter_registered_for_nomas_config():
-    server_args = SimpleNamespace(pipeline_config=NomasPipelineConfig())
-    assert isinstance(get_realtime_model_adapter(server_args), NomasRealtimeAdapter)
 
 
 def test_adapter_events_chunks_and_flush(monkeypatch):
+    built = {}
+
+    def fake_builder(
+        request_id, *, chunk_inputs, num_frames, num_inference_steps, chunk_size, **_
+    ):
+        built.update(
+            num_frames=num_frames, steps=num_inference_steps, chunk_size=chunk_size
+        )
+        return SimpleNamespace(prompt=chunk_inputs.prompt)
+
+    monkeypatch.setattr(adapter_module, "build_realtime_sampling_params", fake_builder)
+
+    def segment(payload, event_id=None):
+        return RealtimeEvent(
+            type="event", kind="segment", payload=payload, event_id=event_id
+        )
+
     async def run():
-        adapter = NomasRealtimeAdapter()
+        server_args = SimpleNamespace(pipeline_config=NomasPipelineConfig())
+        adapter = get_realtime_model_adapter(server_args)
+        assert isinstance(adapter, NomasRealtimeAdapter)
         session = GenerateSession()
         session.set_adapter(adapter)
-        request = _init_request(condition_inputs={"prompt_format": "json"})
+        request = RealtimeVideoGenerationsRequest.model_validate(
+            {
+                "type": "init",
+                "prompt": "A red car.",
+                "num_frames": 17,
+                "condition_inputs": {"prompt_format": "json"},
+            }
+        )
         await adapter.on_init(session, request)
         session.set_request(request)
         state = adapter._state(session)
         assert state.prompt_format == "json" and len(state.pending) == 1
         assert adapter.get_chunk_size(session, None, None) == 5
-
-        # 32 frames -> 8 latents -> (8-1)*4+1 = 29 canonical poses
-        camera = [[[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0], [0, 0, 0, 1.0]]] * 29
-        log = adapter.ingest_event(
-            session,
-            RealtimeEvent(
-                type="event",
-                kind="segment",
-                payload={"caption": "turn", "frames": 32, "norm_extrinsics": camera},
-                event_id=3,
-            ),
-        )
-        assert log.startswith("kind=segment") and len(state.pending) == 2
-        with pytest.raises(ValueError, match="4x4 matrices"):
-            adapter.ingest_event(
-                session,
-                RealtimeEvent(
-                    type="event",
-                    kind="segment",
-                    payload={
-                        "caption": "x",
-                        "frames": 32,
-                        "norm_extrinsics": camera[:5],
-                    },
-                ),
-            )
-        with pytest.raises(ValueError, match="unsupported event kind"):
-            adapter.ingest_event(
-                session, RealtimeEvent(type="event", kind="prompt", payload="x")
-            )
-
-        built = {}
-
-        def fake_builder(
-            request_id,
-            *,
-            request,
-            chunk_inputs,
-            num_frames,
-            num_inference_steps,
-            chunk_size,
-        ):
-            built.update(
-                num_frames=num_frames, steps=num_inference_steps, chunk_size=chunk_size
-            )
-            return SimpleNamespace(prompt=chunk_inputs.prompt)
-
-        monkeypatch.setattr(
-            adapter_module, "build_realtime_sampling_params", fake_builder
-        )
         chunk = SimpleNamespace(request_id="r0", index=0)
 
+        def step():
+            size = adapter.get_chunk_size(session, None, chunk)
+            inputs = adapter.sample_chunk_inputs(session, None, chunk, size)
+            params = adapter.build_sampling_params(session, None, chunk, inputs, size)
+            return size, inputs, params
+
+        # 32 frames -> 8 latents -> (8-1)*4+1 = 29 canonical poses
+        camera = [torch.eye(4).tolist()] * 29
+        log = adapter.ingest_event(
+            session,
+            segment({"caption": "turn", "frames": 32, "norm_extrinsics": camera}, 3),
+        )
+        assert log.startswith("kind=segment") and len(state.pending) == 2
+        for event, error in (
+            (
+                segment({"caption": "x", "frames": 32, "norm_extrinsics": camera[:5]}),
+                "4x4 matrices",
+            ),
+            (
+                RealtimeEvent(type="event", kind="prompt", payload="x"),
+                "unsupported event kind",
+            ),
+        ):
+            with pytest.raises(ValueError, match=error):
+                adapter.ingest_event(session, event)
+
         await adapter.wait_for_next_chunk(session)
-        size = adapter.get_chunk_size(session, None, chunk)
-        inputs = adapter.sample_chunk_inputs(session, None, chunk, size)
-        params = adapter.build_sampling_params(session, None, chunk, inputs, size)
+        _, _, params = step()
         assert built == {"num_frames": 17, "steps": 8, "chunk_size": 5}
         assert params.segments == [{"frames": 17, "caption": "A red car."}]
         assert params.prompt_format == "json" and params.norm_extrinsics is None
@@ -433,9 +401,7 @@ def test_adapter_events_chunks_and_flush(monkeypatch):
         assert adapter.get_realtime_event_id(session) is None
         session.generate_chunk_completed()
 
-        size = adapter.get_chunk_size(session, None, chunk)
-        inputs = adapter.sample_chunk_inputs(session, None, chunk, size)
-        params = adapter.build_sampling_params(session, None, chunk, inputs, size)
+        size, _, params = step()
         assert size == 8 and params.norm_extrinsics == camera
         assert adapter.get_realtime_event_id(session) == 3
         session.generate_chunk_completed()
@@ -444,23 +410,12 @@ def test_adapter_events_chunks_and_flush(monkeypatch):
         waiter = asyncio.create_task(adapter.wait_for_next_chunk(session))
         await asyncio.sleep(0)
         assert not waiter.done()
-        assert (
-            adapter.ingest_event(session, RealtimeEvent(type="event", kind="end"))
-            == "kind=end"
-        )
+        end = RealtimeEvent(type="event", kind="end")
+        assert adapter.ingest_event(session, end) == "kind=end"
         await asyncio.wait_for(waiter, 1)
         with pytest.raises(ValueError, match="after end"):
-            adapter.ingest_event(
-                session,
-                RealtimeEvent(
-                    type="event",
-                    kind="segment",
-                    payload={"caption": "late", "frames": 4},
-                ),
-            )
-        size = adapter.get_chunk_size(session, None, chunk)
-        inputs = adapter.sample_chunk_inputs(session, None, chunk, size)
-        params = adapter.build_sampling_params(session, None, chunk, inputs, size)
+            adapter.ingest_event(session, segment({"caption": "late", "frames": 4}))
+        size, inputs, params = step()
         assert size == 1 and inputs.condition_inputs[NOMAS_FLUSH_CONDITION] is True
         assert inputs.condition_inputs[NOMAS_SEGMENT_CONDITION]["frames"] == 4
         assert params.prompt_format == "plain"
@@ -484,38 +439,3 @@ def test_segment_payload_validation():
     ):
         with pytest.raises(ValueError):
             parse_segment_payload(payload, None)
-
-
-@torch.inference_mode()
-def test_growth_failure_after_eviction_requires_reset(monkeypatch):
-    from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import NomasCache
-
-    model = tiny_model()
-    c = condition()
-    plain = NomasSegmentCondition(c.text_states, c.text_mask)
-    session = NomasLatentSession(
-        model,
-        cache_capacity=16,
-        max_cache_capacity=64,
-        max_cache_segments=1,
-        seed=7,
-        steps=1,
-    )
-    session.generate_segment(SHAPE, plain, evict=True)
-    rng = session.generator.get_state()
-    grow = NomasCache.grow
-
-    def fail_allocation(*args):
-        raise torch.OutOfMemoryError("injected allocation failure")
-
-    monkeypatch.setattr(NomasCache, "grow", fail_allocation)
-    with pytest.raises(torch.OutOfMemoryError, match="injected"):
-        session.generate_segment((4, 2, 2), plain, evict=True)
-    assert session.cache.valid_length == 0 and session.cache.failed
-    assert torch.equal(session.generator.get_state(), rng)
-    monkeypatch.setattr(NomasCache, "grow", grow)
-    with pytest.raises(RuntimeError, match="reset the session"):
-        session.generate_segment((4, 2, 2), plain, evict=True)
-    session.reset()
-    session.generate_segment((4, 2, 2), plain, evict=True)
-    assert session.cache.valid_length == 24

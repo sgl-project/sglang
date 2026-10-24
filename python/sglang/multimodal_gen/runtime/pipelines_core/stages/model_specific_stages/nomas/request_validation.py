@@ -200,17 +200,23 @@ def cache_bytes_per_token(config, head_shards=1):
     )
 
 
-def check_cache_budget(config, capacity, *, free_bytes=None, head_shards=1):
-    """Bound persistent KV before allocation; this is not a peak-memory predictor."""
-    required = capacity * cache_bytes_per_token(config, head_shards)
+def cache_budget_bytes(config, free_bytes=None):
+    """KV budget: max_cache_gib, capped by free memory minus the reserve."""
     limit = config.max_cache_gib * 2**30
     if free_bytes is not None:
         limit = min(
             limit, max(0, free_bytes - config.cache_free_memory_reserve_gib * 2**30)
         )
+    return limit
+
+
+def check_cache_budget(config, capacity, *, free_bytes=None, head_shards=1):
+    """Bound persistent KV before allocation; this is not a peak-memory predictor."""
+    required = capacity * cache_bytes_per_token(config, head_shards)
+    limit = cache_budget_bytes(config, free_bytes)
     if required > limit:
         raise ValueError(
             f"Nomas KV requires {required / 2**30:.2f} GiB, budget {limit / 2**30:.2f} GiB; "
-            "reduce resolution, event count or text length. No KV eviction is implemented."
+            "reduce resolution, event count or text length."
         )
     return required

@@ -28,8 +28,6 @@ class NomasArchConfig(DiTArchConfig):
     )
 
     def __post_init__(self):
-        if self.hidden_size <= 0 or self.num_attention_heads <= 0:
-            raise ValueError("hidden size and head count must be positive")
         if self.hidden_size % self.num_attention_heads:
             raise ValueError("hidden size must be divisible by head count")
         if sum(self.rope_dim_list) != self.hidden_size // self.num_attention_heads:
@@ -42,17 +40,6 @@ class NomasArchConfig(DiTArchConfig):
             raise ValueError(
                 "Nomas cache executor currently requires patch_size=(1,1,1)"
             )
-        if (
-            min(
-                self.num_layers,
-                self.in_channels,
-                self.out_channels,
-                self.text_states_dim,
-                self.camera_chunk_size,
-            )
-            <= 0
-        ):
-            raise ValueError("model dimensions and camera chunk size must be positive")
         self.num_channels_latents = self.in_channels
 
 

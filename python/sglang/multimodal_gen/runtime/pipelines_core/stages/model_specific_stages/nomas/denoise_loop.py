@@ -24,7 +24,6 @@ class NomasSegmentCondition(Struct, frozen=True):
     text_states: torch.Tensor
     text_mask: torch.Tensor
     camera_embedding: torch.Tensor | None = None
-    norm_extrinsics: torch.Tensor | None = None
     camera_has_mask: torch.Tensor | None = None
     text_offsets: tuple[int, ...] | None = None
     video_windows: tuple[tuple[int, int, int], ...] | None = None
@@ -48,7 +47,6 @@ class NomasLatentSession:
         steps: int = 8,
         shift: float = 5.0,
         cache_noise_sigma: float = 0.206897,
-        hide_cached_action_tails: bool = True,
         generator: torch.Generator | None = None,
         sigmas: torch.Tensor | None = None,
         max_cache_segments: int | None = None,
@@ -64,8 +62,6 @@ class NomasLatentSession:
             raise ValueError("Euler steps and shift must be positive and finite")
         if not 0 <= cache_noise_sigma <= 1:
             raise ValueError("cache noise sigma must be in [0,1]")
-        if model.config.in_channels != model.config.out_channels:
-            raise ValueError("segment executor requires equal input/output channels")
         self.model = model.eval().requires_grad_(False)
         self.cache = model.allocate_cache(cache_capacity)
         self.seed = seed
@@ -90,7 +86,6 @@ class NomasLatentSession:
             )
         self.steps, self.shift = steps, shift
         self.cache_noise_sigma = cache_noise_sigma
-        self.hide_cached_action_tails = hide_cached_action_tails
         if max_cache_segments is not None and max_cache_segments < 1:
             raise ValueError("max_cache_segments must be positive or None")
         # Upstream max_cache_segments: FIFO by whole segment, None keeps all.
@@ -206,11 +201,10 @@ class NomasLatentSession:
                 text_mask=condition.text_mask,
                 cache=self.cache,
                 camera_embedding=condition.camera_embedding,
-                norm_extrinsics=condition.norm_extrinsics,
                 camera_has_mask=condition.camera_has_mask,
                 text_offsets=condition.text_offsets,
                 video_windows=condition.video_windows,
-                hide_cached_action_tails=self.hide_cached_action_tails,
+                hide_cached_action_tails=True,
             )
             sigmas = self.sigmas
             if sigmas is None:
@@ -223,21 +217,13 @@ class NomasLatentSession:
                 dtype=p.dtype,
                 enabled=p.dtype in (torch.bfloat16, torch.float16),
             ):
-                # Compute pose embedding once per segment, outside the Euler loop.
-                if condition.norm_extrinsics is not None:
-                    if condition.camera_embedding is not None:
-                        raise ValueError("pass exactly one camera representation")
-                    kwargs["camera_embedding"] = self.model.embed_camera(
-                        condition.norm_extrinsics
-                    )
-                    kwargs["norm_extrinsics"] = None
                 context = self.model.prepare_segment_context(
                     latent,
                     condition.text_mask,
                     self.cache,
                     text_offsets=condition.text_offsets,
                     video_windows=condition.video_windows,
-                    hide_cached_action_tails=self.hide_cached_action_tails,
+                    hide_cached_action_tails=True,
                 )
                 kwargs["_context"] = context
                 for index in range(self.steps):
@@ -262,7 +248,7 @@ class NomasLatentSession:
                                 self.cache,
                                 text_offsets=condition.text_offsets,
                                 video_windows=condition.video_windows,
-                                hide_cached_action_tails=self.hide_cached_action_tails,
+                                hide_cached_action_tails=True,
                                 rope=context.rope,
                             )
                     sigma = self.cache_noise_sigma

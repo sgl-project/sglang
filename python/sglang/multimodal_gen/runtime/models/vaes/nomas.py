@@ -32,8 +32,7 @@ TUBE_DIM = TUBELET[0] * TUBELET[1] * TUBELET[2] * 3
 LATENT_CHANNELS = 32
 # A DCAE latent cell is (4, 32, 32) pixels: 1 tubelet in time, 2 x 2 in space.
 LATENT_TOKEN_GRID = 2
-# Target size of one FP32 Q/K input chunk; intermediate tensors add overhead.
-_QK_CHUNK_INPUT_BYTES = 16 * 2**20
+# Target FP32 bytes per fused Q/K chunk; only the squares are materialised.
 _QK_FUSED_CHUNK_BYTES = 256 * 2**20
 
 
@@ -130,29 +129,6 @@ def apply_mrope(
     return x * cos + rotated * sin
 
 
-def _mrope_to_dtype(x, cos, sin, sections, dtype):
-    return apply_mrope(x, cos, sin, sections).to(dtype)
-
-
-@lru_cache(maxsize=1)
-def _compiled_mrope():
-    # Keep the FP32 multiply/add rounding boundaries instead of contracting
-    # the RoPE products into FMA. The RMS reductions stay outside this graph.
-    # Dynamic shapes cover Q/K head counts, chunk tails and decode windows.
-    return torch.compile(
-        _mrope_to_dtype,
-        dynamic=True,
-        fullgraph=True,
-        options={"emulate_precision_casts": True},
-    )
-
-
-def _apply_mrope_and_cast(x, cos, sin, sections, dtype):
-    if x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling():
-        return _compiled_mrope()(x, cos, sin, sections, dtype)
-    return _mrope_to_dtype(x, cos, sin, sections, dtype)
-
-
 def _fused_ok(x: torch.Tensor) -> bool:
     return (
         x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
@@ -216,10 +192,6 @@ def _mean_square(x):
     return _compiled_square()(x).mean(-1, keepdim=True)
 
 
-_LOCAL_LAYOUTS: dict = {}
-_COMPILED_FLEX = None
-
-
 @lru_cache(maxsize=1)
 def _block_mask_builder():
     from torch.nn.attention.flex_attention import create_block_mask
@@ -231,52 +203,43 @@ def local_attention_layout(grid: tuple[int, int, int], tile: int, device):
     """``(perm, inverse, block_mask)`` of the sliding-tile attention, or None when the plane has
     at most 3 x 3 tiles (full attention). ``tokens[:, perm]`` is the tile-major order the mask is
     built in; cached per shape."""
+    _, height, width = grid
+    if -(-height // tile) <= 3 and -(-width // tile) <= 3:
+        return None
+    return _cached_local_layout(tuple(grid), tile, str(device))
+
+
+@lru_cache(maxsize=8)
+def _cached_local_layout(grid, tile, device):
     from torch.nn.attention.flex_attention import create_block_mask
 
     frames, height, width = grid
     tiles_h, tiles_w = -(-height // tile), -(-width // tile)
-    if tiles_h <= 3 and tiles_w <= 3:
-        return None
-    key = (grid, tile, str(device))
-    if key not in _LOCAL_LAYOUTS:
-        if len(_LOCAL_LAYOUTS) >= 8:
-            _LOCAL_LAYOUTS.pop(next(iter(_LOCAL_LAYOUTS)))
-        t, h, w = torch.meshgrid(
-            *(torch.arange(n, device=device) for n in grid), indexing="ij"
-        )
-        tile_h, tile_w = (h // tile).flatten(), (w // tile).flatten()
-        order = (
-            ((tile_h * tiles_w + tile_w) * frames + t.flatten()) * tile
-            + (h % tile).flatten()
-        ) * tile
-        perm = torch.argsort(order + (w % tile).flatten())
-        tile_h, tile_w = tile_h[perm], tile_w[perm]
-        center_h = tile_h.clamp(1, max(tiles_h - 2, 1))
-        center_w = tile_w.clamp(1, max(tiles_w - 2, 1))
+    t, h, w = torch.meshgrid(
+        *(torch.arange(n, device=device) for n in grid), indexing="ij"
+    )
+    tile_h, tile_w = (h // tile).flatten(), (w // tile).flatten()
+    order = (
+        ((tile_h * tiles_w + tile_w) * frames + t.flatten()) * tile
+        + (h % tile).flatten()
+    ) * tile
+    perm = torch.argsort(order + (w % tile).flatten())
+    tile_h, tile_w = tile_h[perm], tile_w[perm]
+    center_h = tile_h.clamp(1, max(tiles_h - 2, 1))
+    center_w = tile_w.clamp(1, max(tiles_w - 2, 1))
 
-        def mask_mod(batch, head, q_idx, kv_idx):
-            return ((center_h[q_idx] - tile_h[kv_idx]).abs() <= 1) & (
-                (center_w[q_idx] - tile_w[kv_idx]).abs() <= 1
-            )
+    def mask_mod(batch, head, q_idx, kv_idx):
+        return ((center_h[q_idx] - tile_h[kv_idx]).abs() <= 1) & (
+            (center_w[q_idx] - tile_w[kv_idx]).abs() <= 1
+        )
 
-        count = frames * height * width
-        builder = (
-            _block_mask_builder()
-            if torch.device(device).type == "cuda"
-            else create_block_mask
-        )
-        if torch.device(device).type != "cuda" and count * count > 16_777_216:
-            raise ValueError("PixelUMM CPU reference mask is too large; use CUDA")
-        block_mask = builder(
-            mask_mod,
-            None,
-            None,
-            count,
-            count,
-            device=device,
-        )
-        _LOCAL_LAYOUTS[key] = (perm, torch.argsort(perm), block_mask)
-    return _LOCAL_LAYOUTS[key]
+    count = frames * height * width
+    on_cuda = torch.device(device).type == "cuda"
+    if not on_cuda and count * count > 16_777_216:
+        raise ValueError("PixelUMM CPU reference mask is too large; use CUDA")
+    builder = _block_mask_builder() if on_cuda else create_block_mask
+    block_mask = builder(mask_mod, None, None, count, count, device=device)
+    return perm, torch.argsort(perm), block_mask
 
 
 def _flex_attention(
@@ -288,13 +251,17 @@ def _flex_attention(
     """
     from torch.nn.attention.flex_attention import flex_attention
 
-    global _COMPILED_FLEX
     if q.device.type != "cuda" or torch.compiler.is_compiling():
         return flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
-    if _COMPILED_FLEX is None:
-        # Never allow an eager quadratic-memory fallback after graph specialization.
-        _COMPILED_FLEX = torch.compile(flex_attention, dynamic=True, fullgraph=True)
-    return _COMPILED_FLEX(q, k, v, block_mask=block_mask, enable_gqa=True)
+    return _compiled_flex()(q, k, v, block_mask=block_mask, enable_gqa=True)
+
+
+@lru_cache(maxsize=1)
+def _compiled_flex():
+    from torch.nn.attention.flex_attention import flex_attention
+
+    # Never allow an eager quadratic-memory fallback after graph specialization.
+    return torch.compile(flex_attention, dynamic=True, fullgraph=True)
 
 
 class RMSNorm(nn.Module):
@@ -343,33 +310,11 @@ class GenAttention(nn.Module):
         return torch.cat((norm_t(t_part), norm_hw(hw_part)), dim=-1)
 
     def _prepare_qk(self, x, cos, sin, norm_t, norm_hw, dtype):
-        # Bound FP32 QK/RoPE intermediates without splitting the norm reduction
-        # dimension. All operations and casts retain their original order.
-        batch, tokens, heads, head_dim = x.shape
-        fp32_bytes = torch.finfo(torch.float32).bits // 8
-        bytes_per_token = batch * heads * head_dim * fp32_bytes
-        chunk = max(1, _QK_CHUNK_INPUT_BYTES // bytes_per_token)
         if _fused_ok(x):
             return self._prepare_qk_fused(x, cos, sin, norm_t, norm_hw, dtype)
-        if torch.is_grad_enabled() or tokens <= chunk:
-            normalized = self._split_norm(x.float(), norm_t, norm_hw)
-            return _apply_mrope_and_cast(
-                normalized, cos, sin, self.arch.rope_sections, dtype
-            )
-        result = torch.empty_like(x, dtype=dtype)
-        for first in range(0, tokens, chunk):
-            last = min(first + chunk, tokens)
-            normalized = self._split_norm(x[:, first:last].float(), norm_t, norm_hw)
-            part = _apply_mrope_and_cast(
-                normalized,
-                cos[:, first:last],
-                sin[:, first:last],
-                self.arch.rope_sections,
-                dtype,
-            )
-            result[:, first:last].copy_(part)
-            del normalized, part
-        return result
+        # CPU / autograd reference: FP32 QK norm, MRoPE, then the cast.
+        normalized = self._split_norm(x.float(), norm_t, norm_hw)
+        return apply_mrope(normalized, cos, sin, self.arch.rope_sections).to(dtype)
 
     def _prepare_qk_fused(self, x, cos, sin, norm_t, norm_hw, dtype):
         """Same values as the eager path: ATen mean squares, one fused kernel for the rest."""
@@ -471,10 +416,6 @@ class DCAEVPixelUMMDecoder(nn.Module):
         self, arch: GenExpertArch = QWEN3_8B_GEN, *, local_attention_tile: int = 0
     ):
         super().__init__()
-        if local_attention_tile < 0:
-            raise ValueError(
-                f"local_attention_tile must be >= 0 tokens, got {local_attention_tile}"
-            )
         self.arch = arch
         self.local_attention_tile = int(local_attention_tile)
         hidden = arch.hidden_size
@@ -590,8 +531,6 @@ class NomasStreamingDecoder:
     """
 
     def __init__(self, window: int, overlap: int, temporal_ratio: int = 4):
-        if not 0 <= overlap < window:
-            raise ValueError("PixelUMM requires 0 <= overlap < window")
         self.window, self.stride = window, window - overlap
         self.ratio = temporal_ratio
         # Latents still needed by a future window; the first is absolute latent_start.

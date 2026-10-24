@@ -32,8 +32,6 @@ class NomasCache(Struct):
     @classmethod
     def allocate(cls, config, capacity: int, *, device, dtype, num_heads=None):
         """``num_heads`` is the per-rank head count under TP or sequence parallel."""
-        if capacity < 0:
-            raise ValueError("cache capacity must be nonnegative")
         shape = (
             1,
             capacity,
@@ -50,21 +48,21 @@ class NomasCache(Struct):
     def capacity(self) -> int:
         return self.visible.shape[1]
 
-    def reserve(self, tokens: int):
+    def _check_usable(self):
         if self.failed:
             raise RuntimeError(
                 "cache is invalid after a failed commit; reset the session"
             )
+
+    def reserve(self, tokens: int):
+        self._check_usable()
         if tokens <= 0 or self.valid_length + tokens > self.capacity:
             raise ValueError(
                 "Nomas cache capacity exceeded; evict older segments or raise the budget"
             )
 
     def history_mask(self, hide_action_tails: bool):
-        if self.failed:
-            raise RuntimeError(
-                "cache is invalid after a failed commit; reset the session"
-            )
+        self._check_usable()
         mask = self.visible[:, : self.valid_length].clone()
         if hide_action_tails:
             for start, end in self.action_tails:
@@ -110,10 +108,7 @@ class NomasCache(Struct):
         them and tails that fell out are dropped. The RoPE frame offset keeps
         counting, so later segments keep their absolute positions.
         """
-        if self.failed:
-            raise RuntimeError(
-                "cache is invalid after a failed commit; reset the session"
-            )
+        self._check_usable()
         if not self.segment_lengths:
             return 0
         evicted = self.segment_lengths.pop(0)
@@ -128,7 +123,7 @@ class NomasCache(Struct):
                 self.visible[:, :remaining] = self.visible[
                     :, evicted : self.valid_length
                 ].clone()
-            self.visible[:, max(remaining, 0) :] = False
+            self.visible[:, remaining:] = False
             self.action_tails = [
                 (max(start - evicted, 0), end - evicted)
                 for start, end in self.action_tails
@@ -144,10 +139,7 @@ class NomasCache(Struct):
         """Reallocate to a larger capacity, keeping committed rows (upstream growth)."""
         if capacity <= self.capacity:
             return
-        if self.failed:
-            raise RuntimeError(
-                "cache is invalid after a failed commit; reset the session"
-            )
+        self._check_usable()
         for layer in self.layers:
             for key in ("k", "v"):
                 old = layer[key]
@@ -162,18 +154,10 @@ class NomasCache(Struct):
         visible[:, : self.valid_length] = self.visible[:, : self.valid_length]
         self.visible = visible
 
-    def evict_for(self, tokens: int, max_segments: int | None = None) -> int:
-        """Evict oldest segments until ``tokens`` fit and the segment cap holds."""
-        if tokens > self.capacity:
-            raise ValueError(
-                "a single Nomas segment exceeds the cache capacity; "
-                "reduce resolution, segment length or text length"
-            )
+    def evict_for(self, tokens: int) -> int:
+        """Evict oldest segments until ``tokens`` fit; the caller checked one fits."""
         evicted = 0
-        while self.segment_lengths and (
-            self.valid_length + tokens > self.capacity
-            or (max_segments is not None and len(self.segment_lengths) >= max_segments)
-        ):
+        while self.segment_lengths and self.valid_length + tokens > self.capacity:
             evicted += self.evict_oldest_segment()
         return evicted
 

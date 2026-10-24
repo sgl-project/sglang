@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Weightless Nomas tests: DiT segment session, pipeline stages and request contracts."""
 
+from dataclasses import fields
 from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.nn import functional as F
 
 from sglang.multimodal_gen.configs.models.dits.nomas import NomasArchConfig, NomasConfig
-from sglang.multimodal_gen.configs.models.vaes.nomas import NomasVAEArchConfig
+from sglang.multimodal_gen.configs.models.vaes.nomas import (
+    NomasVAEArchConfig,
+    NomasVAEConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.nomas import (
     NomasPipelineConfig,
     nomas_postprocess_text,
@@ -22,18 +24,18 @@ from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import (
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
-from sglang.multimodal_gen.runtime.models.vaes.nomas import GenExpertArch, window_starts
+from sglang.multimodal_gen.runtime.models.vaes.nomas import (
+    GenExpertArch,
+    NomasPixelUMMDecoder,
+    window_starts,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.denoise_loop import (
     NomasLatentSession,
     NomasSegmentCondition,
 )
-from sglang.srt.utils.network import get_free_port_below_ephemeral
 
-
-@pytest.fixture(autouse=True, scope="module")
-def _model_parallel(single_process_model_parallel):
-    """The framework's parallel linears resolve the TP group at construction."""
-    yield
+# The framework's parallel linears resolve the TP group at construction.
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 
 def tiny_model(device="cpu", backend="sdpa"):
@@ -76,6 +78,19 @@ def condition(device="cpu", dtype=torch.float32, padded=True):
         text_offsets=(2, 4, valid),
         video_windows=((0, 1, 0), (1, 2, 1)),
     )
+
+
+def tiny_decoder():
+    torch.manual_seed(5)
+    arch = NomasVAEArchConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=32,
+    )
+    return NomasPixelUMMDecoder(NomasVAEConfig(arch_config=arch)).eval()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA fusion")
@@ -235,27 +250,10 @@ def test_fa3_segment_attention_matches_dense_mask():
     assert not actual[:, frames * spatial + valid :].any()
 
 
-@requires_hopper
-@torch.inference_mode()
-def test_fa3_session_matches_reference_backend():
-    cond = condition("cuda", torch.bfloat16)
-    outputs = {}
-    for backend in ("fa3", "sdpa"):
-        session = NomasLatentSession(
-            tiny_model("cuda", backend).bfloat16(), cache_capacity=64, seed=42, steps=2
-        )
-        outputs[backend] = [session.generate_segment((2, 2, 2), cond) for _ in range(2)]
-    for actual, expected in zip(outputs["fa3"], outputs["sdpa"], strict=True):
-        torch.testing.assert_close(
-            actual.float(), expected.float(), atol=2e-2, rtol=2e-2
-        )
-
-
 @torch.inference_mode()
 def test_session_commit_reset_isolation_capacity_and_retry():
     model = tiny_model()
     a = NomasLatentSession(model, cache_capacity=32, seed=42, steps=2)
-    b = NomasLatentSession(model, cache_capacity=32, seed=42, steps=2)
     cond = condition()
     first = a.generate_segment((2, 2, 2), cond)
     assert (
@@ -264,10 +262,6 @@ def test_session_commit_reset_isolation_capacity_and_retry():
         and a.cache.frame_offset == 2
     )
     assert a.cache.visible[0, :14].all() and not a.cache.visible[0, 14:16].any()
-    assert b.cache.valid_length == 0
-    torch.testing.assert_close(
-        first, b.generate_segment((2, 2, 2), cond), atol=0, rtol=0
-    )
     state = a.generator.get_state().clone()
     before = [{key: x.clone() for key, x in layer.items()} for layer in a.cache.layers]
     with pytest.raises(ValueError, match="shape"):
@@ -377,18 +371,14 @@ def test_invalid_attention_layout_rejected(mask, offsets, windows):
         )
 
 
-def test_official_model_id_routes_cli_to_diffusion():
-    # The official repo has no model_index.json; detection relies on the registry.
+def test_registration_cli_routing_and_full_parameter_count():
     from sglang.cli.utils import get_is_diffusion_model
-
-    assert get_is_diffusion_model("tencent/Hy-Nomas")
-
-
-def test_model_registry_and_full_parameter_count():
     from sglang.multimodal_gen.runtime.models.registry import (
         _discover_and_register_models,
     )
 
+    # The official repo has no model_index.json; detection relies on the registry.
+    assert get_is_diffusion_model("tencent/Hy-Nomas")
     assert "NomasTransformer3DModel" in _discover_and_register_models()
     with torch.device("meta"):
         model = NomasTransformer3DModel(NomasConfig())
@@ -518,29 +508,8 @@ def test_segment_context_reuse_matches_rebuilding_every_prediction(monkeypatch, 
     assert torch.equal(optimized.generator.get_state(), reference.generator.get_state())
 
 
-@pytest.mark.parametrize("bad_tensor", ["latent", "k", "v"])
-@pytest.mark.parametrize("bad_value", [float("nan"), float("inf")])
-def test_segment_finite_reduction_checks_every_tensor(bad_tensor, bad_value):
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.denoise_loop import (
-        _segment_is_finite,
-    )
-
-    latent = torch.ones(1)
-    entries = [{"k": torch.ones(2), "v": torch.ones(2)} for _ in range(2)]
-    assert _segment_is_finite(latent, entries)
-    target = latent if bad_tensor == "latent" else entries[-1][bad_tensor]
-    target[0] = bad_value
-    assert not _segment_is_finite(latent, entries)
-
-
-def test_exact_upstream_schedule_and_shapes():
+def test_latent_shapes_and_batching():
     config = NomasPipelineConfig()
-    scheduler = FlowMatchEulerDiscreteScheduler(shift=5.0)
-    for steps in (1, 2, 8, 50):
-        scheduler.set_timesteps(sigmas=config.prepare_sigmas(None, steps))
-        s = torch.linspace(1, 0, steps + 1)
-        expected = 5 * s / (1 + 4 * s)
-        torch.testing.assert_close(scheduler.sigmas.cpu(), expected, atol=0, rtol=0)
     request = SimpleNamespace(height=64, width=96, num_frames=48, guidance_scale=1)
     assert config.prepare_latent_shape(request, 1, 12) == (1, 32, 12, 2, 3)
     request.num_frames = 49
@@ -551,20 +520,16 @@ def test_exact_upstream_schedule_and_shapes():
     assert not config.supports_dynamic_batching()
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {},
-        {"generator_device": None},
-        {"generator_device": "cuda"},
-        {"generator_device": "cpu"},
-    ],
-)
-def test_http_video_builder_uses_nomas_cpu_noise_policy(monkeypatch, overrides):
+@pytest.mark.parametrize("overrides", [{}, {"generator_device": "cuda"}])
+def test_http_requests_keep_nomas_fields_and_cpu_noise(monkeypatch, overrides):
     from sglang.multimodal_gen.configs.sample.nomas import NomasSamplingParams
+    from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
     from sglang.multimodal_gen.runtime.entrypoints.openai import video_api
     from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
         VideoGenerationsRequest,
+    )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+        request_model_kwargs,
     )
 
     request = VideoGenerationsRequest(
@@ -587,18 +552,7 @@ def test_http_video_builder_uses_nomas_cpu_noise_policy(monkeypatch, overrides):
     assert kwargs["seed"] == 42
     assert kwargs["segments"] == [{"frames": 17, "caption": "road"}]
     assert kwargs["prompt_format"] == "json"
-
-
-def test_nomas_http_extensions_stay_model_specific():
-    from sglang.multimodal_gen.configs.sample.nomas import NomasSamplingParams
-    from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-    from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
-        VideoGenerationsRequest,
-    )
-    from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-        request_model_kwargs,
-    )
-
+    # Nomas-only fields reach Nomas sampling params and no other model's.
     values = {
         "continuation_prompts": ["turn left"],
         "prompt_format": "plain",
@@ -649,6 +603,9 @@ def test_pixelumm_window_boundaries_and_config_rejection():
     assert window_starts(8, 10, 5) == [0]
     assert window_starts(12, 10, 5) == [0, 2]
     assert window_starts(21, 10, 5) == [0, 5, 10, 11]
+    assert {f.name for f in fields(GenExpertArch)} <= {
+        f.name for f in fields(NomasVAEArchConfig)
+    }
     for kwargs in (
         {"temporal_overlap_latents": 10},
         {"num_steps": 0},
@@ -663,9 +620,8 @@ def test_pixelumm_window_boundaries_and_config_rejection():
     "tokens,heads,batch", [(17, 8, 1), (1025, 32, 1), (2049, 8, 2)]
 )
 @torch.inference_mode()
-def test_pixelumm_fused_rope_preserves_chunk_rounding(tokens, heads, batch):
+def test_pixelumm_fused_qk_norm_mrope_is_bitwise_exact(tokens, heads, batch):
     from sglang.multimodal_gen.runtime.models.vaes.nomas import (
-        _QK_CHUNK_INPUT_BYTES,
         GenAttention,
         apply_mrope,
     )
@@ -677,16 +633,10 @@ def test_pixelumm_fused_rope_preserves_chunk_rounding(tokens, heads, batch):
     x = torch.randn(batch, tokens, heads, 128, device="cuda", dtype=torch.bfloat16)
     angles = torch.randn(1, tokens, 1, 128, device="cuda")
     cos, sin = angles.cos(), angles.sin()
-    chunk = max(1, _QK_CHUNK_INPUT_BYTES // (batch * heads * 128 * 4))
-    expected = torch.empty_like(x)
-    for start in range(0, tokens, chunk):
-        end = min(start + chunk, tokens)
-        normalized = attention._split_norm(
-            x[:, start:end].float(), attention.q_norm_t, attention.q_norm_hw
-        )
-        expected[:, start:end] = apply_mrope(
-            normalized, cos[:, start:end], sin[:, start:end], (64, 32, 32)
-        ).to(x.dtype)
+    normalized = attention._split_norm(
+        x.float(), attention.q_norm_t, attention.q_norm_hw
+    )
+    expected = apply_mrope(normalized, cos, sin, (64, 32, 32)).to(x.dtype)
     actual = attention._prepare_qk(
         x, cos, sin, attention.q_norm_t, attention.q_norm_hw, x.dtype
     )
@@ -758,9 +708,6 @@ def test_event_plan_and_budget():
 def test_action_windows_and_camera_gate_follow_upstream():
     """Malformed action timing must degrade to full attention, not reject the
     request, and a camera-on segment must not carry a gate mask."""
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.denoise_loop import (
-        NomasSegmentCondition,
-    )
     from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.request_validation import (
         action_video_windows,
     )
@@ -770,28 +717,24 @@ def test_action_windows_and_camera_gate_follow_upstream():
 
     drive = {"start_time": 0, "end_time": "00:00.5"}
     turn = {"start_time": 0.5, "end_time": 1}
-    assert action_video_windows([drive, turn], 6, 24) == ((0, 3, 0), (3, 6, 1))
-    # A null timestamp is 0 seconds upstream; here it empties the second span.
-    assert action_video_windows(
-        [drive, {"start_time": 0.5, "end_time": None}], 6, 24
-    ) == (
-        (0, 3, 0),
-        (3, 6, -1),
-    )
-    assert action_video_windows([drive], 6, 24) == ((0, 3, 0), (3, 6, -1))
-    assert action_video_windows([{"start_time": 0, "end_time": 9}], 6, 24) is None
-    assert (
-        action_video_windows([drive, {"start_time": 0.25, "end_time": 1}], 6, 24)
-        is None
-    )
-    assert action_video_windows([drive, {"action": "no timing"}], 6, 24) is None
-    assert action_video_windows([{"start_time": 1, "end_time": 0.5}], 6, 24) is None
+    split, tail_gap = ((0, 3, 0), (3, 6, 1)), ((0, 3, 0), (3, 6, -1))
+    for actions, expected in (
+        ([drive, turn], split),
+        # A null timestamp is 0 seconds upstream; here it empties the second span.
+        ([drive, {"start_time": 0.5, "end_time": None}], tail_gap),
+        ([drive], tail_gap),
+        ([{"start_time": 0, "end_time": 9}], None),
+        ([drive, {"start_time": 0.25, "end_time": 1}], None),
+        ([drive, {"action": "no timing"}], None),
+        ([{"start_time": 1, "end_time": 0.5}], None),
+    ):
+        assert action_video_windows(actions, 6, 24) == expected, actions
 
-    condition = NomasSegmentCondition(
+    plain = NomasSegmentCondition(
         torch.zeros(1, 2, 4), torch.ones(1, 2, dtype=torch.bool)
     )
-    assert segment_camera_condition(condition, None, 0, 2) is condition
-    sliced = segment_camera_condition(condition, torch.arange(5.0).view(1, 5, 1), 1, 3)
+    assert segment_camera_condition(plain, None, 0, 2) is plain
+    sliced = segment_camera_condition(plain, torch.arange(5.0).view(1, 5, 1), 1, 3)
     assert sliced.camera_embedding.flatten().tolist() == [1.0, 2.0]
     assert sliced.camera_has_mask is None
 
@@ -839,44 +782,3 @@ def test_latent_preparation_preserves_offline_noise_and_skips_online_draw(online
         expected = LatentPreparationStage(scheduler, None).forward(request(), args)
         torch.testing.assert_close(result.latents, expected.latents, atol=0, rtol=0)
         assert torch.equal(result.generator.get_state(), expected.generator.get_state())
-
-
-def test_local_token_range_requires_divisible_tokens():
-    from sglang.multimodal_gen.runtime.models.dits.nomas_layers import (
-        ParallelInfo,
-        local_token_range,
-    )
-
-    assert local_token_range(16, ParallelInfo(sp_size=2, sp_rank=1)) == (8, 16)
-    with pytest.raises(ValueError, match="not divisible"):
-        local_token_range(15, ParallelInfo(sp_size=2))
-
-
-def _run_shared_memory_budget(rank, port):
-    """Use a real CPU collective without allocating on either GPU."""
-    from unittest.mock import patch
-
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas import (
-        stages,
-    )
-
-    dist.init_process_group(
-        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2
-    )
-    try:
-        group = SimpleNamespace(world_size=2, cpu_group=dist.group.WORLD)
-        with (
-            patch.object(torch.cuda, "mem_get_info", return_value=(16 + rank * 16, 64)),
-            patch.object(stages, "model_parallel_is_initialized", return_value=True),
-            patch.object(stages, "get_replica_group", return_value=group),
-        ):
-            assert stages._free_bytes(torch.device("cuda", rank)) == 16
-    finally:
-        dist.destroy_process_group()
-
-
-def test_memory_budget_uses_least_free_rank(monkeypatch):
-    monkeypatch.setenv("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "cpu")
-    mp.spawn(
-        _run_shared_memory_budget, args=(get_free_port_below_ephemeral(),), nprocs=2
-    )

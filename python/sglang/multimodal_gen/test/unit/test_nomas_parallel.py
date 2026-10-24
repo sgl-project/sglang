@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.models.dits.nomas import NomasTransformer3DModel
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.denoise_loop import (
     NomasLatentSession,
-    NomasSegmentCondition,
 )
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 from sglang.srt.utils.network import get_free_port_below_ephemeral
@@ -26,19 +25,11 @@ SHAPE = (2, 2, 4)  # 16 video tokens: divisible by sp 2, camera chunks straddle 
 
 
 def _condition(device, dtype):
-    gen = torch.Generator().manual_seed(456)
-    return NomasSegmentCondition(
-        text_states=torch.randn(1, 8, 3584, generator=gen).to(
-            device=device, dtype=dtype
-        ),
-        text_mask=(torch.arange(8, device=device)[None] < 6),
-        camera_embedding=torch.randn(1, 2, 64, generator=gen).to(
-            device=device, dtype=dtype
-        ),
-        text_offsets=(2, 4, 6),
-        video_windows=((0, 1, 0), (1, 2, 1)),
-        action_start=2,
-    )
+    from msgspec.structs import replace
+
+    from sglang.multimodal_gen.test.unit.test_nomas import condition
+
+    return replace(condition(device, dtype), camera_has_mask=None, action_start=2)
 
 
 def _run(rank, world_size, tp_size, backend, port, output_dir):
@@ -145,18 +136,14 @@ def test_tensor_and_sequence_parallel_match_single_rank(tmp_path, backend):
 
 
 def _run_window_parallel_decode(rank, port):
-    from sglang.multimodal_gen.configs.models.vaes.nomas import (
-        NomasVAEArchConfig,
-        NomasVAEConfig,
-    )
     from sglang.multimodal_gen.runtime.distributed.parallel_state import (
         get_decode_parallel_world_size,
     )
     from sglang.multimodal_gen.runtime.models.vaes.nomas import (
-        NomasPixelUMMDecoder,
         merge_windows,
         window_starts,
     )
+    from sglang.multimodal_gen.test.unit.test_nomas import tiny_decoder
 
     os.environ.update(
         MASTER_ADDR="127.0.0.1",
@@ -170,16 +157,7 @@ def _run_window_parallel_decode(rank, port):
         tp_size=1, sp_size=2, ulysses_degree=2, ring_degree=1
     )
     assert get_decode_parallel_world_size() == 2
-    torch.manual_seed(5)
-    arch = NomasVAEArchConfig(
-        hidden_size=64,
-        intermediate_size=128,
-        num_layers=1,
-        num_heads=2,
-        num_kv_heads=1,
-        head_dim=32,
-    )
-    decoder = NomasPixelUMMDecoder(NomasVAEConfig(arch_config=arch)).cuda().eval()
+    decoder = tiny_decoder().cuda()
     latent = torch.randn(
         1, 32, 21, 2, 2, generator=torch.Generator().manual_seed(11)
     ).cuda()

@@ -91,7 +91,6 @@ class NomasRealtimeState:
         self.pending: deque[NomasSegmentEvent] = deque()
         self.available = asyncio.Event()
         self.ended = False
-        self.flushed = False
         self.prompt_format = "plain"
         self.latest_sampled_event_id: int | None = None
 
@@ -99,7 +98,6 @@ class NomasRealtimeState:
         self.pending.clear()
         self.available.clear()
         self.ended = False
-        self.flushed = False
         self.latest_sampled_event_id = None
 
     def push(self, segment: NomasSegmentEvent) -> None:
@@ -206,7 +204,6 @@ class NomasRealtimeAdapter(BaseRealtimeModelAdapter):
         if not state.ended:
             raise RuntimeError("no Nomas event is pending; wait_for_next_chunk first")
         # One flush chunk re-decodes the withheld tail, then the loop stops.
-        state.flushed = True
         if session.request is not None:
             session.request.max_chunks = session.generate_chunk_cnt + 1
         return RealtimeChunkInputs(

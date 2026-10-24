@@ -42,20 +42,23 @@ from sglang.multimodal_gen.runtime.models.dits.nomas_layers import (
     TimestepEmbedder,
     current_parallel_info,
     gated_residual,
-    gather_heads,
-    gather_seq,
     get_nd_rotary_pos_embed,
-    get_rotary_pos_embed_with_offset,
-    heads_to_seq,
     local_token_range,
     modulate_for_linear,
     rms_norm_rotate,
-    seq_to_heads,
+    sp_all_gather,
+    ulysses_all_to_all,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+
+
+def _camera_rope_tables(device=None):
+    return get_nd_rotary_pos_embed(
+        [8, 28, 28], (0, 0, 0), (7500, 1, 1), theta=256, device=device
+    )
 
 
 class NomasSegmentContext(Struct, frozen=True):
@@ -73,7 +76,7 @@ class NomasTextRefiner(nn.Module):
         super().__init__()
         d = config.hidden_size
         self.input_embedder = nn.Linear(config.text_states_dim, d)
-        self.t_embedder = TimestepEmbedder(d, nn.SiLU)
+        self.t_embedder = TimestepEmbedder(d)
         self.c_embedder = PixArtAlphaTextProjection(
             config.text_states_dim, d, act_fn="silu"
         )
@@ -162,7 +165,7 @@ class NomasDoubleStreamBlock(nn.Module):
                 q = rms_norm_rotate(q_norm, q, rope, v.dtype)
                 k = rms_norm_rotate(k_norm, k, rope, v.dtype)
                 # Local tokens, all heads -> all tokens, local heads.
-                q, k, v = (seq_to_heads(x, self.info) for x in (q, k, v))
+                q, k, v = (ulysses_all_to_all(x, self.info, 2, 1) for x in (q, k, v))
             else:
                 q, k = q_norm(q).to(v), k_norm(k).to(v)
                 # Text is replicated; keep this rank's head slice.
@@ -175,8 +178,8 @@ class NomasDoubleStreamBlock(nn.Module):
         img_attn, txt_attn = attention(q, k, v, layer_cache, valid_length).split(
             (video_tokens, txt.shape[1]), 1
         )
-        img_attn = heads_to_seq(img_attn, self.info)
-        txt_attn = gather_heads(txt_attn, self.info)
+        img_attn = ulysses_all_to_all(img_attn, self.info, 1, 2)
+        txt_attn = sp_all_gather(txt_attn, self.info, 2)
         outputs = []
         for stream, x, attn, mod in zip(
             ("img", "txt"), (img, txt), (img_attn, txt_attn), mods
@@ -208,13 +211,11 @@ class NomasCameraAttention(nn.Module):
         self.img_attn_q = nn.Linear(config.hidden_size, 1024, bias=False)
         self.keyboard_attn_kv = nn.Linear(128, 2048, bias=False)
         self.proj_keyboard = nn.Linear(1024, config.hidden_size, bias=False)
-        cos, sin = get_nd_rotary_pos_embed([8, 28, 28], (7500, 1, 1), theta=256)
+        cos, sin = _camera_rope_tables()
         self.register_buffer("freqs_cos", cos, persistent=False)
         self.register_buffer("freqs_sin", sin, persistent=False)
 
-    def forward(
-        self, x, camera, spatial_tokens, has_camera, time_offset=0, token_offset=0
-    ):
+    def forward(self, x, camera, spatial_tokens, has_camera, token_offset=0):
         """``x`` holds video tokens [token_offset, token_offset + n) of the segment."""
         b, n, _ = x.shape
         frames = camera.shape[1]
@@ -225,8 +226,8 @@ class NomasCameraAttention(nn.Module):
             .unbind(2)
         )
         tokens = torch.arange(n, device=x.device) + token_offset
-        qids = (tokens // spatial_tokens + time_offset).clamp(max=7499)
-        kids = (torch.arange(frames, device=x.device) + time_offset).clamp(max=7499)
+        qids = (tokens // spatial_tokens).clamp(max=7499)
+        kids = torch.arange(frames, device=x.device).clamp(max=7499)
         q = rms_norm_rotate(
             self.key_attn_q_norm,
             q,
@@ -261,8 +262,6 @@ class NomasCameraAttention(nn.Module):
 
 
 class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
-    _fsdp_shard_conditions = []
-    _compile_conditions = []
     param_names_mapping = NomasArchConfig().param_names_mapping
     reverse_param_names_mapping = {}
     # Segment attention (FA3 / Flex / SDPA reference) is model-specific, not a
@@ -276,12 +275,9 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         *,
         quant_config=None,
         attention_backend="auto",
-        **kwargs,
     ):
         if quant_config is not None:
             raise ValueError("Nomas does not support quantized weights yet")
-        if kwargs:
-            raise ValueError(f"Unsupported Nomas model options: {sorted(kwargs)}")
         if config.quant_config is not None:
             raise NotImplementedError("Nomas v1 does not implement quantized loading")
         if attention_backend == "auto":
@@ -307,11 +303,10 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.layer_names = ["double_blocks"]
         self.img_in = PatchEmbed(list(c.patch_size), c.in_channels, c.hidden_size)
         self.txt_in = NomasTextRefiner(c)
-        self.time_in = TimestepEmbedder(c.hidden_size, nn.SiLU)
+        self.time_in = TimestepEmbedder(c.hidden_size)
         self.double_blocks = nn.ModuleList(
             [NomasDoubleStreamBlock(c, self.parallel) for _ in range(c.num_layers)]
         )
-        self.single_blocks = nn.ModuleList()
         self.final_layer = FinalLayerPerBlock(
             c.hidden_size, list(c.patch_size), c.out_channels
         )
@@ -325,12 +320,7 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     def post_load_weights(self):
         # Meta initialization / to_empty() does not restore nonpersistent buffers
         # from a checkpoint. Build these on CPU, matching the source model.
-        cos, sin = get_nd_rotary_pos_embed(
-            [8, 28, 28],
-            (7500, 1, 1),
-            theta=256,
-            device=torch.device("cpu"),
-        )
+        cos, sin = _camera_rope_tables(torch.device("cpu"))
         for module in self.action_modules:
             p = module.img_attn_q.weight
             module.freqs_cos = cos.to(device=p.device, dtype=p.dtype)
@@ -393,19 +383,16 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             self.attention_backend,
         )
         if rope is None:
-            if cache.frame_offset == 0:
-                rope = get_nd_rotary_pos_embed(
-                    c.rope_dim_list,
-                    (t, h, w),
-                    theta=c.rope_theta,
-                    device=latent.device,
-                )
-            else:
-                # Preserve upstream's CPU construction and rounding.
-                rope = get_rotary_pos_embed_with_offset(
-                    (t, h, w), cache.frame_offset, c.rope_dim_list, c.rope_theta
-                )
-                rope = tuple(x.to(latent.device) for x in rope)
+            offset = cache.frame_offset
+            # Upstream builds offset tables on the CPU; keep its construction.
+            rope = get_nd_rotary_pos_embed(
+                c.rope_dim_list,
+                (offset, 0, 0),
+                (offset + t, h, w),
+                c.rope_theta,
+                device=latent.device if offset == 0 else None,
+            )
+            rope = tuple(x.to(latent.device) for x in rope)
             lo, hi = local_token_range(t * h * w, self.parallel)
             rope = tuple(x[lo:hi] for x in rope)
         return NomasSegmentContext(
@@ -421,12 +408,10 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         *,
         cache,
         camera_embedding=None,
-        norm_extrinsics=None,
         camera_has_mask=None,
         text_offsets=None,
         video_windows=None,
         hide_cached_action_tails=False,
-        camera_rope_time_offset=0,
         collect_cache=False,
         _context: NomasSegmentContext | None = None,
     ):
@@ -440,21 +425,7 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             hidden_states, timestep, encoder_hidden_states, text_mask, cache
         )
         _, _, t, h, w = hidden_states.shape
-        if collect_cache:
-            cache.reserve(t * h * w + text_mask.shape[-1])
-        if norm_extrinsics is not None:
-            if camera_embedding is not None:
-                raise ValueError(
-                    "pass camera embeddings or normalized extrinsics, not both"
-                )
-            camera_embedding = self.embed_camera(norm_extrinsics)
-        self._check_camera(
-            camera_embedding,
-            camera_has_mask,
-            camera_rope_time_offset,
-            t,
-            hidden_states.dtype,
-        )
+        self._check_camera(camera_embedding, camera_has_mask, t, hidden_states.dtype)
         if _context is None:
             _context = self.prepare_segment_context(
                 hidden_states,
@@ -496,11 +467,10 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                     camera_embedding,
                     h * w,
                     camera_has_mask,
-                    camera_rope_time_offset,
                     token_offset=lo,
                 )
         img = self.final_layer(img, vec)
-        img = gather_seq(img, self.parallel)
+        img = sp_all_gather(img, self.parallel, 1)
         return img.view(1, t, h, w, c.out_channels).permute(
             0, 4, 1, 2, 3
         ).contiguous(), entries
@@ -535,9 +505,7 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         if text_mask.device != self.device or timestep.device != self.device:
             raise ValueError("mask and timestep device must match model weights")
 
-    def _check_camera(
-        self, camera_embedding, camera_has_mask, rope_offset, frames, dtype
-    ):
+    def _check_camera(self, camera_embedding, camera_has_mask, frames, dtype):
         if camera_embedding is not None:
             if camera_embedding.shape != (1, frames, 64):
                 raise ValueError("camera/latent alignment mismatch")
@@ -550,8 +518,6 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             camera_has_mask.shape != (1,) or camera_has_mask.device != self.device
         ):
             raise ValueError("camera mask must have shape [1] on model device")
-        if rope_offset < 0:
-            raise ValueError("camera RoPE offset must be nonnegative")
 
     def forward(
         self,

@@ -15,7 +15,6 @@ class NomasRealtimeState(BaseRealtimeState):
         super().__init__()
         # NomasLatentSession; owns the KV cache and RoPE frame offset.
         self.session: Any = None
-        self.num_inference_steps: int | None = None
         # Pre-sampled latent noise [1, C, T, h, w] on CPU, sliced by absolute
         # latent frame so a segment's noise does not depend on earlier event
         # lengths (upstream interactive_noise bank). Its generator also draws
@@ -24,14 +23,11 @@ class NomasRealtimeState(BaseRealtimeState):
         self.noise_generator: torch.Generator | None = None
         # NomasStreamingDecoder: the PixelUMM timeline of every decoded event.
         self.decoder: Any = None
-        self.emitted_frames: int = 0
         self.generated_latents: int = 0
 
     def dispose(self) -> None:
         self.session = None
-        self.num_inference_steps = None
         self.noise_bank = None
         self.noise_generator = None
         self.decoder = None
-        self.emitted_frames = 0
         self.generated_latents = 0

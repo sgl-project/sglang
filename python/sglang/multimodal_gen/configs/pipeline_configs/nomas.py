@@ -41,7 +41,6 @@ class NomasPipelineConfig(PipelineConfig):
     vae_precision: str = "bf16"
     vae_tiling: bool = False
     vae_sp: bool = False
-    dit_precision: str = "bf16"
     text_encoder_configs: tuple = field(
         default_factory=lambda: (
             Qwen2_5VLConfig(arch_config=QwenImageArchConfig(text_len=1280)),
