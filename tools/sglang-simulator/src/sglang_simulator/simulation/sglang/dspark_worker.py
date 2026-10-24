@@ -99,7 +99,13 @@ class C_DSparkWorkerHook(BaseHook):
         def forward(
             self, batch, on_publish=None, grammar_barrier=None, *, pp_proxy_tensors=None
         ):
-            if grammar_barrier is not None or pp_proxy_tensors is not None:
+            # Native Scheduler supplies this callback for every DSPark forward.
+            # The native worker only consumes it when batch.has_grammar; an
+            # explicitly grammar-free batch needs no callback or grammar model.
+            if (
+                grammar_barrier is not None
+                and getattr(batch, "has_grammar", None) is not False
+            ) or pp_proxy_tensors is not None:
                 raise PredictorError(
                     "unsupported_execution_profile",
                     "DSPark simulator has no grammar-overlap or pipeline adapter",

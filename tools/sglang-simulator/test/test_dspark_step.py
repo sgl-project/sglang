@@ -211,6 +211,22 @@ def test_native_dspark_hook_routes_to_explicit_runtime_and_retains_result(monkey
     assert calls == [{"worker": worker, "batch": batch, "on_publish": None}]
     with pytest.raises(PredictorError, match="grammar-overlap"):
         worker.forward_batch_generation(batch, grammar_barrier=lambda: None)
+    # Scheduler supplies the callback for every DSPark batch. The native worker
+    # consumes it only when has_grammar is true; no callback runs for this case.
+    grammar_free = SimpleNamespace(has_grammar=False)
+    barrier_calls = []
+    assert (
+        worker.forward_batch_generation(
+            grammar_free, grammar_barrier=lambda: barrier_calls.append("unexpected")
+        )
+        is output
+    )
+    assert calls[-1] == {"worker": worker, "batch": grammar_free, "on_publish": None}
+    assert barrier_calls == []
+    with pytest.raises(PredictorError, match="grammar-overlap"):
+        worker.forward_batch_generation(
+            SimpleNamespace(has_grammar=True), grammar_barrier=lambda: None
+        )
 
 
 def test_native_dspark_hook_has_no_latency_or_progress_fallback(monkeypatch):

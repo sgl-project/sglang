@@ -865,6 +865,36 @@ assets, and the unchanged AgentX 1.0.7 client. It must preserve warmup handoff,
 DAG/credit completion and native response pacing. No complete 13/priority-10
 configuration or 393-trace Pareto result is established by these CPU checks.
 
+The optional `test_native_overlap_scheduler_future_map_and_reference_driver_drain_together`
+smoke uses installed SGLang `Scheduler`, `FutureMap`, `ScheduleBatch`, DSPark worker
+and result types. It runs the production hooks and original overlap loop,
+selection/decode preparation, launch and native result processor for one prefill,
+consecutive decodes, length finish and an already-launched successor. It checks
+publication before previous-result processing, relay event waits, terminal
+reference/history cleanup and exactly-once accounting. Model initialization,
+initial prefill admission, memory resources, telemetry and CPU stream/events are
+explicit fixtures; costs, progress and reference mirror policy are synthetic.
+The native scheduler's grammar barrier is accepted on an explicitly grammar-free
+batch, matching the native worker's conditional use; grammar progress still
+rejects. This smoke does not establish physical mirror policy, silicon timing,
+AgentX completion or coverage of every synchronization/dynamic-membership path.
+
+In the matching pinned SGLang/PyTorch CPU environment, with Simulator and the
+matching InferCast SDK source mounted at `/work/G` and `/work/sdk`, run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+PYTHONPATH=/work/G/tools/sglang-simulator/src:/work/G/tools/sglang-simulator/test:/work/sdk/src:/work/sdk \
+python3 -B -m pytest -q -ra -p no:cacheprovider \
+  /work/G/tools/sglang-simulator/test/test_dspark_native_results.py
+```
+
+The subprocess enables the CPU bootstrap itself. Missing torch/SGLang explicitly
+skips these native checks; a skip is not a successful native smoke. In the fixed
+ROCm image's no-GPU CPU probe, `USER`/`LOGNAME` and its existing read-only AITER
+JIT cache must be available. `GPU_ARCHS=gfx950` selects that image's AITER build
+target; it does not observe hardware or establish a physical backend policy.
+
 Run repository checks before submitting:
 
 ```bash
