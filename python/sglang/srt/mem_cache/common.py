@@ -13,6 +13,7 @@ from sglang.kernels.ops.memory.common import (
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -24,7 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.runtime_context import get_serving, get_spec
+from sglang.srt.runtime_context import get_schedule, get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -135,6 +136,43 @@ def free_swa_out_of_window_slots(
             free_segment = token_to_kv_pool_allocator.free_swa_segment
         free_segment(free_slots, start_pos=evicted_seqlen)
         req.kv.set_evicted_seqlen(component_type, new_evicted_seqlen)
+
+
+def free_chunked_swa_before_plan(
+    req: Req,
+    *,
+    enable_overlap: bool,
+    tree_cache: BasePrefixCache,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+) -> None:
+    """Free a chunked prefill's out-of-window SWA slots before its next chunk is sized.
+
+    PrefillAdder sizes a continuing chunk from the SWA pool's free count, but
+    maybe_evict_swa frees these slots only later, in alloc_for_extend. At the pool
+    size compute_swa_request_cap gives (chunks in flight x chunk + window + slack),
+    every chunk after the second then alternates between the slack and
+    chunk - window tokens.
+
+    The bound is maybe_evict_swa's for this request in the same scheduling step,
+    so this frees what alloc_for_extend would free, only earlier.
+    """
+    if not tree_cache.supports_swa() or tree_cache.supports_prefix_sharing():
+        return
+    if is_swa_req_ring(token_to_kv_pool_allocator):
+        # A per-request ring is not sized from the SWA free count.
+        return
+    if not req.kv.holds_kv:
+        return
+    pre_len = req.prefix_len
+    if enable_overlap:
+        # The previous chunk may still be running, and it reads the window
+        # before its start, one chunk back.
+        if req.extend_batch_idx < 2:
+            return
+        pre_len -= max(get_schedule().chunked_prefill_size, 0)
+    token_to_kv_pool_allocator.free_group_begin()
+    tree_cache.evict_sliding_windows(req, pre_len)
+    token_to_kv_pool_allocator.free_group_end()
 
 
 def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
