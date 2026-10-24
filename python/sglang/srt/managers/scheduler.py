@@ -28,6 +28,7 @@ from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.runtime_context import (
     SpawnRanks,
     attention_backends,
@@ -160,10 +161,16 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     MMInputsProcessError,
+    ObserveElasticEPMembershipProgressOutput,
+    ObserveElasticEPMembershipReqInput,
+    ObserveElasticEPMembershipReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
+    RecoverElasticEPProgressOutput,
+    RecoverElasticEPReqInput,
+    RecoverElasticEPReqOutput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1887,6 +1894,11 @@ class Scheduler(
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
+                (RecoverElasticEPReqInput, self.handle_recover_elastic_ep),
+                (
+                    ObserveElasticEPMembershipReqInput,
+                    self.handle_observe_elastic_ep_membership,
+                ),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),
                 (
@@ -2251,6 +2263,25 @@ class Scheduler(
             self.rust_server.push_control_output(recv_req, output)
         else:
             self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+        if isinstance(output, ObserveElasticEPMembershipReqOutput):
+            logger.info(
+                "[Elastic EP][membership] reply_sent submission_id=%s "
+                "responder_rank=%s accepted=%s",
+                output.submission_id,
+                output.responder_rank,
+                output.accepted,
+            )
+        elif isinstance(output, RecoverElasticEPReqOutput):
+            logger.info(
+                "[Elastic EP][recovery] reply_sent operation_id=%s "
+                "submission_id=%s responder_rank=%s accepted=%s "
+                "recovery_phase=%s",
+                output.operation_id,
+                output.submission_id,
+                output.responder_rank,
+                output.success,
+                output.recovery_phase,
+            )
 
     @staticmethod
     def _tokenized_requests(recv_req):
@@ -5040,6 +5071,7 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
+        self._poll_elastic_ep_recovery()
         snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
         # Router-facing gauge on the dedicated PUB socket, reusing the
         # snapshot above rather than walking the queues again.
@@ -5062,6 +5094,8 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        self._maybe_complete_recovery_warmup(batch)
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
@@ -5158,6 +5192,36 @@ class Scheduler(
                     )
                 )
 
+    def _poll_elastic_ep_recovery(self) -> None:
+        from sglang.srt.elastic_ep.elastic_ep import (
+            ElasticEPStateManager,
+            poll_recovery_control_plane,
+        )
+
+        if not poll_recovery_control_plane() or get_parallel().tp_rank != 0:
+            return
+        state = ElasticEPStateManager.instance()
+        if state is None:
+            return
+        from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
+
+        self.ipc_channels.send_to_tokenizer.send_output(
+            ElasticScaleUpdateReq(
+                success=state.recovery_succeeded is not False,
+                terminal=state.recovery_succeeded is not None,
+                effective_ep_size=state.effective_ep_size,
+                operation_id=state.recovery_operation_id,
+                recovery_update=True,
+                recovery_phase=state.recovery_phase,
+                recovery_topology_generation=state.recovery_topology_generation,
+                recovery_rank_offset=state.recovery_rank_offset,
+                recovery_failed_allocation_incarnation=(
+                    state.recovery_failed_allocation_incarnation
+                ),
+                error=state.recovery_error,
+            )
+        )
+
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
     ) -> Optional[AddExternalCorpusReqOutput]:
@@ -5202,6 +5266,8 @@ class Scheduler(
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         self.dp_attn_adapter.drop_sync_wait_carry()
+        self._poll_elastic_ep_recovery()
+        self._maybe_schedule_recovery_warmup()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -5879,6 +5945,66 @@ class Scheduler(
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
         new_ep_size = recv_req.new_ep_size
         max_ep_size = get_parallel().max_world_size
+        operation_id = recv_req.operation_id
+        runtime_instance_id = recv_req.runtime_instance_id
+        make_output = partial(
+            ScaleElasticEPReqOutput,
+            submission_id=recv_req.submission_id,
+        )
+
+        state = ElasticEPStateManager.instance()
+        if state is not None and state.operation_id == operation_id:
+            expected_allocations = list(recv_req.expected_joining_allocation_ids or [])
+            existing_allocations = list(
+                state.operation_expected_joining_allocation_ids or []
+            )
+            conflict = None
+            if state.runtime_instance_id != runtime_instance_id:
+                conflict = (
+                    f"Operation {operation_id} belongs to runtime instance "
+                    f"{state.runtime_instance_id}, not {runtime_instance_id}."
+                )
+            elif state.operation_target_ep_size != new_ep_size:
+                conflict = (
+                    f"Operation {operation_id} already targets EP size "
+                    f"{state.operation_target_ep_size}, not {new_ep_size}."
+                )
+            elif existing_allocations != expected_allocations:
+                conflict = (
+                    f"Operation {operation_id} already has joining allocations "
+                    f"{existing_allocations}, not {expected_allocations}."
+                )
+            if conflict is not None:
+                return make_output(
+                    success=False,
+                    conflict=True,
+                    message=conflict,
+                    operation_id=operation_id,
+                    old_ep_size=old_ep_size,
+                    new_ep_size=new_ep_size,
+                    pending_ep_size=state.pending_ep_size,
+                    scale_phase=state.scale_phase,
+                    terminal=state.operation_succeeded is not None,
+                    effective_ep_size=state.effective_ep_size,
+                )
+
+            terminal = state.operation_succeeded is not None
+            success = state.operation_succeeded is not False
+            return make_output(
+                success=success,
+                message=(
+                    state.last_error
+                    if not success
+                    else f"Returning existing Elastic EP operation {operation_id}."
+                ),
+                operation_id=operation_id,
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+                pending_ep_size=state.pending_ep_size,
+                scale_phase=state.scale_phase,
+                terminal=terminal,
+                effective_ep_size=state.effective_ep_size,
+            )
 
         logger.debug(
             "[Elastic EP][scale] request received: new_ep_size=%d "
@@ -5889,24 +6015,30 @@ class Scheduler(
         )
 
         if new_ep_size <= old_ep_size:
-            return ScaleElasticEPReqOutput(
+            return make_output(
                 success=False,
                 message=(
                     f"new_ep_size ({new_ep_size}) must be greater than current "
                     f"effective_ep_size ({old_ep_size})."
                 ),
+                operation_id=operation_id,
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
+                terminal=True,
+                effective_ep_size=old_ep_size,
             )
         if new_ep_size > max_ep_size:
-            return ScaleElasticEPReqOutput(
+            return make_output(
                 success=False,
                 message=(
                     f"new_ep_size ({new_ep_size}) exceeds --max-ep-size "
                     f"({max_ep_size}). Restart with a larger --max-ep-size."
                 ),
+                operation_id=operation_id,
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
+                terminal=True,
+                effective_ep_size=old_ep_size,
             )
         from sglang.srt.elastic_ep.topology import attn_replica_size
 
@@ -5921,30 +6053,73 @@ class Scheduler(
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
             )
+
+        if operation_id is None or runtime_instance_id is None:
+            return make_output(
+                success=False,
+                message="Elastic EP scale requests require runtime and operation IDs.",
+                operation_id=operation_id,
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+                terminal=True,
+                effective_ep_size=old_ep_size,
+            )
+
+        parallel = get_parallel()
+        allocation_rank_width = (
+            parallel.elastic_ep_allocation_width or parallel.tp_size // parallel.nnodes
+        )
+        requested_rank_count = new_ep_size - old_ep_size
+        if requested_rank_count != allocation_rank_width:
+            return make_output(
+                success=False,
+                message=(
+                    "This API accepts exactly one joining allocation per operation: "
+                    f"new_ep_size - effective_ep_size must equal the local rank width "
+                    f"({allocation_rank_width}), got {requested_rank_count}."
+                ),
+                operation_id=operation_id,
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+                terminal=True,
+                effective_ep_size=old_ep_size,
+            )
         if ElasticEPStateManager.is_scaling():
-            return ScaleElasticEPReqOutput(
+            return make_output(
                 success=False,
                 message=(
                     "A previous scale operation has not completed yet. Wait until "
                     "all pending ranks have joined before issuing another scale."
                 ),
+                conflict=True,
+                operation_id=operation_id,
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
                 pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
+                effective_ep_size=old_ep_size,
             )
 
-        if not ElasticEPStateManager.request_scale(new_ep_size):
-            return ScaleElasticEPReqOutput(
+        if not ElasticEPStateManager.request_scale(
+            new_ep_size,
+            runtime_instance_id,
+            operation_id,
+            recv_req.expected_joining_allocation_ids,
+        ):
+            return make_output(
                 success=False,
                 message=(
                     "Failed to queue elastic EP scale: no elastic state or "
                     "scale already pending."
                 ),
+                conflict=True,
+                operation_id=operation_id,
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
                 pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
+                terminal=True,
+                effective_ep_size=old_ep_size,
             )
         if (eplb_manager := self.tp_worker.model_runner.eplb_manager) is not None:
             eplb_manager.disable_rebalance("elastic EP scale-up is pending")
@@ -5954,13 +6129,387 @@ class Scheduler(
             new_ep_size,
         )
 
-        return ScaleElasticEPReqOutput(
+        return make_output(
             success=True,
             message=f"Scaling initiated from {old_ep_size} to {new_ep_size}",
+            operation_id=operation_id,
             old_ep_size=old_ep_size,
             new_ep_size=new_ep_size,
             pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
             scale_phase=ElasticEPStateManager.get_scale_phase(),
+            effective_ep_size=old_ep_size,
+        )
+
+    def handle_recover_elastic_ep(
+        self, recv_req: RecoverElasticEPReqInput
+    ) -> RecoverElasticEPReqOutput:
+        """Publish one fenced fixed-slot recovery operation.
+
+        Process-group admission and readiness remain intentionally outside this
+        control-plane-only handler.
+        """
+        from sglang.srt.elastic_ep.elastic_ep import (
+            ElasticEPStateManager,
+            RecoveryOperation,
+        )
+
+        responder_rank = get_parallel().dp_rank
+        if responder_rank is None:
+            responder_rank = 0
+        self._send_recovery_progress(
+            recv_req, responder_rank, "scheduler_handler_entered"
+        )
+        logger.info(
+            "[Elastic EP][recovery] scheduler_entered operation_id=%s "
+            "submission_id=%s responder_rank=%s",
+            recv_req.operation_id,
+            recv_req.submission_id,
+            responder_rank,
+        )
+        state = ElasticEPStateManager.instance()
+        make_output = partial(
+            RecoverElasticEPReqOutput,
+            operation_id=recv_req.operation_id,
+            submission_id=recv_req.submission_id,
+            responder_rank=responder_rank,
+        )
+        if state is None:
+            return make_output(
+                success=False,
+                message="Elastic EP recovery requires initialized elastic state.",
+                terminal=True,
+            )
+        operation = RecoveryOperation(
+            runtime_instance_id=recv_req.runtime_instance_id,
+            topology_generation=recv_req.topology_generation,
+            operation_id=recv_req.operation_id,
+            allocation_id=recv_req.allocation_id,
+            rank_offset=recv_req.rank_offset,
+            failed_allocation_incarnation=recv_req.failed_allocation_incarnation
+            or recv_req.allocation_id,
+        )
+        try:
+            self._send_recovery_progress(
+                recv_req, responder_rank, "scheduler_store_started"
+            )
+            logger.info(
+                "[Elastic EP][recovery] store_started operation_id=%s "
+                "submission_id=%s responder_rank=%s",
+                recv_req.operation_id,
+                recv_req.submission_id,
+                responder_rank,
+            )
+            accepted = ElasticEPStateManager.request_recovery(operation)
+            self._send_recovery_progress(
+                recv_req, responder_rank, "scheduler_store_completed"
+            )
+            logger.info(
+                "[Elastic EP][recovery] store_completed operation_id=%s "
+                "submission_id=%s responder_rank=%s",
+                recv_req.operation_id,
+                recv_req.submission_id,
+                responder_rank,
+            )
+        except (RuntimeError, ValueError) as exc:
+            logger.warning(
+                "[Elastic EP][recovery] store_failed operation_id=%s "
+                "submission_id=%s responder_rank=%s error_type=%s",
+                recv_req.operation_id,
+                recv_req.submission_id,
+                responder_rank,
+                type(exc).__name__,
+            )
+            return make_output(
+                success=False,
+                conflict=True,
+                message=str(exc),
+                recovery_phase=state.recovery_phase,
+                terminal=True,
+            )
+        except Exception:
+            logger.exception(
+                "[Elastic EP][recovery] store_failed operation_id=%s "
+                "submission_id=%s responder_rank=%s error_type=unexpected",
+                recv_req.operation_id,
+                recv_req.submission_id,
+                responder_rank,
+            )
+            raise
+        if not accepted:
+            return make_output(
+                success=False,
+                conflict=True,
+                message="A different Elastic EP operation is already pending.",
+                recovery_phase=state.recovery_phase,
+                terminal=True,
+            )
+        if state.recovery_succeeded is not None:
+            return make_output(
+                success=state.recovery_succeeded,
+                message=(
+                    f"Recovery operation {recv_req.operation_id} completed."
+                    if state.recovery_succeeded
+                    else state.recovery_error
+                ),
+                recovery_phase=state.recovery_phase,
+                terminal=True,
+            )
+        return make_output(
+            success=True,
+            message=f"Recovery operation {recv_req.operation_id} is restoring.",
+            recovery_phase=state.recovery_phase,
+        )
+
+    def _send_recovery_progress(
+        self,
+        recv_req: RecoverElasticEPReqInput,
+        responder_rank: int,
+        completed_stage: str,
+    ) -> None:
+        self.send_control_output(
+            RecoverElasticEPProgressOutput(
+                operation_id=recv_req.operation_id,
+                submission_id=recv_req.submission_id,
+                responder_rank=responder_rank,
+                completed_stage=completed_stage,
+            ),
+            recv_req,
+        )
+
+    def handle_observe_elastic_ep_membership(
+        self, recv_req: ObserveElasticEPMembershipReqInput
+    ) -> ObserveElasticEPMembershipReqOutput:
+        from sglang.srt.elastic_ep.elastic_ep import observe_recovery_membership
+
+        responder_rank = get_parallel().dp_rank
+        if responder_rank is None:
+            responder_rank = 0
+
+        self._send_membership_observation_progress(
+            recv_req, responder_rank, "scheduler_handler_entered"
+        )
+        logger.info(
+            "[Elastic EP][membership] scheduler_entered submission_id=%s "
+            "responder_rank=%s",
+            recv_req.submission_id,
+            responder_rank,
+        )
+        if (
+            recv_req.deadline_unix_seconds is not None
+            and time.time() >= recv_req.deadline_unix_seconds
+        ):
+            self._send_membership_observation_progress(
+                recv_req, responder_rank, "scheduler_deadline_rejected"
+            )
+            logger.warning(
+                "[Elastic EP][membership] deadline_rejected submission_id=%s "
+                "responder_rank=%s",
+                recv_req.submission_id,
+                responder_rank,
+            )
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message=(
+                    "Membership observation expired before scheduler processing; "
+                    "no state was changed."
+                ),
+                submission_id=recv_req.submission_id,
+                responder_rank=responder_rank,
+            )
+        try:
+            self._send_membership_observation_progress(
+                recv_req, responder_rank, "scheduler_store_started"
+            )
+            logger.info(
+                "[Elastic EP][membership] store_started submission_id=%s "
+                "responder_rank=%s",
+                recv_req.submission_id,
+                responder_rank,
+            )
+            key = observe_recovery_membership(
+                runtime_instance_id=recv_req.runtime_instance_id,
+                topology_generation=recv_req.topology_generation,
+                rank=recv_req.rank,
+                failed_allocation_incarnation=recv_req.failed_allocation_incarnation,
+                membership_epoch=recv_req.membership_epoch,
+                deadline_unix_seconds=recv_req.deadline_unix_seconds,
+            )
+            self._send_membership_observation_progress(
+                recv_req, responder_rank, "scheduler_store_completed"
+            )
+            logger.info(
+                "[Elastic EP][membership] store_completed submission_id=%s "
+                "responder_rank=%s",
+                recv_req.submission_id,
+                responder_rank,
+            )
+        except TimeoutError as exc:
+            self._send_membership_observation_progress(
+                recv_req, responder_rank, "scheduler_deadline_rejected"
+            )
+            logger.warning(
+                "[Elastic EP][membership] deadline_rejected submission_id=%s "
+                "responder_rank=%s",
+                recv_req.submission_id,
+                responder_rank,
+            )
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message=str(exc),
+                submission_id=recv_req.submission_id,
+                responder_rank=responder_rank,
+            )
+        except (RuntimeError, ValueError) as exc:
+            logger.warning(
+                "[Elastic EP][membership] store_failed submission_id=%s "
+                "responder_rank=%s error_type=%s",
+                recv_req.submission_id,
+                responder_rank,
+                type(exc).__name__,
+            )
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message=str(exc),
+                submission_id=recv_req.submission_id,
+                responder_rank=responder_rank,
+            )
+        except Exception:
+            logger.exception(
+                "[Elastic EP][membership] store_failed submission_id=%s "
+                "responder_rank=%s error_type=unexpected",
+                recv_req.submission_id,
+                responder_rank,
+            )
+            raise
+        return ObserveElasticEPMembershipReqOutput(
+            accepted=True,
+            message="Elastic EP membership observation accepted.",
+            observation_key=key,
+            submission_id=recv_req.submission_id,
+            responder_rank=responder_rank,
+        )
+
+    def _send_membership_observation_progress(
+        self,
+        recv_req: ObserveElasticEPMembershipReqInput,
+        responder_rank: int,
+        completed_stage: str,
+    ) -> None:
+        self.send_control_output(
+            ObserveElasticEPMembershipProgressOutput(
+                submission_id=recv_req.submission_id,
+                responder_rank=responder_rank,
+                completed_stage=completed_stage,
+            ),
+            recv_req,
+        )
+
+    def _maybe_schedule_recovery_warmup(self) -> None:
+        """Drive fenced recovery without waiting for customer traffic.
+
+        The request follows the ordinary scheduler generation path so the
+        replacement rank participates in the same forward used as readiness
+        evidence. Its health-check RID suppresses user-facing output.
+        """
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        state = ElasticEPStateManager.instance()
+        if state is None:
+            return
+        if state.recovery_phase == "restoring":
+            self.model_worker.model_runner.maybe_join_ep_ranks()
+            return
+        if state.recovery_phase != "slot_restored":
+            return
+
+        operation_id = state.recovery_operation_id
+        if operation_id is None or not ElasticEPStateManager.begin_recovery_warmup(
+            operation_id
+        ):
+            return
+        token_id = self.tokenizer.bos_token_id if self.tokenizer is not None else None
+        if token_id is None:
+            token_id = next(iter(self.model_config.hf_eos_token_id), None)
+        if token_id is None:
+            self._report_recovery_warmup_result(operation_id, success=False)
+            return
+        sampling_params = SamplingParams(max_new_tokens=1, temperature=0.0, top_k=1)
+        # Internal warmup requests bypass TokenizerManager preprocessing, so
+        # establish the same normalized contract expected by ScheduleBatch.
+        sampling_params.normalize(self.tokenizer)
+        sampling_params.verify(self.model_config.vocab_size)
+        self.handle_generate_request(
+            TokenizedGenerateReqInput(
+                rid=f"{HEALTH_CHECK_RID_PREFIX}elastic-recovery-{operation_id}",
+                input_text=None,
+                input_ids=array("q", [token_id]),
+                input_embeds=None,
+                mm_inputs=None,
+                token_type_ids=None,
+                sampling_params=sampling_params,
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=False,
+                no_logs=True,
+            )
+        )
+
+    def _maybe_complete_recovery_warmup(self, batch: ScheduleBatch) -> None:
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        state = ElasticEPStateManager.instance()
+        if (
+            state is None
+            or state.recovery_phase != "warming_up"
+            or state.recovery_operation_id is None
+        ):
+            return
+        rid = f"{HEALTH_CHECK_RID_PREFIX}elastic-recovery-{state.recovery_operation_id}"
+        for req in batch.reqs:
+            if req.rid == rid and req.finished():
+                success = not isinstance(
+                    req.finished_reason, FINISH_ABORT
+                ) and ElasticEPStateManager.recovery_membership_matches(
+                    state.recovery_operation_id
+                )
+                self._report_recovery_warmup_result(
+                    state.recovery_operation_id, success=success
+                )
+                return
+
+    def _report_recovery_warmup_result(
+        self, operation_id: str, *, success: bool
+    ) -> None:
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        completed = ElasticEPStateManager.complete_recovery_warmup(
+            operation_id, success=success
+        )
+        state = ElasticEPStateManager.instance()
+        if completed and get_exec().moe.moe_a2a_backend == "nixl":
+            from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+            if success:
+                NixlEPBuffer.finish_recovery(operation_id)
+            elif state is not None and state.recovery_rank_offset is not None:
+                NixlEPBuffer.abort_recovery(operation_id, state.recovery_rank_offset)
+        if state is None or not completed or get_parallel().tp_rank != 0:
+            return
+        from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
+
+        self.ipc_channels.send_to_tokenizer.send_output(
+            ElasticScaleUpdateReq(
+                success=success,
+                terminal=True,
+                effective_ep_size=state.effective_ep_size,
+                operation_id=operation_id,
+                recovery_update=True,
+                recovery_phase=state.recovery_phase,
+                error=state.recovery_error,
+            )
         )
 
     def load_lora_adapter(

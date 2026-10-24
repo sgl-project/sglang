@@ -42,7 +42,9 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
     ElasticScaleUpdateReq,
+    ObserveElasticEPMembershipReqInput,
     ProfileReq,
+    RecoverElasticEPReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     sock_recv,
@@ -274,6 +276,42 @@ class DataParallelController:
             if worker is not None:
                 sock_send(worker, obj)
 
+    def send_membership_observation_to_survivors(
+        self, obj: ObserveElasticEPMembershipReqInput
+    ):
+        """Route one observation without committing the proposed membership."""
+        targets = [
+            i
+            for i in self._active_workers[:: self.control_message_step]
+            if i != obj.rank and self.workers[i] is not None
+        ]
+        logger.info(
+            "[Elastic EP][membership] dpc_routed submission_id=%s "
+            "failed_rank=%s target_ranks=%s",
+            obj.submission_id,
+            obj.rank,
+            targets,
+        )
+        for i in targets:
+            worker = self.workers[i]
+            sock_send(worker, obj)
+
+    def send_recovery_to_schedulers(self, obj: RecoverElasticEPReqInput):
+        targets = [
+            i
+            for i in self._active_workers[:: self.control_message_step]
+            if self.workers[i] is not None
+        ]
+        logger.info(
+            "[Elastic EP][recovery] dpc_routed operation_id=%s submission_id=%s "
+            "target_ranks=%s",
+            obj.operation_id,
+            obj.submission_id,
+            targets,
+        )
+        for i in targets:
+            sock_send(self.workers[i], obj)
+
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if get_exec().moe.elastic_ep_backend is not None:
             if len(ranks.status) != self.max_dp_size:
@@ -405,9 +443,16 @@ class DataParallelController:
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (
+                    ObserveElasticEPMembershipReqInput,
+                    self.send_membership_observation_to_survivors,
+                ),
+                (RecoverElasticEPReqInput, self.send_recovery_to_schedulers),
+                (
                     ElasticScaleUpdateReq,
-                    lambda msg: self.add_elastic_workers(
-                        msg.slot_offset, msg.slot_count
+                    lambda msg: (
+                        self.add_elastic_workers(msg.slot_offset, msg.slot_count)
+                        if msg.terminal and msg.success
+                        else None
                     ),
                 ),
             ]

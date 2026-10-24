@@ -27,6 +27,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from array import array
 from collections import deque
 from contextlib import nullcontext
@@ -75,6 +76,7 @@ from sglang.srt.layers.joint_schema_head import (
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.communicator import FanOutTimeoutError
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -96,8 +98,14 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
+    ObserveElasticEPMembershipProgressOutput,
+    ObserveElasticEPMembershipReqInput,
+    ObserveElasticEPMembershipReqOutput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    RecoverElasticEPProgressOutput,
+    RecoverElasticEPReqInput,
+    RecoverElasticEPReqOutput,
     ScaleElasticEPReqInput,
     ScaleElasticEPReqOutput,
     SessionParams,
@@ -205,8 +213,80 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+_ELASTIC_EP_SCHEDULER_RESPONSE_TIMEOUT_SECS = 30
+# Mooncake's default reconciliation window can occupy the scheduler for 30
+# seconds. Keep the mutation cutoff beyond that window and reserve the final
+# five seconds for a correlated acknowledgement or rejection to return.
+_ELASTIC_EP_MEMBERSHIP_RESPONSE_TIMEOUT_SECS = 60
+_ELASTIC_EP_MEMBERSHIP_REPLY_GRACE_SECS = 5
+_MEMBERSHIP_OBSERVATION_STAGE_ORDER = {
+    stage: index
+    for index, stage in enumerate(
+        (
+            "tokenizer_dispatched",
+            "scheduler_handler_entered",
+            "scheduler_deadline_rejected",
+            "scheduler_store_started",
+            "scheduler_store_completed",
+            "tokenizer_acknowledgement_received",
+        )
+    )
+}
+_RECOVERY_SUBMISSION_STAGE_ORDER = {
+    stage: index
+    for index, stage in enumerate(
+        (
+            "tokenizer_dispatched",
+            "scheduler_handler_entered",
+            "scheduler_store_started",
+            "scheduler_store_completed",
+            "tokenizer_acknowledgement_received",
+        )
+    )
+}
 
 logger = logging.getLogger(__name__)
+
+
+class MembershipObservationTimeout(TimeoutError):
+    """The tokenizer did not receive the complete survivor quorum in time."""
+
+    def __init__(
+        self,
+        *,
+        submission_id: str,
+        expected_ranks: List[int],
+        received_ranks: List[int],
+        last_completed_stage: str,
+        elapsed_seconds: float,
+    ) -> None:
+        super().__init__("Timed out waiting for the membership survivor quorum.")
+        self.submission_id = submission_id
+        self.expected_ranks = expected_ranks
+        self.received_ranks = received_ranks
+        self.missing_ranks = sorted(set(expected_ranks) - set(received_ranks))
+        self.last_completed_stage = last_completed_stage
+        self.elapsed_seconds = elapsed_seconds
+
+
+class RecoverySubmissionTimeout(TimeoutError):
+    """The tokenizer could not determine whether recovery was admitted."""
+
+    def __init__(
+        self,
+        *,
+        operation_id: str,
+        submission_id: str,
+        last_completed_stage: str,
+        elapsed_seconds: float,
+        recovery_phase: str,
+    ) -> None:
+        super().__init__("Timed out waiting for the recovery scheduler quorum.")
+        self.operation_id = operation_id
+        self.submission_id = submission_id
+        self.last_completed_stage = last_completed_stage
+        self.elapsed_seconds = elapsed_seconds
+        self.recovery_phase = recovery_phase
 
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
@@ -535,9 +615,54 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         parallel = get_parallel()
         self.elastic_worker_count = parallel.num_dp_ranks
         self.attn_replica_size = attn_replica_size()
+        self.elastic_instance_id = (
+            parallel.elastic_ep_runtime_instance_id or uuid.uuid4().hex
+        )
+        self.elastic_initial_ep_size = (
+            parallel.elastic_ep_initial_size
+            or self.elastic_worker_count * self.attn_replica_size
+        )
+        self.elastic_allocation_width = parallel.elastic_ep_allocation_width
+        self.elastic_max_committed_ep_size = (
+            self.elastic_worker_count * self.attn_replica_size
+        )
+        self.elastic_operation_id = None
+        self.elastic_operation_target = None
+        self.elastic_operation_succeeded = None
+        self.elastic_expected_joining_allocation_ids = []
         self.elastic_pending_ep_size = None
         self.elastic_scale_phase = "idle"
         self.elastic_last_error = None
+        self.elastic_runtime_health = "healthy"
+        self.elastic_runtime_error = None
+        self.elastic_scheduler_response_timeout = min(
+            _ELASTIC_EP_SCHEDULER_RESPONSE_TIMEOUT_SECS,
+            get_exec().moe.elastic_ep_scale_timeout,
+        )
+        self.elastic_membership_observation_timeout = (
+            _ELASTIC_EP_MEMBERSHIP_RESPONSE_TIMEOUT_SECS
+        )
+        self.elastic_membership_observation_reply_grace = min(
+            _ELASTIC_EP_MEMBERSHIP_REPLY_GRACE_SECS,
+            self.elastic_membership_observation_timeout / 2,
+        )
+        self.elastic_joining_rank_offset = None
+        self.elastic_joining_rank_count = 0
+        self.elastic_ready_rank_count = 0
+        self.elastic_joining_allocation_ids = []
+        self._elastic_scale_lock = asyncio.Lock()
+        self.elastic_recovery_operation_id = None
+        self.elastic_recovery_topology_generation = None
+        self.elastic_recovery_allocation_id = None
+        self.elastic_recovery_failed_allocation_incarnation = None
+        self.elastic_recovery_rank_offset = None
+        self.elastic_recovery_phase = "idle"
+        self.elastic_recovery_succeeded = None
+        self.elastic_recovery_error = None
+        self.elastic_active_rank_status = [True] * self.elastic_worker_count
+        self._elastic_reported_rank_status = list(self.elastic_active_rank_status)
+        self._elastic_membership_fences = {}
+        self._elastic_recovery_lock = asyncio.Lock()
         self.enable_metrics = get_observability().enable_metrics
         self.incremental_streaming_output = get_serving().incremental_streaming_output
         self.enable_lora = get_lora().enable_lora
@@ -900,6 +1025,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
+                (
+                    RecoverElasticEPProgressOutput,
+                    self._record_recovery_submission_progress,
+                ),
+                (
+                    ObserveElasticEPMembershipProgressOutput,
+                    self._record_membership_observation_progress,
+                ),
             ]
         )
         self.init_communicators()
@@ -3658,12 +3791,101 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        self._dispatch_to_scheduler(ranks)
+        status = list(ranks.status)
+        if len(status) != len(self.elastic_active_rank_status):
+            logger.warning(
+                "Ignoring Elastic EP active-rank update with status len=%d; expected=%d",
+                len(status),
+                len(self.elastic_active_rank_status),
+            )
+            return
+        self._elastic_reported_rank_status = list(status)
+        for rank in self._elastic_membership_fences:
+            status[rank] = False
+        self._apply_active_rank_status(status)
+
+    def _apply_active_rank_status(self, status: List[bool]) -> None:
+        self.elastic_active_rank_status = status
+        active_rank_count = sum(self.elastic_active_rank_status)
+        self.recover_elastic_ep_communicator.set_fan_out(active_rank_count)
+        self.observe_elastic_ep_membership_communicator.set_fan_out(active_rank_count)
+        self._dispatch_to_scheduler(
+            ActiveRanksOutput(status=list(self.elastic_active_rank_status))
+        )
 
     def forward_elastic_scale_update(self, msg: ElasticScaleUpdateReq):
+        if msg.recovery_update:
+            if msg.operation_id != self.elastic_recovery_operation_id:
+                logger.warning(
+                    "Ignoring stale Elastic EP recovery update for operation %s; current=%s",
+                    msg.operation_id,
+                    self.elastic_recovery_operation_id,
+                )
+                return
+            self.elastic_recovery_phase = msg.recovery_phase or "failed"
+            if msg.recovery_topology_generation is not None:
+                self.elastic_recovery_topology_generation = (
+                    msg.recovery_topology_generation
+                )
+            if msg.recovery_rank_offset is not None:
+                self.elastic_recovery_rank_offset = msg.recovery_rank_offset
+            if msg.recovery_failed_allocation_incarnation is not None:
+                self.elastic_recovery_failed_allocation_incarnation = (
+                    msg.recovery_failed_allocation_incarnation
+                )
+            if msg.terminal:
+                self.elastic_recovery_succeeded = msg.success
+                self.elastic_recovery_error = None if msg.success else msg.error
+                recovery_rank = self.elastic_recovery_rank_offset
+                recovery_fence = self._elastic_membership_fences.get(recovery_rank)
+                if (
+                    msg.success
+                    and recovery_fence is not None
+                    and recovery_fence[:3]
+                    == (
+                        self.elastic_instance_id,
+                        self.elastic_recovery_topology_generation,
+                        self.elastic_recovery_failed_allocation_incarnation,
+                    )
+                ):
+                    self._elastic_membership_fences.pop(recovery_rank, None)
+                    self.update_active_ranks(
+                        ActiveRanksOutput(
+                            status=list(self._elastic_reported_rank_status)
+                        )
+                    )
+            return
+        if not msg.operation_update:
+            if msg.runtime_health is not None:
+                self.elastic_runtime_health = msg.runtime_health
+                self.elastic_runtime_error = msg.runtime_error
+            return
+
+        if (
+            msg.operation_id is not None
+            and msg.operation_id != self.elastic_operation_id
+        ):
+            logger.warning(
+                "Ignoring stale Elastic EP update for operation %s; current=%s",
+                msg.operation_id,
+                self.elastic_operation_id,
+            )
+            return
+
+        if msg.runtime_health is not None:
+            self.elastic_runtime_health = msg.runtime_health
+            self.elastic_runtime_error = msg.runtime_error
+        self.elastic_scale_phase = msg.scale_phase
+        self.elastic_joining_rank_offset = msg.joining_rank_offset
+        self.elastic_joining_rank_count = msg.joining_rank_count
+        self.elastic_ready_rank_count = msg.ready_rank_count
+        self.elastic_joining_allocation_ids = list(msg.joining_allocation_ids)
+        if not msg.terminal:
+            return
+
         if not msg.success:
             self.elastic_pending_ep_size = None
-            self.elastic_scale_phase = "failed"
+            self.elastic_operation_succeeded = False
             self.elastic_last_error = msg.error
             return
 
@@ -3671,49 +3893,709 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.elastic_worker_count = physical_ep_size_to_dp_size(
             msg.effective_ep_size, self.attn_replica_size
         )
+        self.elastic_max_committed_ep_size = max(
+            self.elastic_max_committed_ep_size,
+            msg.effective_ep_size,
+        )
         self.elastic_pending_ep_size = None
-        self.elastic_scale_phase = "serving_expanded"
+        self.elastic_operation_succeeded = True
         self.elastic_last_error = None
         self.update_control_communicator_fan_out(self.elastic_worker_count)
 
     def get_elastic_ep_state(self):
         return {
+            "instance_id": self.elastic_instance_id,
+            "operation_id": self.elastic_operation_id,
+            "target_ep_size": self.elastic_operation_target,
+            "operation_succeeded": self.elastic_operation_succeeded,
             "is_scaling_elastic_ep": self.elastic_pending_ep_size is not None,
+            "initial_ep_size": self.elastic_initial_ep_size,
+            "allocation_width": self.elastic_allocation_width,
             "effective_ep_size": self.elastic_worker_count * self.attn_replica_size,
+            "max_committed_ep_size": self.elastic_max_committed_ep_size,
             "pending_ep_size": self.elastic_pending_ep_size,
             "scale_phase": self.elastic_scale_phase,
             "last_error": self.elastic_last_error,
+            "runtime_health": self.elastic_runtime_health,
+            "runtime_error": self.elastic_runtime_error,
+            "joining_rank_offset": self.elastic_joining_rank_offset,
+            "joining_rank_count": self.elastic_joining_rank_count,
+            "ready_rank_count": self.elastic_ready_rank_count,
+            "joining_allocation_ids": list(self.elastic_joining_allocation_ids),
+            "recovery_operation_id": self.elastic_recovery_operation_id,
+            "recovery_phase": self.elastic_recovery_phase,
+            "recovery_succeeded": self.elastic_recovery_succeeded,
+            "recovery_topology_generation": self.elastic_recovery_topology_generation,
+            "recovery_allocation_id": self.elastic_recovery_allocation_id,
+            "recovery_rank_offset": self.elastic_recovery_rank_offset,
+            "recovery_failed_allocation_incarnation": self.elastic_recovery_failed_allocation_incarnation,
+            "recovery_error": self.elastic_recovery_error,
         }
 
     async def scale_elastic_ep(
         self, obj: ScaleElasticEPReqInput
     ) -> ScaleElasticEPReqOutput:
         """Send a scale request to every DP scheduler."""
-        if self.elastic_pending_ep_size is not None:
+        async with self._elastic_scale_lock:
+            return await self._scale_elastic_ep_locked(obj)
+
+    async def recover_elastic_ep(
+        self, obj: RecoverElasticEPReqInput
+    ) -> RecoverElasticEPReqOutput:
+        """Fan out one fenced fixed-slot recovery operation to every scheduler."""
+        async with self._elastic_recovery_lock:
+            operation_id = obj.operation_id
+            existing = operation_id == self.elastic_recovery_operation_id
+            requested = (
+                obj.topology_generation,
+                obj.allocation_id,
+                obj.rank_offset,
+                obj.failed_allocation_incarnation,
+            )
+            current = (
+                self.elastic_recovery_topology_generation,
+                self.elastic_recovery_allocation_id,
+                self.elastic_recovery_rank_offset,
+                getattr(self, "elastic_recovery_failed_allocation_incarnation", None),
+            )
+            if existing:
+                if requested != current:
+                    return RecoverElasticEPReqOutput(
+                        success=False,
+                        conflict=True,
+                        message=(
+                            f"Recovery operation {operation_id} does not match "
+                            "its original fenced slot."
+                        ),
+                        operation_id=operation_id,
+                        recovery_phase=self.elastic_recovery_phase,
+                        terminal=self.elastic_recovery_succeeded is not None,
+                    )
+                if self.elastic_recovery_phase != "submission_unknown":
+                    return self._current_elastic_recovery_output(operation_id)
+                self.elastic_recovery_phase = "reconciling_submission"
+                self.elastic_recovery_error = None
+            if self.elastic_recovery_operation_id is not None and (
+                self.elastic_recovery_succeeded is None and not existing
+            ):
+                return RecoverElasticEPReqOutput(
+                    success=False,
+                    conflict=True,
+                    message="A previous Elastic EP recovery operation is pending.",
+                    operation_id=operation_id,
+                    recovery_phase=self.elastic_recovery_phase,
+                    terminal=True,
+                )
+
+            if not existing:
+                self.elastic_recovery_operation_id = operation_id
+                self.elastic_recovery_topology_generation = obj.topology_generation
+                self.elastic_recovery_allocation_id = obj.allocation_id
+                self.elastic_recovery_failed_allocation_incarnation = (
+                    obj.failed_allocation_incarnation
+                )
+                self.elastic_recovery_rank_offset = obj.rank_offset
+                self.elastic_recovery_phase = "submitting"
+                self.elastic_recovery_succeeded = None
+                self.elastic_recovery_error = None
+            scheduler_obj = RecoverElasticEPReqInput(
+                operation_id=operation_id,
+                runtime_instance_id=self.elastic_instance_id,
+                topology_generation=obj.topology_generation,
+                allocation_id=obj.allocation_id,
+                rank_offset=obj.rank_offset,
+                failed_allocation_incarnation=obj.failed_allocation_incarnation,
+                submission_id=uuid.uuid4().hex,
+            )
+            submission_id = scheduler_obj.submission_id
+            expected_ranks = [
+                rank
+                for rank, active in enumerate(self.elastic_active_rank_status)
+                if active
+            ]
+            started_at = time.monotonic()
+            logger.info(
+                "[Elastic EP][recovery] submission_started operation_id=%s "
+                "submission_id=%s expected_ranks=%s timeout_seconds=%.3f",
+                operation_id,
+                submission_id,
+                expected_ranks,
+                self.elastic_scheduler_response_timeout,
+            )
+            if not hasattr(self, "_recovery_submission_progress"):
+                self._recovery_submission_progress = {}
+            self._recovery_submission_progress[submission_id] = {
+                rank: "tokenizer_dispatched" for rank in expected_ranks
+            }
+            self.auto_create_handle_loop()
+            try:
+                responses: List[
+                    RecoverElasticEPReqOutput
+                ] = await self.recover_elastic_ep_communicator(
+                    scheduler_obj,
+                    timeout=self.elastic_scheduler_response_timeout,
+                )
+            except FanOutTimeoutError as exc:
+                if self.elastic_recovery_succeeded is not None:
+                    self._recovery_submission_progress.pop(submission_id, None)
+                    return self._current_elastic_recovery_output(operation_id)
+                progress_by_rank = self._recovery_submission_progress.pop(
+                    submission_id,
+                    {rank: "tokenizer_dispatched" for rank in expected_ranks},
+                )
+                for response in exc.partial_results:
+                    if response.responder_rank in progress_by_rank:
+                        progress_by_rank[response.responder_rank] = (
+                            "tokenizer_acknowledgement_received"
+                        )
+                last_completed_stage = (
+                    min(
+                        progress_by_rank.values(),
+                        key=_RECOVERY_SUBMISSION_STAGE_ORDER.__getitem__,
+                    )
+                    if progress_by_rank
+                    else "tokenizer_dispatched"
+                )
+                elapsed_seconds = time.monotonic() - started_at
+                self.elastic_recovery_phase = "submission_unknown"
+                logger.warning(
+                    "[Elastic EP][recovery] timed_out operation_id=%s "
+                    "submission_id=%s last_completed_stage=%s "
+                    "elapsed_seconds=%.3f",
+                    operation_id,
+                    submission_id,
+                    last_completed_stage,
+                    elapsed_seconds,
+                )
+                raise RecoverySubmissionTimeout(
+                    operation_id=operation_id,
+                    submission_id=submission_id,
+                    last_completed_stage=last_completed_stage,
+                    elapsed_seconds=elapsed_seconds,
+                    recovery_phase=self.elastic_recovery_phase,
+                ) from exc
+            except BaseException:
+                self._recovery_submission_progress.pop(submission_id, None)
+                if self.elastic_recovery_succeeded is not None:
+                    return self._current_elastic_recovery_output(operation_id)
+                self.elastic_recovery_phase = "submission_unknown"
+                raise
+            self._recovery_submission_progress.pop(submission_id, None)
+            if self.elastic_recovery_succeeded is not None:
+                return self._current_elastic_recovery_output(operation_id)
+            if not responses:
+                self.elastic_recovery_phase = "submission_unknown"
+                raise RuntimeError(
+                    "Recovery submission returned no scheduler responses."
+                )
+            for response in responses:
+                logger.info(
+                    "[Elastic EP][recovery] acknowledgement_%s operation_id=%s "
+                    "submission_id=%s responder_rank=%s elapsed_seconds=%.3f",
+                    "received" if response.success else "rejected",
+                    operation_id,
+                    submission_id,
+                    response.responder_rank,
+                    time.monotonic() - started_at,
+                )
+            failed = next(
+                (response for response in responses if not response.success), None
+            )
+            if failed is not None:
+                self.elastic_recovery_succeeded = False
+                self.elastic_recovery_phase = failed.recovery_phase
+                self.elastic_recovery_error = failed.message
+                failed.operation_id = operation_id
+                return failed
+
+            self.elastic_recovery_phase = responses[0].recovery_phase
+            responses[0].operation_id = operation_id
+            return responses[0]
+
+    def _record_recovery_submission_progress(
+        self, progress: RecoverElasticEPProgressOutput
+    ) -> None:
+        submissions = getattr(self, "_recovery_submission_progress", {})
+        progress_by_rank = submissions.get(progress.submission_id)
+        if progress_by_rank is None or progress.responder_rank not in progress_by_rank:
+            return
+        if progress.completed_stage not in _RECOVERY_SUBMISSION_STAGE_ORDER:
+            logger.warning(
+                "[Elastic EP][recovery] progress_rejected operation_id=%s "
+                "submission_id=%s responder_rank=%s completed_stage=%s",
+                progress.operation_id,
+                progress.submission_id,
+                progress.responder_rank,
+                progress.completed_stage,
+            )
+            return
+        previous_stage = progress_by_rank[progress.responder_rank]
+        if (
+            _RECOVERY_SUBMISSION_STAGE_ORDER[progress.completed_stage]
+            > _RECOVERY_SUBMISSION_STAGE_ORDER[previous_stage]
+        ):
+            progress_by_rank[progress.responder_rank] = progress.completed_stage
+        logger.info(
+            "[Elastic EP][recovery] progress_received operation_id=%s "
+            "submission_id=%s responder_rank=%s completed_stage=%s",
+            progress.operation_id,
+            progress.submission_id,
+            progress.responder_rank,
+            progress.completed_stage,
+        )
+
+    async def observe_elastic_ep_membership(
+        self, obj: ObserveElasticEPMembershipReqInput
+    ) -> ObserveElasticEPMembershipReqOutput:
+        """Apply membership before admitting a recovery operation."""
+        async with self._elastic_recovery_lock:
+            return await self._observe_elastic_ep_membership_locked(obj)
+
+    async def _observe_elastic_ep_membership_locked(
+        self, obj: ObserveElasticEPMembershipReqInput
+    ) -> ObserveElasticEPMembershipReqOutput:
+        """Fan out a CPU-only membership observation to schedulers."""
+        if self.attn_replica_size != 1:
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message=(
+                    "Fixed-slot membership observation requires one physical EP "
+                    "rank per DP slot."
+                ),
+            )
+        if not 0 <= obj.rank < len(self.elastic_active_rank_status):
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message="Membership observation rank is outside the active topology.",
+            )
+        fence = (
+            obj.runtime_instance_id,
+            obj.topology_generation,
+            obj.failed_allocation_incarnation,
+        )
+        previous_fence = self._elastic_membership_fences.get(obj.rank)
+        if previous_fence is not None:
+            previous_epoch = previous_fence[3]
+            previous_identity = previous_fence[:3]
+            if previous_identity == fence and obj.membership_epoch == previous_epoch:
+                pass
+            elif (
+                previous_identity == fence and obj.membership_epoch > previous_epoch
+            ) or obj.topology_generation > previous_fence[1]:
+                pass
+            else:
+                return ObserveElasticEPMembershipReqOutput(
+                    accepted=False,
+                    message=(
+                        "Membership observation is stale or conflicts with the "
+                        "applied slot incarnation."
+                    ),
+                )
+        survivor_ranks = {
+            rank
+            for rank, active in enumerate(self.elastic_active_rank_status)
+            if active and rank != obj.rank
+        }
+        if not survivor_ranks:
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message="Membership observation requires at least one survivor.",
+            )
+        submission_id = uuid.uuid4().hex
+        response_timeout = self.elastic_membership_observation_timeout
+        mutation_timeout = (
+            response_timeout - self.elastic_membership_observation_reply_grace
+        )
+        deadline_unix_seconds = time.time() + mutation_timeout
+        scheduler_obj = ObserveElasticEPMembershipReqInput(
+            runtime_instance_id=obj.runtime_instance_id,
+            topology_generation=obj.topology_generation,
+            rank=obj.rank,
+            failed_allocation_incarnation=(obj.failed_allocation_incarnation),
+            membership_epoch=obj.membership_epoch,
+            submission_id=submission_id,
+            deadline_unix_seconds=deadline_unix_seconds,
+        )
+        expected_ranks = sorted(survivor_ranks)
+        started_at = time.monotonic()
+        logger.info(
+            "[Elastic EP][membership] submission_started submission_id=%s "
+            "expected_ranks=%s mutation_timeout_seconds=%.3f "
+            "response_timeout_seconds=%.3f",
+            submission_id,
+            expected_ranks,
+            mutation_timeout,
+            response_timeout,
+        )
+        if not hasattr(self, "_membership_observation_progress"):
+            self._membership_observation_progress = {}
+        self._membership_observation_progress[submission_id] = {
+            rank: "tokenizer_dispatched" for rank in expected_ranks
+        }
+        self.auto_create_handle_loop()
+        try:
+            responses: List[
+                ObserveElasticEPMembershipReqOutput
+            ] = await self.observe_elastic_ep_membership_communicator(
+                scheduler_obj,
+                fan_out=len(survivor_ranks),
+                timeout=response_timeout,
+            )
+        except FanOutTimeoutError as exc:
+            received_ranks = sorted(
+                response.responder_rank
+                for response in exc.partial_results
+                if response.responder_rank is not None
+            )
+            elapsed_seconds = time.monotonic() - started_at
+            missing_ranks = sorted(survivor_ranks - set(received_ranks))
+            progress_by_rank = self._membership_observation_progress.pop(
+                submission_id,
+                {rank: "tokenizer_dispatched" for rank in expected_ranks},
+            )
+            for rank in received_ranks:
+                progress_by_rank[rank] = "tokenizer_acknowledgement_received"
+            last_completed_stage = min(
+                progress_by_rank.values(),
+                key=_MEMBERSHIP_OBSERVATION_STAGE_ORDER.__getitem__,
+            )
+            logger.warning(
+                "[Elastic EP][membership] timed_out submission_id=%s "
+                "expected_ranks=%s received_ranks=%s missing_ranks=%s "
+                "last_completed_stage=%s elapsed_seconds=%.3f",
+                submission_id,
+                expected_ranks,
+                received_ranks,
+                missing_ranks,
+                last_completed_stage,
+                elapsed_seconds,
+            )
+            raise MembershipObservationTimeout(
+                submission_id=submission_id,
+                expected_ranks=expected_ranks,
+                received_ranks=received_ranks,
+                last_completed_stage=last_completed_stage,
+                elapsed_seconds=elapsed_seconds,
+            ) from exc
+        except BaseException:
+            self._membership_observation_progress.pop(submission_id, None)
+            raise
+        self._membership_observation_progress.pop(submission_id, None)
+        if not responses:
+            raise RuntimeError(
+                "Membership observation returned no scheduler responses."
+            )
+        responder_ranks = [response.responder_rank for response in responses]
+        for response in responses:
+            logger.info(
+                "[Elastic EP][membership] reply_%s submission_id=%s "
+                "responder_rank=%s elapsed_seconds=%.3f",
+                "received" if response.accepted else "rejected",
+                submission_id,
+                response.responder_rank,
+                time.monotonic() - started_at,
+            )
+        if (
+            len(set(responder_ranks)) != len(responder_ranks)
+            or set(responder_ranks) != survivor_ranks
+        ):
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message=(
+                    "Membership observation responses did not match the survivor "
+                    f"quorum: expected={sorted(survivor_ranks)}, "
+                    f"received={responder_ranks}."
+                ),
+                submission_id=submission_id,
+            )
+        rejected = next(
+            (response for response in responses if not response.accepted), None
+        )
+        if rejected is not None:
+            return rejected
+        observation_keys = {response.observation_key for response in responses}
+        if None in observation_keys or len(observation_keys) != 1:
+            return ObserveElasticEPMembershipReqOutput(
+                accepted=False,
+                message="Survivors did not accept the same membership observation key.",
+                submission_id=submission_id,
+            )
+        if not responses[0].accepted:
+            return responses[0]
+
+        # The scheduler quorum has durably applied this exact observation.
+        # Commit the matching tokenizer-visible recovery state before the HTTP
+        # handler acknowledges membership. Synchronous scheduler admission has
+        # already consumed the observation, so a later scheduler poll cannot be
+        # relied on to publish this transition back to the tokenizer.
+        self.elastic_recovery_topology_generation = obj.topology_generation
+        self.elastic_recovery_rank_offset = obj.rank
+        self.elastic_recovery_failed_allocation_incarnation = (
+            obj.failed_allocation_incarnation
+        )
+        self.elastic_recovery_phase = "awaiting_recovery"
+        self.elastic_recovery_succeeded = None
+        self.elastic_recovery_error = None
+
+        # Fence the local routing view and publish it to the DPC on the same
+        # ordered control channel used by the subsequent recovery request.
+        self._elastic_membership_fences[obj.rank] = (*fence, obj.membership_epoch)
+        status = list(self.elastic_active_rank_status)
+        status[obj.rank] = False
+        self._elastic_reported_rank_status = list(status)
+        self._apply_active_rank_status(status)
+        return responses[0]
+
+    def _record_membership_observation_progress(
+        self, progress: ObserveElasticEPMembershipProgressOutput
+    ) -> None:
+        submissions = getattr(self, "_membership_observation_progress", {})
+        progress_by_rank = submissions.get(progress.submission_id)
+        if progress_by_rank is None or progress.responder_rank not in progress_by_rank:
+            return
+        if progress.completed_stage not in _MEMBERSHIP_OBSERVATION_STAGE_ORDER:
+            logger.warning(
+                "[Elastic EP][membership] progress_rejected submission_id=%s "
+                "responder_rank=%s completed_stage=%s",
+                progress.submission_id,
+                progress.responder_rank,
+                progress.completed_stage,
+            )
+            return
+        previous_stage = progress_by_rank[progress.responder_rank]
+        if (
+            _MEMBERSHIP_OBSERVATION_STAGE_ORDER[progress.completed_stage]
+            > _MEMBERSHIP_OBSERVATION_STAGE_ORDER[previous_stage]
+        ):
+            progress_by_rank[progress.responder_rank] = progress.completed_stage
+        logger.info(
+            "[Elastic EP][membership] progress_received submission_id=%s "
+            "responder_rank=%s completed_stage=%s",
+            progress.submission_id,
+            progress.responder_rank,
+            progress.completed_stage,
+        )
+
+    def _current_elastic_recovery_output(
+        self, operation_id: str
+    ) -> RecoverElasticEPReqOutput:
+        success = self.elastic_recovery_succeeded is not False
+        return RecoverElasticEPReqOutput(
+            success=success,
+            message=(
+                self.elastic_recovery_error or "Recovery operation failed."
+                if not success
+                else f"Returning existing recovery operation {operation_id}."
+            ),
+            operation_id=operation_id,
+            recovery_phase=self.elastic_recovery_phase,
+            terminal=self.elastic_recovery_succeeded is not None,
+        )
+
+    def _current_elastic_scale_output(
+        self, operation_id: str, new_ep_size: int
+    ) -> ScaleElasticEPReqOutput:
+        success = self.elastic_operation_succeeded is not False
+        return ScaleElasticEPReqOutput(
+            success=success,
+            message=(
+                self.elastic_last_error
+                if not success
+                else f"Returning existing Elastic EP operation {operation_id}."
+            ),
+            operation_id=operation_id,
+            instance_id=self.elastic_instance_id,
+            old_ep_size=self.elastic_worker_count * self.attn_replica_size,
+            new_ep_size=new_ep_size,
+            pending_ep_size=self.elastic_pending_ep_size,
+            scale_phase=self.elastic_scale_phase,
+            terminal=self.elastic_operation_succeeded is not None,
+            effective_ep_size=self.elastic_worker_count * self.attn_replica_size,
+        )
+
+    async def _scale_elastic_ep_locked(
+        self, obj: ScaleElasticEPReqInput
+    ) -> ScaleElasticEPReqOutput:
+        operation_id = obj.operation_id or uuid.uuid4().hex
+        retry_unknown_submission = operation_id == self.elastic_operation_id
+        if (
+            obj.expected_instance_id is not None
+            and obj.expected_instance_id != self.elastic_instance_id
+        ):
             return ScaleElasticEPReqOutput(
                 success=False,
+                conflict=True,
                 message=(
-                    "A previous scale operation has not completed yet. Wait until "
-                    "all pending ranks have joined before issuing another scale."
+                    f"Runtime instance changed: expected {obj.expected_instance_id}, "
+                    f"current {self.elastic_instance_id}."
                 ),
+                operation_id=operation_id,
+                instance_id=self.elastic_instance_id,
                 old_ep_size=self.elastic_worker_count * self.attn_replica_size,
                 new_ep_size=obj.new_ep_size,
                 pending_ep_size=self.elastic_pending_ep_size,
                 scale_phase=self.elastic_scale_phase,
             )
+
+        if retry_unknown_submission:
+            if obj.new_ep_size != self.elastic_operation_target:
+                return ScaleElasticEPReqOutput(
+                    success=False,
+                    conflict=True,
+                    message=(
+                        f"Operation {operation_id} already targets EP size "
+                        f"{self.elastic_operation_target}, not {obj.new_ep_size}."
+                    ),
+                    operation_id=operation_id,
+                    instance_id=self.elastic_instance_id,
+                    old_ep_size=self.elastic_worker_count * self.attn_replica_size,
+                    new_ep_size=obj.new_ep_size,
+                    pending_ep_size=self.elastic_pending_ep_size,
+                    scale_phase=self.elastic_scale_phase,
+                )
+            requested_allocations = list(obj.expected_joining_allocation_ids or [])
+            if requested_allocations != self.elastic_expected_joining_allocation_ids:
+                return ScaleElasticEPReqOutput(
+                    success=False,
+                    conflict=True,
+                    message=(
+                        f"Operation {operation_id} already has joining allocations "
+                        f"{self.elastic_expected_joining_allocation_ids}, not "
+                        f"{requested_allocations}."
+                    ),
+                    operation_id=operation_id,
+                    instance_id=self.elastic_instance_id,
+                    old_ep_size=self.elastic_worker_count * self.attn_replica_size,
+                    new_ep_size=obj.new_ep_size,
+                    pending_ep_size=self.elastic_pending_ep_size,
+                    scale_phase=self.elastic_scale_phase,
+                )
+            if self.elastic_scale_phase != "submission_unknown":
+                return self._current_elastic_scale_output(
+                    operation_id,
+                    obj.new_ep_size,
+                )
+            self.elastic_scale_phase = "reconciling_submission"
+            self.elastic_last_error = None
+        else:
+            if self.elastic_pending_ep_size is not None:
+                return ScaleElasticEPReqOutput(
+                    success=False,
+                    conflict=True,
+                    message=(
+                        "A previous scale operation has not completed yet. Wait until "
+                        "all pending ranks have joined before issuing another scale."
+                    ),
+                    operation_id=operation_id,
+                    instance_id=self.elastic_instance_id,
+                    old_ep_size=(self.elastic_worker_count * self.attn_replica_size),
+                    new_ep_size=obj.new_ep_size,
+                    pending_ep_size=self.elastic_pending_ep_size,
+                    scale_phase=self.elastic_scale_phase,
+                    effective_ep_size=(
+                        self.elastic_worker_count * self.attn_replica_size
+                    ),
+                )
+
+            self.elastic_operation_id = operation_id
+            self.elastic_operation_target = obj.new_ep_size
+            self.elastic_operation_succeeded = None
+            self.elastic_expected_joining_allocation_ids = list(
+                obj.expected_joining_allocation_ids or []
+            )
+            self.elastic_pending_ep_size = obj.new_ep_size
+            self.elastic_scale_phase = "submitting"
+            self.elastic_last_error = None
+            self.elastic_joining_rank_offset = (
+                self.elastic_worker_count * self.attn_replica_size
+            )
+            self.elastic_joining_rank_count = (
+                obj.new_ep_size - self.elastic_joining_rank_offset
+            )
+            self.elastic_ready_rank_count = 0
+            self.elastic_joining_allocation_ids = list(
+                obj.expected_joining_allocation_ids or []
+            )
+        scheduler_obj = ScaleElasticEPReqInput(
+            new_ep_size=obj.new_ep_size,
+            operation_id=operation_id,
+            expected_instance_id=obj.expected_instance_id,
+            expected_joining_allocation_ids=obj.expected_joining_allocation_ids,
+            runtime_instance_id=self.elastic_instance_id,
+            submission_id=uuid.uuid4().hex,
+        )
         self.auto_create_handle_loop()
-        responses: List[
-            ScaleElasticEPReqOutput
-        ] = await self.scale_elastic_ep_communicator(obj)
+        try:
+            responses: List[ScaleElasticEPReqOutput] = await asyncio.wait_for(
+                self.scale_elastic_ep_communicator(scheduler_obj),
+                timeout=self.elastic_scheduler_response_timeout,
+            )
+        except asyncio.TimeoutError:
+            if self.elastic_operation_succeeded is not None:
+                return self._current_elastic_scale_output(
+                    operation_id,
+                    obj.new_ep_size,
+                )
+            self.elastic_scale_phase = "submission_unknown"
+            self.elastic_last_error = (
+                "Timed out waiting for Elastic EP scheduler responses."
+            )
+            raise
+        except BaseException as exc:
+            if self.elastic_operation_succeeded is None:
+                self.elastic_scale_phase = "submission_unknown"
+                self.elastic_last_error = f"Scale submission result is unknown: {exc}"
+            raise
+        if self.elastic_operation_succeeded is not None:
+            return self._current_elastic_scale_output(
+                operation_id,
+                obj.new_ep_size,
+            )
+        if not responses:
+            error = "Scale submission returned no scheduler responses."
+            self.elastic_scale_phase = "submission_unknown"
+            self.elastic_last_error = error
+            raise RuntimeError(error)
         for res in responses:
             if not res.success:
-                self.elastic_scale_phase = res.scale_phase
+                self.elastic_scale_phase = (
+                    res.scale_phase if res.pending_ep_size is not None else "failed"
+                )
                 self.elastic_pending_ep_size = res.pending_ep_size
+                self.elastic_operation_succeeded = False
                 self.elastic_last_error = res.message
+                res.operation_id = operation_id
+                res.instance_id = self.elastic_instance_id
                 return res
-        self.elastic_pending_ep_size = responses[0].pending_ep_size
-        self.elastic_scale_phase = responses[0].scale_phase
+
+        pending_response = next(
+            (response for response in responses if not response.terminal),
+            None,
+        )
+        if pending_response is None:
+            self.elastic_worker_count = physical_ep_size_to_dp_size(
+                obj.new_ep_size, self.attn_replica_size
+            )
+            self.elastic_max_committed_ep_size = max(
+                self.elastic_max_committed_ep_size,
+                obj.new_ep_size,
+            )
+            self.elastic_pending_ep_size = None
+            self.elastic_scale_phase = "serving_expanded"
+            self.elastic_operation_succeeded = True
+            self.update_control_communicator_fan_out(self.elastic_worker_count)
+        else:
+            self.elastic_pending_ep_size = pending_response.pending_ep_size
+            self.elastic_scale_phase = pending_response.scale_phase
         self.elastic_last_error = None
+        responses[0].operation_id = operation_id
+        responses[0].instance_id = self.elastic_instance_id
+        responses[0].pending_ep_size = self.elastic_pending_ep_size
+        responses[0].scale_phase = self.elastic_scale_phase
+        responses[0].terminal = pending_response is None
+        responses[0].effective_ep_size = (
+            self.elastic_worker_count * self.attn_replica_size
+        )
         return responses[0]
 
     def _handle_open_session_req_output(self, recv_obj):

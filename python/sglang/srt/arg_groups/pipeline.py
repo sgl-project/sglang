@@ -291,9 +291,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_moe_kernel_config, server_args)
     run_hook(handle_a2a_moe, server_args)
     run_hook(handle_shared_experts_tp, server_args)
+    # Automatic Elastic EP derives physical EP geometry consumed by EPLB.
+    run_hook(handle_elastic_ep, server_args)
     run_hook(handle_eplb_and_dispatch, server_args)
     run_hook(handle_expert_distribution_metrics, server_args)
-    run_hook(handle_elastic_ep, server_args)
     run_hook(validate_experimental_sgl_marlin, server_args)
 
     run_post_process_pass(server_args, _pipeline_parallel_overlap_disable)

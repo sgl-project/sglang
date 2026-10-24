@@ -53,12 +53,14 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
+    ObserveElasticEPMembershipReqOutput,
     OpenSessionReqInput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    RecoverElasticEPReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
@@ -104,7 +106,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Declarative spec: (attr_name_prefix, response_type[, mode])
+# Declarative spec: (attr_name_prefix, response_type[, mode[, correlation_attr]])
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
 _COMMUNICATOR_SPECS = [
@@ -140,7 +142,14 @@ _COMMUNICATOR_SPECS = [
     ("end_weight_update", EndWeightUpdateReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
-    ("scale_elastic_ep", ScaleElasticEPReqOutput),
+    ("scale_elastic_ep", ScaleElasticEPReqOutput, "queueing", "submission_id"),
+    ("recover_elastic_ep", RecoverElasticEPReqOutput, "queueing", "submission_id"),
+    (
+        "observe_elastic_ep_membership",
+        ObserveElasticEPMembershipReqOutput,
+        "queueing",
+        "submission_id",
+    ),
 ]
 
 
@@ -185,10 +194,12 @@ class TokenizerControlMixin:
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
+            correlation_attr = spec[3] if len(spec) > 3 else None
             comm = FanOutCommunicator(
-                self._dispatch_to_scheduler,
-                get_parallel().num_dp_ranks,
-                mode,
+                send=self._dispatch_to_scheduler,
+                fan_out=get_parallel().num_dp_ranks,
+                mode=mode,
+                correlation_attr=correlation_attr,
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))

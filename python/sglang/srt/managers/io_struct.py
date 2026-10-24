@@ -2308,30 +2308,112 @@ class ActiveRanksOutput(BaseReq, kw_only=True):
 
 
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
-    """Report scale completion in physical EP and logical DP-slot units."""
+    """Report an Elastic EP operation or runtime-health update."""
 
     success: bool
     # Public Elastic EP state remains physical.
     effective_ep_size: int
     # DPC capacity and worker activation use logical DP slots.
+    operation_id: Optional[str] = None
+    operation_update: bool = True
+    scale_phase: str = "idle"
+    terminal: bool = True
+    joining_rank_offset: int = 0
+    joining_rank_count: int = 0
+    ready_rank_count: int = 0
+    joining_allocation_ids: List[str] = msgspec.field(default_factory=list)
     slot_offset: int = 0
     slot_count: int = 0
     error: Optional[str] = None
+    runtime_health: Optional[str] = None
+    runtime_error: Optional[str] = None
+    recovery_update: bool = False
+    recovery_phase: Optional[str] = None
+    recovery_topology_generation: Optional[int] = None
+    recovery_rank_offset: Optional[int] = None
+    recovery_failed_allocation_incarnation: Optional[str] = None
 
 
 class ScaleElasticEPReqInput(BaseReq, kw_only=True):
     """Request to scale EP by changing the effective EP size (dp_attention mode)."""
 
     new_ep_size: int
+    operation_id: Optional[str] = None
+    expected_instance_id: Optional[str] = None
+    expected_joining_allocation_ids: Optional[List[str]] = None
+    # Filled by TokenizerManager before scheduler fan-out. It is not accepted
+    # from the public API as the runtime is authoritative for its own identity.
+    runtime_instance_id: Optional[str] = None
+    # Correlates one tokenizer-to-scheduler fan-out attempt. Retries keep the
+    # operation ID but receive a new submission ID.
+    submission_id: Optional[str] = None
 
 
 class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    conflict: bool = False
+    operation_id: Optional[str] = None
+    submission_id: Optional[str] = None
+    instance_id: Optional[str] = None
     old_ep_size: int = 0
     new_ep_size: int = 0
     pending_ep_size: Optional[int] = None
     scale_phase: str = "idle"
+    terminal: bool = False
+    effective_ep_size: int = 0
+
+
+class RecoverElasticEPReqInput(BaseReq, kw_only=True):
+    operation_id: str
+    runtime_instance_id: str
+    topology_generation: int
+    allocation_id: str
+    rank_offset: int
+    failed_allocation_incarnation: str = ""
+    submission_id: Optional[str] = None
+
+
+class RecoverElasticEPReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    conflict: bool = False
+    operation_id: Optional[str] = None
+    submission_id: Optional[str] = None
+    responder_rank: Optional[int] = None
+    recovery_phase: str = "idle"
+    terminal: bool = False
+
+
+class RecoverElasticEPProgressOutput(BaseReq, kw_only=True):
+    operation_id: str
+    submission_id: str
+    responder_rank: int
+    completed_stage: str
+
+
+class ObserveElasticEPMembershipReqInput(BaseReq, kw_only=True):
+    runtime_instance_id: str
+    topology_generation: int
+    rank: int
+    failed_allocation_incarnation: str
+    membership_epoch: int
+    submission_id: Optional[str] = None
+    deadline_unix_seconds: Optional[float] = None
+
+
+class ObserveElasticEPMembershipReqOutput(BaseReq, kw_only=True):
+    accepted: bool
+    message: str
+    observation_key: Optional[str] = None
+    submission_id: Optional[str] = None
+    responder_rank: Optional[int] = None
+
+
+class ObserveElasticEPMembershipProgressOutput(BaseReq, kw_only=True):
+    submission_id: str
+    responder_rank: int
+    completed_stage: str
 
 
 class GetInternalStateReq(BaseReq, kw_only=True):

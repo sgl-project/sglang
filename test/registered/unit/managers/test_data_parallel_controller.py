@@ -31,6 +31,7 @@ from sglang.srt.managers.data_parallel_controller import (
     LoadBalanceMethod,
     WorkerPortHandshake,
 )
+from sglang.srt.managers.io_struct import ObserveElasticEPMembershipReqInput
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
 
@@ -57,8 +58,57 @@ def _make_controller(num_dp_ranks: int) -> DataParallelController:
     ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
+    ctl.control_message_step = 1
     ctl.dp_budget = DPBudget(num_dp_ranks=num_dp_ranks)
     return ctl
+
+
+class TestMembershipObservationRouting(CustomTestCase):
+    def test_routes_only_to_request_scoped_survivors(self):
+        controller = _make_controller(4)
+        request = ObserveElasticEPMembershipReqInput(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            rank=2,
+            failed_allocation_incarnation="pod-uid-5",
+            membership_epoch=4,
+            submission_id="submission-1",
+        )
+
+        with patch("sglang.srt.managers.data_parallel_controller.sock_send") as send:
+            controller.send_membership_observation_to_survivors(request)
+
+        self.assertEqual(
+            send.call_args_list,
+            [
+                call(controller.workers[0], request),
+                call(controller.workers[1], request),
+                call(controller.workers[3], request),
+            ],
+        )
+        self.assertEqual(controller.status, [True, True, True, True])
+
+    def test_route_log_correlates_submission_and_actual_targets(self):
+        controller = _make_controller(2)
+        request = ObserveElasticEPMembershipReqInput(
+            runtime_instance_id="runtime-1",
+            topology_generation=3,
+            rank=1,
+            failed_allocation_incarnation="pod-uid-5",
+            membership_epoch=4,
+            submission_id="submission-1",
+        )
+
+        with (
+            patch("sglang.srt.managers.data_parallel_controller.sock_send"),
+            self.assertLogs(
+                "sglang.srt.managers.data_parallel_controller", level="INFO"
+            ) as logs,
+        ):
+            controller.send_membership_observation_to_survivors(request)
+
+        self.assertIn("submission_id=submission-1", logs.output[0])
+        self.assertIn("target_ranks=[0]", logs.output[0])
 
 
 def _req(

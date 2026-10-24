@@ -934,16 +934,29 @@ class ExecMoe(msgspec.Struct):
         "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",
     ] = False
     ep_join_mode: A[
-        Optional[Literal["scale", "recover"]],
+        Optional[Literal["auto", "scale", "recover"]],
         Arg(
-            help="Join mode for elastic EP. 'recover' rejoins an existing slot after a fault. 'scale' joins as a new rank beyond the original group size and requires --node-rank 1.",
+            help=(
+                "Join mode for elastic EP. 'recover' rejoins an existing slot "
+                "after a fault. 'scale' joins as a new rank beyond the original "
+                "group size and requires --node-rank 1. 'auto' derives the primary "
+                "initial-participant or append-joiner role from "
+                "--elastic-ep-allocation-index."
+            ),
             cli_name="--elastic-ep-join-mode",
-            choices=["scale", "recover"],
+            choices=["auto", "scale", "recover"],
         ),
     ] = None
     elastic_ep_scale_timeout: A[
         float, "Timeout in seconds for a pending elastic EP scale operation."
     ] = 600
+    elastic_ep_recovery_timeout: A[
+        float, "Timeout in seconds for a fixed-slot Elastic EP recovery operation."
+    ] = 600
+    elastic_ep_recovery_policy: A[
+        Literal["legacy", "fixed_slot", "fixed-slot"],
+        "Recovery policy. The fixed_slot policy is opt-in; legacy preserves fault EPLB behavior.",
+    ] = "legacy"
     disable_flashinfer_cutlass_moe_fp4_allgather: A[
         bool, "Disables quantize before all-gather for flashinfer cutlass moe."
     ] = False
