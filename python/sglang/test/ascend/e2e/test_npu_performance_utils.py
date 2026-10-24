@@ -173,6 +173,12 @@ MINIMAX_M2_5_W8A8_MODEL_PATH = (
 MIMO_V2_FLASH_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/iridiumine/MiMo-V2-Flash-W8A8"
 )
+MIMO_V2_5_PRO_FP4_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash"
+)
+MIMO_V2_5_PRO_DFLASH_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash/dflash"
+)
 MINIMAX_M2_5_EAGLE3_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/sgl-npu/MiniMax-M2.5-eagel-model-0318"
 )
