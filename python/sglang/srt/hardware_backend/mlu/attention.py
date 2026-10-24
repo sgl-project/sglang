@@ -38,15 +38,9 @@ class MLUAttnBackend(AttentionBackend):
 
     def _block_tables(self, req_pool_indices):
         return (
-            (
-                self.req_to_token[
-                    req_pool_indices, : self.max_context_len : self.page_size
-                ]
-                // self.page_size
-            )
-            .to(torch.int32)
-            .contiguous()
-        )
+            self.req_to_token[req_pool_indices, : self.max_context_len : self.page_size]
+            // self.page_size
+        ).to(torch.int32)
 
     @staticmethod
     def _cumulative(lengths):
