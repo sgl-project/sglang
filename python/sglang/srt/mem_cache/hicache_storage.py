@@ -152,6 +152,10 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # Number of anchor/KV logical pages represented by one storage object.
+    # Most pools are one-to-one. Coarse pools such as DSV4 C128 set this to
+    # their physical-group coverage so exists() can return a logical prefix.
+    logical_pages_per_object: int = 1
     # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
     block_pages: int = 0
     group_pages: int = 0

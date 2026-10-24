@@ -2130,6 +2130,19 @@ class UnifiedRadixCache(BasePrefixCache):
             assume_stored and storage_start + len(prefetch_key) == storage_hit_end
         )
         prefetch_length = len(prefetch_key)
+        for ct in self.tree_components:
+            if ct == BASE_COMPONENT_TYPE:
+                continue
+            prefetch_length = min(
+                prefetch_length,
+                self.components[ct].align_storage_prefetch_length(
+                    last_host_node_id, prefetch_length
+                ),
+            )
+        prefetch_key = prefetch_key[:prefetch_length]
+        assume_stored = (
+            assume_stored and storage_start + prefetch_length == storage_hit_end
+        )
         stats = self._prefetch_outcome_stats
         if prefetch_length > 0:
             stats["attempts"] += 1
@@ -2913,7 +2926,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 pool_page_size = (
                     entry.host_pool.page_size if entry is not None else self.page_size
                 )
-                num_tokens = min(len(transfer.keys or ()), hit_pages) * pool_page_size
+                hit_objects = hit_pages // transfer.logical_pages_per_object
+                num_tokens = min(len(transfer.keys or ()), hit_objects) * pool_page_size
                 if num_tokens == 0:
                     continue
                 host_indices = self.components[ct].alloc_prefetch_staging(num_tokens)
@@ -3095,7 +3109,11 @@ class UnifiedRadixCache(BasePrefixCache):
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
                 hit_tokens,
-                allow_partial=True,
+                # A coarse pool cannot restore a partially covered group.
+                allow_partial=all(
+                    transfer.logical_pages_per_object == 1
+                    for transfer in operation.pool_transfers or []
+                ),
                 min_tokens=self.prefetch_threshold,
                 evict_host=self.evict_host,
             )

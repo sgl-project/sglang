@@ -750,6 +750,12 @@ class TreeComponent(ABC):
         """Allocate prefetch staging sized by prepare_prefetch, once the hit is known."""
         return None
 
+    def align_storage_prefetch_length(
+        self, node_id: NodeId, prefetch_tokens: int
+    ) -> int:
+        """Align the prefetch span to this component's storage boundaries."""
+        return prefetch_tokens
+
     # ---- Buffer-mode backup hooks (hicache_host_memory_mode=buffer_only) ----
     # Buffer mode writes a node pool by pool: keys per pool come from
     # ``buffer_backup_keys`` or the BACKUP_HOST transfers, beliefs heal through
