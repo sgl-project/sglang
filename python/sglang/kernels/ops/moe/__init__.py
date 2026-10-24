@@ -350,3 +350,6 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+# Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
+from sglang.kernels.ops.moe import cake as _cake  # noqa: E402, F401
