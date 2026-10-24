@@ -142,7 +142,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>fp8_fa_sm120</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}><code>FP8_FA_SM120</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8 (E4M3) dense attention for SM120 GPUs (GeForce RTX 50, RTX PRO Blackwell), written in CuTe-DSL. Q/K/V are quantized per head on the fly; the output stays BF16. Non-causal, batch 1, head dim 128, BF16 inputs; other calls use <code>torch_cudnn_sdpa</code>. Opt-in only: outputs differ from BF16 attention by about 5% relative RMS per call. Each new sequence length compiles once (about 10 s).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8 (E4M3) dense attention for SM120 GPUs (GeForce RTX 50, RTX PRO Blackwell), written in CuTe-DSL. Q/K/V are quantized per head on the fly; the output stays BF16. Non-causal, batch 1, head dim 128, BF16 inputs; other calls use <code>torch_cudnn_sdpa</code>. Opt-in only: outputs differ from BF16 attention by about 5% relative RMS per call. Each new sequence length compiles once (about 10 s). <code>--attention-backend-config</code> keys: <code>bf16_layers</code> (exact attention-layer prefixes that run cuDNN BF16, for heads with very peaked scores; for MiniMax-H3 use <code>blocks.1.attn</code>, <code>blocks.45.attn</code>, <code>blocks.48.attn</code>, <code>blocks.49.attn</code>) and <code>min_seq_len</code> (shorter sequences run cuDNN BF16).</td>
     </tr>
 </tbody>
 </table>
