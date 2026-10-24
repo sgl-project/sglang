@@ -399,6 +399,8 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
 STEP_MAX_US = 2_000_000
+# Pause windows kept for prefill busy accounting.
+PAUSE_WINDOWS_MAX = 1024
 
 # Min wall-clock between load publishes on the stalled no-batch path, which
 # spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
@@ -2542,6 +2544,11 @@ class Scheduler(
         self._prev_step: Optional[Tuple[int, float, bool]] = None
         self._prev_prefill_end_ts: Optional[float] = None
         self._sched_idled = False
+        # Closed pause windows a later prefill step may still overlap; not busy time.
+        self._pause_intervals: Deque[Tuple[float, float]] = deque(
+            maxlen=PAUSE_WINDOWS_MAX
+        )
+        self._pause_started_at: Optional[float] = None
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             server_args=self.server_args,
@@ -5101,13 +5108,22 @@ class Scheduler(
             if prev_end_ts is not None:
                 # A new burst or mode can still overlap an earlier prefill.
                 start_ts = prev_end_ts if contiguous else max(start_ts, prev_end_ts)
-            step_us = int((end_ts - start_ts) * 1e6)
+            pauses = list(self._pause_intervals)
+            if self._pause_started_at is not None:
+                # A result processed while still paused excludes the pause so far.
+                pauses.append((self._pause_started_at, end_ts))
+            paused = sum(max(0.0, min(end_ts, b) - max(start_ts, a)) for a, b in pauses)
+            step_us = int((end_ts - start_ts - paused) * 1e6)
+            # Later prefill steps start at or after this end.
+            while self._pause_intervals and self._pause_intervals[0][1] <= end_ts:
+                self._pause_intervals.popleft()
         else:
             # Decode regression uses launch cadence and skips boundaries.
             if not contiguous:
                 return
             step_us = int((batch.launch_ts - prev_launch_ts) * 1e6)
-        if not 0 < step_us < STEP_MAX_US:
+        # Only decode cadence is capped; a long prefill chunk is real busy time.
+        if step_us <= 0 or (not is_prefill and step_us >= STEP_MAX_US):
             return
         if is_prefill:
             self.total_prefill_busy_us += step_us
@@ -5721,6 +5737,8 @@ class Scheduler(
             # chunked_req cleanup, and overlap result processing through
             # the standard code paths. This avoids duplicating batch
             # manipulation logic and the accounting bugs that come with it.
+            if self._pause_started_at is None:
+                self._pause_started_at = time.monotonic()
             return
 
         if self.enable_overlap and self.last_batch:
@@ -5734,6 +5752,9 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
         elif self.enable_overlap_mlx:
             self._drain_mlx_pending_jobs()
+        # A first retract starts the pause once the in-flight result has drained.
+        if self._pause_started_at is None:
+            self._pause_started_at = time.monotonic()
 
         retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
         if (
@@ -5842,6 +5863,9 @@ class Scheduler(
         ):
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
+        if self._pause_started_at is not None:
+            self._pause_intervals.append((self._pause_started_at, time.monotonic()))
+            self._pause_started_at = None
 
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput
