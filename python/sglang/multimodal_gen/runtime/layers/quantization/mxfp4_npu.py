@@ -37,6 +37,12 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.models.parameter import ModelWeightParameter
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.hardware_backend.npu.quantization.mxfp_capabilities import (
+    W4A4,
+    get_mxfp_capability,
+    require_mxfp_operators,
+    validate_mxfp_configuration,
+)
 
 logger = init_logger(__name__)
 
@@ -115,6 +121,9 @@ class NPUMXFP4DiffusionLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        cap = get_mxfp_capability("diffusion", "dense", W4A4, "online")
+        validate_mxfp_configuration(cap, input_size=layer.weight.shape[-1])
+        require_mxfp_operators(cap)
         weight_fp = layer.weight.data
         if weight_fp.dtype not in (torch.float16, torch.bfloat16):
             weight_fp = weight_fp.to(torch.bfloat16)

@@ -1188,6 +1188,7 @@
                       "docs/hardware-platforms/ascend-npus/optimization/parameter_tuning",
                       "docs/hardware-platforms/ascend-npus/optimization/profiling",
                       "docs/hardware-platforms/ascend-npus/optimization/quantization",
+                      "docs/hardware-platforms/ascend-npus/optimization/mxfp-capabilities",
                       "docs/hardware-platforms/ascend-npus/optimization/ring_sp_performance"
                     ]
                   },

@@ -15,8 +15,18 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import NPUMXFP8MoEMethod
+from sglang.srt.hardware_backend.npu.quantization.mxfp_capabilities import (
+    W8A8,
+    get_mxfp_capability,
+    require_mxfp_operators,
+    validate_mxfp_configuration,
+)
 from sglang.srt.layers.moe.moe_runner import MoeRunner
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
 if TYPE_CHECKING:
@@ -42,17 +52,17 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
         backend = get_moe_runner_backend()
-        if not (backend.is_auto() or backend.is_ascend()):
-            # Not merely a wrong-runner check. Because this method subclasses
-            # UnquantizedFusedMoEMethod it matches FusedMoE's shard-swap list, so
-            # a flashinfer backend would make the weight loader exchange the
-            # w1/w3 shards ("flashinfer assumes w31 format"). Every expert would
-            # then load with gate and up swapped, and gmm1's fused swiglu would
-            # compute silu(up) * gate — no error, just degenerate output.
-            raise ValueError(
-                "MXFP8 MoE on Ascend requires --moe-runner-backend 'auto' or "
-                f"'ascend', got {backend.value!r}."
-            )
+        cap = get_mxfp_capability("srt", "moe", W8A8, "online")
+        # Check before kernels/runner and loading: a flashinfer runner would
+        # otherwise swap w1/w3 shards inherited from the unquantized method.
+        validate_mxfp_configuration(
+            cap,
+            runner=backend.value,
+            a2a_backend=get_moe_a2a_backend().value,
+            activation=moe_runner_config.activation,
+            swiglu_limit=moe_runner_config.swiglu_limit,
+        )
+        require_mxfp_operators(cap)
 
         # The kernels must be attached before the runner is built:
         # AscendRunnerCore.__init__ reads layer.w2_kernel to pick its activation.

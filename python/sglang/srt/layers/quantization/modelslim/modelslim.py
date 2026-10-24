@@ -9,8 +9,19 @@ import torch
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _NPULinearMethodBase,
 )
+from sglang.srt.hardware_backend.npu.quantization.mxfp_capabilities import (
+    MXFP_SCHEMES,
+    get_mxfp_capability,
+    require_mxfp_operators,
+    validate_mxfp_configuration,
+    validate_mxfp_loaded_weights,
+)
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -324,7 +335,14 @@ class ModelSlimConfig(QuantizationConfig):
         for scheme_name, scheme_class in linear_quant_schemes:
             if any(s == scheme_name for s in quant_schemes):
                 logger.info_once(f"Using {scheme_class.__name__}")
-                return scheme_class(quant_config=self.quant_description, prefix=prefix)
+                scheme = scheme_class(
+                    quant_config=self.quant_description, prefix=prefix
+                )
+                if scheme_name in MXFP_SCHEMES:
+                    cap = get_mxfp_capability("srt", "dense", scheme_name, "modelslim")
+                    validate_mxfp_configuration(cap, prefix=prefix)
+                    scheme.mxfp_capability = cap
+                return scheme
 
         logger.warning(
             f"Unsupported Linear modelslim scheme: {quant_schemes} in layer: {prefix}"
@@ -421,7 +439,12 @@ class ModelSlimConfig(QuantizationConfig):
                     f"Unsupported scheme '{name}' for layer {resolved_prefix}"
                 )
                 return None
-            return cls(self, weight_group)
+            scheme = cls(self, weight_group)
+            if name in MXFP_SCHEMES:
+                cap = get_mxfp_capability("srt", "moe", name, "modelslim")
+                validate_mxfp_configuration(cap, prefix=resolved_prefix)
+                scheme.mxfp_capability = cap
+            return scheme
 
         w13_scheme = instantiate(w13_scheme_name, weight_group="w13")
         w2_scheme = instantiate(w2_scheme_name, weight_group="w2")
@@ -477,6 +500,12 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        cap = getattr(layer.scheme, "mxfp_capability", None)
+        if cap is not None:
+            validate_mxfp_loaded_weights(
+                cap, layer.weight, getattr(layer, "weight_scale", None)
+            )
+            require_mxfp_operators(cap)
         layer.scheme.process_weights_after_loading(layer)
 
     def create_weights(
@@ -495,6 +524,9 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
         details
         """
         weight_loader = extra_weight_attrs.get("weight_loader")
+        cap = getattr(layer.scheme, "mxfp_capability", None)
+        if cap is not None:
+            validate_mxfp_configuration(cap, input_size=input_size_per_partition)
         layer.scheme.create_weights(
             layer=layer,
             input_size=input_size,
@@ -536,6 +568,15 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         self.quantization_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        for group in ("w13", "w2"):
+            cap = getattr(getattr(layer, f"{group}_scheme"), "mxfp_capability", None)
+            if cap is not None:
+                validate_mxfp_loaded_weights(
+                    cap,
+                    getattr(layer, f"{group}_weight"),
+                    getattr(layer, f"{group}_weight_scale", None),
+                )
+                require_mxfp_operators(cap)
         layer.w13_scheme.process_weights_after_loading(layer)
         layer.w2_scheme.process_weights_after_loading(layer)
 
@@ -553,6 +594,13 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         the necessary parameters for the layer. See FusedMoEMethodBase for param
         details
         """
+        for scheme, k in (
+            (layer.w13_scheme, hidden_size),
+            (layer.w2_scheme, intermediate_size_per_partition),
+        ):
+            cap = getattr(scheme, "mxfp_capability", None)
+            if cap is not None:
+                validate_mxfp_configuration(cap, input_size=k)
         layer.w13_scheme.create_weights(
             layer=layer,
             num_experts=num_experts,
@@ -578,6 +626,25 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         backend = get_moe_runner_backend()
         if backend.is_auto():
             backend = MoeRunnerBackend.ASCEND
+        for scheme in (layer.w13_scheme, layer.w2_scheme):
+            cap = getattr(scheme, "mxfp_capability", None)
+            if cap is not None:
+                validate_mxfp_configuration(
+                    cap,
+                    runner=backend.value,
+                    a2a_backend=get_moe_a2a_backend().value,
+                    activation=moe_runner_config.activation,
+                    swiglu_limit=moe_runner_config.swiglu_limit,
+                )
+                has_clamp = (
+                    moe_runner_config.swiglu_limit is not None
+                    and moe_runner_config.swiglu_limit > 0
+                )
+                fused = (
+                    bool(getattr(scheme.kernel, "use_fused_gmm1", False))
+                    and not has_clamp
+                )
+                require_mxfp_operators(cap, fused=fused)
         self.runner = MoeRunner(backend, moe_runner_config)
 
     # ------------------------------------------------------------------
