@@ -30,7 +30,10 @@ class NumpyArrayFileRef:
 
     def materialize(self) -> np.ndarray:
         try:
-            return np.load(self.path, allow_pickle=False)
+            # Map the spill rather than copying it. The mapping outlives the
+            # unlink below, and copy-on-write keeps the result writable without
+            # touching the file.
+            return np.asarray(np.load(self.path, allow_pickle=False, mmap_mode="c"))
         finally:
             try:
                 os.unlink(self.path)

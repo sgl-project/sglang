@@ -43,6 +43,21 @@ def test_spill_large_arrays_round_trips_and_removes_file(ipc_request):
     assert not spilled_path.exists()
 
 
+def test_materialized_spill_is_a_writable_mapping(ipc_request):
+    array = np.arange(ipc_array._MIN_FILE_REF_BYTES, dtype=np.uint8)
+    spilled = spill_large_arrays_to_file_refs(array, ipc_request)
+    spilled_path = Path(spilled.path)
+
+    materialized = materialize_file_refs(spilled)
+
+    assert type(materialized) is np.ndarray
+    assert isinstance(materialized.base, np.memmap)
+    assert not spilled_path.exists()
+    materialized[0] = 255
+    assert materialized[0] == 255
+    assert np.array_equal(materialized[1:], array[1:])
+
+
 def test_small_arrays_are_kept_inline(ipc_request):
     array = np.arange(16, dtype=np.uint8)
 
