@@ -380,6 +380,13 @@ def compute_dflash_correct_drafts_and_bonus(
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}.")
 
+    if candidates.device.type == "npu":
+        from sgl_kernel_npu.sample import compute_dflash_correct_drafts_and_bonus
+
+        return compute_dflash_correct_drafts_and_bonus(
+            candidates=candidates, target_predict=target_predict
+        )
+
     if candidates.is_cuda:
         num_correct_drafts = torch.empty(
             bs, dtype=torch.int32, device=candidates.device
