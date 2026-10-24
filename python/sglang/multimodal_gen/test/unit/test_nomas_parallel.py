@@ -65,6 +65,7 @@ def _run(rank, world_size, tp_size, backend, port, output_dir):
     maybe_init_distributed_environment_and_model_parallel(
         tp_size=tp_size, sp_size=sp_size, ulysses_degree=sp_size, ring_degree=1
     )
+    # FA3 and Flex run in BF16; SDPA in FP32 is the tight reference.
     dtype = torch.float32 if backend == "sdpa" else torch.bfloat16
     config = NomasConfig(
         arch_config=NomasArchConfig(
@@ -129,8 +130,13 @@ def _launch(world_size, tp_size, backend, output_dir):
     )
 
 
+_BACKENDS = ["sdpa", "flex"]
+if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
+    _BACKENDS.append("fa3")
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA GPUs")
-@pytest.mark.parametrize("backend", ["sdpa", "flex"])
+@pytest.mark.parametrize("backend", _BACKENDS)
 def test_tensor_and_sequence_parallel_match_single_rank(tmp_path, backend):
     _launch(1, 1, backend, str(tmp_path))
     _launch(2, 2, backend, str(tmp_path))  # TP=2

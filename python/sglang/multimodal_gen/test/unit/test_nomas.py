@@ -131,7 +131,72 @@ def test_segment_mask_against_independent_dense_oracle():
         .flatten(2)
     )
     result[:, 14:] = 0
-    torch.testing.assert_close(plan(q, k, v).flatten(2), result, atol=0, rtol=0)
+    cache = {"k": k[:, :3], "v": v[:, :3]}
+    torch.testing.assert_close(
+        plan(q, k[:, 3:], v[:, 3:], cache, 3).flatten(2), result, atol=0, rtol=0
+    )
+
+
+requires_hopper = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="FA3 segment attention is enabled on Hopper",
+)
+
+
+@requires_hopper
+@torch.inference_mode()
+def test_fa3_segment_attention_matches_dense_mask():
+    """Visible-prefix FA3 plus per-action LSE merge equals the masked reference."""
+    torch.manual_seed(5)
+    frames, spatial, text, valid = 6, 64, 96, 72
+    # Two history segments: video visible, padding and action tails hidden.
+    history = torch.zeros(1, 2 * (frames * spatial + text), dtype=torch.bool)
+    for start in (0, frames * spatial + text):
+        history[:, start : start + frames * spatial + 20] = True
+    history = history.cuda()
+    text_mask = (torch.arange(text, device="cuda") < valid)[None]
+    # Head [0, 24), action 0 [24, 40), empty action 1, action 2 [40, 72);
+    # frames 2-3 are a gap that sees no action text.
+    offsets, windows = (24, 40, 40, 72), ((0, 2, 0), (2, 4, -1), (4, 6, 2))
+    n, h = frames * spatial + text, history.shape[1]
+    q = torch.randn(1, n, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k, v = (
+        torch.randn(1, h + n, 4, 128, device="cuda", dtype=torch.bfloat16)
+        for _ in range(2)
+    )
+    cache = {"k": k[:, :h], "v": v[:, :h]}
+    plans = {
+        backend: NomasAttentionPlan(
+            text_mask, history, frames, spatial, offsets, windows, backend
+        )
+        for backend in ("fa3", "sdpa")
+    }
+    expected = plans["sdpa"](
+        q.float(),
+        k[:, h:].float(),
+        v[:, h:].float(),
+        {key: x.float() for key, x in cache.items()},
+        h,
+    )
+    actual = plans["fa3"](q, k[:, h:], v[:, h:], cache, h)
+    torch.testing.assert_close(actual.float(), expected, atol=1e-2, rtol=1e-2)
+    assert not actual[:, frames * spatial + valid :].any()
+
+
+@requires_hopper
+@torch.inference_mode()
+def test_fa3_session_matches_reference_backend():
+    cond = condition("cuda", torch.bfloat16)
+    outputs = {}
+    for backend in ("fa3", "sdpa"):
+        session = NomasLatentSession(
+            tiny_model("cuda", backend).bfloat16(), cache_capacity=64, seed=42, steps=2
+        )
+        outputs[backend] = [session.generate_segment((2, 2, 2), cond) for _ in range(2)]
+    for actual, expected in zip(outputs["fa3"], outputs["sdpa"], strict=True):
+        torch.testing.assert_close(
+            actual.float(), expected.float(), atol=2e-2, rtol=2e-2
+        )
 
 
 @torch.inference_mode()

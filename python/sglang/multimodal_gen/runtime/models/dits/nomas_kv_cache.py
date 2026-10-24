@@ -2,8 +2,14 @@
 """Nomas segment KV cache and the attention plan that reads it.
 
 The cache stores committed segments (video then text tokens) with their
-visibility; the plan turns history visibility, text padding and action
-windows into a FlexAttention block mask (CUDA) or a bounded dense mask (SDPA).
+visibility. The plan turns history visibility, text padding and action windows
+into one of three equivalent executions:
+
+* ``fa3``: dense FlashAttention-3 over the visible prefix
+  ``[visible history | current video | head text]``, plus one small pass per
+  action over that action's text, merged by log-sum-exp (Hopper).
+* ``flex``: a FlexAttention block mask (CUDA).
+* ``sdpa``: a bounded dense mask, the CPU and test reference.
 """
 
 from functools import lru_cache
@@ -209,8 +215,8 @@ class NomasAttentionPlan:
         video_windows=None,
         backend="flex",
     ):
-        if backend not in ("flex", "sdpa"):
-            raise ValueError("Nomas attention backend must be flex or sdpa")
+        if backend not in ("fa3", "flex", "sdpa"):
+            raise ValueError("Nomas attention backend must be fa3, flex or sdpa")
         if (
             text_mask.ndim != 2
             or text_mask.shape[0] != 1
@@ -295,6 +301,12 @@ class NomasAttentionPlan:
             )
 
         self.backend = backend
+        self.history_length = history_mask.shape[1]
+        if backend == "fa3":
+            self._prepare_fa3(
+                history_mask, valid, text_offsets, video_windows, spatial_tokens
+            )
+            return
         if backend == "flex":
             if device.type != "cuda":
                 raise ValueError(
@@ -314,11 +326,114 @@ class NomasAttentionPlan:
                 torch.arange(key_valid.numel(), device=device)[None, :],
             )
 
-    def __call__(self, q, k, v):
-        q, k, v = (x.transpose(1, 2) for x in (q, k, v))
-        if self.backend == "flex":
-            result = _flex_kernel()(q, k, v, block_mask=self.mask)
+    def _prepare_fa3(self, history_mask, valid, offsets, windows, spatial_tokens):
+        """Index metadata for the compact layout ``[visible history | video | valid text]``."""
+        device = history_mask.device
+        self.history_index = history_mask[0].nonzero().squeeze(-1)
+        hvis = self.history_index.numel()
+        video = self.video_tokens
+        self.compact_tokens = video + valid
+        head_end = valid if offsets is None else offsets[0]
+        self.prefix_tokens = hvis + video + head_end
+        n = self.query_valid.shape[1]
+        int32 = dict(device=device, dtype=torch.int32)
+        self.cu_q = torch.tensor([0, n], **int32)
+        self.cu_prefix = torch.tensor([0, self.prefix_tokens], **int32)
+        self.max_q = n
+        # Each action: its video window rows plus its own text rows see that text.
+        self.actions = []
+        for action, (start, end) in enumerate(zip(offsets or (), (offsets or ())[1:])):
+            if end <= start:
+                continue
+            rows = [
+                torch.arange(a * spatial_tokens, b * spatial_tokens, device=device)
+                for a, b, index in windows
+                if index == action
+            ]
+            rows.append(torch.arange(video + start, video + end, device=device))
+            rows = torch.cat(rows)
+            k_start, k_end = hvis + video + start, hvis + video + end
+            self.actions.append(
+                (
+                    rows,
+                    k_start,
+                    k_end,
+                    torch.tensor([0, rows.numel()], **int32),
+                    torch.tensor([0, k_end - k_start], **int32),
+                )
+            )
+
+    def __call__(self, q, k, v, layer_cache=None, history_length=0):
+        """``k``/``v`` hold the current segment; history is read from ``layer_cache``.
+
+        Returns [1, N, H, D]; the caller flattens heads after any sequence-parallel
+        exchange. Padded text queries return zeros.
+        """
+        if history_length != self.history_length:
+            raise ValueError("attention plan was built for a different history length")
+        if self.backend == "fa3":
+            result = self._fa3(q, k, v, layer_cache)
         else:
-            result = F.scaled_dot_product_attention(q, k, v, attn_mask=self.mask)
-        # [1, N, H, D]; the caller flattens heads after any sequence-parallel exchange.
-        return result.transpose(1, 2) * self.query_valid[:, :, None, None]
+            if history_length:
+                k = torch.cat((layer_cache["k"][:, :history_length], k), 1)
+                v = torch.cat((layer_cache["v"][:, :history_length], v), 1)
+            q, k, v = (x.transpose(1, 2) for x in (q, k, v))
+            if self.backend == "flex":
+                result = _flex_kernel()(q, k, v, block_mask=self.mask)
+            else:
+                result = F.scaled_dot_product_attention(q, k, v, attn_mask=self.mask)
+            result = result.transpose(1, 2)
+        return result * self.query_valid[:, :, None, None]
+
+    def _fa3(self, q, k, v, layer_cache):
+        from sglang.kernels.ops.attention.flash_attention import (
+            flash_attn_varlen_func,
+        )
+
+        def compact(current, key):
+            # [visible history | current video | valid text]: padding and hidden
+            # action tails are dropped instead of masked.
+            current = current[0, : self.compact_tokens]
+            if self.history_index.numel() == 0:
+                return current.contiguous()
+            history = layer_cache[key][0].index_select(0, self.history_index)
+            return torch.cat((history, current), 0)
+
+        k, v = compact(k, "k"), compact(v, "v")
+        q = q[0].contiguous()
+        prefix = self.prefix_tokens
+        out, lse, *_ = flash_attn_varlen_func(
+            q,
+            k[:prefix],
+            v[:prefix],
+            self.cu_q,
+            self.cu_prefix,
+            self.max_q,
+            prefix,
+            return_softmax_lse=True,
+        )
+        # Action rows also attend to their own action text: merge the two
+        # softmax partitions exactly through their log-sum-exp.
+        for rows, k_start, k_end, cu_rows, cu_keys in self.actions:
+            extra, extra_lse, *_ = flash_attn_varlen_func(
+                q[rows],
+                k[k_start:k_end],
+                v[k_start:k_end],
+                cu_rows,
+                cu_keys,
+                rows.numel(),
+                k_end - k_start,
+                return_softmax_lse=True,
+            )
+            base_lse, extra_lse = lse[:, rows].float(), extra_lse.float()
+            top = torch.maximum(base_lse, extra_lse)
+            w_base, w_extra = torch.exp(base_lse - top), torch.exp(extra_lse - top)
+            total = (w_base + w_extra).T[..., None]
+            out[rows] = (
+                (
+                    out[rows].float() * w_base.T[..., None]
+                    + extra.float() * w_extra.T[..., None]
+                )
+                / total
+            ).to(out.dtype)
+        return out[None]

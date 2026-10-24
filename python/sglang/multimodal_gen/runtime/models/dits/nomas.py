@@ -52,7 +52,10 @@ from sglang.multimodal_gen.runtime.models.dits.nomas_layers import (
     modulate,
     seq_to_heads,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 
 class NomasSegmentContext(Struct, frozen=True):
@@ -165,11 +168,10 @@ class NomasDoubleStreamBlock(nn.Module):
             qkv.append((q, k, v))
         q, k, v = [torch.cat((qkv[0][i], qkv[1][i]), 1) for i in range(3)]
         entry = {"k": k, "v": v} if collect_cache else None
-        if valid_length:
-            k = torch.cat((layer_cache["k"][:, :valid_length], k), 1)
-            v = torch.cat((layer_cache["v"][:, :valid_length], v), 1)
         video_tokens = q.shape[1] - txt.shape[1]
-        img_attn, txt_attn = attention(q, k, v).split((video_tokens, txt.shape[1]), 1)
+        img_attn, txt_attn = attention(q, k, v, layer_cache, valid_length).split(
+            (video_tokens, txt.shape[1]), 1
+        )
         img_attn = heads_to_seq(img_attn, self.info)
         txt_attn = gather_heads(txt_attn, self.info)
         outputs = []
@@ -251,7 +253,8 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _compile_conditions = []
     param_names_mapping = NomasArchConfig().param_names_mapping
     reverse_param_names_mapping = {}
-    # The optional Flex mask is model-specific, not a general SGL attention backend.
+    # Segment attention (FA3 / Flex / SDPA reference) is model-specific, not a
+    # general SGL attention backend.
     _supported_attention_backends = {AttentionBackendEnum.TORCH_SDPA}
 
     def __init__(
@@ -260,7 +263,7 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         hf_config=None,
         *,
         quant_config=None,
-        attention_backend="flex",
+        attention_backend="auto",
         **kwargs,
     ):
         if quant_config is not None:
@@ -269,8 +272,11 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             raise ValueError(f"Unsupported Nomas model options: {sorted(kwargs)}")
         if config.quant_config is not None:
             raise NotImplementedError("Nomas v1 does not implement quantized loading")
-        if attention_backend not in ("flex", "sdpa"):
-            raise ValueError("Nomas attention backend must be flex or sdpa")
+        if attention_backend == "auto":
+            # FA3 + log-sum-exp merge is about 2x FlexAttention on Hopper.
+            attention_backend = "fa3" if current_platform.is_hopper() else "flex"
+        if attention_backend not in ("fa3", "flex", "sdpa"):
+            raise ValueError("Nomas attention backend must be auto, fa3, flex or sdpa")
         super().__init__(config, hf_config or {})
         c = self.config
         c.__post_init__()
