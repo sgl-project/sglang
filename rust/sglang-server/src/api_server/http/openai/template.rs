@@ -15,7 +15,7 @@ pub(super) use crate::message::request::RenderedChat;
 pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 
 /// Render a chat request for the tokenizer pool: the raw `body` through the
-/// SGLang request path when there is one, else `request` through the template.
+/// SGLang request path, or `request` through the template when that declines it.
 pub(super) fn render_chat(
     formatter: &ChatFormatter,
     body: Value,
@@ -23,31 +23,18 @@ pub(super) fn render_chat(
     defaults: &ChatTemplateKwargs,
 ) -> Result<RenderedChat, TemplateError> {
     let args = TemplateArgs::new(&body, defaults);
-    match render_body(formatter, body, defaults) {
-        // Valid requests the SGLang path declines render through the template too.
-        Some(Err(TemplateError::NeedsRenderFallback { .. })) | None => formatter
+    match formatter.render_request(body, defaults) {
+        Err(TemplateError::NeedsRenderFallback { .. }) => formatter
             .render_template(request, &args)
             .map(|prompt| RenderedChat {
                 prompt,
                 continuation: String::new(),
             }),
-        Some(rendered) => rendered,
-    }
-}
-
-/// Render the raw body as SGLang does, retaining the continuation boundary.
-pub(super) fn render_body(
-    formatter: &ChatFormatter,
-    body: Value,
-    defaults: &ChatTemplateKwargs,
-) -> Option<Result<RenderedChat, TemplateError>> {
-    formatter.renders_requests().then(|| {
-        let (prompt, continuation) = formatter.render_request(body, defaults)?;
-        Ok(RenderedChat {
+        rendered => rendered.map(|(prompt, continuation)| RenderedChat {
             prompt,
             continuation,
-        })
-    })
+        }),
+    }
 }
 
 #[cfg(test)]
