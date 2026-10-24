@@ -1048,18 +1048,29 @@ def sparse_mla_fwd_decode_partial_fp8(
 
                 for bi_i, j in T.Parallel(BI, group_size):
                     page = page_idx_shared[bi_i]
-                    kv_tile0[bi_i, j] = kv_fp8[b_i, page, g_i, j]
-                    kv_tile1[bi_i, j] = kv_fp8[b_i, page, g_i, group_size + j]
+                    # An invalid index must contribute zero to both QK and PV.
+                    # Slot 0 can contain NaN; masking scores alone cannot stop
+                    # NaN dot products or zero-probability * NaN values.
+                    kv_tile0[bi_i, j] = T.if_then_else(
+                        mask[bi_i], kv_fp8[b_i, page, g_i, j], 0
+                    )
+                    kv_tile1[bi_i, j] = T.if_then_else(
+                        mask[bi_i], kv_fp8[b_i, page, g_i, group_size + j], 0
+                    )
                     if num_main_tiles == 4:
-                        kv_tile2[bi_i, j] = kv_fp8[b_i, page, g_i, 2 * group_size + j]
-                        kv_tile3[bi_i, j] = kv_fp8[b_i, page, g_i, 3 * group_size + j]
+                        kv_tile2[bi_i, j] = T.if_then_else(
+                            mask[bi_i], kv_fp8[b_i, page, g_i, 2 * group_size + j], 0
+                        )
+                        kv_tile3[bi_i, j] = T.if_then_else(
+                            mask[bi_i], kv_fp8[b_i, page, g_i, 3 * group_size + j], 0
+                        )
 
                 if has_tail:
                     for bi_i, j in T.Parallel(BI, d_tail):
                         page = page_idx_shared[bi_i]
-                        k_tail_shared[bi_i, j] = kv_fp8[
-                            b_i, page, g_i, rope_offset_fp8 + j
-                        ]
+                        k_tail_shared[bi_i, j] = T.if_then_else(
+                            mask[bi_i], kv_fp8[b_i, page, g_i, rope_offset_fp8 + j], 0
+                        )
 
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
