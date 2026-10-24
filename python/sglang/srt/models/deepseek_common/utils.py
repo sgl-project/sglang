@@ -28,6 +28,7 @@ from sglang.srt.utils import (
     get_hip_version,
     is_cpu,
     is_cuda,
+    is_gfx942_supported,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
@@ -54,6 +55,11 @@ _is_gfx95_supported = is_gfx95_supported()
 # expects. This flag lets gfx1250 carve out of that fused-rope path.
 _is_gfx1250_supported = is_gfx1250_supported()
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+# gfx942 (MI308X / MI325X, CDNA3) runs the same AITER MoE/topk shared-expert
+# fusion path as gfx950: every consumer of the fused slot (topk expansion,
+# aiter runner) keys off _use_aiter, not off the arch. Validated end to end on
+# MI308X TP4 GLM-5.3-Flash (see glm5_next.py gate).
+_use_aiter_gfx942 = _use_aiter and is_gfx942_supported()
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 
 _is_cublas_ge_129 = is_nvidia_cublas_version_ge_12_9()
