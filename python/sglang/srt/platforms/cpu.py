@@ -120,3 +120,17 @@ class CpuSRTPlatform(CpuDeviceMixin, SRTPlatform):
 
     def is_pin_memory_available(self, device=None) -> bool:
         return False
+
+    def get_quantization_config(self, quantization: str) -> Optional[type]:
+        from sglang.srt.utils.common import cpu_has_amx_support
+
+        if not cpu_has_amx_support():
+            return None
+        from sglang.srt.layers.quantization import CPU_QUANTIZATION_METHODS
+
+        if quantization not in CPU_QUANTIZATION_METHODS:
+            raise ValueError(
+                f"Invalid quantization method on CPU: {quantization}. "
+                f"Available methods on CPU: {list(CPU_QUANTIZATION_METHODS.keys())}"
+            )
+        return CPU_QUANTIZATION_METHODS[quantization]

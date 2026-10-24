@@ -200,6 +200,39 @@ class TestSRTPlatform(CustomTestCase):
 
         self.assertTrue(OutOfTreePlatform().support_mamba_cache_extra_buffer())
 
+    def test_cpu_quantization_config_with_amx(self):
+        from sglang.srt.layers.quantization import CPU_QUANTIZATION_METHODS
+
+        with patch("sglang.srt.utils.common.cpu_has_amx_support", return_value=True):
+            self.assertIs(
+                CpuSRTPlatform().get_quantization_config("fp8"),
+                CPU_QUANTIZATION_METHODS["fp8"],
+            )
+            with self.assertRaisesRegex(
+                ValueError, "Invalid quantization method on CPU"
+            ):
+                CpuSRTPlatform().get_quantization_config("bitsandbytes")
+
+    def test_cpu_quantization_config_without_amx(self):
+        with patch("sglang.srt.utils.common.cpu_has_amx_support", return_value=False):
+            self.assertIsNone(CpuSRTPlatform().get_quantization_config("fp8"))
+
+    def test_in_tree_platform_quantization_config_is_consulted(self):
+        import sglang.srt.layers.quantization as quantization
+
+        sentinel = type("PlatformFp8Config", (), {})
+
+        class _Platform(CudaSRTPlatform):
+            def get_quantization_config(self, name):
+                return sentinel if name == "fp8" else None
+
+        with patch.object(quantization, "current_platform", _Platform()):
+            self.assertIs(quantization.get_quantization_config("fp8"), sentinel)
+            self.assertIs(
+                quantization.get_quantization_config("awq"),
+                quantization.QUANTIZATION_METHODS["awq"],
+            )
+
 
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""
