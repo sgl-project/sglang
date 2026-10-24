@@ -312,6 +312,12 @@ def _handle_dflash(server_args: ServerArgs) -> None:
     if attn_dp_enabled_of(cfg) and cfg.device != "npu":
         if not cfg.device.startswith("cuda"):
             raise ValueError("DFLASH with dp attention requires CUDA or NPU.")
+        # Validated on Beam targets only.
+        target_archs = model_config_of(server_args).hf_config.architectures
+        if "BeamForCausalLM" not in target_archs:
+            raise ValueError(
+                "DFLASH with dp attention on CUDA currently supports only Beam targets."
+            )
         if not cfg.enable_dp_lm_head:
             raise ValueError("DFLASH with dp attention requires --enable-dp-lm-head.")
         if cfg.attn_cp_size != 1:
@@ -322,11 +328,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             raise ValueError(
                 "DFLASH with dp attention requires moe_a2a_backend 'none' or "
                 "'flashinfer_megamoe'."
-            )
-        # An idle DP rank's verify batch carries no mRoPE positions to pad.
-        if model_config_of(server_args).model_is_mrope:
-            raise ValueError(
-                "DFLASH with dp attention on CUDA does not support mRoPE targets."
             )
         from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
         from sglang.srt.utils.hf_transformers_utils import get_config
