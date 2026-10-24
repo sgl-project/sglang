@@ -384,6 +384,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.wo_a_bf16_fused_inv_rope",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.dsv4_wo_a:wo_a_bf16_fused_inv_rope",
+        capabilities=frozenset({CapabilityRequirement.CUDA}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.hopper_bf16_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.hopper_bf16_gemv:hopper_bf16_gemv",
