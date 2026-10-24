@@ -212,6 +212,26 @@ def is_deepseek_dsa(config) -> bool:
     )
 
 
+def is_q8_raw_fp8_nope_layout(
+    *,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> bool:
+    """Whether Q8 prefill and TileLang decode can share raw 512-byte FP8 rows.
+
+    This checks consumers and geometry, not the model name. Callers validate
+    dtype, device and incompatible serving options separately.
+    """
+    return (
+        prefill_backend == "flashmla_sparse_q8"
+        and decode_backend == "tilelang"
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 0
+    )
+
+
 def is_glm_moe_dsa(config) -> bool:
     """True for GLM-5.2, both the main arch and the NextN draft head."""
     return _hf_arch(config) in (

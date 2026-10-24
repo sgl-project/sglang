@@ -1,8 +1,10 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
+from sglang.srt.configs.model_config import is_q8_raw_fp8_nope_layout
 from sglang.srt.layers.attention.dsa.dsa_backend_kpool import (
     DeepseekSparseAttnBackendKPoolMixin,
 )
@@ -55,6 +57,7 @@ def test_q8_validator_accepts_bf16_and_fp8_kv_on_sm90(kv_cache_dtype):
         kv_cache_store_fp8=kv_cache_dtype == torch.float8_e4m3fn,
         qk_rope_head_dim=64,
         device_sm_major=9,
+        kv_lora_rank=512,
     )
 
 
@@ -79,6 +82,7 @@ def test_q8_validator_rejects_unsupported_configs(
             kv_cache_store_fp8=store_fp8,
             qk_rope_head_dim=rope,
             device_sm_major=device_sm_major,
+            kv_lora_rank=512,
         )
 
 
@@ -100,13 +104,14 @@ def test_q8_validator_rejects_combinations_that_used_to_fail_mid_forward(extra):
         kv_cache_store_fp8=False,
         qk_rope_head_dim=0,
         device_sm_major=9,
+        kv_lora_rank=512,
     )
     kwargs.update(extra)
     with pytest.raises(ValueError):
         _validate_flashmla_sparse_q8_backend(**kwargs)
 
 
-def test_q8_validator_rejects_an_unpacked_fp8_pool():
+def test_q8_validator_rejects_an_unpacked_fp8_pool_with_rope():
     """An fp8 dtype whose pool is not stored packed stays in the raw 576-dim
     layout that the bf16 prefix gather cannot read; it previously surfaced as a
     message-less assert on the first prefix extend."""
@@ -118,6 +123,99 @@ def test_q8_validator_rejects_an_unpacked_fp8_pool():
             kv_cache_store_fp8=False,
             qk_rope_head_dim=64,
             device_sm_major=9,
+            kv_lora_rank=512,
+        )
+
+
+@pytest.mark.parametrize(
+    "rank,rope,decode,expected",
+    [
+        (512, 0, "tilelang", True),
+        (256, 0, "tilelang", False),
+        (512, 64, "tilelang", False),
+        (512, 0, "trtllm", False),
+        (512, 0, "flashmla_kv", False),
+    ],
+)
+def test_q8_raw_fp8_layout_and_validator_agree(rank, rope, decode, expected):
+    assert (
+        is_q8_raw_fp8_nope_layout(
+            prefill_backend="flashmla_sparse_q8",
+            decode_backend=decode,
+            kv_lora_rank=rank,
+            qk_rope_head_dim=rope,
+        )
+        is expected
+    )
+    kwargs = dict(
+        prefill_impl="flashmla_sparse_q8",
+        decode_impl=decode,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_store_fp8=False,
+        kv_lora_rank=rank,
+        qk_rope_head_dim=rope,
+        device_sm_major=9,
+    )
+    if expected:
+        _validate_flashmla_sparse_q8_backend(**kwargs)
+    else:
+        with pytest.raises(ValueError, match="unsupported unpacked pool"):
+            _validate_flashmla_sparse_q8_backend(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"hisparse_enabled": True},
+        {"mixed_chunk_enabled": True},
+        {"device_sm_major": 10},
+        {"kv_cache_store_fp8": True},
+    ],
+)
+def test_q8_raw_fp8_keeps_incompatible_combinations_rejected(extra):
+    kwargs = dict(
+        prefill_impl="flashmla_sparse_q8",
+        decode_impl="tilelang",
+        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_store_fp8=False,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        device_sm_major=9,
+    )
+    kwargs.update(extra)
+    with pytest.raises(ValueError):
+        _validate_flashmla_sparse_q8_backend(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "rank,rope,expected_dim", [(512, 0, 512), (512, 64, 656), (256, 0, 264)]
+)
+def test_q8_raw_fp8_pool_allocation_matches_layout_guard(rank, rope, expected_dim):
+    from sglang.srt.mem_cache import kv_cache_configurator as configurator
+
+    model = SimpleNamespace(
+        hf_config=SimpleNamespace(), kv_lora_rank=rank, qk_rope_head_dim=rope
+    )
+    execution = SimpleNamespace(
+        kernel=SimpleNamespace(
+            dsa_prefill_backend="flashmla_sparse_q8", dsa_decode_backend="tilelang"
+        )
+    )
+    with (
+        patch.object(configurator, "is_deepseek_dsa", return_value=True),
+        patch.object(configurator, "_is_hip", False),
+        patch.object(configurator, "get_exec", return_value=execution),
+        patch.object(
+            configurator,
+            "get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode="null"),
+        ),
+    ):
+        assert (
+            configurator.calculate_mla_kv_cache_dim(
+                model_config=model, kv_cache_dtype=torch.float8_e4m3fn
+            )
+            == expected_dim
         )
 
 

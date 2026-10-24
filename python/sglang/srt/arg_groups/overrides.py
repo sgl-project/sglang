@@ -553,9 +553,13 @@ def _check_dsa_backend_constraints(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
     dcp_size: int = 1,
 ) -> None:
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
+    from sglang.srt.configs.model_config import is_q8_raw_fp8_nope_layout
+
     chosen = {prefill_backend, decode_backend}
 
     rocm_only = {"triton"} & chosen
@@ -568,9 +572,18 @@ def _check_dsa_backend_constraints(
 
     if hip or kv_cache_dtype != "fp8_e4m3" or "tilelang" not in chosen:
         return
-    if prefill_backend != "tilelang" or decode_backend != "tilelang":
+    native_raw_nope = is_q8_raw_fp8_nope_layout(
+        prefill_backend=prefill_backend,
+        decode_backend=decode_backend,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+    if not native_raw_nope and (
+        prefill_backend != "tilelang" or decode_backend != "tilelang"
+    ):
         raise ValueError(
-            "CUDA TileLang FP8 KV requires both DSA backends to be tilelang; "
+            "CUDA TileLang FP8 KV requires both DSA backends to be tilelang, "
+            "or Q8 prefill with TileLang decode and a 512-dim NoPE layout; "
             "raw and scaled FP8 KV layouts cannot be mixed."
         )
     if dcp_size > 1:
@@ -579,6 +592,8 @@ def _check_dsa_backend_constraints(
     import torch
 
     major, minor = torch.cuda.get_device_capability()
+    if native_raw_nope and major != 9:
+        raise ValueError("Native raw FP8 NoPE sparse prefill requires SM90.")
     if (major, minor) < (8, 9):
         raise ValueError("CUDA TileLang FP8 KV requires SM89 or newer.")
 
@@ -589,11 +604,19 @@ def _check_tilelang_dsa_fp8_kv(
     decode_backend: Optional[str],
     *,
     hip: bool,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
     dcp_size: int = 1,
 ) -> None:
-    """Backward-compatible entry point for the TileLang DSA validation."""
+    """Entry point for TileLang DSA validation with explicit KV geometry."""
     _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill_backend, decode_backend, hip=hip, dcp_size=dcp_size
+        kv_cache_dtype,
+        prefill_backend,
+        decode_backend,
+        hip=hip,
+        dcp_size=dcp_size,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
     )
 
 
@@ -699,6 +722,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             decode,
             hip=get_platform().is_hip,
             dcp_size=getattr(view, "dcp_size", 1) or 1,
+            kv_lora_rank=model_config_of(view).kv_lora_rank,
+            qk_rope_head_dim=model_config_of(view).qk_rope_head_dim,
         )
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
@@ -733,6 +758,8 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         decode,
         hip=get_platform().is_hip,
         dcp_size=getattr(view, "dcp_size", 1) or 1,
+        kv_lora_rank=model_config_of(view).kv_lora_rank,
+        qk_rope_head_dim=model_config_of(view).qk_rope_head_dim,
     )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "

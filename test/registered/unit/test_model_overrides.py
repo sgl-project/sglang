@@ -2481,7 +2481,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             defaults.update(kw)
             return ResolvedView(
-                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
+                SimpleNamespace(
+                    _model_config=SimpleNamespace(
+                        hf_config=hf, kv_lora_rank=512, qk_rope_head_dim=64
+                    ),
+                    **defaults,
+                )
             )
 
         with (

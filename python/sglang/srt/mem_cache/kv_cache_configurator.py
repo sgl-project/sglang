@@ -29,6 +29,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
     is_minimax_sparse,
+    is_q8_raw_fp8_nope_layout,
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
@@ -3388,11 +3389,16 @@ def calculate_mla_kv_cache_dim(
     ):
         return kv_cache_dim
 
-    # CUDA TileLang uses raw FP8 rows without per-block scales. Argument
-    # validation requires both consumers to use the same TileLang layout.
+    # CUDA TileLang uses raw FP8 rows without per-block scales. Q8 prefill
+    # shares this layout only for 512-dim NoPE latents with TileLang decode.
     if (
         get_exec().kernel.dsa_prefill_backend == "tilelang"
         and get_exec().kernel.dsa_decode_backend == "tilelang"
+    ) or is_q8_raw_fp8_nope_layout(
+        prefill_backend=get_exec().kernel.dsa_prefill_backend,
+        decode_backend=get_exec().kernel.dsa_decode_backend,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
     ):
         return kv_cache_dim
 

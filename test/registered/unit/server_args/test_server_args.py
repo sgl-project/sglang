@@ -1479,7 +1479,12 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         )
         defaults.update(kw)
         view = ResolvedView(
-            SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
+            SimpleNamespace(
+                _model_config=SimpleNamespace(
+                    hf_config=hf, kv_lora_rank=512, qk_rope_head_dim=64
+                ),
+                **defaults,
+            )
         )
         with (
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
