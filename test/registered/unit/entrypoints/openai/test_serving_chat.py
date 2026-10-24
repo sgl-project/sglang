@@ -4945,6 +4945,45 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
 
+    def test_fallback_explicit_thinking_follows_default_thinking_env(self):
+        """A missing thinking kwarg follows SGLANG_DEFAULT_THINKING.
+
+        The dsv4/dsv41 encoder appends the thinking opener when the env is
+        set and the request omits the kwarg. The parser has to split that
+        block. An explicit False still wins, and enable_thinking parsers do
+        not consult this env. Regression: #45614.
+        """
+        self._setup_fallback("deepseek-v41")
+        bare = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        empty = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={},
+        )
+        forced_off = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": False},
+        )
+        forced_on = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": True},
+        )
+        with envs.SGLANG_DEFAULT_THINKING.override(True):
+            self.assertTrue(self.chat._get_reasoning_from_request(bare))
+            self.assertTrue(self.chat._get_reasoning_from_request(empty))
+            self.assertFalse(self.chat._get_reasoning_from_request(forced_off))
+            self.assertTrue(self.chat._get_reasoning_from_request(forced_on))
+        with envs.SGLANG_DEFAULT_THINKING.override(False):
+            self.assertFalse(self.chat._get_reasoning_from_request(bare))
+
+        self._setup_fallback("mimo")
+        with envs.SGLANG_DEFAULT_THINKING.override(True):
+            self.assertFalse(self.chat._get_reasoning_from_request(bare))
+
     def test_fallback_explicit_enable_thinking_mode_default_off(self):
         self._setup_fallback("mimo")
         req_default = ChatCompletionRequest(

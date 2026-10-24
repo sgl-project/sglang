@@ -3026,10 +3026,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             if mode in ("explicit_thinking", "explicit_enable_thinking"):
                 toggle = mode.replace("explicit_", "")
-                return (
-                    request.chat_template_kwargs is not None
-                    and request.chat_template_kwargs.get(toggle) is True
-                )
+                kwargs = request.chat_template_kwargs or {}
+                if toggle in kwargs:
+                    return kwargs.get(toggle) is True
+                # dsv4/dsv41 encoding treats a missing thinking kwarg as
+                # SGLANG_DEFAULT_THINKING and appends the thinking opener.
+                # The parser must use that same default: the opener is not
+                # in the completion, so leaving reasoning off leaks the
+                # thinking block into content. enable_thinking templates do
+                # not read this env, so they stay opt-in.
+                if toggle == "thinking":
+                    return bool(envs.SGLANG_DEFAULT_THINKING.get())
+                return False
             logger.warning(
                 "Unknown reasoning_default mode '%s', defaulting to reasoning disabled",
                 mode,
