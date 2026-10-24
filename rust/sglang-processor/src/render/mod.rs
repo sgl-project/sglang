@@ -130,11 +130,24 @@ impl ChatFormatter {
         }
     }
 
+    /// Whether [`Self::render_request`] renders SGLang request bodies for this
+    /// formatter; the others render through [`Self::render_prompt`].
+    pub fn renders_requests(&self) -> bool {
+        matches!(
+            self,
+            ChatFormatter::DeepSeekV4(_)
+                | ChatFormatter::DeepSeekV41
+                | ChatFormatter::Glm53(_)
+                | ChatFormatter::KimiK3
+                | ChatFormatter::Qwen38 { .. }
+        )
+    }
+
     /// Render an SGLang chat request body under the server's default
     /// `chat_template_kwargs`, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
-    /// re-validated. Only DeepSeek-V4, V4.1, GLM-5.3, Kimi K3 and Qwen3.8 render
+    /// re-validated. Only the formatters [`Self::renders_requests`] names render
     /// this way; others use [`Self::render_prompt`].
     pub fn render_request(
         &self,
