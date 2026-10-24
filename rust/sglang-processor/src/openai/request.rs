@@ -5,9 +5,10 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sglang_api_types::api::v1::{
-    OptionalInt64, OptionalInt64List, OptionalInt64OrList, OptionalString, OptionalStringList,
-    OptionalStringOrList, StringList, StringOrList, optional_int64_or_list,
-    optional_string_or_list, string_or_list,
+    BoolList, BoolOrList, Int64List, Int64OrList, OptionalInt64, OptionalInt64List,
+    OptionalInt64OrList, OptionalString, OptionalStringList, OptionalStringOrList, StringList,
+    StringOrList, bool_or_list, int64_or_list, optional_int64_or_list, optional_string_or_list,
+    string_or_list,
 };
 
 use super::{OpenAiHeaders, OpenAiSettings, Unsupported};
@@ -36,6 +37,28 @@ impl From<OneOrList<String>> for StringOrList {
             value: Some(match value {
                 OneOrList::One(value) => string_or_list::Value::One(value),
                 OneOrList::List(items) => string_or_list::Value::Many(StringList { items }),
+            }),
+        }
+    }
+}
+
+impl From<OneOrList<bool>> for BoolOrList {
+    fn from(value: OneOrList<bool>) -> Self {
+        Self {
+            value: Some(match value {
+                OneOrList::One(value) => bool_or_list::Value::One(value),
+                OneOrList::List(items) => bool_or_list::Value::Many(BoolList { items }),
+            }),
+        }
+    }
+}
+
+impl From<OneOrList<i64>> for Int64OrList {
+    fn from(value: OneOrList<i64>) -> Self {
+        Self {
+            value: Some(match value {
+                OneOrList::One(value) => int64_or_list::Value::One(value),
+                OneOrList::List(items) => int64_or_list::Value::Many(Int64List { items }),
             }),
         }
     }

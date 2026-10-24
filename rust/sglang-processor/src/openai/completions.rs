@@ -243,16 +243,18 @@ fn generate_body(
         sampling_params: Some(SamplingParamsOrList {
             value: Some(sampling_params_or_list::Value::One(sampling)),
         }),
-        return_logprob: Some(request.logprobs.is_some().into()),
+        return_logprob: Some(OneOrList::One(request.logprobs.is_some()).into()),
         logprob_start_len: Some(
-            (if request.echo && request.logprobs.is_some_and(|n| n != 0) {
-                0
-            } else {
-                -1
-            })
+            OneOrList::One(
+                if request.echo && request.logprobs.is_some_and(|n| n != 0) {
+                    0
+                } else {
+                    -1
+                },
+            )
             .into(),
         ),
-        top_logprobs_num: Some(request.logprobs.unwrap_or(0).into()),
+        top_logprobs_num: Some(OneOrList::One(request.logprobs.unwrap_or(0)).into()),
         stream: Some(request.stream),
         return_text_in_logprobs: Some(true),
         lora_path: lora_path(&request.model, &request.lora_path),

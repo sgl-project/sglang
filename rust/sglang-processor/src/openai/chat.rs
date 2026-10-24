@@ -811,8 +811,8 @@ fn generate_body(
         sampling_params: Some(SamplingParamsOrList {
             value: Some(sampling_params_or_list::Value::One(sampling)),
         }),
-        return_logprob: Some(request.logprobs.into()),
-        top_logprobs_num: Some(request.top_logprobs.unwrap_or(0).into()),
+        return_logprob: Some(OneOrList::One(request.logprobs).into()),
+        top_logprobs_num: Some(OneOrList::One(request.top_logprobs.unwrap_or(0)).into()),
         stream: Some(request.stream),
         return_text_in_logprobs: Some(true),
         lora_path: lora_path(&request.model, &request.lora_path),
