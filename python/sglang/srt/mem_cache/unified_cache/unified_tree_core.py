@@ -431,6 +431,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.page_size = params.page_size
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
+        self.allow_missing_mamba_insert = False
         self.is_host_memory_buffer_only = False
         self.enable_storage = False
         self.enable_external_cache_linker = False
@@ -970,6 +971,54 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             device_validators=device_validators,
         )
 
+    def _device_prefix_covered_by_match(
+        self, best_match_node: UnifiedTreeNode
+    ) -> Optional[tuple[UnifiedTreeNode, int]]:
+        """Contiguous GPU Full prefix of ``best_match_node``.
+
+        Mamba is satisfied by the checkpoint at the best match, so intermediate
+        nodes do not need their own state. Other device validators still apply.
+        The walk stops at the first evicted Full page and does not resume.
+        """
+        host_only = any(
+            getattr(comp, "_mamba_host_only_checkpoint", lambda: False)()
+            for comp in self.components
+        )
+        if (
+            not self.enable_hicache
+            or not host_only
+            or best_match_node is self.root_node
+        ):
+            return None
+        path: list[UnifiedTreeNode] = []
+        node = best_match_node
+        while node is not self.root_node:
+            path.append(node)
+            node = node.parent
+        path.reverse()
+        device_validators = tuple(
+            comp.create_match_validator(match_device_only=True)
+            for comp in self.components
+            if comp.component_type != ComponentType.MAMBA
+        )
+        device_node = self.root_node
+        device_len = 0
+        running_len = 0
+        for n in path:
+            full_value = n.component_data[BASE_COMPONENT_TYPE].value
+            if n.evicted or full_value is None:
+                break
+            running_len += len(full_value)
+            # Call every validator. SWA's predicate is stateful and must see
+            # each GPU page, even when an earlier predicate already failed.
+            accepted = True
+            for validator in device_validators:
+                accepted = validator(n) and accepted
+            if accepted:
+                device_node = n
+                device_len = running_len
+        return device_node, device_len
+
     def match_full_device_prefix(self, key: RadixKey) -> tuple[int, NodeId, int]:
         """Read-only FULL-device match, independent of auxiliary components; the
         third result counts the whole deepest node (a partial match pins it all)."""
@@ -1028,8 +1077,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node if self.enable_hicache else best_match_device_node
         )
 
+        device_prefix_len = sum(len(v) for v in value[:best_match_device_value_len])
+        # The mamba state at best_match covers the whole prefix ending there.
+        # GPU Full pages in front of that checkpoint are device hits even when
+        # those nodes do not hold their own mamba value. The anchor still stops
+        # at the first evicted page, so backed-up pages stay a host hit.
+        covered = self._device_prefix_covered_by_match(best_match_node)
+        if covered is not None and covered[1] > device_prefix_len:
+            best_match_device_node, device_prefix_len = covered
+
         result = MatchResult(
-            device_prefix_len=sum(len(v) for v in value[:best_match_device_value_len]),
+            device_prefix_len=device_prefix_len,
             last_device_node=best_match_device_node,
             last_host_node=last_host_node,
             best_match_node=best_match_node,
@@ -2375,6 +2433,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self.enable_hicache = True
+
+    def set_allow_missing_mamba_insert(self, enabled: bool) -> None:
+        """Let one host-only insert omit mamba when the leaf already has it."""
+        self.allow_missing_mamba_insert = bool(enabled)
 
     def set_host_memory_buffer_only(self) -> None:
         self.is_host_memory_buffer_only = True

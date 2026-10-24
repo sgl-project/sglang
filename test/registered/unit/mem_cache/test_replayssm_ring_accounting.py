@@ -19,8 +19,9 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateDType,
     Mamba2StateShape,
 )
-from sglang.srt.mem_cache.kv_cache_configurator import (  # noqa: F401
-    _pp_local_per_request_bytes,
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    _pp_local_per_request_bytes,  # noqa: F401
+    replayssm_ring_memory_charge,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -81,6 +82,29 @@ class TestReplaySSMRingAccounting(CustomTestCase):
         self.assertEqual(
             _kda_params().replayssm_ring_bytes_per_req(record_len=RL),
             3200 * len(LAYERS),
+        )
+
+    def test_kda_host_only_ring_follows_requests(self):
+        per_req = _kda_params().replayssm_ring_bytes_per_req(record_len=RL)
+        # Flag off: the ring stays on every mamba slot.
+        self.assertEqual(
+            replayssm_ring_memory_charge(
+                per_req,
+                request_scoped=False,
+                max_running_requests=96,
+                attn_dp_size=1,
+            ),
+            (0, per_req),
+        )
+        # Host-only: 96 live requests plus the pool padding slot.
+        self.assertEqual(
+            replayssm_ring_memory_charge(
+                per_req,
+                request_scoped=True,
+                max_running_requests=96,
+                attn_dp_size=1,
+            ),
+            (per_req * 97, 0),
         )
 
     def test_zero_len_ring(self):

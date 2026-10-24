@@ -566,6 +566,11 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def set_allow_missing_mamba_insert(self, enabled: bool) -> None:
+        """Let one host-only insert omit mamba when the leaf already has it."""
+        ...
+
+    @abstractmethod
     def set_host_memory_buffer_only(self) -> None:
         """Mark the host tier as buffer-only: one node staged per backup intent."""
         ...

@@ -197,6 +197,9 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub swa_branching_seqlen: Option<usize>,
     /// The donated mamba slot for the insert target leaf; None on non-mamba trees.
     pub mamba_value: Option<Tensor>,
+    /// Host-pool index for a checkpoint that keeps no GPU slot. Mutually
+    /// exclusive with `mamba_value`.
+    pub mamba_host_value: Option<Tensor>,
     /// The inserting request already inserted [0, here); only the nodes past it
     /// count a hit (and get threshold-checked), so a request counts each node once.
     pub inserted_len: usize,
@@ -299,6 +302,7 @@ pub(crate) struct InsertWalkState<K: ChildKeyType> {
     swa_evicted_seqlen: usize,
     swa_branching_seqlen: Option<usize>,
     mamba_value: Option<Tensor>,
+    mamba_host_value: Option<Tensor>,
     inserted_len: usize,
     priority: i64,
     track_adopted_ranges: bool,
@@ -554,6 +558,9 @@ pub struct CacheInitParams {
     pub mamba_cache_chunk_size: Option<usize>,
     /// Per-root-path cap on cached Mamba states; None means unlimited.
     pub mamba_max_states_per_path: Option<usize>,
+    /// Host-only mamba checkpoints never occupy a GPU slot. A host value then
+    /// still counts as a device-prefix match so Full KV indices stay reachable.
+    pub mamba_host_only_checkpoint: bool,
 }
 
 impl Default for CacheInitParams {
@@ -575,6 +582,7 @@ impl Default for CacheInitParams {
             dynamo_kv_event_format: false,
             mamba_cache_chunk_size: None,
             mamba_max_states_per_path: None,
+            mamba_host_only_checkpoint: false,
         }
     }
 }
@@ -633,6 +641,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) is_write_back: bool,
     /// Whether the host tier (HiCache) is wired.
     pub(crate) enable_hicache: bool,
+    /// One insert may omit mamba when the destination leaf already has it.
+    /// Stays false so a donate path that forgot `mamba_value` still panics.
+    pub(crate) allow_missing_mamba_insert: bool,
     /// Whether the host tier stages one node per FIFO backup intent rather than
     /// caching windows; buffer mode sizes its storage keys off a single node.
     pub(crate) is_host_memory_buffer_only: bool,
@@ -977,6 +988,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             page_size: params.page_size,
             is_write_back: params.is_write_back,
             enable_hicache: params.enable_hicache,
+            allow_missing_mamba_insert: false,
             is_host_memory_buffer_only: false,
             enable_storage: false,
             enable_external_cache_linker: false,
@@ -1561,6 +1573,66 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         )
     }
 
+    /// Contiguous GPU Full prefix of `best_match`.
+    ///
+    /// Mamba is satisfied by the checkpoint at the best match, so intermediate
+    /// nodes do not need their own state. Other device validators still apply.
+    /// The walk stops at the first evicted Full page and does not resume.
+    fn device_prefix_covered_by_match_(
+        &self,
+        best_match_node_id: NodeIdx_,
+    ) -> Option<(NodeIdx_, usize)> {
+        let host_only = self
+            .components
+            .iter()
+            .any(|component| component.host_only_checkpoint_counts_as_device());
+        if !self.enable_hicache
+            || !host_only
+            || self.arena.node(best_match_node_id).is_root()
+        {
+            return None;
+        }
+        let mut path = Vec::new();
+        let mut cur = best_match_node_id;
+        loop {
+            let node = self.arena.node(cur);
+            if node.is_root() {
+                break;
+            }
+            path.push(cur);
+            cur = node.parent();
+        }
+        path.reverse();
+
+        let mut validators = Vec::new();
+        for i in 0..self.components.len() {
+            if self.components[i].component_type() == MAMBA {
+                continue;
+            }
+            let component = Arc::clone(&self.components[i]);
+            validators.push(component.create_match_validator(self, /* match_device_only = */ true));
+        }
+
+        let mut device_node = self.arena.root();
+        let mut device_len = 0usize;
+        let mut running_len = 0usize;
+        for id in path {
+            let node = self.arena.node(id);
+            if node.evicted() || !node.has_device_value(FULL) {
+                break;
+            }
+            running_len += node.device_value_len(FULL);
+            let ok = validators
+                .iter_mut()
+                .fold(true, |acc, validator| validator(self, id) && acc);
+            if ok {
+                device_node = id;
+                device_len = running_len;
+            }
+        }
+        Some((device_node, device_len))
+    }
+
     /// Assemble the MatchResult from the walk outputs.
     pub fn match_post_processor_(
         &mut self,
@@ -1607,10 +1679,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             best_match_device_node_id
         };
 
-        let device_prefix_len = value[..best_match_device_value_len]
+        let walk_device_prefix_len = value[..best_match_device_value_len]
             .iter()
             .map(|chunk| chunk.size()[0] as usize)
             .sum();
+        // The mamba state at best_match covers the whole prefix ending there.
+        // GPU Full pages in front of that checkpoint are device hits even when
+        // those nodes do not hold their own mamba value. The anchor still stops
+        // at the first evicted page, so backed-up pages stay a host hit.
+        let (best_match_device_node_id, device_prefix_len) =
+            match self.device_prefix_covered_by_match_(best_match_node_id) {
+                Some((node_id, len)) if len > walk_device_prefix_len => (node_id, len),
+                _ => (best_match_device_node_id, walk_device_prefix_len),
+            };
         let mut result = MatchResult {
             device_prefix_len,
             last_device_node_id: self.arena.node(best_match_device_node_id).id,
@@ -1844,6 +1925,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
+            mamba_host_value: params
+                .mamba_host_value
+                .as_ref()
+                .map(Tensor::shallow_clone),
             inserted_len: params.inserted_len,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
@@ -2010,6 +2095,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
+            mamba_host_value: state
+                .mamba_host_value
+                .as_ref()
+                .map(Tensor::shallow_clone),
             inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
@@ -2066,6 +2155,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
+            mamba_host_value: state
+                .mamba_host_value
+                .as_ref()
+                .map(Tensor::shallow_clone),
             inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
@@ -2202,6 +2295,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
+            mamba_host_value: state
+                .mamba_host_value
+                .as_ref()
+                .map(Tensor::shallow_clone),
             inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
@@ -3494,6 +3591,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Mark the host tier (HiCache) as wired.
     pub fn set_hicache_enabled(&mut self) {
         self.enable_hicache = true;
+    }
+
+    /// Let one host-only insert omit mamba when the leaf already has it.
+    pub fn set_allow_missing_mamba_insert(&mut self, enabled: bool) {
+        self.allow_missing_mamba_insert = enabled;
     }
 
     /// Mark the host tier as buffer-only; wired after the host pools are built.

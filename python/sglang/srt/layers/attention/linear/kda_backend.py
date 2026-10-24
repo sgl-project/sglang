@@ -1271,6 +1271,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_beta=replayssm_beta,
             )
+            ring_indices = getattr(fm, "replayssm_ring_indices", None)
+            if ring_indices is not None:
+                ring_kwargs["ring_indices"] = ring_indices
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
         intermediate_state_indices = select_verify_intermediate_state_indices(
             self.verify_intermediate_state_indices,
@@ -1730,6 +1733,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
     ) -> bool:
         """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
         if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
+            return False
+        # Request-scoped rings are indexed by req_pool_idx. This kernel still
+        # writes the ring through the mamba slot, so keep the Triton path.
+        if getattr(
+            getattr(self.req_to_token_pool, "mamba_pool", None),
+            "replayssm_request_ring",
+            False,
+        ):
             return False
         if importlib.util.find_spec("cutlass") is None:
             return False

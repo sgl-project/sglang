@@ -649,6 +649,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        replayssm_request_ring: bool = False,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -675,6 +676,7 @@ class MambaPool:
             enable_linear_replayssm_spec and cache_params.is_kda
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
+        self.replayssm_request_ring = False
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -762,11 +764,18 @@ class MambaPool:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
-                # GDN speculative replay is request-lifetime scratch. Size it by
-                # active requests instead of every persistent radix-cache slot.
+                # GDN speculative replay is request-lifetime scratch. KDA stays
+                # on every mamba slot unless host-only checkpoints index the
+                # ring by req_pool_idx (see replayssm_request_ring).
+                self.replayssm_request_ring = bool(
+                    replayssm_request_ring
+                    and enable_linear_replayssm_spec
+                    and cache_params.is_kda
+                )
                 num_slots = (
                     spec_state_size + 1
-                    if enable_linear_replayssm_spec and not cache_params.is_kda
+                    if enable_linear_replayssm_spec
+                    and (not cache_params.is_kda or self.replayssm_request_ring)
                     else size + 1
                 )
                 # Decode records follow the SSM dtype. Spec-verify compact d/k
@@ -1009,7 +1018,8 @@ class MambaPool:
             if _replayssm_on:
                 logger.info(
                     f"GDN ReplaySSM ring buffers allocated "
-                    f"(record_len={record_len}, fold={self.replayssm_spec_fold}): "
+                    f"(record_len={record_len}, fold={self.replayssm_spec_fold}, "
+                    f"slots={num_slots}, request_ring={self.replayssm_request_ring}): "
                     f"d={get_tensor_size_bytes(replayssm_d) / GB if replayssm_d is not None else 0.0:.3f}GB, "
                     f"k={get_tensor_size_bytes(replayssm_k) / GB if replayssm_k is not None else 0.0:.3f}GB, "
                     f"g={get_tensor_size_bytes(replayssm_g) / GB:.3f}GB "
@@ -1381,6 +1391,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        replayssm_request_ring: bool = False,
     ):
         super().__init__(
             size=size,
@@ -1420,6 +1431,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
+            replayssm_request_ring=replayssm_request_ring,
         )
 
     def _init_mamba_pool(
@@ -1440,6 +1452,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        replayssm_request_ring: bool = False,
     ):
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
@@ -1454,6 +1467,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            replayssm_request_ring=replayssm_request_ring,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,

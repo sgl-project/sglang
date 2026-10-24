@@ -846,6 +846,94 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self._release_ongoing_load_back_locks(cache)
 
     @requires_full_mamba_ps1
+    def test_host_only_load_back_fills_request_slot_without_node_slot(self):
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture(
+            tree_core_backend="python"
+        )
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+
+        node_mamba_indices = node_device_value(cache, leaf, ComponentType.MAMBA).clone()
+        self._fill_mamba_state(req_to_token_pool, node_mamba_indices, marker=13)
+        expected_temporal, expected_conv = self._snapshot_mamba_state(
+            req_to_token_pool, node_mamba_indices
+        )
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+        self.assertTrue(cache.tree_core.is_full_device_evicted(leaf))
+        self.assertIsNone(node_device_value(cache, leaf, ComponentType.MAMBA))
+
+        req = self._make_req(req_to_token_pool)
+        req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+        req.kv.mamba_pool_idx = None
+        mamba_avail = req_to_token_pool.mamba_allocator.available_size()
+
+        with mock.patch.object(
+            cache.components[ComponentType.MAMBA],
+            "_mamba_host_only_checkpoint",
+            return_value=True,
+        ):
+            self.assertTrue(cache.load_back(leaf, req=req))
+            self.assertIsNotNone(req.kv.mamba_pool_idx)
+            self.assertIsNone(node_device_value(cache, leaf, ComponentType.MAMBA))
+            self.assertEqual(
+                req_to_token_pool.mamba_allocator.available_size(), mamba_avail - 1
+            )
+            self._finish_pending_loads(cache)
+
+        actual_temporal, actual_conv = self._snapshot_mamba_state(
+            req_to_token_pool, req.kv.mamba_pool_idx.unsqueeze(0)
+        )
+        self.assertTrue(torch.equal(actual_temporal, expected_temporal))
+        self.assertEqual(len(actual_conv), len(expected_conv))
+        for actual, expected in zip(actual_conv, expected_conv):
+            self.assertTrue(torch.equal(actual, expected))
+        self._release_ongoing_load_back_locks(cache)
+
+    @requires_full_mamba_ps1
+    def test_host_only_second_load_back_on_inflight_anchor_retries(self):
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture(
+            tree_core_backend="python"
+        )
+        chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+        leaf = chain[-1]
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+
+        def make_req():
+            req = self._make_req(req_to_token_pool)
+            req_to_token_pool.mamba_allocator.free(req.kv.mamba_pool_idx.unsqueeze(0))
+            req.kv.mamba_pool_idx = None
+            req.last_node = cache.root_node_handle()
+            return req
+
+        first, second = make_req(), make_req()
+        # First load restores the KV, so only the host mamba hit routes the
+        # second request into load-back.
+        second.mamba_host_hit_length = 1
+        with mock.patch.object(
+            cache.components[ComponentType.MAMBA],
+            "_mamba_host_only_checkpoint",
+            return_value=True,
+        ):
+            self.assertTrue(cache.load_back(leaf, req=first))
+            mamba_avail = req_to_token_pool.mamba_allocator.available_size()
+            loaded = cache.init_load_back(
+                InitLoadBackParams(best_match_node=leaf, host_hit_length=0, req=second)
+            )
+            self.assertIsNone(loaded)
+            self.assertIsNone(second.kv.mamba_pool_idx)
+            self.assertEqual(
+                req_to_token_pool.mamba_allocator.available_size(), mamba_avail
+            )
+            self._finish_pending_loads(cache)
+        self._release_ongoing_load_back_locks(cache)
+
+    @requires_full_mamba_ps1
     def test_prepare_load_back_mamba(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)

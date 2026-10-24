@@ -166,6 +166,25 @@ _KV_POOL_BASE_FOR_KIND: dict[str, type] = {
 }
 
 
+def replayssm_ring_memory_charge(
+    per_req_bytes: int,
+    *,
+    request_scoped: bool,
+    max_running_requests: int,
+    attn_dp_size: int,
+) -> tuple[int, int]:
+    """Return ``(fixed_bytes, per_slot_bytes)`` for the ReplaySSM ring.
+
+    GDN replay is request scratch. KDA replay stays on every mamba slot unless
+    host-only checkpoints are on, in which case the ring follows live requests:
+    ``max(1, max_running_requests // attn_dp_size) + 1`` (the pool's padding slot).
+    """
+    if request_scoped and per_req_bytes:
+        slots = max(1, max_running_requests // attn_dp_size) + 1
+        return per_req_bytes * slots, 0
+    return 0, per_req_bytes
+
+
 def _pd_prefill_skips_mamba_spec_state() -> bool:
     # Prefill never runs TARGET_VERIFY, so the plain hybrid req pool skips the
     # verify-only snapshots; role-switch and unified-memory pools still allocate them.
@@ -1651,6 +1670,10 @@ class KVCacheConfigurator:
                     or self.hybrid_kda_config is not None
                 )
             ),
+            replayssm_request_ring=(
+                get_exec().mamba.enable_mamba_host_only_checkpoint
+                and self.hybrid_kda_config is not None
+            ),
         )
         return req_to_token_pool
 
@@ -1728,6 +1751,10 @@ class KVCacheConfigurator:
                     self.hybrid_gdn_config is not None
                     or self.hybrid_kda_config is not None
                 )
+            ),
+            replayssm_request_ring=(
+                get_exec().mamba.enable_mamba_host_only_checkpoint
+                and self.hybrid_kda_config is not None
             ),
         )
         return req_to_token_pool
@@ -3004,6 +3031,19 @@ class KVCacheConfigurator:
         if get_memory().disable_radix_cache:
             return 1
 
+        # Host-only checkpoints do not retain a GPU donate slot or a locked
+        # prefix slot. The GPU pool is the live slot plus ping-pong slots the
+        # extra-buffer kernel still writes into. Default off: the branch below
+        # is the previous ratio.
+        if getattr(get_exec().mamba, "enable_mamba_host_only_checkpoint", False):
+            if not get_exec().mamba.enable_mamba_extra_buffer:
+                return 1
+            return 1 + get_mamba_tracking_slots(
+                extra_buffer=True,
+                overlap=not get_schedule().disable_overlap_schedule,
+                lazy=get_exec().mamba.enable_mamba_extra_buffer_lazy,
+            )
+
         skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
         base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO - (
             MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP if skip_decode_lock else 0
@@ -3206,7 +3246,8 @@ class KVCacheConfigurator:
         # budget goes to persistent slots (K sized like non-spec), which is how the
         # freed ~9GB turns into higher max_running.
         # The ring is not part of mamba_cache_per_req. GDN replay is fixed-size
-        # request scratch; KDA replay remains attached to each mamba slot.
+        # request scratch. KDA replay stays on each mamba slot unless host-only
+        # checkpoints are on, in which case it follows live requests too.
         replayssm_active = get_exec().mamba.enable_linear_replayssm_spec and (
             self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
         )
@@ -3220,15 +3261,16 @@ class KVCacheConfigurator:
         else:
             replayssm_ring_per_req = 0
         replayssm_ring_per_req = int(replayssm_ring_per_req * pp_layer_scale)
-        if replayssm_active and self.hybrid_kda_config is None:
-            replay_req_slots = (
-                max(1, get_schedule().max_running_requests // self.attn_dp_size) + 1
-            )
-            replayssm_fixed_bytes = replayssm_ring_per_req * replay_req_slots
-            replayssm_ring_per_slot = 0
-        else:
-            replayssm_fixed_bytes = 0
-            replayssm_ring_per_slot = replayssm_ring_per_req
+        request_scoped = replayssm_active and (
+            self.hybrid_kda_config is None
+            or get_exec().mamba.enable_mamba_host_only_checkpoint
+        )
+        replayssm_fixed_bytes, replayssm_ring_per_slot = replayssm_ring_memory_charge(
+            replayssm_ring_per_req,
+            request_scoped=request_scoped,
+            max_running_requests=get_schedule().max_running_requests,
+            attn_dp_size=self.attn_dp_size,
+        )
         extra_per_slot = replayssm_ring_per_slot + int(
             self.extra_mamba_cache_bytes_per_req * pp_layer_scale
         )

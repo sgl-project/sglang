@@ -492,6 +492,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                     if mamba_max_states_per_path >= 0
                     else None
                 ),
+                mamba_host_only_checkpoint=(
+                    bool(
+                        getattr(
+                            get_exec().mamba,
+                            "enable_mamba_host_only_checkpoint",
+                            False,
+                        )
+                    )
+                    if has_mamba
+                    else False
+                ),
             ),
             [int(component) for component in self.tree_components],
         )
@@ -814,6 +825,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 cache_salt=key.cache_salt,
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
+                mamba_host_value=params.mamba_host_value,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.get_evicted_seqlen(ComponentType.SWA),
                 swa_branching_seqlen=params.swa_branching_seqlen,
@@ -864,6 +876,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_hicache_enabled(self) -> None:
         self._binding.set_hicache_enabled()
+
+    def set_allow_missing_mamba_insert(self, enabled: bool) -> None:
+        self._binding.set_allow_missing_mamba_insert(bool(enabled))
 
     def set_host_memory_buffer_only(self) -> None:
         self._binding.set_host_memory_buffer_only()

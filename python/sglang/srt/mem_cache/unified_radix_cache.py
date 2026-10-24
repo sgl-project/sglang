@@ -1228,7 +1228,20 @@ class UnifiedRadixCache(BasePrefixCache):
 
         insert_params.key = radix_key
         insert_params.value = values
-        result = self.insert(insert_params)
+        reuse_existing_mamba = False
+        for comp in self._components_tuple:
+            materialize = getattr(comp, "materialize_host_only_checkpoint", None)
+            if materialize is not None:
+                reuse_existing_mamba = (
+                    materialize(insert_params, radix_key) or reuse_existing_mamba
+                )
+        if reuse_existing_mamba:
+            self.tree_core.set_allow_missing_mamba_insert(True)
+        try:
+            result = self.insert(insert_params)
+        finally:
+            if reuse_existing_mamba:
+                self.tree_core.set_allow_missing_mamba_insert(False)
 
         if result.rotation_tail_declined:
             # Rotation-base discontinuity with the matched chain (pipelined
@@ -3573,8 +3586,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         params: InitLoadBackParams,
     ) -> Optional[tuple[int, NodeId]]:
-        """Only buffer mode returns None: its admission retries without
-        committing a load."""
+        """None means admission retries without committing a load: buffer
+        mode, or an anchor whose previous load-back is still in flight."""
         if self.buffer_pipeline is not None:
             return self.buffer_pipeline.init_load_back(params)
         best_match_node_id = params.best_match_node
@@ -3593,6 +3606,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
+            # ongoing_load_back is keyed by anchor. A host-only mamba
+            # checkpoint stays off the device after its load, so another
+            # request can reach this anchor before the first H->D is acked.
+            if best_match_node_id in self.ongoing_load_back:
+                return None
             if self.load_back(best_match_node_id, mem_quota, req=req):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
