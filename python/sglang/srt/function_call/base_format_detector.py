@@ -1,3 +1,4 @@
+import inspect
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -13,6 +14,7 @@ except ImportError:
     StructuralTag = Any
     get_model_structural_tag = None
 
+
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import (
@@ -27,6 +29,17 @@ from sglang.srt.function_call.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _xgrammar_supports_token_markers() -> bool:
+    """True when the installed xgrammar accepts ``token_markers``."""
+    if get_model_structural_tag is None:
+        return False
+    try:
+        params = inspect.signature(get_model_structural_tag).parameters
+    except (TypeError, ValueError):
+        return False
+    return "token_markers" in params
 
 
 class BaseFormatDetector(ABC):
@@ -388,6 +401,16 @@ class BaseFormatDetector(ABC):
         """Return the XGrammar model name for native structural tags, if supported."""
         return None
 
+    def use_structural_tag_token_markers(self) -> bool:
+        """Whether XGrammar should match this format's control markers as tokens.
+
+        Only enable this for formats whose markers (e.g. ``<tool_call>``) are
+        dedicated single tokens in the tokenizer. It is applied only when the
+        installed xgrammar supports ``token_markers``; otherwise the text
+        trigger is used.
+        """
+        return False
+
     def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,
@@ -423,12 +446,19 @@ class BaseFormatDetector(ABC):
             if isinstance(tool_choice, ToolChoice)
             else tool_choice
         )
+        extra_kwargs = {}
+        if (
+            self.use_structural_tag_token_markers()
+            and _xgrammar_supports_token_markers()
+        ):
+            extra_kwargs["token_markers"] = True
         return get_model_structural_tag(
             model=structural_tag_name,
             tools=converted_tools,
             tool_choice=converted_tool_choice,
             reasoning=thinking_mode,
             parallel_tool_calls=parallel_tool_calls,
+            **extra_kwargs,
         )
 
     def get_auto_tool_call_structural_tag(
