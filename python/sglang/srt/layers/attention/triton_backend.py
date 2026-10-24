@@ -11,6 +11,8 @@ from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
 )
+from sglang.kernels.ops.attention.verify_mla import cuda_shared_kv_tile
+from sglang.kernels.ops.attention.verify_splitkv import cuda_splitkv_tile
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -113,6 +115,40 @@ def logit_capping_mod(logit_capping_method, logit_cap):
         return logit_cap
     else:
         raise ValueError()
+
+
+def _can_use_cuda_verify(
+    q, k, v, k_buffer, v_buffer, max_len_extend, arch, *, sliding_window=False
+):
+    """Check the tensor contract and require a validated tile for arch."""
+    if not isinstance(max_len_extend, int) or max_len_extend < 1:
+        return False
+    if k is None or v is None:
+        return False
+    tensors = (q, k, v, k_buffer, v_buffer)
+    if any(t.ndim != 3 for t in tensors):
+        return False
+    if q.device.type != "cuda" or _is_hip:
+        return False
+    if not all(
+        t.dtype == torch.bfloat16 and t.device == q.device and t.stride(-1) == 1
+        for t in tensors
+    ):
+        return False
+    h_q, head_dim = q.shape[1:]
+    h_kv = k.shape[1]
+    if h_kv == 0 or h_q % h_kv:
+        return False
+    if k.shape != (q.shape[0], h_kv, head_dim) or v.shape != k.shape:
+        return False
+    if k_buffer.shape[1:] != (h_kv, head_dim) or v_buffer.shape != k_buffer.shape:
+        return False
+    if sliding_window:
+        return cuda_splitkv_tile(h_q, h_kv, head_dim, max_len_extend, arch) is not None
+    return (
+        h_kv == 1
+        and cuda_shared_kv_tile(h_q // h_kv, head_dim, max_len_extend, arch) is not None
+    )
 
 
 @dataclass
@@ -248,6 +284,17 @@ class TritonAttnBackend(AttentionBackend):
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+        )
+        self.use_cuda_verify = (
+            _is_cuda
+            and envs.SGLANG_ENABLE_CUDA_VERIFY_SPLITKV.get()
+            and self.topk == 1
+            and not model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_frozen_kv_mtp()
+        )
+        # Resolved once: eligibility runs per layer on every eager verify step.
+        self.cuda_verify_arch = (
+            torch.cuda.get_device_capability() if self.use_cuda_verify else None
         )
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
@@ -1839,16 +1886,41 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
-        # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
-        # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
-        # returns True if it ran (o written), or False for any case it cannot
-        # serve bit-equivalently (its can_handle() gates on non-causal / sinks /
-        # sliding-window / ragged / topk>1), so we fall through to
-        # extend_attention_fwd below. Correctness is never at risk.
+        # Split-KV verify requires a causal topk=1 chain. Backend eligibility
+        # and kernel feature checks preserve the generic fallback for
+        # unsupported cases. Reduction order can change floating-point results.
         # Route target-verify to the grouped-head kernel when eligible, else the
         # per-head split-KV kernel.
-        if self.use_verify_shared_kv:
+        use_cuda_verify = (
+            self.use_cuda_verify
+            and forward_batch.forward_mode.is_target_verify()
+            and causal
+            and layer.k_scale is None
+            and layer.v_scale is None
+            and (
+                (sliding_window_size == -1 and window_kv_offsets is None)
+                or (sliding_window_size > 0 and window_kv_offsets is not None)
+            )
+            and _can_use_cuda_verify(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k,
+                v,
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.max_extend_len,
+                self.cuda_verify_arch,
+                sliding_window=sliding_window_size > 0,
+            )
+        )
+        if use_cuda_verify:
+            verify_fwd = (
+                self.verify_splitkv_fwd
+                if sliding_window_size > 0
+                else self.verify_shared_kv_fwd
+            )
+        elif sliding_window_size > 0:
+            verify_fwd = None
+        elif self.use_verify_shared_kv:
             verify_fwd = self.verify_shared_kv_fwd
         elif self.use_verify_splitkv:
             verify_fwd = self.verify_splitkv_fwd
