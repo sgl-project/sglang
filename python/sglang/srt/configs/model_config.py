@@ -1215,6 +1215,12 @@ class ModelConfig:
                         self.hf_text_config,
                     )
                 )
+        elif self._is_dflash_draft_kv_on_swa():
+            # An SWA pool with no full layers, on the target allocator's SWA slots.
+            self.is_hybrid_swa = True
+            self.is_deepseek_v4_arch = False
+            self.swa_attention_layer_ids = list(range(self.num_hidden_layers))
+            self.full_attention_layer_ids = []
 
         self.has_attention_sinks = self._detect_attention_sinks()
 
@@ -1229,6 +1235,25 @@ class ModelConfig:
             "Gemma4UnifiedForConditionalGeneration",
             "DiffusionGemmaForBlockDiffusion",
         ]
+
+    def _is_dflash_draft_kv_on_swa(self) -> bool:
+        """SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA on a DFLASH draft whose every layer
+        is sliding-window; the draft worker refuses a target without SWA slots."""
+        if not (
+            envs.SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA.get()
+            and self.is_draft_model
+            and self.speculative_algorithm == "DFLASH"
+            and not self.disable_hybrid_swa_memory
+        ):
+            return False
+        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
+
+        layer_types = get_dflash_layer_types(self.hf_config)
+        return (
+            layer_types is not None
+            and len(layer_types) == self.num_hidden_layers > 0
+            and all(kind == "sliding_attention" for kind in layer_types)
+        )
 
     @cached_property
     def linear_attn_registry_result(self) -> Any:

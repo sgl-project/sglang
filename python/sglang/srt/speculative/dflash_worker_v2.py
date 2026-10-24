@@ -30,8 +30,10 @@ from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind, KVLocPlan
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -47,7 +49,9 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
     get_spec,
@@ -370,6 +374,18 @@ class _DominoDraftSampler:
         self.out[: bs * (self.block_size - 1)].copy_(proposals.reshape(-1))
 
 
+def _draft_kv_write_loc_2d(
+    cache_loc_2d: torch.Tensor, swa_cache_loc: Optional[torch.Tensor]
+):
+    """The prefix-valid writer's loc: the bare [bs, width] full loc, plus its
+    SWA ids for a draft on the target's SWA slots."""
+    if swa_cache_loc is None:
+        return cache_loc_2d
+    return KVWriteLoc(
+        cache_loc_2d, swa_loc=swa_cache_loc.view(cache_loc_2d.shape), physical=True
+    )
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
@@ -430,6 +446,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        # ModelConfig classifies an all-sliding-window draft as hybrid SWA under
+        # SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA, so its pool is built on SWA slots.
+        self._draft_kv_on_swa = (
+            envs.SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA.get()
+            and self.draft_model_runner.model_config.is_hybrid_swa
+        )
+        if self._draft_kv_on_swa:
+            self._check_draft_kv_on_swa(
+                resolved_attention_backend=bundle.resolved_attention_backend
+            )
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
@@ -666,6 +692,89 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
+        if self._draft_kv_on_swa:
+            self._check_draft_pool_on_swa(token_to_kv_pool_allocator)
+
+    def _check_draft_kv_on_swa(self, *, resolved_attention_backend: str) -> None:
+        """Refuse configurations whose draft KV reads, writes or transfers
+        would leave the target's SWA slots."""
+        parallel = get_parallel()
+        draft_windows = [
+            layer.self_attn.sliding_window_size for layer in self.draft_model.layers
+        ]
+        target_window = self.model_runner.sliding_window_size
+        unsupported = [
+            reason
+            for reason, applies in (
+                (
+                    "a target without sliding-window layers",
+                    not self.model_runner.is_hybrid_swa,
+                ),
+                ("--speculative-draft-window-size", self.use_compact_draft_cache),
+                ("--enable-unified-memory", get_memory().enable_unified_memory),
+                (
+                    f"draft attention backend {resolved_attention_backend!r}",
+                    resolved_attention_backend != "trtllm_mha",
+                ),
+                ("DP attention", parallel.attn_dp_enabled),
+                ("context parallelism", parallel.attn_cp_size > 1),
+                ("decode context parallelism", parallel.attn_dcp_size > 1),
+                (
+                    "PD disaggregation",
+                    get_disagg().disaggregation_mode != "null",
+                ),
+                # The target's SWA eviction keeps every slot the draft reads only
+                # if the draft reads no further back than the target.
+                (
+                    f"draft windows {draft_windows} beyond the target window "
+                    f"{target_window}",
+                    target_window is None
+                    or min(draft_windows) < 0
+                    or max(draft_windows) > target_window,
+                ),
+            )
+            if applies
+        ]
+        if unsupported:
+            raise ValueError(
+                "SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA does not support "
+                + ", ".join(unsupported)
+                + "."
+            )
+        if parallel.tp_rank == 0:
+            logger.info(
+                "DFLASH draft KV on the target's SWA slots: %d sliding-window "
+                "layers, draft window_left=%d, target window_left=%d.",
+                len(draft_windows),
+                max(draft_windows),
+                target_window,
+            )
+
+    def _check_draft_pool_on_swa(self, token_to_kv_pool_allocator) -> None:
+        pool = self.draft_model_runner.token_to_kv_pool
+        if not (
+            isinstance(pool, SWAKVPool)
+            and pool.full_layer_nums == 0
+            and isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+            and pool.full_to_swa_index_mapping
+            is token_to_kv_pool_allocator.full_to_swa_index_mapping
+        ):
+            raise RuntimeError(
+                "SGLANG_OPT_DFLASH_DRAFT_KV_ON_SWA expects an all-SWA draft pool on "
+                "the target allocator's full->SWA mapping, got "
+                f"{type(pool).__name__} on {type(token_to_kv_pool_allocator).__name__}."
+            )
+
+    def _draft_swa_write_ids(self, plan: KVLocPlan) -> Optional[torch.Tensor]:
+        """The target's SWA write ids for a draft on its SWA slots, else None.
+        Take them before on_publish: the scheduler may then rewrite the mapping."""
+        if not self._draft_kv_on_swa:
+            return None
+        ids = plan.write_ids(
+            self.model_runner.kv_index_translator, kind=IdSpaceKind.SLIDING_WINDOW
+        )
+        assert ids is not None, "the target plan has no SWA write ids"
+        return ids
 
     def init_attention_backends(self):
         with (
@@ -1815,6 +1924,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         extend_lens: Optional[torch.Tensor] = None,
+        swa_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -1868,6 +1978,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH positions length mismatch: "
                 f"positions={int(positions.numel())}, target_hidden={num_tokens}."
             )
+        if swa_cache_loc is not None and int(swa_cache_loc.numel()) != num_tokens:
+            raise ValueError(
+                "DFLASH swa_cache_loc length mismatch: "
+                f"swa_cache_loc={int(swa_cache_loc.numel())}, target_hidden={num_tokens}."
+            )
         if cache_loc_2d is not None:
             if cache_loc_2d.ndim != 2:
                 raise ValueError(
@@ -1906,6 +2021,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens = commit_lens.to(device, non_blocking=True)
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
+        if swa_cache_loc is not None:
+            if swa_cache_loc.device != device:
+                swa_cache_loc = swa_cache_loc.to(device, non_blocking=True)
+            if swa_cache_loc.dtype != torch.int64:
+                swa_cache_loc = swa_cache_loc.to(torch.int64)
 
         # `cache_loc` arrives in the draft pool's id space (`_draft_write_ids`);
         # the callers' window buffers stay virtual for the compact
@@ -1940,6 +2060,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                             ctx_cache_loc=cache_loc,
                             ctx_cache_loc_2d=cache_loc_2d,
                             commit_lens=commit_lens,
+                            ctx_swa_cache_loc=swa_cache_loc,
                         )
                         return
                     except Exception as e:
@@ -1950,6 +2071,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
+                write_loc_2d = _draft_kv_write_loc_2d(cache_loc_2d, swa_cache_loc)
                 for layer in self.draft_model.layers:
                     attn = layer.self_attn
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
@@ -1963,7 +2085,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
                     self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
                         attn.attn,
-                        cache_loc_2d,
+                        write_loc_2d,
                         commit_lens,
                         k,
                         v,
@@ -1978,6 +2100,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         ctx_hidden=ctx_hidden,
                         ctx_positions=positions,
                         ctx_cache_loc=cache_loc,
+                        ctx_swa_cache_loc=swa_cache_loc,
                     )
                     return
                 except Exception as e:
@@ -1992,6 +2115,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_hidden=ctx_hidden,
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
+                ctx_swa_cache_loc=swa_cache_loc,
             )
 
     def _append_target_hidden_sequential(
@@ -1999,6 +2123,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        ctx_swa_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
@@ -2018,7 +2143,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
-                KVWriteLoc(ctx_cache_loc, physical=True),
+                KVWriteLoc(ctx_cache_loc, swa_loc=ctx_swa_cache_loc, physical=True),
                 k,
                 v,
                 attn.attn.k_scale,
@@ -2032,11 +2157,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_cache_loc: torch.Tensor,
         ctx_cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        ctx_swa_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
         if self._fused_kv_helper is None:
             raise RuntimeError("DFLASH fused KV helper is not initialized.")
+        write_loc_2d = (
+            None
+            if ctx_cache_loc_2d is None
+            else _draft_kv_write_loc_2d(ctx_cache_loc_2d, ctx_swa_cache_loc)
+        )
 
         def _write_layer_kv(
             layer_idx: int,
@@ -2044,10 +2175,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             cache_v: torch.Tensor,
         ) -> None:
             attn = self.draft_model.layers[layer_idx].self_attn.attn
-            if ctx_cache_loc_2d is not None and commit_lens is not None:
+            if write_loc_2d is not None and commit_lens is not None:
                 token_to_kv_pool.set_kv_buffer_prefix_valid(
                     attn,
-                    ctx_cache_loc_2d,
+                    write_loc_2d,
                     commit_lens,
                     cache_k,
                     cache_v,
@@ -2057,7 +2188,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             else:
                 token_to_kv_pool.set_kv_buffer(
                     attn,
-                    KVWriteLoc(ctx_cache_loc, physical=True),
+                    KVWriteLoc(ctx_cache_loc, swa_loc=ctx_swa_cache_loc, physical=True),
                     cache_k,
                     cache_v,
                     attn.k_scale,
@@ -2340,6 +2471,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return_kv_loc_plan=True,
             )
             kv_loc_plan, batch_output.kv_loc_plan = batch_output.kv_loc_plan, None
+            swa_cache_loc = self._draft_swa_write_ids(kv_loc_plan)
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
@@ -2398,6 +2530,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 cache_loc=self._draft_write_ids(kv_loc_plan),
                 positions=positions,
                 extend_lens=ctx_lens,
+                swa_cache_loc=swa_cache_loc,
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -2584,6 +2717,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             write_virtual=verify_out_cache_loc,
             read_extent=block_size,
         )
+        verify_swa_cache_loc = self._draft_swa_write_ids(kv_loc_plan)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
@@ -2972,6 +3106,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
             positions=positions,
             commit_lens=commit_lens,
+            swa_cache_loc=verify_swa_cache_loc,
         )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
