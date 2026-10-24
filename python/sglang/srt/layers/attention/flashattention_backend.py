@@ -48,8 +48,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
-    resolve_ragged_verify_layout,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
@@ -475,7 +475,7 @@ class FlashAttentionBackend(AttentionBackend):
             and self.kv_index_translator.reads_are_translated
             and self.topk <= 1
             and forward_batch.encoder_lens is None
-            and resolve_ragged_verify_layout(forward_batch) is None
+            and forward_batch.ragged_verify_layout is None
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
@@ -688,7 +688,7 @@ class FlashAttentionBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
-                ragged_verify_layout=resolve_ragged_verify_layout(forward_batch),
+                ragged_verify_layout=forward_batch.ragged_verify_layout,
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=out_cache_loc,
             )
@@ -741,7 +741,7 @@ class FlashAttentionBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
-                ragged_verify_layout=resolve_ragged_verify_layout(forward_batch),
+                ragged_verify_layout=forward_batch.ragged_verify_layout,
                 seq_lens_cpu=(
                     forward_batch.seq_lens_cpu if self.needs_cpu_seq_lens else None
                 ),
@@ -1040,7 +1040,7 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             if self.topk <= 1:
-                ragged_layout = resolve_ragged_verify_layout(forward_batch)
+                ragged_layout = forward_batch.ragged_verify_layout
                 if ragged_layout is not None:
                     geometry = build_ragged_target_verify_geometry(
                         seq_lens=forward_batch.seq_lens, layout=ragged_layout
@@ -3008,7 +3008,8 @@ class FlashAttentionBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
-        ragged_verify_layout=None,
+        *,
+        ragged_verify_layout: Optional[RaggedVerifyLayout],
     ):
         """Shared capture+replay body for the cuda-graph init path.
 

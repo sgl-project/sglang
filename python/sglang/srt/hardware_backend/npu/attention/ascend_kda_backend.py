@@ -12,7 +12,6 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 
 _LOG2_E = math.log2(math.e)
 
@@ -354,7 +353,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         draft_token_num = forward_batch.spec_info.draft_token_num
         batch_size = query_start_loc.shape[0] - 1
         num_dense_tokens = batch_size * draft_token_num
-        ragged_layout = resolve_ragged_verify_layout(forward_batch)
+        ragged_layout = forward_batch.ragged_verify_layout
         if ragged_layout is None and seq_len == num_dense_tokens:
             dense_token_indices = None
             dense_qkv = mixed_qkv.view(batch_size, draft_token_num, -1)

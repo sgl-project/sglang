@@ -40,10 +40,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.speculative.ragged_verify import (
-    RaggedVerifyLayout,
-    resolve_ragged_verify_layout,
-)
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -349,7 +346,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens = forward_batch.seq_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
-        ragged_layout = resolve_ragged_verify_layout(forward_batch)
+        ragged_layout = forward_batch.ragged_verify_layout
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()

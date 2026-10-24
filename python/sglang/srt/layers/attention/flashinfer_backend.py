@@ -47,7 +47,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -753,7 +752,7 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info = forward_batch.spec_info
 
         if (
-            resolve_ragged_verify_layout(forward_batch) is not None
+            forward_batch.ragged_verify_layout is not None
             and forward_mode.is_target_verify()
         ):
             raise NotImplementedError(

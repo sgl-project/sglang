@@ -44,12 +44,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 logger = logging.getLogger(__name__)
 _validate_mamba_replay_state_indices = (
@@ -84,7 +84,6 @@ class MambaAttnBackendBase(AttentionBackend):
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
         self.topk = get_spec().speculative_eagle_topk or 0
-        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -284,7 +283,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 # full-attention layers.
                 query_start_loc = None
             elif forward_batch.forward_mode.is_target_verify():
-                ragged_layout = resolve_ragged_verify_layout(forward_batch)
+                ragged_layout = forward_batch.ragged_verify_layout
                 if ragged_layout is not None:
                     # Compact ragged verify: variable per-request verify lens.
                     query_start_loc = ragged_layout.qo_indptr_device
@@ -377,13 +376,13 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.req_pool_indices,
             forward_batch.forward_mode,
             forward_batch.spec_info,
-            resolve_ragged_verify_layout(forward_batch),
             forward_batch.seq_lens_cpu if not in_capture else None,
             num_padding=(
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            ragged_verify_layout=forward_batch.ragged_verify_layout,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -691,22 +690,15 @@ class MambaAttnBackendBase(AttentionBackend):
         req_pool_indices: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        ragged_verify_layout=None,
     ):
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
             )
         elif forward_mode.is_target_verify():
-            if ragged_verify_layout is not None:
-                # Ragged capture: qsl from the runner's synthetic layout.
-                self.query_start_loc_list[bs - 1].copy_(
-                    ragged_verify_layout.qo_indptr_device
-                )
-            else:
-                self.query_start_loc_list[bs - 1].copy_(
-                    self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
-                )
+            self.query_start_loc_list[bs - 1].copy_(
+                self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+            )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
@@ -753,11 +745,12 @@ class MambaAttnBackendBase(AttentionBackend):
         req_pool_indices: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        ragged_verify_layout,
         seq_lens_cpu: Optional[torch.Tensor],
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
+        *,
+        ragged_verify_layout: Optional[RaggedVerifyLayout],
     ):
         if num_padding is None:
             if seq_lens_cpu is None:
@@ -894,7 +887,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 # mamba slot -1 and are skipped.
                 if ragged_verify_layout.bs != bs or ragged_verify_layout.cap is None:
                     ragged_verify_layout = ragged_verify_layout.padded_to_bucket(
-                        padded_bs=bs, cap=self.num_draft_tokens
+                        padded_bs=bs, cap=spec_info.draft_token_num
                     )
                 self.query_start_loc_list[bs - 1].copy_(
                     ragged_verify_layout.qo_indptr_device
@@ -1095,13 +1088,13 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch.req_pool_indices,
             forward_batch.forward_mode,
             forward_batch.spec_info,
-            resolve_ragged_verify_layout(forward_batch),
             forward_batch.seq_lens_cpu if not in_capture else None,
             num_padding=(
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            ragged_verify_layout=forward_batch.ragged_verify_layout,
         )
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
