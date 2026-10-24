@@ -479,6 +479,21 @@ class AnthropicServing:
                     if image_part is not None:
                         content_parts.append(image_part)
 
+                elif block.type == "video":
+                    # SGLang extension, validated as top-level user base64 MP4.
+                    # Reuse the Chat video processor for both normal and SSE.
+                    content_parts.append(
+                        {
+                            "type": "video_url",
+                            "video_url": {
+                                "url": (
+                                    f"data:{block.source.media_type};base64,"
+                                    f"{block.source.data}"
+                                ),
+                            },
+                        }
+                    )
+
                 elif block.type == "search_result":
                     search_text = _text_from_search_result(block.model_dump())
                     if search_text:

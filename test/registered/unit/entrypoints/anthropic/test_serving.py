@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse  # noqa: E402
 from jinja2 import Environment  # noqa: E402
 
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
+    AnthropicCountTokensRequest,
     AnthropicMessage,
     AnthropicMessagesRequest,
 )
@@ -191,6 +192,115 @@ class TestAnthropicServing(unittest.TestCase):
         if tools is not None:
             overrides["tools"] = tools
         return self._anthropic_request(**overrides)
+
+    @staticmethod
+    def _video_block(data="Zmlyc3Q="):
+        return {
+            "type": "video",
+            "source": {"type": "base64", "media_type": "video/mp4", "data": data},
+        }
+
+    def test_inline_mp4_preserves_media_and_tool_result_order(self):
+        """The SGLang extension must reach the shared Chat adapter without losing
+        video or moving it across a tool_result in either response mode."""
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                request = self._anthropic_request(
+                    stream=stream,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "before"},
+                                self._video_block(),
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "call_x",
+                                    "content": "ok",
+                                },
+                                self._video_block("c2Vjb25k"),
+                                {"type": "text", "text": "after"},
+                            ],
+                        }
+                    ],
+                )
+                converted = self._serving()._convert_to_chat_completion_request(request)
+                self.assertEqual(
+                    [m.role for m in converted.messages], ["user", "tool", "user"]
+                )
+                parts_before = converted.messages[0].content
+                self.assertEqual(
+                    [part.type for part in parts_before], ["text", "video_url"]
+                )
+                self.assertEqual(parts_before[0].text, "before")
+                self.assertEqual(
+                    parts_before[1].video_url.url, "data:video/mp4;base64,Zmlyc3Q="
+                )
+                self.assertEqual(converted.messages[1].tool_call_id, "call_x")
+                self.assertEqual(converted.messages[1].content, "ok")
+                parts_after = converted.messages[2].content
+                self.assertEqual(
+                    [part.type for part in parts_after], ["video_url", "text"]
+                )
+                self.assertEqual(
+                    parts_after[0].video_url.url, "data:video/mp4;base64,c2Vjb25k"
+                )
+                self.assertEqual(parts_after[1].text, "after")
+                self.assertEqual(converted.stream, stream)
+
+    def test_inline_mp4_source_rejects_url_wrong_mime_and_empty_data(self):
+        for source in (
+            {"type": "url", "url": "https://example.com/video.mp4"},
+            {"type": "base64", "media_type": "video/webm", "data": "Zmlyc3Q="},
+            {"type": "base64", "media_type": "video/mp4", "data": ""},
+            {"type": "base64", "media_type": "video/mp4", "data": "  "},
+            {"type": "base64", "media_type": "video/mp4"},
+        ):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                self._anthropic_request(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [{"type": "video", "source": source}],
+                        }
+                    ]
+                )
+
+    def test_inline_mp4_rejects_system_assistant_and_nested_tool_content(self):
+        for role in ("system", "assistant"):
+            with (
+                self.subTest(role=role),
+                self.assertRaisesRegex(ValueError, "top-level user"),
+            ):
+                self._anthropic_request(
+                    messages=[{"role": role, "content": [self._video_block()]}]
+                )
+        with self.assertRaisesRegex(ValueError, "top-level user"):
+            self._anthropic_request(system=[self._video_block()])
+        for nested in (
+            [self._video_block()],
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "inner",
+                    "content": [self._video_block()],
+                }
+            ],
+        ):
+            with (
+                self.subTest(nested=nested),
+                self.assertRaisesRegex(
+                    ValueError, "top-level user|Unsupported tool_result.content"
+                ),
+            ):
+                self._tool_result_request(nested)
+
+    def test_inline_mp4_count_tokens_rejected_before_text_only_count(self):
+        with self.assertRaisesRegex(ValueError, "count_tokens does not support video"):
+            AnthropicCountTokensRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": [self._video_block()]}],
+            )
 
     def test_messages_preserves_pd_rendezvous_through_native_conversion(self):
         """PD routers inject bootstrap fields into /v1/messages bodies; dropping

@@ -478,3 +478,23 @@ Decisions the preset already makes:
 <Note>
 No preset has a full serving round on final weights; the constants derive from measured single- and dual-node rounds plus a 64-GPU sweep. Validate throughput and accuracy on your workload before committing a fleet.
 </Note>
+
+
+## Inline MP4 through Messages
+
+SGLang's Messages adapter accepts the following extension in top-level user
+content and forwards it to the served model's normal Chat video processor:
+
+```json
+{
+  "type": "video",
+  "source": {"type": "base64", "media_type": "video/mp4", "data": "<base64 MP4 bytes>"}
+}
+```
+
+This is a SGLang extension, not an Anthropic API content type. It requires a
+video-capable model and processor. K3's underlying Chat video support is tracked
+in [#35325](https://github.com/sgl-project/sglang/pull/35325); the adapter does not
+add that model support itself. Only inline MP4 is accepted; system/assistant
+video, video nested inside tool results, and video token counting are rejected.
+Text, video and tool-result order is preserved in both response modes.
