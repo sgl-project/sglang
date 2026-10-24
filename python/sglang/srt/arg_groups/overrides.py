@@ -1097,7 +1097,10 @@ def _deterministic_attention_backend(view: Any) -> dict:
 
     if view.attention_backend is None:
         # User didn't specify attention backend, fallback based on GPU architecture
-        if get_platform().is_sm100 or get_platform().is_sm120:
+        if get_platform().is_xpu:
+            # fa3 and flashinfer have no XPU kernels.
+            backend = "intel_xpu"
+        elif get_platform().is_sm100 or get_platform().is_sm120:
             # Blackwell and newer architectures
             if _deterministic_is_deepseek_model(view):
                 # fallback to triton for DeepSeek models because flashinfer

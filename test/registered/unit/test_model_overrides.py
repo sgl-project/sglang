@@ -4036,5 +4036,41 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
 
 
+class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
+    """The deterministic fallback must not hand XPU a CUDA-only backend.
+
+    fa3 asserts on the device's SM version, so an XPU server that only asked
+    for --enable-deterministic-inference dies at launch rather than falling
+    back. The explicit-backend case guards the other direction: the platform
+    branch must not override a backend the user named.
+    """
+
+    @staticmethod
+    def _view(attention_backend):
+        return SimpleNamespace(
+            enable_deterministic_inference=True,
+            attention_backend=attention_backend,
+            model_path="Qwen/Qwen3-4B",
+        )
+
+    def test_xpu_fallback_is_an_xpu_backend(self):
+        with patch.object(
+            overrides_module, "get_platform", return_value=SimpleNamespace(is_xpu=True)
+        ):
+            updates = overrides_module._deterministic_attention_backend(
+                self._view(None)
+            )
+        self.assertEqual(updates, {"attention_backend": "intel_xpu"})
+
+    def test_xpu_keeps_explicit_backend(self):
+        with patch.object(
+            overrides_module, "get_platform", return_value=SimpleNamespace(is_xpu=True)
+        ):
+            updates = overrides_module._deterministic_attention_backend(
+                self._view("triton")
+            )
+        self.assertEqual(updates, {})
+
+
 if __name__ == "__main__":
     unittest.main()
