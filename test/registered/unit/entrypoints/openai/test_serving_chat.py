@@ -2107,6 +2107,69 @@ class ServingChatTestCase(CustomTestCase):
                 parser.get_structure_constraint.call_args.kwargs["thinking_mode"]
             )
 
+    def test_parserless_template_thinking_reaches_xgrammar_tag(self):
+        """Without a parser, the template's thinking mode drives xgrammar tags."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        self.tm.server_args.reasoning_parser = None
+        self.tm.server_args.tool_call_parser = "qwen3_coder"
+        self.chat.reasoning_parser = None
+        self.chat.tool_call_parser = "qwen3_coder"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "add",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "integer"},
+                        "b": {"type": "integer"},
+                    },
+                    "required": ["a", "b"],
+                },
+                "strict": True,
+            },
+        }
+        cases = (
+            (None, True),
+            ({"enable_thinking": True}, True),
+            ({"enable_thinking": False}, False),
+        )
+
+        for chat_template_kwargs, expected in cases:
+            with (
+                self.subTest(chat_template_kwargs=chat_template_kwargs),
+                patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+                ) as parser_cls,
+            ):
+                parser = parser_cls.return_value
+                parser.get_structure_constraint.return_value = (
+                    "structural_tag",
+                    "tag",
+                )
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "What is 2+2?"}],
+                    tools=[tool],
+                    tool_choice="required",
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+
+                result = self.chat._process_messages(req, is_multimodal=False)
+
+                parser.get_structure_constraint.assert_called_once()
+                self.assertEqual(
+                    parser.get_structure_constraint.call_args.kwargs["thinking_mode"],
+                    expected,
+                )
+                self.assertFalse(result.require_reasoning)
+
     def test_kimi_k3_constraint_failure_keeps_native_stop_format(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
