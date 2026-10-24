@@ -72,7 +72,12 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        # Bundled legacy MTP is BF16; separately packed MTP must retain its quantizer.
+        if (
+            quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+            and not getattr(quant_config, "quantized_mtp", False)
+        ):
             logger.debug(
                 "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
             )
@@ -90,7 +95,12 @@ class DeepseekModelNextN(nn.Module):
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        if quant_config is not None and quant_config.get_name() == "quark":
+        # A separately packed draft quantizes eh_proj too; its quant method still
+        # honors the checkpoint's ignore list.
+        if quant_config is not None and (
+            quant_config.get_name() == "quark"
+            or getattr(quant_config, "quantized_mtp", False)
+        ):
             self.eh_proj = ReplicatedLinear(
                 2 * config.hidden_size,
                 config.hidden_size,

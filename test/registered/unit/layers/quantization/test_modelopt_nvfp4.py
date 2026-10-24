@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -128,6 +129,89 @@ class TestModelOptNvfp4(CustomTestCase):
                 is_checkpoint_nvfp4_serialized=False,
                 group_size=16,
                 use_per_token_activation=True,
+            )
+
+    def test_checkpoint_activation_metadata_overrides_environment(self):
+        env = (
+            "sglang.srt.layers.quantization.modelopt_quant.envs."
+            "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get"
+        )
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), patch(env, return_value=not enabled):
+                config = ModelOptFp4Config.from_config(
+                    {"quant_algo": "NVFP4", "use_per_token_activation": enabled}
+                )
+                legacy = ModelOptFp4Config.from_config({"quant_algo": "NVFP4"})
+                self.assertEqual(config.use_per_token_activation, enabled)
+                self.assertEqual(legacy.use_per_token_activation, not enabled)
+
+    def test_quantized_mtp_is_explicit_checkpoint_opt_in(self):
+        legacy = ModelOptFp4Config.from_config({"quant_algo": "NVFP4"})
+        packed = ModelOptFp4Config.from_config(
+            {"quant_algo": "NVFP4", "quantized_mtp": True}
+        )
+        self.assertFalse(legacy.quantized_mtp)
+        self.assertTrue(packed.quantized_mtp)
+        self.assertTrue(packed.is_checkpoint_nvfp4_serialized)
+
+    def test_nested_hf_quant_config_metadata_is_read_from_inner_block(self):
+        env = (
+            "sglang.srt.layers.quantization.modelopt_quant.envs."
+            "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get"
+        )
+        with patch(env, return_value=False):
+            config = ModelOptFp4Config.from_config(
+                {
+                    "quantization": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                        "exclude_modules": [],
+                        "quantized_mtp": True,
+                        "use_per_token_activation": True,
+                    }
+                }
+            )
+        self.assertTrue(config.quantized_mtp)
+        self.assertTrue(config.use_per_token_activation)
+
+    def test_per_token_metadata_rejects_cutedsl_deepep(self):
+        runner = SimpleNamespace(is_flashinfer_cutedsl=lambda: True)
+        a2a = SimpleNamespace(is_deepep=lambda: True)
+        with (
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.get_moe_runner_backend",
+                return_value=runner,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.modelopt_quant.get_moe_a2a_backend",
+                return_value=a2a,
+            ),
+            self.assertRaisesRegex(
+                ValueError, "moe_a2a_backend='none' or 'flashinfer'"
+            ),
+        ):
+            ModelOptFp4Config.from_config(
+                {"quant_algo": "NVFP4", "use_per_token_activation": True}
+            )
+
+    def test_checkpoint_metadata_rejects_incompatible_quantization(self):
+        for algo in ("FP8", "W4A16_NVFP4"):
+            with (
+                self.subTest(algo=algo),
+                self.assertRaisesRegex(
+                    ValueError, "Per-token activation metadata requires serialized W4A4"
+                ),
+            ):
+                ModelOptFp4Config.from_config(
+                    {
+                        "quant_algo": algo,
+                        "group_size": 16,
+                        "use_per_token_activation": True,
+                    }
+                )
+        with self.assertRaisesRegex(ValueError, "quantized_mtp requires serialized"):
+            ModelOptFp4Config.from_config(
+                {"quant_algo": "FP8", "group_size": 16, "quantized_mtp": True}
             )
 
     def test_shared_expert_fusion_requires_matching_fp4_precision(self):

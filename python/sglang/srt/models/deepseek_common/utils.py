@@ -130,6 +130,7 @@ def enable_nextn_moe_bf16_cast_to_fp8(
         envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
         and quant_config is not None
         and quant_config.get_name() == "modelopt_fp4"
+        and not getattr(quant_config, "quantized_mtp", False)
         and get_moe_runner_backend().is_deep_gemm()
     )
 
