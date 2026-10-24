@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
+    STAGING_COPY_BUFFERS_ALIGNED_16_KEY,
     STAGING_WATERMARK_WAIT_S,
     DecodeStagingContext,
     PrefillStagingContext,
@@ -531,22 +532,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
 
-    def set_kv_buffer_tensors(
-        self,
-        k_buffers: list,
-        v_buffers: list,
-        page_size: int,
-        slot_layer_ids: Optional[List[int]] = None,
-    ):
-        # slot_layer_ids follows the staging slot order (every k_buffer, then
-        # every v_buffer), which is not kv_args.kv_layer_ids once a draft exists.
-        self.kv_buffer_tensors = {
-            "k_buffers": k_buffers,
-            "v_buffers": v_buffers,
-            "page_size": page_size,
-            "slot_layer_ids": list(slot_layer_ids or []),
-        }
-
     def _register_staging_memory(self, ptr: int, size: int) -> None:
         self.engine.batch_register([ptr], [size])
 
@@ -783,6 +768,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_head_start,
             num_heads_to_send,
             page_size,
+            buffers_aligned_16=self.kv_buffer_tensors.get(
+                STAGING_COPY_BUFFERS_ALIGNED_16_KEY, False
+            ),
         )
 
         if pairs is None:
