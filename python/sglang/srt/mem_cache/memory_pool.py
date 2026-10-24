@@ -5257,6 +5257,16 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_rope_fp4_sf,
             )
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        super().move_kv_cache(tgt_loc, src_loc)
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for kv_scale in self.kv_scale_buffer:
+            kv_scale[tgt_loc_flat] = kv_scale[src_loc_flat]
+
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
