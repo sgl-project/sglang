@@ -5,7 +5,6 @@ import torch
 
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
-    _linear_nvfp4_scales_to_tma,
 )
 from sglang.multimodal_gen.runtime.platforms.cuda import CudaPlatform
 

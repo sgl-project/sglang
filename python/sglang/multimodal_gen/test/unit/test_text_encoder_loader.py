@@ -21,9 +21,6 @@ from sglang.multimodal_gen.runtime.layers.quantization.comfy_nvfp4 import (
     ComfyNvfp4Config,
     ComfyNvfp4LinearMethod,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
-    _swizzled_nvfp4_scales_to_linear,
-)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
 )
@@ -35,6 +32,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    _swizzled_nvfp4_scales_to_linear,
+)
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
