@@ -281,8 +281,30 @@ def _init_cpu_threads_env(
 ) -> None:
     if _is_cpu_amx_available or _is_cpu_arm64:
         parallel = get_parallel()
-        # Bind OpenMP threads to CPU cores
-        torch.ops.sgl_kernel.init_cpu_threads_env(local_omp_cpuid)
+        gpu_id = get_device().gpu_id
+        mem_bind_env = os.environ.get("SGLANG_CPU_MEM_BIND", None)
+        node_mem_bind = -1
+
+        if mem_bind_env:
+            nodes = [n.strip() for n in mem_bind_env.split(",") if n.strip()]
+            if len(nodes) == 1:
+                # Single node given (e.g. "8"): all ranks bind to node 8
+                node_mem_bind = int(nodes[0])
+            elif gpu_id < len(nodes):
+                # Multiple nodes given (e.g. "8,9"): rank 0 gets 8, rank 1 gets 9
+                node_mem_bind = int(nodes[gpu_id])
+            else:
+                logger.warning(
+                    "SGLANG_CPU_MEM_BIND has %d nodes, but gpu_id is %d. Using fallback.",
+                    len(nodes),
+                    gpu_id,
+                )
+
+        # Bind OpenMP threads to CPU cores and bind memory to the target NUMA node
+        if node_mem_bind < 0:
+            torch.ops.sgl_kernel.init_cpu_threads_env(local_omp_cpuid)
+        else:
+            torch.ops.sgl_kernel.init_cpu_threads_env(local_omp_cpuid, node_mem_bind)
 
         # Set local size to hint SGLang to use shared memory based AllReduce
         os.environ["LOCAL_SIZE"] = str(parallel.tp_size)
