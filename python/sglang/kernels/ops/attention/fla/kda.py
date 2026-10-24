@@ -1163,6 +1163,7 @@ def chunk_kda_fwd(
     beta_is_raw: bool = False,
     chunk_indices: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
+    fuse_intra: Optional[bool] = None,
 ):
     chunk_size = 64
     # Pre-compute chunk indices once and thread through all downstream kernels.
@@ -1217,6 +1218,12 @@ def chunk_kda_fwd(
     _H_pr = q.shape[-2]
     _B = q.shape[0]
     _small_grid = _B * _NT_pr * _H_pr <= 256
+    # A caller that splits one extend into several calls passes the decision
+    # made for the whole extend, so every token runs the same variant as in a
+    # single call (the variants differ beyond rounding for large gate decays
+    # without lower_bound: the fused diagonal clamps per-token gate offsets).
+    if fuse_intra is not None:
+        _small_grid = fuse_intra
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,
@@ -1291,6 +1298,7 @@ def chunk_kda(
     beta_is_raw: bool = False,
     chunk_indices: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
+    fuse_intra: Optional[bool] = None,
     **kwargs,
 ):
     if scale is None:
@@ -1320,4 +1328,5 @@ def chunk_kda(
         beta_is_raw=beta_is_raw,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
+        fuse_intra=fuse_intra,
     )
