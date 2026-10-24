@@ -6,8 +6,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.registry import (
     _RADIX_CACHE_REGISTRY,
@@ -16,6 +18,7 @@ from sglang.srt.mem_cache.registry import (
     create_unified_radix_cache,
     default_radix_cache_factory,
     get_radix_cache_factory,
+    prepare_radix_cache_worker,
     register_radix_cache_backend,
     registered_radix_cache_backends,
 )
@@ -109,10 +112,130 @@ class TestRegisterRadixCacheBackend(_RegistryIsolationMixin, CustomTestCase):
         with self.assertRaises(ValueError):
             register_radix_cache_backend("   ", MagicMock())
 
-    def test_duplicate_registration_raises(self):
-        register_radix_cache_backend("dupe", MagicMock())
+    def test_duplicate_registration_preserves_factory_and_preparer(self):
+        factory, preparer = MagicMock(), MagicMock()
+        register_radix_cache_backend("dupe", factory, prepare_worker=preparer)
         with self.assertRaises(ValueError):
-            register_radix_cache_backend("dupe", MagicMock())
+            register_radix_cache_backend(
+                "dupe", MagicMock(), prepare_worker=MagicMock()
+            )
+        self.assertIs(get_radix_cache_factory("dupe"), factory)
+        _publish(self, radix_cache_backend="dupe")
+        worker = object()
+        prepare_radix_cache_worker(worker, True)
+        preparer.assert_called_once_with(worker, True)
+
+    def test_registration_does_not_read_configuration_or_prepare_worker(self):
+        factory, preparer = MagicMock(), MagicMock()
+        with patch(
+            "sglang.srt.mem_cache.registry.get_memory",
+            side_effect=AssertionError("configuration is not published yet"),
+        ):
+            register_radix_cache_backend(
+                "early_plugin", factory, prepare_worker=preparer
+            )
+        self.assertIs(get_radix_cache_factory("early_plugin"), factory)
+        factory.assert_not_called()
+        preparer.assert_not_called()
+
+    def test_invalid_preparer_does_not_reserve_backend_name(self):
+        with self.assertRaisesRegex(TypeError, "prepare_worker must be callable"):
+            register_radix_cache_backend(
+                "invalid", MagicMock(), prepare_worker=object()
+            )
+        self.assertIsNone(get_radix_cache_factory("invalid"))
+        self.assertNotIn("invalid", registered_radix_cache_backends())
+        factory, preparer = MagicMock(), MagicMock()
+        register_radix_cache_backend("invalid", factory, prepare_worker=preparer)
+        self.assertIs(get_radix_cache_factory("invalid"), factory)
+        _publish(self, radix_cache_backend="invalid")
+        worker = object()
+        prepare_radix_cache_worker(worker, False)
+        preparer.assert_called_once_with(worker, False)
+
+
+class TestPrepareRadixCacheWorker(_RegistryIsolationMixin, CustomTestCase):
+    def test_uses_only_published_backend_before_cache_construction(self):
+        selected, other = MagicMock(), MagicMock()
+        factory = MagicMock()
+        register_radix_cache_backend("selected", factory, prepare_worker=selected)
+        register_radix_cache_backend("other", MagicMock(), prepare_worker=other)
+        _publish(self, radix_cache_backend="selected")
+        worker = SimpleNamespace(
+            server_args=SimpleNamespace(radix_cache_backend="other")
+        )
+
+        prepare_radix_cache_worker(worker, False)
+
+        selected.assert_called_once_with(worker, False)
+        other.assert_not_called()
+        factory.assert_not_called()
+
+    def test_default_and_factory_only_backends_need_no_preparation(self):
+        unused = MagicMock()
+        register_radix_cache_backend("unused", MagicMock(), prepare_worker=unused)
+        factory = MagicMock()
+        register_radix_cache_backend("factory_only", factory)
+        for name in (None, "factory_only"):
+            with self.subTest(backend=name):
+                _publish(self, radix_cache_backend=name)
+                prepare_radix_cache_worker(object(), True)
+        unused.assert_not_called()
+        factory.assert_not_called()
+
+    def test_prepares_once_before_all_runners_on_every_worker_call(self):
+        events = []
+        register_radix_cache_backend(
+            "ordered",
+            MagicMock(),
+            prepare_worker=lambda worker, capture: events.append((worker, capture)),
+        )
+        _publish(self, radix_cache_backend="ordered")
+        for worker_number in range(2):
+            runners = [MagicMock(), MagicMock()]
+            worker = SimpleNamespace(model_runner=runners[0], model_runner_list=runners)
+            for index, runner in enumerate(runners):
+                runner.init_cuda_graphs.side_effect = (
+                    lambda *, capture_decode_cuda_graph, index=index: events.append(
+                        (worker_number, index, capture_decode_cuda_graph)
+                    )
+                )
+            for capture in (True, False, True):
+                with self.subTest(worker=worker_number, capture=capture):
+                    events.clear()
+                    TpModelWorker.init_cuda_graphs(
+                        worker, capture_decode_cuda_graph=capture
+                    )
+                    self.assertEqual(
+                        events,
+                        [
+                            (worker, capture),
+                            (worker_number, 0, capture),
+                            (worker_number, 1, capture),
+                        ],
+                    )
+
+    def test_unknown_backend_and_callback_failure_prevent_all_runner_calls(self):
+        failure = RuntimeError("backend preparation failed")
+        register_radix_cache_backend(
+            "failing", MagicMock(), prepare_worker=MagicMock(side_effect=failure)
+        )
+        for name, error in (("unknown", ValueError), ("failing", RuntimeError)):
+            for capture in (True, False):
+                with self.subTest(backend=name, capture=capture):
+                    _publish(self, radix_cache_backend=name)
+                    runners = [MagicMock(), MagicMock()]
+                    worker = SimpleNamespace(
+                        model_runner=runners[0], model_runner_list=runners
+                    )
+                    with self.assertRaises(error) as caught:
+                        TpModelWorker.init_cuda_graphs(
+                            worker, capture_decode_cuda_graph=capture
+                        )
+                    if name == "failing":
+                        self.assertIs(caught.exception, failure)
+                    for runner in runners:
+                        runner.init_cuda_graphs.assert_not_called()
 
 
 class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
