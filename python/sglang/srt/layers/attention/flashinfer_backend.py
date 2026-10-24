@@ -520,12 +520,25 @@ class FlashInferAttnBackend(AttentionBackend):
                 and not check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
             ):
                 fmha_backend = "cutlass"
-        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=fmha_backend
-        )
+        # Sliding and full layers can require different kernels and window
+        # specializations. Keep their ragged plans separate, as for paged KV.
+        self.prefill_wrappers_ragged = [
+            BatchPrefillWithRaggedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                # CUTLASS ragged attention does not apply a sliding mask.
+                backend=(
+                    "auto"
+                    if self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+                    and wrapper_id == 0
+                    else fmha_backend
+                ),
+            )
+            for wrapper_id in range(self.num_wrappers)
+        ]
+        self.prefill_wrapper_ragged = self.prefill_wrappers_ragged[0]
 
-        # Two wrappers: one for sliding window attention and one for full attention.
-        # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
+        # Sliding/full or decoder/cross-attention layers use separate plans.
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
@@ -1363,9 +1376,9 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
-            self._get_wrapper_idx(layer)
-        ]
+        wrapper_idx = self._get_wrapper_idx(layer)
+        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[wrapper_idx]
+        prefill_wrapper_ragged = self.prefill_wrappers_ragged[wrapper_idx]
 
         logits_soft_cap = layer.logit_cap
 
@@ -1461,12 +1474,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = self.prefill_wrapper_ragged.forward(
+                o = prefill_wrapper_ragged.forward(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
+                    window_left=layer.sliding_window_size,
                     logits_soft_cap=logits_soft_cap,
                 )
 
@@ -1479,7 +1493,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                     else -1
                 )
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                o1, s1 = prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
@@ -1901,6 +1915,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self._swa_kv_pool = attn_backend._swa_kv_pool
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
+        self.prefill_wrappers_ragged = attn_backend.prefill_wrappers_ragged
 
         # Dispatch the update function
         if self.attn_backend.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
@@ -2074,7 +2089,7 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
             self.call_begin_forward(
-                self.prefill_wrapper_ragged,
+                self.prefill_wrappers_ragged[wrapper_id],
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -2090,11 +2105,11 @@ class FlashInferIndicesUpdaterPrefill:
                 fixed_split_size=fixed_split_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=swa_paged_custom_mask,
-                # paged-only SWA path only; ragged keeps its custom prefix
-                # mask, spec-verify keeps its tree mask
+                # Both ragged and paged modules specialize sliding-window
+                # support at plan time. Spec-verify keeps its tree mask.
                 window_left=(
                     sliding_window_size
-                    if (wrapper_id == 0 and not use_ragged and spec_info is None)
+                    if (wrapper_id == 0 and spec_info is None)
                     else -1
                 ),
                 plan=plan,
@@ -2177,7 +2192,7 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens_sum = paged_kernel_lens.sum().item()
 
             self.call_begin_forward(
-                self.prefill_wrapper_ragged,
+                self.prefill_wrappers_ragged[wrapper_id],
                 prefill_wrappers[wrapper_id],
                 req_pool_indices,
                 paged_kernel_lens,
@@ -2301,6 +2316,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.num_kv_heads,
                 self.head_dim,
                 q_data_type=self.q_data_type,
+                window_left=window_left,
             )
 
         if use_sliding_window_kv_pool and not use_swa_source:
@@ -2388,8 +2404,9 @@ class FlashInferIndicesUpdaterPrefill:
             if eagle_verify:
                 paged_plan_kwargs["uniform_verify_width"] = num_tokens_per_req
 
-        if window_left >= 0:
+        if window_left >= 0 and not use_ragged:
             # selects the module with the per-element window mask compiled in
+            # Ragged prefill's cached prefix uses its explicit custom mask.
             paged_plan_kwargs["window_left"] = window_left
 
         wrapper_paged.begin_forward(
