@@ -273,7 +273,7 @@ def test_comfy_marker_conflicting_values_rejected(tmp_path):
 @pytest.mark.parametrize("missing", [False, True])
 @pytest.mark.parametrize("competing_index", [False, True])
 def test_native_encoder_restoration_checks_checkpoint_before_fallback(
-    tmp_path, missing, competing_index
+    tmp_path, missing, competing_index, single_process_model_parallel
 ):
     config = transformers.T5Config(
         vocab_size=32,
