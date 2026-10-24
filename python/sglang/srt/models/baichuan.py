@@ -190,7 +190,7 @@ class BaiChuanAttention(nn.Module):
             alibi_slopes = alibi_slopes[head_start:head_end]
             self.alibi_slopes = torch.tensor(
                 alibi_slopes,
-                dtype=dtype,
+                dtype=torch.float32 if _is_xpu else dtype,
                 device="npu" if _is_npu else "xpu" if _is_xpu else "cuda",
             )
         else:
@@ -202,7 +202,7 @@ class BaiChuanAttention(nn.Module):
             )
 
         self.attn_kwargs = {}
-        if self.position_embedding == "ALIBI" and _is_npu:
+        if self.position_embedding == "ALIBI" and (_is_npu or _is_xpu):
             self.attn_kwargs["slopes"] = self.alibi_slopes
 
     def forward(
