@@ -103,6 +103,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
+        scheduler.dllm_config = None
         scheduler.server_args = MagicMock()
         scheduler.waiting_queue = []
         # pause_generation zeros gen_throughput and flushes KV events.
@@ -378,6 +379,57 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertFalse(scheduler.running_batch.batch_is_full)
         self.assertIsNone(scheduler.chunked_req)
         self.assertIsNone(scheduler.last_batch)
+
+    def test_retract_takes_dllm_requests_out_of_the_dllm_manager(self):
+        """dLLM requests wait in the dLLM manager between blocks. Retract must
+        take each out once, releasing the KV holders and resetting the rest."""
+        from sglang.srt.dllm.config import DllmConfig
+        from sglang.srt.dllm.mixin.req import DllmReqPhase
+        from sglang.srt.dllm.mixin.scheduler import DllmManager
+
+        scheduler = self._new_scheduler()
+        config = DllmConfig("LowConfidence", {}, 4, 99, 4)
+        scheduler.dllm_config = config
+        scheduler.dllm_manager = DllmManager(config)
+
+        def _req(rid, holds_kv):
+            return SimpleNamespace(
+                rid=rid,
+                finished=lambda: False,
+                is_retracted=True,
+                kv=SimpleNamespace(holds_kv=holds_kv),
+            )
+
+        last, between_blocks = _req("last", True), _req("between", True)
+        idle = Req(
+            rid="idle",
+            origin_input_text="",
+            origin_input_ids=array("q", range(8)),
+            sampling_params=SamplingParams(),
+            dllm_config=config,
+        )
+        idle.dllm_phase = DllmReqPhase.STAGING_DECODE
+        idle.dllm_incomplete_ids = array("q", range(4))
+        scheduler.last_batch = SimpleNamespace(
+            reqs=[last], forward_mode=ForwardMode.DLLM_EXTEND
+        )
+        scheduler.dllm_manager.waiting_queue = [last, between_blocks, idle]
+        scheduler.dllm_manager.staging_queue = [last]
+        requeue_log = self._spy_requeue(scheduler)
+
+        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        self.assertEqual(
+            mock_retract_all.call_args.kwargs["reqs"], [last, between_blocks]
+        )
+        self.assertEqual(
+            [entry["req"] for entry in requeue_log], [last, between_blocks, idle]
+        )
+        self.assertEqual(scheduler.dllm_manager.waiting_queue, [])
+        self.assertEqual(scheduler.dllm_manager.staging_queue, [])
+        self.assertEqual(idle.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
+        self.assertEqual(len(idle.dllm_incomplete_ids), 0)
 
     def test_retract_after_dp_conversion_releases_each_req_once(self):
         """retract after DP attention converted the running batch to extend

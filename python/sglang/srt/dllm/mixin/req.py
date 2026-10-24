@@ -34,6 +34,19 @@ class ReqDllmMixin:
             else:
                 self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
 
+    def reset_dllm_for_retract(self: Req):
+        # Retraction frees the KV, so the request rejoins as an incoming
+        # request and drops any unresolved FDFO block.
+        self.dllm_incomplete_ids = array("q")
+        self.dllm_algo_state = None
+        committed_len = len(self.origin_input_ids) + len(self.output_ids)
+        self.dllm_phase = (
+            DllmReqPhase.INCOMING_PREFILL
+            if self.dllm_config.requires_separate_context_encoding
+            or committed_len >= self.dllm_config.block_size
+            else DllmReqPhase.INCOMING_DECODE
+        )
+
     def is_dllm(self: Req) -> bool:
         return self.dllm_config is not None
 
