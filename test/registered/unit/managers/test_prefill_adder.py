@@ -74,6 +74,7 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.full_evictable_size.return_value = full_evictable_size
         tree_cache.swa_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
+        tree_cache.supports_mamba.return_value = False
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
@@ -469,6 +470,59 @@ class TestPrefillAdder(CustomTestCase):
                     (adder.memory_budget.total_offset, adder.memory_budget.swa_offset),
                     before,
                 )
+
+    def test_hybrid_mamba_continuation_ends_on_full_kv_page(self):
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_token_allocator.available_size.return_value = 10000
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=16, rem_chunk_tokens=123
+        )
+        req = self.create_mock_req("continuation", priority=0, max_new_tokens=0)
+        req.prefix_len = 128
+        req.full_untruncated_fill_ids = list(range(307))
+
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertEqual(req.extend_end, 240)
+
+    def test_hybrid_mamba_ignore_eos_prime_ends_on_full_kv_page(self):
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_token_allocator.available_size.return_value = 10000
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=16, rem_chunk_tokens=123
+        )
+        req = self.create_mock_req("prime", priority=0, max_new_tokens=0)
+        req.sampling_params.ignore_eos = True
+        req.origin_input_ids = list(range(307))
+        req.full_untruncated_fill_ids = list(range(307))
+
+        adder.add_one_req_ignore_eos(req)
+        self.assertEqual(req.extend_end, 112)
+
+    def test_hybrid_mamba_continuation_defers_without_full_page(self):
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_token_allocator.available_size.return_value = 10000
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=16, rem_chunk_tokens=15
+        )
+        req = self.create_mock_req("continuation", priority=0, max_new_tokens=0)
+        req.full_untruncated_fill_ids = list(range(307))
+
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertIsNone(req.extend_end)
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_hybrid_mamba_continuation_keeps_untruncated_tail(self):
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_token_allocator.available_size.return_value = 10000
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=16, rem_chunk_tokens=123
+        )
+        req = self.create_mock_req("tail", priority=0, max_new_tokens=0)
+        req.prefix_len = 128
+        req.full_untruncated_fill_ids = list(range(143))
+
+        self.assertIsNone(adder.add_chunked_req(req))
+        self.assertEqual(req.extend_end, 143)
 
     def test_shared_continuation_uses_memory_chunk_limit(self):
         adder = self.create_shared_adder()
