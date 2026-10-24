@@ -1172,10 +1172,13 @@ class UnifiedRadixCache(BasePrefixCache):
             req.kv.req_pool_idx, : len(token_ids)
         ]
 
+        # Only the finishing insert counts hits, once per node on the path; a
+        # checkpoint (e.g. a prefill chunk) counts none, so write-through and
+        # external-linker offload fire once per request rather than per chunk.
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
-            inserted_len=req.kv.cache_inserted_len,
+            inserted_len=0 if is_finished else len(token_ids),
             priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
