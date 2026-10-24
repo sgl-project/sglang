@@ -1884,6 +1884,60 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             (self._publish(sa), self._leaf("attention_backend"))[1], "flashinfer"
         )
 
+    def test_llada2_checkpoint_block_size_reaches_page_size_resolution(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+
+        from sglang.srt.dllm.config import DllmConfig
+
+        tokenizer_dir = self.enterContext(tempfile.TemporaryDirectory())
+        Tokenizer(WordLevel({"[UNK]": 0, "<mask>": 1}, unk_token="[UNK]")).save(
+            os.path.join(tokenizer_dir, "tokenizer.json")
+        )
+        with open(os.path.join(tokenizer_dir, "tokenizer_config.json"), "w") as f:
+            json.dump(
+                {"mask_token": "<mask>", "tokenizer_class": "PreTrainedTokenizerFast"},
+                f,
+            )
+        for page_size in (None, 128):
+            with self.subTest(page_size=page_size):
+                sa = self._construct(
+                    "LLaDA2MoeModelLM",
+                    "llama",
+                    config_extra={"block_size": 64, "expert_capacity": 48},
+                    dllm_algorithm="LowConfidence",
+                    page_size=page_size,
+                    tokenizer_path=tokenizer_dir,
+                    skip_tokenizer_init=True,
+                )
+                self.assertEqual(self._resolved(sa, "page_size"), 64)
+                self.assertEqual((self._publish(sa), self._leaf("page_size"))[1], 64)
+                self.assertEqual(DllmConfig.from_server_args(sa).mask_id, 1)
+
+    def test_llada2_model_override_is_used_before_dllm_resolution(self):
+        from sglang.srt.dllm.config import DllmConfig
+
+        for yaml_size in (None, 64, 32):
+            with self.subTest(yaml_size=yaml_size):
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f:
+                    if yaml_size is not None:
+                        f.write(f"block_size: {yaml_size}\n")
+                        f.flush()
+                    kwargs = dict(
+                        config_extra={"block_size": 32, "expert_capacity": 48},
+                        dllm_algorithm="LowConfidence",
+                        json_model_override_args='{"block_size": 64}',
+                        dllm_algorithm_config=f.name if yaml_size is not None else None,
+                    )
+                    if yaml_size == 32:
+                        with self.assertRaisesRegex(
+                            ValueError, r"checkpoint block_size \(64\), got 32"
+                        ):
+                            self._construct("LLaDA2MoeModelLM", "llama", **kwargs)
+                    else:
+                        sa = self._construct("LLaDA2MoeModelLM", "llama", **kwargs)
+                        self.assertEqual(DllmConfig.from_server_args(sa).block_size, 64)
+
     def test_attention_backend_leaf_materializes_end_state(self):
         # The default-fill pass declares the platform-selected backend; the
         # leaf must equal the last declared value while the server_args field
