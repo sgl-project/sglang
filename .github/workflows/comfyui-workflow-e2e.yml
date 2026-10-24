@@ -1,0 +1,136 @@
+# DRAFT: not yet run on a GPU runner. The runner script and the CPU-side
+# helpers are tested; this job, the model layout and the thresholds are not.
+#
+# Runs every shipped ComfyUI_SGLDiffusion workflow headless in ComfyUI and
+# compares the output with the same graph run on native ComfyUI nodes.
+# Manual only: it needs a GPU and large model weights that are not in CI.
+name: ComfyUI Workflow E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref of sglang to checkout'
+        required: false
+        default: ''
+        type: string
+      comfyui_ref:
+        description: 'ComfyUI git ref to test against (tag or commit)'
+        required: false
+        default: 'master'
+        type: string
+      models_dir:
+        description: 'ComfyUI models directory on the runner (diffusion_models/, text_encoders/, vae/, loras/ inside)'
+        required: true
+        type: string
+      only:
+        description: 'Space-separated workflow file names to run (empty = all)'
+        required: false
+        default: ''
+        type: string
+      model_map_json:
+        description: 'Optional JSON {shipped filename: replacement filename}'
+        required: false
+        default: ''
+        type: string
+      min_psnr:
+        description: 'Minimum PSNR (dB) of SGLD output vs native'
+        required: false
+        default: '25'
+        type: string
+
+concurrency:
+  group: comfyui-workflow-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SGLANG_IS_IN_CI: true
+
+jobs:
+  comfyui-workflow-static-check:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Checkout ComfyUI
+        env:
+          COMFYUI_REF: ${{ inputs.comfyui_ref }}
+        run: |
+          git clone https://github.com/comfyanonymous/ComfyUI.git "$RUNNER_TEMP/ComfyUI"
+          git -C "$RUNNER_TEMP/ComfyUI" checkout "$COMFYUI_REF"
+
+      - name: Install dependencies
+        run: |
+          pip install -r "$RUNNER_TEMP/ComfyUI/requirements.txt" pytest numpy pillow
+          pip install -e "python[diffusion]"
+
+      - name: Static check and CPU tests
+        env:
+          COMFYUI_DIR: ${{ runner.temp }}/ComfyUI
+        run: |
+          cd python
+          python sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion/ci/workflow_check.py --comfyui-dir "$COMFYUI_DIR"
+          python -m pytest -q sglang/multimodal_gen/test/unit/test_comfyui_workflow_ci.py
+
+  comfyui-workflow-e2e-1-gpu:
+    needs: comfyui-workflow-static-check
+    runs-on: 1-gpu-h100
+    timeout-minutes: 240
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Checkout ComfyUI
+        env:
+          COMFYUI_REF: ${{ inputs.comfyui_ref }}
+        run: |
+          git clone https://github.com/comfyanonymous/ComfyUI.git "$RUNNER_TEMP/ComfyUI"
+          git -C "$RUNNER_TEMP/ComfyUI" checkout "$COMFYUI_REF"
+          pip install -r "$RUNNER_TEMP/ComfyUI/requirements.txt"
+
+      - name: Run workflows
+        env:
+          COMFYUI_DIR: ${{ runner.temp }}/ComfyUI
+          MODEL_MAP_JSON: ${{ inputs.model_map_json }}
+          ONLY: ${{ inputs.only }}
+          MODELS_DIR: ${{ inputs.models_dir }}
+          MIN_PSNR: ${{ inputs.min_psnr }}
+        run: |
+          cd python
+          ARGS=""
+          if [ -n "$MODEL_MAP_JSON" ]; then
+            echo "$MODEL_MAP_JSON" > "$RUNNER_TEMP/model_map.json"
+            ARGS="--model-map $RUNNER_TEMP/model_map.json"
+          fi
+          if [ -n "$ONLY" ]; then
+            ARGS="$ARGS --only $ONLY"
+          fi
+          python sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion/ci/run_workflows.py \
+            --comfyui-dir "$COMFYUI_DIR" \
+            --models-dir "$MODELS_DIR" \
+            --min-psnr "$MIN_PSNR" \
+            --out-dir "$RUNNER_TEMP/workflow_ci_out" \
+            $ARGS
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: comfyui-workflow-e2e
+          path: ${{ runner.temp }}/workflow_ci_out
+          retention-days: 7
