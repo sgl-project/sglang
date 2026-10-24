@@ -522,6 +522,37 @@ class TestHiCacheHostRegister(unittest.TestCase):
         # CUDA and ROCm ("cuda") keep the cudaHostRegister default.
         self.assertIs(ALLOC_MEMORY_FUNCS.default_factory(), alloc_with_host_register)
 
+    def test_registration_failure_consumes_pending_error_before_rollback(self):
+        # The failed call leaves the error pending for the next unrelated CUDA
+        # call, so the failure path must consume it.
+        gib = 1024**3
+        mib = 1024**2
+        buffer = _FakeBuffer(0x10000000, 2 * gib + 17)
+        cudart = _FakeCudart(fail_on_registration=2)
+        order = []
+
+        with (
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB, "get", return_value=1
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+            mock.patch.object(
+                host_common,
+                "consume_pending_cuda_error",
+                side_effect=lambda: order.append("consume"),
+            ),
+            mock.patch.object(
+                host_common,
+                "_cuda_host_unregister_ranges",
+                side_effect=lambda *args, **kwargs: order.append("rollback") or [],
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                _cuda_host_register(buffer, registration_granularity_bytes=300 * mib)
+
+        self.assertEqual(len(cudart.registrations), 2)
+        self.assertEqual(order, ["consume", "rollback"])
+
 
 if __name__ == "__main__":
     unittest.main()
