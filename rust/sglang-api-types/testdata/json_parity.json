@@ -594,6 +594,29 @@
         }
       },
       "canonical": "{\"server_args\":{\"pp_max_micro_batch_size\":4,\"speculative_accept_threshold_single\":0.75}}"
+    },
+    {
+      "type": "StartProfileRequest",
+      "name": "optional lists and flags keep Python's absent-versus-set distinction",
+      "input": {
+        "output_dir": "/tmp/prof",
+        "num_steps": 5,
+        "activities": ["CPU", "GPU"],
+        "with_stack": false
+      },
+      "canonical": "{\"output_dir\":\"/tmp/prof\",\"num_steps\":5,\"activities\":[\"CPU\",\"GPU\"],\"profile_by_stage\":false,\"with_stack\":false,\"merge_profiles\":false,\"detailed_annotations\":false}"
+    },
+    {
+      "type": "SlowDownRequest",
+      "name": "an explicit null sleep time clears the delay",
+      "input": {"forward_sleep_time": null},
+      "canonical": "{}"
+    },
+    {
+      "type": "ReleaseMemoryOccupationRequest",
+      "name": "tags are a bare string list",
+      "input": {"tags": ["weights"]},
+      "canonical": "{\"tags\":[\"weights\"]}"
     }
   ]
 }

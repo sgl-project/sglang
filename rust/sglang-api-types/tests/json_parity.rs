@@ -68,6 +68,11 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "SetInternalStateRequest" => {
                 check::<api::SetInternalStateRequest>(&name, input, canonical)
             }
+            "StartProfileRequest" => check::<api::StartProfileRequest>(&name, input, canonical),
+            "SlowDownRequest" => check::<api::SlowDownRequest>(&name, input, canonical),
+            "ReleaseMemoryOccupationRequest" => {
+                check::<api::ReleaseMemoryOccupationRequest>(&name, input, canonical)
+            }
             other => panic!("fixture type {other} has no Rust mapping; add it here"),
         }
     }

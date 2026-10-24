@@ -108,6 +108,46 @@ control_messages! {
         server_args: serde_json::Map<String, serde_json::Value>,
     }
 
+    /// `/start_profile` and `/stop_profile`'s control request, Python's
+    /// `ProfileReq`. `req_type` is the `ProfileReqType` enum's value on the
+    /// wire: 1 starts, 2 stops.
+    ProfileReq {
+        req_type: u8,
+        output_dir: Option<String>,
+        start_step: Option<i64>,
+        num_steps: Option<i64>,
+        activities: Option<Vec<String>>,
+        profile_by_stage: bool,
+        with_stack: Option<bool>,
+        record_shapes: Option<bool>,
+        profile_id: Option<String>,
+        merge_profiles: bool,
+        profile_prefix: Option<String>,
+        profile_stages: Option<Vec<String>>,
+        detailed_annotations: bool,
+    }
+
+    /// The expert-distribution recorder; `action` is `ExpertDistributionReqType`'s
+    /// value: 1 start, 2 stop, 3 dump.
+    ExpertDistributionReq {
+        action: u8,
+    }
+
+    /// `/slow_down`: Python's `SlowDownReqInput`.
+    SlowDownReqInput {
+        forward_sleep_time: Option<f64>,
+    }
+
+    /// `/release_memory_occupation`: Python's `ReleaseMemoryOccupationReqInput`.
+    ReleaseMemoryOccupationReqInput {
+        tags: Option<Vec<String>>,
+    }
+
+    /// `/resume_memory_occupation`: Python's `ResumeMemoryOccupationReqInput`.
+    ResumeMemoryOccupationReqInput {
+        tags: Option<Vec<String>>,
+    }
+
     /// Clear the HiCache storage backend.
     ClearHiCacheReqInput {}
 
@@ -186,6 +226,106 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
 impl SetInternalStateReq {
     pub fn new(rid: String, server_args: serde_json::Map<String, serde_json::Value>) -> Self {
         Self { rid, server_args }
+    }
+}
+
+/// `ExpertDistributionReqType` on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertDistributionAction {
+    Start = 1,
+    Stop = 2,
+    Dump = 3,
+}
+
+impl ExpertDistributionReq {
+    pub fn new(rid: String, action: ExpertDistributionAction) -> Self {
+        Self {
+            rid,
+            action: action as u8,
+        }
+    }
+}
+
+impl SlowDownReqInput {
+    pub fn new(rid: String, forward_sleep_time: Option<f64>) -> Self {
+        Self {
+            rid,
+            forward_sleep_time,
+        }
+    }
+}
+
+impl ReleaseMemoryOccupationReqInput {
+    pub fn new(rid: String, tags: Option<Vec<String>>) -> Self {
+        Self { rid, tags }
+    }
+}
+
+impl ResumeMemoryOccupationReqInput {
+    pub fn new(rid: String, tags: Option<Vec<String>>) -> Self {
+        Self { rid, tags }
+    }
+}
+
+/// `ProfileReqType.START_PROFILE` / `STOP_PROFILE` on the wire.
+pub const PROFILE_REQ_START: u8 = 1;
+pub const PROFILE_REQ_STOP: u8 = 2;
+
+/// The `/start_profile` fields a client may set, before the frontend fills
+/// its defaults; the owned form of `api::StartProfileRequest`.
+#[derive(Debug, Clone, Default)]
+pub struct ProfileOptions {
+    pub output_dir: Option<String>,
+    pub start_step: Option<i64>,
+    pub num_steps: Option<i64>,
+    pub activities: Option<Vec<String>>,
+    pub profile_by_stage: bool,
+    pub with_stack: Option<bool>,
+    pub record_shapes: Option<bool>,
+    pub profile_id: Option<String>,
+    pub merge_profiles: bool,
+    pub profile_prefix: Option<String>,
+    pub profile_stages: Option<Vec<String>>,
+    pub detailed_annotations: bool,
+}
+
+impl ProfileReq {
+    pub fn start(rid: String, options: ProfileOptions) -> Self {
+        Self {
+            rid,
+            req_type: PROFILE_REQ_START,
+            output_dir: options.output_dir,
+            start_step: options.start_step,
+            num_steps: options.num_steps,
+            activities: options.activities,
+            profile_by_stage: options.profile_by_stage,
+            with_stack: options.with_stack,
+            record_shapes: options.record_shapes,
+            profile_id: options.profile_id,
+            merge_profiles: options.merge_profiles,
+            profile_prefix: options.profile_prefix,
+            profile_stages: options.profile_stages,
+            detailed_annotations: options.detailed_annotations,
+        }
+    }
+
+    pub fn stop(rid: String) -> Self {
+        Self {
+            rid,
+            req_type: PROFILE_REQ_STOP,
+            output_dir: None,
+            start_step: None,
+            num_steps: None,
+            activities: None,
+            profile_by_stage: false,
+            with_stack: None,
+            record_shapes: None,
+            profile_id: None,
+            merge_profiles: false,
+            profile_prefix: None,
+            profile_stages: None,
+            detailed_annotations: false,
+        }
     }
 }
 

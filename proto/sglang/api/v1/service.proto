@@ -53,6 +53,22 @@ service SglangService {
   // `/set_internal_state`: override numeric scheduler knobs on every DP rank;
   // one `updated` flag per rank.
   rpc SetInternalState(SetInternalStateRequest) returns (SetInternalStateResponse);
+
+  // `/start_profile` and `/stop_profile`: a profiler capture on every DP rank.
+  rpc StartProfile(StartProfileRequest) returns (ProfileResponse);
+  rpc StopProfile(StopProfileRequest) returns (ProfileResponse);
+
+  // `/{start,stop,dump}_expert_distribution_record`.
+  rpc StartExpertDistributionRecord(ExpertDistributionRecordRequest) returns (ExpertDistributionRecordResponse);
+  rpc StopExpertDistributionRecord(ExpertDistributionRecordRequest) returns (ExpertDistributionRecordResponse);
+  rpc DumpExpertDistributionRecord(ExpertDistributionRecordRequest) returns (ExpertDistributionRecordResponse);
+
+  // `/slow_down`: a per-forward sleep on every DP rank, for testing.
+  rpc SlowDown(SlowDownRequest) returns (SlowDownResponse);
+
+  // `/release_memory_occupation`, `/resume_memory_occupation`.
+  rpc ReleaseMemoryOccupation(ReleaseMemoryOccupationRequest) returns (MemoryOccupationResponse);
+  rpc ResumeMemoryOccupation(ResumeMemoryOccupationRequest) returns (MemoryOccupationResponse);
 }
 
 message ListModelsRequest {}

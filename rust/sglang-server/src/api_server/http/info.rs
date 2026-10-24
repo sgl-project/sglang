@@ -26,7 +26,9 @@ use std::sync::Arc;
 use super::app::AppState;
 use super::native_api::native_error;
 use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
+use crate::api_server::handlers::ProfileOutcome;
 use crate::message::info::ServerInfo;
+use crate::message::io_struct::{ExpertDistributionAction, ProfileOptions};
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -43,6 +45,29 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route(
             "/set_internal_state",
             post(set_internal_state).put(set_internal_state),
+        )
+        .route("/start_profile", get(start_profile).post(start_profile))
+        .route("/stop_profile", get(stop_profile).post(stop_profile))
+        .route(
+            "/start_expert_distribution_record",
+            get(start_expert_distribution_record).post(start_expert_distribution_record),
+        )
+        .route(
+            "/stop_expert_distribution_record",
+            get(stop_expert_distribution_record).post(stop_expert_distribution_record),
+        )
+        .route(
+            "/dump_expert_distribution_record",
+            get(dump_expert_distribution_record).post(dump_expert_distribution_record),
+        )
+        .route("/slow_down", get(slow_down).post(slow_down))
+        .route(
+            "/release_memory_occupation",
+            get(release_memory_occupation).post(release_memory_occupation),
+        )
+        .route(
+            "/resume_memory_occupation",
+            get(resume_memory_occupation).post(resume_memory_occupation),
         )
         .route("/abort_request", post(abort_request))
         // Listener-to-listener: another DP rank's control request for this
@@ -69,6 +94,163 @@ async fn set_internal_state(
         .await
     {
         Ok(updated) => Json(api::SetInternalStateResponse { updated }).into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// `GET|POST /start_profile` — Python's optional `ProfileReq` body (absent,
+/// empty, or `null` means every default); 200 with Python's text line, or the
+/// merged failure as a 500 with its message (Python raises, which FastAPI
+/// renders as a bare 500).
+async fn start_profile(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let request = if body.is_empty() {
+        api::StartProfileRequest::default()
+    } else {
+        match serde_json::from_slice::<Option<api::StartProfileRequest>>(&body) {
+            Ok(request) => request.unwrap_or_default(),
+            Err(error) => return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false),
+        }
+    };
+    let options = ProfileOptions {
+        output_dir: request.output_dir,
+        start_step: request.start_step,
+        num_steps: request.num_steps,
+        activities: request.activities.map(|list| list.items),
+        profile_by_stage: request.profile_by_stage,
+        with_stack: request.with_stack,
+        record_shapes: request.record_shapes,
+        profile_id: request.profile_id,
+        merge_profiles: request.merge_profiles,
+        profile_prefix: request.profile_prefix,
+        profile_stages: request.profile_stages.map(|list| list.items),
+        detailed_annotations: request.detailed_annotations,
+    };
+    profile_response(
+        state.core.start_profile(options).await,
+        "Start profiling.\n",
+    )
+}
+
+/// `GET|POST /stop_profile` — the counterpart of `/start_profile`.
+async fn stop_profile(State(state): State<Arc<AppState>>) -> Response {
+    profile_response(
+        state.core.stop_profile().await,
+        "Stop profiling. This will take some time.\n",
+    )
+}
+
+fn profile_response(outcome: Result<ProfileOutcome, CoreError>, done: &'static str) -> Response {
+    match outcome {
+        Ok(outcome) if outcome.success => {
+            // Python's bare `Response(content=...)`: no content type.
+            let mut response = Response::new(Body::from(done));
+            *response.status_mut() = StatusCode::OK;
+            response
+        }
+        Ok(outcome) => native_error(StatusCode::INTERNAL_SERVER_ERROR, &outcome.message, false),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+async fn start_expert_distribution_record(State(state): State<Arc<AppState>>) -> Response {
+    text_ack(
+        state
+            .core
+            .expert_distribution_record(ExpertDistributionAction::Start)
+            .await,
+        "Start recording the expert distribution.\n",
+    )
+}
+
+async fn stop_expert_distribution_record(State(state): State<Arc<AppState>>) -> Response {
+    text_ack(
+        state
+            .core
+            .expert_distribution_record(ExpertDistributionAction::Stop)
+            .await,
+        "Stop recording the expert distribution.\n",
+    )
+}
+
+async fn dump_expert_distribution_record(State(state): State<Arc<AppState>>) -> Response {
+    text_ack(
+        state
+            .core
+            .expert_distribution_record(ExpertDistributionAction::Dump)
+            .await,
+        "Dump expert distribution record.\n",
+    )
+}
+
+/// Python's `Response(content=<line>)` on success: a bare 200 text body.
+fn text_ack(outcome: Result<(), CoreError>, done: &'static str) -> Response {
+    match outcome {
+        Ok(()) => {
+            let mut response = Response::new(Body::from(done));
+            *response.status_mut() = StatusCode::OK;
+            response
+        }
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// `GET|POST /slow_down` — Python answers the handler's `None` as a JSON
+/// `null`, and a failure as its `{"error": {...}}` 400 body.
+async fn slow_down(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::SlowDownRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    null_ack(state.core.slow_down(body.forward_sleep_time).await)
+}
+
+/// `GET|POST /release_memory_occupation` — see `slow_down` for the shape.
+async fn release_memory_occupation(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::ReleaseMemoryOccupationRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    null_ack(
+        state
+            .core
+            .release_memory_occupation(body.tags.map(|list| list.items))
+            .await,
+    )
+}
+
+/// `GET|POST /resume_memory_occupation` — see `slow_down` for the shape.
+async fn resume_memory_occupation(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::ResumeMemoryOccupationRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    null_ack(
+        state
+            .core
+            .resume_memory_occupation(body.tags.map(|list| list.items))
+            .await,
+    )
+}
+
+/// FastAPI's rendering of a handler that returns `None`: 200 with `null`.
+fn null_ack(outcome: Result<(), CoreError>) -> Response {
+    match outcome {
+        Ok(()) => Json(Value::Null).into_response(),
         Err(error) => native_error(error.http_status(), &error.to_string(), false),
     }
 }
@@ -1001,6 +1183,159 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(intake_rx.try_recv().is_err());
+    }
+
+    /// `/start_profile` takes an absent, empty, or null body as all defaults
+    /// and answers Python's text line; `/stop_profile` too; a failing rank is
+    /// a 500 carrying the scheduler's reason.
+    #[tokio::test]
+    async fn profile_routes_answer_python_text_lines() {
+        for (uri, method, body, reply, status, expected) in [
+            (
+                "/start_profile",
+                "GET",
+                "",
+                (true, ""),
+                StatusCode::OK,
+                "Start profiling.\n",
+            ),
+            (
+                "/start_profile",
+                "POST",
+                "null",
+                (true, ""),
+                StatusCode::OK,
+                "Start profiling.\n",
+            ),
+            (
+                "/start_profile",
+                "POST",
+                r#"{"num_steps": 3, "activities": ["CPU"]}"#,
+                (true, ""),
+                StatusCode::OK,
+                "Start profiling.\n",
+            ),
+            (
+                "/stop_profile",
+                "POST",
+                "",
+                (true, ""),
+                StatusCode::OK,
+                "Stop profiling. This will take some time.\n",
+            ),
+            (
+                "/stop_profile",
+                "GET",
+                "",
+                (false, "Profiler is not running"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Profiler is not running",
+            ),
+        ] {
+            let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+            let mut builder = HttpRequest::builder().method(method).uri(uri);
+            if !body.is_empty() {
+                builder = builder.header(CONTENT_TYPE, "application/json");
+            }
+            let response = tokio::spawn(
+                routes()
+                    .with_state(state)
+                    .oneshot(builder.body(Body::from(body)).unwrap()),
+            );
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("{uri}: must submit one control request");
+            };
+            assert!(admission.try_accept());
+            request
+                .sink
+                .try_send(ResponseItem::Control(Bytes::from(
+                    rmp_serde::to_vec_named(
+                        &serde_json::json!({"success": reply.0, "message": reply.1}),
+                    )
+                    .unwrap(),
+                )))
+                .unwrap();
+            let response = response.await.unwrap().unwrap();
+            assert_eq!(response.status(), status, "{method} {uri} {body:?}");
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains(expected), "{method} {uri}: {text}");
+        }
+
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/start_profile")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"num_steps": "many"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(intake_rx.try_recv().is_err());
+    }
+
+    /// The acknowledged routes answer Python's shapes: a text line for the
+    /// expert-distribution recorder, a JSON `null` for the others.
+    #[tokio::test]
+    async fn acknowledged_routes_answer_python_shapes() {
+        let bare = Bytes::from(
+            rmp_serde::to_vec_named(&serde_json::json!({"rid": "x", "http_worker_ipc": null}))
+                .unwrap(),
+        );
+        for (uri, body, expected) in [
+            (
+                "/start_expert_distribution_record",
+                "",
+                "Start recording the expert distribution.\n",
+            ),
+            (
+                "/stop_expert_distribution_record",
+                "",
+                "Stop recording the expert distribution.\n",
+            ),
+            (
+                "/dump_expert_distribution_record",
+                "",
+                "Dump expert distribution record.\n",
+            ),
+            ("/slow_down", r#"{"forward_sleep_time": 0.5}"#, "null"),
+            (
+                "/release_memory_occupation",
+                r#"{"tags": ["weights"]}"#,
+                "null",
+            ),
+            ("/resume_memory_occupation", "{}", "null"),
+        ] {
+            let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+            let mut builder = HttpRequest::builder().method("POST").uri(uri);
+            if !body.is_empty() {
+                builder = builder.header(CONTENT_TYPE, "application/json");
+            }
+            let response = tokio::spawn(
+                routes()
+                    .with_state(state)
+                    .oneshot(builder.body(Body::from(body)).unwrap()),
+            );
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("{uri}: must submit one control request");
+            };
+            assert!(admission.try_accept());
+            request
+                .sink
+                .try_send(ResponseItem::Control(bare.clone()))
+                .unwrap();
+            let response = response.await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&bytes), expected, "{uri}");
+        }
     }
 
     /// A forwarded control request reaches the local scheduler under the rid

@@ -5,6 +5,7 @@ syntax = "proto3";
 
 package sglang.api.v1;
 
+import "sglang/api/v1/common.proto";
 import "sglang/json/v1/options.proto";
 
 // `/set_internal_state`: numeric scheduler knobs to override at runtime.
@@ -20,3 +21,57 @@ message SetInternalStateResponse {
   option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
   repeated bool updated = 1;
 }
+
+// `/start_profile`: begin a profiler capture on every DP rank. Python's
+// `ProfileReq` minus `req_type`, which the operation implies. The frontend
+// fills `with_stack`/`record_shapes` from `SGLANG_PROFILE_WITH_STACK` /
+// `SGLANG_PROFILE_RECORD_SHAPES` when unset and mints `profile_id` when
+// absent, as Python's TokenizerManager does.
+message StartProfileRequest {
+  optional string output_dir = 1;
+  optional int64 start_step = 2;
+  // Stop automatically after this many steps; no `/stop_profile` needed.
+  optional int64 num_steps = 3;
+  // Among "CPU", "GPU", "MEM", "RPD"; the scheduler's default when unset.
+  optional StringList activities = 4;
+  bool profile_by_stage = 5;
+  optional bool with_stack = 6;
+  optional bool record_shapes = 7;
+  optional string profile_id = 8;
+  bool merge_profiles = 9;
+  optional string profile_prefix = 10;
+  optional StringList profile_stages = 11;
+  bool detailed_annotations = 12;
+}
+
+message StopProfileRequest {}
+
+// The merged outcome of a profile start or stop across DP ranks.
+message ProfileResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// `/start_expert_distribution_record`, `/stop_expert_distribution_record`,
+// `/dump_expert_distribution_record`: the MoE expert-distribution recorder
+// on every DP rank. The operation implies the action.
+message ExpertDistributionRecordRequest {}
+message ExpertDistributionRecordResponse {}
+
+// `/slow_down`: sleep this long before every forward, for testing; unset or
+// non-positive clears the delay.
+message SlowDownRequest {
+  optional double forward_sleep_time = 1;
+}
+message SlowDownResponse {}
+
+// `/release_memory_occupation` and `/resume_memory_occupation`: free or
+// reclaim the GPU memory of the tagged regions (`weights`, `kv_cache`); every
+// region when `tags` is unset.
+message ReleaseMemoryOccupationRequest {
+  optional StringList tags = 1;
+}
+message ResumeMemoryOccupationRequest {
+  optional StringList tags = 1;
+}
+message MemoryOccupationResponse {}
