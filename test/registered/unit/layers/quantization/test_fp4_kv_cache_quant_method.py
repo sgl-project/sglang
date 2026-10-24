@@ -436,5 +436,57 @@ class TestFP4MXBlock16KVQuantizeUtil(CustomTestCase):
         self.assertLess(rel_error, 0.5)
 
 
+class TestUltraQuantKVCacheMethod(CustomTestCase):
+    def test_pool_cap_fits_32bit_buffer_offset(self):
+        """The largest pool the recipe allows must be one the FlyDSL decode can address.
+
+        Pools are allocated with a padding page past the token capacity, and every
+        code buffer is reached through a 32-bit buffer offset.
+        """
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            UltraQuantKVCacheMethod,
+        )
+        from sglang.srt.layers.quantization.quark.ultraquant_tensor import code_bytes
+
+        head_dim = 256
+        for kv_head_num, page_size in ((1, 1), (2, 1), (4, 64)):
+            with self.subTest(kv_head_num=kv_head_num, page_size=page_size):
+                row_bytes = kv_head_num * code_bytes(head_dim)
+                cap = UltraQuantKVCacheMethod.max_pool_tokens(
+                    kv_head_num, head_dim, page_size
+                )
+                self.assertLessEqual((cap + page_size) * row_bytes, 0xFFFFFFFF)
+                self.assertGreater((cap + page_size + 1) * row_bytes, 0xFFFFFFFF)
+
+    def test_buffers_match_cell_size(self):
+        from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+            UltraQuantKVCacheMethod,
+        )
+        from sglang.srt.layers.quantization.quark.ultraquant_tensor import (
+            code_bytes,
+            n_groups,
+        )
+
+        size, heads, dim, layers = 16, 2, 128, 6
+        m = UltraQuantKVCacheMethod()
+        bufs = m.create_buffers(size, heads, dim, layers, "cpu")
+
+        for layer in range(layers):
+            with self.subTest(layer=layer):
+                k, k_scale = bufs["k_buffer"][layer], bufs["k_scale_buffer"][layer]
+                self.assertEqual(k.dtype, bufs["store_dtype"])
+                self.assertEqual(k.shape, (size, heads, code_bytes(dim)))
+                self.assertEqual(k_scale.shape, (size, heads, n_groups(dim)))
+
+        allocated = sum(
+            t.numel() * t.element_size()
+            for name in ("k_buffer", "v_buffer", "k_scale_buffer", "v_scale_buffer")
+            for t in bufs[name]
+        )
+        self.assertEqual(
+            m.compute_cell_size(heads, dim, layers, kv_size=1) * size, allocated
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
