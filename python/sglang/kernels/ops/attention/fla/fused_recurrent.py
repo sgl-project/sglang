@@ -634,6 +634,27 @@ def fused_recurrent_kda_packed_decode(
             f"Invalid head config inferred from mixed_qkv: H={H}, HV={HV}."
         )
 
+    if use_qk_l2norm_in_kernel:
+        from sglang.kernels.ops.attention.fla import kda_packed_decode_rowstream
+
+        if kda_packed_decode_rowstream.covered(
+            mixed_qkv, a, b, initial_state, out, ssm_state_indices
+        ):
+            kda_packed_decode_rowstream.kda_packed_decode_rowstream(
+                mixed_qkv,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                scale,
+                initial_state,
+                out,
+                ssm_state_indices,
+                H,
+                lower_bound,
+            )
+            return out, initial_state
+
     # Batched-decode CUDA fast path:
     # row-streaming state update reaches the in-place R+W bandwidth of the
     # part (~9.6 TB/s) where this triton kernel tops out at ~5 TB/s holding a

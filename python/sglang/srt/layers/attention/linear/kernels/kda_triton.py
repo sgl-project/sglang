@@ -5,7 +5,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_gfx95_supported, is_npu, is_xpu
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -27,6 +27,9 @@ class TritonKDAKernel(LinearAttnKernelBase):
     # non-packed Triton decode() path (fused_sigmoid_gating_delta_rule_update),
     # the same fallback CPU/NPU use. Batched decode is handled via query_start_loc.
     supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
+    # The packed kernels implement the safe gate; only the gfx950 dispatch is
+    # validated with it so far.
+    supports_packed_decode_safe_gate: bool = is_gfx95_supported()
     supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
     supports_track_state_snapshot: bool = True
 
