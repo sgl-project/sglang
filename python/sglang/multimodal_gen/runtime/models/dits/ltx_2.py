@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional, Tuple, Union
 
 import torch
@@ -136,6 +137,14 @@ def _ltx2_try_fused_qknorm_split_rope(
 
 
 _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED = False
+
+
+@dataclass(slots=True)
+class LTX2PromptKV:
+    """One block's prompt cross-attention (K, V) with K normed, fixed for a denoising loop"""
+
+    video: tuple[torch.Tensor, torch.Tensor]
+    audio: tuple[torch.Tensor, torch.Tensor]
 
 
 def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
@@ -878,15 +887,20 @@ class LTX2Attention(nn.Module):
         skip_sequence_parallel_override: bool = False,
         gather_context_kv_for_sp: bool = False,
         context_replicated_prefix_len: int = 0,
+        context_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         gate_input = x
         context_ = x if context is None else context
-        v, _ = self.to_v(context_)
+        if context_kv is None:
+            v, _ = self.to_v(context_)
+        else:
+            k, v = context_kv
         use_attention = not all_perturbed
 
         if use_attention:
             q, _ = self.to_q(x)
-            k, _ = self.to_k(context_)
+            if context_kv is None:
+                k, _ = self.to_k(context_)
 
             fused_qk = None
             if pe is not None:
@@ -933,7 +947,8 @@ class LTX2Attention(nn.Module):
                     k_dtype = k.dtype
                     with torch.autocast(device_type=q.device.type, enabled=False):
                         q = self.q_norm(q).to(dtype=q_dtype)
-                        k = self.k_norm(k).to(dtype=k_dtype)
+                        if context_kv is None:
+                            k = self.k_norm(k).to(dtype=k_dtype)
 
                 if pe is not None and cos.dim() == 3:
                     q = apply_interleaved_rotary_emb(q, (cos, sin))
@@ -1024,6 +1039,19 @@ class LTX2Attention(nn.Module):
         out_proj, _ = self.to_out[0](out_flat)
 
         return out_proj
+
+    def project_context_kv(
+        self, context: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The normed K and the V that ``forward`` projects from an unrotated ``context``."""
+        v, _ = self.to_v(context)
+        k, _ = self.to_k(context)
+        if self.qk_norm:
+            assert self.k_norm is not None
+            k_dtype = k.dtype
+            with torch.autocast(device_type=k.device.type, enabled=False):
+                k = self.k_norm(k).to(dtype=k_dtype)
+        return k, v
 
     def _slice_rope_for_tp(
         self,
@@ -1306,6 +1334,7 @@ class LTX2TransformerBlock(nn.Module):
         v2a_cross_attn_perturbation_mask: Optional[torch.Tensor] = None,
         audio_replicated_for_sp: bool = False,
         video_memory_prefix_len: int = 0,
+        prompt_kv: LTX2PromptKV | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = hidden_states.size(0)
         video_ada_values = _ltx2_try_fused_ada_values9(
@@ -1429,6 +1458,7 @@ class LTX2TransformerBlock(nn.Module):
                 norm_hidden_states,
                 context=encoder_hidden_states,
                 mask=encoder_attention_mask,
+                context_kv=None if prompt_kv is None else prompt_kv.video,
             )
             hidden_states = hidden_states + attn_hidden_states
 
@@ -1437,6 +1467,7 @@ class LTX2TransformerBlock(nn.Module):
                 norm_audio_hidden_states,
                 context=audio_encoder_hidden_states,
                 mask=audio_encoder_attention_mask,
+                context_kv=None if prompt_kv is None else prompt_kv.audio,
             )
             audio_hidden_states = audio_hidden_states + attn_audio_hidden_states
         # 3. Audio-to-Video and Video-to-Audio Cross-Attention
@@ -1908,6 +1939,11 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.audio_out_channels = arch.audio_out_channels
         self.timestep_scale_multiplier = arch.timestep_scale_multiplier
         self.av_ca_timestep_scale_multiplier = arch.av_ca_timestep_scale_multiplier
+        # prompt K/V depend on the text alone unless adaLN modulates the prompt per step
+        self.caches_prompt_kv = not arch.cross_attention_adaln
+        # (video text shape, audio text shape) -> per-block prompt K/V; kept for the
+        # process lifetime so a captured forward keeps reading the same addresses
+        self._prompt_kv_buffers: dict[tuple[int, ...], list[LTX2PromptKV]] = {}
 
         self.layer_names = ["transformer_blocks"]
 
@@ -1950,6 +1986,46 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         return video_timestep, audio_timestep_for_ca
 
+    @torch.no_grad()
+    def prepare_prompt_kv(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        audio_encoder_hidden_states: torch.Tensor,
+    ) -> tuple[int, ...]:
+        """Project every block's prompt K/V into persistent buffers; returns the key ``forward`` reads them by.
+
+        Valid until the text or the DiT weights change, i.e. for one denoising loop.
+        """
+        if self.caption_projection is not None:
+            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+        if self.audio_caption_projection is not None:
+            audio_encoder_hidden_states = self.audio_caption_projection(
+                audio_encoder_hidden_states
+            )
+        key = (*encoder_hidden_states.shape, *audio_encoder_hidden_states.shape)
+        buffers = self._prompt_kv_buffers.get(key)
+        if buffers is None:
+            self._prompt_kv_buffers[key] = [
+                LTX2PromptKV(
+                    video=block.attn2.project_context_kv(encoder_hidden_states),
+                    audio=block.audio_attn2.project_context_kv(
+                        audio_encoder_hidden_states
+                    ),
+                )
+                for block in self.transformer_blocks
+            ]
+            return key
+        for block, prompt_kv in zip(self.transformer_blocks, buffers):
+            for dst, src in zip(
+                (*prompt_kv.video, *prompt_kv.audio),
+                (
+                    *block.attn2.project_context_kv(encoder_hidden_states),
+                    *block.audio_attn2.project_context_kv(audio_encoder_hidden_states),
+                ),
+            ):
+                dst.copy_(src)
+        return key
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1981,6 +2057,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         video_memory_prefix_len: int = 0,
         late_layer_ratio: float = 1.0,
         late_audio_self_attention_mask: Optional[torch.Tensor] = None,
+        cached_prompt_kv: tuple[int, ...] | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         batch_size = hidden_states.size(0)
@@ -2153,13 +2230,17 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             batch_size, -1, temb_ca_audio_gate.shape[-1]
         )
 
-        # 4. Prepare prompt embeddings
-        if self.caption_projection is not None:
-            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        if self.audio_caption_projection is not None:
-            audio_encoder_hidden_states = self.audio_caption_projection(
-                audio_encoder_hidden_states
-            )
+        # 4. Prepare prompt embeddings, or read the K/V prepare_prompt_kv projected from them
+        prompt_kvs = None
+        if cached_prompt_kv is not None:
+            prompt_kvs = self._prompt_kv_buffers[cached_prompt_kv]
+        else:
+            if self.caption_projection is not None:
+                encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+            if self.audio_caption_projection is not None:
+                audio_encoder_hidden_states = self.audio_caption_projection(
+                    audio_encoder_hidden_states
+                )
 
         if _is_npu:
             # If the 'encoder_attention_mask' is provided and it is all ones,
@@ -2229,7 +2310,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 )
             )
         late_layer_start = int(len(self.transformer_blocks) * float(late_layer_ratio))
-        for block in self.transformer_blocks:
+        for block_pos, block in enumerate(self.transformer_blocks):
             block_idx = getattr(block, "idx", -1)
             video_self_attn_perturbation_mask = None
             audio_self_attn_perturbation_mask = None
@@ -2300,6 +2381,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 v2a_cross_attn_perturbation_mask=v2a_cross_attn_perturbation_mask,
                 audio_replicated_for_sp=audio_replicated_for_sp,
                 video_memory_prefix_len=video_memory_prefix_len,
+                prompt_kv=None if prompt_kvs is None else prompt_kvs[block_pos],
             )
 
         # 6. Output layers
