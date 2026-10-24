@@ -847,9 +847,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         ragged_layout = (
-            forward_batch.ragged_verify_layout
-            if self.ragged_verify_mode
-            else None
+            forward_batch.ragged_verify_layout if self.ragged_verify_mode else None
         )
         if ragged_layout is not None:
             return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
@@ -1533,9 +1531,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "Diffusion graph replay requires prepared input embeddings"
             )
         ragged_layout = (
-            forward_batch.ragged_verify_layout
-            if self.ragged_verify_mode
-            else None
+            forward_batch.ragged_verify_layout if self.ragged_verify_mode else None
         )
         is_ragged = ragged_layout is not None
 
