@@ -18,6 +18,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConf
 from sglang.multimodal_gen.configs.task_type import get_request_task_type
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs,
+    normalize_output_seeds,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -123,8 +124,8 @@ class InputValidationStage(PipelineStage):
     def _generate_seeds(self, batch: Req, server_args: ServerArgs):
         """Generate deterministic per-output seeds.
 
-        Batched requests pass one base seed per prompt through `extra`; each
-        prompt expands to `num_outputs_per_prompt` consecutive seeds.
+        Batched requests pass a base seed or an explicit per-output seed list
+        for each prompt through `extra`.
         """
         seed = batch.seed
         num_videos_per_prompt = batch.num_outputs_per_prompt
@@ -142,10 +143,14 @@ class InputValidationStage(PipelineStage):
                 raise ValueError(
                     "dynamic_batch_seeds must be a list with one seed per prompt"
                 )
-            base_seeds = [int(item) for item in dynamic_batch_seeds]
             seeds = []
-            for base_seed in base_seeds:
-                seeds.extend([base_seed + i for i in range(num_videos_per_prompt)])
+            for prompt_seed in dynamic_batch_seeds:
+                seeds.extend(
+                    normalize_output_seeds(
+                        prompt_seed,
+                        num_outputs_per_prompt=num_videos_per_prompt,
+                    )
+                )
         elif isinstance(seed, list):
             if len(seed) != num_videos_per_prompt:
                 raise ValueError(
