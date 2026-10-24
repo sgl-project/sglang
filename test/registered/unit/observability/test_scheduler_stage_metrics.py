@@ -51,6 +51,22 @@ class TestSchedulerStageMetricsRecorder(CustomTestCase):
         )
         self.assertEqual(sum(wall_ns.values()), 100)
 
+    def test_backwards_clock_span_is_dropped(self):
+        """A monotonic clock reset after restore must not drain negative wall time."""
+        recorder = SchedulerStageMetricsRecorder(enabled=True)
+        recorder.start(wall_ns=0)
+
+        with patch(
+            "sglang.srt.observability.scheduler_stage_metrics.time.monotonic_ns",
+            side_effect=[100, 10],
+        ):
+            previous_stage = recorder.enter(SCHEDULER_STAGE_RUN_BATCH)
+            recorder.exit(previous_stage)
+
+        self.assertEqual(
+            recorder.drain(wall_ns=30), {("other", FORWARD_OVERLAP_NONE): 120}
+        )
+
     def test_decorator_restores_stage_after_exception(self):
         recorder = SchedulerStageMetricsRecorder(enabled=True)
         recorder.start(wall_ns=0)
