@@ -46,6 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_attn_backend,
     get_forward_context,
     get_req_to_token_pool,
     get_token_to_kv_pool,
@@ -446,14 +447,16 @@ class EagerRunner(BaseRunner):
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         model_runner = self.model_runner
+        # Draft steps can override the runner's default backend in ForwardContext.
+        attn_backend = get_attn_backend()
         # Padded idle (DP-attn MLP sync) needs metadata reinit; unpadded must
         # drop stale forward_metadata to avoid an SWA use-after-free on req_pool.
         if forward_batch.batch_size > 0:
             if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
-            model_runner.attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.init_forward_metadata(forward_batch)
         else:
-            model_runner.attn_backend.forward_metadata = None
+            attn_backend.forward_metadata = None
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
         with (
