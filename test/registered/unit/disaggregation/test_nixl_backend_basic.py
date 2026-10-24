@@ -353,6 +353,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 decode_tp_size=1,
                 dst_kv_ptrs=[0],
                 dst_aux_ptrs=[0],
+                dst_aux_item_lens=[64],
                 gpu_id=0,
                 staging_base_ptr=0,
                 staging_total_size=0,
@@ -376,7 +377,11 @@ class TestNixlTransferWorker(CustomTestCase):
         mgr.attn_tp_size = 1
         mgr.transfer_source_rank = 0
         mgr.kv_args = SimpleNamespace(
-            engine_rank=0, kv_data_ptrs=[0], num_draft_entries=0
+            engine_rank=0,
+            kv_data_ptrs=[0],
+            num_draft_entries=0,
+            aux_data_ptrs=[0],
+            aux_item_lens=[64],
         )
         mgr.exceptions = {}
         mgr.failure_lock = threading.Lock()
@@ -436,6 +441,44 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertIn(room, mgr.req_to_decode_prefix_len)
         mgr.send_kvcache.assert_called_once()
 
+    def test_incompatible_aux_layout_fails_before_transfer_and_worker_continues(self):
+        mgr = self._make_manager(21)
+        healthy = self._make_manager(22)
+        mgr.kv_args.aux_data_ptrs = [0] * 8
+        mgr.kv_args.aux_item_lens = [64] * 6 + [4096, 64]
+        for manager, capacity in ((mgr, 2048), (healthy, 4096)):
+            peer = manager.decode_kv_args_table["agent"]
+            peer.dst_aux_ptrs = [0] * 8
+            peer.dst_aux_item_lens = [64] * 6 + [capacity, 64]
+        healthy_req = healthy.transfer_infos[22]["agent"]
+        healthy_req.agent_name = "healthy"
+        mgr.transfer_infos[22] = {"healthy": healthy_req}
+        mgr.request_status[22] = KVPoll.WaitingForInput
+        mgr.decode_kv_args_table["healthy"] = healthy.decode_kv_args_table["agent"]
+        mgr.agent.check_xfer_state = MagicMock(return_value="DONE")
+        mgr.send_kv_status_message = MagicMock()
+        mgr.send_kvcache = MagicMock(return_value="kv_handle")
+        mgr.send_aux = MagicMock(return_value="aux_handle")
+        chunks = [self._make_chunk(room, [1], True) for room in (21, 22)]
+        queue = SimpleNamespace(get=MagicMock(side_effect=[*chunks, SystemExit()]))
+
+        with self.assertRaises(SystemExit):
+            mgr.transfer_worker(queue)
+
+        self.assertEqual(mgr.request_status[21], KVPoll.Failed)
+        self.assertIn("metadata buffer layout mismatch", mgr.failure_records[21])
+        self.assertIsInstance(mgr.exceptions[21], ValueError)
+        self.assertEqual(mgr.request_status[22], KVPoll.Success)
+        mgr.send_kvcache.assert_called_once()
+        self.assertEqual(mgr.send_kvcache.call_args.args[0], "healthy")
+        mgr.send_aux.assert_called_once()
+        self.assertEqual(mgr.send_aux.call_args.args[0], "healthy")
+        mgr.send_kv_status_message.assert_called_once()
+        self.assertEqual(
+            mgr.send_kv_status_message.call_args.kwargs["status"], KVPoll.Failed
+        )
+        self.assertEqual(mgr._staging_outstanding.get(21, 0), 0)
+
     def test_dcp_destinations_use_disjoint_pack_regions_before_chunk_barrier(self):
         room = 23
         mgr = self._make_manager(room)
@@ -459,6 +502,7 @@ class TestNixlTransferWorker(CustomTestCase):
                 decode_tp_size=len(agents),
                 dst_kv_ptrs=[0x3000 + i * 0x100],
                 dst_aux_ptrs=[0],
+                dst_aux_item_lens=[64],
                 gpu_id=0,
                 staging_base_ptr=0,
                 staging_total_size=0,
@@ -477,6 +521,8 @@ class TestNixlTransferWorker(CustomTestCase):
             kv_data_ptrs=[0x1000],
             page_size=4,
             num_draft_entries=0,
+            aux_data_ptrs=[0],
+            aux_item_lens=[64],
         )
         mgr._dcp_pack_buffers = [SimpleNamespace(get_size=lambda: 16)]
 
@@ -888,6 +934,8 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
             kv_data_ptrs=[0x1000, 0x2000],
             kv_data_lens=[64, 64],
             kv_item_lens=[16, 16],
+            aux_data_ptrs=[0],
+            aux_item_lens=[16],
         )
         mgr.decode_kv_args_table = {}
         for name in peers:
@@ -900,6 +948,7 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
                 dst_kv_ptrs=[0x3000, 0x4000],
                 dst_kv_mem_kinds=["VRAM", "VRAM"],
                 dst_aux_ptrs=[0],
+                dst_aux_item_lens=[16],
                 dst_state_data_ptrs=[],
                 gpu_id=0,
                 decode_tp_size=1,
