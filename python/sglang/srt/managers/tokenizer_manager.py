@@ -1662,6 +1662,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 rid=obj.rid,
                 priority=obj.priority,
                 dimensions=obj.dimensions,
+                encoding_format=obj.encoding_format,
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 http_worker_ipc=obj.http_worker_ipc,
@@ -2728,8 +2729,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     out_dict["prompt_token_ids"] = state.prompt_token_ids
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
+                embedding = recv_obj.embeddings[i]
+                if (
+                    recv_obj.tensor_embeddings is not None
+                    and recv_obj.tensor_embeddings[i] is not None
+                ):
+                    embedding = recv_obj.tensor_embeddings[i]
                 out_dict = {
-                    "embedding": recv_obj.embeddings[i],
+                    "embedding": embedding,
                     "meta_info": meta_info,
                 }
                 # Unpack pooled hidden states (PHS).

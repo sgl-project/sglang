@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.attention.graph_utils import _zero_padded_tokens
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
@@ -59,6 +60,42 @@ def _make_pp_buffers_and_registry():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_attention_padding_respects_cuda_and_mixed_moe_layers(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = True
+        runner.model_runner = SimpleNamespace(attn_backend=object())
+        runner.attention_layers = []
+        runner.quant_config = None
+        runner.moe_fusions = []
+        runner.dsa_indexers = None
+        runner.mha_companion_layers = None
+        for cuda, moe_layers, zero_tail in (
+            (True, [], False),
+            (True, [None, None], False),
+            (True, [None, object()], True),
+            (False, [], True),
+            (False, [None, object()], True),
+        ):
+            with self.subTest(cuda=cuda, moe_layers=moe_layers):
+                runner.moe_layers = moe_layers
+                output = torch.ones(4, 2)
+                with (
+                    patch(
+                        "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda",
+                        return_value=cuda,
+                    ),
+                    runner._prefill_forward_context(
+                        SimpleNamespace(moe_num_token_non_padded=lambda: None),
+                        num_tokens=4,
+                        raw_num_tokens=2,
+                    ),
+                ):
+                    _zero_padded_tokens(output, 2)
+                torch.testing.assert_close(output[:2], torch.ones(2, 2))
+                torch.testing.assert_close(
+                    output[2:], torch.zeros(2, 2) if zero_tail else torch.ones(2, 2)
+                )
+
     def test_capture_buckets_keep_tp_shards_equal(self):
         override = get_context().override_server_args(
             enable_two_batch_overlap=False,

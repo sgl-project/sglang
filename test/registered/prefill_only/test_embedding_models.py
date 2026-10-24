@@ -156,6 +156,30 @@ class TestEmbeddingModels(CustomTestCase):
                     matryoshka_dim=128,
                 )
 
+    def test_embedding_encoding_format(self):
+        model = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
+        tp_size = MODEL_TO_CONFIG[model][0]
+        torch_dtype = torch.float16
+        prompts = self._truncate_prompts(DEFAULT_PROMPTS, model)
+
+        with SRTRunner(
+            model,
+            tp_size=tp_size,
+            torch_dtype=torch_dtype,
+            model_type="embedding",
+        ) as srt_runner:
+            default_outputs = srt_runner.forward(prompts)
+            tensor_outputs = srt_runner.forward(prompts, encoding_format="tensor")
+
+        for default_emb, tensor_emb in zip(
+            default_outputs.embed_logits, tensor_outputs.embed_logits
+        ):
+            self.assertNotIsInstance(default_emb, torch.Tensor)
+            self.assertIsInstance(tensor_emb, torch.Tensor)
+            self.assertEqual(tensor_emb.dtype, torch_dtype)
+            similarity = get_similarities(default_emb, tensor_emb.float())
+            self.assertTrue(torch.all(abs(similarity - 1) < 1e-5))
+
 
 if __name__ == "__main__":
     unittest.main()
