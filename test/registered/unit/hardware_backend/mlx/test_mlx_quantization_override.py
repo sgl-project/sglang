@@ -1,7 +1,6 @@
 """Unit tests for ``MlxQuantizationConfig.override_quantization_method``.
 
 The override is a classmethod over a dict; no mlx / Apple Silicon dependency.
-Runs on every CI platform and guards #25119 from regression.
 """
 
 from __future__ import annotations
@@ -10,17 +9,14 @@ import unittest
 
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
 
-class TestMlxQuantizationOverride(unittest.TestCase):
-    """Pure-logic tests for ``MlxQuantizationConfig.override_quantization_method``.
-
-    The override is a classmethod over a dict; no mlx / Apple Silicon
-    dependency. Runs on every CI platform and guards #25119 from regression.
-    """
+class TestMlxQuantizationOverride(CustomTestCase):
+    """Pure-logic tests for ``MlxQuantizationConfig.override_quantization_method``."""
 
     def test_mlx_q4_dict_config_autodetect(self):
         """Bare {group_size, bits=4} dict maps to mlx_q4."""
@@ -73,11 +69,28 @@ class TestMlxQuantizationOverride(unittest.TestCase):
                 {"bits": "4", "group_size": 64}, None
             )
         )
-        # Unsupported bit-width.
         self.assertIsNone(
             MlxQuantizationConfig.override_quantization_method(
-                {"bits": 2, "group_size": 64}, None
+                hf_quant_cfg={"bits": True, "group_size": 64},
+                user_quant=None,
             )
+        )
+        # Non-positive bits on the passthrough branch.
+        self.assertIsNone(
+            MlxQuantizationConfig.override_quantization_method(
+                hf_quant_cfg={"bits": 0, "group_size": 64},
+                user_quant=None,
+            )
+        )
+
+    def test_six_bit_affine_dict_passthrough(self):
+        """A {group_size, bits=6} MLX dict maps to the mlx passthrough marker."""
+        self.assertEqual(
+            MlxQuantizationConfig.override_quantization_method(
+                hf_quant_cfg={"group_size": 64, "bits": 6, "mode": "affine"},
+                user_quant=None,
+            ),
+            "mlx",
         )
 
     def test_user_quant_explicit_defers_to_user(self):

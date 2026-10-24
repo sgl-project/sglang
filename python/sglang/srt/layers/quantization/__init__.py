@@ -138,6 +138,7 @@ if is_xpu():
 if is_mps():
     BASE_QUANTIZATION_METHODS.update(
         {
+            "mlx": MlxQuantizationConfig,
             "mlx_q4": MlxQuantizationConfig,
             "mlx_q8": MlxQuantizationConfig,
         }
