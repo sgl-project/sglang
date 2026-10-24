@@ -642,14 +642,22 @@ class Glm4MoeDetector(BaseFormatDetector):
             parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
 
             if arg_type == "string":
-                # Only convert to string if explicitly defined as string type
-                if isinstance(parsed_value, str):
-                    arguments[arg_key] = parsed_value
-                elif isinstance(parsed_value, (dict, list)):
-                    # If parsed as dict/list but schema says string, convert to JSON string
-                    arguments[arg_key] = json.dumps(parsed_value, ensure_ascii=False)
+                # The chat template writes string values raw. A value that is
+                # itself valid JSON is still that literal text: "hello" keeps
+                # its quotes, and true / null / 1e2 are not rewritten.
+                try:
+                    json.loads(arg_value)
+                except (json.JSONDecodeError, ValueError):
+                    if isinstance(parsed_value, str):
+                        arguments[arg_key] = parsed_value
+                    elif isinstance(parsed_value, (dict, list)):
+                        arguments[arg_key] = json.dumps(
+                            parsed_value, ensure_ascii=False
+                        )
+                    else:
+                        arguments[arg_key] = str(parsed_value)
                 else:
-                    arguments[arg_key] = str(parsed_value)
+                    arguments[arg_key] = arg_value
             elif arg_type is None:
                 # If type is not defined, keep the parsed value as-is
                 arguments[arg_key] = parsed_value if is_good_json else arg_value
