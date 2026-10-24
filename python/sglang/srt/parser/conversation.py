@@ -75,6 +75,26 @@ class SeparatorStyle(IntEnum):
     UNLIMITED_OCR = auto()
 
 
+def _merge_consecutive_same_role(
+    messages: List[List[str]],
+) -> List[Tuple[str, Optional[str]]]:
+    # Joined with "\n\n" like mistral-common's InstructRequestNormalizer;
+    # the trailing None generation slot is never merged.
+    merged: List[Tuple[str, Optional[str]]] = []
+    for role, message in messages:
+        if (
+            merged
+            and merged[-1][0] == role
+            and merged[-1][1] is not None
+            and message is not None
+        ):
+            text = "\n\n".join(part for part in (merged[-1][1], message) if part)
+            merged[-1] = (role, text)
+        else:
+            merged.append((role, message))
+    return merged
+
+
 @dataclasses.dataclass
 class Conversation:
     """A class that manages prompt templates and keeps all conversation history."""
@@ -220,7 +240,9 @@ class Conversation:
                 ret = system_prompt
             else:
                 ret = "[INST] "
-            for i, (role, message) in enumerate(self.messages):
+            # Tags below are positional, so turns must alternate first.
+            messages = _merge_consecutive_same_role(self.messages)
+            for i, (role, message) in enumerate(messages):
                 tag = self.roles[i % 2]
                 if message:
                     if i == 0:
