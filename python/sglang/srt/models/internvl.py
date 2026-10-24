@@ -38,7 +38,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_janus_pro import DropPath
-from sglang.srt.models.gpt_oss import GptOssForCausalLM
+from sglang.srt.models.gpt_oss import GptOssForCausalLM, _own_if_runai_streamed
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
@@ -727,6 +727,21 @@ class InternVLChatModel(nn.Module):
                 ("gate_up_proj", "gate_proj", 0),
                 ("gate_up_proj", "up_proj", 1),
             ]
+        elif self.config.llm_config.architectures[0] == "GptOssForCausalLM":
+            # GPT-OSS has its own loader; this loop handles the wrapper weights.
+            stacked_params_mapping = []
+            other_weights = []
+            language_weights = []
+            for name, loaded_weight in weights:
+                if name.startswith("language_model."):
+                    language_weights.append(
+                        (name[len("language_model.") :], loaded_weight)
+                    )
+                else:
+                    other_weights.append((name, _own_if_runai_streamed(loaded_weight)))
+
+            self.language_model.load_weights(iter(language_weights))
+            weights = other_weights
 
         params_dict = dict(self.named_parameters())
 

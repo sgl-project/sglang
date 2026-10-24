@@ -3,7 +3,9 @@ import json
 import traceback
 import unittest
 from io import BytesIO
+from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import Mock
 
 import requests
 import torch
@@ -36,6 +38,7 @@ if not hasattr(_hf_activations, "PytorchGELUTanh"):
 
 from sglang import Engine
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+from sglang.srt.models.internvl import InternVLChatModel
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.utils.common import is_cuda, is_xpu
 from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
@@ -488,6 +491,35 @@ class TestKimiVLImageUnderstandsImage(VLMInputTestBase, CustomTestCase):
 
 #     def _processor_output_image_data(self, processor_output):
 #         return dict(processor_output, format="processor_output")
+
+
+class TestInternVLGptOssWeightLoading(CustomTestCase):
+    def test_gpt_oss_backbone_weights_go_to_its_own_loader(self):
+        model = InternVLChatModel.__new__(InternVLChatModel)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(
+            llm_config=SimpleNamespace(architectures=["GptOssForCausalLM"]),
+            vision_config=SimpleNamespace(num_dummy_heads=0),
+        )
+        model.language_model = Mock()
+        model.vision_model = torch.nn.Module()
+        model.vision_model.norm = torch.nn.LayerNorm(2)
+        model.mlp1 = torch.nn.Sequential(torch.nn.LayerNorm(2), torch.nn.Linear(2, 2))
+        weights = [
+            ("language_model.model.embed_tokens.weight", torch.zeros(1)),
+            ("vision_model.norm.weight", torch.full((2,), 2.0)),
+            ("mlp1.1.bias", torch.full((2,), 3.0)),
+        ]
+
+        model.load_weights(iter(weights))
+
+        model.language_model.load_weights.assert_called_once()
+        self.assertEqual(
+            list(model.language_model.load_weights.call_args.args[0]),
+            [("model.embed_tokens.weight", weights[0][1])],
+        )
+        torch.testing.assert_close(model.vision_model.norm.weight, weights[1][1])
+        torch.testing.assert_close(model.mlp1[1].bias, weights[2][1])
 
 
 class TestInternVLUnderstandsImage(VLMInputTestBase, CustomTestCase):
