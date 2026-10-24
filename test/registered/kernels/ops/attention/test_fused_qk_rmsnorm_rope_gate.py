@@ -137,6 +137,68 @@ class TestFusedQKRMSNormRoPEGate(CustomTestCase):
             gate_out.float(), packed[..., self.head_dim :].float(), atol=0, rtol=0
         )
 
+    def test_row_offsets_past_int32(self):
+        """The last row starts past element 2**31, as in a prefill of about 210k
+        tokens with Qwen3.5-4B's 10,240-element qkv rows."""
+        tokens, row_stride = 1025, 2**21 + 64  # 1024 * row_stride > 2**31
+        q_width = self.num_q_heads * 2 * self.head_dim
+        rows = torch.empty(tokens, row_stride, device="cuda", dtype=torch.bfloat16)
+        q_gate = rows[:, :q_width]
+        q_gate.normal_()
+        k = torch.randn(
+            tokens,
+            self.num_kv_heads * self.head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        positions = torch.arange(tokens, device="cuda", dtype=torch.int64) % 512
+        q_out, k_out, gate_out = fused_qk_gemma_rmsnorm_rope_gate(
+            q_gate,
+            k,
+            self.q_weight,
+            self.k_weight,
+            self.cos_sin_cache,
+            positions,
+            self.eps,
+            self.num_q_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_dim,
+            has_gate=True,
+        )
+
+        last = [0, tokens - 1]
+        packed = q_gate[last].view(2, self.num_q_heads, 2 * self.head_dim)
+        cos, sin = self.cos_sin_cache[positions[last]].chunk(2, dim=-1)
+        want_q = neox_rope(
+            gemma_rmsnorm(packed[..., : self.head_dim], self.q_weight, self.eps),
+            cos,
+            sin,
+            self.rotary_dim,
+        )
+        want_k = neox_rope(
+            gemma_rmsnorm(
+                k[last].view(2, self.num_kv_heads, self.head_dim),
+                self.k_weight,
+                self.eps,
+            ),
+            cos,
+            sin,
+            self.rotary_dim,
+        )
+        torch.testing.assert_close(
+            q_out[last].view_as(want_q).float(), want_q.float(), atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            k_out[last].view_as(want_k).float(), want_k.float(), atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            gate_out[last].float(),
+            packed[..., self.head_dim :].float(),
+            atol=0,
+            rtol=0,
+        )
+
     def test_mrope_matches_the_rotary_module(self):
         """With t == h == w every layout agrees, so only distinct rows catch a wrong
         axis. Interleaved [11, 11, 10] is what Qwen3.6-35B-A3B ships, and [24, 20, 20]
