@@ -14,11 +14,12 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import inspect
 import logging
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
-from functools import partial
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
@@ -175,6 +176,29 @@ FULL_CG_PREFILL_WORKSPACE_MARGIN = 1.25
 # Use as a fast path to override the indptr in flashinfer's plan function
 # This is used to remove some host-to-device copy overhead.
 global_override_indptr_cpu = None
+
+
+# Decided once per wrapper class; a **kwargs-only plan() fails closed.
+@lru_cache(maxsize=None)
+def _prefill_plan_accepts_uniform_q_len(wrapper_cls) -> bool:
+    try:
+        return "uniform_q_len" in inspect.signature(wrapper_cls.plan).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _verify_plan_uniform_q_len(*, wrapper_paged, spec_info) -> Optional[int]:
+    """EAGLE verify gives every request num_tokens_per_req query rows (a constant-stride
+    qo_indptr), which FlashInfer's FA2 CUDA-graph planner uses to size its query tile;
+    FlashInfer re-checks the promise against qo_indptr on the host, so a wrong hint
+    degrades to the stock plan rather than failing. None keeps plan() unchanged."""
+    if spec_info is None or spec_info.spec_input_type != SpecInputType.EAGLE_VERIFY:
+        return None
+    if not _prefill_plan_accepts_uniform_q_len(type(wrapper_paged)):
+        return None
+    if spec_info.num_tokens_per_req <= 0:
+        return None
+    return int(spec_info.num_tokens_per_req)
 
 
 def fast_prefill_plan(
@@ -2391,6 +2415,15 @@ class FlashInferIndicesUpdaterPrefill:
         if window_left >= 0:
             # selects the module with the per-element window mask compiled in
             paged_plan_kwargs["window_left"] = window_left
+
+        # fast_prefill_plan has no uniform_q_len and never serves the custom-mask
+        # verify plan; on a FlashInfer without the keyword this adds nothing.
+        if not uses_fast_prefill:
+            uniform_q_len = _verify_plan_uniform_q_len(
+                wrapper_paged=wrapper_paged, spec_info=spec_info
+            )
+            if uniform_q_len is not None:
+                paged_plan_kwargs["uniform_q_len"] = uniform_q_len
 
         wrapper_paged.begin_forward(
             qo_indptr,
