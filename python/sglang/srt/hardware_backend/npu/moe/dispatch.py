@@ -1,12 +1,13 @@
-"""Ascend MoE dispatch state and routing kernels for the no-A2A path.
+"""Ascend MoE dispatch state for the no-A2A path.
 
 The NPU no-A2A path uses the community ``StandardDispatcher``: token routing
 by expert is not a communication concern, so the Ascend work (the routing
 permute with its fused activation quantization, and the weighted unpermute)
 lives in the MoE runner's ``standard -> ascend`` permute hooks instead of in a
-dedicated dispatcher.
+dedicated dispatcher, calling the shared routing entry points in
+``hardware_backend.npu.moe.routing``.
 
-This module owns the two pieces of state those hooks need, both written by the
+This module owns the pieces of state those hooks need, written by the
 quantization method once the weights are loaded:
 
 - the dtype the routing op must hand to the grouped matmul
@@ -15,37 +16,30 @@ quantization method once the weights are loaded:
   :func:`set_finalize_all_gather` (GGUF keeps full, non-intermediate-sharded
   expert weights, so the hidden dim must be gathered).
 
-The kernels are cached on the layer per (dtype, all-gather) so a steady-state
-forward pays no construction cost.
+The resolved ``(quant_mode, all-gather)`` tuple is cached on the layer so a
+steady-state forward pays no resolution cost.
 """
 
 from __future__ import annotations
 
 from typing import Tuple
 
-from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
-    AllGatherFinalizeRoutingWrapper,
-    BaseFinalizeRouting,
-    NPUFinalizeRouting,
-)
-from sglang.srt.hardware_backend.npu.moe.init_routing import (
+from sglang.srt.hardware_backend.npu.moe.routing import (
+    INT8_QUANT_MODE,
     MXFP8_QUANT_MODE,
-    BaseInitRouting,
-    NPUMoEInitRouting_v2,
 )
 from sglang.srt.layers.moe.utils import DispatcherOutputDtype
-from sglang.srt.runtime_context import get_parallel
 
 _DISPATCH_DTYPE_ATTR = "moe_dispatch_dtype"
 _FINALIZE_ALL_GATHER_ATTR = "moe_dispatch_finalize_all_gather"
 _ROUTING_CACHE_ATTR = "_ascend_routing_cache"
 
-# ``npu_moe_init_routing_v2``'s ``quant_mode`` argument: -1 keeps the hidden
-# states as they are, 1 emits int8 + per-token scale, 3 emits e4m3 + e8m0
-# block scales (MXFP8) while fusing the activation quantization into routing.
+# Quant modes the no-A2A routing can produce (see
+# ``hardware_backend.npu.moe.routing``); anything else is a programming error
+# in the quant method that set the dtype rather than a user misconfiguration.
 _QUANT_MODE = {
     DispatcherOutputDtype.BF16: -1,
-    DispatcherOutputDtype.INT8: 1,
+    DispatcherOutputDtype.INT8: INT8_QUANT_MODE,
     DispatcherOutputDtype.MXFP8: MXFP8_QUANT_MODE,
 }
 
@@ -54,8 +48,6 @@ _QUANT_MODE = {
 # a prefix sum"), so the value sits next to the contract it describes.
 GROUP_LIST_TYPE = 1
 
-# Values ``NPUMoEInitRouting_v2`` accepts; anything else is a programming error
-# in the quant method that set the dtype rather than a user misconfiguration.
 _SUPPORTED_DTYPES = tuple(_QUANT_MODE)
 
 
@@ -84,7 +76,7 @@ def set_finalize_all_gather(layer, enabled: bool = True) -> None:
 
 
 def quant_mode_of(dtype) -> int:
-    """Map a dispatch dtype to ``npu_moe_init_routing_v2``'s ``quant_mode``."""
+    """Map a dispatch dtype to the routing op's ``quant_mode``."""
     resolved = DispatcherOutputDtype(dtype)
     if resolved not in _QUANT_MODE:
         raise ValueError(
@@ -94,11 +86,11 @@ def quant_mode_of(dtype) -> int:
     return _QUANT_MODE[resolved]
 
 
-def get_routing(layer) -> Tuple[BaseInitRouting, BaseFinalizeRouting, int]:
-    """Return ``(init, finalize, group_list_type)`` for this layer.
+def get_routing(layer) -> Tuple[int, bool, int]:
+    """Return ``(quant_mode, finalize_tp_all_gather, group_list_type)``.
 
-    Call it after the weights are loaded: the quantization method writes the
-    dtype in ``process_weights_after_loading``, and the first forward follows.
+    Call after the weights are loaded: the quantization method writes the
+    dtype in ``process_weights_after_loading``, before the first forward.
     """
     dtype = get_dispatch_dtype(layer)
     all_gather = bool(getattr(layer, _FINALIZE_ALL_GATHER_ATTR, False))
@@ -106,11 +98,6 @@ def get_routing(layer) -> Tuple[BaseInitRouting, BaseFinalizeRouting, int]:
     if cache is not None and cache[0] == (dtype, all_gather):
         return cache[1], cache[2], cache[3]
 
-    init = NPUMoEInitRouting_v2(quant_mode=quant_mode_of(dtype))
-    finalize: BaseFinalizeRouting = NPUFinalizeRouting(drop_pad_mode=2)
-    if all_gather and get_parallel().tp_size > 1:
-        finalize = AllGatherFinalizeRoutingWrapper(finalize, dim=-1)
-
-    cache = ((dtype, all_gather), init, finalize, GROUP_LIST_TYPE)
-    setattr(layer, _ROUTING_CACHE_ATTR, cache)
-    return init, finalize, GROUP_LIST_TYPE
+    resolved = (quant_mode_of(dtype), all_gather, GROUP_LIST_TYPE)
+    setattr(layer, _ROUTING_CACHE_ATTR, ((dtype, all_gather), *resolved))
+    return resolved
