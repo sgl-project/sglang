@@ -155,6 +155,10 @@ class TestDSV4CompressedPools(CustomTestCase):
                     ]
                     pool.unified_kv_pool = SimpleNamespace(
                         swa_pages=2,
+                        # each layer's compressed rows start past its SWA ring;
+                        # only ratio-1/2 kv_source groups (none here) move it
+                        compress_row_base=[2] * len(stage_ratios),
+                        groups={},
                         kv_buffer=buffers,
                         kv_buffer_rope=rope_buffers,
                     )

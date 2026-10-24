@@ -107,6 +107,9 @@ class PoolName(str, Enum):
     # bf16 rope pool, so each compressed region mirrors to two host pools.
     DEEPSEEK_V4_C4_ROPE = "deepseek_v4_c4_rope"
     DEEPSEEK_V4_C128_ROPE = "deepseek_v4_c128_rope"
+    # DeepSeek-V4.1 ratio-1 / 2 kv_source regions, same split under fp8 unified_kv.
+    DEEPSEEK_V4_C1_ROPE = "deepseek_v4_c1_rope"
+    DEEPSEEK_V4_C2_ROPE = "deepseek_v4_c2_rope"
     DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"

@@ -7,6 +7,11 @@ position and the compressed slot equals the FULL slot. Ratio 2 pair-pools the
 token against the pending partner in the state ring first. ``out_loc == 0``
 marks a padded graph row on both paths, and both return the pre-RoPE latent for
 the index-key projection.
+
+``fp8_2buff=True`` stores into the fp8 two-pool unified_kv instead (the layout of
+``compress_norm_rope_store(fp8_2buff=True)``): ``k_cache`` is the ``[rows, 512]``
+nope pool, ``k_cache_rope`` the ``[rows, rope_dim]`` bf16 rope pool, and slot ``s``
+lands on row ``row_base + s``. The quantization is the V4 one, unchanged.
 """
 
 from __future__ import annotations
@@ -31,7 +36,13 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_c1_module(head_dim: int, rope_dim: int, page_size: int, layout: KVLayout):
+def _jit_c1_module(
+    head_dim: int,
+    rope_dim: int,
+    page_size: int,
+    layout: KVLayout,
+    fp8_2buff: bool = False,
+):
     args = make_cpp_args(
         head_dim,
         rope_dim,
@@ -39,6 +50,19 @@ def _jit_c1_module(head_dim: int, rope_dim: int, page_size: int, layout: KVLayou
         layout.cpp_name,
         is_arch_support_pdl(),
     )
+    if fp8_2buff:
+        # its own module: the paged one never needs the two-pool instantiations
+        return load_jit(
+            make_name("c1_decode_fp8_2buff"),
+            *args,
+            cuda_files=["deepseek_v4/c1.cuh"],
+            cuda_wrappers=[
+                (
+                    "decode_fusion_fp8_2buff",
+                    f"FlashCompress1Kernel<{args}>::run_decode_fusion_fp8_2buff",
+                ),
+            ],
+        )
     return load_jit(
         make_name("c1_decode"),
         *args,
@@ -46,6 +70,21 @@ def _jit_c1_module(head_dim: int, rope_dim: int, page_size: int, layout: KVLayou
         cuda_wrappers=[
             ("decode_fusion", f"FlashCompress1Kernel<{args}>::run_decode_fusion"),
         ],
+    )
+
+
+def _check_fp8_2buff(
+    layout: KVLayout,
+    k_cache: torch.Tensor,
+    k_cache_rope: Optional[torch.Tensor],
+    rope_dim: int,
+) -> None:
+    from .unified_kv_kernels.layout import check_two_pool_pair
+
+    assert layout is KVLayout.V4, "the fp8 two-pool store quantizes like V4"
+    assert is_hip_runtime(), "the fp8 two-pool unified_kv only exists on HIP"
+    check_two_pool_pair(
+        k_cache, k_cache_rope, rope_width=rope_dim, rope_dtype=torch.bfloat16
     )
 
 
@@ -61,6 +100,9 @@ def c1_decode_norm_rope_store(
     page_size: int,
     layout: Union[KVLayout, str] = KVLayout.V4,
     out: Optional[torch.Tensor] = None,
+    fp8_2buff: bool = False,
+    k_cache_rope: Optional[torch.Tensor] = None,
+    row_base: int = 0,
 ) -> torch.Tensor:
     """RMSNorm ``kv_input`` and write the main KV slot, in a single launch.
 
@@ -92,6 +134,22 @@ def c1_decode_norm_rope_store(
         out = kv_input.new_empty((num_tokens, head_dim))
 
     layout = KVLayout.parse(layout)
+    if fp8_2buff:
+        _check_fp8_2buff(layout, k_cache, k_cache_rope, freqs_cis.shape[-1])
+        module = _jit_c1_module(head_dim, freqs_cis.shape[-1], 1, layout, True)
+        module.decode_fusion_fp8_2buff(
+            kv_input,
+            out,
+            norm_weight,
+            freqs_cis,
+            positions,
+            out_loc,
+            k_cache.view(torch.uint8),
+            k_cache_rope.view(torch.uint8),
+            int(row_base),
+            float(eps),
+        )
+        return out
     module = _jit_c1_module(head_dim, freqs_cis.shape[-1], page_size, layout)
     module.decode_fusion(
         kv_input,
@@ -113,6 +171,7 @@ def _jit_c2_module(
     rope_dim: int,
     page_size: int,
     layout: KVLayout,
+    fp8_2buff: bool = False,
 ) -> Module:
     args = make_cpp_args(
         head_dim,
@@ -121,6 +180,22 @@ def _jit_c2_module(
         layout.cpp_name,
         is_arch_support_pdl(),
     )
+    if fp8_2buff:
+        return load_jit(
+            make_name("c2_fp8_2buff"),
+            *args,
+            cuda_files=["deepseek_v4/c2.cuh"],
+            cuda_wrappers=[
+                (
+                    "decode_fusion_fp8_2buff",
+                    f"FlashCompress2Kernel<{args}>::run_decode_fusion_fp8_2buff",
+                ),
+                (
+                    "prefill_fusion_fp8_2buff",
+                    f"FlashCompress2Kernel<{args}>::run_prefill_fusion_fp8_2buff",
+                ),
+            ],
+        )
     return load_jit(
         make_name("c2"),
         *args,
@@ -148,6 +223,9 @@ def c2_decode_norm_rope_store(
     draft_len: int = 1,
     layout: Union[KVLayout, str] = KVLayout.V4,
     out: Optional[torch.Tensor] = None,
+    fp8_2buff: bool = False,
+    k_cache_rope: Optional[torch.Tensor] = None,
+    row_base: int = 0,
 ) -> torch.Tensor:
     """Pair-pool ``kv_input`` against ``kv_state``, RMSNorm, and write the main KV slot.
 
@@ -175,6 +253,26 @@ def c2_decode_norm_rope_store(
         out = kv_input.new_empty((num_tokens, head_dim), dtype=torch.bfloat16)
 
     layout = KVLayout.parse(layout)
+    if fp8_2buff:
+        _check_fp8_2buff(layout, k_cache, k_cache_rope, freqs_cis.shape[-1])
+        module = _jit_c2_module(head_dim, freqs_cis.shape[-1], 1, layout, True)
+        module.decode_fusion_fp8_2buff(
+            kv_input,
+            kv_state,
+            out,
+            norm_weight,
+            positions,
+            req,
+            raw_out_loc,
+            eps,
+            freqs_cis,
+            k_cache.view(torch.uint8),
+            k_cache_rope.view(torch.uint8),
+            int(row_base),
+            ring_size,
+            draft_len,
+        )
+        return out
     module = _jit_c2_module(head_dim, freqs_cis.shape[-1], page_size, layout)
     module.decode_fusion(
         kv_input,
@@ -211,6 +309,9 @@ def c2_prefill_norm_rope_store(
     ring_size: int,
     layout: Union[KVLayout, str] = KVLayout.V4,
     out: Optional[torch.Tensor] = None,
+    fp8_2buff: bool = False,
+    k_cache_rope: Optional[torch.Tensor] = None,
+    row_base: int = 0,
 ) -> torch.Tensor:
     """:func:`c2_decode_norm_rope_store` for an extend batch, then the ring write-back.
 
@@ -231,6 +332,27 @@ def c2_prefill_norm_rope_store(
         out = kv_input.new_empty((num_tokens, head_dim), dtype=torch.bfloat16)
 
     layout = KVLayout.parse(layout)
+    if fp8_2buff:
+        _check_fp8_2buff(layout, k_cache, k_cache_rope, freqs_cis.shape[-1])
+        module = _jit_c2_module(head_dim, freqs_cis.shape[-1], 1, layout, True)
+        module.prefill_fusion_fp8_2buff(
+            kv_input,
+            kv_state,
+            out,
+            norm_weight,
+            positions,
+            req,
+            raw_out_loc,
+            eps,
+            freqs_cis,
+            k_cache.view(torch.uint8),
+            k_cache_rope.view(torch.uint8),
+            int(row_base),
+            ring_size,
+            extend_start_loc,
+            extend_seq_lens,
+        )
+        return out
     module = _jit_c2_module(head_dim, freqs_cis.shape[-1], page_size, layout)
     module.prefill_fusion(
         kv_input,

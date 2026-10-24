@@ -459,6 +459,71 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 components={ComponentType.FULL, ComponentType.SWA},
             )
 
+    def test_unified_deepseek_v41_ships_rope_regions_for_its_own_ratios(self):
+        """Fp8 unified V4.1 ships each C1/C2 group with its bf16 rope half, and asks
+        for no C4/C128 rope region: V4.1 has neither ratio."""
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4LayerItem
+
+        def index_pool(num_layers):
+            return SimpleNamespace(
+                page_size=2,
+                index_k_with_scale_buffer=[
+                    torch.zeros((8, 3), dtype=torch.uint8) for _ in range(num_layers)
+                ],
+            )
+
+        nope = {1: ([torch.zeros((4, 5), dtype=torch.uint8)], 5)}
+        nope[2] = ([torch.zeros((4, 6), dtype=torch.uint8) for _ in range(2)], 6)
+        rope = {1: ([torch.zeros((4, 2), dtype=torch.uint8)], 2)}
+        rope[2] = ([torch.zeros((4, 2), dtype=torch.uint8) for _ in range(2)], 2)
+        kvcache = SimpleNamespace(
+            _unified_kv=True,
+            start_layer=0,
+            end_layer=3,
+            layer_mapping=[
+                DeepSeekV4LayerItem(2, -1),
+                DeepSeekV4LayerItem(1, -1),
+                DeepSeekV4LayerItem(2, -1),
+            ],
+            swa_kv_pool=None,
+            c4_kv_pool=None,
+            c128_kv_pool=None,
+            c4_indexer_kv_pool=None,
+            swa_page_size=4,
+            sources_by_ratio={1: [1], 2: [0, 2]},
+            index_pools={1: index_pool(1), 2: index_pool(2)},
+            unified_region_buffers=Mock(side_effect=nope.__getitem__),
+            unified_rope_region_buffers=Mock(side_effect=rope.__getitem__),
+        )
+
+        group = _build_deepseek_v4_device_pool_group(kvcache, page_size=4)
+
+        self.assertEqual(
+            set(group.entry_map),
+            {
+                PoolName.DEEPSEEK_V4_C1,
+                PoolName.DEEPSEEK_V4_C1_ROPE,
+                PoolName.DEEPSEEK_V4_C1_INDEXER,
+                PoolName.DEEPSEEK_V4_C2,
+                PoolName.DEEPSEEK_V4_C2_ROPE,
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+            },
+        )
+        self.assertEqual(
+            kvcache.unified_rope_region_buffers.call_args_list, [call(1), call(2)]
+        )
+        for name, buffers, mapping in (
+            (PoolName.DEEPSEEK_V4_C1_ROPE, rope[1][0], {1: 0}),
+            (PoolName.DEEPSEEK_V4_C2_ROPE, rope[2][0], {0: 0, 2: 1}),
+        ):
+            entry = group.entry_map[name]
+            self.assertEqual(group.sources[name], PoolName.KV)
+            self.assertEqual(entry.layer_mapping, mapping)
+            self.assertEqual(
+                [b.data_ptr() for b in entry.components[0]],
+                [b.data_ptr() for b in buffers],
+            )
+
     def test_unified_deepseek_v4_uses_only_compressed_pools(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4LayerItem
 

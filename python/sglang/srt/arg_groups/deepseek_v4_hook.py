@@ -251,7 +251,12 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
 
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+        is_unified_kv_fp8,
         is_unified_kv_triton,
+    )
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
     )
 
     cfg = resolving_view(server_args)
@@ -319,7 +324,31 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             and str(cfg.speculative_algorithm).upper() != "DSPARK",
         ),
         ("HiSparse", cfg.enable_hisparse),
-        ("the unified KV layout", is_unified_kv_triton()),
+        # The fp8 two-pool layout covers ratios 1 / 2 (kv_source groups), incl. PD
+        # transfer, the external cache linker and DSpark (its draft keeps a bf16
+        # ring of its own); the bf16 rows, encoder replay and HiCache are not
+        # wired / validated for them.
+        (
+            "the bf16 unified KV layout (set SGLANG_DSV4_UNIFIED_KV_FP8=1)",
+            is_unified_kv_triton() and not is_unified_kv_fp8(),
+        ),
+        # the decoder replay floors the late layers' window (pf_swa_floor); the
+        # encoder replay moves the window into a RequestWindow pool unified lacks
+        (
+            "the unified KV layout with encoder SWA bounded replay",
+            is_unified_kv_triton() and cfg.enable_encoder_swa_bounded_replay,
+        ),
+        # the draft's block window assumes uniform verify blocks
+        (
+            "the unified KV layout with compact ragged verify",
+            is_unified_kv_triton()
+            and cfg.speculative_algorithm is not None
+            and read_ragged_verify_mode() is not RaggedVerifyMode.STATIC,
+        ),
+        (
+            "the unified KV layout with HiCache",
+            is_unified_kv_triton() and cfg.enable_hierarchical_cache,
+        ),
         (
             "TRT-LLM with encoder SWA bounded replay",
             cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
@@ -335,11 +364,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
 
     if cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None:
-        from sglang.srt.speculative.ragged_verify import (
-            RaggedVerifyMode,
-            read_ragged_verify_mode,
-        )
-
         # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
         supported_prefill_cp = (
             cfg.disaggregation_mode == "prefill"
@@ -348,7 +372,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
+            or cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "mori")
             or (
                 (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
                 and not supported_prefill_cp
@@ -356,8 +380,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             or cfg.dcp_size != 1
         ):
             raise ValueError(
-                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake or NIXL, "
-                "DCP=1, and CP=1 on decode. Prefill CP requires "
+                "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, NIXL, "
+                "or MoRI, DCP=1, and CP=1 on decode. Prefill CP requires "
                 "--enable-prefill-cp with the interleave strategy. "
                 "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."

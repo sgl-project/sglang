@@ -1852,7 +1852,12 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
 
     from sglang.srt.disaggregation.base.conn import StateType
 
-    if kv_args.state_types.count(StateType.SWA) != 2:
+    # Paged KV ships target and draft SWA as two SWA components, unified KV as two
+    # SWA_RING; the state_types below keep a paged side from pairing with a unified one.
+    if (
+        kv_args.state_types.count(StateType.SWA) != 2
+        and kv_args.state_types.count(StateType.SWA_RING) != 2
+    ):
         raise RuntimeError(
             "DeepSeek-V4.1 DSpark PD requires target and draft SWA state"
         )

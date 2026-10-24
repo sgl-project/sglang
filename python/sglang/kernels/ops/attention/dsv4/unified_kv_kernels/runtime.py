@@ -35,6 +35,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
+    inverse_rope_tail,
+)
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.layout import (
     check_two_pool_pair,
 )
@@ -371,10 +374,11 @@ def flydsl_decode_supported(
 
 
 def _stream_hint(compress_ratio: Optional[int]) -> Optional[str]:
-    # FlyDSL split plans are keyed by stream kind
+    # FlyDSL split plans are keyed by stream kind; DeepSeek-V4.1's ratio-1/2
+    # streams are an SWA-ring prefix plus a top-k tail, the CSA shape
     if compress_ratio is None:
         return None
-    return {0: "swa", 4: "csa", 128: "hca"}[compress_ratio]
+    return {0: "swa", 1: "csa", 2: "csa", 4: "csa", 128: "hca"}[compress_ratio]
 
 
 def flydsl_grouped_verify_pays(
@@ -399,6 +403,179 @@ def build_grouped_verify_streams(
     )
 
 
+# DeepSeek-V4.1 low-ratio streams (128 SWA rows + up to 512 top-k rows): the
+# occupancy heuristic over-splits them and the stage-2 merge dominates. MI355X,
+# 16 heads, 640 rows: auto 16.1 us (merge 9.2) vs 8 splits 14.1 at T=1, best at
+# T=8 / 16 too (work/tests/bench_unified_decode.py).
+_DECODE_LOW_RATIO_SPLITS = 8
+
+
+def _decode_fp8_head_splits(T: int, compress_ratio: Optional[int]) -> Optional[int]:
+    """Split count for T <= _DECODE_SPLIT_TAIL_MIN_TOKENS; None keeps aiter's pick.
+
+    The 128-row SWA stream runs fastest unsplit (7.1 vs 10.4 us at T=1), the
+    ratio-1/2 streams at 8 splits; c4 / c128 keep the heuristic."""
+    if compress_ratio == 0:
+        return 1
+    if compress_ratio in (1, 2):
+        return max(1, min(_DECODE_LOW_RATIO_SPLITS, _cu_count() // T))
+    return None
+
+
+@triton.jit
+def _merge_splits_inv_rope_kernel(
+    mid_o_ptr,  # [n_seq, S, H, Lv] fp32 split partials (normalised per split)
+    mid_lse_ptr,  # [n_seq, S, H, 1] fp32
+    out_ptr,  # [n_seq, H, Lv] bf16
+    kv_indptr_ptr,  # [n_seq+1] int32
+    split_indptr_ptr,  # [n_seq+1] int32
+    valid_split_ptr,  # [n_seq] int32, written by the asm kernel
+    fr_ptr,  # [max_pos, ROPE_DIM] fp32, real/imag interleaved
+    pos_ptr,  # [n_seq] int
+    stride_mid_ob,  # S * H
+    stride_mid_os,  # H
+    stride_obs,
+    stride_oh,
+    fr_stride_pos,
+    Lv: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    mgc: tl.constexpr,
+    MAX_S: tl.constexpr,  # >= the split count, power of two
+):
+    """aiter's ``_fwd_kernel_stage2_asm`` (decode: one q row per sequence, split
+    count > 1) with the model's inverse RoPE on the last ROPE_DIM dims folded into
+    the store, as SGLang's gluon split reduce does for the paged V4.1 path.
+
+    Every split's partial is loaded up front, in one batch of loads, and the
+    online-softmax recurrence then runs in stage2's order on registers: the same
+    arithmetic, without one dependent global load per split."""
+    seq = tl.program_id(0)
+    head = tl.program_id(1)
+    kv_len = tl.load(kv_indptr_ptr + seq + 1) - tl.load(kv_indptr_ptr + seq)
+    n_split = tl.load(split_indptr_ptr + seq + 1) - tl.load(split_indptr_ptr + seq)
+    n_valid = tl.minimum(n_split, tl.cdiv(kv_len, mgc))
+    n_valid = tl.minimum(n_valid, tl.load(valid_split_ptr + seq))
+    d = tl.arange(0, Lv)
+    offs_logic = seq * stride_mid_ob + head
+    s = tl.arange(0, MAX_S)
+    live_s = s < n_valid
+    tv_all = tl.load(
+        mid_o_ptr + (offs_logic + s[:, None] * stride_mid_os) * Lv + d[None, :],
+        mask=live_s[:, None],
+        other=0.0,
+    )
+    lse_all = tl.load(
+        mid_lse_ptr + offs_logic + s * stride_mid_os, mask=live_s, other=0.0
+    )
+    e_sum = 0.0
+    e_max = -float("inf")
+    acc = tl.zeros((Lv,), dtype=tl.float32)
+    for split in tl.static_range(MAX_S):
+        pick = s == split
+        tv = tl.sum(tl.where(pick[:, None], tv_all, 0.0), axis=0)
+        tlogic = tl.sum(tl.where(pick, lse_all, 0.0), axis=0)
+        live = split < n_valid
+        n_e_max = tl.maximum(tlogic, e_max)
+        old_scale = tl.exp(e_max - n_e_max)
+        new_acc = acc * old_scale
+        exp_logic = tl.exp(tlogic - n_e_max)
+        new_acc += exp_logic * tv
+        acc = tl.where(live, new_acc, acc)
+        e_sum = tl.where(live, e_sum * old_scale + exp_logic, e_sum)
+        e_max = tl.where(live, n_e_max, e_max)
+    out = (acc / e_sum).to(out_ptr.dtype.element_ty)
+    pos = tl.load(pos_ptr + seq)
+    out = inverse_rope_tail(out, d, fr_ptr, pos, fr_stride_pos, Lv, ROPE_DIM)
+    tl.store(out_ptr + seq * stride_obs + head * stride_oh + d, out)
+
+
+_MERGE_NUM_WARPS = 2  # bench_merge.py: 3.4 us at T=1..16, 8 splits (1 warp 3.8, 4 warps 5.3; stage2 5.2)
+
+
+def _decode_fp8_2buff_inv_rope(
+    q,
+    q_rope,
+    unified_kv,
+    unified_kv_rope,
+    kv_indices,
+    kv_indptr,
+    attn_sink,
+    out,
+    qo_indptr,
+    num_kv_splits,
+    inv_rope,
+) -> None:
+    """mla_decode_fwd_v4_nm's asm call and split bookkeeping, then the split merge
+    with the inverse RoPE folded in (one kernel instead of stage2 + a RoPE pass)."""
+    import aiter
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.mla import get_meta_param
+
+    n_seq = qo_indptr.shape[0] - 1
+    T, H, row_bytes = q.shape
+    rows = unified_kv.shape[0]
+    v_head_dim = out.shape[-1]
+    _, split_indptr = get_meta_param(
+        num_kv_splits, n_seq, kv_indices.shape[0], H, 1, q.dtype, max(1, -(-H // 64)), 1
+    )
+    split_indptr = split_indptr.to(device=q.device, dtype=torch.int32)
+    logits = torch.empty(
+        (n_seq, num_kv_splits, H, v_head_dim), dtype=torch.float32, device=q.device
+    )
+    lse = torch.empty(
+        (n_seq, num_kv_splits, H, 1), dtype=torch.float32, device=q.device
+    )
+    valid = torch.empty((n_seq,), dtype=torch.int32, device=q.device)
+    aiter.mla_decode_v4_asm(
+        q,
+        q_rope,
+        unified_kv.view(rows, 1, 1, row_bytes),
+        unified_kv_rope.view(rows, 1, 1, unified_kv_rope.shape[-1]),
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        split_indptr,
+        attn_sink,
+        1,
+        0.0,
+        0,
+        int(num_kv_splits),
+        logits,
+        lse,
+        out,
+        valid,
+        1,
+        None,
+    )
+    freqs_real, positions = inv_rope
+    assert freqs_real.dtype == torch.float32 and freqs_real.stride(1) == 1
+    mgc = (
+        32 if (H in (8, 16) and get_gfx() == "gfx950") else (64 if H in (8, 16) else 16)
+    )
+    _merge_splits_inv_rope_kernel[(n_seq, H)](
+        logits,
+        lse,
+        out,
+        kv_indptr,
+        split_indptr,
+        valid,
+        freqs_real,
+        positions,
+        lse.stride(0),
+        lse.stride(1),
+        out.stride(0),
+        out.stride(1),
+        freqs_real.stride(0),
+        Lv=v_head_dim,
+        ROPE_DIM=freqs_real.shape[-1],
+        mgc=mgc,
+        MAX_S=triton.next_power_of_2(int(num_kv_splits)),
+        num_warps=_MERGE_NUM_WARPS,
+        num_stages=2,
+        waves_per_eu=4,
+    )
+
+
 def decode_fp8_2buff(
     *,
     q: torch.Tensor,  # [T, H, nope_row_bytes] fp8 packed nope + inline e8m0 scale
@@ -415,6 +592,8 @@ def decode_fp8_2buff(
     compress_ratio: Optional[int] = None,
     q_kv_bounds: Optional[torch.Tensor] = None,
     kv_len_hint: Optional[int] = None,
+    low_ratio_model: bool = False,
+    inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Decode over the two-pool fp8 unified_kv, through aiter's FlyDSL v4 nm
     decode (split merge in the same launch) where available, else the asm kernel.
@@ -437,6 +616,13 @@ def decode_fp8_2buff(
 
     ``compress_ratio`` names the stream (0 SWA, 4 CSA, 128 HCA) so the split
     count past 40 tokens can fit the stream; None keeps the fixed 4.
+    ``low_ratio_model`` (DeepSeek-V4.1: ratios 0 / 1 / 2) also picks the asm
+    split count up to 40 tokens (``_decode_fp8_head_splits``); V4 keeps aiter's.
+
+    ``inv_rope`` = (freqs_real ``[max_pos, rope_dim]`` fp32, positions) applies the
+    model's inverse RoPE to the output: folded into the split merge when the asm
+    call splits (decode, one q row per sequence), else a RoPE pass on the bf16
+    output.
 
     ``max_seqlen_q`` above 1 puts several q rows in one tile, which the v4
     dispatcher serves for gqa=16 at 1, 2 and 4 off the same 64-row tile.
@@ -486,7 +672,7 @@ def decode_fp8_2buff(
         kwargs = dict(hint=_stream_hint(compress_ratio), q_kv_bounds=q_kv_bounds)
     else:
         assert q_kv_bounds is None, "grouped verify streams need FlyDSL"
-        if fp8_hca_persist_wanted(
+        if inv_rope is None and fp8_hca_persist_wanted(
             T=T,
             H=H,
             v_head_dim=v_head_dim,
@@ -520,6 +706,29 @@ def decode_fp8_2buff(
         # the per-token path and differ once q rows share a tile.
         if num_kv_splits is None and n_seq > _DECODE_SPLIT_TAIL_MIN_TOKENS:
             num_kv_splits = _decode_fp8_tail_splits(n_seq, compress_ratio)
+        elif num_kv_splits is None and low_ratio_model:
+            num_kv_splits = _decode_fp8_head_splits(n_seq, compress_ratio)
+        if (
+            inv_rope is not None
+            and num_kv_splits is not None
+            and num_kv_splits > 1
+            and max_seqlen_q == 1
+            and n_seq == T
+        ):
+            _decode_fp8_2buff_inv_rope(
+                q,
+                q_rope,
+                unified_kv,
+                unified_kv_rope,
+                kv_indices,
+                kv_indptr,
+                attn_sink,
+                out,
+                qo_indptr,
+                num_kv_splits,
+                inv_rope,
+            )
+            return out[:T]
         decode_fwd, kwargs = (
             mla_decode_fwd_v4_nm,
             dict(num_kv_splits=num_kv_splits, split_indptr=split_indptr),
@@ -541,6 +750,8 @@ def decode_fp8_2buff(
     # ReqToTokenPool reserves, so the builders can't emit a zero-length one, and
     # the compare + masked_fill_ was costing a launch per layer for it. One would
     # come back NaN now (all-sink denominator); the guard UT pins that.
+    if inv_rope is not None:
+        apply_inverse_rope(out[:T], inv_rope)
     return out[:T]
 
 
@@ -576,6 +787,25 @@ def decode_fp8_2buff_wo_a_mxfp8(
         qo_indptr=qo_indptr,
         max_seqlen_q=max_seqlen_q,
         q_kv_bounds=q_kv_bounds,
+    )
+
+
+def apply_inverse_rope(
+    out: torch.Tensor, inv_rope: Tuple[torch.Tensor, torch.Tensor]
+) -> None:
+    """The model's standalone inverse RoPE on ``out`` ``[T, H, D]`` (last rope_dim
+    dims of every head), for the paths that do not fold it into a merge."""
+    from sglang.kernels.ops.attention.dsv4.norm_rope import fused_rope_inplace
+
+    freqs_real, positions = inv_rope
+    T = out.shape[0]
+    freqs_cis = torch.view_as_complex(freqs_real.view(freqs_real.shape[0], -1, 2))
+    fused_rope_inplace(
+        out[..., -freqs_real.shape[-1] :],
+        None,
+        freqs_cis,
+        positions.view(-1)[:T],
+        inverse=True,
     )
 
 
@@ -687,6 +917,352 @@ def build_decode_streams(
     return swa_i, swa_p, hca_i, hca_p, csa_i, csa_p
 
 
+@triton.jit
+def _swa_prefix_kernel(
+    state_slot_ptr,  # [N] int32
+    positions_ptr,  # [N] int32
+    indptr_ptr,  # [N+1] int32
+    indices_ptr,  # [*] int32 (out)
+    ring_stride,
+    win: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Per token: the SWA-ring prefix ``slot*ring + (pos-n+1+i)%ring``, i < n,
+    n = min(pos+1, win), at indptr[t] -- the prefix every decode stream starts with."""
+    t = tl.program_id(0)
+    slot = tl.load(state_slot_ptr + t)
+    pos = tl.load(positions_ptr + t)
+    n = tl.minimum(pos + 1, win)
+    base = tl.load(indptr_ptr + t)
+    i = tl.arange(0, BLOCK_N)
+    abs_pos = pos - n + 1 + i
+    tl.store(
+        indices_ptr + base + i, slot * ring_stride + abs_pos % ring_stride, mask=i < n
+    )
+
+
+def build_low_ratio_decode_stream(
+    *,
+    state_slot: torch.Tensor,  # [N] int
+    positions: torch.Tensor,  # [N] int
+    swa_len: torch.Tensor,  # [N] int, == min(pos+1, win)
+    compress_len: torch.Tensor,  # [N] int, valid front-packed top-k entries
+    width: int,  # top-k columns of the ratio's sparse page indices
+    win: int,
+    ring_stride: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Decode stream of a ratio-1/2 (DeepSeek-V4.1) layer: the SWA-ring prefix,
+    written here once per step, then ``compress_len`` compressed rows that
+    ``fill_compress_tail`` writes per layer (the indexer rewrites the top-k and
+    each kv_source group member has its own compressed-row base)."""
+    device = state_slot.device
+    N = state_slot.shape[0]
+    indptr = _lengths_to_indptr(swa_len + compress_len)
+    indices = torch.empty(N * (win + width), dtype=torch.int32, device=device)
+    if N > 0:
+        _swa_prefix_kernel[(N,)](
+            state_slot.to(torch.int32),
+            positions.to(torch.int32),
+            indptr,
+            indices,
+            ring_stride,
+            win=win,
+            BLOCK_N=triton.next_power_of_2(win),
+        )
+    return indices, indptr
+
+
+@triton.jit
+def _dspark_block_stream_kernel(
+    state_slot_ptr,  # [N] int
+    positions_ptr,  # [N] int
+    indptr_ptr,  # [N+1] int32
+    indices_ptr,  # [*] int32 (out)
+    ring_stride,
+    block_size,
+    win: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Per token of a DSpark draft block: its request's window ``[prefix - n,
+    prefix)``, n = min(prefix, win), then the whole block ``[prefix, prefix +
+    block_size)``, as ring rows ``slot*ring + pos%ring`` at indptr[t]; prefix is
+    the position of the block's first row."""
+    t = tl.program_id(0)
+    first = t - t % block_size
+    slot = tl.load(state_slot_ptr + first).to(tl.int64)
+    prefix = tl.load(positions_ptr + first).to(tl.int64)
+    n = tl.minimum(prefix, win)
+    base = tl.load(indptr_ptr + t)
+    i = tl.arange(0, BLOCK_N)
+    abs_pos = prefix - n + i
+    tl.store(
+        indices_ptr + base + i,
+        (slot * ring_stride + abs_pos % ring_stride).to(tl.int32),
+        mask=i < n + block_size,
+    )
+
+
+def build_dspark_block_streams(
+    *,
+    state_slot: torch.Tensor,  # [N] int, request-major
+    positions: torch.Tensor,  # [N] int, prefix + i on row i of a block
+    block_size: int,
+    win: int,
+    ring_stride: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Decode streams of a DeepSeek-V4.1 DSpark draft block (``block_size`` rows
+    per request): every row reads its request's last ``win`` committed positions
+    and the whole block, not a causal window -- the paged draft's block window
+    (``BuildDsparkSwaRingIndices``) over the unified SWA ring."""
+    device = state_slot.device
+    N = state_slot.shape[0]
+    assert N % block_size == 0, f"{N=} rows are not whole blocks of {block_size}"
+    assert ring_stride >= win + block_size, (
+        f"a ring of {ring_stride} rows cannot hold the {win}-row window and the "
+        f"{block_size}-row block at once"
+    )
+    prefix = positions.reshape(-1, block_size)[:, :1].to(torch.int32)
+    lengths = (torch.clamp(prefix, max=win) + block_size).expand(-1, block_size)
+    indptr = _lengths_to_indptr(lengths.reshape(-1))
+    indices = torch.empty(N * (win + block_size), dtype=torch.int32, device=device)
+    if N > 0:
+        _dspark_block_stream_kernel[(N,)](
+            state_slot.contiguous(),
+            positions.contiguous(),
+            indptr,
+            indices,
+            ring_stride,
+            block_size,
+            win=win,
+            BLOCK_N=triton.next_power_of_2(win + block_size),
+        )
+    return indices, indptr
+
+
+@triton.jit
+def _v41_decode_lengths_kernel(
+    seq_lens_ptr,  # [N] int
+    swa_len_ptr,  # [N] int
+    swa_indptr_ptr,  # [N+1] int32 (out)
+    c1_len_ptr,  # [N] int32 (out)
+    c1_indptr_ptr,  # [N+1] int32 (out)
+    c2_len_ptr,
+    c2_indptr_ptr,
+    N,
+    topk,
+    HAS_C1: tl.constexpr,
+    HAS_C2: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """One program: the SWA stream's indptr and, per ratio R in (1, 2), the top-k
+    length min(seq_len // R, topk) and its stream's indptr (SWA prefix + tail)."""
+    i = tl.arange(0, BLOCK)
+    m = i < N
+    sl = tl.load(seq_lens_ptr + i, mask=m, other=0).to(tl.int32)
+    sw = tl.load(swa_len_ptr + i, mask=m, other=0).to(tl.int32)
+    tl.store(swa_indptr_ptr, 0)
+    tl.store(swa_indptr_ptr + 1 + i, tl.cumsum(sw, axis=0), mask=m)
+    if HAS_C1:
+        ln = tl.minimum(sl, topk)
+        tl.store(c1_len_ptr + i, ln, mask=m)
+        tl.store(c1_indptr_ptr, 0)
+        tl.store(c1_indptr_ptr + 1 + i, tl.cumsum(sw + ln, axis=0), mask=m)
+    if HAS_C2:
+        ln = tl.minimum(sl // 2, topk)
+        tl.store(c2_len_ptr + i, ln, mask=m)
+        tl.store(c2_indptr_ptr, 0)
+        tl.store(c2_indptr_ptr + 1 + i, tl.cumsum(sw + ln, axis=0), mask=m)
+
+
+@triton.jit
+def _v41_decode_swa_kernel(
+    state_slot_ptr,  # [N] int
+    positions_ptr,  # [N] int
+    indptr_ptr,  # [N+1] int32
+    indices_ptr,  # [*] int32 (out)
+    swa_loc_ptr,  # [N] int32 (out)
+    swa_loc_i64_ptr,  # [N] int64 (out)
+    ring_stride,
+    win: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Per token: _swa_prefix_kernel's SWA-ring prefix, and the ring row this
+    step's K goes to, slot*ring + pos%ring."""
+    t = tl.program_id(0)
+    slot = tl.load(state_slot_ptr + t).to(tl.int64)
+    pos = tl.load(positions_ptr + t).to(tl.int64)
+    n = tl.minimum(pos + 1, win)
+    base = tl.load(indptr_ptr + t)
+    i = tl.arange(0, BLOCK_N)
+    abs_pos = pos - n + 1 + i
+    tl.store(
+        indices_ptr + base + i,
+        (slot * ring_stride + abs_pos % ring_stride).to(tl.int32),
+        mask=i < n,
+    )
+    loc = slot * ring_stride + pos % ring_stride
+    tl.store(swa_loc_ptr + t, loc.to(tl.int32))
+    tl.store(swa_loc_i64_ptr + t, loc)
+
+
+def build_v41_decode_meta(
+    *,
+    state_slot: torch.Tensor,  # [N] int
+    positions: torch.Tensor,  # [N] int
+    seq_lens: torch.Tensor,  # [N] int
+    swa_len: torch.Tensor,  # [N] int, == min(pos+1, win)
+    ratios,  # the model's ratio-1/2 set
+    topk: int,
+    win: int,
+    ring_stride: int,
+) -> dict:
+    """Decode metadata of a model whose compressed layers are all ratio 1 / 2
+    (DeepSeek-V4.1), in two launches: the SWA stream (ratio-0 layers), each
+    ratio's top-k length and stream indptr (the streams themselves are built per
+    index source, build_low_ratio_group_streams), and the SWA ring write rows."""
+    N = state_slot.shape[0]
+    dev = state_slot.device
+    i32 = dict(dtype=torch.int32, device=dev)
+    out = dict(
+        swa_indptr=torch.empty(N + 1, **i32),
+        swa_indices=torch.empty(N * win, **i32),
+        swa_loc=torch.empty(N, **i32),
+        swa_loc_i64=torch.empty(N, dtype=torch.int64, device=dev),
+    )
+    for r in (1, 2):
+        if r in ratios:
+            out[f"c{r}_len"] = torch.empty(N, **i32)
+            out[f"c{r}_indptr"] = torch.empty(N + 1, **i32)
+    if N == 0:
+        out["swa_indptr"].zero_()
+        for r in ratios:
+            out[f"c{r}_indptr"].zero_()
+        return out
+    assert state_slot.is_contiguous() and positions.is_contiguous()
+    assert seq_lens.is_contiguous() and swa_len.is_contiguous()
+    dummy = out["swa_indptr"]
+    _v41_decode_lengths_kernel[(1,)](
+        seq_lens,
+        swa_len,
+        out["swa_indptr"],
+        out.get("c1_len", dummy),
+        out.get("c1_indptr", dummy),
+        out.get("c2_len", dummy),
+        out.get("c2_indptr", dummy),
+        N,
+        topk,
+        HAS_C1=1 in ratios,
+        HAS_C2=2 in ratios,
+        BLOCK=triton.next_power_of_2(N),
+        num_warps=4,
+    )
+    _v41_decode_swa_kernel[(N,)](
+        state_slot,
+        positions,
+        out["swa_indptr"],
+        out["swa_indices"],
+        out["swa_loc"],
+        out["swa_loc_i64"],
+        ring_stride,
+        win=win,
+        BLOCK_N=triton.next_power_of_2(win),
+    )
+    return out
+
+
+@triton.jit
+def _low_ratio_group_stream_kernel(
+    indices_ptr,  # [G, stride_g] int32 (out)
+    indptr_ptr,  # [N+1] int32
+    state_slot_ptr,  # [N] int
+    positions_ptr,  # [N] int
+    prefix_len_ptr,  # [N] int
+    page_idx_ptr,  # [N, Wc] int
+    valid_len_ptr,  # [N] int
+    stride_g,
+    ring_stride,
+    base0,
+    base_step,
+    win: tl.constexpr,
+    Wc: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Per (token t, layer g): _swa_prefix_kernel's SWA-ring prefix, then
+    _fill_compress_tail_kernel's tail at compressed-row base base0 + g*base_step."""
+    t = tl.program_id(0)
+    g = tl.program_id(1)
+    out = indices_ptr + g.to(tl.int64) * stride_g + tl.load(indptr_ptr + t)
+    slot = tl.load(state_slot_ptr + t).to(tl.int32)
+    pos = tl.load(positions_ptr + t).to(tl.int32)
+    n = tl.minimum(pos + 1, win)
+    i = tl.arange(0, BLOCK_N)
+    tl.store(out + i, slot * ring_stride + (pos - n + 1 + i) % ring_stride, mask=i < n)
+    tail = out + tl.load(prefix_len_ptr + t).to(tl.int32)
+    base = base0 + g * base_step
+    nc = tl.load(valid_len_ptr + t).to(tl.int32)
+    for off in tl.range(0, Wc, BLOCK):
+        j = off + tl.arange(0, BLOCK)
+        m = j < nc
+        j_clamped = tl.minimum(j, Wc - 1)
+        pi = tl.load(page_idx_ptr + t * Wc + j_clamped, mask=m, other=-1).to(tl.int32)
+        tl.store(tail + j, tl.where(pi >= 0, pi + base, -1), mask=m)
+
+
+def low_ratio_decode_indptr(
+    swa_len: torch.Tensor, compress_len: torch.Tensor
+) -> torch.Tensor:
+    """indptr of a ratio-1/2 decode stream (SWA prefix + compressed tail per token)."""
+    return _lengths_to_indptr(swa_len + compress_len)
+
+
+def build_low_ratio_group_streams(
+    *,
+    state_slot: torch.Tensor,  # [N] int
+    positions: torch.Tensor,  # [N] int
+    indptr: torch.Tensor,  # [N+1] int32, low_ratio_decode_indptr
+    prefix_len: torch.Tensor,  # [N] int, == min(pos+1, win)
+    page_indices: torch.Tensor,  # [N, Wc] int32, the top-k these layers read
+    valid_len: torch.Tensor,  # [N] int, valid front-packed top-k entries
+    num_layers: int,
+    base0: int,
+    base_step: int,
+    win: int,
+    ring_stride: int,
+) -> torch.Tensor:
+    """The decode streams of ``num_layers`` ratio-1/2 layers that read the same
+    top-k, in one launch: row g is what build_low_ratio_decode_stream followed by
+    fill_compress_tail(swa_pages=base0 + g*base_step) leaves for layer g. The
+    layers differ only in their compressed-row base (kv_source group position)."""
+    N, Wc = page_indices.shape
+    stride_g = N * (win + Wc)
+    out = torch.empty((num_layers, stride_g), dtype=torch.int32, device=indptr.device)
+    if N == 0:
+        return out
+    assert state_slot.is_contiguous() and positions.is_contiguous()
+    assert prefix_len.is_contiguous() and page_indices.is_contiguous()
+    assert valid_len.is_contiguous()
+    _low_ratio_group_stream_kernel[(N, num_layers)](
+        out,
+        indptr,
+        state_slot,
+        positions,
+        prefix_len,
+        page_indices,
+        valid_len,
+        stride_g,
+        ring_stride,
+        base0,
+        base_step,
+        win=win,
+        Wc=Wc,
+        BLOCK_N=triton.next_power_of_2(win),
+        BLOCK=min(1024, triton.next_power_of_2(max(Wc, 1))),
+        num_warps=4,
+    )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Prefill index builder (ragged-packed: paged prefix + flat extend)
 # ---------------------------------------------------------------------------
@@ -697,9 +1273,11 @@ def _prefill_lengths_kernel(
     page_idx_ptr,  # [T, Wc] int (front-packed, -1 padded)
     prefix_len_ptr,  # [T] int32 out
     extend_len_ptr,  # [T] int32 out
+    floor_ptr,  # [T] int: lowest SWA position the token may see (HAS_FLOOR)
     win: tl.constexpr,
     Wc: tl.constexpr,
     HAS_COMPRESS: tl.constexpr,
+    HAS_FLOOR: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Per token: write extend/prefix segment lengths"""
@@ -708,7 +1286,9 @@ def _prefill_lengths_kernel(
     cstart = tl.load(chunk_start_ptr + t).to(tl.int32)
     tpic = pos - cstart
     swa_low = tl.maximum(pos - win + 1, 0)
-    extend_count = tl.minimum(tpic + 1, win)
+    if HAS_FLOOR:
+        swa_low = tl.maximum(swa_low, tl.load(floor_ptr + t).to(tl.int32))
+    extend_count = tl.maximum(tl.minimum(tpic + 1, pos - swa_low + 1), 0)
     prefix_swa_count = tl.minimum(tl.maximum(cstart - swa_low, 0), win)
     tl.store(extend_len_ptr + t, extend_count)
     if HAS_COMPRESS:
@@ -737,9 +1317,11 @@ def _build_prefill_indices_kernel(
     ext_out_ptr,
     swa_pages,
     ring_stride,  # SWA ring per-slot stride
+    floor_ptr,  # [T] int: lowest SWA position the token may see (HAS_FLOOR)
     win: tl.constexpr,
     Wc: tl.constexpr,
     HAS_COMPRESS: tl.constexpr,
+    HAS_FLOOR: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Per token: write extend rows + prefix (SWA ring slots ++ swa_pages+compressed slots) as two ragged segments"""
@@ -751,7 +1333,9 @@ def _build_prefill_indices_kernel(
 
     tpic = pos - cstart
     swa_low = tl.maximum(pos - win + 1, 0)
-    extend_count = tl.minimum(tpic + 1, win)
+    if HAS_FLOOR:
+        swa_low = tl.maximum(swa_low, tl.load(floor_ptr + t).to(tl.int32))
+    extend_count = tl.maximum(tl.minimum(tpic + 1, pos - swa_low + 1), 0)
     prefix_swa_count = tl.minimum(tl.maximum(cstart - swa_low, 0), win)
 
     ebase = tl.load(ext_indptr_ptr + t)
@@ -797,8 +1381,17 @@ def build_prefill_indices(
     swa_pages: int,
     c128_page_indices: Optional[torch.Tensor],
     c4_sparse_page_indices: Optional[torch.Tensor],
+    low_ratio_page_indices: Optional[torch.Tensor] = None,
+    swa_floor: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build ragged prefill indices: prefix (SWA ring + swa_pages + compressed) into unified_kv + extend into current-chunk kv; returns (prefix_indices, prefix_indptr, extend_indices, extend_indptr)."""
+    """Build ragged prefill indices: prefix (SWA ring + swa_pages + compressed) into unified_kv + extend into current-chunk kv; returns (prefix_indices, prefix_indptr, extend_indices, extend_indptr).
+
+    ``swa_pages`` is only the compressed-row base: ratios 1 / 2 pass their layer's
+    ``get_unified_compress_row_base`` and their top-k in ``low_ratio_page_indices``.
+    ``swa_floor`` ([T] absolute positions) floors each token's SWA window, as
+    ``swa_replay_start`` does for the paged layout (decoder SWA bounded replay:
+    the late layers never wrote ring rows before their tail); compressed rows are
+    not floored."""
     device = state_slot.device
     T = state_slot.shape[0]
     assert positions.is_contiguous() and chunk_start.is_contiguous()
@@ -812,6 +1405,9 @@ def build_prefill_indices(
     elif compress_ratio == 4:
         assert c4_sparse_page_indices is not None
         page_idx = c4_sparse_page_indices[:T]
+    elif compress_ratio in (1, 2):
+        assert low_ratio_page_indices is not None
+        page_idx = low_ratio_page_indices[:T]
     else:
         raise ValueError(f"bad compress_ratio {compress_ratio}")
 
@@ -823,15 +1419,20 @@ def build_prefill_indices(
     block = min(1024, triton.next_power_of_2(max(win, Wc, 1)))
     prefix_len = torch.empty(T, dtype=torch.int32, device=device)
     extend_len = torch.empty(T, dtype=torch.int32, device=device)
+    has_floor = swa_floor is not None
+    if has_floor:
+        assert swa_floor.is_contiguous() and swa_floor.shape[0] >= T
     _prefill_lengths_kernel[(T,)](
         positions,
         chunk_start,
         page_idx if has_compress else positions,  # dummy ptr when no compress
         prefix_len,
         extend_len,
+        swa_floor if has_floor else positions,  # dummy ptr when no floor
         win=win,
         Wc=Wc if has_compress else 1,
         HAS_COMPRESS=has_compress,
+        HAS_FLOOR=has_floor,
         BLOCK=block,
         num_warps=4,
     )
@@ -853,9 +1454,11 @@ def build_prefill_indices(
         kv_indices_extend,
         swa_pages,
         ring_stride,
+        swa_floor if has_floor else positions,
         win=win,
         Wc=Wc if has_compress else 1,
         HAS_COMPRESS=has_compress,
+        HAS_FLOOR=has_floor,
         BLOCK=block,
         num_warps=4,
     )

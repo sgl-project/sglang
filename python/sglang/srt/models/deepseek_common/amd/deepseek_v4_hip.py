@@ -132,10 +132,18 @@ def attention_inv_rope(
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """(freqs_real, positions) for aiter's gfx950 sparse kernel to apply the inverse RoPE
     itself; None for the other kernels, and where the fp8 wo_a front end or the prefill
-    graph op keeps it."""
+    graph op keeps it. The fp8 unified_kv backend takes it for DeepSeek-V4.1 (no
+    query head norm) and folds it into its decode split merge; V4 keeps its own."""
+    if unified:
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+            is_unified_kv_fp8,
+        )
+
+        if attn.q_head_norm or not is_unified_kv_fp8() or wo_a_applies_inv_rope:
+            return None
+        return torch.view_as_real(attn.freqs_cis).flatten(-2), positions
     if (
-        unified
-        or not _is_gfx95_supported
+        not _is_gfx95_supported
         or resolve_hip_flashmla_backend() != "aiter_sparse"
         or wo_a_applies_inv_rope
     ):

@@ -38,7 +38,16 @@ struct Compress2DecodeParams {
   uint8_t* __restrict__ kvcache;           // [npages, kPageBytes] uint8
   fast_mod_div_u32_t ring_size;            // Positions per request slot in the pair-state ring.
   float eps;
+  // fp8 two-pool (unified_kv) store: `kvcache` is the [rows, 512] nope pool, this the
+  // [rows, kRopeDim] bf16 rope pool, and slot `raw_out_loc >> 1` lands on row `row_base + slot`
+  uint8_t* __restrict__ kvcache_rope = nullptr;
+  int64_t row_base = 0;
 };
+
+/// 448 B fp8 nope + 7 UE8M0 tile scales written twice + pad: the unified_kv row.
+/// Same constant as kFp8TwoPoolRowBytes in fused_norm_rope_v2.cuh and
+/// DSV4_FP8_NOPE_ROW_BYTES in unified_kv_kernels/layout.py.
+constexpr int64_t kC2Fp8TwoPoolRowBytes = 512;
 
 /// Elements per thread; 256 threads per token measured fastest on B200 decode batches.
 /// At (512, 64) it also keeps the nope/rope split warp-aligned, as the fp8 amax reduction requires.
@@ -76,8 +85,11 @@ template <
     typename PosT,
     typename LocT,
     deepseek_v4::KVLayout kLayout,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kFp8TwoPool = false>
 __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(const Compress2DecodeParams params) {
+  // the two-pool row keeps the V4 numerics (fp8 nope, 64-wide UE8M0 tiles, bf16 rope)
+  static_assert(!kFp8TwoPool || kLayout == deepseek_v4::KVLayout::V4, "the fp8 two-pool store quantizes like V4");
   using namespace device;
   using deepseek_v4::KVLayout;
   using deepseek_v4::fp8::cast_to_ue8m0;
@@ -255,6 +267,41 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
     }
   }
 
+  if constexpr (kFp8TwoPool) {
+    // unified_kv: one row index addresses the 512 B nope row and the bf16 rope row
+    const int64_t dst = params.row_base + out_loc;
+    uint8_t* const nope_ptr = params.kvcache + dst * kC2Fp8TwoPoolRowBytes;
+    if (tx >= kNopeThreads) {
+      bf16_vec_t rope_out;
+#pragma unroll
+      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+        rope_out[i] = cast<bf16x2_t>(fp32x2_t{staged[i * 2 + 0], staged[i * 2 + 1]});
+      }
+      rope_out.store(params.kvcache_rope + dst * (kRopeDim * 2), tx - kNopeThreads);
+    } else {
+      auto abs_max = fabsf(staged[0]);
+#pragma unroll
+      for (uint32_t i = 1; i < kVecSize; ++i) {
+        abs_max = fmaxf(abs_max, fabsf(staged[i]));
+      }
+      abs_max = warp::reduce_max<kFp8Lanes>(abs_max);
+      const auto scale_ue8m0 = cast_to_ue8m0(fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX);
+      const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
+#pragma unroll
+      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+        reinterpret_cast<fp8x2_e4m3_t*>(nope_ptr)[tx * (kVecSize / 2) + i] =
+            pack_fp8(staged[i * 2 + 0] * inv_scale, staged[i * 2 + 1] * inv_scale);
+      }
+      // scales sit behind the payload, each written twice: the asm reader loads them in pairs
+      if (tx % kFp8Lanes == 0) {
+        uint8_t* const scale_ptr = nope_ptr + (kHeadDim - kRopeDim) + (tx / kFp8Lanes) * 2;
+        scale_ptr[0] = scale_ue8m0;
+        scale_ptr[1] = scale_ue8m0;
+      }
+    }
+    return;
+  }
+
   // `raw_out_loc / ratio`; ratio 2 makes it a shift.
   const auto kv_row = Paged::row(params.kvcache, out_loc);
 
@@ -332,17 +379,18 @@ struct FlashCompress2Kernel {
   static constexpr int32_t kPageBits = std::bit_width(kPageSize) - 1;
   static constexpr int64_t kPageBytes = deepseek_v4::kv_page_bytes<kLayout>(kPageSize);
   static_assert(kLayout != deepseek_v4::KVLayout::V4 || kPageBytes == host::div_ceil(584ll * kPageSize, 576) * 576);
-  template <C2Mode kMode, typename PosT, typename LocT>
+  template <C2Mode kMode, typename PosT, typename LocT, bool kFp8TwoPool = false>
   static constexpr auto kernel =
-      flash_c2_decode_kernel<kMode, kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kUsePDL>;
+      flash_c2_decode_kernel<kMode, kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kUsePDL, kFp8TwoPool>;
   template <typename PosT, typename LocT>
   static constexpr auto store_kernel = c2_prefill_store_kernel<kHeadDim, PosT, LocT, kUsePDL>;
 
   /// \brief The (`positions`, `raw_out_loc`) dtype pair, resolved at run time.
-  template <C2Mode kMode>
+  template <C2Mode kMode, bool kFp8TwoPool = false>
   static auto select(const bool pos_i32, const bool loc_i32) {
-    if (pos_i32) return loc_i32 ? kernel<kMode, int32_t, int32_t> : kernel<kMode, int32_t, int64_t>;
-    return loc_i32 ? kernel<kMode, int64_t, int32_t> : kernel<kMode, int64_t, int64_t>;
+    if (pos_i32)
+      return loc_i32 ? kernel<kMode, int32_t, int32_t, kFp8TwoPool> : kernel<kMode, int32_t, int64_t, kFp8TwoPool>;
+    return loc_i32 ? kernel<kMode, int64_t, int32_t, kFp8TwoPool> : kernel<kMode, int64_t, int64_t, kFp8TwoPool>;
   }
 
   static auto select_store(const bool pos_i32, const bool loc_i32) {
@@ -432,7 +480,97 @@ struct FlashCompress2Kernel {
         &requests);
   }
 
+  /// \brief `run_decode_fusion` into the fp8 two-pool unified_kv rows instead of pages.
+  ///
+  /// \param kvcache `[rows, 512]` uint8 view of the nope pool (fp8 + doubled UE8M0 scales).
+  /// \param kvcache_rope `[rows, kRopeDim * 2]` uint8 view of the bf16 rope pool.
+  /// \param row_base row of compressed slot 0: the kv_source group's compressed region.
+  static void run_decode_fusion_fp8_2buff(
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView kv_state,
+      const tvm::ffi::TensorView kv_output,
+      const tvm::ffi::TensorView norm_weight,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView req,
+      const tvm::ffi::TensorView raw_out_loc,
+      const float eps,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView kvcache,
+      const tvm::ffi::TensorView kvcache_rope,
+      const int64_t row_base,
+      const int64_t ring_size,
+      const int64_t draft_len) {
+    const auto two_pool = TwoPool{.rope = &kvcache_rope, .row_base = row_base};
+    launch<false, true>(
+        kv_input,
+        kv_state,
+        kv_output,
+        norm_weight,
+        positions,
+        req,
+        raw_out_loc,
+        eps,
+        ring_size,
+        freqs_cis,
+        kvcache,
+        draft_len,
+        nullptr,
+        &two_pool);
+  }
+
+  /// \brief `run_prefill_fusion` into the fp8 two-pool unified_kv rows instead of pages.
+  static void run_prefill_fusion_fp8_2buff(
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView kv_state,
+      const tvm::ffi::TensorView kv_output,
+      const tvm::ffi::TensorView norm_weight,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView req,
+      const tvm::ffi::TensorView raw_out_loc,
+      const float eps,
+      const tvm::ffi::TensorView freqs_cis,
+      const tvm::ffi::TensorView kvcache,
+      const tvm::ffi::TensorView kvcache_rope,
+      const int64_t row_base,
+      const int64_t ring_size,
+      const tvm::ffi::TensorView extend_start_loc,
+      const tvm::ffi::TensorView extend_seq_lens) {
+    using namespace host;
+    auto B = SymbolicSize{"num_reqs"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(extend_start_loc);
+    TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(extend_seq_lens);
+    const auto requests = StoreRequests{
+        .extend_start_loc = static_cast<const int32_t*>(extend_start_loc.data_ptr()),
+        .extend_seq_lens = static_cast<const int32_t*>(extend_seq_lens.data_ptr()),
+        .num_reqs = static_cast<uint32_t>(B.unwrap()),
+    };
+    const auto two_pool = TwoPool{.rope = &kvcache_rope, .row_base = row_base};
+    launch<true, true>(
+        kv_input,
+        kv_state,
+        kv_output,
+        norm_weight,
+        positions,
+        req,
+        raw_out_loc,
+        eps,
+        ring_size,
+        freqs_cis,
+        kvcache,
+        1,
+        &requests,
+        &two_pool);
+  }
+
  private:
+  /// The rope pool and the compressed-region base of an fp8 two-pool store.
+  struct TwoPool {
+    const tvm::ffi::TensorView* rope;
+    int64_t row_base;
+  };
+
   struct StoreRequests {
     const int32_t* extend_start_loc;
     const int32_t* extend_seq_lens;
@@ -441,7 +579,8 @@ struct FlashCompress2Kernel {
 
   /// \tparam kPrefill `C2Mode::Prefill` plus the ring write-back of `requests`; otherwise
   /// Decode, or Verify when `draft_len > 1`.
-  template <bool kPrefill>
+  /// \tparam kFp8TwoPool store into the unified_kv pools described by `two_pool`.
+  template <bool kPrefill, bool kFp8TwoPool = false>
   static void launch(
       const tvm::ffi::TensorView kv_input,
       const tvm::ffi::TensorView kv_state,
@@ -455,7 +594,8 @@ struct FlashCompress2Kernel {
       const tvm::ffi::TensorView freqs_cis,
       const tvm::ffi::TensorView kvcache,
       const int64_t draft_len,
-      const StoreRequests* requests = nullptr) {
+      const StoreRequests* requests = nullptr,
+      const TwoPool* two_pool = nullptr) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
@@ -477,9 +617,27 @@ struct FlashCompress2Kernel {
 
     // Real/imag interleaved, so the trailing dim is kRopeDim, not kRopeDim / 2.
     TensorMatcher({-1, kRopeDim}).with_dtype<fp32_t>().with_device(device_).verify(freqs_cis);
-    // The pool allocates the buffer as uint8 and hands it out viewed as its
-    // fp8 dtype (`get_extra_key_buffer`); both are one byte per element.
-    TensorMatcher({-1, kPageBytes}).with_dtype<uint8_t, fp8_e4m3_t>().with_device(device_).verify(kvcache);
+    if constexpr (kFp8TwoPool) {
+      static_assert(kLayout == deepseek_v4::KVLayout::V4, "the fp8 two-pool store quantizes like V4");
+      constexpr int64_t kRopeRowBytes = kRopeDim * 2;
+      auto R = SymbolicSize{"rows"};
+      // one row index addresses both pools, so they must have the same row count
+      TensorMatcher({R, kC2Fp8TwoPoolRowBytes})
+          .with_strides({kC2Fp8TwoPoolRowBytes, 1})
+          .with_dtype<uint8_t>()
+          .with_device(device_)
+          .verify(kvcache);
+      TensorMatcher({R, kRopeRowBytes})
+          .with_strides({kRopeRowBytes, 1})
+          .with_dtype<uint8_t>()
+          .with_device(device_)
+          .verify(*two_pool->rope);
+      RuntimeCheck(two_pool->row_base >= 0 && two_pool->row_base < R.unwrap());
+    } else {
+      // The pool allocates the buffer as uint8 and hands it out viewed as its
+      // fp8 dtype (`get_extra_key_buffer`); both are one byte per element.
+      TensorMatcher({-1, kPageBytes}).with_dtype<uint8_t, fp8_e4m3_t>().with_device(device_).verify(kvcache);
+    }
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     if (num_tokens == 0) return;
@@ -500,12 +658,14 @@ struct FlashCompress2Kernel {
         .kvcache = static_cast<uint8_t*>(kvcache.data_ptr()),
         .ring_size = static_cast<fast_mod_div_u32_t>(ring_size),
         .eps = eps,
+        .kvcache_rope = kFp8TwoPool ? static_cast<uint8_t*>(two_pool->rope->data_ptr()) : nullptr,
+        .row_base = kFp8TwoPool ? two_pool->row_base : 0,
     };
     // `LaunchKernel` is move-only, so each arm builds its own.
     const auto pos_i32 = pos_dtype.is_type<int32_t>();
     const auto loc_i32 = loc_dtype.is_type<int32_t>();
     if constexpr (kPrefill) {
-      const auto k = select<C2Mode::Prefill>(pos_i32, loc_i32);
+      const auto k = select<C2Mode::Prefill, kFp8TwoPool>(pos_i32, loc_i32);
       LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
       if (requests->num_reqs == 0) return;
@@ -515,11 +675,11 @@ struct FlashCompress2Kernel {
           .enable_pdl(kUsePDL)(store, params, requests->extend_start_loc, requests->extend_seq_lens);
     } else if (is_verify) {
       const auto block = static_cast<uint32_t>(draft_len);
-      const auto k = select<C2Mode::Verify>(pos_i32, loc_i32);
+      const auto k = select<C2Mode::Verify, kFp8TwoPool>(pos_i32, loc_i32);
       LaunchKernel(dim3{block, num_tokens / block}, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
     } else {
-      const auto k = select<C2Mode::Decode>(pos_i32, loc_i32);
+      const auto k = select<C2Mode::Decode, kFp8TwoPool>(pos_i32, loc_i32);
       LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
           .enable_pdl(kUsePDL)(k, params);
     }
