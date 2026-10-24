@@ -43,7 +43,7 @@ class SCMScheduler(DiffusersSCMScheduler):
         device: str | torch.device | None = None,
         timesteps: list[float] | None = None,
         max_timesteps: float = 1.57080,
-        intermediate_timesteps: float = 1.3,
+        intermediate_timesteps: float | None = None,
     ) -> None:
         if timesteps is not None:
             # Explicit TrigFlow angles replace the max/intermediate schedule.
@@ -55,14 +55,14 @@ class SCMScheduler(DiffusersSCMScheduler):
                 intermediate_timesteps=None,
             )
         else:
-            # Diffusers' defaults; the intermediate angle only exists for 2 steps.
+            # Diffusers' 2-step default; Diffusers rejects an intermediate angle otherwise.
+            if intermediate_timesteps is None and num_inference_steps == 2:
+                intermediate_timesteps = 1.3
             super().set_timesteps(
                 num_inference_steps,
                 device=device,
                 max_timesteps=max_timesteps,
-                intermediate_timesteps=(
-                    intermediate_timesteps if num_inference_steps == 2 else None
-                ),
+                intermediate_timesteps=intermediate_timesteps,
             )
         # num_inference_steps + 1 angles, ending at 0 (the clean sample).
         self.angles = self.timesteps

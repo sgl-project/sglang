@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 from diffusers import SCMScheduler as DiffusersSCMScheduler
@@ -41,8 +43,9 @@ def _diffusers_sprint_loop(steps: int, schedule: dict) -> torch.Tensor:
         scheduler.set_timesteps(
             steps,
             max_timesteps=1.57080,
+            # SanaSprintPipeline's default; its check_inputs requires None otherwise.
             intermediate_timesteps=(
-                schedule.get("intermediate_timesteps", 1.3) if steps == 2 else None
+                (schedule.get("intermediate_timesteps") or 1.3) if steps == 2 else None
             ),
         )
     scheduler.set_begin_index(0)
@@ -92,6 +95,9 @@ def _shared_denoising_loop(steps: int, schedule: dict) -> torch.Tensor:
     [
         (1, {}),
         (2, {}),
+        # The pipeline always forwards the request field, which defaults to None.
+        (2, {"intermediate_timesteps": None}),
+        (4, {"intermediate_timesteps": None}),
         (4, {}),
         (2, {"intermediate_timesteps": 1.1}),
         (4, {"timesteps": [1.5708, 1.3, 1.0, 0.6, 0.0]}),
@@ -217,13 +223,22 @@ def test_sana_sprint_rejects_unusable_schedules():
         {"trigflow_timesteps": [1.5708, 0.0]},  # needs num_inference_steps + 1
         {"trigflow_timesteps": [1.0, 1.3, 0.0]},  # not decreasing
         {"intermediate_timesteps": 1.6},  # outside (0, max_timesteps)
+        # Past pi/2 the sCM timestep leaves [0, 1]; 3pi/4 is its pole.
+        {"num_inference_steps": 4, "max_timesteps": 2.3562},
+        {"trigflow_timesteps": [1.5708, -0.5, -1.0]},
+        {"trigflow_timesteps": [1.5708, 1.3, 0.2]},  # must end at the clean sample
+        # Diffusers rejects an intermediate angle unless num_inference_steps == 2.
+        {"num_inference_steps": 4, "intermediate_timesteps": 1.1},
     ]
     for overrides in bad:
         with pytest.raises(ValueError):
             SanaSprintSamplingParams(**overrides)._validate_with_pipeline_config(config)
-    SanaSprintSamplingParams(
-        trigflow_timesteps=[1.5708, 1.3, 0.0]
-    )._validate_with_pipeline_config(config)
+    for good in (
+        {"trigflow_timesteps": [1.5708, 1.3, 0.0]},
+        {"num_inference_steps": 4},
+        {"num_inference_steps": 2, "max_timesteps": math.pi / 2},
+    ):
+        SanaSprintSamplingParams(**good)._validate_with_pipeline_config(config)
 
 
 def test_sana_sprint_resolution_binning_matches_diffusers():
