@@ -25,9 +25,6 @@ DEFAULT_BLOCK_QUOTA = 32 if _is_hip else 2
 # Logical copy-group width; this is not the hardware warp/wavefront size.
 COPY_GROUP_THREADS = 32
 
-# Copy-round widths, widest first. The narrow rounds admit element sizes 128
-# does not divide, such as MLA's 576 B fp8 row, but only pay off against the
-# ROCm quota above, so CUDA keeps the original 128 B requirement.
 GROUP_BYTES = (128, 64, 32, 16) if _is_hip else (128,)
 
 
@@ -200,11 +197,15 @@ def can_use_write_back_jit_kernel(
 
 
 def _tiles_across_lanes(element_size: int, unroll: int) -> bool:
-    """Mirror of pick_group_bytes() in kvcacheio/hicache.cuh."""
+    """Check complete vector packages on CUDA and complete copy rounds on ROCm."""
     if unroll <= 0 or unroll > COPY_GROUP_THREADS or COPY_GROUP_THREADS % unroll != 0:
         return False
 
     lanes_per_worker = COPY_GROUP_THREADS // unroll
+    if not _is_hip:
+        package_size = 128 // lanes_per_worker
+        return package_size in (4, 8, 16) and element_size % package_size == 0
+
     return any(
         group % lanes_per_worker == 0
         and element_size % group == 0

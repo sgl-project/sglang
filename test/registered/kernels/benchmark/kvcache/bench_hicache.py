@@ -55,11 +55,15 @@ class HiCacheCache:
     def get_slice(self, num_layers: int, element_size: int) -> "HiCacheCache":
         def slice_cuda(t: torch.Tensor) -> torch.Tensor:
             needed_cuda = num_layers * GPU_CACHE_SIZE
-            return t.view(-1, element_size)[:needed_cuda].unflatten(0, (num_layers, -1))
+            return t.flatten()[: needed_cuda * element_size].view(
+                num_layers, GPU_CACHE_SIZE, element_size
+            )
 
         def slice_host(t: torch.Tensor) -> torch.Tensor:
             needed_host = num_layers * HOST_CACHE_SIZE
-            return t.view(-1, element_size)[:needed_host].unflatten(0, (num_layers, -1))
+            return t.flatten()[: needed_host * element_size].view(
+                num_layers, HOST_CACHE_SIZE, element_size
+            )
 
         return HiCacheCache(
             k_cache_cuda=slice_cuda(self.k_cache_cuda),
@@ -232,8 +236,8 @@ def pytorch_transfer(
 # Benchmark configuration
 
 ELEMENT_SIZE_RANGE = get_benchmark_range(
-    full_range=[64, 128, 256, 512, 1024],
-    ci_range=[1024],
+    full_range=[64, 128, 256, 288, 512, 1024],
+    ci_range=[288, 1024],
 )
 
 LINE_VALS = ["aot", "jit", "torch"]

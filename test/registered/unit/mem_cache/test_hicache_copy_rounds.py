@@ -14,18 +14,36 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def _screen(element_size: int, unroll: int, *, is_hip: bool) -> bool:
     """Run _tiles_across_lanes() as the given platform would see it."""
     group_bytes = (128, 64, 32, 16) if is_hip else (128,)
-    with mock.patch.object(hicache, "GROUP_BYTES", group_bytes):
+    with (
+        mock.patch.object(hicache, "GROUP_BYTES", group_bytes),
+        mock.patch.object(hicache, "_is_hip", is_hip),
+    ):
         return hicache._tiles_across_lanes(element_size, unroll)
 
 
 class TestHiCacheCopyRounds(unittest.TestCase):
-    def test_mla_fp8_row_is_admitted_only_on_rocm(self):
-        # 576 B is MLA's fp8 row and the reason the narrow rounds exist: 128 does
-        # not divide it, so the 128-only CUDA screen has to keep turning it away.
+    def test_mla_fp8_row_is_admitted_everywhere(self):
         unroll = hicache._default_unroll(576)
         self.assertEqual(unroll, 2)
         self.assertTrue(_screen(576, unroll=unroll, is_hip=True))
-        self.assertFalse(_screen(576, unroll=unroll, is_hip=False))
+        self.assertTrue(_screen(576, unroll=unroll, is_hip=False))
+
+    def test_cuda_admits_complete_vector_packages(self):
+        for element_size, unroll, expected in (
+            (16, 4, True),
+            (64, 2, True),
+            (144, 4, True),
+            (520, 2, True),
+            (576, 2, True),
+            (578, 2, False),
+            (580, 2, False),
+            (580, 1, True),
+            (576, 8, False),
+        ):
+            with self.subTest(element_size=element_size, unroll=unroll):
+                self.assertEqual(
+                    _screen(element_size, unroll=unroll, is_hip=False), expected
+                )
 
     def test_a_size_128_divides_is_admitted_everywhere(self):
         self.assertTrue(_screen(512, unroll=4, is_hip=True))
