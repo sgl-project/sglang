@@ -1805,8 +1805,10 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             return
 
         failures: list[tuple[str, str]] = []
+        performance_failed = False
 
         def run_case_check(name: str, fn: Callable[[], None]) -> None:
+            nonlocal performance_failed
             try:
                 fn()
             except BaseException as exc:
@@ -1815,8 +1817,11 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 if name == "performance" and isinstance(
                     exc, (AssertionError, pytest.fail.Exception)
                 ):
-                    raise PerformanceValidationError(f"[performance] {exc}") from exc
+                    performance_failed = True
                 failures.append((name, str(exc)))
+                print(f"[validation] {case.id}: {name}=failed")
+            else:
+                print(f"[validation] {case.id}: {name}=passed")
 
         if is_realtime_case:
             chunk_stats = pop_realtime_perf_stats(case.id)
@@ -1845,10 +1850,18 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
             def validate_mesh_output() -> None:
                 mesh_path = MESH_OUTPUT_PATHS.pop(case.id, None)
-                if mesh_path:
-                    validate_mesh_correctness(mesh_path)
+                assert mesh_path, f"Missing generated mesh for '{case.id}'"
+                validate_mesh_correctness(mesh_path)
 
             run_case_check("mesh correctness", validate_mesh_output)
+
+        # Always validate the already-generated mesh before terminating a slow
+        # or unbaselined request. Keep the existing fail-fast policy for extra
+        # API checks and repeated generations, with both failures in the report.
+        if performance_failed:
+            raise PerformanceValidationError(
+                "\n\n".join(f"[{name}] {message}" for name, message in failures)
+            )
 
         if case.run_models_api_check:
             run_case_check(

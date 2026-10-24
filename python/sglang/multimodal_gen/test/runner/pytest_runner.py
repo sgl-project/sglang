@@ -190,6 +190,7 @@ def _is_consistency_failure(full_output: str) -> bool:
 
     return (
         "Consistency check failed for " in full_output
+        or "[mesh correctness]" in full_output
         or "GT not found for " in full_output
         or "--- MISSING GROUND TRUTH DETECTED ---" in full_output
     )
