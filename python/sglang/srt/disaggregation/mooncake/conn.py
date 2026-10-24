@@ -1077,8 +1077,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 return -1
 
         # Decode pp size should be equal to prefill pp size or 1
-        # Published layer IDs give exact pairing; plain-MHA peers publish none
-        # and keep positional slicing.
+        # Published layer IDs give exact pairing. When neither peer publishes
+        # them (quantized or special MHA pools), MHA keeps positional slicing.
         has_layer_ids = bool(src_layer_ids or dst_layer_ids)
         if _uses_flat_entry_layout(
             mla_backend=self.is_mla_backend or self.is_hybrid_mla_backend,

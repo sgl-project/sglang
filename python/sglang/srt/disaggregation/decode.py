@@ -645,7 +645,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_item_lens = kv_item_lens
         kv_args.num_draft_entries = num_draft_entries
         kv_args.kv_layer_ids = build_kv_layer_ids(
-            token_to_kv_pool=self.token_to_kv_pool,
+            token_to_kv_pool=transfer_kv_pool,
             draft_token_to_kv_pool=self.draft_token_to_kv_pool,
             num_draft_entries=num_draft_entries,
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,

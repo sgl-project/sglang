@@ -20,6 +20,23 @@ For the design details, please refer to [link](https://docs.google.com/document/
 
 Currently, we support Mooncake and NIXL as the transfer engine.
 
+## Pipeline-parallel worker upgrades
+
+Ordinary MHA KV pools (NHD layout, no KV quantization) publish KV layer IDs, and
+transfers pair their entries by layer ID, as they already do for hybrid pools.
+With pipeline-parallel prefill, upgrade prefill and decode workers together: a
+pair where only one side publishes layer IDs is rejected with `Layer metadata
+must be provided by both PD peers or neither`. Mooncake and NIXL reject it even
+when both peers register the same number of entries, because matching counts do
+not establish matching layer spans; Mori rejects it when the counts differ. The
+rejection is not limited to one request on Mooncake and NIXL. On Mooncake it ends
+the transfer worker thread that hit it, which logs that the prefill instance is
+dead. On NIXL it ends the prefill rank's bootstrap thread, and requests to that
+rank then time out in `KVPoll.Bootstrapping`. Mori fails only the affected
+request. With single-stage (PP=1) prefill, mixed versions keep positional
+pairing on all three backends. Drain in-flight requests before restarting both
+roles.
+
 ## Decode allocation policy
 
 By default, decode reserves each request's destination KV slots before prefill

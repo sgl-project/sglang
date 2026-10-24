@@ -1168,12 +1168,16 @@ class MoriKVManager(CommonKVManager):
 
         src_layer_ids = getattr(self.kv_args, "kv_layer_ids", None) or []
         if src_layer_ids or dst_kv_layer_ids:
-            dst_indices = resolve_dcp_dst_entry_indices(
-                src_layer_ids,
-                dst_kv_layer_ids or [],
-                len(src_descs),
-                len(dst_mem_descs),
-            )
+            dst_indices = [
+                j
+                for _, j in build_transfer_entry_pairs(
+                    src_layer_ids,
+                    dst_kv_layer_ids or [],
+                    len(src_descs),
+                    len(dst_mem_descs),
+                    allow_positional_fallback=self.pp_size == 1,
+                )
+            ]
             dst_k_descs = [
                 dst_mem_descs[dst_indices[i]] for i in range(num_local_layers)
             ]

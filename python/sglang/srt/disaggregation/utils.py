@@ -1089,14 +1089,31 @@ def build_kv_layer_ids(
     into a reserved band above the target's layer range. Both PD peers run this
     against the same draft config and so agree on the band.
 
-    Returns [] for pools that cannot report ids, leaving the peers on positional
-    pairing.
+    token_to_kv_pool must be the selected registration producer, not a device
+    pool standing in for a host producer. Returns [] for unsupported layouts.
     """
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    if isinstance(token_to_kv_pool, HybridLinearKVPool):
+        layer_ids = token_to_kv_pool.get_kv_layer_ids()
+    elif (
+        type(token_to_kv_pool) is MHATokenToKVPool
+        and token_to_kv_pool.kv_cache_layout == "nhd"
+        and not token_to_kv_pool.is_quantized_kv_cache
+    ):
+        # Only this producer's K-all/V-all registration is described here.
+        # Subclasses can register envelopes or carry separate quantization state.
+        pointers, lengths, item_lengths = token_to_kv_pool.get_contiguous_buf_infos()
+        expected_entries = 2 * token_to_kv_pool.layer_num
+        if not len(pointers) == len(lengths) == len(item_lengths) == expected_entries:
+            raise RuntimeError(
+                "Ordinary MHA registration must contain two entries per layer: "
+                f"pointers={len(pointers)}, lengths={len(lengths)}, "
+                f"item_lengths={len(item_lengths)}, expected={expected_entries}"
+            )
+        layer_ids = list(token_to_kv_pool.model_layer_ids) * 2
+    else:
         return []
-    layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
         return layer_ids
 

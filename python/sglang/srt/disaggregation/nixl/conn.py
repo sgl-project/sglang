@@ -1311,13 +1311,33 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         assert page_size * num_groups * bytes_per_token_to_send == src_kv_item_len
         assert page_size * bytes_per_token_dst == dst_kv_item_len
 
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_pp = (
-            self.get_mha_kv_ptrs_with_pp(
-                self.kv_args.kv_data_ptrs, decode_kv_args.dst_kv_ptrs
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if src_layer_ids or decode_kv_args.dst_kv_layer_ids:
+            # Layer IDs pair PP-local entries with the decode's global layout.
+            if any(
+                item_len != src_kv_item_len for item_len in self.kv_args.kv_item_lens
+            ):
+                raise RuntimeError(
+                    "NIXL head-sliced transfer assumes one item length for every "
+                    f"KV entry, got {set(self.kv_args.kv_item_lens)}"
+                )
+            pairs = build_transfer_entry_pairs(
+                src_layer_ids,
+                decode_kv_args.dst_kv_layer_ids,
+                len(self.kv_args.kv_data_ptrs),
+                len(decode_kv_args.dst_kv_ptrs),
+                allow_positional_fallback=self.pp_size == 1,
             )
-        )
-        src_ptrs = list(src_k_ptrs[:layers_pp]) + list(src_v_ptrs[:layers_pp])
-        dst_ptrs = list(dst_k_ptrs[:layers_pp]) + list(dst_v_ptrs[:layers_pp])
+            src_ptrs = [self.kv_args.kv_data_ptrs[i] for i, _ in pairs]
+            dst_ptrs = [decode_kv_args.dst_kv_ptrs[j] for _, j in pairs]
+        else:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_pp = (
+                self.get_mha_kv_ptrs_with_pp(
+                    self.kv_args.kv_data_ptrs, decode_kv_args.dst_kv_ptrs
+                )
+            )
+            src_ptrs = list(src_k_ptrs[:layers_pp]) + list(src_v_ptrs[:layers_pp])
+            dst_ptrs = list(dst_k_ptrs[:layers_pp]) + list(dst_v_ptrs[:layers_pp])
         num_ptr_pairs = len(src_ptrs)
 
         num_slots = self.kv_args.kv_data_lens[0] // src_kv_item_len
