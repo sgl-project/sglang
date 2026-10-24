@@ -43,8 +43,86 @@ pub struct ChatModel {
 }
 
 impl ChatModel {
+    /// What `template_detection` and `chat_encoding_spec` resolve for
+    /// `formatter`; the host fills in the rest.
+    #[cfg(feature = "render")]
+    pub fn for_formatter(formatter: &crate::ChatFormatter) -> Self {
+        Self {
+            always_thinks: formatter.always_thinks(),
+            reasoning_toggle: formatter.reasoning_toggle().map(|(param, enabled)| {
+                ReasoningToggle {
+                    toggle_param: param.to_owned(),
+                    default_enabled: enabled,
+                }
+            }),
+            chat_encoding_spec: matches!(formatter, crate::ChatFormatter::KimiK3)
+                .then(|| "kimi_k3".to_owned()),
+            ..Self::default()
+        }
+    }
+
     fn is_kimi_k3(&self) -> bool {
         self.chat_encoding_spec.as_deref() == Some("kimi_k3")
+    }
+
+    /// `_patch_reasoning_skip_special_tokens`: K3's markers are special
+    /// tokens, so its output keeps them.
+    pub fn keeps_special_tokens(&self, reasoning_parser: Option<&str>) -> bool {
+        self.is_kimi_k3() || reasoning_parser == Some("kimi_k3")
+    }
+
+    /// `_reported_prompt_tokens`: the prompt tokens left out of `usage`.
+    pub fn unreported_prompt_tokens(&self) -> u64 {
+        match self.is_kimi_k3() {
+            true => KIMI_K3_GENERATION_STUB_TOKENS,
+            false => 0,
+        }
+    }
+
+    /// `_get_reasoning_from_request` under `reasoning_parser`, given the
+    /// request's template kwargs over the server's defaults: whether the reply
+    /// starts in reasoning. `None` for a parser SGLang's port does not cover,
+    /// which keeps its own default.
+    pub fn thinking(
+        &self,
+        reasoning_parser: Option<&str>,
+        kwargs: &Map<String, Value>,
+    ) -> Option<bool> {
+        let config = think_config(reasoning_parser?)?;
+        Some(
+            config
+                .default_thinking(kwargs)
+                .unwrap_or_else(|| match &self.reasoning_toggle {
+                    Some(toggle) => toggle.enabled(kwargs),
+                    None => {
+                        self.always_thinks || kwargs.get("thinking") == Some(&Value::Bool(true))
+                    }
+                }),
+        )
+    }
+
+    /// [`Self::thinking`] for a raw chat `body` under the server's `defaults`:
+    /// its kwargs take the thinking toggle its effort implies, then the
+    /// defaults, as the request validator and `_process_messages` fill them.
+    #[cfg(feature = "render")]
+    pub fn request_thinking(
+        &self,
+        reasoning_parser: Option<&str>,
+        body: &Value,
+        defaults: &HashMap<String, Value>,
+    ) -> Option<bool> {
+        let mut kwargs = body["chat_template_kwargs"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(thinking) = crate::requested_thinking(body) {
+            kwargs.entry("thinking").or_insert(thinking.into());
+            kwargs.entry("enable_thinking").or_insert(thinking.into());
+        }
+        for (key, value) in defaults {
+            kwargs.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        self.thinking(reasoning_parser, &kwargs)
     }
 }
 
@@ -277,21 +355,11 @@ pub fn lower_chat(
     for (key, value) in settings.default_chat_template_kwargs.iter().flatten() {
         kwargs.entry(key.clone()).or_insert_with(|| value.clone());
     }
-    let thinking = match parser.and_then(|config| config.default_thinking(&kwargs)) {
-        Some(thinking) => thinking,
-        None => {
-            parser.is_some()
-                && match &model.reasoning_toggle {
-                    Some(toggle) => toggle.enabled(&kwargs),
-                    None => {
-                        model.always_thinks || kwargs.get("thinking") == Some(&Value::Bool(true))
-                    }
-                }
-        }
-    };
-    // `_patch_reasoning_skip_special_tokens`: K3's markers are special tokens.
+    let thinking = model
+        .thinking(settings.reasoning_parser.as_deref(), &kwargs)
+        .unwrap_or(false);
     let kimi_k3 = model.is_kimi_k3();
-    if kimi_k3 || settings.reasoning_parser.as_deref() == Some("kimi_k3") {
+    if model.keeps_special_tokens(settings.reasoning_parser.as_deref()) {
         request.skip_special_tokens = false;
     }
     // `_process_messages`: tool output keeps the parser's special tokens.
@@ -384,11 +452,7 @@ pub fn lower_chat(
         .sum();
     let responder = ChatResponder {
         model: request.model,
-        unreported_prompt_tokens: if kimi_k3 {
-            KIMI_K3_GENERATION_STUB_TOKENS
-        } else {
-            0
-        },
+        unreported_prompt_tokens: model.unreported_prompt_tokens(),
         history_tool_calls,
         n: request.n as usize,
         logprobs: request.logprobs,
@@ -1219,6 +1283,33 @@ impl ChatResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kimi K3 keeps its markers and its generation stub out of `usage`, and
+    /// its reply starts in reasoning unless the merged kwargs turn
+    /// `thinking` off; a parser SGLang's port does not cover keeps its own
+    /// default.
+    #[test]
+    fn chat_model_applies_python_chat_rules() {
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            ..ChatModel::default()
+        };
+        assert!(k3.keeps_special_tokens(None));
+        assert!(ChatModel::default().keeps_special_tokens(Some("kimi_k3")));
+        assert!(!ChatModel::default().keeps_special_tokens(Some("qwen3")));
+        assert_eq!(k3.unreported_prompt_tokens(), 3);
+        assert_eq!(ChatModel::default().unreported_prompt_tokens(), 0);
+
+        let kwargs = |thinking: bool| {
+            let mut kwargs = Map::new();
+            kwargs.insert("thinking".into(), thinking.into());
+            kwargs
+        };
+        assert_eq!(k3.thinking(Some("kimi_k3"), &Map::new()), Some(true));
+        assert_eq!(k3.thinking(Some("kimi_k3"), &kwargs(false)), Some(false));
+        assert_eq!(k3.thinking(Some("deepseek-r1"), &Map::new()), None);
+        assert_eq!(k3.thinking(None, &Map::new()), None);
+    }
 
     /// The reason `messages` is not lowered, with a renderer that accepts anything.
     fn unsupported(messages: Value) -> Option<&'static str> {
