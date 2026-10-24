@@ -78,6 +78,19 @@ class Disagg(msgspec.Struct):
     disaggregation_bootstrap_port: A[
         int, "Bootstrap server port on the prefill server. Default is 8998."
     ] = 8998
+    disaggregation_bootstrap_allowlist: A[
+        List[str],
+        Arg(
+            help=(
+                "JSON list of Prefill bootstrap endpoints (host:port) that a "
+                "Decode server may query. When set, configure every Prefill "
+                "endpoint used by the router; unlisted request endpoints are "
+                "rejected. Defaults to empty, which disables validation. "
+                "Set this in production to restrict bootstrap lookups."
+            ),
+            type_parser=json_list_type,
+        ),
+    ] = []
     disaggregation_ib_device: A[
         Optional[str],
         'The InfiniBand devices for disaggregation transfer. Supports a single device (e.g., --disaggregation-ib-device mlx5_0), a shared comma-separated list (e.g., --disaggregation-ib-device mlx5_0,mlx5_1), a per-GPU JSON mapping (e.g., --disaggregation-ib-device \'{"0": "mlx5_0,mlx5_1", "1": "mlx5_2"}\'), or a path to a JSON file containing that mapping. Supported by Mooncake and NIXL UCX. Mapping keys are process-visible GPU IDs (after CUDA_VISIBLE_DEVICES); use HCA names without port suffixes for NIXL UCX. For NIXL UCX, a non-empty UCX_NET_DEVICES takes precedence over this option, including per-GPU mappings. Default is None, which preserves backend device selection.',

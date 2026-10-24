@@ -74,6 +74,25 @@ destination registration. Older decode workers do not enforce this check. Keep
 `early` on both sides until every worker has been upgraded, then enable the new
 policy on both sides.
 
+## Decode bootstrap endpoint allowlist
+
+Decode workers can validate the Prefill bootstrap address carried with each
+request before querying the Prefill bootstrap registry. By default, validation
+is disabled for compatibility with existing deployments. In production, set
+the allowlist on each Decode worker and include every Prefill `host:port`
+endpoint that the router may select:
+
+```bash
+--disaggregation-bootstrap-allowlist '["10.0.0.11:8998", "10.0.0.12:8998"]'
+```
+
+Use the addresses reachable from Decode, including the Prefill
+`--disaggregation-bootstrap-port`. When configured, malformed and unlisted
+addresses are rejected with HTTP 400 before Decode makes an HTTP request.
+Decode does not automatically discover Prefill endpoints from its own
+`--dist-init-addr` or bootstrap port. See the
+[server argument reference](./server_arguments#pd-disaggregation) for details.
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.

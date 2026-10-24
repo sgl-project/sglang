@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import threading
 import time
@@ -71,6 +72,11 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+_PREFILL_INFO_HTTP_TIMEOUT = (2, 2)
+_PREFILL_INFO_TOTAL_TIMEOUT = 2.0
+_PREFILL_INFO_MAX_RESPONSE_BYTES = 64 * 1024
+_PREFILL_INFO_MAX_CACHE_ENTRIES = 1024
 
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
@@ -161,6 +167,13 @@ class PrefillServerInfo:
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
+
+
+def _normalize_bootstrap_addr(bootstrap_addr: str) -> str:
+    network_addr = NetworkAddress.parse(bootstrap_addr)
+    return NetworkAddress(
+        network_addr.host.lower(), network_addr.port
+    ).to_host_port_str()
 
 
 @dataclasses.dataclass
@@ -464,6 +477,12 @@ class CommonKVManager(BaseKVManager):
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.connection_lock = threading.Lock()
             self.required_prefill_response_num_table: Dict[int, int] = {}
+            self.prefill_bootstrap_allowlist = frozenset(
+                _normalize_bootstrap_addr(addr)
+                for addr in get_disagg().disaggregation_bootstrap_allowlist
+            )
+            self._empty_bootstrap_allowlist_error_logged = False
+            self._empty_bootstrap_allowlist_log_lock = threading.Lock()
             self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
             self.heartbeat_failures: Dict[str, int] = {}
             self.session_pool: Dict = defaultdict(requests.Session)
@@ -1271,6 +1290,19 @@ class CommonKVManager(BaseKVManager):
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.
         Returns True if info is available (cached or freshly fetched)."""
+        normalized_addr = (
+            bootstrap_addr
+            if bootstrap_addr in self.prefill_bootstrap_allowlist
+            else self.get_allowed_prefill_bootstrap_addr(bootstrap_addr)
+        )
+        if normalized_addr is None:
+            logger.warning(
+                "Rejecting invalid or unregistered prefill bootstrap address: %r",
+                bootstrap_addr,
+            )
+            return False
+        bootstrap_addr = normalized_addr
+
         if bootstrap_addr in self.prefill_info_table:
             return True
 
@@ -1281,15 +1313,32 @@ class CommonKVManager(BaseKVManager):
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
                 f"target_tp_rank={-1}&target_pp_rank={-1}"
             )
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
+            response = requests.get(
+                url,
+                timeout=_PREFILL_INFO_HTTP_TIMEOUT,
+                allow_redirects=False,
+                stream=True,
+            )
+            try:
+                if response.status_code != 200:
+                    logger.error(
+                        "Failed to get prefill server info: %s",
+                        response.status_code,
+                    )
+                    return False
+
+                deadline = time.monotonic() + _PREFILL_INFO_TOTAL_TIMEOUT
+                body = bytearray()
+                for chunk in response.iter_content(chunk_size=1):
+                    if time.monotonic() >= deadline:
+                        raise requests.Timeout("Timed out reading prefill server info")
+                    body.extend(chunk)
+                    if len(body) > _PREFILL_INFO_MAX_RESPONSE_BYTES:
+                        raise ValueError("Prefill server info response is too large")
+                data = json.loads(body)
                 info = PrefillServerInfo(**data)
-            else:
-                logger.error(
-                    f"Failed to get prefill server info: {response.status_code}, {response.text}"
-                )
-                return False
+            finally:
+                response.close()
         except Exception as e:
             logger.error(f"Error fetching prefill server info from bootstrap: {e}")
             return False
@@ -1392,9 +1441,42 @@ class CommonKVManager(BaseKVManager):
                 )
 
         self._resolve_rank_mapping(info)
+        if (
+            bootstrap_addr not in self.prefill_info_table
+            and len(self.prefill_info_table) >= _PREFILL_INFO_MAX_CACHE_ENTRIES
+        ):
+            self.prefill_info_table.pop(next(iter(self.prefill_info_table)))
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
+
+    def get_allowed_prefill_bootstrap_addr(self, bootstrap_addr: str) -> Optional[str]:
+        if not self.prefill_bootstrap_allowlist:
+            with self._empty_bootstrap_allowlist_log_lock:
+                should_log = not self._empty_bootstrap_allowlist_error_logged
+                self._empty_bootstrap_allowlist_error_logged = True
+            if should_log:
+                logger.warning(
+                    "Decode bootstrap endpoint validation is disabled because "
+                    "--disaggregation-bootstrap-allowlist is empty. For "
+                    "production deployments, set it to a JSON list of every "
+                    "router-selectable Prefill host:port endpoint."
+                )
+            try:
+                return _normalize_bootstrap_addr(bootstrap_addr)
+            except (TypeError, ValueError):
+                # Preserve legacy behavior when validation is opt-in: let the
+                # lookup fail normally rather than rejecting the request with 400.
+                return bootstrap_addr
+        try:
+            normalized_addr = _normalize_bootstrap_addr(bootstrap_addr)
+        except (TypeError, ValueError):
+            return None
+        return (
+            normalized_addr
+            if normalized_addr in self.prefill_bootstrap_allowlist
+            else None
+        )
 
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
