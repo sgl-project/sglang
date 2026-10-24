@@ -104,6 +104,7 @@ impl OpenAiChat {
                 ),
                 incremental_streaming_output: server_args.incremental_streaming_output,
                 reasoning_parser: server_args.reasoning_parser.clone(),
+                served_model_name: Some(server_args.served_model_name.clone()),
                 stream_response_default_include_usage: server_args
                     .stream_response_default_include_usage,
                 tool_call_parser: server_args.tool_call_parser.clone(),
@@ -735,6 +736,65 @@ mod tests {
         assert_eq!(token["top_logprobs"][1]["token"], "!");
         assert_eq!(token["top_logprobs"][1]["bytes"], json!([b'!']));
         assert!(value["usage"].get("reasoning_tokens").is_some());
+
+        // Streamed, cumulative or incremental.
+        for incremental in [false, true] {
+            let args = ServerArgs {
+                tokenizer_path: tokenizer_path().into(),
+                incremental_streaming_output: incremental,
+                ..Default::default()
+            };
+            let app = lowered_state_with(args, |rid| {
+                let mut item = chunk(rid, "!", true);
+                if let ResponseItem::Done(output) = &mut item {
+                    output.extras = Some(Box::new(ChunkExtras {
+                        out_lp_val: vec![-0.5],
+                        out_lp_idx: vec![1],
+                        out_lp_txt: vec!["!".into()],
+                        ..Default::default()
+                    }));
+                }
+                item
+            });
+            let body =
+                json!({"model": "model", "messages": messages, "logprobs": true, "stream": true});
+            let response = post_json(app, "/v1/chat/completions", body).await;
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains(r#""logprob":-0.5"#), "{text}");
+        }
+    }
+
+    /// A stream's internal failure before its first frame keeps its 500.
+    #[tokio::test]
+    async fn streamed_internal_error_keeps_its_status() {
+        let app = lowered_state(|_| ResponseItem::Error(Error::Internal("boom".into())));
+        let messages = json!([{"role": "user", "content": "hi"}]);
+        let body = json!({"model": "model", "messages": messages, "stream": true});
+        let response = post_json(app, "/v1/chat/completions", body).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let value = body_json(response).await;
+        assert_eq!(
+            (value["type"].as_str(), value["code"].as_u64()),
+            (Some("500"), Some(500))
+        );
+    }
+
+    /// A served name with a colon, requested exactly, is not a LoRA adapter.
+    #[tokio::test]
+    async fn served_name_with_a_colon_is_the_base_model() {
+        let args = ServerArgs {
+            served_model_name: "model:tag".into(),
+            ..Default::default()
+        };
+        let formatter = checkpoint_formatter(&json!({}), "{{ messages[0].content }}");
+        let state = answering_app_state_with(Arc::new(args), formatter, Some(tokenizer()), "ok");
+        let app = super::super::routes().with_state(state);
+        let body = json!({"model": "model:tag", "messages": [{"role": "user", "content": "hi"}]});
+        let response = post_json(app, "/v1/chat/completions", body).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// A template without a detected reasoning toggle reasons by the parser's

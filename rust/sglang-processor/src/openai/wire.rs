@@ -35,26 +35,24 @@ pub(super) fn stream_error_event(message: &str, err_type: &str, code: u16) -> St
     format!("data: {}\n\n", python_json(&error, true))
 }
 
-/// A native `/generate` error's message, OpenAI type and status. Python's
-/// `/generate` sends no code (a ValueError, so a 400); an engine that sends one
-/// keeps its status, typed as `create_error_response` types it.
-fn engine_error_parts(error: GenerateStreamError) -> (String, String, u16) {
+/// A native `/generate` error's message, unary and streamed OpenAI types, and
+/// status. Python's `/generate` errors are 400s; another status a host names
+/// stays, as Python's `HTTPException` keeps it.
+fn engine_error_parts(error: GenerateStreamError) -> (String, String, &'static str, u16) {
     let error = error.error.unwrap_or_default();
-    let code = u16::try_from(error.code)
-        .ok()
-        .filter(|code| (400..600).contains(code))
-        .unwrap_or(400);
-    let err_type = match code {
-        400 => "BadRequestError".to_owned(),
-        _ => code.to_string(),
-    };
-    (error.message, err_type, code)
+    let status = Some(u64::from(error.code))
+        .filter(|&code| code != 400)
+        .and_then(|code| Some((code as u16, http_status_name(code)?)));
+    match status {
+        Some((code, name)) => (error.message, code.to_string(), name, code),
+        None => (error.message, "BadRequestError".to_owned(), "BadRequestError", 400),
+    }
 }
 
 /// The OpenAI reply for a native `/generate` error.
 pub(super) fn engine_error_reply(error: GenerateStreamError) -> Reply {
-    let (message, err_type, code) = engine_error_parts(error);
-    error_reply(&message, &err_type, code)
+    let (message, unary_type, _, code) = engine_error_parts(error);
+    error_reply(&message, &unary_type, code)
 }
 
 /// Python's answer when the engine output lacks what the OpenAI layer reads.
@@ -163,8 +161,8 @@ impl StreamState {
             return Err(engine_error_reply(error));
         }
         self.failed = true;
-        let (message, err_type, code) = engine_error_parts(error);
-        Ok(vec![stream_error_event(&message, &err_type, code)])
+        let (message, _, event_type, code) = engine_error_parts(error);
+        Ok(vec![stream_error_event(&message, event_type, code)])
     }
 
     /// An abort or error just ended the stream; Python stops there, without
@@ -263,6 +261,19 @@ pub(super) fn logprob_slice<T>(items: &[T], prev: usize, total: usize, increment
         let start = prev.min(items.len());
         &items[start..start + total.saturating_sub(prev).min(items.len() - start)]
     }
+}
+
+/// `output_token_logprobs_length`, or, for frames without it, the count the
+/// frame's list implies.
+pub(super) fn logprobs_length(meta: &GenerateMetaInfo, prev: usize, incremental: bool) -> usize {
+    if let Some(length) = meta.output_token_logprobs_length {
+        return length as usize;
+    }
+    let listed = meta
+        .output_token_logprobs
+        .as_ref()
+        .map_or(0, |logprobs| logprobs.entries.len());
+    if incremental { prev + listed } else { listed }
 }
 
 #[cfg(test)]
