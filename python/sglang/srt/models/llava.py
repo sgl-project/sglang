@@ -63,11 +63,12 @@ class LlavaBaseForCausalLM(nn.Module):
     @staticmethod
     def _infer_image_aspect_ratio(mm_items):
         """Determine image_aspect_ratio from processor metadata or item count."""
-        # Check if processor stored the aspect_ratio it used
+        # The processor records the ratio it actually preprocessed with. A recorded
+        # `None` means a plain square resize (llava-1.5), so the padded token count
+        # must not be derived from an anyres grid.
         for item in mm_items:
-            ar = item.model_specific_data.get("image_aspect_ratio")
-            if ar is not None:
-                return ar
+            if "image_aspect_ratio" in item.model_specific_data:
+                return item.model_specific_data["image_aspect_ratio"] or "square"
         # Fallback: multi-image or video → pad, single image → anyres
         image_items = [item for item in mm_items if item.is_image()]
         has_video = any(item.is_video() for item in mm_items)
@@ -89,6 +90,9 @@ class LlavaBaseForCausalLM(nn.Module):
         image_aspect_ratio = self._infer_image_aspect_ratio(image_inputs.mm_items)
         offset_list = []
         image_inputs.image_pad_len = []
+        # Inclusive [start, end] placeholder spans per item; general_mm_embed_routine
+        # locates each item's tokens in the expanded input_ids through them.
+        item_spans = [[] for _ in image_inputs.mm_items]
         for image_idx, image_s in enumerate(image_sizes):
             if len(image_sizes) > 16:
                 # 2x2 pooling with stride 2
@@ -129,7 +133,8 @@ class LlavaBaseForCausalLM(nn.Module):
             except ValueError:
                 offset = 0
             # old_len + pad_len - 1, because we need to remove image_token_id
-            pad_token = pad_values[image_idx % len(pad_values)]
+            item_idx = image_idx % len(pad_values)
+            pad_token = pad_values[item_idx]
             input_ids = (
                 input_ids[:offset]
                 + array("q", [pad_token]) * new_image_feature_len
@@ -137,6 +142,11 @@ class LlavaBaseForCausalLM(nn.Module):
             )
             offset_list.append(offset)
             image_inputs.image_pad_len.append(new_image_feature_len)
+            # Earlier items are already expanded, so `offset` is the final index.
+            item_spans[item_idx].append((offset, offset + new_image_feature_len - 1))
+
+        for item, spans in zip(image_inputs.mm_items, item_spans):
+            item.offsets = spans
 
         image_inputs.image_offsets = offset_list
         return input_ids
@@ -813,6 +823,11 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         for item in items:
             # in each item, we assume pixel_values is always batched
             pixel_values, image_sizes = item.feature, item.image_sizes
+            if not isinstance(pixel_values, torch.Tensor):
+                # LlavaImageProcessor hands back numpy pixel values.
+                pixel_values = torch.as_tensor(
+                    np.asarray(pixel_values), device=self.vision_tower.device
+                )
             if last_layer_only:
                 selected_image_feature = self.vision_tower(pixel_values, image_sizes)
             else:
@@ -867,10 +882,9 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         weight name remapping as the weights are already properly structured with
         'language_model' and 'vision_tower' prefixes in the safetensors files.
         """
-        if (
-            self.vision_feature_select_strategy == "patch"
-            or self.vision_feature_select_strategy == "full"
-        ):
+        # HF spells the drop-CLS strategy "default"; `get_image_feature` treats it
+        # as "patch", so the token count must not gain the CLS slot here either.
+        if self.vision_feature_select_strategy in ("default", "patch", "full"):
             pass
         elif self.vision_feature_select_strategy == "cls_patch":
             self.image_feature_len += 1
