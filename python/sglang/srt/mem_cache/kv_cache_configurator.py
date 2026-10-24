@@ -3232,6 +3232,22 @@ class KVCacheConfigurator:
         extra_per_slot = replayssm_ring_per_slot + int(
             self.extra_mamba_cache_bytes_per_req * pp_layer_scale
         )
+        if (
+            replayssm_active
+            and self.hybrid_kda_config is not None
+            and envs.SGLANG_K3_KDA_PENDING_REPLAY.get()
+        ):
+            heads, value_dim, key_dim = config.mamba2_cache_params.shape.temporal
+            # Capacity8: bf16 V/K, fp32 per-K decay and beta, int32/head
+            # counters, plus one int32 physical-slot index shared by all layers.
+            pending_bytes = (
+                max_stage_mamba_layers
+                * heads
+                * (8 * (2 * value_dim + 6 * key_dim + 4) + 4)
+                + 4
+            )
+            extra_per_slot += pending_bytes
+
         reserves_spec_state = (
             has_spec_dec
             and not replayssm_active

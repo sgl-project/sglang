@@ -1154,6 +1154,12 @@ class Envs:
     # Experimental Kimi K3 NVFP4 optimizations; each path checks its coverage.
     SGLANG_K3_NVFP4_ROUTE_QUANT = EnvBool(True)
     SGLANG_K3_NVFP4_CAKE = EnvBool(False)
+    SGLANG_K3_NVFP4_TP_SHARED_OVERLAP = EnvBool(False)
+    SGLANG_K3_FP8_DENSE_SHAPE_DISPATCH = EnvBool(False)
+    SGLANG_K3_EARLY_SHARED_FORK = EnvBool(False)
+    SGLANG_K3_SPLIT_FRONT_TGV = EnvBool(False)
+    SGLANG_K3_DFLASH_PREP_GRAPH = EnvBool(False)
+    SGLANG_K3_KDA_PENDING_REPLAY = EnvBool(False)
     SGLANG_K3_DCP_CUTE_PREFILL = EnvBool(False)
     SGLANG_K3_BCG_MHA = EnvBool(False)
     SGLANG_K3_KV_B_PROJ_CUTLASS = EnvBool(True)

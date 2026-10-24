@@ -487,6 +487,32 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.prefill_graph_max_seqs = envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get()
+        pool = self.req_to_token_pool.mamba_pool
+        if (
+            envs.SGLANG_K3_KDA_PENDING_REPLAY.get()
+            and getattr(pool, "replayssm_is_kda", False)
+            and getattr(pool, "replayssm_spec_fold", False)
+        ):
+            args = model_runner.server_args
+            if type(pool).__name__ != "MambaPool":
+                raise ValueError("KDA pending replay currently requires a fixed MambaPool")
+            if (
+                args.speculative_algorithm != "DFLASH"
+                or args.speculative_dflash_block_size != 8
+                or pool.mamba_cache.temporal.shape[2] != 12
+            ):
+                raise ValueError(
+                    "KDA pending replay experiment requires TP8 Kimi DFlash block8"
+                )
+            if pool.kda_pending_replay is None:
+                from sglang.kernels.ops.attention.linear.kda_pending_replay import (
+                    KdaPendingReplay,
+                )
+
+                pool.kda_pending_replay = KdaPendingReplay(pool.mamba_cache.temporal)
+                pool.mem_usage += pool.kda_pending_replay.mem_usage_bytes() / (1 << 30)
+        self.pending_replay = pool.kda_pending_replay
+
         # Needed by the extra_buffer track path: _init_track_conv_indices reads
         # conv_states_shape[-1] as the conv window length (kernel_size - 1).
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
@@ -776,6 +802,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        if self.pending_replay is not None:
+            self.pending_replay.flush(
+                self.req_to_token_pool.mamba2_layer_index(layer.layer_id),
+                indices=self.forward_metadata.mamba_cache_indices,
+            )
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -1053,6 +1084,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if forward_batch.forward_mode.is_target_verify():
             return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
 
+        if self.pending_replay is not None:
+            self.pending_replay.flush(
+                self.req_to_token_pool.mamba2_layer_index(layer.layer_id),
+                indices=self.forward_metadata.mamba_cache_indices,
+            )
+
         if self.prefill_graph_metadata is not None:
             # Breakable prefill CUDA graph bucket: host-free chain on static
             # tables refreshed before each replay.
@@ -1295,7 +1332,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token=retrieve_parent_token,
             replayssm_rawv=replayssm_rawv,
         ):
+            pending_kwargs = {}
+            if self.pending_replay is not None:
+                pending_layer = self.req_to_token_pool.mamba2_layer_index(
+                    layer.layer_id
+                )
+                if draft_token_num == 8 and query_start_loc.numel() in (17, 33, 49):
+                    pending_kwargs = self.pending_replay.layer_kwargs(pending_layer)
+                # Other buckets are flushed once by DFlash before graph replay.
             return self._run_dspark_cutedsl_mtp(
+                pending_kwargs=pending_kwargs,
                 layer=layer,
                 mixed_qkv=mixed_qkv,
                 a=a,
@@ -1311,6 +1357,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_rawk=mamba_cache_params.replayssm_rawk,
                 replayssm_g=mamba_cache_params.replayssm_g,
                 replayssm_beta=mamba_cache_params.replayssm_beta,
+            )
+        if self.pending_replay is not None and query_start_loc.numel() in (17, 33, 49):
+            self.pending_replay.flush(
+                self.req_to_token_pool.mamba2_layer_index(layer.layer_id),
+                indices=self.forward_metadata.mamba_cache_indices,
             )
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
@@ -1812,6 +1863,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         intermediate_state_indices: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        pending_kwargs=None,
         replayssm_rawv: Optional[torch.Tensor] = None,
         replayssm_rawk: Optional[torch.Tensor] = None,
         replayssm_g: Optional[torch.Tensor] = None,
@@ -1858,6 +1910,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         a = a.reshape(1, seq_len, h, layer.head_k_dim)
         out = fused_kda_decode_mtp_dspark(
+            **(pending_kwargs or {}),
             x_q=x_q,
             x_k=x_k,
             x_v=x_v,

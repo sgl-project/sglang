@@ -192,3 +192,79 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("batch", [1, 16, 32, 48])
+def test_deferred_replay_matches_fold_then_verify(batch, monkeypatch):
+    from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
+        commit_kda_replayssm_spec,
+    )
+
+    verify = fused_kda_decode_mtp_dspark
+    saved = {}
+    with monkeypatch.context() as patch:
+        patch.setitem(
+            globals(), "fused_kda_decode_mtp_dspark", lambda **kw: saved.update(kw)
+        )
+        _run("ring", N=batch, H=12, num_spec=7, seed=42, onorm=True, pad_last=batch > 1)
+    initial = saved["recurrent_state"].clone()
+    slots, heads = initial.shape[:2]
+    rawv = torch.randn(slots, heads, 8, 128, dtype=torch.bfloat16, device=DEV)
+    rawk = torch.randn_like(rawv)
+    gate = -torch.rand(slots, heads, 8, 128, device=DEV) * 0.2
+    beta = torch.rand(slots, heads, 8, device=DEV)
+    accepted = torch.tensor(
+        [4] if batch == 1 else [0, 1, 4, 8] * (batch // 4),
+        dtype=torch.int32,
+        device=DEV,
+    )
+    ids = saved["ssm_state_indices"]
+    counts = torch.zeros(slots, heads, dtype=torch.int32, device=DEV)
+    valid = ids >= 0
+    counts[ids[valid]] = accepted[valid, None].expand(-1, heads)
+    reference = initial.clone()
+    commit_kda_replayssm_spec(
+        reference,
+        rawv,
+        rawk,
+        gate,
+        beta,
+        ids,
+        accepted,
+        max_cache_len=8,
+        num_k_heads=heads,
+        null_block_id=-1,
+    )
+    expected = verify(**dict(saved, recurrent_state=reference)).clone()
+    actual = initial.clone()
+    pending = counts.clone()
+    kwargs = dict(
+        saved,
+        recurrent_state=actual,
+        replay_rawv=rawv,
+        replay_rawk=rawk,
+        replay_g=gate,
+        replay_beta=beta,
+        replay_lens=pending,
+    )
+
+    def check(output):
+        state_error = (actual - reference).norm() / reference.norm().clamp_min(1e-9)
+        output_error = (
+            output.float() - expected.float()
+        ).norm() / expected.float().norm().clamp_min(1e-9)
+        assert state_error.item() < 2e-5
+        assert output_error.item() < 2e-3
+        assert pending.count_nonzero().item() == 0
+
+    check(verify(**kwargs))
+    committed = actual.clone()
+    verify(**kwargs)
+    torch.testing.assert_close(actual, committed, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = verify(**kwargs)
+    actual.copy_(initial)
+    pending.copy_(counts)
+    graph.replay()
+    check(graph_output)
