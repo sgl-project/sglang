@@ -1,0 +1,558 @@
+"""The chat prompt is encoded one message at a time and the ids are reused across turns.
+
+An agent sends its whole history on every turn. These tests pin that the
+per-message ids equal a full encode, that a turn only encodes its new messages,
+that tokenizers for which the split is not exact get no cache, and that the
+cache turns itself off when a full encode disagrees.
+"""
+
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from tokenizers import (
+    AddedToken,
+    Regex,
+    Tokenizer,
+    models,
+    normalizers,
+    pre_tokenizers,
+    processors,
+)
+from tokenizers.trainers import BpeTrainer
+from transformers import PreTrainedTokenizerBase, PreTrainedTokenizerFast
+
+from sglang.srt.entrypoints.openai import parallel_prompt_encode as ppe
+from sglang.srt.entrypoints.openai.prompt_segment_cache import PromptSegmentCache
+from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.environ import envs
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+render_and_encode = OpenAIServingChat._render_and_encode_chat_template
+
+TEMPLATE = (
+    "{% for m in messages %}<|{{ m['role'] }}|>\n{{ m['content'] }}{% endfor %}"
+    "{% if add_generation_prompt %}<|assistant|>\n{% endif %}"
+    # Mentions every role token so the cache finds its split points.
+    "{# <|system|> <|user|> <|assistant|> <|observation|> #}"
+)
+ROLES = ("<|system|>", "<|user|>", "<|assistant|>", "<|observation|>")
+CORPUS = [
+    "the service returned errors after the deploy at noon",
+    "query the logs for timeouts and connection resets",
+    'tool result: {"status": "error", "count": 42, "host": "web-1"}',
+    "the root cause is a connection pool that is too small",
+]
+# Message content that looks like the template: markers, parts of markers,
+# whitespace at both ends, and text outside ASCII.
+TEMPLATE_LIKE_CONTENT = [
+    "the user wrote <|user|> and <|assistant|><|observation|> in a log line",
+    "a cut marker <|user and <| and |> and <|system",
+    "  leading and trailing whitespace \n\n",
+    "région ünïcode 日本語 \U0001f600 <|system|>",
+]
+
+
+def _tokenizer(
+    normalizer=None, template=TEMPLATE, extra_tokens=(), intra=False, **role_flags
+):
+    backend = Tokenizer(models.BPE(unk_token="[UNK]"))
+    backend.pre_tokenizer = (
+        pre_tokenizers.Sequence(
+            [
+                pre_tokenizers.Split(
+                    Regex(ppe._INTRA_SPLIT_REGEX), behavior="isolated"
+                ),
+                pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+            ]
+        )
+        if intra
+        else pre_tokenizers.ByteLevel(add_prefix_space=False)
+    )
+    if normalizer is not None:
+        backend.normalizer = normalizer
+    backend.train_from_iterator(
+        CORPUS * 4, BpeTrainer(vocab_size=400, special_tokens=["[UNK]"])
+    )
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+    tokenizer.add_special_tokens(
+        {
+            "additional_special_tokens": [
+                AddedToken(role, special=True, **role_flags) for role in ROLES
+            ]
+        }
+    )
+    for token in extra_tokens:
+        tokenizer.add_tokens([token], special_tokens=token.special)
+    tokenizer.chat_template = template
+    return tokenizer
+
+
+class CountingTokenizer:
+    """Forwards to a tokenizer and records the text of every encode call."""
+
+    def __init__(self, tokenizer):
+        self._tokenizer = tokenizer
+        self.encoded = []
+
+    def __getattr__(self, name):
+        return getattr(self._tokenizer, name)
+
+    def encode(self, text, **kwargs):
+        self.encoded.append(text)
+        return self._tokenizer.encode(text, **kwargs)
+
+
+class ContextDependentTokenizer(CountingTokenizer):
+    """A full prompt gets one more id than the sum of its messages."""
+
+    def encode(self, text, **kwargs):
+        ids = super().encode(text, **kwargs)
+        return ids + [0] if text.count("<|") > 1 else ids
+
+
+def _conversation(turns, contents=CORPUS):
+    messages = [
+        {"role": "system", "content": contents[0]},
+        {"role": "user", "content": contents[1]},
+    ]
+    for turn in range(turns):
+        messages.append({"role": "assistant", "content": f"{contents[3]} {turn}"})
+        messages.append({"role": "observation", "content": f"{contents[2]} {turn}"})
+    return messages
+
+
+def _render(tokenizer, turns, contents=CORPUS):
+    return tokenizer.apply_chat_template(
+        _conversation(turns, contents), tokenize=False, add_generation_prompt=True
+    )
+
+
+def _unchecked_cache(tokenizer, **kwargs):
+    """A cache that never compares with a full encode, so the test does."""
+    return PromptSegmentCache.create(
+        tokenizer, check_first=0, check_every=10**9, **kwargs
+    )
+
+
+class TestPromptSegmentCache(CustomTestCase):
+    def test_special_adding_post_processors_keep_full_prompt_ids(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                tokenizer = _tokenizer()
+                post_processor = processors.TemplateProcessing(
+                    single="<|assistant|> $A",
+                    special_tokens=[
+                        (
+                            "<|assistant|>",
+                            tokenizer.convert_tokens_to_ids("<|assistant|>"),
+                        )
+                    ],
+                )
+                if nested:
+                    post_processor = processors.Sequence(
+                        [processors.ByteLevel(), post_processor]
+                    )
+                tokenizer.backend_tokenizer.post_processor = post_processor
+                cache = PromptSegmentCache.create(tokenizer)
+                self.assertIsNotNone(cache)
+                first = "<|user|>query the logs"
+                for _ in range(3):
+                    self.assertEqual(
+                        cache.encode(first, {"add_special_tokens": False}),
+                        tokenizer.encode(first, add_special_tokens=False),
+                    )
+                text = first + "<|user|>root cause"
+                for kwargs in (
+                    {},
+                    {"add_special_tokens": True},
+                    {"add_special_tokens": False},
+                ):
+                    self.assertEqual(
+                        cache.encode(text, kwargs), tokenizer.encode(text, **kwargs)
+                    )
+                self.assertTrue(cache.enabled)
+
+    def test_ids_equal_a_full_encode_on_every_turn(self):
+        tokenizer = _tokenizer()
+        cache = _unchecked_cache(tokenizer)
+        for turns in range(6):
+            text = _render(tokenizer, turns)
+            self.assertEqual(cache.encode(text, {}), tokenizer.encode(text))
+        self.assertTrue(cache.enabled)
+
+    def test_ids_equal_a_full_encode_when_content_looks_like_the_template(self):
+        tokenizer = _tokenizer()
+        cache = _unchecked_cache(tokenizer)
+        for turns in range(4):
+            text = _render(tokenizer, turns, TEMPLATE_LIKE_CONTENT)
+            self.assertEqual(cache.encode(text, {}), tokenizer.encode(text))
+
+    def test_a_turn_only_encodes_its_new_messages(self):
+        tokenizer = CountingTokenizer(_tokenizer())
+        cache = _unchecked_cache(tokenizer)
+        cache.encode(_render(tokenizer, 3), {})
+        tokenizer.encoded.clear()
+
+        cache.encode(_render(tokenizer, 4), {})
+
+        # Turn 4 adds one assistant and one observation message. The generation
+        # prompt at the end was already encoded on the previous turn.
+        self.assertEqual(len(tokenizer.encoded), 2)
+        self.assertTrue(all(text.startswith("<|") for text in tokenizer.encoded))
+
+    def test_encode_kwargs_are_part_of_the_key(self):
+        tokenizer = CountingTokenizer(_tokenizer())
+        cache = _unchecked_cache(tokenizer)
+        text = _render(tokenizer, 1)
+        cache.encode(text, {})
+        tokenizer.encoded.clear()
+
+        cache.encode(text, {"add_special_tokens": False})
+
+        self.assertGreater(len(tokenizer.encoded), 0)
+
+    def test_a_disagreeing_full_encode_turns_the_cache_off(self):
+        tokenizer = ContextDependentTokenizer(_tokenizer())
+        cache = PromptSegmentCache.create(tokenizer, check_first=1)
+        text = _render(tokenizer, 2)
+
+        ids = cache.encode(text, {})
+
+        self.assertEqual(ids, tokenizer.encode(text))
+        self.assertFalse(cache.enabled)
+
+    def test_the_check_repeats_at_the_interval(self):
+        tokenizer = ContextDependentTokenizer(_tokenizer())
+        cache = PromptSegmentCache.create(tokenizer, check_first=0, check_every=2)
+        text = _render(tokenizer, 2)
+
+        cache.encode(text, {})
+        self.assertTrue(cache.enabled)
+        cache.encode(text, {})
+
+        self.assertFalse(cache.enabled)
+
+    def test_old_messages_are_evicted_by_size(self):
+        tokenizer = _tokenizer()
+        cache = _unchecked_cache(tokenizer, max_chars=200)
+        for turns in range(8):
+            text = _render(tokenizer, turns)
+            self.assertEqual(cache.encode(text, {}), tokenizer.encode(text))
+        self.assertLessEqual(
+            cache._chars, 200 + max(len(s) for s, _ in cache._segments)
+        )
+
+    def test_a_message_that_every_request_uses_is_not_evicted(self):
+        tokenizer = CountingTokenizer(_tokenizer())
+        system = {"role": "system", "content": CORPUS[0]}
+        # Room for the system message and about two user messages.
+        cache = _unchecked_cache(tokenizer, max_chars=200)
+
+        for request in range(8):
+            user = {"role": "user", "content": f"{CORPUS[1]} {request}"}
+            text = tokenizer.apply_chat_template([system, user], tokenize=False)
+            cache.encode(text, {})
+
+        system_encodes = [t for t in tokenizer.encoded if t.startswith("<|system|>")]
+        self.assertEqual(len(system_encodes), 1)
+
+
+class TestUnsupportedTokenizers(CustomTestCase):
+    def test_bpe_dropout_gets_no_cache(self):
+        tokenizer = _tokenizer()
+        tokenizer.backend_tokenizer.model.dropout = 0.5
+        self.assertIsNone(PromptSegmentCache.create(tokenizer))
+
+    def test_a_normalizer_gets_no_cache(self):
+        tokenizer = _tokenizer(normalizer=normalizers.Lowercase())
+        self.assertIsNone(PromptSegmentCache.create(tokenizer))
+
+    def test_a_special_token_that_depends_on_its_neighbors_gets_no_cache(self):
+        for flag in ("lstrip", "rstrip", "single_word"):
+            with self.subTest(flag=flag):
+                tokenizer = _tokenizer(**{flag: True})
+                self.assertIsNone(PromptSegmentCache.create(tokenizer))
+
+    def test_a_tokenizer_that_splits_special_tokens_gets_no_cache(self):
+        tokenizer = _tokenizer()
+        tokenizer.split_special_tokens = True
+        self.assertIsNone(PromptSegmentCache.create(tokenizer))
+
+    def test_a_template_without_special_tokens_gets_no_cache(self):
+        tokenizer = _tokenizer(template="{{ messages[0]['content'] }}")
+        self.assertIsNone(PromptSegmentCache.create(tokenizer))
+
+    def test_a_tokenizer_without_a_fast_backend_gets_no_cache(self):
+        slow = SimpleNamespace(encode=lambda text, **kwargs: [1])
+        self.assertIsNone(PromptSegmentCache.create(slow))
+
+    def test_a_backend_that_is_not_huggingface_tokenizers_gets_no_cache(self):
+        real = _tokenizer()
+        other_backend = SimpleNamespace(
+            backend_tokenizer=SimpleNamespace(normalizer=None),
+            chat_template=real.chat_template,
+            added_tokens_decoder=real.added_tokens_decoder,
+            encode=real.encode,
+        )
+        self.assertIsNone(PromptSegmentCache.create(other_backend))
+
+    def test_an_added_token_that_overlaps_a_marker_never_changes_the_ids(self):
+        cases = {
+            "ends with the start of a marker": (
+                [AddedToken("=<", normalized=False)],
+                TEMPLATE,
+                "<|user|>\nx =<|assistant|>\n",
+            ),
+            "contains a marker": (
+                [AddedToken("a<|user|>", normalized=False)],
+                TEMPLATE,
+                "<|system|>\nbanana<|user|>\nquery the logs",
+            ),
+            "marker that overlaps itself": (
+                [AddedToken(">>", normalized=False, special=True)],
+                TEMPLATE + "{# >> #}",
+                "<|user|>\nshift >>> right<|assistant|>\n",
+            ),
+            "starts inside a marker that the backend matches later": (
+                [
+                    AddedToken("small", normalized=True, special=True),
+                    AddedToken("mall", normalized=False),
+                ],
+                TEMPLATE + "{# small #}",
+                "<|user|>\nthe pool is too small",
+            ),
+        }
+        for name, (extra_tokens, template, text) in cases.items():
+            with self.subTest(name):
+                tokenizer = _tokenizer(template=template, extra_tokens=extra_tokens)
+                cache = _unchecked_cache(tokenizer)
+                # No cache is a correct answer. A cache with other ids is not.
+                ids = cache.encode(text, {}) if cache else tokenizer.encode(text)
+                self.assertEqual(ids, tokenizer.encode(text))
+
+
+class TestRenderAndEncode(CustomTestCase):
+    def _server(self, tokenizer, cache):
+        return SimpleNamespace(
+            tokenizer_manager=SimpleNamespace(tokenizer=tokenizer),
+            _prompt_text_round_trip_is_lossy=False,
+            _prompt_segment_cache=cache,
+        )
+
+    def _encode(self, server, turns):
+        prompt_ids, _ = render_and_encode(
+            server,
+            _conversation(turns),
+            tools=None,
+            template_kwargs={},
+            encode_kwargs={},
+            use_cache=False,
+        )
+        return prompt_ids
+
+    def test_the_chat_endpoint_reuses_message_ids(self):
+        tokenizer = CountingTokenizer(_tokenizer())
+        server = self._server(tokenizer, _unchecked_cache(tokenizer))
+        first = self._encode(server, 2)
+        tokenizer.encoded.clear()
+
+        second = self._encode(server, 3)
+
+        self.assertEqual(second, tokenizer._tokenizer.encode(_render(tokenizer, 3)))
+        # Both prompts end with the generation prompt. The rest of the first is a prefix.
+        tail = len(tokenizer._tokenizer.encode("<|assistant|>\n"))
+        self.assertEqual(second[: len(first) - tail], first[:-tail])
+        self.assertEqual(len(tokenizer.encoded), 2)
+
+    def test_a_sequence_duplicating_post_processor_keeps_full_prompt_ids(self):
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                tokenizer = _tokenizer(
+                    template="{% for m in messages %}<|user|>{{ m['content'] }}{% endfor %}"
+                )
+                post_processor = processors.TemplateProcessing(
+                    single="$A $A", special_tokens=[]
+                )
+                if nested:
+                    post_processor = processors.Sequence(
+                        [processors.ByteLevel(), post_processor]
+                    )
+                tokenizer.backend_tokenizer.post_processor = post_processor
+                cache = PromptSegmentCache.create(tokenizer)
+                server = self._server(tokenizer, cache)
+                messages = [{"role": "user", "content": "query the logs"}]
+                # One segment hides the duplication during the initial checks.
+                for request in range(4):
+                    if request == 3:
+                        messages.append({"role": "user", "content": "root cause"})
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                    prompt_ids, _ = render_and_encode(
+                        server,
+                        messages,
+                        tools=None,
+                        template_kwargs={},
+                        encode_kwargs={"add_special_tokens": False},
+                        use_cache=False,
+                    )
+                    self.assertEqual(
+                        prompt_ids, tokenizer.encode(text, add_special_tokens=False)
+                    )
+                self.assertIsNone(cache)
+
+    def test_without_a_cache_the_prompt_is_encoded_whole(self):
+        tokenizer = CountingTokenizer(_tokenizer())
+        server = self._server(tokenizer, None)
+
+        prompt_ids = self._encode(server, 2)
+
+        self.assertEqual(prompt_ids, tokenizer._tokenizer.encode(_render(tokenizer, 2)))
+        self.assertEqual(len(tokenizer.encoded), 1)
+
+    def test_a_cache_that_turned_itself_off_encodes_the_prompt_whole(self):
+        tokenizer = ContextDependentTokenizer(_tokenizer())
+        cache = PromptSegmentCache.create(tokenizer, check_first=1)
+        server = self._server(tokenizer, cache)
+        self._encode(server, 2)
+        self.assertFalse(cache.enabled)
+        tokenizer.encoded.clear()
+
+        self._encode(server, 3)
+
+        self.assertEqual(tokenizer.encoded, [_render(tokenizer, 3)])
+
+    def test_an_absent_or_disabled_cache_keeps_parallel_encoding(self):
+        """The cache must not remove the upstream long-prompt encoding path."""
+        tokenizer = _tokenizer()
+        messages = _conversation(3, [content * 256 for content in CORPUS])
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        reference = tokenizer.encode(text)
+        original_split = ppe.split_prompt
+
+        for disabled in (False, True):
+            with self.subTest(disabled_cache=disabled):
+                cache = PromptSegmentCache.create(tokenizer) if disabled else None
+                if cache is not None:
+                    cache.enabled = False
+                chunks = []
+
+                def split_prompt(*args, **kwargs):
+                    result = original_split(*args, **kwargs)
+                    chunks.extend(result)
+                    return result
+
+                with (
+                    envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(True),
+                    envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(0),
+                    patch.object(ppe, "_parallel_ok", True),
+                    patch.object(ppe, "split_prompt", side_effect=split_prompt),
+                ):
+                    ids, _ = render_and_encode(
+                        self._server(tokenizer, cache),
+                        messages,
+                        tools=None,
+                        template_kwargs={},
+                        encode_kwargs={},
+                        use_cache=False,
+                    )
+
+                self.assertEqual(ids, reference)
+                self.assertGreater(len(chunks), 1)
+
+    def test_cold_long_prompts_and_validation_keep_parallel_encoding(self):
+        """Cold messages and full validation must not serialize long chats.
+
+        Cover both many messages below the threshold and one long message
+        whose content needs the GLM / Llama intra-message split points.
+        """
+        original_encode = PreTrainedTokenizerBase.encode
+        original_plan = ppe._plan_for
+        for intra in (False, True):
+            for parallel in (False, True):
+                with self.subTest(intra=intra, parallel=parallel):
+                    tokenizer = _tokenizer(intra=intra)
+                    messages = (
+                        [{"role": "user", "content": CORPUS[0] * 2000}]
+                        if intra
+                        else [
+                            {"role": "user", "content": f"{i} " + CORPUS[0] * 100}
+                            for i in range(12)
+                        ]
+                    )
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                    reference = tokenizer.encode(text)
+                    cache = PromptSegmentCache.create(tokenizer)
+                    server = self._server(tokenizer, cache)
+                    serial_texts, batches = [], []
+
+                    class Backend:
+                        def __init__(self, backend):
+                            self.backend = backend
+
+                        def __getattr__(self, name):
+                            return getattr(self.backend, name)
+
+                        def encode_batch(self, chunks, **kwargs):
+                            batches.append(list(chunks))
+                            return self.backend.encode_batch(chunks, **kwargs)
+
+                    def plan_for(tokenizer):
+                        backend, *plan = original_plan(tokenizer)
+                        return (Backend(backend), *plan)
+
+                    def encode(tokenizer, text, **kwargs):
+                        serial_texts.append(text)
+                        return original_encode(tokenizer, text, **kwargs)
+
+                    with (
+                        envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(parallel),
+                        envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(32768),
+                        patch.object(ppe, "_parallel_ok", True),
+                        patch.object(ppe, "_plan_for", side_effect=plan_for),
+                        patch.object(PreTrainedTokenizerBase, "encode", encode),
+                    ):
+                        # The cold call and the first three full validation checks.
+                        for _ in range(3):
+                            ids, _ = render_and_encode(
+                                server,
+                                messages,
+                                tools=None,
+                                template_kwargs={},
+                                encode_kwargs={},
+                                use_cache=False,
+                            )
+                            self.assertEqual(ids, reference)
+                        encoded_before_warm_call = (len(serial_texts), len(batches))
+                        self.assertEqual(cache.encode(text, {}), reference)
+                        self.assertEqual(
+                            (len(serial_texts), len(batches)), encoded_before_warm_call
+                        )
+
+                    self.assertTrue(cache.enabled)
+                    if parallel:
+                        self.assertEqual(len(serial_texts), 0)
+                        self.assertEqual(len(batches), 4)
+                        self.assertTrue(all(len(batch) > 1 for batch in batches))
+                        self.assertTrue(
+                            all(
+                                len(chunk) < 32768
+                                for batch in batches
+                                for chunk in batch
+                            )
+                        )
+                    else:
+                        self.assertEqual(batches, [])
+                        self.assertGreater(len(serial_texts), 3)
+
+
+if __name__ == "__main__":
+    unittest.main()

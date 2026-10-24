@@ -47,6 +47,7 @@ from sglang.srt.entrypoints.openai import (
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     parallel_prompt_encode,
 )
+from sglang.srt.entrypoints.openai.prompt_segment_cache import PromptSegmentCache
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -364,6 +365,13 @@ class OpenAIServingChat(OpenAIServingBase):
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
         self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
             OrderedDict()
+        )
+        # Encodes only the messages of a prompt that it has not seen. None when
+        # per-message encoding is not exact for this tokenizer.
+        self._prompt_segment_cache = (
+            PromptSegmentCache.create(self.tokenizer_manager.tokenizer)
+            if envs.SGLANG_OPT_USE_CHAT_PROMPT_SEGMENT_CACHE.get()
+            else None
         )
 
     def _probe_prompt_text_round_trip(self) -> bool:
@@ -1824,9 +1832,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 return_dict=False,
                 **template_kwargs,
             )
-            prompt_ids = parallel_prompt_encode(
-                self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
-            )
+            segment_cache = self._prompt_segment_cache
+            if segment_cache is not None and segment_cache.enabled:
+                prompt_ids = segment_cache.encode(rendered_prompt, encode_kwargs)
+            else:
+                prompt_ids = parallel_prompt_encode(
+                    self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
+                )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
             if cache_key is not None
