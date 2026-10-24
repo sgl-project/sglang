@@ -13,6 +13,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.kimik3_format import (
+    CALL_CLOSE,
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
@@ -75,6 +76,8 @@ class KimiK3Detector(BaseFormatDetector):
         self.bot_token = TOOLS_OPEN
         self.eot_token = TOOLS_CLOSE
         self._sent_normal_idx = 0
+        self._scan_pos = 0
+        self._close_search_pos = 0
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -180,15 +183,30 @@ class KimiK3Detector(BaseFormatDetector):
     ) -> StreamingParseResult:
         self._buffer += new_text
         try:
-            open_idx = self._buffer.find(self.bot_token)
-            if open_idx == -1:
-                return StreamingParseResult(normal_text=self._emit_normal_text())
+            if self._scan_pos == 0:
+                open_idx = self._buffer.find(self.bot_token, self._sent_normal_idx)
+                if open_idx == -1:
+                    return StreamingParseResult(normal_text=self._emit_normal_text())
 
-            normal_text = self._emit_normal_text(limit=open_idx)
-            section = self._buffer[open_idx + len(self.bot_token) :]
+                normal_text = self._emit_normal_text(limit=open_idx)
+                self._scan_pos = open_idx + len(self.bot_token)
+                self._close_search_pos = self._scan_pos
+            else:
+                normal_text = ""
+
+            close_idx = self._buffer.find(CALL_CLOSE, self._close_search_pos)
+            if close_idx == -1:
+                self._close_search_pos = max(
+                    self._scan_pos, len(self._buffer) - len(CALL_CLOSE) + 1
+                )
+                return StreamingParseResult(normal_text=normal_text)
+
+            last_close_end = self._buffer.rfind(CALL_CLOSE, close_idx) + len(CALL_CLOSE)
             calls = []
-            parsed = self._parse_calls(section)
-            for call in parsed[self.current_tool_id + 1 :]:
+            for m in _CALL_RE.finditer(self._buffer, self._scan_pos, last_close_end):
+                call = self._decode_call(m["attrs"], m["body"])
+                if call is None:
+                    continue
                 self.current_tool_id += 1
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
                     self.prev_tool_call_arr.append({})
@@ -206,23 +224,33 @@ class KimiK3Detector(BaseFormatDetector):
                         parameters=call["arguments"],
                     )
                 )
+            self._scan_pos = last_close_end
+            self._close_search_pos = max(
+                self._scan_pos, len(self._buffer) - len(CALL_CLOSE) + 1
+            )
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(
                 "Error in Kimi K3 parse_streaming_increment: %s", e, exc_info=True
             )
-            # _sent_normal_idx indexes into _buffer, so it must be reset with it;
-            # otherwise every later _emit_normal_text sees limit <= _sent_normal_idx
-            # and silently drops the rest of the response.
+            # _sent_normal_idx and scan cursors index into _buffer, so they must
+            # be reset with it; otherwise every later _emit_normal_text sees
+            # limit <= _sent_normal_idx and silently drops the rest of the response.
             self._buffer = ""
             self._sent_normal_idx = 0
+            self._scan_pos = 0
+            self._close_search_pos = 0
             return StreamingParseResult()
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
-        open_idx = self._buffer.find(self.bot_token)
+        open_idx = (
+            self._scan_pos - len(self.bot_token)
+            if self._scan_pos > 0
+            else self._buffer.find(self.bot_token, self._sent_normal_idx)
+        )
         if open_idx != -1:
             section = self._buffer[open_idx + len(self.bot_token) :]
-            if not self._parse_calls(section):
+            if self.current_tool_id == -1 and not self._parse_calls(section):
                 logger.warning(
                     "Kimi K3 tools section ended with no complete tool call; "
                     "dropping %d buffered chars",
