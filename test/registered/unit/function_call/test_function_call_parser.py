@@ -3135,6 +3135,49 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
 
+    def test_anyof_string_null_preserves_json_null(self):
+        """anyOf[string,null] with bare null must not become the string 'None'."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="api_fetch",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "body": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                            "params": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                            "method": {"type": "string"},
+                            "url": {"type": "string"},
+                        },
+                        "required": ["method", "url", "params", "body"],
+                    },
+                ),
+            )
+        ]
+        text = (
+            "<tool_call>api_fetch\n"
+            "<arg_key>body</arg_key>\n<arg_value>null</arg_value>\n"
+            "<arg_key>method</arg_key>\n<arg_value>GET</arg_value>\n"
+            "<arg_key>params</arg_key>\n<arg_value>null</arg_value>\n"
+            "<arg_key>url</arg_key>\n<arg_value>https://example.com</arg_value>\n"
+            "</tool_call>"
+        )
+        calls = self.detector.detect_and_parse(text, tools).calls
+        self.assertEqual(len(calls), 1)
+        args = json.loads(calls[0].parameters)
+        self.assertEqual(
+            args,
+            {
+                "body": None,
+                "params": None,
+                "method": "GET",
+                "url": "https://example.com",
+            },
+        )
+        self.assertIsNone(args["body"])
+        self.assertIsNone(args["params"])
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):

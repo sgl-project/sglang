@@ -649,7 +649,10 @@ class Glm4MoeDetector(BaseFormatDetector):
                     # If parsed as dict/list but schema says string, convert to JSON string
                     arguments[arg_key] = json.dumps(parsed_value, ensure_ascii=False)
                 else:
-                    arguments[arg_key] = str(parsed_value)
+                    # JSON null must survive; str() would corrupt it to "None"
+                    arguments[arg_key] = (
+                        None if parsed_value is None else str(parsed_value)
+                    )
             elif arg_type is None:
                 # If type is not defined, keep the parsed value as-is
                 arguments[arg_key] = parsed_value if is_good_json else arg_value
