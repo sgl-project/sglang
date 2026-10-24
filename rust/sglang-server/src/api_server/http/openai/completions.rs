@@ -15,8 +15,8 @@ use axum::{
     routing::post,
 };
 use dynamo_protocols::types::{
-    Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
-    CreateCompletionResponse, Logprobs, Prompt, Stop,
+    Choice, CompletionFinishReason, CompletionTokensDetails, CompletionUsage,
+    CreateCompletionRequest, CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
 use serde::Deserialize;
@@ -373,6 +373,7 @@ pub(super) async fn unary_completion(
     let mut extensions = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = BTreeMap::<usize, u32>::new();
     let mut completion_tokens = 0u64;
+    let mut reasoning_tokens = 0u64;
 
     for choice in submitted {
         let output = match collect_output(choice.call).await {
@@ -386,6 +387,7 @@ pub(super) async fn unary_completion(
             .entry(choice.prompt_index)
             .or_insert(output.prompt_tokens);
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+        reasoning_tokens = reasoning_tokens.saturating_add(output.reasoning_tokens);
         let (response_choice, extension) = completion_choice(
             choice.index,
             if echo {
@@ -408,6 +410,7 @@ pub(super) async fn unary_completion(
     let usage = completion_usage(
         prompt_tokens,
         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+        reasoning_tokens,
     );
 
     Json(completion_response_value(
@@ -531,6 +534,8 @@ pub(super) fn completion_event_stream(
         let mut first_chunks = vec![true; count];
         let mut prompt_tokens_by_prompt = BTreeMap::<usize, u32>::new();
         let mut completion_tokens_by_choice = vec![0u64; count];
+        // Running totals per choice: the latest event's value is the choice's.
+        let mut reasoning_tokens_by_choice = vec![0u64; count];
         let mut streams = Vec::with_capacity(count);
 
         for choice in submitted {
@@ -555,6 +560,7 @@ pub(super) fn completion_event_stream(
                 .or_insert(output.prompt_tokens);
             completion_tokens_by_choice[index] = completion_tokens_by_choice[index]
                 .saturating_add(output.completion_tokens);
+            reasoning_tokens_by_choice[index] = output.reasoning_tokens;
             let first = std::mem::replace(&mut first_chunks[index], false);
             let text = if echo && first {
                 echoes[index].clone() + &output.text
@@ -565,6 +571,7 @@ pub(super) fn completion_event_stream(
                 completion_usage(
                     output.prompt_tokens,
                     u32::try_from(completion_tokens_by_choice[index]).unwrap_or(u32::MAX),
+                    reasoning_tokens_by_choice[index],
                 )
             });
             let (choice, extension) = completion_choice(
@@ -594,6 +601,9 @@ pub(super) fn completion_event_stream(
             let completion_tokens = completion_tokens_by_choice
                 .into_iter()
                 .fold(0u64, u64::saturating_add);
+            let reasoning_tokens = reasoning_tokens_by_choice
+                .into_iter()
+                .fold(0u64, u64::saturating_add);
             let final_chunk = CreateCompletionResponse {
                 id: response_id,
                 choices: vec![],
@@ -604,6 +614,7 @@ pub(super) fn completion_event_stream(
                 usage: Some(completion_usage(
                     prompt_tokens,
                     u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                    reasoning_tokens,
                 )),
             };
             yield completion_response_value(final_chunk, &[]).to_string();
@@ -612,11 +623,28 @@ pub(super) fn completion_event_stream(
     }
 }
 
-pub(super) fn completion_usage(prompt_tokens: u32, completion_tokens: u32) -> CompletionUsage {
+/// OpenAI `CompletionUsage`, with reasoning tokens in `completion_tokens_details`
+/// as Python's `UsageProcessor` reports them. The spec's other completion detail
+/// counts (predicted outputs, audio) do not apply and are reported as 0.
+pub(super) fn completion_usage(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    reasoning_tokens: u64,
+) -> CompletionUsage {
     CompletionUsage {
         prompt_tokens,
         completion_tokens,
         total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        completion_tokens_details: Some(CompletionTokensDetails {
+            reasoning_tokens: Some(
+                u32::try_from(reasoning_tokens.min(u64::from(completion_tokens)))
+                    .unwrap_or(u32::MAX),
+            ),
+            accepted_prediction_tokens: Some(0),
+            rejected_prediction_tokens: Some(0),
+            audio_tokens: Some(0),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -713,10 +741,10 @@ fn append_top_logprobs(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chunk, submitted};
+    use super::super::test_utils::{chunk, submitted, with_tokens};
     use super::{
         ChoiceExtensions, PromptSpec, completion_event_stream, completion_logprobs,
-        completion_prompt_specs, completion_response_value, unary_completion,
+        completion_prompt_specs, completion_response_value, completion_usage, unary_completion,
     };
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
@@ -825,6 +853,91 @@ mod tests {
         assert_eq!(value["choices"][0]["matched_stop"], "</s>");
         assert_eq!(value["usage"]["prompt_tokens"], 5);
         assert_eq!(value["usage"]["completion_tokens"], 4);
+    }
+
+    #[tokio::test]
+    async fn unary_reports_reasoning_tokens_in_completion_tokens_details() {
+        // Running totals: each choice's latest value, summed over choices.
+        let (choice0, tx0) = submitted(0, 0, "r0");
+        let (choice1, tx1) = submitted(1, 0, "r1");
+        tx0.send(with_tokens(chunk("r0", "a", false), 2, 1))
+            .await
+            .unwrap();
+        tx0.send(with_tokens(chunk("r0", "b", true), 2, 2))
+            .await
+            .unwrap();
+        tx1.send(with_tokens(chunk("r1", "x", true), 4, 3))
+            .await
+            .unwrap();
+
+        let response = unary_completion(
+            vec![choice0, choice1],
+            "cmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            false,
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["usage"]["completion_tokens"], 8);
+        assert_eq!(
+            value["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            5
+        );
+    }
+
+    #[test]
+    fn reasoning_tokens_detail_never_exceeds_completion_tokens() {
+        let usage = completion_usage(5, 3, 7);
+        let details = usage.completion_tokens_details.unwrap();
+        assert_eq!(details.reasoning_tokens, Some(3));
+    }
+
+    #[tokio::test]
+    async fn continuous_usage_reports_each_choice_latest_reasoning_total() {
+        let (choice, tx) = submitted(0, 0, "r0");
+        tx.send(with_tokens(chunk("r0", "a", false), 2, 1))
+            .await
+            .unwrap();
+        tx.send(with_tokens(chunk("r0", "b", true), 2, 2))
+            .await
+            .unwrap();
+
+        let stream = completion_event_stream(
+            vec![choice],
+            "cmpl-test".into(),
+            "model".into(),
+            1,
+            false,
+            false,
+            false,
+            true,
+        );
+        futures::pin_mut!(stream);
+        let frames: Vec<String> = stream.collect().await;
+        let usage: Vec<(serde_json::Value, serde_json::Value)> = frames
+            .iter()
+            .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+            .filter(|frame| !frame["choices"].as_array().unwrap().is_empty())
+            .map(|frame| {
+                (
+                    frame["usage"]["completion_tokens"].clone(),
+                    frame["usage"]["completion_tokens_details"]["reasoning_tokens"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            usage,
+            [
+                (serde_json::json!(2), serde_json::json!(1)),
+                (serde_json::json!(4), serde_json::json!(2)),
+            ],
+            "{frames:?}"
+        );
     }
 
     #[tokio::test]
