@@ -75,7 +75,7 @@ Other deployment flags:
 - `--lora-weight-name`: Select the exact safetensors file when the LoRA repository contains multiple weight files.
 
 <Note>
-For native LTX-2.3 two-stage serving without a user LoRA, `resident` is the fastest high-VRAM path. LTX-2 still applies the distilled LoRA during the stage switch, so `--ltx2-two-stage-device-mode` is mainly an LTX-2.3 optimization. When you pass `--lora-path`, SGLang still applies the user LoRA during the two-stage switch, so use `resident` on H200-class GPUs for enough VRAM, but do not expect the same premerged-stage2 benefit as the no-user-LoRA path.
+For LTX-2 and LTX-2.3 two-stage serving without a user LoRA, `resident` is the fastest high-VRAM path: stage 2 runs a second DiT with the distilled LoRA merged in, and it is the default on GPUs with at least 130 GiB. When you pass `--lora-path`, SGLang still applies the user LoRA during the two-stage switch, so use `resident` on H200-class GPUs for enough VRAM, but do not expect the same premerged-stage2 benefit as the no-user-LoRA path.
 </Note>
 
 ### 3.3 Fast multi-GPU presets

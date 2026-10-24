@@ -1096,7 +1096,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _adjust_ltx2_two_stage_device_mode(self):
-        if not self._is_ltx23_two_stage_pipeline():
+        if not self._is_ltx2_distilled_lora_two_stage_pipeline():
             return
 
         mode = self.ltx2_two_stage_device_mode
@@ -1170,6 +1170,13 @@ class ServerArgs(DisaggServerArgsMixin):
             device_total_memory_gb,
         )
         return "original"
+
+    def _is_ltx2_distilled_lora_two_stage_pipeline(self) -> bool:
+        # LTX-2 and LTX-2.3 refine with a distilled LoRA; LTX-2.5 ships a distilled DiT
+        return (
+            is_ltx2_two_stage_pipeline_name(self.pipeline_class_name)
+            and not self.pipeline_config.default_sigmas
+        )
 
     def _is_ltx23_two_stage_pipeline(self) -> bool:
         return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
@@ -2919,9 +2926,10 @@ class ServerArgs(DisaggServerArgsMixin):
             choices=LTX2_TWO_STAGE_DEVICE_MODE_CHOICES,
             default=ServerArgs.ltx2_two_stage_device_mode,
             help=(
-                "LTX-2.3 two-stage device residency mode: "
+                "LTX-2 / LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
-                "'resident' keeps both transformers resident on GPU. "
+                "'resident' keeps both transformers resident on GPU and runs stage 2 "
+                "on the one with the distilled LoRA merged in. "
                 "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
             ),
         )
