@@ -163,12 +163,8 @@ def _gpu_fabric_clique(device: torch.device):
     """Return this GPU's NVLink fabric clique, or ``None`` if not joined."""
     if pynvml is None:
         return None
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_ids = list(map(int, cuda_visible_devices.split(",")))
-    else:
-        device_ids = list(range(torch.cuda.device_count()))
-    handle = pynvml.nvmlDeviceGetHandleByIndex(device_ids[device.index])
+    nvml_index = torch.cuda._get_nvml_device_index(device)
+    handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_index)
     if (
         _NVML_GPU_FABRIC_INFO_V3_TYPE is not None
         and _NVML_GPU_FABRIC_INFO_V3_VERSION is not None
@@ -180,8 +176,11 @@ def _gpu_fabric_clique(device: torch.device):
     else:
         fabric = pynvml.c_nvmlGpuFabricInfo_t()
         pynvml.nvmlDeviceGetGpuFabricInfo(handle, ctypes.byref(fabric))
-        clique_id = fabric.partitionId
-    if fabric.state != _NVML_GPU_FABRIC_STATE_COMPLETED:
+        clique_id = fabric.cliqueId
+    if (
+        fabric.state != _NVML_GPU_FABRIC_STATE_COMPLETED
+        or fabric.status != pynvml.NVML_SUCCESS
+    ):
         return None
     return (bytes(fabric.clusterUuid), int(clique_id))
 
