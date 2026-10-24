@@ -608,6 +608,7 @@ class ChatCompletionMessageContentImageURL(BaseModel):
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
+    cache_id: Optional[str] = Field(default=None, min_length=1, max_length=256)
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
     fps: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
