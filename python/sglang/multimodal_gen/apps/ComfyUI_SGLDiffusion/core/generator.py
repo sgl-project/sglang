@@ -12,6 +12,7 @@ import sys
 import torch
 
 from ..executors.flux import FluxExecutor
+from ..executors.flux2 import Flux2Executor
 from ..executors.minimax_h3 import (
     FastH3Executor,
     MiniMaxH3Executor,
@@ -209,6 +210,7 @@ def _load_executor_classes():
     """Qwen adapters import ComfyUI. Keep them optional so CI can load the rest."""
     classes = [
         FluxExecutor,
+        Flux2Executor,
         ZImageExecutor,
         MiniMaxH3Executor,
         FastH3Executor,
@@ -614,7 +616,10 @@ class SGLDiffusionGenerator:
         self.last_options = gather_options
         self.model_path = detect_path
 
-        pipeline_class_name = self.pipeline_class_dict[model_type]
+        executor_class = self.executor_class_dict[model_type]
+        pipeline_class_name = executor_class.adapter_cls.pipeline_class_for(
+            model_config
+        )
         worker_model_path = runtime_model_path or detect_path
         int8_kernel = gather_options["int8_kernel"]
         # auto keeps whatever the ComfyUI process environment already selects.
@@ -632,7 +637,6 @@ class SGLDiffusionGenerator:
             )
         self.model_type = model_type
 
-        executor_class = self.executor_class_dict[model_type]
         self.executor = executor_class(
             self.generator, worker_model_path, comfyui_model, model_config
         )

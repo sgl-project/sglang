@@ -26,7 +26,7 @@ class PackedForward:
     prompt_embeds: list[torch.Tensor]
     height: int
     width: int
-    guidance_scale: float = 1.0
+    guidance_scale: float | None = 1.0
     prompt_seq_lens: list[list[int]] | None = None
     pooled_embeds: list[torch.Tensor] | None = None
     extra_req: dict[str, Any] = field(default_factory=dict)
@@ -51,6 +51,14 @@ class ComfyUIModelAdapter:
         super().__init_subclass__(**kwargs)
         for model_type in cls.model_types:
             _ADAPTERS[model_type] = cls
+
+    @classmethod
+    def pipeline_class_for(cls, model_config) -> str:
+        """Pipeline to launch for a detected ComfyUI model config.
+
+        Families whose variants need different pipelines override this.
+        """
+        return cls.pipeline_class_name
 
     def pack(
         self, x: torch.Tensor, timestep: torch.Tensor, context, **kwargs

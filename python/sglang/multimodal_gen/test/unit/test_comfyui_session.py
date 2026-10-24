@@ -466,6 +466,29 @@ def test_comfyui_mode_h3_vae_post_init_without_latent_stats() -> None:
     assert arch.latents_std is None
 
 
+def test_reference_latent_and_its_ids_are_restored_together() -> None:
+    """A step that omits the references must get the latent and its ids back as a pair.
+
+    Restoring only the latent leaves the worker without ids for those tokens.
+    """
+    sid = "run-refs"
+    latent, ids = torch.ones(1, 6, 8), torch.zeros(1, 6, 4)
+    first = _Req()
+    first.extra["comfyui_session_id"] = sid
+    first.prompt_embeds = [torch.ones(2, 4)]
+    first.image_latent = latent
+    first.condition_image_latent_ids = ids
+    bind_comfyui_session(first)
+
+    later = _Req()
+    later.extra["comfyui_session_id"] = sid
+    later.image_latent = None
+    later.condition_image_latent_ids = None
+    bind_comfyui_session(later)
+    assert later.image_latent is latent
+    assert later.condition_image_latent_ids is ids
+
+
 def test_control_residuals_are_never_cached_across_steps() -> None:
     sid = "run-control"
     first = _Req()

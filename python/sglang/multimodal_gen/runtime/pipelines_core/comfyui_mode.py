@@ -37,6 +37,7 @@ _CONDITIONING_FIELDS = (
     "pooled_embeds",
     "neg_pooled_embeds",
     "image_latent",
+    "condition_image_latent_ids",
     "vae_image_sizes",
     "prompt_attention_mask",
     "negative_attention_mask",

@@ -1166,7 +1166,7 @@ class DenoisingStage(PipelineStage):
             device=device,
         )
 
-    def get_or_build_guidance(self, bsz: int, dtype, device):
+    def get_or_build_guidance(self, bsz: int, dtype, device, batch: Req | None = None):
         """
         Get the guidance tensor, using a cached version if available.
 
@@ -1177,6 +1177,15 @@ class DenoisingStage(PipelineStage):
         if self.server_args.pipeline_config.should_use_guidance:
             # TODO: should the guidance_scale be picked-up from sampling_params?
             guidance_val = self.server_args.pipeline_config.embedded_cfg_scale
+            if (
+                batch is not None
+                and self.server_args.comfyui_mode
+                and isinstance(self.server_args.pipeline_config, Flux2PipelineConfig)
+            ):
+                # ComfyUI owns FLUX.2 guidance; None is FluxDisableGuidance.
+                if batch.guidance_scale is None:
+                    return None
+                guidance_val = batch.guidance_scale
             return self._build_guidance(bsz, dtype, device, guidance_val)
         else:
             return None
@@ -1347,6 +1356,7 @@ class DenoisingStage(PipelineStage):
             latents.shape[0],
             latents.dtype,
             latents.device,
+            batch,
         )
 
         image_kwargs = self.prepare_extra_func_kwargs(
