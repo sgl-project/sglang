@@ -796,7 +796,7 @@ class Function(BaseModel):
     description: Optional[str] = Field(default=None, examples=[None])
     name: str
     parameters: Optional[object] = None
-    strict: bool = False
+    strict: Optional[bool] = False
     defer_loading: Optional[bool] = None
 
     @model_serializer(mode="wrap")
@@ -1815,7 +1815,7 @@ class ResponseTool(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
-    strict: bool = False
+    strict: Optional[bool] = False
     # Inner schemas for ``namespace`` tools.
     tools: Optional[List[Dict[str, Any]]] = None
     defer_loading: Optional[bool] = None
