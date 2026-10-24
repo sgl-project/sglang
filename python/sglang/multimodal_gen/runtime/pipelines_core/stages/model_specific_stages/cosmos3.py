@@ -25,6 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels import get_kernel
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
@@ -76,7 +77,11 @@ from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.runtime.utils.vision import load_image, load_video
+from sglang.multimodal_gen.runtime.utils.vision import (
+    load_image,
+    load_video,
+    preprocess_image,
+)
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_compiler_backend
 
@@ -253,8 +258,7 @@ def _preprocess_video_frames_gpu(
     frames: Iterator[np.ndarray], height: int, width: int
 ) -> list[torch.Tensor]:
     """Resize/crop/normalize batches of up to eight RGB frames on CUDA."""
-    from sglang.kernels.ops.mm.process.lanczos import lanczos_resize
-
+    lanczos_resize = get_kernel("mm.lanczos_resize")
     processed = []
     while batch := list(islice(frames, 8)):
         pixels = torch.from_numpy(np.stack(batch)).pin_memory().cuda(non_blocking=True)
@@ -301,7 +305,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         max_frames: int,
     ) -> torch.Tensor:
         """Load transfer media as CPU ``uint8 [1, 3, T, H, W]``."""
-        frames = load_video(control_path)
+        frames = load_video(control_path, max_frames=max_frames)
         if not frames:
             raise ValueError(f"No frames decoded from transfer video: {control_path!r}")
         frames = frames[:max_frames]
@@ -465,8 +469,24 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             tensors: list[torch.Tensor] = []
             for src in image_sources:
                 image = load_image(src)
-                image = _resize_crop_pil(image, target_w, target_h)
-                tensors.append(_pil_to_normalized_tensor(image))
+                scale = max(target_w / image.width, target_h / image.height)
+                width, height = (
+                    math.ceil(scale * image.width),
+                    math.ceil(scale * image.height),
+                )
+                tensors.append(
+                    preprocess_image(
+                        image,
+                        device=get_local_torch_device(),
+                        size=(width, height),
+                        crop=(
+                            (height - target_h) // 2,
+                            (width - target_w) // 2,
+                            target_h,
+                            target_w,
+                        ),
+                    )[0].contiguous()
+                )
             batch.preprocessed_image = torch.stack(tensors, dim=0).contiguous()
             self.log_info(
                 f"Preprocessed {len(tensors)} conditioning image(s) to "
@@ -491,7 +511,10 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             # to noise.
             num_source_frames = max(cond_indexes) * 4 + 1
             num_target_frames = batch.num_frames
-            force_cpu = envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+            force_cpu = (
+                not current_platform.is_cuda()
+                or envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+            )
             with closing(
                 _iter_video_frames_pyav(video_path, num_source_frames, keep)
             ) as frames:
