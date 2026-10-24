@@ -74,12 +74,12 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
       int64_t M,
       int64_t lda,
       bool is_first_token) {
-    assert(K == 4);
-    constexpr int ROWS = K;
+    static_assert(K == 3 || K == 4);
+    constexpr int ROWS = 4;
     constexpr int COLS = BLOCK_N / block_size_n();
 
     // leading dimension size for b for next block [K/2, 32, 2]
-    constexpr int ldb = block_size_n() * K;
+    constexpr int ldb = block_size_n() * ROWS;
 
     __m512bh va[ROWS * COLS];
     __m512bh vb[ROWS * COLS];
@@ -111,7 +111,11 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
     auto preloada = [&](auto i) {
       constexpr int col = i;
       int64_t m = 0;
-      va[1 * COLS + col] = MM512_LOAD_A(m - 3);
+      if constexpr (K == 4) {
+        va[1 * COLS + col] = MM512_LOAD_A(m - 3);
+      } else {
+        va[1 * COLS + col] = (__m512bh)_mm512_setzero_si512();
+      }
       va[2 * COLS + col] = MM512_LOAD_A(m - 2);
       va[3 * COLS + col] = MM512_LOAD_A(m - 1);
     };
@@ -120,7 +124,11 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
     auto loada = [&](auto i, int64_t m) {
       constexpr int col = i;
       // update previous time step
-      va[0 * COLS + col] = va[1 * COLS + col];
+      if constexpr (K == 4) {
+        va[0 * COLS + col] = va[1 * COLS + col];
+      } else {
+        va[0 * COLS + col] = (__m512bh)_mm512_setzero_si512();
+      }
       va[1 * COLS + col] = va[2 * COLS + col];
       va[2 * COLS + col] = va[3 * COLS + col];
       // load current time step
@@ -204,7 +212,7 @@ struct tinygemm_kernel<at::BFloat16, K, BLOCK_N, has_bias, has_silu> {
 #define LAUNCH_TINYGEMM_KERNEL(K, NB_SIZE)                                                   \
   tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply(                          \
       input + bs * seqlen * dim + mb_start * dim + nb_start,                                 \
-      weight + nb_start * width,                                                             \
+      weight + nb_start * 4,                                                                 \
       out + bs * seqlen * dim + mb_start * dim + nb_start,                                   \
       has_bias ? bias + nb_start : nullptr,                                                  \
       has_conv_states ? conv_states + conv_state_index * (K - 1) * dim + nb_start : nullptr, \
@@ -223,6 +231,7 @@ void causal_conv1d_fwd_kernel_impl(
     const int32_t* __restrict__ conv_indices,
     const bool* __restrict__ has_initial_state,
     bool silu_activation,
+    int64_t pad_slot_id,
     int64_t batch,
     int64_t dim,
     int64_t seqlen,
@@ -251,10 +260,23 @@ void causal_conv1d_fwd_kernel_impl(
         int64_t nb_start = nb * BLOCK_N;
         int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
 
-        const bool has_initial_states_value = has_conv_states ? has_initial_state[bs] : false;
+        const bool has_initial_states_value = has_conv_states && has_initial_state && has_initial_state[bs];
         int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+        if (conv_state_index == pad_slot_id) {
+          for (int64_t token = 0; token < mb_size; ++token) {
+            copy_stub<scalar_t>(out + (bs * seqlen + mb_start + token) * dim + nb_start, nullptr, nb_size);
+          }
+          data_index_step(mb, num_seq_blocks, nb, NB);
+          continue;
+        }
 
         switch (width << 4 | nb_size >> 4) {
+          case 0x32:
+            LAUNCH_TINYGEMM_KERNEL(3, 32);
+            break;
+          case 0x34:
+            LAUNCH_TINYGEMM_KERNEL(3, 64);
+            break;
           case 0x42:
             LAUNCH_TINYGEMM_KERNEL(4, 32);
             break;
@@ -275,26 +297,34 @@ void causal_conv1d_fwd_kernel_impl(
   if (has_conv_states) {
     at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
       for (int64_t bs = begin; bs < end; ++bs) {
+        const int64_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+        if (conv_state_index == pad_slot_id || seqlen == 0) {
+          continue;
+        }
         update_conv_state(
-            conv_states + bs * (width - 1) * dim, input + bs * seqlen * dim, width, dim, seqlen, has_initial_state[bs]);
+            conv_states + conv_state_index * (width - 1) * dim,
+            input + bs * seqlen * dim,
+            width,
+            dim,
+            seqlen,
+            has_initial_state && has_initial_state[bs]);
       }
     });
   }
 }
 
-#define LAUNCH_TINYGEMM_VARLEN_KERNEL(K, NB_SIZE)                   \
-  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply( \
-      input + batch_offset * dim + mb_start * dim + nb_start,       \
-      weight + nb_start * width,                                    \
-      out + batch_offset * dim + mb_start * dim + nb_start,         \
-      has_bias ? bias + nb_start : nullptr,                         \
-      nullptr,                                                      \
-      false,                                                        \
-      mb_size,                                                      \
-      dim,                                                          \
+#define LAUNCH_TINYGEMM_VARLEN_KERNEL(K, NB_SIZE)                                            \
+  tinygemm_kernel<scalar_t, K, NB_SIZE, has_bias, has_silu>::apply(                          \
+      input + batch_offset * dim + mb_start * dim + nb_start,                                \
+      weight + nb_start * 4,                                                                 \
+      out + batch_offset * dim + mb_start * dim + nb_start,                                  \
+      has_bias ? bias + nb_start : nullptr,                                                  \
+      has_conv_states ? conv_states + conv_state_index * (K - 1) * dim + nb_start : nullptr, \
+      has_initial_states_value,                                                              \
+      mb_size,                                                                               \
+      dim,                                                                                   \
       mb_start == 0);
 
-// TODO: add `has_initial_state` support for varlen kernel
 template <typename scalar_t>
 void causal_conv1d_fwd_varlen_kernel_impl(
     scalar_t* __restrict__ out,
@@ -307,6 +337,7 @@ void causal_conv1d_fwd_varlen_kernel_impl(
     const bool* __restrict__ has_initial_state,
     const int32_t* __restrict__ block_indices,
     bool silu_activation,
+    int64_t pad_slot_id,
     int64_t batch,
     int64_t dim,
     int64_t width,
@@ -335,7 +366,23 @@ void causal_conv1d_fwd_varlen_kernel_impl(
         int64_t nb_start = nb * BLOCK_N;
         int64_t nb_size = std::min(dim - nb_start, BLOCK_N);
 
+        const int64_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+        if (conv_state_index == pad_slot_id) {
+          for (int64_t token = 0; token < mb_size; ++token) {
+            copy_stub<scalar_t>(out + (batch_offset + mb_start + token) * dim + nb_start, nullptr, nb_size);
+          }
+          data_index_step(mb, num_seq_blocks, nb, NB);
+          continue;
+        }
+        const bool has_initial_states_value = has_conv_states && has_initial_state && has_initial_state[bs];
+
         switch (width << 4 | nb_size >> 4) {
+          case 0x32:
+            LAUNCH_TINYGEMM_VARLEN_KERNEL(3, 32);
+            break;
+          case 0x34:
+            LAUNCH_TINYGEMM_VARLEN_KERNEL(3, 64);
+            break;
           case 0x42:
             LAUNCH_TINYGEMM_VARLEN_KERNEL(4, 32);
             break;
@@ -359,13 +406,16 @@ void causal_conv1d_fwd_varlen_kernel_impl(
         int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
         int32_t seqlen = query_start_loc[bs + 1] - query_start_loc[bs];
         int32_t batch_offset = query_start_loc[bs];
+        if (conv_state_index == pad_slot_id || seqlen == 0) {
+          continue;
+        }
         update_conv_state(
             conv_states + conv_state_index * (width - 1) * dim,
             input + batch_offset * dim,
             width,
             dim,
             seqlen,
-            /* has_initial_state */ false);
+            has_initial_state && has_initial_state[bs]);
       }
     });
   }
@@ -380,6 +430,7 @@ void causal_conv1d_update_kernel_impl(
     const scalar_t* __restrict__ bias,
     const int32_t* __restrict__ conv_indices,
     bool silu_activation,
+    int64_t pad_slot_id,
     int64_t batch,
     int64_t dim,
     int64_t seqlen,
@@ -406,8 +457,19 @@ void causal_conv1d_update_kernel_impl(
 
         const bool has_initial_states_value = true;
         int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+        if (conv_state_index == pad_slot_id) {
+          copy_stub<scalar_t>(out + bs * dim + nb_start, nullptr, nb_size);
+          data_index_step(bs, batch, nb, NB);
+          continue;
+        }
 
         switch (width << 4 | nb_size >> 4) {
+          case 0x32:
+            LAUNCH_TINYGEMM_KERNEL(3, 32);
+            break;
+          case 0x34:
+            LAUNCH_TINYGEMM_KERNEL(3, 64);
+            break;
           case 0x42:
             LAUNCH_TINYGEMM_KERNEL(4, 32);
             break;
@@ -431,6 +493,9 @@ void causal_conv1d_update_kernel_impl(
     for (int64_t bs = begin; bs < end; ++bs) {
       // update old states, range [1, width - 1)
       int32_t conv_state_index = has_conv_indices ? conv_indices[bs] : bs;
+      if (conv_state_index == pad_slot_id) {
+        continue;
+      }
       for (int64_t w = 1; w < width - 1; ++w) {
         std::memcpy(CONV_STATE_INDEXR(w - 1), CONV_STATE_INDEXR(w), dim * sizeof(scalar_t));
       }
@@ -450,16 +515,17 @@ at::Tensor causal_conv1d_weight_pack(const at::Tensor& weight) {
   int64_t dim = weight.size(0);
   int64_t width = weight.size(1);
   constexpr int64_t BLOCK_N = block_size_n();
-  TORCH_CHECK(width == 4, "causal_conv1d_weight_pack: support only width of 4");
+  TORCH_CHECK(width == 3 || width == 4, "causal_conv1d_weight_pack: support only width of 3 or 4");
   TORCH_CHECK(dim % BLOCK_N == 0, "causal_conv1d_weight_pack: invalid dim size ", dim);
 
-  const int64_t N = dim, K2 = width >> 1;
+  const auto padded_weight = width == 3 ? at::constant_pad_nd(weight, {1, 0}) : weight;
+  const int64_t N = dim, K2 = 2;
   const int64_t NB = div_up(N, BLOCK_N);
 
-  auto packed_weight = at::empty_like(weight);
+  auto packed_weight = at::empty_like(padded_weight);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(weight.scalar_type(), "causal_conv1d_fwd_kernel_impl", [&] {
     // cast to float32 as vnni size is 2
-    const float* w_data = reinterpret_cast<float*>(weight.data_ptr<scalar_t>());
+    const float* w_data = reinterpret_cast<const float*>(padded_weight.data_ptr<scalar_t>());
     float* packed_data = reinterpret_cast<float*>(packed_weight.data_ptr<scalar_t>());
 
     at::parallel_for(0, NB * K2 * BLOCK_N, 0, [&](int64_t begin, int64_t end) {
@@ -560,7 +626,7 @@ at::Tensor causal_conv1d_fwd_cpu(
   const int64_t batch = is_var_seqlen ? query_start_loc.value().size(0) - 1 : x.size(0);
   const int64_t dim = x.size(-2);
   const int64_t seqlen = x.size(-1);
-  const int64_t width = weight.size(-1);
+  const int64_t width = is_vnni && conv_states.has_value() ? conv_states.value().size(2) + 1 : weight.size(-1);
 
   const auto scalar_type = x.scalar_type();
   CHECK_EQ(weight.scalar_type(), scalar_type);
@@ -609,6 +675,7 @@ at::Tensor causal_conv1d_fwd_cpu(
           conditional_data_ptr<bool>(has_initial_state),
           block_indices.data_ptr<int32_t>(),
           silu_activation,
+          pad_slot_id,
           batch,
           dim,
           width,
@@ -623,6 +690,7 @@ at::Tensor causal_conv1d_fwd_cpu(
           conditional_data_ptr<int32_t>(conv_state_indices),
           conditional_data_ptr<bool>(has_initial_state),
           silu_activation,
+          pad_slot_id,
           batch,
           dim,
           seqlen,
@@ -665,7 +733,7 @@ at::Tensor causal_conv1d_update_cpu(
   int64_t batch = x.size(0);
   int64_t dim = x.size(1);
   int64_t seqlen = 1;
-  int64_t width = weight.size(-1);
+  int64_t width = is_vnni ? conv_states.size(2) + 1 : weight.size(-1);
 
   const auto scalar_type = x.scalar_type();
   CHECK_EQ(weight.scalar_type(), scalar_type);
@@ -694,6 +762,7 @@ at::Tensor causal_conv1d_update_cpu(
         conditional_data_ptr<scalar_t>(bias),
         conditional_data_ptr<int32_t>(conv_state_indices),
         silu_activation,
+        pad_slot_id,
         batch,
         dim,
         seqlen,
