@@ -313,9 +313,14 @@ def _tool_call_pairing_error(messages: list) -> str | None:
 def _normalize_minimax_m3_request(request: ChatCompletionRequest) -> None:
     """Map the thinking config and effort aliases onto what the M3 template reads."""
     template_kwargs = dict(request.chat_template_kwargs or {})
-    # A template-kwargs effort would override the normalized one when rendering.
-    template_kwargs.pop("reasoning_effort", None)
-    effort = request.reasoning_effort
+    # A template-kwargs effort would override the normalized one when rendering;
+    # entry points that skip the request conversion still carry it here.
+    kwargs_effort = template_kwargs.pop("reasoning_effort", None)
+    effort = (
+        request.reasoning_effort
+        if request.reasoning_effort is not None
+        else kwargs_effort
+    )
     if request.thinking is not None:
         template_kwargs.setdefault("thinking_mode", request.thinking["type"])
     if effort in ("none", "minimal"):
@@ -1464,6 +1469,10 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        if self.is_minimax_m3:
+            # Settle the request's own thinking and effort first; server defaults
+            # only fill what it left unset.
+            _normalize_minimax_m3_request(request)
         if self.default_chat_template_kwargs:
             ctk = dict(request.chat_template_kwargs or {})
             for k, v in self.default_chat_template_kwargs.items():
