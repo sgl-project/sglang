@@ -1,4 +1,4 @@
-"""Run on SM103 to validate the opt-in Kimi K3 KV projection runner."""
+"""Run on SM103 to validate the Kimi K3 KV projection runner."""
 
 from unittest.mock import patch
 

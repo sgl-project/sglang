@@ -1,6 +1,8 @@
 # Kimi K3 NVFP4 experimental optimizations
 
-This branch collects five default-off optimizations for independent testing on NVIDIA B300 (SM103), targeting `nvidia/Kimi-K3-NVFP4`. It is a draft integration, not a validated all-options combination. Install SGLang from the repository root with `pip install -e "python"`. The tested Cake adapter uses FlashInfer 0.7.2 private prepared-stage APIs and requires the Cake modules in that installation.
+This branch collects five independently controlled optimizations for independent testing on NVIDIA B300 (SM103), targeting `nvidia/Kimi-K3-NVFP4`. It is a draft integration, not a validated all-options combination. Install SGLang from the repository root with `pip install -e "python"`. The tested Cake adapter uses FlashInfer 0.7.2 private prepared-stage APIs and requires the Cake modules in that installation.
+
+Routing/quant fusion and the aligned KV projection CUTLASS path are enabled by default. Cake, CuTe DCP prefill and BCG MHA remain disabled by default. Set the corresponding environment variable to `0` to disable a path. All runtime coverage guards still apply.
 
 ## Switches and coverage
 
@@ -16,19 +18,19 @@ Row counts refer to actual GEMM/verify activation rows, not request batch size o
 
 ## Independent comparisons
 
-Keep the launch command, checkpoint, prompts, cache counts and other environment settings unchanged. Unset all five switches for the baseline. For TP8/FP8-KV/DFlash block8 without DCP, run these candidates separately:
+Keep the launch command, checkpoint, prompts, cache counts and other environment settings unchanged. Set all five switches to `0` for the baseline; unsetting a variable uses its default. For TP8/FP8-KV/DFlash block8 without DCP, run these candidates separately:
 
 ```bash
-export SGLANG_K3_NVFP4_ROUTE_QUANT=1  # candidate A; other switches unset
+export SGLANG_K3_NVFP4_ROUTE_QUANT=1  # candidate A; other switches explicitly set to 0
 # Run your unchanged launch command and benchmark.
 ```
 
 ```bash
-unset SGLANG_K3_NVFP4_ROUTE_QUANT
+export SGLANG_K3_NVFP4_ROUTE_QUANT=0
 export SGLANG_K3_NVFP4_CAKE=1        # candidate B; requires Cake APIs
 ```
 
-For prefill, unset both MoE switches and separately enable `SGLANG_K3_KV_B_PROJ_CUTLASS=1`. Confirm that the original FP8 GEMM backend is TRTLLM and the measured request reaches the eligible KV projection. A stock FP8-KV/DCP1 launch does not exercise the two DCP attention options. Test those only in a separately labeled TP8/DCP8 configuration; the MHA candidate additionally requires BF16 KV and explicitly enabled BCG. When comparing MHA and CuTe MLA, enable only the corresponding attention switch. The combined MHA plus KV-CUTLASS candidate is a separate run.
+For prefill, set both MoE switches to `0` and separately enable `SGLANG_K3_KV_B_PROJ_CUTLASS=1`. Confirm that the original FP8 GEMM backend is TRTLLM and the measured request reaches the eligible KV projection. A stock FP8-KV/DCP1 launch does not exercise the two DCP attention options. Test those only in a separately labeled TP8/DCP8 configuration; the MHA candidate additionally requires BF16 KV and explicitly enabled BCG. When comparing MHA and CuTe MLA, enable only the corresponding attention switch. The combined MHA plus KV-CUTLASS candidate is a separate run.
 
 Use `bench_one_batch_server` for isolated prefill and steady decode, output length1024 and fixed acceptance4 for performance. Measure 8k/32k/128k, and prefill with cache0 and approximately95%, recording actual cache counts. Use natural acceptance for accuracy. A single-node isolated comparison does not establish PD transfer or multi-turn SLO performance; PD hardware is not required to test these kernel paths.
 
