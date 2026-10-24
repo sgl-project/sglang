@@ -3446,10 +3446,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {},
             )
 
+        # page_size 1 is accepted: the flat page table runs the non-paged varlen
+        # kernel.
         self.assertEqual(
             _intel_xpu_page_constraint(
                 _view(
                     decode_attention_backend="intel_xpu",
+                )
+            ),
+            {},
+        )
+        # an unsupported page still snaps to 128
+        self.assertEqual(
+            _intel_xpu_page_constraint(
+                _view(
+                    decode_attention_backend="intel_xpu",
+                    page_size=32,  # non-MLA accepts only 1, 64, 128
                 )
             ),
             {"page_size": 128},
