@@ -376,6 +376,82 @@ class TestBufferSlotClearing(unittest.TestCase):
         self.assertNotIn("adapter", pool.eviction_policy.access_order)
 
 
+class TestEmbeddingSlotReuse(unittest.TestCase):
+    """A reused slot must not keep the evicted adapter's embed_tokens/lm_head."""
+
+    VOCAB, HIDDEN, MAX_RANK = 8, 4, 4
+
+    def _make_pool(self):
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.num_layer = 0
+        pool.target_modules = {"embed_tokens", "lm_head"}
+        pool.strict_loading = False
+        pool.pin_memory_available = False
+        pool.enable_lora_overlap_loading = False
+        pool.base_hf_config = types.SimpleNamespace(vocab_size=self.VOCAB)
+        pool.lora_added_tokens_size = 0
+        pool.tp_size = 1
+        pool.tp_rank = 0
+        pool.embedding_A_buffer = {
+            "embed_tokens": torch.zeros(1, self.MAX_RANK, self.VOCAB)
+        }
+        pool.embedding_B_buffer = {
+            "embed_tokens": torch.zeros(1, self.HIDDEN, self.MAX_RANK)
+        }
+        pool.lm_head_A_buffer = {"lm_head": torch.zeros(1, self.MAX_RANK, self.HIDDEN)}
+        pool.lm_head_B_buffer = {"lm_head": torch.zeros(1, self.VOCAB, self.MAX_RANK)}
+        pool.new_embeddings_buffer = {}
+        return pool
+
+    def _adapter(self, rank, value, with_embed_tokens):
+        layers = {
+            "base_model.model.lm_head.lora_A.weight": torch.full(
+                (rank, self.HIDDEN), value
+            ),
+            "base_model.model.lm_head.lora_B.weight": torch.full(
+                (self.VOCAB, rank), value
+            ),
+        }
+        if with_embed_tokens:
+            layers["base_model.model.model.embed_tokens.lora_embedding_A"] = torch.full(
+                (rank, self.VOCAB), value
+            )
+            layers["base_model.model.model.embed_tokens.lora_embedding_B"] = torch.full(
+                (self.HIDDEN, rank), value
+            )
+        return types.SimpleNamespace(
+            config=types.SimpleNamespace(r=rank, lora_added_tokens_size=0),
+            layers=[],
+            embedding_layers=layers,
+            added_tokens_embeddings=None,
+            pinned_embedding_layers={},
+            pinned_added_tokens_embeddings={},
+            scaling=1.0,
+        )
+
+    def test_partial_embedding_adapter_does_not_inherit_evicted_weights(self):
+        """A slot reused by a smaller adapter that only has lm_head keeps nothing of
+        the evicted adapter's embed_tokens, and no stale rows past its own rank."""
+        pool = self._make_pool()
+        lm_head_module = object()
+        full = self._adapter(self.MAX_RANK, 1.0, with_embed_tokens=True)
+        partial = self._adapter(2, 2.0, with_embed_tokens=False)
+
+        pool.load_lora_weight_to_buffer("full", 0, full, [], None, lm_head_module)
+        pool.load_lora_weight_to_buffer("partial", 0, partial, [], None, lm_head_module)
+
+        # embed_tokens was not provided by the new adapter: nothing may remain.
+        self.assertEqual(pool.embedding_A_buffer["embed_tokens"][0].abs().sum(), 0)
+        self.assertEqual(pool.embedding_B_buffer["embed_tokens"][0].abs().sum(), 0)
+        # lm_head was provided at rank 2: loaded, and the rank tail is clean.
+        lm_a = pool.lm_head_A_buffer["lm_head"][0]
+        lm_b = pool.lm_head_B_buffer["lm_head"][0]
+        self.assertTrue((lm_a[:2] == 2).all())
+        self.assertTrue((lm_b[:, :2] == 2).all())
+        self.assertEqual(lm_a[2:].abs().sum(), 0)
+        self.assertEqual(lm_b[:, 2:].abs().sum(), 0)
+
+
 def _make_fake_base_model(num_experts: int) -> torch.nn.Module:
     """Return a `torch.nn.Module` whose `.config` exposes `num_experts`.
 
