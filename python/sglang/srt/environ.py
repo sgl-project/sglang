@@ -1032,6 +1032,17 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Fused AITER KDA decode. Empty keeps the unfused chain; "aiter" selects
+    # the gfx950 FlyDSL kernel.
+    SGLANG_OPT_HIP_K3_KDA_FUSED_BACKEND = EnvStrWithAlias(
+        "", deprecated_name="SGLANG_ROCM_K3_KDA_FUSED_BACKEND"
+    )
+    # Requantize Quark per-channel FP8 kv_b to per-tensor FP8 so the MLA absorb
+    # BMMs run the AITER a8w8 kernel (~2.3% weight error vs dequant to bf16).
+    SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8 = EnvBool(True)
+    # Fuse the Kimi-K3 gfx950 MLA decode identity-RoPE Q, Q concat and latent KV
+    # cache write into one AITER launch; fails closed to the split chain.
+    SGLANG_OPT_HIP_K3_MLA_Q_CACHE_FUSION = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
@@ -2085,6 +2096,17 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Kimi-K3 gfx950 MoE pre-route: one FP8 launch computes the router logits,
+    # the latent down-projection and the shared gate-up for 1 to 4 tokens.
+    SGLANG_OPT_HIP_K3_MOE_PREROUTE_FP8 = EnvBool(False)
+    # With the pre-route on, run 2- and 4-token decode through the cooperative
+    # kernel, which returns the shared expert already SiTU-activated.
+    SGLANG_OPT_HIP_K3_PREROUTE_PREACTIVATED_SHARED = EnvBool(False)
+    # Where the K3 FlyDSL kernels come from: "auto" prefers the SGLang copy and
+    # falls back to AITER, "sglang" and "aiter" pin one source.
+    SGLANG_OPT_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
+        "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
+    )
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
