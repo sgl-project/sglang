@@ -66,7 +66,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
-from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.runtime_context import get_device, get_model, get_parallel, get_serving
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -1273,6 +1273,7 @@ def _uniform_sum_len_scatter_rows(
     counts = forward_batch.global_num_tokens_padded_cpu
     if (
         not is_cuda()
+        or get_device().device != "cuda"
         or is_dp_gatherv_active()
         or envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
         or padding is None
