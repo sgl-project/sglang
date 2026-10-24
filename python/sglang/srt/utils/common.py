@@ -489,8 +489,8 @@ def get_available_gpu_memory(
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
         total_free_memory = get_free_cpu_memory()
-        n_numa_node: int = len(get_cpu_ids_by_node())
-        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
+        n_node = len(get_cpu_ids_by_node()) or 1
+        free_gpu_memory = round(total_free_memory / n_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
@@ -916,14 +916,14 @@ def get_cpu_memory_capacity():
             "You need to set proper --max-total-tokens to avoid the out-of-memory error."
         )
         return None
-    n_numa_node = len(get_cpu_ids_by_node()) or 1
+    n_node = len(get_cpu_ids_by_node()) or 1
     total_cpu_memory = psutil.virtual_memory().total
     instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
     if instance_max_cpu_memory is not None:
         total_cpu_memory = min(total_cpu_memory, instance_max_cpu_memory)
-    per_numa_mem = total_cpu_memory / n_numa_node
+    per_node_mem = total_cpu_memory / n_node
     # Retrieved value in Byte, need MB
-    return float(per_numa_mem // (1 << 20))
+    return float(per_node_mem // (1 << 20))
 
 
 def get_xpu_memory_capacity():
@@ -4446,7 +4446,7 @@ def parse_lscpu_topology():
     try:
         # Get CPU topology: CPU,Core,Socket,Node
         output = subprocess.check_output(
-            ["lscpu", "-p=CPU,Core,Socket,Node"], text=True
+            ["lscpu", "-p=CPU,Core,Socket,Node,Cache"], text=True
         )
     except Exception as e:
         raise RuntimeError(f"Unexpected error running 'lscpu': {e}")
@@ -4455,19 +4455,18 @@ def parse_lscpu_topology():
     cpu_info = []
     for line in output.splitlines():
         if not line.startswith("#"):
-            parts = line.strip().split(",")
-            if len(parts) != 4:
-                logger.warning("Skipping malformed lscpu line: %s", line.strip())
-                continue
-            cpu = int(parts[0])  # CPU id must always be present
-            core, socket, node = [int(p) if p else 0 for p in parts[1:]]
-            cpu_info.append((cpu, core, socket, node))
+            parts = re.split(r"[,:]+", line)
+            line_info = list()
+            for p in parts:
+                line_info.append(int(p) if p.isdigit() else 0)
+            # (cpu, core, socket, node, L3)
+            cpu_info.append(line_info[:4] + [line_info[-1]])
 
-    # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
+    # [(0,0,0,0,0),(1,1,0,0,0),...,(43,43,0,1,0),...,(256,0,0,0,0),...]
     return cpu_info
 
 
-def get_physical_cpus_by_numa():
+def get_physical_cpus_by_numa_or_block():
     cpu_info = parse_lscpu_topology()
 
     # Map NUMA node -> set of (core_id, socket) to avoid duplicates
@@ -4475,11 +4474,17 @@ def get_physical_cpus_by_numa():
     # ...
     # 5: {(214,1): 214, (215,1): 215}
     physical_by_node = defaultdict(dict)  # node -> core_id -> cpu_id
+    # L3 cache index represents block
+    physical_by_block = defaultdict(dict)  # block -> core_id -> cpu_id
 
-    for cpu, core, socket, node in cpu_info:
+    for cpu, core, socket, node, block in cpu_info:
         key = (core, socket)
         if key not in physical_by_node[node]:
             physical_by_node[node][key] = (
+                cpu  # pick first CPU seen for that physical core
+            )
+        if key not in physical_by_block[block]:
+            physical_by_block[block][key] = (
                 cpu  # pick first CPU seen for that physical core
             )
 
@@ -4493,18 +4498,23 @@ def get_physical_cpus_by_numa():
     # ...
     # 5: [214,215,...,255]
     node_to_cpus = {}
+    block_to_cpus = {}
     for node, core_to_cpu in physical_by_node.items():
         cpus = sorted(core_to_cpu.values())
         allowed_cpus = set(cpus).intersection(cpus_allowed_list)
         node_to_cpus[node] = allowed_cpus
+    for block, core_to_cpu in physical_by_block.items():
+        cpus = sorted(core_to_cpu.values())
+        allowed_cpus = set(cpus).intersection(cpus_allowed_list)
+        block_to_cpus[block] = allowed_cpus
 
-    return node_to_cpus
+    return block_to_cpus if len(block_to_cpus) > len(node_to_cpus) else node_to_cpus
 
 
 # Only physical cores are used. Logical cores are excluded.
 def get_cpu_ids_by_node():
-    node_to_cpus = get_physical_cpus_by_numa()
-    # Sort by NUMA node index
+    node_to_cpus = get_physical_cpus_by_numa_or_block()
+    # Sort by NUMA node index or CBB block index
     # ['0,1,2,3', '4,5,6,7', '8,9,10,11', '12,13,14,15', '16,17,18,19', '20,21,22,23']
     return [
         ",".join(map(str, sorted(cpus)))
