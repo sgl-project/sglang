@@ -4,6 +4,7 @@ import threading
 import unittest
 from array import array
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -1097,14 +1098,35 @@ def test_layer_counter_reports_failure_after_the_forward():
     assert counter.finish(index) is False
 
 
-def test_layer_counter_finish_waits_for_layers_still_loading():
-    counter = LayerWiseLoadCounter(1)
+@pytest.mark.parametrize(
+    "failed_first", [False, True], ids=["success", "failed-first-layer"]
+)
+def test_layer_counter_finish_waits_for_layers_still_loading(monkeypatch, failed_first):
+    counter = LayerWiseLoadCounter(2)
     index = counter.update_producer()
-    loader = threading.Timer(0.05, counter.complete, (index, 0))
-    loader.start()
+    first, pending = counter.futures[index]
+    if failed_first:
+        first.set_exception(RuntimeError("first layer failed"))
+    else:
+        first.set_result(None)
+    waiting = threading.Event()
+    exception = pending.exception
 
-    assert counter.finish(index) is True  # the forward never waited on layer 0
-    loader.join()
+    def wait_for_pending(timeout=None):
+        waiting.set()
+        return exception(timeout)
+
+    monkeypatch.setattr(pending, "exception", wait_for_pending)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        finishing = executor.submit(counter.finish, index)
+        try:
+            assert waiting.wait(timeout=1)
+            assert not finishing.done()
+            assert index in counter.futures
+        finally:
+            pending.set_result(None)
+        assert finishing.result(timeout=1) is (not failed_first)
+    assert index not in counter.futures
 
 
 def test_finish_loads_adopts_a_peer_rank_failure():

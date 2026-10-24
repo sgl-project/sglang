@@ -120,7 +120,8 @@ class LayerWiseLoadCounter:
             return True
         # Wait before dropping the entry: the load thread still completes the
         # layers the forward never waited on through it.
-        landed = all(future.exception() is None for future in futures)
+        errors = [future.exception() for future in futures]
+        landed = all(error is None for error in errors)
         del self.futures[index]
         return landed
 
