@@ -466,6 +466,7 @@ class HFRunner:
         output_strs = []
         top_input_logprobs = []
         top_output_logprobs = []
+        diag_hf = {"top_ids": [], "top_vals": [], "gen_ids": [], "score_dtype": [], "param_dtype": []}  # [TPDIAG]
         if token_ids_logprob is not None:
             token_ids_input_logprobs = []
             token_ids_output_logprobs = []
@@ -525,6 +526,25 @@ class HFRunner:
                         for logits in outputs.scores
                     ]
                 )
+                # [TPDIAG] Diagnostic only: top-5 ids and values, the generated ids
+                # and dtypes from the same scores; no extra forward pass.
+                try:
+                    _tops = [
+                        torch.topk(
+                            F.log_softmax(logits[0], dim=-1, dtype=torch.float32),
+                            k=NUM_TOP_LOGPROBS,
+                        )
+                        for logits in outputs.scores
+                    ]
+                    diag_hf["top_ids"].append([t.indices.tolist() for t in _tops])
+                    diag_hf["top_vals"].append([t.values.tolist() for t in _tops])
+                    diag_hf["gen_ids"].append(
+                        outputs[0][0][len(input_ids[0]) :].tolist()
+                    )
+                    diag_hf["score_dtype"].append(str(outputs.scores[0].dtype))
+                    diag_hf["param_dtype"].append(str(next(model.parameters()).dtype))
+                except Exception as e:  # never change the test outcome
+                    diag_hf.setdefault("errors", []).append(repr(e))
                 if token_ids_logprob is not None:
                     token_ids_output_logprobs.append(
                         [
@@ -550,13 +570,15 @@ class HFRunner:
                 # Unload the LoRA adapter if it is used
                 model.unload()
 
-        return ModelOutput(
+        _out = ModelOutput(
             output_strs=output_strs,
             top_input_logprobs=top_input_logprobs,
             top_output_logprobs=top_output_logprobs,
             token_ids_input_logprobs=token_ids_input_logprobs,
             token_ids_output_logprobs=token_ids_output_logprobs,
         )
+        _out.diag_hf = diag_hf  # [TPDIAG]
+        return _out
 
 
 class SRTRunner:

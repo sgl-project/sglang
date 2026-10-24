@@ -899,6 +899,73 @@ def run_lora_test_one_by_one(
                 f"srt_ids={srt_outputs.top_output_logprob_idx[i][pos]}",
                 flush=True,
             )
+        # [TPDIAG] Diagnostic only: top-5 (token id, logprob) pairs on both sides,
+        # the generated ids and the environment. Never changes the outcome.
+        try:
+            import importlib.metadata as _md
+            import os as _os
+            import socket as _socket
+
+            def _ver(name):
+                try:
+                    return _md.version(name)
+                except Exception:
+                    return "?"
+
+            _d = getattr(hf_outputs, "diag_hf", None) or {}
+            if i == 0:
+                try:
+                    with open("/proc/driver/nvidia/version") as _f:
+                        _drv = _f.readline().strip()
+                except Exception:
+                    _drv = "?"
+                print(
+                    f"[TPDIAG] env call={_TPDIAG_CALL} host={_socket.gethostname()} "
+                    f"runner={_os.environ.get('RUNNER_NAME')} github_sha={_os.environ.get('GITHUB_SHA')} "
+                    f"gpu={torch.cuda.get_device_name(0) if torch.cuda.is_available() else '?'} "
+                    f"cuda={torch.version.cuda} driver={_drv!r} torch={torch.__version__} "
+                    f"transformers={_ver('transformers')} peft={_ver('peft')} "
+                    f"flashinfer={_ver('flashinfer-python')} sglang_kernel={_ver('sglang-kernel')} "
+                    f"test_dtype={torch_dtype} backend={backend} tp={model_case.tp_size} "
+                    f"hf_score_dtype={_d.get('score_dtype')} hf_param_dtype={_d.get('param_dtype')} "
+                    f"hf_diag_errors={_d.get('errors')}",
+                    flush=True,
+                )
+            hf_ids_all = _d["top_ids"][i]
+            hf_vals_all = _d["top_vals"][i]
+            hf_gen = _d["gen_ids"][i]
+            srt_gen = [t[1] for t in srt_outputs.output_token_logprobs_lst[i]]
+            first_diff = next(
+                (k for k, (a, b) in enumerate(zip(hf_gen, srt_gen)) if a != b), None
+            )
+            print(
+                f"[TPDIAG] gen call={_TPDIAG_CALL} row={i} adaptor={adaptor.name} "
+                f"hf_len={len(hf_gen)} srt_len={len(srt_gen)} first_diff={first_diff} "
+                f"hf_gen={hf_gen} srt_gen={srt_gen}",
+                flush=True,
+            )
+            for pos in range(
+                min(len(hf_ids_all), len(srt_outputs.top_output_logprob_idx[i]))
+            ):
+                hf_pairs = list(zip(hf_ids_all[pos], hf_vals_all[pos]))
+                srt_pairs = list(
+                    zip(
+                        srt_outputs.top_output_logprob_idx[i][pos],
+                        srt_outputs.top_output_logprobs[i][pos],
+                    )
+                )
+                hf_only = [t for t in hf_ids_all[pos] if t not in srt_outputs.top_output_logprob_idx[i][pos]]
+                srt_only = [t for t in srt_outputs.top_output_logprob_idx[i][pos] if t not in hf_ids_all[pos]]
+                print(
+                    f"[TPDIAG] pairs call={_TPDIAG_CALL} row={i} pos={pos} "
+                    f"prefix_same={hf_gen[:pos] == srt_gen[:pos]} "
+                    f"chosen_same={hf_gen[pos:pos + 1] == srt_gen[pos:pos + 1]} "
+                    f"hf_vals_equal_compared={hf_vals_all[pos] == list(hf_outputs.top_output_logprobs[i][pos])} "
+                    f"hf_only={hf_only} srt_only={srt_only} hf={hf_pairs!r} srt={srt_pairs!r}",
+                    flush=True,
+                )
+        except Exception as e:
+            print(f"[TPDIAG] diag error call={_TPDIAG_CALL} row={i}: {e!r}", flush=True)
 
         srt_output_str = srt_outputs.output_strs[i].strip()
         hf_output_str = hf_outputs.output_strs[i].strip()
