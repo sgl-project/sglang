@@ -23,7 +23,7 @@ class TestRotaryEmbeddingMLU(CustomTestCase):
                     ).to("mlu")
                     for offset in (0, 7):
                         # On the second call, grow the warmed cache and query
-                        # new rows. Reusing the old vendor cache must fail.
+                        # new rows. Reusing the old MLU cos/sin cache must fail.
                         start = 0
                         if offset:
                             start = rope.cos_sin_cache.shape[0]

@@ -1,6 +1,6 @@
 """BF16 paged GQA attention for Cambricon MLUs.
 
-Uses the vendor flash kernel for ragged prefill (including cached prefixes and
+Uses torch_mlu_ops.flash_attention for ragged prefill (including cached prefixes and
 mixed batches), and the cached single-query kernel for decode.
 """
 
