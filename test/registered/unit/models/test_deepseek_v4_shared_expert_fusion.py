@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
     resolve_shared_experts_config,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.models import deepseek_v4
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
@@ -29,7 +30,8 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
-    """V4 shared-expert fusion requires explicit startup intent."""
+    """V4 shared-expert fusion requires explicit startup intent, except by default
+    with the gfx950 aiter MoE, MXFP4 routed experts and one shared expert."""
 
     def setUp(self):
         super().setUp()
@@ -37,23 +39,43 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         cm.__enter__()
         self.addCleanup(cm.__exit__, None, None, None)
 
-    def _publish(self, enforce):
+    def _publish(self, enforce, disable=False):
         override = get_context().override_server_args(
-            enforce_shared_experts_fusion=enforce
+            enforce_shared_experts_fusion=enforce,
+            disable_shared_experts_fusion=disable,
         )
         override.install()
         self.addCleanup(override.restore)
 
-    def _install(self, model_class=DeepseekV4ForCausalLM, n_shared_experts=1):
+    def _install(
+        self, model_class=DeepseekV4ForCausalLM, n_shared_experts=1, quant_config=None
+    ):
         config = resolve_shared_experts_config(
             model_class,
             SimpleNamespace(n_shared_experts=n_shared_experts),
-            None,
+            quant_config,
         )
 
         scope = get_model().override(shared_experts=config)
         scope.__enter__()
         self.addCleanup(scope.__exit__, None, None, None)
+
+    def _gfx950_aiter(self):
+        for name in ("_use_aiter", "_is_gfx95_supported"):
+            p = patch.object(deepseek_v4, name, True)
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _mxfp4(**overrides):
+        config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            weight_block_size=[128, 128],
+            is_fp4_experts=True,
+        )
+        for name, value in overrides.items():
+            setattr(config, name, value)
+        return config
 
     def _make_dspark_config(self):
         return DeepSeekV4Config(
@@ -187,6 +209,97 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
                 SimpleNamespace(n_shared_experts=1), matched
             )
         )
+
+    def test_fuses_by_default_with_gfx950_aiter_and_mxfp4_experts(self):
+        self._publish(enforce=False)
+        self._gfx950_aiter()
+        self.assertIsNone(
+            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                SimpleNamespace(n_shared_experts=1), self._mxfp4()
+            )
+        )
+        self._install(quant_config=self._mxfp4())
+        self.assertFalse(is_shared_experts_fusion_disabled())
+
+    def test_default_needs_gfx950_aiter_mxfp4_and_one_shared_expert(self):
+        """Outside the default rule the gate keeps the old answer, and a second
+        shared expert falls back instead of raising."""
+        self._publish(enforce=False)
+        cases = {
+            "not gfx950": (True, False, self._mxfp4(), 1),
+            "no aiter": (False, True, self._mxfp4(), 1),
+            "fp8 routed experts": (True, True, self._mxfp4(is_fp4_experts=False), 1),
+            "dequant fp4 to fp8": (True, True, self._mxfp4(dequant_fp4_to_fp8=True), 1),
+            "no quant config": (True, True, None, 1),
+            "two shared experts": (True, True, self._mxfp4(), 2),
+        }
+        for label, (use_aiter, gfx95, quant, n_shared) in cases.items():
+            with (
+                self.subTest(label),
+                patch.object(deepseek_v4, "_use_aiter", use_aiter),
+                patch.object(deepseek_v4, "_is_gfx95_supported", gfx95),
+            ):
+                self.assertEqual(
+                    DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                        SimpleNamespace(n_shared_experts=n_shared), quant
+                    ),
+                    "Config does not support fused shared expert(s).",
+                )
+
+    def test_disable_flag_wins_over_the_default(self):
+        """--disable-shared-experts-fusion is applied before the gate is asked."""
+        self._publish(enforce=False, disable=True)
+        self._gfx950_aiter()
+        self.assertIsNone(
+            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                SimpleNamespace(n_shared_experts=1), self._mxfp4()
+            )
+        )
+        self._install(quant_config=self._mxfp4())
+        self.assertTrue(is_shared_experts_fusion_disabled())
+
+    def test_default_keeps_the_ep_and_precision_vetoes(self):
+        self._publish(enforce=False)
+        self._gfx950_aiter()
+        with (
+            get_parallel().override(tp_size=4, attn_tp_size=4, moe_ep_size=4),
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.NONE),
+        ):
+            self.assertIn(
+                "Expert parallelism",
+                DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                    SimpleNamespace(n_shared_experts=1), self._mxfp4()
+                ),
+            )
+        self.assertIn(
+            "higher precision",
+            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                SimpleNamespace(n_shared_experts=1),
+                self._mxfp4(can_fuse_shared_expert=lambda: False),
+            ),
+        )
+
+    def test_default_stays_off_with_an_all_to_all_backend(self):
+        self._publish(enforce=False)
+        self._gfx950_aiter()
+        for backend in (MoeA2ABackend.MORI, MoeA2ABackend.MEGAMOE):
+            with (
+                self.subTest(backend=backend.value),
+                get_parallel().override(tp_size=4, attn_tp_size=4, moe_ep_size=4),
+                get_flags().moe.override(a2a_backend=backend),
+            ):
+                self.assertEqual(
+                    DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                        SimpleNamespace(n_shared_experts=1), self._mxfp4()
+                    ),
+                    "Config does not support fused shared expert(s).",
+                )
+
+    def test_dspark_draft_fuses_by_default_too(self):
+        self._publish(enforce=False)
+        self._gfx950_aiter()
+        self._install(DeepseekV4ForCausalLMDSpark, quant_config=self._mxfp4())
+        self.assertFalse(is_shared_experts_fusion_disabled())
 
     def test_dspark_entry_class_uses_the_v4_gate(self):
         """A DSV4 DSpark draft must inherit the target's default fusion policy."""
