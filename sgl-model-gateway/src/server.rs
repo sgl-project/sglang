@@ -399,9 +399,13 @@ async fn v1_conversations_delete_item(
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
-    WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
-        .await
-        .into_response()
+    let result =
+        WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client).await;
+    state
+        .context
+        .policy_registry
+        .clear_cache_aware_worker_caches(&result.successful);
+    result.into_response()
 }
 
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
