@@ -45,6 +45,8 @@ pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 
 // Dynamo crates whose types appear in this crate's public API. Hosts use these
 // re-exports so their Dynamo versions always match the processor's.
+#[cfg(feature = "parser")]
+pub use dynamo_parsers;
 #[cfg(any(feature = "parser", feature = "render"))]
 pub use dynamo_protocols;
 #[cfg(feature = "render")]
