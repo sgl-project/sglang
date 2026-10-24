@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Protocol
 import msgspec
 
 if TYPE_CHECKING:
-    from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest, ToolCall
+    from sglang.srt.entrypoints.openai.protocol import (
+        ChatCompletionRequest,
+        ResponsesRequest,
+        ToolCall,
+    )
     from sglang.srt.function_call.core_types import ToolCallItem
 
 EncodingBackend = Literal["builtin", "recipe"]
@@ -17,6 +21,7 @@ EncodingBackend = Literal["builtin", "recipe"]
 class ChatOutputHooks(msgspec.Struct, frozen=True, kw_only=True):
     """Chat-handler policies an output adapter needs, bound to one handler."""
 
+    thinking_requested: Callable[[ChatCompletionRequest], bool]
     tool_call_parsing_active: Callable[[ChatCompletionRequest], bool]
     history_tool_calls_count: Callable[[ChatCompletionRequest], int]
     tool_call_id: Callable[[ToolCallItem, int], str]
@@ -54,6 +59,8 @@ class ChatEncodingOutputAdapter(Protocol):
     def parse_responses_output(
         self,
         *,
+        request: ResponsesRequest,
+        require_reasoning: bool,
         output_ids: list[int],
         finish_reason: Optional[dict[str, Any]],
         separate_reasoning: bool,
@@ -61,7 +68,12 @@ class ChatEncodingOutputAdapter(Protocol):
     ) -> tuple[str, str, list[ToolCallItem]]: ...
 
     def new_responses_stream(
-        self, *, separate_reasoning: bool, parse_tool_calls: bool
+        self,
+        *,
+        request: ResponsesRequest,
+        require_reasoning: bool,
+        separate_reasoning: bool,
+        parse_tool_calls: bool,
     ) -> ResponsesOutputStream: ...
 
 
@@ -69,6 +81,10 @@ class ChatEncodingAdapter(Protocol):
     collects_openai_media: bool
     """Whether media still has to be collected from the OpenAI messages after
     ``encode_messages`` returns prompt ids."""
+
+    strict_tool_call_arguments: bool
+    """Whether history tool-call ``arguments`` must parse as JSON before
+    ``encode_messages`` sees them; False when the encoding serializes them itself."""
 
     @property
     def output(self) -> Optional[ChatEncodingOutputAdapter]:
@@ -81,19 +97,97 @@ class ChatEncodingAdapter(Protocol):
         messages: list[dict[str, Any]],
         request: ChatCompletionRequest,
         tools: Optional[list[dict]],
-    ) -> list[int]: ...
+        thinking: bool,
+        image_data: list,
+    ) -> list[int]:
+        """``thinking`` is the handler's thinking decision for ``request``. An
+        encoding that collects media itself appends the prompt's images to
+        ``image_data`` in placeholder order."""
+        ...
+
+
+def select_new_output_ids(
+    *,
+    output_ids: list[int],
+    num_consumed_tokens: int,
+    completion_tokens: int,
+    finish_reason_type: Optional[str],
+    incremental: bool,
+) -> list[int]:
+    if not incremental:
+        # Intermediate chunks share the live output list; completion_tokens is
+        # this chunk's snapshot, so later tokens wait for their own chunk.
+        return output_ids[num_consumed_tokens:completion_tokens]
+    if finish_reason_type == "abort":
+        # The abort chunk re-sends already-streamed tokens.
+        return output_ids[: max(completion_tokens - num_consumed_tokens, 0)]
+    return output_ids
+
+
+def token_output_sse_chunks(
+    *,
+    chunk_id: str,
+    created: int,
+    model: str,
+    index: int,
+    usage: Optional[dict[str, Any]],
+    logprobs: Optional[dict],
+    reasoning: str,
+    content: str,
+    tool_calls: list[ToolCall],
+) -> list[str]:
+    """One streamed step of a token-level output parser: a reasoning chunk, a content
+    chunk, then one chunk per tool call; the step's logprobs ride on the first."""
+    from sglang.srt.entrypoints.openai.protocol import (
+        ChatCompletionResponseStreamChoice,
+        ChatCompletionStreamResponse,
+        DeltaMessage,
+    )
+    from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
+
+    fields = dict(
+        chunk_id=chunk_id, created=created, model=model, index=index, usage=usage
+    )
+    chunks = []
+    if reasoning:
+        chunks.append(
+            build_sse_content(reasoning_content=reasoning, logprobs=logprobs, **fields)
+        )
+        logprobs = None
+    if content:
+        chunks.append(build_sse_content(content=content, logprobs=logprobs, **fields))
+        logprobs = None
+    for tool_call in tool_calls:
+        chunk = ChatCompletionStreamResponse(
+            id=chunk_id,
+            created=created,
+            choices=[
+                ChatCompletionResponseStreamChoice(
+                    index=index,
+                    delta=DeltaMessage(tool_calls=[tool_call]),
+                    finish_reason=None,
+                )
+            ],
+            model=model,
+            usage=usage,
+        )
+        chunks.append(f"data: {chunk.model_dump_json()}\n\n")
+    if logprobs is not None:
+        chunks.append(build_sse_content(logprobs=logprobs, **fields))
+    return chunks
 
 
 class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
     """Everything a builder may read; a builder takes only what its encoding needs.
 
     Consumers:
-      tokenizer: prompt encoding (Inkling).
+      tokenizer: prompt encoding (Inkling, DeepSeek-V4 / V4.1).
       reasoning_parser, tool_call_parser, chat_hooks: adapter-owned output parsing.
       hf_config: config-dependent encoding (DeepSeek V4.1 image_token_id).
-      model_path, revision: checkpoint files (DeepSeek tokenizer.json and the
-        encoder file for effort-profile detection).
-      backend: selects the builder; "recipe" is an explicit opt-in.
+      model_path, revision: checkpoint files.
+      default_chat_template_kwargs: the workers' --default-chat-template-kwargs
+        (deepseek-recipe validates the default effort at startup).
+      backend: selects the builder; every spec has a "builtin" one.
     """
 
     chat_encoding_spec: str
@@ -104,6 +198,7 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
     hf_config: Any
     model_path: str
     revision: Optional[str]
+    default_chat_template_kwargs: Optional[dict[str, Any]] = None
     backend: EncodingBackend = "builtin"
 
     def require(self, field: str) -> Any:
@@ -127,11 +222,35 @@ def _build_inkling(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
     )
 
 
+def _build_deepseek_recipe(
+    ctx: ChatEncodingAdapterContext,
+) -> Optional[ChatEncodingAdapter]:
+    if ctx.tokenizer is None:
+        return None  # --skip-tokenizer-init: the server encodes no chat prompts.
+    from sglang.srt.entrypoints.openai.serving_deepseek_recipe import (
+        DeepSeekRecipeChatEncodingAdapter,
+    )
+
+    return DeepSeekRecipeChatEncodingAdapter(
+        chat_encoding_spec=ctx.chat_encoding_spec,
+        tokenizer=ctx.tokenizer,
+        reasoning_parser=ctx.reasoning_parser,
+        tool_call_parser=ctx.tool_call_parser,
+        chat_hooks=ctx.chat_hooks,
+        default_chat_template_kwargs=ctx.default_chat_template_kwargs,
+    )
+
+
 _BUILDERS: dict[
     str,
-    dict[EncodingBackend, Callable[[ChatEncodingAdapterContext], ChatEncodingAdapter]],
+    dict[
+        EncodingBackend,
+        Callable[[ChatEncodingAdapterContext], Optional[ChatEncodingAdapter]],
+    ],
 ] = {
     "inkling": {"builtin": _build_inkling},
+    "dsv4": {"builtin": _build_deepseek_recipe},
+    "dsv41": {"builtin": _build_deepseek_recipe},
 }
 
 

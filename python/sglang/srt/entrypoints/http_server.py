@@ -2679,6 +2679,19 @@ def _reserve_reuseport_socket(config: uvicorn.Config) -> socket.socket:
         raise SystemExit(1) from error
 
 
+def _granian_http1_settings():
+    from granian.http import HTTP1Settings
+
+    if not envs.SGLANG_TIMEOUT_KEEP_ALIVE.is_set():
+        return HTTP1Settings()
+    timeout_s = envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()
+    if timeout_s <= 0:
+        raise ValueError(
+            f"SGLANG_TIMEOUT_KEEP_ALIVE must be a positive number of seconds, got {timeout_s}"
+        )
+    return HTTP1Settings(header_read_timeout=timeout_s * 1000)
+
+
 def _run_granian_server(
     host,
     port,
@@ -2722,6 +2735,7 @@ def _run_granian_server(
         port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
+        http1_settings=_granian_http1_settings(),
         http2_settings=HTTP2Settings(
             initial_connection_window_size=http2_initial_connection_window_size,
             max_concurrent_streams=http2_max_concurrent_streams,
