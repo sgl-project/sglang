@@ -1274,6 +1274,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                                 "this item will fall back to hash_feature().",
                                 hex_hash,
                             )
+                    # The scheduler reuses these ids as-is; set_hash changed the pads.
+                    padded_input_ids = mm_inputs.padded_input_ids
+                    if padded_input_ids is not None:
+                        for item in mm_inputs.mm_items:
+                            for start, end in item.offsets:
+                                padded_input_ids[start : end + 1] = (
+                                    item.padding_sequence(end - start + 1)
+                                )
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
