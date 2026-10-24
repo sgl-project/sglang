@@ -39,7 +39,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Safe POD slice casts (feature buffers viewed as bytes for the shm copy).
 bytemuck = "1"
 core_affinity = "0.8"
-sglang-processor = { path = "../sglang-processor" }
+sglang-processor = { path = "../sglang-processor", features = ["openai"] }
 minijinja = "2.24"
 flume = "0.12.0"
 http = "1.5.0"

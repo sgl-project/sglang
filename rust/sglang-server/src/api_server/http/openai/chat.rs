@@ -26,6 +26,7 @@ use sglang_processor::dynamo_protocols::types::{
     FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
     TopLogprobs,
 };
+use sglang_processor::openai::ChatModel;
 use sglang_processor::{
     ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning,
     tool_call_stream,
@@ -166,8 +167,18 @@ async fn chat_completions(
     let tools = (!tools.is_empty()).then_some(tools);
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    // What `reasoning_effort` and `reasoning` imply for thinking, as the renderer reads them.
-    let requested_thinking = sglang_processor::requested_thinking(&body);
+    // Python's chat-layer facts for the served template, and whether the
+    // reply starts in reasoning, as Python decides it from the request.
+    let chat_model = state
+        .chat_formatter
+        .as_ref()
+        .map(ChatModel::for_formatter)
+        .unwrap_or_default();
+    let force_reasoning = chat_model.request_thinking(
+        reasoning_parser.as_deref(),
+        &body,
+        &state.server_args.default_chat_template_kwargs,
+    );
     let (request, rendered) =
         match prepare_chat_request(&state, body, request, chat_template_kwargs.as_ref()).await {
             Ok(prepared) => prepared,
@@ -189,10 +200,7 @@ async fn chat_completions(
         }
     };
 
-    // `_patch_reasoning_skip_special_tokens`: K3's channel markers are special tokens.
-    if reasoning_parser.as_deref() == Some("kimi_k3")
-        || matches!(state.chat_formatter, Some(ChatFormatter::KimiK3))
-    {
+    if chat_model.keeps_special_tokens(reasoning_parser.as_deref()) {
         sampling.skip_special_tokens = false;
     }
 
@@ -221,23 +229,7 @@ async fn chat_completions(
         || state.server_args.stream_response_default_include_usage;
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
-    let force_reasoning = match reasoning_parser.as_deref() {
-        // Kimi K3's detector starts in reasoning unless told otherwise; Python
-        // passes the thinking flag.
-        Some("kimi_k3") => Some(
-            chat_template_kwargs
-                .as_ref()
-                .and_then(|kwargs| kwargs.get("thinking"))
-                .cloned()
-                .or(requested_thinking.map(Value::Bool))
-                .or_else(|| {
-                    let defaults = &state.server_args.default_chat_template_kwargs;
-                    defaults.get("thinking").cloned()
-                })
-                != Some(Value::Bool(false)),
-        ),
-        parser => starts_in_reasoning(parser, rendered.prompt.as_str()).then_some(true),
-    };
+    let prompt_stub_tokens = chat_model.unreported_prompt_tokens() as u32;
     // As Python, the continued text decides whether generation starts in reasoning.
     let reasoning_options = ReasoningOptions {
         force_reasoning,
@@ -289,6 +281,7 @@ async fn chat_completions(
             parser,
             reasoning_parser,
             reasoning_options,
+            prompt_stub_tokens,
             tools,
             stream_tool_choice,
             uses_tool_call_structural_tag,
@@ -307,6 +300,7 @@ async fn chat_completions(
             parser,
             reasoning_parser,
             reasoning_options,
+            prompt_stub_tokens,
             tools,
             parallel_tool_calls,
             service_tier,
@@ -506,6 +500,7 @@ pub(super) async fn unary_chat(
     parser: Option<String>,
     reasoning_parser: Option<String>,
     reasoning_options: ReasoningOptions,
+    prompt_stub_tokens: u32,
     tools: Option<Vec<ToolDefinition>>,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
@@ -523,7 +518,7 @@ pub(super) async fn unary_chat(
         };
 
         if prompt_tokens == 0 {
-            prompt_tokens = output.prompt_tokens;
+            prompt_tokens = output.prompt_tokens.saturating_sub(prompt_stub_tokens);
         }
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
@@ -595,6 +590,7 @@ pub(super) fn chat_event_stream(
     parser: Option<String>,
     reasoning_parser: Option<String>,
     reasoning_options: ReasoningOptions,
+    prompt_stub_tokens: u32,
     tools: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
@@ -660,7 +656,7 @@ pub(super) fn chat_event_stream(
                 }
             };
             if prompt_tokens == 0 {
-                prompt_tokens = output.prompt_tokens;
+                prompt_tokens = output.prompt_tokens.saturating_sub(prompt_stub_tokens);
             }
             completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
             let finish_reason = chat_finish_reason(&output);
@@ -894,21 +890,12 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
     }
 }
 
-/// V4, GLM-5.3 and Qwen3.8 prefill `<think>` (Qwen3.8 with a newline) when
-/// thinking, so the generated stream has no opening marker.
-fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
-    matches!(
-        reasoning_parser,
-        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "deepseek-v41" | "glm45" | "qwen3")
-    ) && prompt.trim_end_matches('\n').ends_with("<think>")
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::test_utils::{chat_submitted, chunk};
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, starts_in_reasoning, unary_chat,
+        merge_template_stops, unary_chat,
     };
     use crate::message::config::DefaultSamplingParams;
     use crate::message::response::ChunkExtras;
@@ -916,6 +903,7 @@ mod tests {
     use futures::StreamExt;
     use sglang_processor::ReasoningOptions;
     use sglang_processor::dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
+    use sglang_processor::openai::ChatModel;
 
     fn request() -> CreateChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -923,30 +911,6 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
-    }
-
-    #[test]
-    fn prefilled_think_starts_in_reasoning() {
-        let glm = Some("glm45");
-        assert!(starts_in_reasoning(glm, "<|user|>hi<|assistant|><think>"));
-        assert!(!starts_in_reasoning(
-            glm,
-            "<|user|>hi<|assistant|><think></think>"
-        ));
-        let qwen = Some("qwen3");
-        assert!(starts_in_reasoning(
-            qwen,
-            "<|im_start|>assistant\n<think>\n"
-        ));
-        assert!(!starts_in_reasoning(
-            qwen,
-            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        ));
-        assert!(starts_in_reasoning(
-            Some("deepseek-v4"),
-            "<｜Assistant｜><think>"
-        ));
-        assert!(!starts_in_reasoning(None, "<think>\n"));
     }
 
     fn render_dsv41(body: serde_json::Value) -> super::super::template::RenderedChat {
@@ -965,7 +929,7 @@ mod tests {
     /// reasoning, as on Python, whose split follows the request's thinking flag.
     #[test]
     fn continuation_inside_think_starts_in_reasoning() {
-        let rendered = render_dsv41(serde_json::json!({
+        let body = serde_json::json!({
             "model": "m",
             "messages": [
                 {"role": "user", "content": "What is 17*23?"},
@@ -973,12 +937,15 @@ mod tests {
             ],
             "continue_final_message": true,
             "chat_template_kwargs": {"thinking": true}
-        }));
+        });
+        let rendered = render_dsv41(body.clone());
         assert_eq!(rendered.continuation, "Let me compute: 17*20");
-        assert!(starts_in_reasoning(
-            Some("deepseek-v41"),
-            rendered.prompt.as_str()
-        ));
+        let model = ChatModel::for_formatter(&super::super::ChatFormatter::DeepSeekV41);
+        let defaults = Default::default();
+        assert_eq!(
+            model.request_thinking(Some("deepseek-v41"), &body, &defaults),
+            Some(true)
+        );
     }
 
     /// A DeepSeek-V4 continuation is the assistant text as is, as SGLang's
@@ -1160,6 +1127,7 @@ mod tests {
             None,
             None,
             ReasoningOptions::default(),
+            3, // Kimi K3's generation stub
             None,
             true,
             None,
@@ -1173,7 +1141,10 @@ mod tests {
         assert_eq!(value["choices"][0]["message"]["role"], "assistant");
         assert_eq!(value["choices"][0]["message"]["content"], "Paris");
         assert_eq!(value["choices"][1]["index"], 1);
-        assert_eq!(value["usage"]["prompt_tokens"], 5);
+        assert_eq!(
+            value["usage"]["prompt_tokens"], 2,
+            "the stub is not reported"
+        );
         assert_eq!(value["usage"]["completion_tokens"], 2);
     }
 
@@ -1259,6 +1230,7 @@ mod tests {
             None,
             Some("deepseek-r1".into()),
             ReasoningOptions::default(),
+            0,
             None,
             true,
             None,
@@ -1298,6 +1270,7 @@ mod tests {
             None,
             Some("deepseek-r1".into()),
             ReasoningOptions::default(),
+            0,
             None,
             None,
             false,
@@ -1344,6 +1317,7 @@ mod tests {
             None,
             None,
             ReasoningOptions::default(),
+            0,
             None,
             None,
             false,
