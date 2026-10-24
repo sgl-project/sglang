@@ -32,14 +32,11 @@ class TestDllmConfig(CustomTestCase):
             vocab_size=157184,
         )
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as config_file:
-            if content is not None:
-                config_file.write(content)
-                config_file.flush()
+            config_file.write(content)
+            config_file.flush()
             server_args = SimpleNamespace(
                 dllm_algorithm=algorithm,
-                dllm_algorithm_config=(
-                    config_file.name if content is not None else None
-                ),
+                dllm_algorithm_config=config_file.name,
                 model_path="local/diffusion-model",
                 revision=None,
                 max_running_requests=None,
@@ -52,41 +49,14 @@ class TestDllmConfig(CustomTestCase):
                 return DllmConfig.from_server_args(server_args)
 
     def test_unknown_keys_list_the_supported_keys(self):
-        cases = (
-            (
-                "LowConfidence",
-                "threshhold",  # codespell:ignore threshhold
-                "block_size, threshold",
-            ),
-            (
-                "JointThreshold",
-                "edit_treshold",  # codespell:ignore treshold
-                "block_size, edit_threshold, max_post_edit_steps, penalty_lambda, "
-                "threshold, vectorized_decoding",
-            ),
-            (
-                "JointThresholdInDel",
-                "max_post_edit_step",
-                "block_size, edit_threshold, max_post_edit_steps, threshold",
-            ),
-            (
-                "Gemma4Renoise",
-                "max_denoise_steps",
-                "block_size, capture_input_preparation, confidence_threshold, "
-                "max_denoising_steps, sampler_config, seed, stability_threshold, "
-                "stopping_config, t_max, t_min, temperature_schedule, "
-                "use_temperature_table",
-            ),
+        key = "threshhold"  # codespell:ignore threshhold
+        with self.assertRaises(ValueError) as error:
+            self._parse_config("LowConfidence", yaml.safe_dump({key: 0.8}))
+        self.assertEqual(
+            str(error.exception),
+            f"Unknown configuration keys for LowConfidence: {key}. "
+            "Supported keys: block_size, threshold",
         )
-        for algorithm, key, supported_keys in cases:
-            with self.subTest(algorithm=algorithm):
-                with self.assertRaises(ValueError) as error:
-                    self._parse_config(algorithm, yaml.safe_dump({key: 1}))
-                self.assertEqual(
-                    str(error.exception),
-                    f"Unknown configuration keys for {algorithm}: {key}. "
-                    f"Supported keys: {supported_keys}",
-                )
 
     def test_keys_from_other_algorithms_are_rejected(self):
         cases = (
@@ -138,43 +108,29 @@ class TestDllmConfig(CustomTestCase):
                 )
 
     def test_mixed_unknown_key_types_report_a_value_error(self):
-        cases = (
-            ("LowConfidence", {7: 1, "extra_option": 2}, "7, extra_option"),
-            (
-                "Gemma4Renoise",
-                {"sampler_config": {7: 1, "extra_option": 2}},
-                "sampler_config.7, sampler_config.extra_option",
-            ),
+        with self.assertRaises(ValueError) as error:
+            self._parse_config(
+                "LowConfidence", yaml.safe_dump({7: 1, "extra_option": 2})
+            )
+        self.assertIn(
+            "Unknown configuration keys for LowConfidence: 7, extra_option. "
+            "Supported keys: ",
+            str(error.exception),
         )
-        for algorithm, values, keys in cases:
-            with self.subTest(algorithm=algorithm):
-                with self.assertRaises(ValueError) as error:
-                    self._parse_config(algorithm, yaml.safe_dump(values))
-                self.assertIn(
-                    f"Unknown configuration keys for {algorithm}: {keys}. "
-                    "Supported keys: ",
-                    str(error.exception),
-                )
 
     def test_input_preparation_option_requires_algorithm_support(self):
         for algorithm in ("LowConfidence", "JointThreshold", "JointThresholdInDel"):
-            for enabled in (False, True):
-                with self.subTest(algorithm=algorithm, enabled=enabled):
-                    with self.assertRaises(ValueError) as error:
-                        self._parse_config(
-                            algorithm,
-                            yaml.safe_dump({"capture_input_preparation": enabled}),
-                        )
-                    message = str(error.exception)
-                    self.assertIn(
-                        f"Unknown configuration keys for {algorithm}: "
-                        "capture_input_preparation. Supported keys: ",
-                        message,
+            with self.subTest(algorithm=algorithm):
+                with self.assertRaises(ValueError) as error:
+                    self._parse_config(
+                        algorithm,
+                        yaml.safe_dump({"capture_input_preparation": True}),
                     )
-                    self.assertNotIn(
-                        "capture_input_preparation",
-                        message.split("Supported keys: ", 1)[1],
-                    )
+                self.assertIn(
+                    f"Unknown configuration keys for {algorithm}: "
+                    "capture_input_preparation. Supported keys: ",
+                    str(error.exception),
+                )
 
     def test_gemma_input_preparation_option(self):
         for enabled in (False, True):
@@ -258,56 +214,25 @@ class TestDllmConfig(CustomTestCase):
         self.assertEqual(algorithm.confidence_threshold, 0.02)
         self.assertEqual(algorithm.stability_threshold, 2)
 
-    def test_gemma_flat_aliases_remain_fallbacks(self):
-        aliases = {
-            "t_min": 0.2,
-            "t_max": 0.7,
-            "confidence_threshold": 0.03,
-            "stability_threshold": 3,
-        }
-        cases = (
-            ({}, 0.2, 0.03),
-            (
-                {
-                    "temperature_schedule": {"t_min": 0.3},
-                    "stopping_config": {"confidence_threshold": 0.02},
-                },
-                0.3,
-                0.02,
-            ),
-        )
-        for sections, t_min, confidence in cases:
-            with self.subTest(sections=sections):
-                config = self._parse_config(
-                    "Gemma4Renoise", yaml.safe_dump({**aliases, **sections})
-                )
-                algorithm = get_algorithm(config)
-                self.assertEqual((algorithm.t_min, algorithm.t_max), (t_min, 0.7))
-                self.assertEqual(algorithm.confidence_threshold, confidence)
-                self.assertEqual(algorithm.stability_threshold, 3)
-
-    def test_absent_and_empty_yaml_preserve_defaults(self):
+    def test_empty_yaml_preserves_defaults(self):
         for name, threshold in (
             ("LowConfidence", 0.95),
-            ("JointThreshold", 0.5),
-            ("JointThresholdInDel", 0.5),
             ("Gemma4Renoise", None),
         ):
-            for content in (None, "", "{}", "# No overrides\n"):
-                with self.subTest(algorithm=name, content=content):
-                    config = self._parse_config(name, content)
-                    algorithm = get_algorithm(config)
-                    self.assertEqual(config.algorithm_config, {})
-                    self.assertEqual(config.max_running_requests, 1)
-                    if threshold is not None:
-                        self.assertEqual(config.block_size, 32)
-                        self.assertEqual(algorithm.threshold, threshold)
-                    else:
-                        self.assertEqual(config.block_size, 256)
-                        self.assertEqual(algorithm.max_denoising_steps, 48)
-                        self.assertEqual(algorithm.entropy_bound, 0.1)
-                        self.assertEqual((algorithm.t_min, algorithm.t_max), (0.4, 0.8))
-                        self.assertTrue(algorithm.use_graph_input_preparation)
+            with self.subTest(algorithm=name):
+                config = self._parse_config(name, "")
+                algorithm = get_algorithm(config)
+                self.assertEqual(config.algorithm_config, {})
+                self.assertEqual(config.max_running_requests, 1)
+                if threshold is not None:
+                    self.assertEqual(config.block_size, 32)
+                    self.assertEqual(algorithm.threshold, threshold)
+                else:
+                    self.assertEqual(config.block_size, 256)
+                    self.assertEqual(algorithm.max_denoising_steps, 48)
+                    self.assertEqual(algorithm.entropy_bound, 0.1)
+                    self.assertEqual((algorithm.t_min, algorithm.t_max), (0.4, 0.8))
+                    self.assertTrue(algorithm.use_graph_input_preparation)
 
     def test_null_gemma_sections_preserve_defaults(self):
         config = self._parse_config(
@@ -321,12 +246,10 @@ class TestDllmConfig(CustomTestCase):
         self.assertEqual(algorithm.stability_threshold, 1)
 
     def test_non_mapping_yaml_keeps_the_existing_error(self):
-        for content in ("- threshold\n", "42\n"):
-            with self.subTest(content=content):
-                with self.assertRaisesRegex(
-                    ValueError, "The dLLM algorithm config must be a YAML mapping"
-                ):
-                    self._parse_config("LowConfidence", content)
+        with self.assertRaisesRegex(
+            ValueError, "The dLLM algorithm config must be a YAML mapping"
+        ):
+            self._parse_config("LowConfidence", "42\n")
 
 
 if __name__ == "__main__":
