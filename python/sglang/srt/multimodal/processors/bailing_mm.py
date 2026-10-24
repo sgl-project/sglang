@@ -139,6 +139,11 @@ class BailingMMMultimodalProcessor(BaseMultimodalProcessor):
             + cls._token_string(processor, tokenizer, end_attrs, end_fallback)
         )
 
+    def _mm_preprocessing_device_choice(self) -> Optional[str]:
+        # process_mm_data below hands the base placement to its processor
+        # call, so report that placement for worker sizing and JPEG decode.
+        return super()._mm_preprocessing_device_choice()
+
     def process_mm_data(
         self,
         input_text,
@@ -162,7 +167,7 @@ class BailingMMMultimodalProcessor(BaseMultimodalProcessor):
         image_processor = getattr(processor, "image_processor", None)
         device: Optional[str] = None
         if isinstance(image_processor, BaseImageProcessor):
-            device = self._fast_image_processor_device(processor)
+            device = self._resolve_mm_preprocessing_device(processor)
         if device is not None:
             processor_kwargs["device"] = device
 

@@ -86,6 +86,7 @@ def make_processor(case, config, image_processor_cls=None):
         tokenizer_worker_num=1,
         base_gpu_id=0,
         rl_on_policy_target=None,
+        mm_preprocessing_device="auto",
         allowed_media_domains=[],
         media_url_max_file_size_mb=64,
     )
