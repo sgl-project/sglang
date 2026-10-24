@@ -59,6 +59,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SANA_SPRINT_1_6B_MODEL_NAME_FOR_TEST,
     DEFAULT_SANA_SPRINT_MODEL_NAME_FOR_TEST,
     DEFAULT_SANA_VIDEO_MODEL_NAME_FOR_TEST,
     DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
@@ -216,6 +217,16 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "sana_sprint_0.6b_t2i",
         DiffusionServerArgs(
             model_path=DEFAULT_SANA_SPRINT_MODEL_NAME_FOR_TEST,
+            modality="image",
+        ),
+        SANA_SPRINT_T2I_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+    ),
+    DiffusionTestCase(
+        "sana_sprint_1.6b_t2i",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SANA_SPRINT_1_6B_MODEL_NAME_FOR_TEST,
             modality="image",
         ),
         SANA_SPRINT_T2I_CI_sampling_params,

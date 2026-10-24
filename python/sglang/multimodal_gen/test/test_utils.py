@@ -226,6 +226,9 @@ DEFAULT_SANA_VIDEO_MODEL_NAME_FOR_TEST = (
 DEFAULT_SANA_SPRINT_MODEL_NAME_FOR_TEST = (
     "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers"
 )
+DEFAULT_SANA_SPRINT_1_6B_MODEL_NAME_FOR_TEST = (
+    "Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers"
+)
 
 
 def print_value_formatted(description: str, value: int | float | str):
