@@ -25,7 +25,7 @@ from sglang.srt.parser.deepseek_recipe_output import (
     whole_tool_calls,
 )
 from sglang.srt.parser.deepseek_recipe_renderer import (
-    RecipeEncoder,
+    DeepSeekRecipe,
     parse_effort_budget,
 )
 from sglang.srt.runtime_context import get_serving
@@ -65,7 +65,9 @@ class DeepSeekRecipeChatEncodingAdapter:
         default_chat_template_kwargs: Optional[dict[str, Any]],
     ):
         self._spec = chat_encoding_spec
-        self.encoder = RecipeEncoder.from_hf_tokenizer(chat_encoding_spec, tokenizer)
+        self.deepseek_recipe = DeepSeekRecipe.from_hf_tokenizer(
+            chat_encoding_spec, tokenizer
+        )
         raw = (DEFAULT_EFFORT_ENVS[chat_encoding_spec].get() or "").strip()
         self._default_effort = int(raw) if raw.isdigit() else raw or None
         # Encoded at boot, so a bad server default fails startup, not requests.
@@ -146,7 +148,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         )
         image_data.extend(ImageData(url=url) for url in image_urls)
         if task_prefix:
-            prompt_ids += self.encoder.encode_text(task_prefix)
+            prompt_ids += self.deepseek_recipe.encode_text(task_prefix)
         return prompt_ids
 
     def _encode(
@@ -168,7 +170,7 @@ class DeepSeekRecipeChatEncodingAdapter:
             budget = parse_effort_budget(effort)
         elif effort is not None:
             body["reasoning_effort"] = effort
-        return self.encoder.encode(
+        return self.deepseek_recipe.encode(
             body, task=task, effort_budget=budget, image_urls=image_urls
         )
 
@@ -339,8 +341,8 @@ class DeepSeekRecipeChatEncodingAdapter:
             else None
         )
         return DeepSeekRecipeOutputParser(
-            self.encoder,
-            thinking_stage=self.encoder.parse_start(
+            self.deepseek_recipe,
+            thinking_stage=self.deepseek_recipe.parse_start(
                 thinking=self._hooks.thinking_requested(request),
                 task=request.task,
                 continued=continued,
@@ -362,8 +364,8 @@ class DeepSeekRecipeChatEncodingAdapter:
         parse_tool_calls: bool,
     ) -> DeepSeekRecipeOutputParser:
         return DeepSeekRecipeOutputParser(
-            self.encoder,
-            thinking_stage=self.encoder.parse_start(thinking=require_reasoning),
+            self.deepseek_recipe,
+            thinking_stage=self.deepseek_recipe.parse_start(thinking=require_reasoning),
             parse_tool_calls=parse_tool_calls,
             separate_reasoning=separate_reasoning,
             stop=_stop_strings(request.stop),

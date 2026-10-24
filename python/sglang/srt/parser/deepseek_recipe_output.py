@@ -11,7 +11,7 @@ from typing import Any, Optional
 import msgspec
 
 from sglang.srt.parser.deepseek_recipe_renderer import (
-    RecipeEncoder,
+    DeepSeekRecipe,
     load_deepseek_recipe,
 )
 
@@ -64,7 +64,7 @@ class DeepSeekRecipeOutputParser:
 
     def __init__(
         self,
-        encoder: RecipeEncoder,
+        deepseek_recipe: DeepSeekRecipe,
         *,
         thinking_stage: Any,
         parse_tool_calls: bool,
@@ -78,18 +78,20 @@ class DeepSeekRecipeOutputParser:
             parse_tool_calls=parse_tool_calls,
             parse_json_output=parse_json_output,
             thinking_initial_stage=thinking_stage,
-            special_tokens=encoder.special_tokens,
+            special_tokens=deepseek_recipe.special_tokens,
         )
         # The generator only frames chunks; what is parsed follows `options`.
         request = recipe.ConversationRequest(
-            recipe.Conversation(), encoder.model_version
+            recipe.Conversation(), deepseek_recipe.model_version
         )
         generator = recipe.ChatCompletionRequest.chunk_generator(
-            request, "", encoder.model
+            request, "", deepseek_recipe.model
         )
         self._recipe = recipe
-        self._processor = recipe.StreamProcessor(generator, options, encoder.tokenizer)
-        self._hf_tokenizer = encoder.hf_tokenizer
+        self._processor = recipe.StreamProcessor(
+            generator, options, deepseek_recipe.tokenizer
+        )
+        self._hf_tokenizer = deepseek_recipe.hf_tokenizer
         self._reasoning_as_content = not separate_reasoning
         self._hold_reasoning = separate_reasoning and not stream_reasoning
         self._held_reasoning = ""

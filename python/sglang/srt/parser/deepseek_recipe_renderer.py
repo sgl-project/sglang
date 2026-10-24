@@ -102,7 +102,7 @@ def _error_message(body: Any) -> str:
         return str(body)
 
 
-class RecipeEncoder:
+class DeepSeekRecipe:
     """`tokenizer` is the checkpoint's `tokenizers.Tokenizer`; recipe encodes prompts
     with its own copy of it, and the SGLang extensions splice ids from the original."""
 
@@ -128,7 +128,7 @@ class RecipeEncoder:
     @classmethod
     def from_hf_tokenizer(
         cls, chat_encoding_spec: str, tokenizer: Any
-    ) -> RecipeEncoder:
+    ) -> DeepSeekRecipe:
         backend = getattr(tokenizer, "backend_tokenizer", None)
         if backend is None:
             raise ValueError(
