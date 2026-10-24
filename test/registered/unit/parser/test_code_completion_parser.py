@@ -123,6 +123,15 @@ class TestGenerateCompletionPromptFromRequest(CustomTestCase):
         result = generate_completion_prompt_from_request(request)
         self.assertEqual(result, "just code")
 
+    def test_a_missing_suffix_is_left_as_the_prompt(self):
+        with patch(
+            "sglang.srt.parser.code_completion_parser.completion_template_name",
+            "deepseek_coder",
+        ):
+            request = CompletionRequest(prompt="just code")
+            result = generate_completion_prompt_from_request(request)
+            self.assertEqual(result, "just code")
+
     def test_nonempty_suffix_uses_fim_template(self):
         """Test that non-empty suffix triggers FIM formatting."""
         with patch(
