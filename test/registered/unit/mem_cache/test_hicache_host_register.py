@@ -208,12 +208,8 @@ class TestHiCacheHostRegister(unittest.TestCase):
         for layout in ("page_first", "page_first_direct"):
             with self.subTest(layout=layout):
                 host = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
-                host.device_pool = SimpleNamespace(
-                    device="cpu", index_k_with_scale_buffer=target_buffers
-                )
-                host.mtp_draft_device_pools = [
-                    SimpleNamespace(index_k_with_scale_buffer=[draft_buffer])
-                ]
+                host._buffer_device = torch.device("cpu")
+                host.packed_device_index_buffers = [*target_buffers, draft_buffer]
                 host.layout = layout
                 host._live_target_layers = [0, 1, 2]
                 host.layer_num = 4
@@ -229,8 +225,6 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 with mock.patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}):
                     host.init_kv_buffer()
 
-                self.assertEqual(len(host.packed_device_index_buffers), 4)
-                self.assertIs(host.packed_device_index_buffers[-1], draft_buffer)
                 self.assertEqual(
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     host.indexer_layout_dim,

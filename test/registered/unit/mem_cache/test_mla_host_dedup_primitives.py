@@ -5,7 +5,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupBroadcaster,
     MLAHostDedupContext,
@@ -13,7 +13,6 @@ from sglang.srt.mem_cache.mla_host_dedup import (
 )
 from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
-    make_dsa_indexer_pool_decl,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -97,15 +96,42 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             size=8,
             start_layer=0,
             end_layer=2,
-            index_head_dim=8,
-            quant_block_size=4,
+            index_head_dim=128,
+            quant_block_size=128,
             page_size=2,
             index_page_size=2,
             skip_topk_layers=[False] * 2,
+            index_kpool=1,
+            model_layer_ids=(0, 1),
+            kv_buffer=[object()] * 2,
+            index_key_cache=SimpleNamespace(buffer=[object()] * 2),
+        )
+        dsa_device_pool.get_device_pool_infos = lambda: (
+            DSATokenToKVPool.get_device_pool_infos(dsa_device_pool)
+        )
+        dsa_device_pool._should_allocate_index_layer = lambda layer: (
+            DSATokenToKVPool._should_allocate_index_layer(dsa_device_pool, layer)
+        )
+        from sglang.srt.mem_cache.device_pool_info import (
+            IndexKeyBufferInfo,
+            IndexKeyFormat,
+        )
+
+        info = IndexKeyBufferInfo(
+            page_size=2,
+            compress_ratio=1,
+            key_format=IndexKeyFormat.DSA_FP8,
+            buffers=tuple(torch.empty((4, 264), dtype=torch.uint8) for _ in range(2)),
         )
         indexer_host = DSAIndexerPoolHost(
-            decl=make_dsa_indexer_pool_decl(dsa_device_pool),
-            anchor_host=mla_host,
+            info,
+            layer_mapping={0: 0, 1: 1},
+            target_device_layer_num=2,
+            num_host_pages=mla_host.page_num,
+            transfer_page_size=mla_host.page_size,
+            layout=mla_host.layout,
+            buffer_device="cpu",
+            dtype=dsa_device_pool.store_dtype,
             pin_memory=False,
             is_dummy=True,
         )

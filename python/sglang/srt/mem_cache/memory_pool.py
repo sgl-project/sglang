@@ -2058,17 +2058,6 @@ class KVCache(abc.ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} has no device pool provider")
 
-    def host_pool_decls(self):
-        """Host pools HiCache keeps for the buffers this device pool (and its
-        sub-pools) owns: the KV pool itself, plus dependent pools such as sparse
-        index keys in subclasses. Not a description of the whole model: buffers
-        owned elsewhere (e.g. Mamba state in req_to_token_pool) are declared by
-        their owner or assembled by the existing strategy paths."""
-        # pool_host imports this module. Resolve the declaration types lazily.
-        from sglang.srt.mem_cache.pool_host.host_pool_decl import make_kv_pool_decl
-
-        return (make_kv_pool_decl(self),)
-
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
@@ -4343,12 +4332,6 @@ class HybridLinearKVPool(KVCache):
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
 
-    def host_pool_decls(self):
-        # Only the full-attention sub-pool owns HiCache-addressable buffers here.
-        # Mamba state belongs to req_to_token_pool's MambaPool and is assembled
-        # by _MambaStrategy, not declared through this pool.
-        return self.full_kv_pool.host_pool_decls()
-
     @property
     def post_capture_active(self) -> bool:
         return self.full_kv_pool.post_capture_active
@@ -5372,16 +5355,46 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def _should_allocate_index_layer(self, local_layer_idx: int) -> bool:
         return not self.skip_topk_layers[local_layer_idx]
 
-    def host_pool_decls(self):
-        # pool_host imports this module. Resolve the mirror side lazily.
-        from sglang.srt.mem_cache.pool_host.dsa import make_dsa_indexer_pool_decl
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        from sglang.srt.mem_cache.device_pool_info import (
+            DevicePoolInfo,
+            IndexKeyBufferInfo,
+            IndexKeyFormat,
+        )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
 
-        kv_decls = super().host_pool_decls()
-        # Shared-topk layers own a 0-row placeholder, so a non-empty buffer list
-        # is not enough: some layer must actually hold index keys.
-        if not self.index_k_with_scale_buffer or all(self.skip_topk_layers):
-            return kv_decls
-        return (*kv_decls, make_dsa_indexer_pool_decl(self))
+        if (self.index_head_dim, self.quant_block_size) != (128, 128):
+            raise ValueError(
+                f"DSA_FP8 index key format requires index_head_dim=128 and "
+                f"quant_block_size=128, got {self.index_head_dim} and {self.quant_block_size}"
+            )
+
+        kv_infos = super().get_device_pool_infos()
+        # Local buffer positions, translated to model layer IDs below.
+        index_buffer_layer_ids = tuple(
+            layer
+            for layer in range(self.layer_num)
+            if self._should_allocate_index_layer(layer)
+        )
+        if not index_buffer_layer_ids or not self.index_key_cache.buffer:
+            return kv_infos
+        index_info = DevicePoolInfo(
+            pool_name=PoolName.INDEXER,
+            indices_from_pool=PoolName.KV,
+            layer_ids=tuple(
+                self.model_layer_ids[layer] for layer in index_buffer_layer_ids
+            ),
+            buffer_info=IndexKeyBufferInfo(
+                page_size=self.page_size,
+                compress_ratio=self.index_kpool,
+                kernel_page_size=self.index_page_size,
+                buffers=tuple(
+                    self.index_key_cache.buffer[i] for i in index_buffer_layer_ids
+                ),
+                key_format=IndexKeyFormat.DSA_FP8,
+            ),
+        )
+        return (*kv_infos, index_info)
 
     @property
     def index_k_with_scale_buffer(self):
