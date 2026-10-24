@@ -18,9 +18,7 @@ def _make_weight(c_in, c_out, kt=3, kh=3, kw=3, seed=0):
     torch.manual_seed(seed)
     weight = torch.randn(c_out, c_in, kt, kh, kw, dtype=torch.float32)
     weight_2d = (
-        weight.permute(0, 2, 1, 3, 4)
-        .reshape(c_out, kt * c_in, kh, kw)
-        .contiguous()
+        weight.permute(0, 2, 1, 3, 4).reshape(c_out, kt * c_in, kh, kw).contiguous()
     )
     return weight, weight_2d
 
@@ -30,9 +28,7 @@ def test_batched_conv2d_matches_conv3d_without_padding():
     weight, weight_2d = _make_weight(4, 6, seed=1)
 
     expected = F.conv3d(x, weight, None, stride=(1, 1, 1))
-    got = RocmPlatform._conv3d_as_batched_conv2d(
-        x, weight_2d, None, (1, 1, 1), kt=3
-    )
+    got = RocmPlatform._conv3d_as_batched_conv2d(x, weight_2d, None, (1, 1, 1), kt=3)
 
     assert got.shape == expected.shape
     assert torch.allclose(got, expected, atol=1e-5, rtol=1e-5)
@@ -44,9 +40,7 @@ def test_batched_conv2d_matches_conv3d_with_bias_and_temporal_stride():
     bias = torch.randn(5, dtype=torch.float32)
 
     expected = F.conv3d(x, weight, bias, stride=(2, 1, 1))
-    got = RocmPlatform._conv3d_as_batched_conv2d(
-        x, weight_2d, bias, (2, 1, 1), kt=3
-    )
+    got = RocmPlatform._conv3d_as_batched_conv2d(x, weight_2d, bias, (2, 1, 1), kt=3)
 
     assert got.shape == expected.shape
     assert torch.allclose(got, expected, atol=1e-5, rtol=1e-5)
