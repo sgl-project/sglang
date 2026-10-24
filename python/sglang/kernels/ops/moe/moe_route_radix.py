@@ -48,13 +48,16 @@ def _jit_route_radix_module() -> Module:
     )
 
 
+def supports_shape(num_experts: int, topk: int) -> bool:
+    return num_experts == _NUM_EXPERTS and topk == _TOPK
+
+
 def covered(scores: torch.Tensor, bias: torch.Tensor, topk: int) -> bool:
     """Specialized for K3 decode routing: [M, 896] bf16 or fp32
     row-contiguous scores (8B/16B-aligned rows), fp32 bias, top-16."""
     return (
         scores.dim() == 2
-        and scores.size(1) == _NUM_EXPERTS
-        and int(topk) == _TOPK
+        and supports_shape(scores.size(1), int(topk))
         and scores.dtype in (torch.bfloat16, torch.float32)
         and bias.dtype == torch.float32
         and scores.stride(1) == 1
