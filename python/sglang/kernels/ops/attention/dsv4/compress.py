@@ -239,6 +239,60 @@ class CompressorDecodePlan(NamedTuple):
         return True
 
 
+# The plan build's raw H2D copy is captured with its host pointer baked in when
+# the plan is built for CUDA-graph use, so the staging buffer must outlive the
+# graph; cache it per (device, num_q_tokens) instead of per call.
+_PIN_STAGING_CACHE: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _get_pin_staging_buffer(
+    num_q_tokens: int, device: torch.device, persistent: bool
+) -> torch.Tensor:
+    if not persistent:
+        return torch.empty((2, num_q_tokens, 16), dtype=torch.uint8, pin_memory=True)
+    key = (device, int(num_q_tokens))
+    buf = _PIN_STAGING_CACHE.get(key)
+    if buf is None:
+        buf = torch.empty((2, num_q_tokens, 16), dtype=torch.uint8, pin_memory=True)
+        _PIN_STAGING_CACHE[key] = buf
+    return buf
+
+
+# Write-after-read barrier for the persistent staging buffer above: stage 0
+# refills the pinned buffer on the host every forward, while the previous
+# forward's async H2D still reads it on the compute stream. The overlap
+# scheduler runs the CPU one forward ahead, so the refill can clobber a copy
+# that has not run yet. One read-done event per key gates the next refill.
+_PIN_STAGING_READ_DONE: dict[tuple[torch.device, int], torch.cuda.Event] = {}
+
+
+def _make_external_event() -> torch.cuda.Event:
+    # external=True can be recorded inside a cuda-graph capture (the plan build
+    # is captured on the decode target-verify path); fall back when unsupported.
+    try:
+        return torch.cuda.Event(external=True)
+    except TypeError:
+        return torch.cuda.Event()
+
+
+def _wait_prev_pin_staging_read(key: tuple[torch.device, int]) -> None:
+    event = _PIN_STAGING_READ_DONE.get(key)
+    # A host-side sync is illegal mid-capture; the one-shot capture pass has no
+    # prior in-flight copy on this buffer to race, so skipping it there is safe.
+    if event is not None and not torch.cuda.is_current_stream_capturing():
+        event.synchronize()
+
+
+def _record_pin_staging_read_done(key: tuple[torch.device, int]) -> None:
+    # Record on the current stream, which is the stream the C++ planner's H2D
+    # runs on (resolve_device -> TVMFFIEnvGetStream == torch's current stream).
+    event = _PIN_STAGING_READ_DONE.get(key)
+    if event is None:
+        event = _make_external_event()
+        _PIN_STAGING_READ_DONE[key] = event
+    event.record()
+
+
 class CompressorPrefillPlan(NamedTuple):
     compress_ratio: int
     plan_c: torch.Tensor  # [num_q_tokens, 16] uint8 --- CompressPlan
@@ -369,11 +423,17 @@ class CompressorPrefillPlan(NamedTuple):
         extend_lens_cpu = extend_lens.detach().to(torch.int64).cpu()
         rid_i64 = req_pool_indices.to(torch.int64)
         r2t_i32 = req_to_token.to(torch.int32)
-        pin_buffer = torch.empty(
-            (2, num_q_tokens, 16), dtype=torch.uint8, pin_memory=True
-        )
-        plan_c_pin, plan_w_pin = pin_buffer[0], pin_buffer[1]
         device = req_pool_indices.device
+        persistent = bool(use_cuda_graph)
+        pin_buffer = _get_pin_staging_buffer(num_q_tokens, device, persistent)
+        # Only the persistent (cuda-graph) path shares the buffer across
+        # forwards; wait for the previous forward's H2D read to finish before
+        # stage 0 (module.plan_prefill below) refills it. The eager path
+        # allocates per call, so it needs no barrier.
+        staging_key = (device, int(num_q_tokens))
+        if persistent:
+            _wait_prev_pin_staging_read(staging_key)
+        plan_c_pin, plan_w_pin = pin_buffer[0], pin_buffer[1]
         plan_c_dev = torch.empty((num_q_tokens, 16), dtype=torch.uint8, device=device)
         plan_w_dev = torch.empty((num_q_tokens, 16), dtype=torch.uint8, device=device)
         module = _jit_compress_128_online_module(512)  # NOTE: only support dim=512
@@ -389,6 +449,10 @@ class CompressorPrefillPlan(NamedTuple):
             int(state_slot_offset),
             bool(use_cuda_graph),
         )
+        if persistent:
+            # Mark this forward's H2D read of the shared buffer; the next
+            # forward waits on it before refilling (see above).
+            _record_pin_staging_read_done(staging_key)
         return CompressorPrefillPlan(
             128,
             plan_c_dev[: int(num_c)],
