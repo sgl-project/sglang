@@ -119,49 +119,6 @@ def handle_attention_backend_compatibility(server_args: Any):
     # Split-backend override + default fill.
     run_post_process_pass(server_args, _attention_backend_default)
 
-    # Torch native and flex attention backends
-    attention_backend = resolved_view(server_args).attention_backend
-    if attention_backend == "torch_native":
-        logger.warning(
-            "Cuda graph is disabled because of using torch native attention backend"
-        )
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
-            ),
-        )
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-            ),
-        )
-
-    if attention_backend == "flex_attention":
-        logger.warning(
-            "Cuda graph is disabled because of using torch Flex Attention backend"
-        )
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
-            ),
-        )
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-            ),
-        )
-        assert cfg.speculative_algorithm is None, (
-            "Speculative decoding is currently not supported with Flex Attention backend"
-        )
-
     # Whisper's encoder token padding conflicts with prefix caching.
     # Only disable for Whisper; other encoder-decoder models (e.g., mllama) use radix cache.
     if (
@@ -268,6 +225,8 @@ def handle_attention_backend_compatibility(server_args: Any):
                     mem_fraction_static=cfg.mem_fraction_static * 0.85,
                 )
 
+    # XPU platforms backends
+    run_post_process_pass(server_args, _intel_xpu_page_constraint)
     # Other platforms backends
     run_post_process_pass(server_args, _attention_backend_platform_fallbacks)
 
@@ -276,6 +235,49 @@ def handle_attention_backend_compatibility(server_args: Any):
         _check_xpu_dcp(server_args, model_config)
 
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
+
+    # Torch native and flex attention backends
+    attention_backend = resolved_view(server_args).attention_backend
+    if attention_backend == "torch_native":
+        logger.warning(
+            "Cuda graph is disabled because of using torch native attention backend"
+        )
+        declare_resolution(
+            server_args,
+            "_handle_attention_backend_compatibility",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+            ),
+        )
+        declare_resolution(
+            server_args,
+            "_handle_attention_backend_compatibility",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
+
+    if attention_backend == "flex_attention":
+        logger.warning(
+            "Cuda graph is disabled because of using torch Flex Attention backend"
+        )
+        declare_resolution(
+            server_args,
+            "_handle_attention_backend_compatibility",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+            ),
+        )
+        declare_resolution(
+            server_args,
+            "_handle_attention_backend_compatibility",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
+        assert cfg.speculative_algorithm is None, (
+            "Speculative decoding is currently not supported with Flex Attention backend"
+        )
 
 
 def handle_linear_attn_backend(server_args: Any):
