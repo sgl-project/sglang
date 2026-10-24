@@ -350,3 +350,21 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+for _fn in ("run_tri", "run_tri_cooperative_preactivated", "run_shared_down"):
+    register_kernel(
+        KernelSpec(
+            op=f"moe.kimi_k3_preroute_{_fn}",
+            backend=KernelBackend.FLYDSL,
+            target=f"sglang.kernels.ops.moe.moe_preroute_aiter_hip:{_fn}",
+            capabilities=_HIP,
+        )
+    )
+del _fn
+register_kernel(
+    KernelSpec(
+        op="moe.kimi_k3_latent_tail_fp8",
+        backend=KernelBackend.FLYDSL,
+        target="sglang.kernels.ops.moe.latent_tail_aiter_hip:run",
+        capabilities=_HIP,
+    )
+)
