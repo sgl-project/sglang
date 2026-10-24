@@ -497,6 +497,7 @@ class Runtime:
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.post(self.generate_url, json=json_data) as response:
+                response.raise_for_status()
                 async for chunk, _ in response.content.iter_chunks():
                     chunk = chunk.decode("utf-8")
                     if chunk and chunk.startswith("data:"):
