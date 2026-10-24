@@ -716,6 +716,24 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
         self.assertIs(attention_op, custom_ops.npu_sparse_attn_sharedkv)
         self.assertEqual(kwargs, {})
 
+    @patch(_ARCH35_PATCH_TARGET, return_value=True)
+    def test_arch35_dspark_uses_quant_host_ops(self, _):
+        with patch("torch.ops.npu", MagicMock(), create=True) as npu_ops:
+            metadata_op, attention_op = _sparse_attn_ops(is_dspark=True)
+
+        self.assertIs(
+            metadata_op, npu_ops.kv_quant_sparse_attn_sharedkv_metadata_host
+        )
+        self.assertIs(attention_op, npu_ops.kv_quant_sparse_attn_sharedkv)
+
+    @patch(_ARCH35_PATCH_TARGET, return_value=False)
+    def test_pre_arch35_dspark_uses_host_metadata_ops(self, _):
+        with patch("torch.ops.npu", MagicMock(), create=True) as npu_ops:
+            metadata_op, attention_op = _sparse_attn_ops(is_dspark=True)
+
+        self.assertIs(metadata_op, npu_ops.sparse_attn_sharedkv_metadata_host)
+        self.assertIs(attention_op, npu_ops.sparse_attn_sharedkv)
+
 
 class TestSparseAttentionMetadata(unittest.TestCase):
     _ARCH35_PATCH_TARGET = (
@@ -772,11 +790,12 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         cu_seqlens_q_cpu = cu_seqlens_q.clone()
         seqused_kv_cpu = seqused_kv.clone()
 
+        metadata_op = MagicMock()
         with (
-            patch("torch.ops.npu", MagicMock(), create=True) as npu_ops,
+            patch("torch.ops.npu", MagicMock(), create=True),
             patch(
                 "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._sparse_attn_ops",
-                return_value=(MagicMock(), MagicMock()),
+                return_value=(metadata_op, MagicMock()),
             ),
         ):
             backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
@@ -801,7 +820,6 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                 is_nextn=False,
             )
 
-        metadata_op = npu_ops.sparse_attn_sharedkv_metadata_host
         metadata_op.assert_called_once()
         self.assertIs(kernel_metadata["c1a_metadata"], metadata_op.return_value)
         self.assertIs(metadata_op.call_args.kwargs["cu_seqlens_q"], cu_seqlens_q_cpu)

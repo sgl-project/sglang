@@ -42,8 +42,9 @@ _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
 def _sparse_attn_ops(is_dspark=False):
     """(metadata op, attention op) for the DSV4 shared-KV sparse attention.
 
-    A5 reads a quantized KV cache, which is a different kernel rather than a
-    flag on the pre-A5 one.
+    ``is_dspark`` selects the DSpark draft-worker pair: it reads its sequence
+    lengths from CPU mirrors (host metadata) and, on A5, uses a dedicated
+    quantized sparse-attention kernel rather than a flag on the pre-A5 one.
     """
     if is_npu_arch35():
         if is_dspark:
@@ -55,11 +56,14 @@ def _sparse_attn_ops(is_dspark=False):
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata,
             torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv,
         )
+    if is_dspark:
+        return (
+            torch.ops.npu.sparse_attn_sharedkv_metadata_host,
+            torch.ops.npu.sparse_attn_sharedkv,
+        )
     return (
         torch.ops.custom.npu_sparse_attn_sharedkv_metadata,
-        torch.ops.custom.npu_sparse_attn_sharedkv
-        if not is_dspark
-        else torch.ops.npu.sparse_attn_sharedkv,
+        torch.ops.custom.npu_sparse_attn_sharedkv,
     )
 
 
@@ -2025,13 +2029,10 @@ class DeepseekV4AscendAttnBackend(
                 "seqused_kv": seq_kv_cpu[:bs].to(dtype=torch.int32).contiguous()
             }
             host_inputs["cu_seqlens_q"] = cu_q_cpu.to(dtype=torch.int32).contiguous()
-            if is_npu_arch35():
-                metadata_op, _ = _sparse_attn_ops(is_dspark=True)
-            else:
-                metadata_op = torch.ops.npu.sparse_attn_sharedkv_metadata_host
+            metadata_op, _ = _sparse_attn_ops(is_dspark=True)
             c1a_metadata = metadata_op(**(c1a_kwargs | host_inputs))
         else:
-            metadata_op, _ = _sparse_attn_ops(self._is_dspark_draft_worker)
+            metadata_op, _ = _sparse_attn_ops()
             c1a_metadata = metadata_op(**c1a_kwargs)
         kernel_metadata = {"c1a_metadata": c1a_metadata}
 
@@ -2143,35 +2144,6 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
         q_arg = attn_kwargs.pop("q")
         if self._is_dspark_draft_worker and is_npu_arch35():
-            if (
-                q_arg.dtype != torch.bfloat16
-                or q_arg.ndim != 3
-                or q_arg.shape[1] not in (64, 128)
-                or q_arg.shape[2] != 512
-            ):
-                raise RuntimeError(
-                    "DSpark A5 sparse attention requires BF16 TND queries with "
-                    "64 or 128 heads and head dimension 512"
-                )
-            if ori_kv.dtype != torch.float8_e4m3fn or ori_kv.shape[-1] != 640:
-                raise RuntimeError(
-                    "DSpark A5 sparse attention requires packed FP8 KV rows "
-                    "of 640 bytes"
-                )
-            if (
-                attn_sink is None
-                or attn_sink.dtype != torch.float32
-                or attn_sink.numel() != q_arg.shape[1]
-            ):
-                raise RuntimeError(
-                    "DSpark A5 sparse attention requires one FP32 sink per query head"
-                )
-            if fm.kernel_metadata["c1a_metadata"].dtype != torch.int32 or (
-                fm.kernel_metadata["c1a_metadata"].numel() != 1024
-            ):
-                raise RuntimeError(
-                    "DSpark A5 sparse attention requires int32[1024] metadata"
-                )
             # The quantized kernel's C++ entry requires contiguous Q. This is
             # a no-op for the usual padded query tensor.
             q_arg = q_arg.contiguous()

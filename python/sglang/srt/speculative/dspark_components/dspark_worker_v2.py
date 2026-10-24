@@ -8,7 +8,6 @@ from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
@@ -559,13 +558,6 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         if not self._hosts_draft:
             return
-        if is_npu_arch35() and self._draft_is_moe:
-            from sglang.srt.hardware_backend.npu.extra_ops_loader import (
-                initialize_dspark_a5_sparse_attn_ops,
-            )
-
-            initialize_dspark_a5_sparse_attn_ops()
-
         with draft_pp_context(), self._draft_context():
             self._draft_worker.init_attention_backends()
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
