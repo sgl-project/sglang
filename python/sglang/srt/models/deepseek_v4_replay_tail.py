@@ -587,8 +587,10 @@ class DecoderReplayTail:
                     hidden_states = state = hc_boundary.materialize(
                         hidden_states, forward_batch, next=next_boundary
                     )
+                    from sglang.kernels.ops.layernorm.mhc import mhc_stream_mean
+
                     # The draft head reads the attention input of its target layers.
-                    aux.append(state.residual.mean(dim=1))
+                    aux.append(mhc_stream_mean(state.residual))
                 ctx = (
                     nullcontext()
                     if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)

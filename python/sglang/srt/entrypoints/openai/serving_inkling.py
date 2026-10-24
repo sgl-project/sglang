@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 class InklingChatEncodingAdapter:
     collects_openai_media = True
+    strict_tool_call_arguments = True
 
     def __init__(
         self,
@@ -73,7 +74,11 @@ class InklingChatEncodingAdapter:
         messages: list[dict[str, Any]],
         request: ChatCompletionRequest,
         tools: list[dict] | None,
+        thinking: bool,
+        image_data: list,
     ) -> list[int]:
+        # Inkling's thinking is effort-conditioned and the handler collects its
+        # media, so `thinking` and `image_data` are not read.
         reasoning_effort = parse_reasoning_effort(request.reasoning_effort)
         if reasoning_effort is None:
             reasoning_effort = self._default_reasoning_effort

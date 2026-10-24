@@ -82,6 +82,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
     initialize_current_platform,
@@ -1606,6 +1607,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
 
     def merge_lora_weights(
@@ -1624,6 +1626,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self.pipeline.merge_lora_weights(target, strength)
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
 
     def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
@@ -1639,7 +1642,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self.pipeline.unmerge_lora_weights(target)
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
+
+    def _drop_breakable_cuda_graphs(self, reason: str) -> None:
+        # captured graphs replay the weights and LoRA branches of capture time
+        for stage in self.pipeline.stages:
+            if isinstance(stage, DenoisingStage):
+                stage.drop_breakable_cuda_graphs(reason)
 
     def _update_lora_metrics(self) -> None:
         if self.metrics is not None and isinstance(self.pipeline, LoRAPipeline):
@@ -1668,7 +1678,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 "sleeping": False,
                 "message": "already awake",
             }
-        return self.memory_occupation.resume_memory_occupation()
+        result = self.memory_occupation.resume_memory_occupation()
+        self._drop_breakable_cuda_graphs("weights moved by resume_memory_occupation")
+        return result
 
 
 OOM_MSG = """
