@@ -341,18 +341,16 @@ def _flashinfer_hc_pre(
     num_tokens, hc_mult, hidden_size = x.shape
     hc_hidden_size = hc_mult * hidden_size
     mix_dim = hc_fn.shape[0]  # hc_mult * (2 + hc_mult) == 24
-    n_splits = _flashinfer_mhc_pre_num_splits(num_tokens, hc_hidden_size)
+    # DeepGEMM reduces split-K internally (issue #43743): without `num_splits`
+    # it writes {m, n} / {m} results directly, so keep the finalization on the
+    # single fully-reduced split.
+    n_splits = 1
 
-    dot_mix = torch.empty(
-        (n_splits, num_tokens, mix_dim), dtype=torch.float32, device=x.device
-    )
-    sqrsum = torch.empty((n_splits, num_tokens), dtype=torch.float32, device=x.device)
+    dot_mix = torch.empty((num_tokens, mix_dim), dtype=torch.float32, device=x.device)
+    sqrsum = torch.empty((num_tokens,), dtype=torch.float32, device=x.device)
     tf32_hc_prenorm_gemm(
-        x.reshape(num_tokens, hc_hidden_size), hc_fn, dot_mix, sqrsum, n_splits
+        x.reshape(num_tokens, hc_hidden_size), hc_fn, dot_mix, sqrsum, None
     )
-    if n_splits == 1:
-        dot_mix = dot_mix.squeeze(0)
-        sqrsum = sqrsum.squeeze(0)
 
     post, comb, layer_input = mhc_pre_big_fuse(
         dot_mix,
