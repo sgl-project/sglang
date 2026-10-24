@@ -302,8 +302,19 @@ class FunctionCallParser:
             or None if no constraint applies.
         """
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
+        # Under "auto", constrain with the structural tag only when every tool
+        # is strict. A model-native structural tag is triggered per tool call
+        # and lists every allowed tool name, so it cannot enforce per-tool
+        # strictness: putting a mixed set under one tag would also constrain
+        # the non-strict tools with their open (non-strict) schemas, which can
+        # corrupt their calls (e.g. qwen3_coder's tag masks the template's own
+        # zero-argument form and lets the model invent parameters for a
+        # non-strict tool, sgl-project/sglang#45235). A mixed set therefore
+        # leaves generation unconstrained, exactly like the no-strict case,
+        # matching OpenAI's per-tool "strict" semantics. The strict tools'
+        # schemas are still enforced under "required"/named tool_choice.
         should_constrain_auto = tool_choice == "auto" and (
-            any(tool.function.strict for tool in self.tools)
+            (bool(self.tools) and all(tool.function.strict for tool in self.tools))
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
         if isinstance(self.detector, ResponseTemplateToolDetector):

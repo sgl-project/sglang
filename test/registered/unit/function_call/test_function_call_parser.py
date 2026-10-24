@@ -5137,6 +5137,100 @@ class TestGetStructureConstraint(unittest.TestCase):
         result = parser.get_structure_constraint("auto")
         self.assertIsNone(result)
 
+    def _make_mixed_strict_parser(self, parser_name):
+        """Two tools mirroring sgl-project/sglang#45235: a non-strict
+        zero-argument tool alongside a strict tool."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_schema",
+                    description="Return the database schema.",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    strict=False,
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="query_database",
+                    description="Run a read-only SQL query.",
+                    parameters={
+                        "type": "object",
+                        "properties": {"sql": {"type": "string"}},
+                        "required": ["sql"],
+                        "additionalProperties": False,
+                    },
+                    strict=True,
+                ),
+            ),
+        ]
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        return FunctionCallParser(tools, parser_name)
+
+    def test_qwen3_coder_auto_mixed_strict_returns_none(self):
+        """auto with a mixed strict/non-strict tool set must not constrain.
+
+        Forcing non-strict tools under the qwen_3_coder structural tag makes
+        zero-argument tools receive invented arguments
+        (sgl-project/sglang#45235). "strict" is per-tool per OpenAI semantics.
+        """
+        parser = self._make_mixed_strict_parser("qwen3_coder")
+        result = parser.get_structure_constraint("auto")
+        self.assertIsNone(result)
+
+    def test_kimi_auto_mixed_strict_returns_none(self):
+        """auto with mixed strictness behaves like the no-strict case."""
+        parser = self._make_mixed_strict_parser("kimi_k2")
+        result = parser.get_structure_constraint("auto")
+        self.assertIsNone(result)
+
+    def test_qwen3_coder_auto_all_strict_returns_structural_tag(self):
+        """auto with every tool strict keeps the structural_tag constraint."""
+        import xgrammar as xgr
+
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_schema",
+                    description="Return the database schema.",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    strict=True,
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="query_database",
+                    description="Run a read-only SQL query.",
+                    parameters={
+                        "type": "object",
+                        "properties": {"sql": {"type": "string"}},
+                        "required": ["sql"],
+                        "additionalProperties": False,
+                    },
+                    strict=True,
+                ),
+            ),
+        ]
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        parser = FunctionCallParser(tools, "qwen3_coder")
+        result = parser.get_structure_constraint("auto")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        self.assertIsInstance(result[1], xgr.StructuralTag)
+
     def test_inkling_auto_constrains_json_after_tool_trigger(self):
         import xgrammar as xgr
 
