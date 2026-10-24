@@ -25,6 +25,7 @@ from typing import List, Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
     LoadConfig,
@@ -644,7 +645,9 @@ class ModelRunner:
             else None
         )
 
-    def init_kv_cache_configurator(self):
+    def init_kv_cache_configurator(
+        self, draft_parallel_layout: DraftParallelLayout | None = None
+    ):
         # The replica count that shares this KV budget is the deployment's, not
         # the one a draft scope reports; the pool is allocated outside any scope,
         # so the PP width comes from the runner's own group.
@@ -671,6 +674,7 @@ class ModelRunner:
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             ),
             spec_aux_config=self.spec_aux_config,
+            draft_parallel_layout=draft_parallel_layout,
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_swa_compress=self.is_hybrid_swa_compress,
             use_mla_backend=self.use_mla_backend,
@@ -962,12 +966,17 @@ class ModelRunner:
         """
         return self.max_decode_logits_rows()
 
-    def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
+    def alloc_memory_pool(
+        self,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
+        *,
+        draft_parallel_layout: DraftParallelLayout | None = None,
+    ):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
             self.memory_pool_config = memory_pool_config
 
-        self.init_kv_cache_configurator()
+        self.init_kv_cache_configurator(draft_parallel_layout)
         result = self.kv_cache_configurator.configure(
             pre_model_load_memory=self.pre_model_load_memory
         )
