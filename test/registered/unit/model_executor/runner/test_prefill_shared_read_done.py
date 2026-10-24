@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
+    refresh_shared_read_done_event,
 )
 from sglang.srt.runtime_context import get_context, get_memory
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -179,6 +180,249 @@ class TestPrefillReadDoneCapability(CustomTestCase):
                 with envs.SGLANG_ENABLE_PREFILL_WAR_READ_DONE.override(enabled):
                     _prepare_and_publish(runner, _batch(mode))
                 self.assertIsNone(runner.shared_read_done_event)
+
+
+def test_refresh_shared_read_done_event_noop_when_unset():
+    runner = _model_runner()
+    runner.device_module = _DEVICE_MODULE
+    refresh_shared_read_done_event(runner)
+    assert runner.shared_read_done_event is None
+
+
+def test_refresh_shared_read_done_event_replaces_existing_event():
+    initial = _Event()
+    initial.record()
+    runner = _model_runner()
+    runner.shared_read_done_event = initial
+    runner.decode_cuda_graph_runner = SimpleNamespace(device_module=_DEVICE_MODULE)
+
+    refresh_shared_read_done_event(runner)
+
+    refreshed = runner.shared_read_done_event
+    assert isinstance(refreshed, _Event)
+    assert refreshed is not initial
+    assert refreshed.recorded
+
+
+def test_ngram_target_verify_refreshes_shared_read_done_after_kv_move(monkeypatch):
+    import torch
+    from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+    maybe_stub_sgl_kernel()
+    import sglang.srt.speculative.ngram_worker as ngram_worker_mod
+    from sglang.srt.speculative.ngram_worker import NGRAMWorker
+
+    order = []
+    initial_event = _Event()
+    initial_event.record()
+
+    def _make_event():
+        ev = _Event()
+        order.append(("event_created", ev))
+        return ev
+
+    runner = SimpleNamespace(
+        shared_read_done_event=None,
+        watermark_state=None,
+        is_mamba_model=False,
+        model_config=SimpleNamespace(hybrid_linear_attn_config=None),
+        device_module=SimpleNamespace(Event=_make_event),
+    )
+
+    def _target_forward(batch, pp_proxy_tensors=None, is_verify=False):
+        assert is_verify
+        runner.shared_read_done_event = initial_event
+        order.append(("target_forward", initial_event))
+        return SimpleNamespace(
+            logits_output=SimpleNamespace(next_token_logits=torch.zeros((1, 4))),
+            can_run_cuda_graph=True,
+        )
+
+    worker = NGRAMWorker.__new__(NGRAMWorker)
+    worker.device = "cpu"
+    worker.draft_token_num = 2
+    worker.speculative_num_draft_tokens = 2
+    worker.model_runner = runner
+    worker._target_worker = SimpleNamespace(
+        model_runner=runner,
+        forward_batch_generation=_target_forward,
+    )
+    worker.token_to_kv_pool_allocator = SimpleNamespace()
+    worker.ngram_corpus = SimpleNamespace(erase_match_state=lambda rids: None)
+    worker._prev_decode_rids = set()
+    worker._prepare_for_speculative_decoding = lambda batch: None
+    worker._update_ngram_corpus = lambda batch: order.append(("update_corpus", None))
+
+    monkeypatch.setattr(
+        ngram_worker_mod,
+        "commit_mamba_states_after_verify",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        ngram_worker_mod,
+        "eagle_sample",
+        lambda *args, **kwargs: (
+            torch.tensor([10, 11], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([[0, 1]], dtype=torch.int32),
+        ),
+    )
+    monkeypatch.setattr(
+        ngram_worker_mod,
+        "move_accept_tokens_to_target_kvcache",
+        lambda *args, **kwargs: order.append(("move_kv", runner.shared_read_done_event)),
+    )
+
+    batch = SimpleNamespace(
+        reqs=[SimpleNamespace(rid="r0")],
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        spec_info=SimpleNamespace(),
+        has_grammar=False,
+        input_ids=torch.tensor([1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        out_cache_loc=torch.tensor([1, 2], dtype=torch.int64),
+        return_logprob=False,
+    )
+
+    worker.forward_batch_generation(batch)
+
+    # During move_accept_tokens_to_target_kvcache, the old graph event was still active;
+    # immediately after move_accept_tokens_to_target_kvcache, a fresh event was recorded
+    # and published before corpus update / return.
+    op_names = [name for name, _ in order]
+    assert op_names == ["target_forward", "move_kv", "event_created", "update_corpus"]
+    assert dict(order)["move_kv"] is initial_event
+    assert runner.shared_read_done_event is not initial_event
+    assert runner.shared_read_done_event.recorded
+
+
+@pytest.mark.parametrize("topk", [1, 2])
+def test_eagle_verify_refreshes_shared_read_done_when_tree_compaction_moves_kv(
+    monkeypatch, topk
+):
+    import contextlib
+    import torch
+    from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+    maybe_stub_sgl_kernel()
+    import sglang.srt.speculative.eagle_worker_common as eagle_common_mod
+    from sglang.srt.speculative.eagle_worker_common import run_eagle_verify
+
+    order = []
+    initial_event = _Event()
+    initial_event.record()
+
+    runner = SimpleNamespace(
+        shared_read_done_event=None,
+        watermark_state=None,
+        is_mamba_model=False,
+        model_config=SimpleNamespace(hybrid_linear_attn_config=None),
+        attn_backend=SimpleNamespace(verify_mask=None),
+        device_module=SimpleNamespace(Event=_Event),
+    )
+
+    def _target_forward(
+        batch=None,
+        forward_batch=None,
+        is_verify=False,
+        pp_proxy_tensors=None,
+        skip_sample=False,
+    ):
+        assert is_verify
+        runner.shared_read_done_event = initial_event
+        order.append("target_forward")
+        return SimpleNamespace(
+            logits_output=SimpleNamespace(next_token_logits=torch.zeros((2, 4))),
+            can_run_cuda_graph=True,
+            routed_experts_output=None,
+            indexer_topk_output=None,
+        )
+
+    target_worker = SimpleNamespace(
+        model_runner=runner,
+        forward_batch_generation=_target_forward,
+    )
+
+    monkeypatch.setattr(
+        eagle_common_mod,
+        "commit_mamba_states_after_verify",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        eagle_common_mod,
+        "eagle_prepare_for_verify",
+        lambda verify_input, req_to_token_pool, batch, target_worker: (
+            SimpleNamespace(mark_forward_metadata_ready=lambda: None),
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        eagle_common_mod,
+        "eagle_sample",
+        lambda *args, **kwargs: (
+            torch.tensor([10, 11], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([[0, 1]], dtype=torch.int32),
+        ),
+    )
+    monkeypatch.setattr(
+        eagle_common_mod,
+        "fill_bonus_tokens_func",
+        lambda *args, **kwargs: None,
+    )
+
+    def _fake_finalize(batch, accept_index, accept_lens, predict, *args, **kwargs):
+        order.append("finalize_tree_path")
+        assert runner.shared_read_done_event is initial_event
+        return predict
+
+    monkeypatch.setattr(
+        eagle_common_mod,
+        "_finalize_accept_tree_path",
+        _fake_finalize,
+    )
+
+    batch = SimpleNamespace(
+        reqs=[SimpleNamespace(rid="r0")],
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        spec_info=SimpleNamespace(
+            draft_token_num=2,
+            positions=torch.tensor([4, 5], dtype=torch.int64),
+        ),
+        has_grammar=False,
+        input_ids=torch.tensor([1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([4], dtype=torch.int32),
+        req_pool_indices=torch.tensor([0], dtype=torch.int32),
+        out_cache_loc=torch.tensor([1, 2], dtype=torch.int64),
+        return_logprob=False,
+        hisparse_coordinator=None,
+        mamba_track_indices=None,
+    )
+    allocator = SimpleNamespace(get_kvcache=lambda: SimpleNamespace())
+
+    run_eagle_verify(
+        batch=batch,
+        target_worker=target_worker,
+        req_to_token_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=allocator,
+        plan_stream=None,
+        plan_stream_ctx=contextlib.nullcontext(),
+        topk=topk,
+        num_draft_tokens=2,
+        device="cpu",
+        metadata_ready_pre_pad=False,
+        finalize_tree_path=True,
+    )
+
+    if topk > 1:
+        assert order == ["target_forward", "finalize_tree_path"]
+        assert runner.shared_read_done_event is not initial_event
+        assert runner.shared_read_done_event.recorded
+    else:
+        assert order == ["target_forward"]
+        assert runner.shared_read_done_event is initial_event
 
 
 if __name__ == "__main__":

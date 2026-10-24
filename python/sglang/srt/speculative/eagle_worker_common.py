@@ -22,6 +22,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
+    refresh_shared_read_done_event,
+)
 from sglang.srt.runtime_context import mamba_track_grid
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
@@ -782,6 +785,9 @@ def run_eagle_verify(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             num_draft_tokens=num_draft_tokens,
         )
+        # _finalize_accept_tree_path -> move_accept_tokens_to_target_kvcache
+        # reads req_to_token after target verify replay; advance the WAR fence.
+        refresh_shared_read_done_event(target_worker.model_runner)
 
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
