@@ -1,11 +1,15 @@
 import copy
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_mega_decode
+from sglang.kernels.ops.attention.flash_mla_interface import (
+    flash_mla_mega_decode,
+    flash_mla_mega_prefill,
+)
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DeepseekV4AttnBackend,
     DSV4Metadata,
@@ -24,12 +28,13 @@ from sglang.srt.models.deepseek_v4 import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
+    interleave_pages,
     quantize_k_cache_v41,
     quantize_k_cache_v41_fp4,
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 def unpack_output(data, scale):
@@ -361,10 +366,8 @@ class TestMegaAttention(CustomTestCase):
         for heads in (16, 64):
             with self.subTest(heads=heads):
                 q = torch.randn(3, heads, 512, device="cuda", dtype=torch.bfloat16)
-                packed = pack_query(q, 64)
-                packed_before = packed.clone()
                 data, scale, _ = flash_mla_mega_decode(
-                    packed,
+                    pack_query(q, 64),
                     main,
                     indices,
                     positions,
@@ -380,9 +383,6 @@ class TestMegaAttention(CustomTestCase):
                         [64, 32, 0], device="cuda", dtype=torch.int32
                     ),
                 )
-                # The model reuses one packed buffer whose padding it zeroes once,
-                # so the kernel must not write its query.
-                self.assertTrue(torch.equal(packed, packed_before))
                 groups = heads // 8
                 weight = torch.randn(
                     groups, 64, 4096, device="cuda", dtype=torch.bfloat16
@@ -402,6 +402,82 @@ class TestMegaAttention(CustomTestCase):
                 self.assertLess(
                     error.item() / expected.square().mean().sqrt().item(), 0.04
                 )
+
+    def test_mega_kernels_leave_q_unchanged(self):
+        # The model zeroes the packed query's padding once per forward and every
+        # layer reuses the buffer, so no MegaAttention kernel may write its query.
+        torch.manual_seed(789)
+        tokens, topk, extra_topk, page = 48, 128, 512, 64
+        positions = torch.randint(0, 4096, (tokens,), device="cuda", dtype=torch.int32)
+        angle = (
+            torch.arange(4096, device="cuda")[:, None]
+            / torch.arange(1, 33, device="cuda")[None]
+        )
+        table = torch.cat((angle.cos(), angle.sin()), dim=-1).float()
+        main = quantize_k_cache_v41(
+            torch.randn(6, page, 512, device="cuda", dtype=torch.bfloat16) / 4
+        )
+        extra = quantize_k_cache_v41_fp4(
+            torch.randn(9, page, 512, device="cuda", dtype=torch.bfloat16) / 4
+        )
+        decode_caches = {
+            True: (paged_view(main, page, 528), paged_view(extra, page, 288)),
+            False: (
+                paged_view(interleave_pages(main, page, 512, 16), page, 528),
+                paged_view(interleave_pages(extra, page, 256, 32), page, 288),
+            ),
+        }
+        indices = torch.randint(
+            0, 6 * page, (tokens, topk), device="cuda", dtype=torch.int32
+        )
+        extra_indices = torch.randint(
+            0, 9 * page, (tokens, extra_topk), device="cuda", dtype=torch.int32
+        )
+        lengths = torch.randint(1, topk + 1, (tokens,), device="cuda").int()
+        extra_lengths = torch.randint(0, extra_topk + 1, (tokens,), device="cuda").int()
+        prefill_kv = torch.randn(512, 1, 512, device="cuda", dtype=torch.bfloat16) / 4
+        prefill_indices = torch.randint(
+            0, 512, (tokens, 1, topk), device="cuda", dtype=torch.int32
+        )
+        for (heads, padded), use_legacy, op in itertools.product(
+            ((16, 64), (64, 64), (128, 128)), (True, False), ("decode", "prefill")
+        ):
+            with self.subTest(heads=heads, use_legacy=use_legacy, op=op):
+                q_real = torch.randn(
+                    tokens, heads, 512, device="cuda", dtype=torch.bfloat16
+                )
+                q = pack_query(q_real, padded)
+                common = dict(
+                    attn_sink=torch.randn(padded, device="cuda"),
+                    topk_length=lengths,
+                    use_legacy=use_legacy,
+                )
+                if op == "decode":
+                    main_kv, extra_kv = decode_caches[use_legacy]
+                    flash_mla_mega_decode(
+                        q,
+                        main_kv,
+                        indices,
+                        positions,
+                        table,
+                        512**-0.5,
+                        extra_kv=extra_kv,
+                        extra_indices=extra_indices,
+                        extra_topk_length=extra_lengths,
+                        **common,
+                    )
+                else:
+                    flash_mla_mega_prefill(
+                        q,
+                        prefill_kv,
+                        prefill_indices,
+                        positions,
+                        table,
+                        512**-0.5,
+                        **common,
+                    )
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(q, pack_query_reference(q_real, padded)))
 
 
 if __name__ == "__main__":
