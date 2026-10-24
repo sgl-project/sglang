@@ -26,11 +26,14 @@ from unittest.mock import Mock, patch
 import torch
 import torch.distributed as dist
 
+from sglang.srt.model_executor.runner import base_runner
 from sglang.srt.model_executor.runner import flashinfer_autotune as autotune
+from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     _autotune_cache_digest,
     _autotune_tactic_sync_group,
     _drop_diverged_autotune_cache,
+    autotune_dummy_input_ids,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.test_utils import CustomTestCase, find_available_port
@@ -306,6 +309,65 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
             ),
             [False, False],
         )
+
+
+VOCAB = 163840
+
+
+def _ids_seen_by_the_tuned_forward(buffers, *, batch_size: int) -> torch.Tensor:
+    seen = []
+    runner = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            canary_manager=None, model_config=SimpleNamespace(vocab_size=VOCAB)
+        ),
+        _dummy_run=lambda **kw: seen.append(kw["buffers"].input_ids.clone()),
+    )
+    with patch.object(
+        base_runner, "run_flashinfer_autotune_forward", lambda mr, fn, **kw: fn()
+    ):
+        BaseRunner._flashinfer_autotune(runner, buffers=buffers, batch_size=batch_size)
+    return seen[0]
+
+
+class TestAutotuneDummyInputIds(CustomTestCase):
+    """The dummy forward must not tune on identical rows.
+
+    The static dummy buffers are zero-filled, so every row embedded token 0 and
+    the MoE router sent all rows to the same experts; FlashInfer ranked its MoE
+    tactics on that pattern, and the picks were slower on real decode batches.
+    """
+
+    def test_tuned_forward_sees_distinct_in_vocab_rows(self):
+        buffers = SimpleNamespace(input_ids=torch.zeros(56, dtype=torch.int64))
+        ids = _ids_seen_by_the_tuned_forward(buffers, batch_size=56)
+        self.assertEqual(ids.unique().numel(), 56)
+        self.assertTrue(bool((ids >= 0).all()) and bool((ids < VOCAB).all()))
+        # The decode graph runner captures from these buffers afterwards.
+        self.assertTrue(bool((buffers.input_ids == 0).all()))
+
+    def test_every_rank_tunes_on_the_same_rows(self):
+        # Ranks reduce their timings per tactic, so they must profile the same routes.
+        runs = [
+            _ids_seen_by_the_tuned_forward(
+                SimpleNamespace(input_ids=torch.zeros(56, dtype=torch.int64)),
+                batch_size=56,
+            )
+            for _ in range(2)
+        ]
+        self.assertTrue(torch.equal(runs[0], runs[1]))
+
+    def test_buffer_is_zeroed_when_the_forward_fails(self):
+        ids = torch.zeros(8, dtype=torch.int64)
+        with self.assertRaises(RuntimeError):
+            with autotune_dummy_input_ids(ids, vocab_size=VOCAB):
+                raise RuntimeError("tuning failed")
+        self.assertTrue(bool((ids == 0).all()))
+
+    def test_more_rows_than_vocab_stay_in_vocab(self):
+        ids = torch.zeros(20, dtype=torch.int64)
+        with autotune_dummy_input_ids(ids, vocab_size=8):
+            self.assertTrue(bool((ids < 8).all()))
+            self.assertEqual(ids.unique().numel(), 8)
 
 
 class TestModelPrefillAutotune(CustomTestCase):

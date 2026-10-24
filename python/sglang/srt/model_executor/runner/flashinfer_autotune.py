@@ -49,6 +49,30 @@ logger = logging.getLogger(__name__)
 
 FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
 
+# Arbitrary; the ids only need to be distinct and the same on every rank.
+AUTOTUNE_DUMMY_TOKEN_SEED = 0
+
+
+@contextlib.contextmanager
+def autotune_dummy_input_ids(input_ids: torch.Tensor, *, vocab_size: int):
+    """Distinct token ids for the autotune dummy forward, zeroed again after.
+
+    The static buffers are zero-filled, so every dummy row embeds token 0 and the
+    MoE router sends every row to the same experts; FlashInfer tunes its MoE
+    tactics on the caller's routes, so they would be ranked on a traffic pattern
+    no real batch produces. Zero is what the buffer owners expect afterwards.
+    """
+    gen = torch.Generator(device="cpu").manual_seed(AUTOTUNE_DUMMY_TOKEN_SEED)
+    ids = torch.randperm(vocab_size, generator=gen)
+    num_tokens = input_ids.shape[0]
+    if num_tokens > vocab_size:
+        ids = ids.repeat(-(-num_tokens // vocab_size))
+    input_ids.copy_(ids[:num_tokens])
+    try:
+        yield
+    finally:
+        input_ids.zero_()
+
 
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     skip_ops = set(get_exec().kernel.flashinfer_autotune_skip_ops or ())
