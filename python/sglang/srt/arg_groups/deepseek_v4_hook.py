@@ -17,7 +17,11 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    derive_attn_tp_size,
+    get_platform,
+)
 from sglang.srt.utils.common import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
@@ -25,17 +29,38 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MEGA_ATTENTION_HEADS = 64
+
+
+def _fills_mega_attention_tile(*, cfg, num_heads: int) -> bool:
+    # validate_deepseek_v4_cp sets attn_cp_size to the whole TP group after this runs.
+    if cfg.enable_prefill_cp:
+        return True
+    attn_tp_size = derive_attn_tp_size(
+        tp_size=cfg.tp_size,
+        attn_cp_size=cfg.attn_cp_size,
+        attn_dp_size=cfg.attn_dp_size,
+    )
+    return num_heads >= _MEGA_ATTENTION_HEADS * attn_tp_size
+
 
 def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
     from sglang.srt.utils.common import is_sm100_supported
 
     cfg = resolving_view(server_args)
+    hf_config = model_config_of(server_args).hf_config
     layout = envs.SGLANG_DSV4_KV_LAYOUT
     if (
-        model_config_of(server_args).hf_config.model_type != "deepseek_v41"
+        hf_config.model_type != "deepseek_v41"
         or cfg.device != "cuda"
         or not is_sm100_supported()
         or cfg.kv_cache_dtype != "fp8_e4m3"
+        or (
+            cfg.disaggregation_mode == "null"
+            and not _fills_mega_attention_tile(
+                cfg=cfg, num_heads=hf_config.num_attention_heads
+            )
+        )
         or (layout.is_set() and layout.get().lower() not in ("auto", "v41", "v41_new"))
     ):
         return "flashmla"
