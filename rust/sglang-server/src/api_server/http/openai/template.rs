@@ -62,8 +62,7 @@ pub(super) fn render_body(
 
 #[cfg(test)]
 mod tests {
-    use sglang_processor::ChatFormatterOptions;
-
+    use super::super::test_utils::checkpoint_formatter;
     use super::*;
 
     /// Qwen3.8's renderer declines floats serde_json prints unlike Python;
@@ -76,18 +75,8 @@ mod tests {
             "/../sglang-processor/tests/fixtures/parity/qwen3.8-27b.json"
         );
         let fixture: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        let dir = std::env::temp_dir().join(format!("qwen38-declined-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.json"), fixture["config"].to_string()).unwrap();
         let template = fixture["chat_template"].as_str().unwrap();
-        std::fs::write(dir.join("chat_template.jinja"), template).unwrap();
-        std::fs::write(dir.join("tokenizer_config.json"), "{}").unwrap();
-        let (formatter, error) = sglang_processor::select_chat_formatter(&ChatFormatterOptions {
-            tokenizer_path: dir.to_string_lossy().into_owned(),
-            ..Default::default()
-        });
-        std::fs::remove_dir_all(&dir).unwrap();
-        let formatter = formatter.unwrap_or_else(|| panic!("{error:?}"));
+        let formatter = checkpoint_formatter(&fixture["config"], template);
         assert!(matches!(formatter, ChatFormatter::Qwen38 { .. }));
 
         for name in ["history_float_arguments", "tool_float_values"] {

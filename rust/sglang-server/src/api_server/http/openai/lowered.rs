@@ -25,7 +25,7 @@ use super::template::{render_body, render_chat};
 use super::{AppState, ChatFormatter};
 use crate::api_server::core::CoreError;
 use crate::api_server::http::native_api::{
-    RequestTiming, drain_unary, generate_requests, generation_event_stream_with,
+    GenerateItem, RequestTiming, drain_unary, generate_requests, generation_event_stream_with,
 };
 use crate::message::config::ServerArgs;
 use crate::message::request::check_prompt_copies;
@@ -35,7 +35,6 @@ pub struct OpenAiChat {
     settings: OpenAiSettings,
     model: ChatModel,
     tokenizer: Arc<DynamoTokenizer>,
-    template_defaults: super::ChatTemplateKwargs,
     /// Token text and bytes for logprobs.
     pieces: Arc<dyn OpenAiTokenizer>,
 }
@@ -114,18 +113,24 @@ impl OpenAiChat {
                 ..ChatModel::for_formatter(formatter)
             },
             tokenizer,
-            template_defaults: server_args.default_chat_template_kwargs.clone(),
             pieces,
         }
     }
 
     /// The prompt ids Python's chat layer encodes for `request`.
-    fn render(&self, formatter: &ChatFormatter, request: &Value) -> Option<Vec<u32>> {
-        let rendered = match render_body(formatter, request.clone(), &self.template_defaults) {
+    fn render(
+        &self,
+        formatter: &ChatFormatter,
+        request: &Value,
+        defaults: &super::ChatTemplateKwargs,
+    ) -> Option<Vec<u32>> {
+        let rendered = match render_body(formatter, request.clone(), defaults) {
+            // A request the SGLang path declines goes to the typed handler,
+            // which renders it through the template.
             Some(rendered) => rendered.ok()?,
             None => {
                 let ChatBody { request: chat, raw } = ChatBody::deserialize(request).ok()?;
-                render_chat(formatter, raw, &chat.request, &self.template_defaults).ok()?
+                render_chat(formatter, raw, &chat.request, defaults).ok()?
             }
         };
         let ids = rendered.encode(&*self.tokenizer).ok()?;
@@ -156,7 +161,8 @@ pub(super) async fn chat(
             custom_labels: None,
             sglext_ids,
         };
-        let render = |request: &Value| openai.render(formatter, request);
+        let defaults = &lowering.server_args.default_chat_template_kwargs;
+        let render = |request: &Value| openai.render(formatter, request, defaults);
         lower_chat(
             &body,
             &headers,
@@ -240,8 +246,11 @@ pub(super) async fn chat(
         .await;
         // One failed choice fails the request, as Python's batch does.
         if let Some((status, item)) = drained.iter().find(|(status, _)| *status != StatusCode::OK) {
-            let body = serde_json::to_vec(item).expect("api.v1 types serialize to JSON");
-            return Some(failed_response(*status, &body));
+            let message = match item {
+                GenerateItem::Error(failure) => failure.error.as_ref().map(|e| e.message.as_str()),
+                GenerateItem::Frame(_) => None,
+            };
+            return Some(error_response(*status, message.unwrap_or_default()));
         }
         let items: Vec<_> = drained.into_iter().map(|(_, item)| item).collect();
         let body = match is_batch {
@@ -322,15 +331,6 @@ fn python_error_frame(error: &CoreError, index: Option<u32>) -> String {
     .to_string()
 }
 
-/// A failed unary choice, as Python's chat layer answers its abort.
-fn failed_response(status: StatusCode, body: &[u8]) -> Response {
-    let message = serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|body| Some(body.pointer("/error/message")?.as_str()?.to_owned()))
-        .unwrap_or_default();
-    error_response(status, &message)
-}
-
 /// `OpenAIServingBase.create_error_response`: a 400 is the `ValueError` it
 /// answers as a `BadRequestError`; any other status is an `HTTPException`,
 /// whose status code is the type.
@@ -361,14 +361,11 @@ mod tests {
 
     use axum::Router;
 
-    use super::super::test_utils::{
-        answering_app_state_with, answering_app_state_with_item, body_json, chunk, post_json,
-    };
+    use super::super::test_utils::{answering_app_state_with_item, body_json, chunk, post_json};
     use super::*;
     use crate::message::response::{ChunkExtras, ResponseItem};
     use crate::utils::error::Error;
 
-    /// A word-level tokenizer; the mocked core ignores the prompt ids.
     /// A byte-level word tokenizer's `tokenizer.json`; id 3 is `é`'s bytes.
     fn tokenizer_path() -> &'static str {
         static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -390,15 +387,7 @@ mod tests {
     }
 
     async fn chat(body: Value) -> Value {
-        let args = ServerArgs {
-            served_model_name: "model".into(),
-            reasoning_parser: Some("deepseek-v41".into()),
-            ..Default::default()
-        };
-        let formatter = ChatFormatter::DeepSeekV41;
-        let text = "17*23</think>391";
-        let state = answering_app_state_with(Arc::new(args), formatter, Some(tokenizer()), text);
-        let app = super::super::routes().with_state(state);
+        let app = lowered_state(|rid| chunk(rid, "17*23</think>391", true));
         body_json(post_json(app, "/v1/chat/completions", body).await).await
     }
 
@@ -632,44 +621,23 @@ mod tests {
             "tool calls require --tool-call-parser"
         );
     }
+
     /// Launch defaults and request overrides must reach both rendering and response parsing.
     #[tokio::test]
     async fn processor_honors_server_thinking_defaults() {
         let args = ServerArgs {
-            served_model_name: "model".into(),
-            reasoning_parser: Some("deepseek-v41".into()),
             default_chat_template_kwargs: [("thinking".into(), Value::Bool(false))].into(),
             ..Default::default()
         };
-        let state = answering_app_state_with(
-            Arc::new(args),
-            ChatFormatter::DeepSeekV41,
-            Some(tokenizer()),
-            "Hello!",
-        );
+        let app = lowered_state_with(args, |rid| chunk(rid, "Hello!", true));
         let body = json!({"model":"model", "messages":[{"role":"user","content":"Hi"}]});
-        let value = body_json(
-            post_json(
-                super::super::routes().with_state(state.clone()),
-                "/v1/chat/completions",
-                body.clone(),
-            )
-            .await,
-        )
-        .await;
+        let value =
+            body_json(post_json(app.clone(), "/v1/chat/completions", body.clone()).await).await;
         assert_eq!(value["choices"][0]["message"]["content"], "Hello!");
         assert!(value["choices"][0]["message"]["reasoning_content"].is_null());
         let mut override_body = body;
         override_body["chat_template_kwargs"] = json!({"thinking":true});
-        let value = body_json(
-            post_json(
-                super::super::routes().with_state(state),
-                "/v1/chat/completions",
-                override_body,
-            )
-            .await,
-        )
-        .await;
+        let value = body_json(post_json(app, "/v1/chat/completions", override_body).await).await;
         assert_eq!(
             value["choices"][0]["message"]["reasoning_content"],
             "Hello!"

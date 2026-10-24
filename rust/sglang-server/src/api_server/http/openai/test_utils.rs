@@ -24,6 +24,27 @@ use crate::api_server::core::{CoreCall, CoreEvent, CoreHandle};
 use crate::message::config::ServerArgs;
 use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::tokenizer_manager::wiring::TmEvent;
+/// The formatter a checkpoint with `config` and Jinja `template` selects.
+pub(super) fn checkpoint_formatter(
+    config: &serde_json::Value,
+    template: &str,
+) -> super::ChatFormatter {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("jinja-{}-{id}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    std::fs::write(dir.join("chat_template.jinja"), template).unwrap();
+    std::fs::write(dir.join("tokenizer_config.json"), "{}").unwrap();
+    let (formatter, error) =
+        sglang_processor::select_chat_formatter(&sglang_processor::ChatFormatterOptions {
+            tokenizer_path: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+    std::fs::remove_dir_all(&dir).unwrap();
+    formatter.unwrap_or_else(|| panic!("{error:?}"))
+}
+
 pub(super) fn core_handle() -> CoreHandle {
     CoreHandle::new(
         flume::unbounded().0,
