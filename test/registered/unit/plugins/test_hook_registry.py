@@ -441,6 +441,52 @@ class TestEdgeCases(_HookTestCase):
         mod.orig(1)
         self.assertEqual(call_count[0], 1)
 
+    def test_failed_target_cleared_after_successful_retry(self):
+        """A target that fails, then applies on a later apply_hooks() call, must not
+        stay in failed_targets()."""
+        mod, name = _make_module()
+        target = f"{name}.added_later"
+        HookRegistry.register(target, lambda result: result)
+
+        HookRegistry.apply_hooks()
+        self.assertIn(target, HookRegistry.failed_targets())
+
+        vars(mod)["added_later"] = lambda: "orig"
+        HookRegistry.apply_hooks()
+        self.assertNotIn(target, HookRegistry.failed_targets())
+        self.assertIn(target, HookRegistry.applied_targets())
+
+    def test_failed_targets_returns_a_copy(self):
+        """failed_targets() is read-only status: a caller clearing its result must
+        not erase the failures that load_plugins() checks for required hooks."""
+        _, name = _make_module()
+        target = f"{name}.missing"
+        HookRegistry.register(target, lambda result: result)
+        HookRegistry.apply_hooks()
+
+        HookRegistry.failed_targets().clear()
+        self.assertIn(target, HookRegistry.failed_targets())
+
+    def test_plugin_style_registry_access_keeps_working(self):
+        """Out-of-tree plugins unpack _hooks entries as 3-tuples, and some patch a
+        target themselves and add it to _patched; apply_hooks() must then skip that
+        target without wrapping it twice or reporting it as failed."""
+        calls = []
+        mod, name = _make_module(fn=lambda: "orig")
+        target = f"{name}.fn"
+        HookRegistry.register(target, lambda result: calls.append(result))
+        self.assertEqual(
+            [ht for ht, _, _ in HookRegistry._hooks[target]], [HookType.AFTER]
+        )
+
+        HookRegistry._apply_target(target, HookRegistry._hooks[target])
+        HookRegistry._patched.add(target)
+        HookRegistry.apply_hooks()
+
+        mod.fn()
+        self.assertEqual(calls, ["orig"])
+        self.assertNotIn(target, HookRegistry.failed_targets())
+
 
 if __name__ == "__main__":
     import unittest

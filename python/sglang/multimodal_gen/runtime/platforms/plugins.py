@@ -6,7 +6,7 @@ from collections import Counter, defaultdict
 from collections.abc import Callable
 from enum import Enum
 from importlib.metadata import EntryPoint, entry_points
-from typing import Any
+from typing import Any, ClassVar
 
 from sglang.multimodal_gen.runtime.platforms import (
     PLATFORM_PLUGINS_GROUP,
@@ -81,8 +81,13 @@ _required_dist: str | None = None
 
 class HookRegistry(_HookRegistry):
     # Rebound so diffusion hooks do not land in SRT's registry.
-    _hooks = defaultdict(list)
-    _patched = set()
+    _hooks: ClassVar[dict[str, list[tuple[HookType, Callable, HookSource | None]]]] = (
+        defaultdict(list)
+    )
+    _patched: ClassVar[set[str]] = set()
+    _applied_count: ClassVar[dict[str, int]] = {}
+    _failed_targets: ClassVar[dict[str, BaseException]] = {}
+    _required: ClassVar[set[tuple[str, int]]] = set()
 
 
 def plugin_hook(target: str, type: HookType = HookType.AFTER) -> Callable:
