@@ -107,6 +107,7 @@ pub fn into_requests(
         extra_key,
         cache_salt,
         session_params,
+        ..
     } = req;
     if session_params.is_some() {
         return Err(Error::Validation(

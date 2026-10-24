@@ -47,6 +47,10 @@ class MetadataGlueGraph:
     def __init__(self, device):
         self.device = device
         self.disabled = False
+        # Since the first warm-up: prep steps served by a graph replay, and steps
+        # that ran eagerly after it (capture failure, disabled, or never routed here).
+        self.replays = 0
+        self.eager = 0
         self._states: Dict[Any, dict] = {}
         self._capture_stream = None
 
@@ -55,12 +59,34 @@ class MetadataGlueGraph:
         static buffers and backend state may have been rebuilt)."""
         self._states.clear()
 
+    def note_not_routed(self) -> None:
+        """A replay the caller prepared eagerly without calling ``run`` (padding,
+        TBO, pdmux, LoRA, disabled)."""
+        if self._states or self.disabled:
+            self.eager += 1
+
     @staticmethod
     def _leaves(attn_backend) -> List[Any]:
         backends = [attn_backend]
         if attn_backend.attn_backend_list is not None:
             backends.extend(attn_backend.attn_backend_list)
         return backends
+
+    def is_captured(self, key) -> bool:
+        st = self._states.get(key)
+        return not self.disabled and st is not None and st["graph"] is not None
+
+    def reinstall(self, key) -> None:
+        """Point each backend at the metadata ``key``'s graph writes."""
+        for backend, metadata in self._states[key]["meta"]:
+            backend.forward_metadata = metadata
+
+    def replay(self, key) -> None:
+        """Replay ``key``'s captured prep on the current stream (a staging side stream
+        included); the caller reinstalls its metadata before the forward."""
+        self.reinstall(key)
+        self._states[key]["graph"].replay()
+        self.replays += 1
 
     def run(self, attn_backend, fb_view, key) -> None:
         """Run ``init_forward_metadata_out_graph`` for this replay, through the
@@ -74,6 +100,7 @@ class MetadataGlueGraph:
             for backend, metadata in st["meta"]:
                 backend.forward_metadata = metadata
             st["graph"].replay()
+            self.replays += 1
             return
 
         if st["warmups"] < self.NUM_WARMUP:
@@ -85,7 +112,10 @@ class MetadataGlueGraph:
             self._capture_stream = torch.cuda.Stream()
         graph = torch.cuda.CUDAGraph()
         try:
-            with torch.cuda.graph(graph, stream=self._capture_stream):
+            # captured while serving: other threads may use CUDA meanwhile
+            with torch.cuda.graph(
+                graph, stream=self._capture_stream, capture_error_mode="thread_local"
+            ):
                 attn_backend.init_forward_metadata_out_graph(fb_view)
         except Exception:
             logger.warning(
@@ -95,6 +125,7 @@ class MetadataGlueGraph:
                 exc_info=True,
             )
             self.disabled = True
+            self.eager += 1
             # Ops under a failed capture were recorded, not executed — run
             # this step's prep for real.
             attn_backend.init_forward_metadata_out_graph(fb_view)
