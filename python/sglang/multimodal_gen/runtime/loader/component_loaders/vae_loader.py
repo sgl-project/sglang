@@ -166,12 +166,12 @@ def _should_use_channels_last_3d(
 
 def _channels_last_3d_prefix(server_args: ServerArgs | None) -> str:
     """Module-name prefix of the Conv3d weights to convert to channels_last_3d."""
-    # multi-GPU Wan converts only its decoder: channels_last_3d convs round
-    # differently, and the encode output seeds I2V sampling
+    # multi-GPU Wan / Cosmos3 convert only their decoder: channels_last_3d
+    # convs round differently, and the encode output seeds I2V sampling
     if (
         server_args is not None
         and server_args.num_gpus > 1
-        and isinstance(server_args.pipeline_config, WanT2V480PConfig)
+        and isinstance(server_args.pipeline_config, (WanT2V480PConfig, Cosmos3Config))
     ):
         return "decoder."
     return ""
