@@ -22,7 +22,8 @@ TokenSpaceProcessor.process(media, IDs)
   worker_thread_device d, no processor pool -> inline processing on device d
 
 get_mm_processor -> TokenSpaceSGLangProcessor
-  each strategy keeps its legacy processor's loader and worker defaults
+  each strategy keeps its legacy processor's loader and worker defaults,
+    except the departures listed in _LEGACY_DEFAULT_DEPARTURES
   registered serving spec -> mm_tokens, IO threads, item split; none -> the defaults
   tokenizer + strategy -> served output; caller IDs never decoded
   --allowed-media-domains / max file size -> the core's media URL policy
@@ -376,8 +377,26 @@ def _token_space_defaults(strategy_class):
     return defaults
 
 
+# Deliberate departures from the legacy defaults: (model type, attribute) -> value.
+_LEGACY_DEFAULT_DEPARTURES = {
+    # Legacy Omni kept the base's 4 I/O workers only because it sits outside
+    # the Qwen tuning branch; one strategy serves every Qwen model type.
+    ("qwen3_omni_moe", "auto_mm_io_worker_num"): 16,
+}
+
+
 # The model types each registered architecture is served with.
-_MODEL_TYPES_BY_ARCH = {}
+_MODEL_TYPES_BY_ARCH = {
+    "Qwen2VLForConditionalGeneration": ("qwen2_vl",),
+    "Qwen2_5_VLForConditionalGeneration": ("qwen2_5_vl",),
+    "Qwen3VLForConditionalGeneration": ("qwen3_vl",),
+    "Qwen3VLMoeForConditionalGeneration": ("qwen3_vl_moe",),
+    "Qwen3_5ForConditionalGeneration": ("qwen3_5",),
+    "Qwen3_5MoeForConditionalGeneration": ("qwen3_5_moe",),
+    "Qwen3_5ForCausalLMMTP": ("qwen3_5",),
+    "Qwen3OmniMoeForConditionalGeneration": ("qwen3_omni_moe",),
+    "Qwen4ExpForConditionalGeneration": ("qwen4_exp",),
+}
 
 
 class TestTokenSpaceSGLangProcessor(unittest.TestCase):
@@ -393,7 +412,11 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                 continue
             for model_type in _MODEL_TYPES_BY_ARCH[arch]:
                 hf_config = SimpleNamespace(model_type=model_type)
+                hf_config.thinker_config = hf_config
                 expected = _legacy_defaults(legacy[arch], hf_config)
+                for (departed_type, name), value in _LEGACY_DEFAULT_DEPARTURES.items():
+                    if departed_type == model_type:
+                        expected[name] = value
                 with self.subTest(arch=arch, model_type=model_type):
                     self.assertEqual(_token_space_defaults(strategy_class), expected)
 
