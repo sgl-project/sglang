@@ -51,6 +51,21 @@ def start_disagg_service():
         return bootstrap_server
 
 
+def rust_server_serves_kv_bootstrap(transfer_backend: str) -> bool:
+    """Whether the embedded Rust server's KV bootstrap registry stands in for
+    the transfer backend's bootstrap server: it ports ``CommonKVBootstrapServer``,
+    the HTTP registry the built-in backends run, but not a backend that brings
+    a bootstrap server of its own."""
+    from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
+
+    server_class = get_kv_class(
+        TransferBackend(transfer_backend), KVClassType.BOOTSTRAP_SERVER
+    )
+    return server_class is not None and issubclass(
+        server_class, CommonKVBootstrapServer
+    )
+
+
 def maybe_create_ascend_config_store(transfer_backend: TransferBackend) -> None:
     """Also called directly by the rust-server scheduler: there the KV
     bootstrap registry is served by the embedded rust server's api listener

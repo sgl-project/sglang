@@ -23,6 +23,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
+    RoutingMethodType,
     get_flashinfer_a2a_dispatch_type,
     is_flashinfer_cutedsl_v1_path,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -1255,14 +1256,14 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
 
         # Align FP8 weights to FlashInfer per-tensor kernel layout if enabled
-        if get_moe_runner_backend().is_flashinfer_trtllm():
+        if self._moe_runner_backend.is_flashinfer_trtllm():
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 align_fp8_moe_weights_for_flashinfer_trtllm,
             )
 
             # ModelOpt FP8 stores weights in [Up, Gate] order, so we need to swap
             align_fp8_moe_weights_for_flashinfer_trtllm(layer, swap_w13_halves=True)
-        elif get_moe_runner_backend().is_flashinfer_cutlass():
+        elif self._moe_runner_backend.is_flashinfer_cutlass():
             assert (
                 hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None
             )
@@ -1352,6 +1353,18 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
         else:
             self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        # This per-tensor TRT-LLM adapter only supports logits routing. An
+        # undeclared router keeps Triton's weight layout and local expert IDs.
+        self._moe_runner_backend = (
+            moe_runner_backend
+            if moe_runner_backend.is_flashinfer_trtllm()
+            and moe_runner_config.routing_method_type
+            not in (None, RoutingMethodType.Unspecified)
+            else self.runner.runner_backend
+        )
+
+    def get_moe_runner_backend(self, layer):
+        return self._moe_runner_backend
 
     def apply(
         self,
@@ -1362,10 +1375,18 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
+        if self._moe_runner_backend.is_flashinfer_trtllm() and not (
+            TopKOutputChecker.format_is_bypassed(topk_output)
+        ):
+            raise NotImplementedError(
+                "TRT-LLM per-tensor FP8 cannot consume materialized routing. "
+                "Use --moe-runner-backend triton for this router."
+            )
+
         # Fast path: TRT-LLM FP8 per-tensor MoE using BYPASSED TopK routing
 
         if (
-            get_moe_runner_backend().is_flashinfer_trtllm()
+            self._moe_runner_backend.is_flashinfer_trtllm()
             and TopKOutputChecker.format_is_bypassed(topk_output)
         ):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -1409,7 +1430,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 dispatch_output, quant_info, self.moe_runner_config
             )
 
-        if get_moe_runner_backend().is_flashinfer_cutlass():
+        if self._moe_runner_backend.is_flashinfer_cutlass():
             activation_str = self.moe_runner_config.activation
             assert activation_str in _SUPPORTED_ACT_STRS, (
                 f"Activation {activation_str!r} is not supported for "
@@ -1629,7 +1650,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if group_size is None and quant_method and "NVFP4" in quant_method:
                 group_size = 16
 
-            exclude_modules = config.get("ignore", [])
+            exclude_modules = config.get(
+                "ignore",
+                config.get("modules_to_not_convert", config.get("exclude_modules", [])),
+            )
         else:
             # Fall back to nested format (hf_quant_config.json - legacy format)
             try:
@@ -2004,7 +2028,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         )
 
         if getattr(layer, "_interleave_for_swiglu_fusion", False):
-            from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+            from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
                 interleave_linear_and_gate,
                 swizzle_blockscale_2d,
             )
@@ -2345,7 +2369,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and is_cuda():
+        self._lora_marlin = moe_runner_backend.is_lora_marlin()
+        if moe_runner_backend.is_lora() and not self._lora_marlin:
+            raise ValueError(
+                "NVFP4 MoE LoRA requires --moe-runner-backend lora_marlin."
+            )
+        if (moe_runner_backend.is_auto() or moe_runner_backend.is_lora()) and is_cuda():
             capability = get_device_capability()
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
@@ -2420,6 +2449,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # nvfp4_online overrides this for serialized FP8 source weights.
         return False
 
+    def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:
+        """Align TRT-LLM weights, allowing model-specific storage layouts."""
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            align_fp4_moe_weights_for_flashinfer_trtllm,
+            trtllm_nvfp4_hidden_alignment,
+        )
+
+        align_fp4_moe_weights_for_flashinfer_trtllm(
+            layer,
+            hidden_alignment=trtllm_nvfp4_hidden_alignment(
+                use_per_token_activation=self.quant_config.use_per_token_activation,
+                is_gated=layer.moe_runner_config.is_gated,
+            ),
+        )
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -2429,6 +2473,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        if self.enable_flashinfer_trtllm_moe:
+            alignment = (
+                64
+                if layer.moe_runner_config.is_gated
+                and self.use_flashinfer_trtllm_weight_layout
+                else 128
+            )
+            intermediate_size_per_partition = round_up(
+                intermediate_size_per_partition, alignment
+            )
+            layer.moe_runner_config.intermediate_size_per_partition = (
+                intermediate_size_per_partition
+            )
         # TODO(ch-wan): check if this is needed
         layer.intermediate_size_per_partition = intermediate_size_per_partition
         layer.params_dtype = params_dtype
@@ -2439,6 +2496,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = self.prepare_weight_loader(
             layer, extra_weight_attrs.get("weight_loader")
         )
+        if get_moe_runner_backend().is_flashinfer_megamoe():
+            from sglang.srt.layers.moe.flashinfer_megamoe import (
+                make_nvfp4_megamoe_weight_loader,
+            )
+
+            weight_loader = make_nvfp4_megamoe_weight_loader(layer, weight_loader)
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
@@ -2629,9 +2692,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         layer.mega_l1_weights = l1_pair
         layer.mega_l2_weights = l2_pair
-        layer.mega_l1_alphas = l1_alphas
-        layer.mega_l2_alphas = l2_alphas
-        layer.mega_l2_act_scales = l2_act_scales
+        # Parameters, so EPLB moves each expert's values with its weights.
+        for name, value in (
+            ("mega_l1_alphas", l1_alphas),
+            ("mega_l2_alphas", l2_alphas),
+            ("mega_l2_act_scales", l2_act_scales),
+        ):
+            layer.register_parameter(
+                name, torch.nn.Parameter(value, requires_grad=False)
+            )
         # Free the checkpoint layout.
         layer.w13_weight.data = l1_pair[0]
         layer.w13_weight_scale.data = l1_pair[1]
@@ -2663,6 +2732,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
+        if moe_runner_backend.is_lora_marlin():
+            moe_runner_backend = MoeRunnerBackend.MARLIN
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
@@ -2738,11 +2809,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
-        use_cutedsl_w4a16 = (
-            self._is_cutedsl_v2_standard
-            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
-        )
-        if self.quant_config.use_per_token_activation or use_cutedsl_w4a16:
+        use_w4a16 = (
+            self._is_cutedsl_v2_standard or moe_runner_backend.is_flashinfer_megamoe()
+        ) and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        if self.quant_config.use_per_token_activation or use_w4a16:
             # FlashInfer computes activation scales dynamically per token, so
             # the static checkpoint activation scale is intentionally neutral.
             # CuTe DSL W4A16 keeps activations in BF16, so its GEMM alphas must
@@ -2784,6 +2854,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
             )
             if gemm1_clamp_limit is not None:
+                # The kernel clamps both raw halves with one limit, so move both onto
+                # the larger alpha by rescaling the smaller half's E4M3 block scales.
+                untied = layer.g1_alphas != layer.g1_alphas_up
+                if untied.any():
+                    shared_alphas = torch.maximum(layer.g1_alphas, layer.g1_alphas_up)
+                    # Block-scale rows are [up, gate] in the TRT-LLM weight layout.
+                    ratios = torch.stack([layer.g1_alphas_up, layer.g1_alphas], dim=1)
+                    ratios = torch.where(
+                        untied[:, None], ratios / shared_alphas[:, None], 1.0
+                    )
+                    block_scales = layer.w13_weight_scale.data.unflatten(1, (2, -1))
+                    block_scales.copy_(
+                        block_scales.float().mul_(ratios[:, :, None, None])
+                    )
+                    copy_or_rebind_param(layer, "g1_alphas", shared_alphas)
+                    copy_or_rebind_param(layer, "g1_alphas_up", shared_alphas)
                 copy_or_rebind_param(
                     layer,
                     "gemm1_clamp_limit",
@@ -2800,6 +2886,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         dtype=torch.float32,
                     ),
                 )
+                # SwiGLU adds beta to the raw up half before dequantization.
                 gemm1_beta = (
                     torch.full_like(
                         layer.g1_alphas,
@@ -2807,7 +2894,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         dtype=torch.float32,
                     )
                     if is_situ
-                    else (1.0 / layer.g1_alphas).to(torch.float32)
+                    else (1.0 / layer.g1_alphas_up).to(torch.float32)
                 )
                 copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
 
@@ -2825,7 +2912,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = (
             not self.quant_config.use_per_token_activation
-            and not use_cutedsl_w4a16
+            and not use_w4a16
             and (
                 use_nvfp4_dispatch or should_use_flashinfer_cutlass_moe_fp4_allgather()
             )
@@ -2880,19 +2967,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             and reorder_rows_for_gated_act_gemm is not None
             and shuffle_matrix_sf_a is not None
         ):
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                align_fp4_moe_weights_for_flashinfer_trtllm,
-                trtllm_nvfp4_hidden_alignment,
-            )
-
             # FlashInfer TRTLLM processing - handles both w13 and w2
-            align_fp4_moe_weights_for_flashinfer_trtllm(
-                layer,
-                hidden_alignment=trtllm_nvfp4_hidden_alignment(
-                    use_per_token_activation=self.quant_config.use_per_token_activation,
-                    is_gated=layer.moe_runner_config.is_gated,
-                ),
-            )
+            self._align_fp4_moe_weights_for_flashinfer_trtllm(layer)
             # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
@@ -3023,10 +3099,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def load_up_proj_weight_first(self) -> bool:
-        # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
-        # The CuteDSL v1 (deepep) path uses [Gate, Up] -- do NOT flip.
+        # Only weights and block scales follow the kernel's physical row order;
+        # per-tensor global scales always remain [Gate, Up]. MegaMoE and
+        # CuteDSL v1 (deepep) consume canonical [Gate, Up] weights as well.
         return self.moe_runner_config.is_gated and (
-            self.enable_flashinfer_cutlass_moe or self._is_cutedsl_v2_standard
+            self.use_flashinfer_trtllm_weight_layout
+            or self.enable_flashinfer_cutlass_moe
+            or self._is_cutedsl_v2_standard
         )
 
     def create_moe_runner(
@@ -3050,6 +3129,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self.runner = None
             return
 
+        if moe_runner_backend.is_lora():
+            self.runner = None
+            return
+
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
@@ -3065,6 +3148,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
         self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return self._moe_runner_backend
 
     def get_marlin_quant_info(self, layer: torch.nn.Module):
         """Marlin payload for the fp4-marlin (W4A16) fallback; the weights were
@@ -3117,7 +3203,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         assert activation in _SUPPORTED_ACT_STRS or (
-            activation == "situ" and moe_runner_backend.is_flashinfer_trtllm()
+            activation == "situ"
+            and (
+                moe_runner_backend.is_flashinfer_trtllm()
+                or moe_runner_backend.is_flashinfer_megamoe()
+            )
         ), f"{activation=} is unsupported by {moe_runner_backend}"
 
         if moe_runner_backend.is_flashinfer_megamoe():
@@ -3127,12 +3217,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             mega = ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer)
+            use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
             quant_info = FlashInferMegaMoeQuantInfo(
                 mega=mega,
                 mega_forward=layer._flashinfer_megamoe_forward,
                 fc1_alpha=layer.g1_alphas,
                 fc2_alpha=layer.g2_alphas,
-                fc1_norm_const=layer.w2_input_scale_quant,
+                fc1_norm_const=None if use_w4a16 else layer.w2_input_scale_quant,
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk
                 ),
@@ -3249,7 +3340,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "apply_router_weight_on_input is not supported for Flashinfer"
             )
             swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
+            slot = getattr(layer, "_nvfp4_layout_slot", None)
+            pair_weight = slot[0].pair[slot[1]] if slot and slot[0].is_pair else None
             quant_info = FlashInferCutlassMoeQuantInfo(
+                pair_w2_weight=pair_weight,
                 quant_type="fp4",
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,

@@ -2,6 +2,7 @@
 """Unit tests for multimodal weight-loading utilities."""
 
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,8 +16,8 @@ from safetensors.torch import save_file as safetensors_save_file
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
     checkpoint_bytes,
+    checkpoint_component_sizes,
     dit_parameter_count,
-    load_safetensors_state_dict,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     _disable_runai_streamer_rank_discovery_collective,
@@ -43,18 +44,6 @@ class TestPrecisionVariantSelection(unittest.TestCase):
             filter_duplicate_precision_variant_safetensors(files),
             ["/tmp/model.safetensors", "/tmp/other.bf16.safetensors"],
         )
-
-    def test_shared_state_dict_loader_uses_canonical_file(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            model_dir = Path(tmpdir)
-            canonical = model_dir / "model.safetensors"
-            variant = model_dir / "model.fp16.safetensors"
-            safetensors_save_file({"weight": torch.tensor([1.0])}, canonical)
-            safetensors_save_file({"weight": torch.tensor([2.0])}, variant)
-
-            state_dict = load_safetensors_state_dict(str(model_dir))
-
-        self.assertTrue(torch.equal(state_dict["weight"], torch.tensor([1.0])))
 
     def test_index_selection_precedes_canonical_fallback(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -277,6 +266,79 @@ class TestDitParameterCount(CustomTestCase):
                 )
                 parse.assert_not_called()
                 self.assertEqual(hub_download.called, use_modelscope == "0")
+
+
+def _write_pipeline(root: Path) -> None:
+    """A Diffusers layout: a 58-byte DiT, a 16-byte encoder and weightless parts."""
+    _write_sharded_transformer(root)
+    (root / "text_encoder").mkdir()
+    safetensors_save_file(
+        {"e": torch.zeros(4)}, root / "text_encoder" / "model.safetensors"
+    )
+    for weightless in ("tokenizer", "scheduler"):
+        (root / weightless).mkdir()
+        (root / weightless / "config.json").write_text("{}")
+    (root / "model_index.json").write_text(
+        '{"_class_name": "P", "transformer": ["diffusers", "T"], '
+        '"text_encoder": ["transformers", "E"], "tokenizer": ["transformers", "K"], '
+        '"scheduler": ["diffusers", "S"], "safety_checker": [null, null], '
+        '"boundary_ratio": 0.9}'
+    )
+
+
+class TestCheckpointComponentSizes(CustomTestCase):
+    SIZES = {"transformer": (17, 58), "text_encoder": (4, 16)}
+
+    def test_sizes_every_weighted_component(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _write_pipeline(Path(tmpdir) / "sub")
+
+            self.assertEqual(
+                checkpoint_component_sizes(tmpdir, subfolder="sub", revision=None),
+                self.SIZES,
+            )
+
+    def test_cached_hub_snapshot_is_sized_without_the_network(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _write_pipeline(Path(tmpdir))
+            with patch(_SNAPSHOT_DOWNLOAD, return_value=tmpdir) as snapshot_download:
+                self.assertEqual(
+                    checkpoint_component_sizes(
+                        "org/model", subfolder=None, revision="abc"
+                    ),
+                    self.SIZES,
+                )
+        self.assertTrue(snapshot_download.call_args.kwargs["local_files_only"])
+
+    def test_partial_download_other_formats_or_quantized_weights_are_unsized(self):
+        cases = {
+            # only model_index.json fetched so far, as before the worker downloads
+            "index only": lambda root: shutil.rmtree(root / "text_encoder"),
+            "missing shard": lambda root: (
+                root / "transformer" / "shard-2.safetensors"
+            ).unlink(),
+            "bin weights": lambda root: (
+                (root / "text_encoder" / "model.safetensors").unlink(),
+                (root / "text_encoder" / "pytorch_model.bin").write_bytes(b"0"),
+            ),
+            "quantized": lambda root: safetensors_save_file(
+                {"q": torch.zeros(4, dtype=torch.float8_e4m3fn)},
+                root / "text_encoder" / "model.safetensors",
+            ),
+        }
+        for name, damage in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmpdir:
+                _write_pipeline(Path(tmpdir))
+                damage(Path(tmpdir))
+                self.assertIsNone(
+                    checkpoint_component_sizes(tmpdir, subfolder=None, revision=None)
+                )
+
+    def test_uncached_repo_is_unsized(self):
+        with patch(_SNAPSHOT_DOWNLOAD, side_effect=LocalEntryNotFoundError("miss")):
+            self.assertIsNone(
+                checkpoint_component_sizes("org/model", subfolder=None, revision=None)
+            )
 
 
 class TestDisableRunaiStreamerRankDiscoveryCollective(unittest.TestCase):

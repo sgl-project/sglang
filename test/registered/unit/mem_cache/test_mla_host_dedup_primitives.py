@@ -7,7 +7,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupBroadcaster,
     MLAHostDedupContext,
@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
     make_dsa_indexer_pool_decl,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -58,13 +58,28 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             end_layer=2,
         )
         mla_host = MLATokenToKVPoolHost(
-            mla_device_pool,
+            MLAHostAllocation(
+                dtype=mla_device_pool.store_dtype,
+                kv_lora_rank=mla_device_pool.kv_lora_rank,
+                qk_rope_head_dim=mla_device_pool.qk_rope_head_dim,
+                kv_cache_dim=(
+                    mla_device_pool.kv_lora_rank + mla_device_pool.qk_rope_head_dim
+                ),
+                size_per_token=(
+                    mla_device_pool.kv_lora_rank + mla_device_pool.qk_rope_head_dim
+                )
+                * mla_device_pool.store_dtype.itemsize
+                * (mla_device_pool.layer_num),
+            ),
             host_to_device_ratio=2,
             host_size=0,
             page_size=2,
             layout="page_first",
             pin_memory=False,
-            is_dummy=True,
+            device_capacity_tokens=mla_device_pool.size,
+            start_layer=mla_device_pool.start_layer,
+            end_layer=mla_device_pool.end_layer,
+            target_layer_num=mla_device_pool.layer_num,
         )
 
         self.assertTrue(mla_host._is_dummy)
@@ -111,22 +126,19 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
         for dcp_size in (1, 2):
             for host_size in (0, 0.000002):
                 with self.subTest(dcp_size=dcp_size, host_size=host_size):
-                    pool = _device_pool_stub(
+                    pool = MLATokenToKVPool(
+                        size=8,
+                        page_size=2,
                         layer_num=2,
-                        store_dtype=torch.float16,
+                        dtype=torch.float16,
                         kv_lora_rank=4,
                         qk_rope_head_dim=2,
-                        size=8,
-                        host_capacity_tokens=16,
                         start_layer=7,
                         end_layer=9,
                         device="cpu",
-                        kv_buffer=[torch.zeros(10, 1, 6) for _ in range(2)],
+                        enable_memory_saver=False,
                     )
-                    pool.data_ptrs = torch.tensor(
-                        [buffer.data_ptr() for buffer in pool.kv_buffer],
-                        dtype=torch.uint64,
-                    )
+                    pool.host_capacity_tokens = 16
                     kwargs = dict(
                         host_to_device_ratio=2,
                         host_size=host_size,
@@ -135,8 +147,40 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
                         pin_memory=False,
                         dcp_size=dcp_size,
                     )
-                    host = MLATokenToKVPoolHost(pool, **kwargs)
-                    dummy = MLATokenToKVPoolHost(pool, **kwargs, is_dummy=True)
+                    host = MLATokenToKVPoolHost(
+                        pool.get_device_pool_infos()[0].buffer_info,
+                        device_capacity_tokens=(
+                            pool.size
+                            if pool.host_capacity_tokens is None
+                            else pool.host_capacity_tokens
+                        ),
+                        start_layer=pool.start_layer,
+                        end_layer=pool.end_layer,
+                        target_layer_num=(
+                            (pool.layer_num + pool.layer_shard_size - 1)
+                            // pool.layer_shard_size
+                            if pool.layer_shard_enabled
+                            else pool.layer_num
+                        ),
+                        layer_shard_enabled=pool.layer_shard_enabled,
+                        **kwargs,
+                    )
+                    dummy = MLATokenToKVPoolHost(
+                        MLAHostAllocation(
+                            dtype=pool.store_dtype,
+                            kv_lora_rank=pool.kv_lora_rank,
+                            qk_rope_head_dim=pool.qk_rope_head_dim,
+                            kv_cache_dim=(pool.kv_lora_rank + pool.qk_rope_head_dim),
+                            size_per_token=(pool.kv_lora_rank + pool.qk_rope_head_dim)
+                            * pool.store_dtype.itemsize
+                            * (pool.layer_num),
+                        ),
+                        device_capacity_tokens=pool.host_capacity_tokens,
+                        start_layer=pool.start_layer,
+                        end_layer=pool.end_layer,
+                        target_layer_num=pool.layer_num,
+                        **kwargs,
+                    )
                     self.addCleanup(host.destroy)
                     self.addCleanup(dummy.destroy)
                     self.assertEqual(
@@ -325,6 +369,8 @@ class _DSAPoolStub(DSATokenToKVPool):
         self.device = torch.device("cpu")
         self.layer_shard_enabled = False
         self.store_dtype = torch.uint8
+        self.dsa_kv_cache_store_fp8 = False
+        self.kv_scale_buffer = None
         self.kv_lora_rank, self.qk_rope_head_dim = 4, 2
         self.kv_cache_dim = 6
         self.index_head_dim, self.quant_block_size = 4, 4
@@ -506,15 +552,20 @@ class TestMLAHostDedupRotatingOwners(unittest.TestCase):
 class TestMLAHostDedupRotatingHostPools(unittest.TestCase):
     @staticmethod
     def _host_pools(pool, draft, rank, size):
+        # Mirrors build_kv_host_pool's MLA kwargs.
         mla_host = MLATokenToKVPoolHost(
-            pool,
+            pool._mla_buffer_info(),
             host_to_device_ratio=2,
             host_size=1e-5,
             page_size=2,
             layout="page_first_direct",
             pin_memory=False,
             override_kv_cache_dim=6,
-            mtp_draft_device_pools=(draft,),
+            draft_buffer_infos=(draft._mla_buffer_info(),),
+            device_capacity_tokens=pool.size,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
             dedup_rank=rank,
             dedup_size=size,
         )
@@ -538,8 +589,20 @@ class TestMLAHostDedupRotatingHostPools(unittest.TestCase):
         self.assertEqual(
             (idx0._live_target_layers, idx1._live_target_layers), ([2, 4], [0, 3])
         )
-        self.assertTrue(kv1._is_device_layer_owned(pool, 3))
-        self.assertFalse(kv1._is_device_layer_owned(pool, 2))
+        self.assertEqual(
+            (kv0._target_layer_indices, kv1._target_layer_indices), ((0, 2, 4), (1, 3))
+        )
+        # The all-layer backup reads the owned target layers, then the draft.
+        self.assertEqual(
+            [t.data_ptr() for t in kv1.device_kv_buffers],
+            [
+                t.data_ptr()
+                for t in (pool.kv_buffer[1], pool.kv_buffer[3], draft.kv_buffer[0])
+            ],
+        )
+        self.assertEqual(
+            kv1.device_data_ptrs.tolist(), [t.data_ptr() for t in kv1.device_kv_buffers]
+        )
 
         loads = []
         with mock.patch(

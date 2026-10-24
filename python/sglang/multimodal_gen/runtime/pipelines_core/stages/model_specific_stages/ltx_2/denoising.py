@@ -40,6 +40,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
+from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    rollout_step_kwargs,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     is_ltx2_two_stage_pipeline_name,
@@ -71,6 +74,9 @@ class LTX2DenoisingContext(DenoisingContext):
     use_ltx23_hq_timestep_semantics: bool = False
     res2s_step_noise_generator: torch.Generator | None = None
     res2s_substep_noise_generator: torch.Generator | None = None
+    # fp32 copies of scheduler.sigmas taken once per loop, so steps never sync on them
+    sigmas_host: torch.Tensor | None = None
+    sigmas_device: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -111,6 +117,7 @@ def _prepare_ltx2_rope_coords_for_bcg(
     video_coords: torch.Tensor | None,
     audio_coords: torch.Tensor | None,
     num_frames: int,
+    video_start_frame: int,
     height: int,
     width: int,
     audio_num_frames: int,
@@ -134,6 +141,7 @@ def _prepare_ltx2_rope_coords_for_bcg(
             width=width,
             device=latent_model_input.device,
             fps=fps,
+            start_frame=video_start_frame,
         )
     if audio_coords is None:
         audio_coords = current_model.audio_rope.prepare_audio_coords(
@@ -185,12 +193,6 @@ class LTX2DenoisingStage(DenoisingStage):
             tuple, tuple[torch.Tensor | None, torch.Tensor | None]
         ] = OrderedDict()
         self._ltx2_coords_cache_max_entries = 4
-
-    def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:
-        return self.prepare_extra_func_kwargs(
-            scheduler.step,
-            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
-        )
 
     @staticmethod
     def _randn_like_with_batch_generators(
@@ -1123,6 +1125,7 @@ class LTX2DenoisingStage(DenoisingStage):
             video_coords=video_coords,
             audio_coords=audio_coords,
             num_frames=ctx.latent_num_frames_for_model,
+            video_start_frame=video_sp_start or 0,
             height=ctx.latent_height,
             width=ctx.latent_width,
             audio_num_frames=audio_num_frames_latent,
@@ -1132,6 +1135,20 @@ class LTX2DenoisingStage(DenoisingStage):
         if len(self._ltx2_coords_cache) > self._ltx2_coords_cache_max_entries:
             self._ltx2_coords_cache.popitem(last=False)
         return coords
+
+    @staticmethod
+    def _ltx23_token_timesteps(
+        timestep: torch.Tensor, num_tokens: int, batch: Req
+    ) -> torch.Tensor:
+        """Per-token LTX-2.3 timesteps ``[B, num_tokens]``, or ``[B, 1]`` under lossless.
+
+        Without a denoise mask every token carries the step's sigma, so the DiT can
+        build one AdaLN row per sample and broadcast it instead of one per token.
+        """
+        timestep = timestep.view(-1, 1)
+        if quality_allows(batch.quality, "lossless"):
+            return timestep
+        return timestep.expand(-1, num_tokens)
 
     def _prepare_ltx2_model_inputs(
         self,
@@ -1182,8 +1199,8 @@ class LTX2DenoisingStage(DenoisingStage):
                 batch_size, int(latent_model_input.shape[1]), 1
             )
         elif use_ltx23_two_stage_prompt_timestep:
-            timestep_video = timestep.view(batch_size, 1).expand(
-                batch_size, int(latent_model_input.shape[1])
+            timestep_video = self._ltx23_token_timesteps(
+                timestep, int(latent_model_input.shape[1]), batch
             )
         else:
             timestep_video = timestep
@@ -1193,8 +1210,8 @@ class LTX2DenoisingStage(DenoisingStage):
                 batch_size, int(audio_latent_model_input.shape[1]), 1
             )
         elif use_ltx23_two_stage_prompt_timestep and audio_latent_model_input.ndim == 3:
-            timestep_audio = timestep.view(batch_size, 1).expand(
-                batch_size, int(audio_latent_model_input.shape[1])
+            timestep_audio = self._ltx23_token_timesteps(
+                timestep, int(audio_latent_model_input.shape[1]), batch
             )
         else:
             timestep_audio = timestep
@@ -1606,6 +1623,11 @@ class LTX2DenoisingStage(DenoisingStage):
             self._move_ltx2_scheduler_tensors_to_device(ctx.scheduler, device)
             self._move_ltx2_scheduler_tensors_to_device(ctx.audio_scheduler, device)
 
+        sigmas = ctx.scheduler.sigmas
+        if not isinstance(sigmas, torch.Tensor):
+            raise ValueError("Expected scheduler.sigmas to be a tensor for LTX-2.")
+        ctx.sigmas_host = sigmas.to(device="cpu", dtype=torch.float32)
+        ctx.sigmas_device = sigmas.to(device=ctx.latents.device, dtype=torch.float32)
         return ctx
 
     @staticmethod
@@ -1659,19 +1681,12 @@ class LTX2DenoisingStage(DenoisingStage):
         if ctx.audio_scheduler is None:
             raise ValueError("LTX-2 audio scheduler was not prepared.")
 
-        # 1. Read the scheduler sigma pair and derive the Euler delta.
-        sigmas = getattr(ctx.scheduler, "sigmas", None)
-        if sigmas is None or not isinstance(sigmas, torch.Tensor):
-            raise ValueError("Expected scheduler.sigmas to be a tensor for LTX-2.")
-        sigma = sigmas[step.step_index].to(
-            device=ctx.latents.device, dtype=torch.float32
-        )
-        sigma_next = sigmas[step.step_index + 1].to(
-            device=ctx.latents.device, dtype=torch.float32
-        )
+        # 1. Read the sigma pair from the per-loop copies and derive the Euler delta.
+        sigma = ctx.sigmas_device[step.step_index]
+        sigma_next = ctx.sigmas_device[step.step_index + 1]
         dt = sigma_next - sigma
-        sigma_val = float(sigma.item())
-        sigma_next_val = float(sigma_next.item())
+        sigma_val = float(ctx.sigmas_host[step.step_index])
+        sigma_next_val = float(ctx.sigmas_host[step.step_index + 1])
 
         stage1_guider_params = self._get_ltx2_stage1_guider_params(
             batch, server_args, ctx.stage
@@ -1901,19 +1916,13 @@ class LTX2DenoisingStage(DenoisingStage):
                     midpoint_model_call=_stage2_midpoint_model_call,
                 )
             else:
-                if batch.rollout:
-                    ctx.scheduler._step_index = step.step_index
-                    ctx.latents = ctx.scheduler.step(
-                        model_video,
-                        step.t_device,
-                        ctx.latents,
-                        return_dict=False,
-                        **self._scheduler_step_kwargs(batch, ctx.scheduler),
-                    )[0]
-                else:
-                    ctx.latents = ctx.scheduler.step(
-                        model_video, step.t_device, ctx.latents, return_dict=False
-                    )[0]
+                ctx.latents = ctx.scheduler.step(
+                    model_video,
+                    step.t_device,
+                    ctx.latents,
+                    **rollout_step_kwargs(batch),
+                    return_dict=False,
+                )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(
                     model_audio, step.t_device, ctx.audio_latents, return_dict=False
                 )[0]
@@ -2181,9 +2190,9 @@ class LTX2DenoisingStage(DenoisingStage):
                     v_ptb, a_v_ptb = pass_outputs.get("perturbed", (None, None))
                     v_mod, a_v_mod = pass_outputs.get("modality", (None, None))
 
-                sigma_value_float = float(sigma_value.item())
-                video_sigma_for_x0: float | torch.Tensor = sigma_value_float
-                audio_sigma_for_x0: float | torch.Tensor = sigma_value_float
+                # x0 scales by sigma in fp32 either way; the tensor form avoids a sync
+                video_sigma_for_x0: torch.Tensor = sigma_value
+                audio_sigma_for_x0: torch.Tensor = sigma_value
                 if ctx.use_ltx23_hq_timestep_semantics:
                     video_sigma_for_x0 = model_inputs_local.timestep_video
                     audio_sigma_for_x0 = model_inputs_local.timestep_audio

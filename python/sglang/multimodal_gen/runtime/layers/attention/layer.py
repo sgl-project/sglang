@@ -172,7 +172,7 @@ def _count_active_replicated_modes(
     )
 
 
-def _prepare_sdpa_mask(
+def prepare_sdpa_mask(
     mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
     mask = mask.to(device=device)
@@ -757,20 +757,7 @@ class LocalAttention(nn.Module):
             q_ = q.transpose(1, 2)
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
-
-            if torch.is_floating_point(attn_mask):
-                mask = attn_mask.to(dtype=q_.dtype, device=q_.device)
-                if mask.dim() == 2:
-                    mask = mask[:, None, None, :]
-                elif mask.dim() == 3:
-                    mask = mask[:, None, :, :]
-            else:
-                mask = attn_mask.to(dtype=q_.dtype, device=q_.device)
-                if mask.dim() == 2:
-                    mask = mask[:, None, None, :]
-                elif mask.dim() == 3:
-                    mask = mask[:, None, :, :]
-                mask = (mask - 1.0) * torch.finfo(q_.dtype).max
+            mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
 
             if q_.shape[1] != k_.shape[1]:
                 repeat_factor = q_.shape[1] // k_.shape[1]
@@ -798,6 +785,15 @@ class LocalAttention(nn.Module):
 
         output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
         return output
+
+
+@functools.lru_cache(maxsize=64)
+def _cu_seqlens_on_device(
+    bounds: tuple[int, ...], device: torch.device
+) -> torch.Tensor:
+    # Bounds repeat for every block and step; a fresh pageable H2D copy per call
+    # blocks the host until the stream drains. Callers must not mutate the result.
+    return torch.tensor(bounds, dtype=torch.int32, device=device)
 
 
 class USPAttention(nn.Module):
@@ -982,7 +978,28 @@ class USPAttention(nn.Module):
                 and not num_replicated_kv_prefix
             ), "Varlen USPAttention does not support masks or replicated tokens"
             if effective_skip_sp or get_sequence_parallel_world_size() == 1:
-                return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+                if q.shape[0] != 1:
+                    raise NotImplementedError(
+                        "Local varlen USPAttention expects one packed batch row"
+                    )
+                total = sum(seq_lens)
+                if total != q.shape[1]:
+                    raise ValueError(
+                        f"sum(seq_lens)={total} must match packed length {q.shape[1]}"
+                    )
+                bounds = [0]
+                for length in seq_lens:
+                    bounds.append(bounds[-1] + int(length))
+                cu_seqlens = _cu_seqlens_on_device(tuple(bounds), q.device)
+                out = self.attn_impl.forward_varlen(
+                    q[0],
+                    k[0],
+                    v[0],
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max(seq_lens),
+                    cu_seqlens_host=tuple(bounds),
+                )
+                return out.unsqueeze(0)
             if get_ring_parallel_world_size() > 1:
                 # The varlen all-to-all spans the combined SP group and is not
                 # ring-aware; it would shuffle rows across ring ranks instead
@@ -1239,7 +1256,7 @@ class USPAttention(nn.Module):
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
-                mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
+                mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
                 sdpa_context = (
                     sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                     if self.allow_cudnn_sdp and q_.device.type == "cuda"
@@ -1418,7 +1435,7 @@ class USPAttention(nn.Module):
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
-                mask = _prepare_sdpa_mask(
+                mask = prepare_sdpa_mask(
                     gathered_mask, dtype=q_.dtype, device=q_.device
                 )
                 sdpa_context = (
@@ -2084,7 +2101,7 @@ class USPAttention(nn.Module):
         q_ = q.transpose(1, 2)
         k_ = k.transpose(1, 2)
         v_ = v.transpose(1, 2)
-        mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
+        mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
         sdpa_context = (
             sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
             if self.allow_cudnn_sdp and q_.device.type == "cuda"
