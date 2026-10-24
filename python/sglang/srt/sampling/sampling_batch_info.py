@@ -283,6 +283,9 @@ class SamplingBatchInfo:
                 penaltylib.BatchedRepetitionPenalizer,
             },
         )
+        # The new orchestrator starts these requests with empty counters.
+        for r in reqs:
+            r.penalizer_cumulated_len = 0
 
         ret = cls(
             temperatures=temperatures,
