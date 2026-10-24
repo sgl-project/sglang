@@ -522,7 +522,7 @@ def handle_watermark_msg(staging_ctx, msg_parts) -> None:
         staging_ctx.watermark_cv.notify_all()
 
 
-def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
+def handle_staging_rsp(msg_parts, transfer_infos: dict, staging_requested: set) -> None:
     """Process a STAGING_RSP message and update transfer info with allocation."""
     stg_room = int(msg_parts[1].decode("ascii"))
     stg_chunk_idx = int(msg_parts[2].decode("ascii"))
@@ -530,6 +530,20 @@ def handle_staging_rsp(msg_parts, transfer_infos: dict) -> None:
     stg_round = int(msg_parts[4].decode("ascii"))
     stg_end = int(msg_parts[5].decode("ascii"))
     stg_session = msg_parts[6].decode("ascii")
+    # The ZeroMQ rank socket is unauthenticated, so every field here is
+    # attacker-controlled. set_chunk() grows its lists to chunk_idx + 1 with
+    # no bound, and a peer that first registers a normal-looking transfer can
+    # name any index and exhaust host memory (#45014). The only legitimate
+    # chunks are the ones this engine requested itself, so drop anything whose
+    # (room, chunk, session) key was never requested.
+    if (stg_room, stg_chunk_idx, stg_session) not in staging_requested:
+        logger.warning(
+            "STAGING_RSP dropped: chunk was never requested room=%s chunk=%d session=%s",
+            stg_room,
+            stg_chunk_idx,
+            stg_session,
+        )
+        return
     room_infos = transfer_infos.get(stg_room, {})
     tinfo = room_infos.get(stg_session)
     if tinfo is not None:

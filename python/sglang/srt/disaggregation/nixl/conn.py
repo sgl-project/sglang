@@ -3366,7 +3366,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 # Staging: decode replies with allocated staging offset
                 if waiting_req_bytes[0] == b"STAGING_RSP":
                     if self.enable_staging:
-                        handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                        handle_staging_rsp(
+                            waiting_req_bytes,
+                            self.transfer_infos,
+                            self._staging_ctx.prefetch_requested,
+                        )
                     continue
 
                 if self._handle_abort_notification(waiting_req_bytes):

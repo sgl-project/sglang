@@ -15,7 +15,10 @@ import requests
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.common.staging_handler import PrefillStagingContext
+from sglang.srt.disaggregation.common.staging_handler import (
+    PrefillStagingContext,
+    handle_staging_rsp,
+)
 from sglang.srt.disaggregation.nixl.conn import (
     KVArgsRegisterInfo,
     NixlKVManager,
@@ -755,6 +758,66 @@ class TestNixlStaging(CustomTestCase):
         )
         mgr.server_args = SimpleNamespace(chunked_prefill_size=4)
         return mgr
+
+    @staticmethod
+    def _staging_rsp_msg(room, chunk_idx, session, offset=0, rnd=1, end=1):
+        return [
+            b"STAGING_RSP",
+            str(room).encode("ascii"),
+            str(chunk_idx).encode("ascii"),
+            str(offset).encode("ascii"),
+            str(rnd).encode("ascii"),
+            str(end).encode("ascii"),
+            session.encode("ascii"),
+        ]
+
+    @staticmethod
+    def _rsp_transfer_infos():
+        return {
+            3: {
+                "agent": TransferInfo(
+                    room=3,
+                    endpoint="127.0.0.1",
+                    dst_port=1000,
+                    agent_name="agent",
+                    dst_kv_indices=np.array([1], dtype=np.int32),
+                    dst_aux_index=0,
+                    required_dst_info_num=1,
+                    dst_state_indices=[],
+                )
+            }
+        }
+
+    def test_staging_rsp_applies_requested_chunk(self):
+        transfer_infos = self._rsp_transfer_infos()
+        requested = {(3, 7, "agent")}
+
+        handle_staging_rsp(
+            self._staging_rsp_msg(3, 7, "agent", offset=4096), transfer_infos, requested
+        )
+
+        tinfo = transfer_infos[3]["agent"]
+        self.assertIsNotNone(tinfo.staging)
+        self.assertEqual(tinfo.staging.offsets[7], 4096)
+        self.assertEqual(len(tinfo.staging.offsets), 8)
+
+    def test_staging_rsp_drops_never_requested_chunk(self):
+        transfer_infos = self._rsp_transfer_infos()
+
+        handle_staging_rsp(self._staging_rsp_msg(3, 0, "agent"), transfer_infos, set())
+
+        self.assertIsNone(transfer_infos[3]["agent"].staging)
+
+    def test_staging_rsp_fake_room_huge_index_grows_nothing(self):
+        # The #45014 shape: a peer that first registered a normal-looking
+        # transfer names an absurd chunk index; no list may grow.
+        transfer_infos = self._rsp_transfer_infos()
+
+        handle_staging_rsp(
+            self._staging_rsp_msg(3, 50_000_000, "agent"), transfer_infos, set()
+        )
+
+        self.assertIsNone(transfer_infos[3]["agent"].staging)
 
     def test_do_staging_transfer_requeues_when_allocation_not_ready(self):
         mgr = self._make_manager()
