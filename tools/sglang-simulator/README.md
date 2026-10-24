@@ -666,6 +666,41 @@ Before-work capture, database lookup, synthetic result construction, publication
 and history bookkeeping therefore do not add host-dependent emulator time to a
 complete modeled worker duration.
 
+`simulation.sglang.dspark_reference.DSparkReferenceLedger` provides an explicit,
+immutable reference CPU bookkeeping seam for the source-bounded TP2/attention-DP1,
+PP1, B1-B8, Q6 path. It keeps CPU-processed committed lengths, persistent reserved
+lengths, published prefixes, processed output counts and prefill completion
+separate. Decode preparation calls native `page_aligned_decode_alloc_lens` with
+the original double-buffer reserve; it does not copy the synchronous simulator's
+CPU mirror or implement another allocation formula.
+
+A source adapter must supply the actual event order: prepare the current batch,
+optionally process a previous result at a synchronization boundary, publish the
+current modeled result, then process the previous FIFO result in the ordinary
+overlap path. The FIFO can temporarily contain two results. Preparation freezes
+its CPU seed and reserved vector, so later settlement cannot retroactively alter
+the planner input. Known absent future indices retain that seed; resolving a
+published relay uses the explicitly known backend CPU-mirror policy. Unknown
+policy or missing publication rejects rather than becoming a null mirror.
+
+All operations return a new ledger. Keep the original until cost lookup,
+publication and the surrounding transaction succeed. Only typed modeled
+`DSparkStepResult` objects supply pending progress. Settlement preserves the full
+native commit count, including output-budget overshoot; finished/retracted skips
+are explicit. Drain pending ownership before forgetting a request or clearing
+cache state. Prefill allocation sets committed/reserved lengths before forward,
+and prefill publication adds no sampled bonus to the KV prefix. Chunk completion
+is carried by the existing request's `emits_output` flag.
+
+This seam is not installed by the predictor factory or attached to G's synchronous
+scheduler callbacks. The source adapter still must establish overlap/backend
+policy, relay presence, idle/synchronization/retraction events and reference
+batch membership. In particular, native overlap may launch an extra forward
+before a pending multi-token result finishes a request; G's synchronous finish
+callback alone cannot reproduce that behavior. The ledger neither chooses that
+membership nor proves reference equivalence, qualified costs or serving accuracy.
+G's actual CPU lengths, allocations and native request objects remain unchanged.
+
 Run repository checks before submitting:
 
 ```bash
