@@ -673,10 +673,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             return None
         if spec_info.spec_input_type != SpecInputType.DFLASH_VERIFY:
             return None
-        if (
-            ragged_verify_layout is not None
-            or spec_info.custom_mask is not None
-        ):
+        if ragged_verify_layout is not None or spec_info.custom_mask is not None:
             return None
         if get_parallel().dcp_enabled:
             return None
