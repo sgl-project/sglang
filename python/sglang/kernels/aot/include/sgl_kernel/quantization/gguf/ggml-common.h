@@ -1,3 +1,7 @@
+#pragma once
+
+#include "device_compat.cuh"
+
 // adapted from
 // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/ggml-common.h
 // copied from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-common.h
@@ -954,27 +958,6 @@ typedef float (*vec_dot_q_mul_mat_cuda_t)(
     const int& i,
     const int& j,
     const int& k);
-
-// Utility function
-
-template <typename dst_t>
-static __device__ __forceinline__ dst_t convert_from_half(half val) {
-  return val;
-}
-
-template <>
-__device__ __forceinline__ c10::BFloat16 convert_from_half<c10::BFloat16>(half val) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 || defined(USE_MUSA)
-  return __float2bfloat16(__half2float(val));
-#else
-  return __half2float(val);
-#endif  // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 || defined(USE_MUSA)
-}
-
-template <>
-__device__ __forceinline__ float convert_from_half<float>(half val) {
-  return __half2float(val);
-}
 
 #if defined(USE_ROCM)
 

@@ -59,10 +59,11 @@ class DeviceType(str, Enum):
 
     CUDA = "cuda"
     HIP = "hip"
+    MUSA = "musa"
     NPU = "npu"  # Ascend NPU (torch_npu / sgl_kernel_npu)
     CPU = "cpu"
     MLU = "mlu"
-    # TODO(RFC #29630): XPU / MUSA / ... as backends land.
+    # TODO(RFC #29630): XPU / ... as backends land.
 
 
 class PlatformInfo(msgspec.Struct, frozen=True):
@@ -105,6 +106,14 @@ class PlatformInfo(msgspec.Struct, frozen=True):
             mlu = getattr(torch, "mlu", None)
             if mlu is not None and mlu.is_available():
                 return cls(device_type="mlu")
+            musa = getattr(torch, "musa", None)
+            if musa is not None and musa.is_available():
+                return cls(device_type="musa")
+            if (
+                getattr(torch.version, "musa", None) is not None
+                and torch.cuda.is_available()
+            ):
+                return cls(device_type="musa")
             if torch.cuda.is_available():
                 major, minor = torch.cuda.get_device_capability()
                 return cls(
@@ -130,7 +139,8 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
     (``min_cuda_arch`` / ``max_cuda_arch`` apply only when ``device == CUDA``).
 
     The device-only cases are so common that they are exposed as class constants
-    (``CapabilityRequirement.CUDA`` / ``.HIP`` / ``.NPU``); use :meth:`cuda` for an
+    (``CapabilityRequirement.CUDA`` / ``.HIP`` / ``.MUSA`` / ``.NPU``);
+    use :meth:`cuda` for an
     arch-bounded CUDA requirement (e.g. ``CapabilityRequirement.cuda(
     min_sm=(10, 0))`` for SM100+).
     """
@@ -143,6 +153,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
     # instances of the class itself). ClassVar keeps them out of msgspec fields.
     CUDA: ClassVar[CapabilityRequirement]
     HIP: ClassVar[CapabilityRequirement]
+    MUSA: ClassVar[CapabilityRequirement]
     NPU: ClassVar[CapabilityRequirement]
     MLU: ClassVar[CapabilityRequirement]
 
@@ -169,6 +180,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
 
 CapabilityRequirement.CUDA = CapabilityRequirement(device=DeviceType.CUDA)
 CapabilityRequirement.HIP = CapabilityRequirement(device=DeviceType.HIP)
+CapabilityRequirement.MUSA = CapabilityRequirement(device=DeviceType.MUSA)
 CapabilityRequirement.NPU = CapabilityRequirement(device=DeviceType.NPU)
 CapabilityRequirement.MLU = CapabilityRequirement(device=DeviceType.MLU)
 

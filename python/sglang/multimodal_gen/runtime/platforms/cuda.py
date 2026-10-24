@@ -779,7 +779,11 @@ class CudaPlatformBase(Platform):
                 )
 
                 supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
-                if head_size not in supported_sizes:
+                # FA4 on sm100 serves every multiple of 8 up to 128, e.g. Qwen-VL vision heads (72, 80)
+                fa4_head_size = (
+                    cls.is_blackwell() and head_size <= 128 and head_size % 8 == 0
+                )
+                if head_size not in supported_sizes and not fa4_head_size:
                     logger.info(
                         "Cannot use FlashAttention backend for head size %d.",
                         head_size,
