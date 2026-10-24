@@ -2286,6 +2286,14 @@ class DeepseekV2AttentionMLA(
             else:
                 yield
 
+    def fused_absorb_v_epilogue(
+        self, attn_output: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Override point for a model that folds its post-attention epilogue
+        (e.g. an output gate) into the absorbed-V projection: return the
+        [T, heads * v_head_dim] o_proj input, or None to take the plain bmm."""
+        return None
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:

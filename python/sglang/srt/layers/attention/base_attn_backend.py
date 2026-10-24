@@ -384,6 +384,15 @@ class AttentionBackend(ABC):
         """Run a forward for extend."""
         raise NotImplementedError()
 
+    def supports_split_mla_qk(
+        self, forward_batch: ForwardBatch, layer: RadixAttention
+    ) -> bool:
+        """Whether this absorbed-MLA forward may pass the query and key as
+        separate nope / rope parts (q=q_nope, k=k_nope, q_rope=, k_rope=) to a
+        backend that does not take FORWARD_ABSORB_CORE's fused-rope contract,
+        so the backend can assemble them together with its KV write."""
+        return False
+
     def forward_mixed(
         self,
         q: torch.Tensor,
