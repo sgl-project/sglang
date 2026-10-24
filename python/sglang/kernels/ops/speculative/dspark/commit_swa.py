@@ -11,7 +11,7 @@ def _committed_swa_locations(
     MAP,
     LENS,
     OUT,
-    N: tl.constexpr,
+    N,  # runtime arg: as constexpr it recompiled for every batch size
     WIDTH: tl.constexpr,
     MAP_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
