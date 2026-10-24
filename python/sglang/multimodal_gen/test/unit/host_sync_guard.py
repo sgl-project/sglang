@@ -42,6 +42,10 @@ from unittest.mock import patch
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from sglang.multimodal_gen.runtime.layers.attention import layer as attention_layer
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
+from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+
 _SYNC_WARNING = "called a synchronizing CUDA operation"
 _TORCH_DIR = os.path.dirname(torch.__file__) + os.sep
 
@@ -224,3 +228,72 @@ class forbid_host_syncs(TorchDispatchMode):
         ):
             raise AssertionError(f"boolean-mask {func} syncs the host with the device")
         return func(*args, **kwargs)
+
+
+class RecordOps(TorchDispatchMode):
+    """Records the aten ops the body runs, with their arguments."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls: list[tuple[Any, tuple, dict]] = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        self.calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    def casts(self, dtype: torch.dtype | None = None) -> int:
+        """The number of dtype or device copies, only those to ``dtype`` if given."""
+        return sum(
+            func is aten._to_copy.default
+            and (dtype is None or kwargs.get("dtype") is dtype)
+            for func, _, kwargs in self.calls
+        )
+
+    def uploads(self) -> list[torch.Tensor]:
+        """Tensors built from host data (``torch.tensor``, a list used as an index),
+        each a blocking copy on CUDA; 0-dim ones are Python scalars that kernels
+        read on the host, not uploads."""
+        return [
+            args[0]
+            for func, args, _ in self.calls
+            if func is aten.lift_fresh.default and args[0].dim() > 0
+        ]
+
+
+class CountedUploads(torch.Tensor):
+    """A host tensor that counts its copies to the device in ``uploads``.
+
+    The copy ``.to(...)`` returns is a plain tensor, so moving it again is not
+    counted. Reset ``CountedUploads.uploads`` before the code under test.
+    """
+
+    uploads = 0
+
+    def to(self, *args, **kwargs):
+        CountedUploads.uploads += 1
+        return super().to(*args, **kwargs).as_subclass(torch.Tensor)
+
+
+def reference_custom_ops():
+    """Run every CustomOp built in the body on its reference path: tiny test
+    shapes miss the fused kernels' constraints."""
+    return patch.object(CustomOp, "dispatch_forward", lambda op: op.forward_native)
+
+
+@contextmanager
+def tiny_dit_runtime(compute_dtype: torch.dtype):
+    """Build and run a tiny DiT in one process: SDPA attention computing in
+    ``compute_dtype`` and reference CustomOps. Needs the
+    ``single_process_model_parallel`` fixture."""
+    with (
+        patch.multiple(
+            attention_layer,
+            get_attn_backend=lambda *args, **kwargs: SDPABackend,
+            get_compute_dtype=lambda *args, **kwargs: compute_dtype,
+            _resolve_sp_attention_mode=lambda *args, **kwargs: ("ulysses", False),
+            _maybe_install_backend_autotune=lambda *args, **kwargs: None,
+        ),
+        reference_custom_ops(),
+    ):
+        yield
