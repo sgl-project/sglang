@@ -93,7 +93,8 @@
 //                      `hw|quant|strategy` then `hw|quant` then `hw`;
 //                      falls back to `lmsysorg/sglang:dev`
 //   dockerHostNetworkWhen optional — `(selection, {flags, env}) => boolean`
-//   dockerMounts       optional — additional `-v` mount specs
+//   dockerShmSize      optional — shared memory size for the NPU Docker command
+//   dockerMounts       optional — additional `-v` mount specs, array or `(selection) => array`
 //   dockerRunCommand   optional — command placed after the image and before
 //                      generated server flags; string or `(selection) => string`
 //   runModes           optional — command output tabs to show (`python` and/or
@@ -920,7 +921,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         ? [
             // NPU: --privileged grants the davinci devices; the host CANN
             // driver/firmware/state must be mounted in.
-            "docker run --privileged --shm-size=16g",
+            `docker run --privileged --shm-size=${config.dockerShmSize || "16g"}`,
             ...davinciLines((catalogEntryOf(sel.hw) || {}).npuDevices || 16),
             "  --device=/dev/davinci_manager",
             "  --device=/dev/hisi_hdc",
@@ -953,7 +954,11 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         // The NPU device block already mounts ~/.cache/.
         ...(vendorOf(sel.hw) === "npu"
           ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
-        ...[...(config.dockerMounts || []), ...(cell.pd ? cell.dockerMounts || [] : [])].map((mount) => `  -v ${mount}`),
+        ...[
+          ...(typeof config.dockerMounts === "function"
+            ? config.dockerMounts(sel) : (config.dockerMounts || [])),
+          ...(cell.pd ? cell.dockerMounts || [] : []),
+        ].map((mount) => `  -v ${mount}`),
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
         ...(config.placeholders && config.placeholders.HF_TOKEN
           ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
@@ -1004,12 +1009,14 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     // [key, label, unit, compute?]. Optional compute(measurement) supplies
     // derived metrics (preferred over measurement[key] when present).
     const pct = (entry && entry.latencyPercentile) || config.latencyPercentile || "P50";
+    const deviceLabel = sel.hw === "a3" ? "logical NPU" : "gpu";
     const SPEED_LABELS = [
       ["ttft_ms",                `TTFT (${pct})`,      "ms"],
       ["tpot_ms",                `TPOT (${pct})`,      "ms"],
       // throughput per gpu = total(input+output)/elapsed/GPU;
       // stored directly in the benchmarks file (= output tok/s/GPU × (isl+osl)/osl).
-      ["tokens_per_sec_per_gpu", "throughput per gpu", "tok/s"],
+      ["tokens_per_sec_per_gpu", `throughput per ${deviceLabel}`, "tok/s"],
+      ["output_tokens_per_sec",  "output throughput", "tok/s"],
       ["interactivity",          "interactivity",   "tokens/s/user",
         (m) => (m.tpot_ms != null && m.tpot_ms !== 0)
           ? Math.round((1000 / m.tpot_ms) * 10) / 10
@@ -1154,7 +1161,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       return { title: "Speed", sharedText, colHeaders, rows,
                colCount: measurements.length,
                legend: [
-                 `throughput per gpu = (input+output tokens)/elapsed/GPU`,
+                 `throughput per ${deviceLabel} = (input+output tokens)/elapsed/device count`,
                  `interactivity = 1000/TPOT(ms) (tokens/s/user)`,
                ] };
     };
@@ -1215,7 +1222,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   // interpolation happens in the modal where `env` is in scope. Returns null
   // when nothing is renderable (caller hides the button).
   const buildBenchCommands = (entry, sel) => {
-    const bc = config.benchmarkCommands;
+    const bc = (config.benchmarkCommandsByHardware || {})[sel.hw] || config.benchmarkCommands;
     if (!bc) return null;
 
     // One entry per eval with a value AND a template. A template is a string,
@@ -1395,7 +1402,13 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   const saveEnv = (next) => {
     setEnv(next);
     try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
+    window.dispatchEvent(new CustomEvent(STORAGE_KEY, { detail: next }));
   };
+  useEffect(() => {
+    const onEnv = (event) => setEnv((previous) => ({ ...previous, ...event.detail }));
+    window.addEventListener(STORAGE_KEY, onEnv);
+    return () => window.removeEventListener(STORAGE_KEY, onEnv);
+  }, []);
 
   const [sel, setSel] = useState(() => initialSelectionFromCells());
   const [selectionHydrated, setSelectionHydrated] = useState(false);

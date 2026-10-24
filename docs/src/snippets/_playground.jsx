@@ -2018,7 +2018,7 @@ export const Playground = ({ config }) => {
           ? [
               // NPU: --privileged grants the davinci devices; the host CANN
               // driver/firmware/state must be mounted in.
-              "docker run --privileged --shm-size=16g",
+              `docker run --privileged --shm-size=${config.dockerShmSize || "16g"}`,
               ...davinciLines(npuDevices),
               "  --device=/dev/davinci_manager",
               "  --device=/dev/hisi_hdc",
@@ -2039,7 +2039,11 @@ export const Playground = ({ config }) => {
         ...((multinode || pdMode) ? fabricFlags.map((x) => "  " + x) : []),
         // The NPU device block already mounts ~/.cache/.
         ...(npuDevices ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
-        ...[...(config.dockerMounts || []), ...(cell.pd ? cell.dockerMounts || [] : [])].map((mount) => `  -v ${mount}`),
+        ...[
+          ...(typeof config.dockerMounts === "function"
+            ? config.dockerMounts(sel) : (config.dockerMounts || [])),
+          ...(cell.pd ? cell.dockerMounts || [] : []),
+        ].map((mount) => `  -v ${mount}`),
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
@@ -2478,7 +2482,13 @@ export const Playground = ({ config }) => {
   const saveEnv = (next) => {
     setEnv(next);
     try { window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next)); } catch {}
+    window.dispatchEvent(new CustomEvent(STORAGE_KEY, { detail: next }));
   };
+  useEffect(() => {
+    const onEnv = (event) => setEnv((previous) => ({ ...previous, ...event.detail }));
+    window.addEventListener(STORAGE_KEY, onEnv);
+    return () => window.removeEventListener(STORAGE_KEY, onEnv);
+  }, []);
 
   // Base selection — live-linked to the Deployment panel via URL hash + custom event
   // (history.replaceState doesn't fire hashchange, hence the event too).
