@@ -810,8 +810,8 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
 
         # Per‑group: multiply channel and group scales, then pack into uint64
         per_group_scale = per_group_scale.transpose(1, 2).contiguous()
-        group_num, k, n = weight.shape
-        n = n * 2  # packed weight halves the column dimension
+        group_num, n, _ = weight.shape
+        n = n * 2  # Weights are still [E, packed_out, in] before transposing.
         per_group_scale = per_group_scale.reshape(group_num, -1, n)
         group_num, quantgroup_num, n = per_group_scale.shape
 
