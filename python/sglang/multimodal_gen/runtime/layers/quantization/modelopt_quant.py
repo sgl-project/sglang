@@ -857,29 +857,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.weights_padding_cols = weights_padding_cols
         copy_or_rebind_param(layer, "weight", weight)
 
-        scale_ndim = scales.ndim
-        if scale_ndim == 2:
-            scales = scales.unsqueeze(0)
-        assert scales.ndim == 3
-        B, M, K = scales.shape
-        M_padded = round_up(M, 128)
-        K_padded = round_up(K, 4)
-        padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
-        padded_scales[:B, :M, :K] = scales
-
         # Every FP4 GEMM reachable here reads block scales in the 128x4 TMA layout;
         # trtllm, the one backend wanting its own shuffled layout, returned above.
-        padded_scales = padded_scales.reshape(
-            B, M_padded // 128, 4, 32, K_padded // 4, 4
-        )
-        padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
-
-        padded_scales = padded_scales.contiguous().cuda()
-        padded_scales = (
-            padded_scales.reshape(M_padded, K_padded)
-            if scale_ndim == 2
-            else padded_scales.reshape(B, M_padded, K_padded)
-        )
+        # `_linear_nvfp4_scales_to_tma` builds its padding buffer on
+        # `scales.device`, so this stays an on-device transform instead of a
+        # GPU->CPU->GPU round trip.
+        padded_scales = _linear_nvfp4_scales_to_tma(scales.cuda())
         copy_or_rebind_param(layer, "weight_scale_interleaved", padded_scales)
 
     def apply(
