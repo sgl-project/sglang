@@ -62,7 +62,7 @@ from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     exit_late_layer_dp,
 )
 from sglang.srt.models.deepseek_v4_mhc import HcState
-from sglang.srt.runtime_context import get_flags, get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -257,6 +257,26 @@ class DecoderReplayTail:
             or get_is_capture_mode()
         ):
             return None
+        parallel = get_parallel()
+        early_rows = forward_batch.global_num_tokens_cpu
+        late_rows = forward_batch.global_late_layer_num_tokens_cpu
+        if (
+            is_cuda()
+            and get_moe_a2a_backend().is_megamoe()
+            and get_spec().speculative_algorithm == "DSPARK"
+            and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+            and parallel.attn_tp_size == 1
+            and parallel.attn_cp_size == 1
+            and early_rows is not None
+            and late_rows is not None
+            and len(early_rows) == parallel.attn_dp_size
+            and len(late_rows) == parallel.attn_dp_size
+        ):
+            # With speculative prefill coordination disabled, the scheduler
+            # synchronizes prefills separately from decode: peers are prefill
+            # or idle. Their counts were already exchanged before the forward.
+            # TP/CP=1 keeps that exchange in the same domain as this collective.
+            return max(early_rows), list(late_rows)
         return scattered_dp_counts(
             num_tokens, 0 if tail is None else tail.positions.shape[0]
         )
