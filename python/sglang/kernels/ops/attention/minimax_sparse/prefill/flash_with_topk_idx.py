@@ -1,12 +1,13 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
+import functools
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import get_device_core_count, is_gfx95_supported
 
 from ..common.utils import (
     _bitonic_merge,
@@ -20,6 +21,15 @@ from ..common.utils import (
 
 # gfx950 MI350X: per-page wins at <=2 pages/block, loses at >=8
 _MAX_PER_PAGE_SLOT_UNROLL = 2
+
+# Target CTAs per SM for the score-only KV split.
+# Measured on GB300 over short turns and 16K chunks; re-tune with the kernel.
+_SPLIT_KV_CTAS_PER_SM = 8
+
+
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return get_device_core_count(device_index)
 
 
 @triton.heuristics(
@@ -150,6 +160,16 @@ def _flash_attn_fwd_with_block_score_kernel(
     if BLOCK_SIZE_Q * pid_q >= q_len:
         return
     block_num = (seq_len + block_size - 1) // block_size
+    hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
+    lo = 0
+    if DISABLE_INDEX_VALUE:
+        # No softmax state spans K tiles without the index value: splits need no merge.
+        tiles_per_split = tl.cdiv(tl.cdiv(hi, BLOCK_SIZE_K), tl.num_programs(2))
+        # int32: lo // block_size is a block-pointer offset, and seq_lens may be int64.
+        lo = (tl.program_id(2) * tiles_per_split * BLOCK_SIZE_K).to(tl.int32)
+        hi = tl.minimum(hi, lo + tiles_per_split * BLOCK_SIZE_K)
+        if lo >= hi:
+            return
     # init qkv pointer
     q_ptrs = tl.make_block_ptr(
         base=q_ptr + seq_start * stride_q_n + pid_h * stride_q_h,
@@ -163,7 +183,7 @@ def _flash_attn_fwd_with_block_score_kernel(
         base=score_ptr + seq_start * stride_s_q + pid_h * stride_s_h,
         shape=(q_len, block_num),
         strides=(stride_s_q, stride_s_k),
-        offsets=(pid_q * BLOCK_SIZE_Q, 0),
+        offsets=(pid_q * BLOCK_SIZE_Q, lo // block_size),
         block_shape=(BLOCK_SIZE_Q, BLOCKS_PER_K_BLOCK),
         order=(1, 0),
     )
@@ -199,8 +219,7 @@ def _flash_attn_fwd_with_block_score_kernel(
     acc_o = tl.full((BLOCK_SIZE_Q, BLOCK_SIZE_VD), 0, dtype=tl.float32)
     # attention
     diag_start = (prefix_len + pid_q * BLOCK_SIZE_Q) // BLOCK_SIZE_K * BLOCK_SIZE_K
-    hi = min(seq_len, prefix_len + (pid_q + 1) * BLOCK_SIZE_Q)
-    for i in tl.range(0, hi, BLOCK_SIZE_K):
+    for i in tl.range(lo, hi, BLOCK_SIZE_K):
         # paged load K via req_to_token: pos -> slot -> k_cache
         pos = i + off_k
         pos_mask = pos < seq_len
@@ -609,6 +628,7 @@ def flash_prefill_with_topk_index(
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
     page_size: int = 1,
+    num_kv_splits: Optional[int] = None,  # score-only; None sizes to the GPU
 ):
     assert score_type in (
         "max",
@@ -710,7 +730,20 @@ def flash_prefill_with_topk_index(
             IS_FP8=is_fp8,
         )
     else:
-        _flash_attn_fwd_with_block_score_kernel[grid](
+
+        def split_grid(META):
+            q_tiles = triton.cdiv(max_seqlen_q, META["BLOCK_SIZE_Q"])
+            if not disable_index_value:
+                return (q_tiles, batch_size * num_heads, 1)
+            splits = num_kv_splits
+            if splits is None:
+                splits = (_SPLIT_KV_CTAS_PER_SM * _num_sms(q.device.index)) // max(
+                    1, q_tiles * batch_size * num_heads
+                )
+            k_tiles = triton.cdiv(max_seqlen_k, META["BLOCK_SIZE_K"])
+            return (q_tiles, batch_size * num_heads, max(1, min(splits, k_tiles)))
+
+        _flash_attn_fwd_with_block_score_kernel[split_grid](
             q,
             k_cache,
             v_cache,
