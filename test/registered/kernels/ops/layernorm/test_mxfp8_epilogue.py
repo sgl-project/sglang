@@ -27,7 +27,8 @@ STREAMS = 4
 
 # 9-128 pins the single-tile scale-swizzle bound hc_combine_norm_mxfp8 was
 # widened to; 128 is the last row the swizzle addresses without a block offset.
-@pytest.mark.parametrize("m", [1, 2, 5, 6, 8, 9, 17, 33, 96, 127, 128])
+# 8/9 and 48/49 straddle the changes of the row's grid split.
+@pytest.mark.parametrize("m", [1, 2, 5, 6, 8, 9, 17, 33, 48, 49, 84, 96, 120, 127, 128])
 @pytest.mark.parametrize("scale", [1e-3, 1.0, 1e3])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_bitwise_identical_to_norm_then_quantize(m: int, scale: float, backend: str):
@@ -60,6 +61,35 @@ def test_bitwise_identical_to_norm_then_quantize(m: int, scale: float, backend: 
     )
     assert sf.shape == sf_ref.reshape(-1).shape
     assert torch.equal(sf, sf_ref.reshape(-1))
+
+
+# The split only decides which CTA stores which columns, and the kernel writes
+# every scale byte itself, padding rows included: each split gives the default
+# split's bytes, eagerly and on a graph replay over poisoned outputs.
+@pytest.mark.parametrize("m", [1, 8, 9, 48, 49, 84, 120, 128])
+def test_combine_norm_mxfp8_split_invariant(m: int, monkeypatch):
+    from sglang.kernels.ops.layernorm import hc_combine_norm as mod
+
+    g = torch.Generator(device="cuda").manual_seed(m)
+    x = torch.randn(
+        (m, STREAMS * HIDDEN), device="cuda", dtype=torch.bfloat16, generator=g
+    )
+    pre = torch.randn((m, STREAMS), device="cuda", dtype=torch.bfloat16, generator=g)
+    w = torch.randn((HIDDEN,), device="cuda", dtype=torch.bfloat16, generator=g)
+    expected = mod.hc_combine_norm_mxfp8(x, pre, w, 1e-6)
+
+    for parts in (1, 2, 4):
+        monkeypatch.setattr(mod, "_parts_for", lambda m, k, p=parts: p)
+        eager = mod.hc_combine_norm_mxfp8(x, pre, w, 1e-6)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replayed = mod.hc_combine_norm_mxfp8(x, pre, w, 1e-6)
+        for out in replayed:
+            out.view(torch.uint8).fill_(0xFF)
+        graph.replay()
+        for ref, a, b in zip(expected, eager, replayed):
+            assert torch.equal(a.view(torch.uint8), ref.view(torch.uint8)), parts
+            assert torch.equal(b.view(torch.uint8), ref.view(torch.uint8)), parts
 
 
 def check(x, w, got):
