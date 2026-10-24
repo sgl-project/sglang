@@ -768,8 +768,11 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # Fallback to native implementation if vllm is not available
         if not _has_vllm_rms_norm:
+            if self._can_use_torch_rms_norm(
+                x=x, post_residual_addition=post_residual_addition
+            ):
+                return self._forward_torch_rms_norm(x=x, residual=residual)
             return self.forward_native(x, residual, post_residual_addition)
 
         if is_batch_invariant_mode_enabled():
@@ -800,6 +803,33 @@ class RMSNorm(BaseFusedOp):
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
+
+    def _can_use_torch_rms_norm(
+        self, x: torch.Tensor, post_residual_addition: Optional[torch.Tensor]
+    ) -> bool:
+        # Checked per call: some models flip cast_x_before_out_mul after construction.
+        return (
+            post_residual_addition is None
+            and self.variance_size_override is None
+            and not self.cast_x_before_out_mul
+            and not self.fp32_residual
+            and self.override_orig_dtype is None
+            and x.dtype == self.weight.dtype
+            and not is_batch_invariant_mode_enabled()
+        )
+
+    def _forward_torch_rms_norm(
+        self, x: torch.Tensor, residual: Optional[torch.Tensor]
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # One rms_norm kernel (plus the add) instead of forward_native's ~11;
+        # like forward_native, quant_linear is not fused here.
+        if residual is not None:
+            residual = x + residual
+            x = residual
+        out = nn.functional.rms_norm(
+            x, (self.hidden_size,), self.weight, self.variance_epsilon
+        )
+        return out if residual is None else (out, residual)
 
     def forward_musa(
         self,
