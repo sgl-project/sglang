@@ -98,6 +98,8 @@ class Serving(msgspec.Struct):
     sidecar: A[
         Optional[str],
         "Start a locally managed sidecar against the native gRPC server. "
+        "Also starts on follower nodes with local KV-event publishers; "
+        "the module must support their metadata-only gRPC endpoint. "
         "The selected module must expose main(argv) and read the resolved "
         "native gRPC endpoint from SGLANG_GRPC_ENDPOINT. Requires --grpc-port "
         "or SGLANG_GRPC_PORT.",

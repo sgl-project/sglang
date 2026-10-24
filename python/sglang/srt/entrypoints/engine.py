@@ -184,11 +184,18 @@ class SchedulerInitResult:
     # Rust-server mode only: a KV bootstrap server the Rust server cannot serve.
     kv_bootstrap_server: Optional[Any] = None
     grpc_server: Optional[Any] = None
+    sidecar: Optional[Any] = None
 
-    def stop_grpc_server(self) -> None:
-        if self.grpc_server is not None:
-            self.grpc_server.shutdown()
-            self.grpc_server = None
+    def stop_follower_services(self) -> None:
+        # Keep metadata available until the sidecar has stopped polling it.
+        try:
+            if self.sidecar is not None:
+                self.sidecar.stop()
+                self.sidecar = None
+        finally:
+            if self.grpc_server is not None:
+                self.grpc_server.shutdown()
+                self.grpc_server = None
 
 
 def init_tokenizer_manager(
@@ -1235,12 +1242,28 @@ class Engine(EngineScoreMixin, EngineBase):
                 scheduler_init_result.grpc_server = start_follower_grpc_server(
                     server_args, scheduler_init_result.scheduler_infos[0]
                 )
+                if (
+                    scheduler_init_result.grpc_server is not None
+                    and get_serving().sidecar is not None
+                    and scheduler_init_result.scheduler_infos[0].get("kv_event_sources")
+                ):
+                    from sglang.srt.entrypoints.sidecar import start_sidecar
+
+                    # Followers with local publishers expose enough metadata
+                    # for the sidecar to discover its telemetry-only role.
+                    scheduler_init_result.sidecar = start_sidecar()
+                    scheduler_init_result.all_child_pids.append(
+                        scheduler_init_result.sidecar.proc.pid
+                    )
             except BaseException:
                 # Engine.__init__ has not received these handles yet. Do not
-                # leave GPU workers behind if binding the metadata port fails.
-                for proc in scheduler_procs or []:
-                    kill_process_tree(proc.pid, wait_timeout=60)
-                cls._terminate_weight_cache_daemons(weight_cache_daemon_procs)
+                # leave GPU workers behind if metadata or sidecar startup fails.
+                try:
+                    scheduler_init_result.stop_follower_services()
+                finally:
+                    for proc in scheduler_procs or []:
+                        kill_process_tree(proc.pid, wait_timeout=60)
+                    cls._terminate_weight_cache_daemons(weight_cache_daemon_procs)
                 raise
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
@@ -1281,7 +1304,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     )
                 scheduler_init_result.block_until_scheduler_exits()
             finally:
-                scheduler_init_result.stop_grpc_server()
+                scheduler_init_result.stop_follower_services()
             return (
                 None,
                 None,
@@ -1463,7 +1486,7 @@ class Engine(EngineScoreMixin, EngineBase):
         try:
             scheduler_init_result = getattr(self, "_scheduler_init_result", None)
             if scheduler_init_result is not None:
-                scheduler_init_result.stop_grpc_server()
+                scheduler_init_result.stop_follower_services()
             if (
                 self.tokenizer_manager is not None
                 and self.tokenizer_manager._subprocess_watchdog is not None
