@@ -11,7 +11,7 @@ try:
     import triton.language as tl
 
     _HAS_TRITON = True
-except ImportError:
+except Exception:
     _HAS_TRITON = False
 
 
@@ -29,6 +29,7 @@ if _HAS_TRITON:
         numel,
         HAS_DISPATCH: tl.constexpr,
         HAS_VALID_COUNT: tl.constexpr,
+        WRITE_IDS: tl.constexpr,
         BLOCK: tl.constexpr,
         NUM_BINS: tl.constexpr,
         TOP_K: tl.constexpr,
@@ -46,8 +47,9 @@ if _HAS_TRITON:
             ).to(tl.int64)
         else:
             physical_id = logical_id
-        output_id = tl.where(valid_logical, physical_id, logical_id)
-        tl.store(out_ids_ptr + offs, output_id, mask=mask)
+        if WRITE_IDS:
+            output_id = tl.where(valid_logical, physical_id, logical_id)
+            tl.store(out_ids_ptr + offs, output_id, mask=mask)
 
         valid_row = mask
         if HAS_VALID_COUNT:
@@ -63,6 +65,35 @@ if _HAS_TRITON:
         histogram = tl.histogram(bin_idx, NUM_BINS)
         bins = tl.arange(0, NUM_BINS)
         tl.atomic_add(load_ptr + bins, histogram, mask=bins < num_physical)
+
+
+def _launch_map_record_hist(
+    topk_ids: torch.Tensor,
+    load_buffer: torch.Tensor,
+    *,
+    dispatch: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+) -> None:
+    assert load_buffer.dim() == 1, load_buffer.shape
+    num_physical = int(load_buffer.numel())
+    numel = topk_ids.numel()
+    _eplb_map_record_hist_kernel[(triton.cdiv(numel, 256),)](
+        topk_ids,
+        dispatch if dispatch is not None else topk_ids,
+        output if output is not None else topk_ids,
+        load_buffer,
+        num_token_non_padded if num_token_non_padded is not None else topk_ids,
+        int(dispatch.numel()) if dispatch is not None else num_physical,
+        num_physical,
+        numel,
+        HAS_DISPATCH=dispatch is not None,
+        HAS_VALID_COUNT=num_token_non_padded is not None,
+        WRITE_IDS=output is not None,
+        BLOCK=256,
+        NUM_BINS=1 << num_physical.bit_length(),
+        TOP_K=int(topk_ids.shape[-1]),
+    )
 
 
 def eplb_map_and_record_fused(
@@ -83,32 +114,25 @@ def eplb_map_and_record_fused(
     )
     if dispatch_info is not None and dispatch is None:
         return None
-    num_physical = int(load_buffer.numel())
-    num_logical = int(dispatch.numel()) if dispatch is not None else num_physical
-    top_k = int(topk_ids.shape[-1])
-    numel = topk_ids.numel()
-    output = torch.empty_like(topk_ids)
-    dispatch_ptr = dispatch if dispatch is not None else topk_ids
-    valid_count_ptr = (
-        num_token_non_padded if num_token_non_padded is not None else topk_ids
-    )
-    grid = (triton.cdiv(numel, 256),)
-    _eplb_map_record_hist_kernel[grid](
-        topk_ids.contiguous(),
-        dispatch_ptr,
-        output,
+    topk_ids = topk_ids.contiguous()
+    output = torch.empty(topk_ids.shape, dtype=topk_ids.dtype, device=topk_ids.device)
+    _launch_map_record_hist(
+        topk_ids,
         load_buffer,
-        valid_count_ptr,
-        num_logical,
-        num_physical,
-        numel,
-        HAS_DISPATCH=dispatch is not None,
-        HAS_VALID_COUNT=num_token_non_padded is not None,
-        BLOCK=256,
-        NUM_BINS=1 << num_physical.bit_length(),
-        TOP_K=top_k,
+        dispatch=dispatch,
+        output=output,
+        num_token_non_padded=num_token_non_padded,
     )
     return output
 
 
-__all__ = ["eplb_map_and_record_fused"]
+def record_physical_counts_fused(
+    topk_ids: torch.Tensor, load_buffer: torch.Tensor
+) -> bool:
+    if not _HAS_TRITON or not topk_ids.is_cuda or topk_ids.numel() == 0:
+        return False
+    _launch_map_record_hist(topk_ids.contiguous(), load_buffer)
+    return True
+
+
+__all__ = ["eplb_map_and_record_fused", "record_physical_counts_fused"]

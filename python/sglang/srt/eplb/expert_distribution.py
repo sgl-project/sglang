@@ -53,7 +53,11 @@ from sglang.srt.runtime_context import (
     logs_expert_balancedness_to_server_log,
     reports_expert_balancedness,
 )
-from sglang.srt.utils import Withable, get_device, get_int_env_var
+from sglang.srt.utils import Withable, get_device, get_int_env_var, is_cuda
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sglang.srt.eplb.eplb_map_record_fused import record_physical_counts_fused
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -286,7 +290,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
     def get_current_pass_count_buffer(self, layer_idx: int):
-        if not self._recording or not self._record_current_pass:
+        if not _is_cuda:
+            if not self._recording or not self._record_current_pass:
+                return None
+        elif not self._hook_enabled() or self._current_layer_idx.value != layer_idx:
             return None
         gatherer = self._single_pass_gatherers.get(_SINGLE_PASS_GATHERER_KEY_PRIMARY)
         if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):
@@ -316,14 +323,17 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             local_physical_count_of_layer=local_physical_count_of_layer,
         )
 
-    def _on_hook(self, hook_name: str, **kwargs):
+    def _hook_enabled(self) -> bool:
         if self._disable_all:
-            return
+            return False
         if megamoe_prefill_only_recorder_enabled() and not self._record_current_pass:
-            return
-        if not (
+            return False
+        return (
             self._recording or torch.get_device_module().is_current_stream_capturing()
-        ):
+        )
+
+    def _on_hook(self, hook_name: str, **kwargs):
+        if not self._hook_enabled():
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
@@ -615,8 +625,16 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, enable_global_physical_experts=True)
 
-    # can optimize (e.g. fuse / compile)
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        if (
+            _is_cuda
+            and layer_idx is not None
+            and not torch.compiler.is_compiling()
+            and record_physical_counts_fused(
+                topk_ids=topk_ids, load_buffer=self._data[layer_idx]
+            )
+        ):
+            return
         topk_ids = topk_ids.flatten()
         mask = (topk_ids >= 0) & (
             topk_ids < self._expert_location_metadata.num_physical_experts

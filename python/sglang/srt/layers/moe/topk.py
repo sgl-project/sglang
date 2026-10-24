@@ -96,6 +96,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb import expert_location_dispatch
+from sglang.srt.eplb.eplb_map_record_fused import eplb_map_and_record_fused
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
@@ -2545,6 +2546,34 @@ def capture_routed_experts_if_allowed(
         )
 
 
+def _eplb_map_and_record_fused_if_recording(
+    topk_ids: torch.Tensor,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
+    layer_id: Optional[int],
+    num_token_non_padded: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if (
+        expert_location_dispatch_info is None
+        or expert_location_dispatch_info.ep_dispatch_algorithm != "static"
+        or layer_id is None
+        or torch.compiler.is_compiling()
+    ):
+        return None
+    load_buffer = (
+        get_global_expert_distribution_recorder().get_current_pass_count_buffer(
+            layer_id
+        )
+    )
+    if load_buffer is None:
+        return None
+    return eplb_map_and_record_fused(
+        topk_ids=topk_ids,
+        dispatch_info=expert_location_dispatch_info,
+        load_buffer=load_buffer,
+        num_token_non_padded=num_token_non_padded,
+    )
+
+
 def _post_process_topk_ids(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -2627,17 +2656,28 @@ def _post_process_topk_ids(
             # ExpertDistributionRecorder tracks only EPLB physical routed experts.
             recorder_topk_ids = routed_cols
         else:
-            # A remap table indexed by -1 aliases its last entry, so only the
-            # identity-remap branch may drop the padded-row mask.
-            topk_ids = _biased_grouped_topk_postprocess(
-                topk_ids,
-                expert_location_dispatch_info,
-                (
-                    None
-                    if padded_rows_masked and expert_location_dispatch_info is None
-                    else num_token_non_padded
-                ),
+            fused_topk_ids = _eplb_map_and_record_fused_if_recording(
+                topk_ids=topk_ids,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                layer_id=layer_id,
+                num_token_non_padded=num_token_non_padded,
             )
+            if fused_topk_ids is not None:
+                topk_ids = fused_topk_ids
+                _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+                recorder_was_fused = True
+            else:
+                # A remap table indexed by -1 aliases its last entry, so only the
+                # identity-remap branch may drop the padded-row mask.
+                topk_ids = _biased_grouped_topk_postprocess(
+                    topk_ids,
+                    expert_location_dispatch_info,
+                    (
+                        None
+                        if padded_rows_masked and expert_location_dispatch_info is None
+                        else num_token_non_padded
+                    ),
+                )
     elif _is_hip:
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
         # (negative indices cause illegal memory access). Always fill the padded
