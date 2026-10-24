@@ -72,6 +72,10 @@ from sglang.srt.speculative.domino_utils import (
     domino_greedy_rollout,
     validate_domino_runtime,
 )
+from sglang.srt.speculative.draft_parallel import (
+    model_draft_parallel_spec,
+    resolve_draft_parallel_layout,
+)
 from sglang.srt.speculative.draft_worker_common import (
     build_block_pos_offsets,
     build_draft_tp_worker,
@@ -413,12 +417,16 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # DP drafts use per-DP attention TP, independent of idle peers. CP
         # drafts use full TP without CP, including their backend and KV pool.
-        self.draft_owns_attention = (
-            get_parallel().attn_dp_enabled or get_parallel().attn_cp_size > 1
+        self.draft_parallel_layout = resolve_draft_parallel_layout(
+            model_draft_parallel_spec(
+                target_worker.model_runner.spec_aux_config.draft_model_config,
+                spec_algorithm=target_worker.model_runner.spec_algorithm,
+            ),
+            collapse_cp=True,
         )
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
-        with draft_pp_context(), draft_tp_context(self.draft_owns_attention):
+        with draft_pp_context(), draft_tp_context(self.draft_parallel_layout):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -658,7 +666,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # enabled, the draft worker keeps a private compact req->token table
         # over the same global KV index space, so radix-cache/prefix-hit KV
         # remains reusable while draft attention sees only the recent window.
-        with draft_tp_context(self.draft_owns_attention):
+        with draft_tp_context(self.draft_parallel_layout):
             self._draft_worker.alloc_memory_pool(
                 memory_pool_config=memory_pool_config,
                 req_to_token_pool=(
@@ -670,7 +678,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         with (
             draft_pp_context(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.draft_parallel_layout),
         ):
             self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
@@ -683,7 +691,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def init_cuda_graphs(self):
         with (
             draft_pp_context(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.draft_parallel_layout),
         ):
             capture_decode_cuda_graph = (
                 get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
@@ -1912,7 +1920,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # req_to_token rebuild.
         with (
             torch.inference_mode(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.draft_parallel_layout),
         ):
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
             if self.lilicorr is not None:
@@ -2670,7 +2678,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         with (
             torch.inference_mode(),
-            draft_tp_context(self.draft_owns_attention),
+            draft_tp_context(self.draft_parallel_layout),
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
@@ -2739,7 +2747,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self._draft_sampler.q_out[:bs],
                 )
         elif self.selector is not None:
-            with draft_tp_context(self.draft_owns_attention):
+            with draft_tp_context(self.draft_parallel_layout):
                 draft_next = self._propose_selector_block(
                     draft_logits_output=draft_logits_output,
                     bs=bs,
@@ -2765,7 +2773,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
-            with draft_tp_context(self.draft_owns_attention):
+            with draft_tp_context(self.draft_parallel_layout):
                 draft_next, lilicorr_candidate_ids, lilicorr_q_rows = (
                     propose_lilicorr_block(
                         head=self.lilicorr,
@@ -2786,7 +2794,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            with draft_tp_context(self.draft_owns_attention):
+            with draft_tp_context(self.draft_parallel_layout):
                 draft_next = self._greedy_sample_from_vocab_parallel_head(
                     hidden_states=draft_hidden[:, 1:, :].reshape(
                         -1, draft_hidden.shape[-1]
