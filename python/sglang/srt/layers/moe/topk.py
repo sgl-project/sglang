@@ -2654,9 +2654,11 @@ def _post_process_topk_ids(
             and not eplb_remap_enabled
             and (use_per_rank_shared_slots or not _skip_hip_pad_mask)
         )
-        _fold_pad_weights_into_append = (
-            _fold_pad_into_append and not use_per_rank_shared_slots
-        )
+        # Both fused append kernels (the non-per-rank fused_append_shared_experts
+        # and the per-rank deepep append+remap) now zero the padded weights in
+        # place, so the trailing _zero_topk_weights_padded_region pass is
+        # redundant wherever the id fold engaged.
+        _fold_pad_weights_into_append = _fold_pad_into_append
         if not _fold_pad_into_append:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
@@ -2813,6 +2815,10 @@ def _post_process_topk_ids(
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
+        #
+        # Skipped when the fused append+remap ran, because it was given
+        # num_token_non_padded and already zeroed both the routed and the shared
+        # weights on padded rows, making this a redundant per-layer launch.
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
     return topk_ids, topk_weights, recorder_topk_ids
