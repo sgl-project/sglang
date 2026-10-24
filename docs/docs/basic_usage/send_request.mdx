@@ -3,7 +3,31 @@ title: "Tutorial: Sending a request"
 metatags:
     description: "This notebook provides a quick-start guide to use SGLang in chat completions after installation. "
 ---
-This notebook provides a quick-start guide to use SGLang in chat completions after installation. Once your server is running, API documentation is available at `http://localhost:30000/docs` (Swagger UI), `http://localhost:30000/redoc` (ReDoc), or `http://localhost:30000/openapi.json` (OpenAPI spec, useful for AI agents). Replace `30000` with your port if using a different one.
+This notebook provides a quick-start guide to use SGLang in chat completions after installation. Once your Python HTTP server is running, API documentation is available at `http://localhost:30000/docs` (Swagger UI), `http://localhost:30000/redoc` (ReDoc), or `http://localhost:30000/openapi.json` (OpenAPI spec). Replace `30000` with your port if using a different one. These URLs are disabled when `DISABLE_OPENAPI_DOC=true`.
+
+For `/v1/chat/completions` and `/v1/completions`, the specification derives request
+and unary success schemas from the native models. It also declares the native
+400 validation and 500 serving-error bodies. Other errors, including
+configuration-dependent authentication errors, have unspecified bodies.
+
+Streaming responses use `text/event-stream`. Its `schema` describes **one parsed
+SSE data event**, following an OpenAPI 3.1 per-event convention; it does not describe
+the complete HTTP body or use OpenAPI 3.2 `itemSchema`. The event's `data` string
+is `[DONE]`, native chunk JSON (`ChatCompletionStreamResponse` or
+`CompletionStreamResponse`), or JSON containing an `error` property referencing
+`ErrorResponse`. The chunk models and their dependencies are published in
+`components.schemas`.
+
+To validate a stream, parse SSE framing, ignore comment-only frames, and recognize
+`[DONE]`. For other data events, decode the JSON and validate it against the declared
+`contentSchema` alternatives. Ordinary JSON Schema validators do not automatically
+validate these string contents. The declaration does not guarantee that a
+disconnected stream reaches `[DONE]` or verify event ordering or inference behavior.
+
+To preserve a schema from a running server, save `/openapi.json` together with
+the source revision or image digest, installed dependency versions, and server
+configuration. Importing the ASGI app without starting its lifespan can export
+route declarations, but does not verify server startup or inference behavior.
 
 - For Vision Language Models, see [OpenAI APIs - Vision](./openai_api_vision).
 - For Embedding Models, see [OpenAI APIs - Embedding](./openai_api_embeddings) and [Encode (embedding model)](./native_api#encode-embedding-model).
