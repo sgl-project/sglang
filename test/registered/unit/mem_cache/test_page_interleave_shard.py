@@ -13,8 +13,7 @@
 # ==============================================================================
 """Tests for logical-page KV cache sharding.
 
-The CPU tests pin the pure arithmetic that rotated owner-classed
-allocation hangs on:
+Pins the pure arithmetic that rotated owner-classed allocation hangs on:
 
 1. The placement bijection ``loc = Q*(N*ps) + r*ps + o`` — owner / local-row
    round-trip, disjoint equal partition across ranks.
@@ -31,53 +30,38 @@ allocation hangs on:
 5. ``begin_shard_extend`` plan capture (page positions, padded send rows,
    owner-congruence guard) with the gather stubbed out, following the
    SimpleNamespace binding pattern of ``test_dsa_layer_shard_utils.py``.
-6. The P/D send filter ``filter_kv_indices_for_shard_rank`` and the sender's
+6. MTP draft pool construction, shared allocator/layout validation, and scratch
+   sizing for separate target and draft pools.
+7. The P/D send filter ``filter_kv_indices_for_shard_rank`` and the sender's
    skip of a non-final chunk this rank owns no page of.
-7. Real sharded MLA pools: N ranks of stock-size pools hold N times one pool's
+8. Real sharded MLA pools: N ranks of stock-size pools hold N times one pool's
    tokens, each token stored on exactly one rank.
 
-The GPU tests exercise real pools and NCCL collectives: MLA and MHA gathers
-on 2 ranks (``TestPageInterleaveGatherMultiGpu``), the copy-engine gather's
-symmetric window, its zero-kernel launch, its release, the cross-node
-fallback, and direct comparisons against ordinary NCCL on 2 and 4 ranks
-(``TestPageInterleaveZeroSmGatherMultiGpu``), window allocation and ownership
-(``TestSymmetricBufferLifetime``). DSA indexer and attention coverage lives in
-``test_page_sharded_dsa_attention.py``.
-GPU tests skip when too few CUDA devices are visible, so the same file runs
-in both CPU and CUDA CI suites.
+The real NCCL MLA/MHA/MTP gathers, zero-SM gather correctness and release,
+and symmetric buffer lifetime tests live in
+``test_page_interleave_gather_multi_gpu.py``. DSA indexer and attention
+coverage lives in ``test_page_sharded_dsa_attention.py``.
 """
 
 import ctypes
 import gc
 import math
-import os
 import shutil
-import tempfile
 import unittest
 import unittest.mock
 from array import array
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import torch
-import torch.multiprocessing as mp
 from parameterized import parameterized_class
 
 from sglang.srt.disaggregation.common.conn import CommonKVSender
 from sglang.srt.disaggregation.utils import filter_kv_indices_for_shard_rank
-from sglang.srt.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
-from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     _release_nccl_window_buffer,
     allocate_symmetric_buffer,
-)
-from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
-    NCCL_CTA_POLICY_ZERO,
-    NCCLLibrary,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -94,6 +78,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import _evict_until_allocatable
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -103,7 +88,8 @@ from sglang.srt.mem_cache.page_interleave import (
     PageInterleavePlacement,
     PageShardSpec,
     compute_page_shard_scratch_bytes,
-    get_kv_shard_group,
+    get_kv_shard_group_info,
+    get_shared_kv_shard_pool,
     make_page_shard_spec,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
@@ -117,20 +103,14 @@ from sglang.srt.mem_cache.page_interleave_pool import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import get_parallel, publish
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_context, get_memory, get_parallel, get_spec
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import ceil_div
-from sglang.srt.utils.common import temp_set_env
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mem_cache_utils import finish_req
-from sglang.test.test_utils import (
-    CustomTestCase,
-    enter_scope,
-    publish_build_topology,
-)
+from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
-register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
 
 N = 4  # shard size
 PS = 16  # physical page size
@@ -171,6 +151,7 @@ class TestPageShardScratchSizing(CustomTestCase):
         )
         kvc = SimpleNamespace(
             is_draft_worker=draft,
+            token_to_kv_pool_allocator=None,
             use_mla_backend=use_mla,
             page_size=16,
             kv_cache_dtype=torch.bfloat16,
@@ -202,6 +183,28 @@ class TestPageShardScratchSizing(CustomTestCase):
         self.assertGreater(spec.max_prefix_tokens, 32832)
         self.assertEqual(spec.chunk_tokens, 48)
         self.assertEqual(spec.max_prefix_tokens % spec.logical_page_size, 0)
+
+    def test_target_with_mtp_budgets_one_extra_scratch_pair(self):
+        with (
+            self._fixture(context_len=100, chunk_tokens=64, shard_size=2) as kvc,
+            get_context().override_server_args(enable_multi_layer_eagle=False),
+        ):
+            kvc.spec_algorithm = SpeculativeAlgorithm.EAGLE
+            # Target configs can omit next-N layers; use the resolved draft count.
+            kvc.model_config.num_nextn_predict_layers = None
+            kvc.spec_aux_config = SimpleNamespace(eagle_draft_num_layers=1)
+            expected = 2 * (8 * 128 + 64 + 16) * (16 + 8) * 2
+            for layers in (1, 3):
+                with self.subTest(layers=layers):
+                    kvc.spec_aux_config.eagle_draft_num_layers = layers
+                    self.assertEqual(compute_page_shard_scratch_bytes(kvc), expected)
+                    self.assertEqual(
+                        compute_page_shard_scratch_bytes(kvc, include_mtp=True),
+                        2 * expected,
+                    )
+            kvc.spec_aux_config.eagle_draft_num_layers = None
+            with self.assertRaisesRegex(ValueError, "EAGLE MTP"):
+                compute_page_shard_scratch_bytes(kvc, include_mtp=True)
 
     def test_estimate_matches_actual_mla_and_gqa_scratch_tensors(self):
         for use_mla in (True, False):
@@ -367,34 +370,253 @@ class TestSymmetricBufferFailureCleanup(CustomTestCase):
             comm.nccl.ncclMemFree.assert_called_once_with(1234)
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA device")
-class TestSymmetricBufferLifetime(CustomTestCase):
-    def test_zeroed_buffer_deregisters_before_free(self):
-        """The allocation needs only window registration and memory ownership."""
-        released = []
+def _make_mtp_configurator(use_mla=True):
+    # Keep real pool/allocator types for validation; allocate only CPU metadata.
+    pool_class = (
+        PageInterleaveMLATokenToKVPool if use_mla else PageInterleaveMHATokenToKVPool
+    )
+    target = pool_class.__new__(pool_class)
+    target.shard_spec = PageShardSpec(1, 2, 16, 128, 64)
+    target.shard_group = SimpleNamespace(rank_in_group=1, world_size=2)
+    target.size, target.page_size, target.dtype = 128, 16, torch.bfloat16
+    target.kv_lora_rank, target.qk_rope_head_dim = 8, 4
+    target.head_num, target.head_dim, target.v_head_dim = 2, 4, 6
+    kvc = KVCacheConfigurator.__new__(KVCacheConfigurator)
+    kvc.token_to_kv_pool_allocator = PageInterleavePoolAllocator(
+        size=target.size,
+        physical_page_size=target.page_size,
+        shard_size=target.shard_spec.shard_size,
+        dtype=target.dtype,
+        device="cpu",
+        kvcache=target,
+        need_sort=False,
+        shard_spec=target.shard_spec,
+    )
+    kvc.device = "cpu"
+    kvc.is_draft_worker = True
+    kvc.page_size = target.page_size
+    kvc.use_mla_backend = use_mla
+    kvc.kv_cache_dtype = target.dtype
+    kvc.kv_cache_dtype_str = "bfloat16"
+    kvc.spec_algorithm = SpeculativeAlgorithm.EAGLE
+    kvc.model_config = SimpleNamespace(
+        num_nextn_predict_layers=1,
+        context_len=9999,
+        kv_lora_rank=8,
+        qk_rope_head_dim=4,
+        head_dim=4,
+        v_head_dim=6,
+        get_num_kv_heads=lambda tp: 4 // tp,
+        hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"]),
+    )
+    kvc.layer_info = SimpleNamespace(start_layer=5, end_layer=6, num_effective_layers=1)
+    kvc.is_hybrid_swa = False
+    kvc.sliding_window_size = None
+    kvc.mambaish_config = None
+    kvc.post_capture_kv_active = False
+    return kvc, target
 
-        def free(ptr):
-            released.append(("free", ptr))
-            torch.cuda.caching_allocator_delete(ptr)
 
-        comm = SimpleNamespace(
-            device=torch.device("cuda", torch.cuda.current_device()),
-            nccl=SimpleNamespace(
-                ncclMemAlloc=torch.cuda.caching_allocator_alloc,
-                ncclMemFree=free,
-            ),
-            register_comm_window_raw=lambda ptr, size: ctypes.c_void_p(ptr),
-            deregister_comm_window=lambda window: released.append(
-                ("deregister", window.value)
-            ),
+def _build_mtp_pool(kvc, *, capacity=128, is_dsa_model=False, is_dsv4_model=False):
+    return kvc._build_token_to_kv_pool(
+        sizes=SimpleNamespace(max_total_num_tokens=capacity),
+        is_dsa_model=is_dsa_model,
+        is_dsv4_model=is_dsv4_model,
+        req_to_token_pool=None,
+    )
+
+
+class TestMTPKVShardConfig(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
+            get_context().override_server_args(
+                page_size=16, chunked_prefill_size=1024, enable_multi_layer_eagle=False
+            )
         )
-        buf, registered = allocate_symmetric_buffer(comm, 8192)
-        self.assertTrue(registered)
-        self.assertEqual(int(buf.count_nonzero()), 0)
-        ptr = buf.data_ptr()
-        del buf
-        gc.collect()
-        self.assertEqual(released, [("deregister", ptr), ("free", ptr)])
+        stack.enter_context(
+            get_parallel().override(
+                tp_size=2, attn_tp_size=2, moe_tp_size=2, attn_dcp_size=1
+            )
+        )
+
+    def test_draft_shares_target_layout_but_has_its_own_pool(self):
+        for use_mla in (True, False):
+            with self.subTest(use_mla=use_mla):
+                kvc, target = _make_mtp_configurator(use_mla)
+                pool_class = type(target)
+                # Mock allocation only; preserve real types and distinct instances.
+                with (
+                    unittest.mock.patch.object(
+                        pool_class, "__init__", return_value=None
+                    ) as init,
+                    unittest.mock.patch.object(
+                        page_interleave,
+                        "get_kv_shard_group",
+                        side_effect=AssertionError,
+                    ),
+                ):
+                    self.assertIs(get_shared_kv_shard_pool(kvc), target)
+                    self.assertEqual(get_kv_shard_group_info(kvc), (1, 2))
+                    self.assertIs(make_page_shard_spec(kvc), target.shard_spec)
+                    pool = _build_mtp_pool(kvc)
+                self.assertIsInstance(pool, pool_class)
+                self.assertIsNot(pool, target)
+                kwargs = init.call_args.kwargs
+                self.assertIs(kwargs["shard_spec"], target.shard_spec)
+                self.assertIs(kwargs["shard_group"], target.shard_group)
+                for name, expected in dict(
+                    size=128,
+                    page_size=16,
+                    dtype=torch.bfloat16,
+                    layer_num=1,
+                    start_layer=5,
+                    end_layer=6,
+                ).items():
+                    self.assertEqual(kwargs[name], expected, name)
+                allocator = kvc.token_to_kv_pool_allocator
+                self.assertIs(
+                    kvc._build_token_to_kv_pool_allocator(
+                        sizes=SimpleNamespace(max_total_num_tokens=128),
+                        token_to_kv_pool=pool,
+                        is_dsv4_model=False,
+                        req_to_token_pool=None,
+                        token_to_kv_pool_allocator=allocator,
+                    ),
+                    allocator,
+                )
+                # Scratch uses inherited bounds despite different draft context/chunk sizes.
+                row_bytes = (8 + 4) * 2 if use_mla else 2 * (4 + 6) * 2
+                self.assertEqual(
+                    compute_page_shard_scratch_bytes(kvc),
+                    2 * (128 + 64 + 16) * row_bytes,
+                )
+                with self.assertRaisesRegex(ValueError, "target"):
+                    compute_page_shard_scratch_bytes(kvc, include_mtp=True)
+
+    def test_without_shared_allocator_keeps_existing_pool(self):
+        for draft, allocator in ((True, None), (True, object()), (False, None)):
+            with self.subTest(draft=draft, allocator=allocator):
+                kvc, _ = _make_mtp_configurator()
+                kvc.is_draft_worker = draft
+                kvc.token_to_kv_pool_allocator = allocator
+                self.assertIsNone(get_shared_kv_shard_pool(kvc))
+                if draft:
+                    self.assertEqual(get_kv_shard_group_info(kvc), (None, 1))
+                    self.assertIsNone(make_page_shard_spec(kvc))
+                    self.assertEqual(compute_page_shard_scratch_bytes(kvc), 0)
+                with unittest.mock.patch.object(
+                    KVCacheConfigurator, "_build_mla_kv_pool"
+                ) as build:
+                    self.assertIs(_build_mtp_pool(kvc), build.return_value)
+                build.assert_called_once_with(
+                    max_total_num_tokens=128, mla_pool_class=MLATokenToKVPool
+                )
+
+    def test_rejects_invalid_shared_allocator(self):
+        kvc, _ = _make_mtp_configurator()
+        for name, value, message in (
+            ("_kvcache", object(), "target's sharded KV pool"),
+            ("shard_spec", PageShardSpec(0, 2, 16, 128, 64), "different shard layouts"),
+            ("shard_size", 4, "different shard layouts"),
+            ("page_size", 32, "different shard layouts"),
+            ("size", 128, "different shard layouts"),
+        ):
+            with (
+                self.subTest(attribute=name),
+                unittest.mock.patch.object(kvc.token_to_kv_pool_allocator, name, value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                get_shared_kv_shard_pool(kvc)
+
+    def test_rejects_incompatible_pool_geometry(self):
+        for use_mla in (True, False):
+            kvc, _ = _make_mtp_configurator(use_mla)
+            geometry = (
+                ("kv_lora_rank", "qk_rope_head_dim")
+                if use_mla
+                else ("head_dim", "v_head_dim")
+            )
+            cases = [
+                (kvc, "page_size", 32, "physical page size"),
+                (kvc, "kv_cache_dtype", torch.float16, "geometry and dtype"),
+                (kvc, "use_mla_backend", not use_mla, "attention geometry"),
+                *(
+                    (kvc.model_config, field, 16, "geometry and dtype")
+                    for field in geometry
+                ),
+            ]
+            if not use_mla:
+                cases.append(
+                    (
+                        kvc.model_config,
+                        "get_num_kv_heads",
+                        lambda tp: 4,
+                        "geometry and dtype",
+                    )
+                )
+            for obj, name, value, message in cases:
+                with (
+                    self.subTest(use_mla=use_mla, attribute=name),
+                    unittest.mock.patch.object(obj, name, value),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    _build_mtp_pool(kvc)
+            for capacity in (64, 256):
+                with (
+                    self.subTest(use_mla=use_mla, capacity=capacity),
+                    self.assertRaisesRegex(ValueError, "same per-rank capacity"),
+                ):
+                    _build_mtp_pool(kvc, capacity=capacity)
+
+    def test_rejects_unsupported_draft_config(self):
+        kvc, _ = _make_mtp_configurator()
+        cases = [
+            (kvc, "spec_algorithm", algorithm, "EAGLE MTP")
+            for algorithm in (
+                SpeculativeAlgorithm.EAGLE3,
+                SpeculativeAlgorithm.DFLASH,
+                SpeculativeAlgorithm.FROZEN_KV_MTP,
+            )
+        ] + [
+            (kvc.model_config, "num_nextn_predict_layers", None, "EAGLE MTP"),
+            (kvc.model_config, "num_nextn_predict_layers", 0, "EAGLE MTP"),
+            (kvc, "is_hybrid_swa", True, "dense MLA and MHA"),
+            (kvc, "mambaish_config", object(), "dense MLA and MHA"),
+            (kvc, "sliding_window_size", 128, "dense MLA and MHA"),
+            (kvc, "post_capture_kv_active", True, "plain per-layer KV layout"),
+            (kvc, "kv_cache_dtype_str", "mxfp8", "plain per-layer KV layout"),
+        ]
+        for obj, name, value, message in cases:
+            with (
+                self.subTest(attribute=name, value=value),
+                unittest.mock.patch.object(obj, name, value),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                _build_mtp_pool(kvc)
+        for options in ({"is_dsa_model": True}, {"is_dsv4_model": True}):
+            with (
+                self.subTest(options=options),
+                self.assertRaisesRegex(ValueError, "dense MLA and MHA"),
+            ):
+                _build_mtp_pool(kvc, **options)
+        for context, options, message in (
+            (get_spec(), {"enable_multi_layer_eagle": True}, "EAGLE MTP"),
+            (get_parallel(), {"attn_dcp_size": 2}, "incompatible with DCP"),
+            (
+                get_memory(),
+                {"enable_page_major_kv_layout": True},
+                "plain per-layer KV layout",
+            ),
+        ):
+            with (
+                self.subTest(options=options),
+                context.override(**options),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                _build_mtp_pool(kvc)
 
 
 def _make_spec(shard_rank=0, max_prefix_groups=64, chunk_pages=32):
@@ -1586,599 +1808,6 @@ class TestShardSendFilter(CustomTestCase):
                 for chunk in (pages[:2], pages[2:])
             ]
             self.assertEqual(skips, expect_skip)
-
-
-# =============================================================================
-# Multi-GPU: the real NCCL layer-ahead gather (2 GPUs).
-#
-# Everything above is pure arithmetic on a CPU stub. This section drives real
-# pools over a real process group, which is the only check that the plan the
-# stub validates actually addresses the bytes the collective delivers:
-#
-# 1. MLA pool sharded across the attention-TP group: replicated writes are
-#    owner-filtered into disjoint pool stripes; a later batch's chunked-prefix
-#    read (get_mla_kv_buffer) assembles the full prefix from all ranks via the
-#    layer-ahead NCCL allgather and must return the canonical bytes.
-# 2. MHA pool sharded across the attention-CP group: the post-allgather full
-#    chunk is staged into the scratch chunk region and owner-persisted; a later
-#    batch reads prefix+chunk through the translated page table (the scratch),
-#    and the assembled rows must match the canonical bytes.
-#
-# Skipped unless 2 CUDA devices are visible, so it is inert on the CPU runner
-# this file is registered to. Run it explicitly with:
-#   CUDA_VISIBLE_DEVICES=0,1 python3 test/registered/unit/mem_cache/\
-#       test_page_interleave_shard.py TestPageInterleaveGatherMultiGpu
-# =============================================================================
-
-_GATHER_WORLD = 2
-_GATHER_LAYER_NUM = 4
-_GATHER_PAGE_SIZE = 16
-_GATHER_GRANULE = _GATHER_WORLD * _GATHER_PAGE_SIZE
-_GATHER_SIZE = _GATHER_PAGE_SIZE * 64  # physical token slots per rank
-_GATHER_KV_LORA_RANK = 128
-_GATHER_QK_ROPE = 32
-_GATHER_HEAD_NUM = 2
-_GATHER_HEAD_DIM = 32
-_GATHER_DTYPE = torch.bfloat16
-
-
-def _mla_value(loc, dim):
-    """Deterministic canonical latent value for logical slot ``loc``."""
-    loc = loc.to(torch.float32)
-    return (loc.unsqueeze(-1) + torch.arange(dim, device=loc.device) * 0.001).to(
-        _GATHER_DTYPE
-    )
-
-
-def _dist_init(rank, world, port, attn_cp_size):
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world)
-    os.environ.setdefault("no_proxy", "127.0.0.1,localhost")
-    torch.cuda.set_device(rank)
-
-    init_distributed_environment(
-        world_size=world,
-        rank=rank,
-        local_rank=rank,
-        distributed_init_method=f"tcp://127.0.0.1:{port}",
-        backend="nccl",
-    )
-    # Publish the widths the groups below are about to be built at. The derived
-    # quotients (attn_tp_size, attn_dcp_size, ...) are projected from these
-    # leaves at publish; initialize_model_parallel no longer supplies them, and
-    # MLATokenToKVPool.set_mla_kv_buffer reads attn_dcp_size on the write path.
-    publish(
-        ServerArgs(model_path="dummy", tp_size=world, attn_cp_size=attn_cp_size),
-        role="scheduler",
-    )
-    publish_build_topology(tp_size=world, attn_cp_size=attn_cp_size, world_rank=rank)
-    initialize_model_parallel()
-
-
-def _gather_make_spec(shard_rank, max_prefix_groups=16, chunk_groups=4):
-    return PageShardSpec(
-        shard_rank=shard_rank,
-        shard_size=_GATHER_WORLD,
-        page_size=_GATHER_PAGE_SIZE,
-        max_prefix_tokens=max_prefix_groups * _GATHER_GRANULE,
-        chunk_tokens=chunk_groups * _GATHER_GRANULE,
-    )
-
-
-def _fake_req_to_token(groups, seq_len, device):
-    """req_to_token row where sequence group j is allocator group groups[j]."""
-    row = torch.zeros(
-        (1, len(groups) * _GATHER_GRANULE), dtype=torch.int32, device=device
-    )
-    for j, q in enumerate(groups):
-        row[0, j * _GATHER_GRANULE : (j + 1) * _GATHER_GRANULE] = torch.arange(
-            q * _GATHER_GRANULE,
-            (q + 1) * _GATHER_GRANULE,
-            dtype=torch.int32,
-            device=device,
-        )
-    return row[:, :seq_len] if seq_len < row.shape[1] else row
-
-
-def _check(rank, name, got, expect, atol=0.0):
-    ok = torch.allclose(got.float(), expect.float(), atol=atol, rtol=0)
-    max_err = (got.float() - expect.float()).abs().max().item()
-    print(f"[rank {rank}] {name}: max_err={max_err:.6f} {'OK' if ok else 'FAIL'}")
-    assert ok, f"[rank {rank}] {name} mismatch (max_err={max_err})"
-
-
-def _run_mla(rank, world, port):
-    _dist_init(rank, world, port, attn_cp_size=1)
-
-    group = get_parallel().attn_tp_group
-    assert group.world_size == world
-    # Topology-first shard-group selection: no CP here, so MLA falls back to
-    # the attn-TP axis, while GQA has no replicated axis (world_size 1).
-    assert get_kv_shard_group(use_mla_backend=True) is group
-    assert get_kv_shard_group(use_mla_backend=False).world_size == 1
-    spec = _gather_make_spec(shard_rank=group.rank_in_group)
-
-    pool = PageInterleaveMLATokenToKVPool(
-        _GATHER_SIZE,
-        page_size=_GATHER_PAGE_SIZE,
-        dtype=_GATHER_DTYPE,
-        kv_lora_rank=_GATHER_KV_LORA_RANK,
-        qk_rope_head_dim=_GATHER_QK_ROPE,
-        layer_num=_GATHER_LAYER_NUM,
-        device=f"cuda:{rank}",
-        enable_memory_saver=False,
-        start_layer=0,
-        end_layer=_GATHER_LAYER_NUM - 1,
-        shard_spec=spec,
-        shard_group=group,
-    )
-    device = pool.kv_buffer[0].device
-
-    # ---- chunk 1: replicated write, owner-filtered persist -----------------
-    # "Allocator" hands out fragmented groups (identical on every rank).
-    chunk1_groups = [5, 2, 9]
-    chunk1_locs = _fake_req_to_token(chunk1_groups, 3 * _GATHER_GRANULE, device)[
-        0
-    ].long()
-    for layer_id in range(_GATHER_LAYER_NUM):
-        layer = SimpleNamespace(layer_id=layer_id)
-        vals = _mla_value(
-            chunk1_locs + layer_id * 1000, _GATHER_KV_LORA_RANK + _GATHER_QK_ROPE
-        )
-        pool.set_mla_kv_buffer(
-            layer,
-            chunk1_locs,
-            vals[:, :_GATHER_KV_LORA_RANK].unsqueeze(1),
-            vals[:, _GATHER_KV_LORA_RANK:].unsqueeze(1),
-        )
-    torch.cuda.synchronize()
-    torch.distributed.barrier()
-
-    # Pool holds only the owned stripe: group Q sits at local rows [Q*ps,(Q+1)*ps)
-    # on every rank, holding that rank's page of the group.
-    for q in chunk1_groups:
-        local_rows = torch.arange(
-            q * _GATHER_PAGE_SIZE, (q + 1) * _GATHER_PAGE_SIZE, device=device
-        )
-        owned_locs = (
-            q * _GATHER_GRANULE
-            + group.rank_in_group * _GATHER_PAGE_SIZE
-            + torch.arange(_GATHER_PAGE_SIZE, device=device)
-        )
-        got = pool.kv_buffer[0][local_rows, 0, :].view(_GATHER_DTYPE)
-        expect = _mla_value(owned_locs, _GATHER_KV_LORA_RANK + _GATHER_QK_ROPE)
-        _check(rank, f"mla owned stripe g{q}", got, expect)
-
-    # ---- chunk 2: prefix gather + staged chunk, both read styles -----------
-    seq_groups = chunk1_groups + [12]  # one new chunk group
-    prefix_len = 3 * _GATHER_GRANULE
-    seq_len = prefix_len + _GATHER_GRANULE
-    req_to_token = _fake_req_to_token(seq_groups, seq_len, device)
-    chunk2_locs = req_to_token[0, prefix_len:seq_len].long()
-    pool.begin_shard_extend(req_to_token, torch.tensor([0]), [prefix_len], [seq_len])
-
-    for layer_id in range(_GATHER_LAYER_NUM):
-        layer = SimpleNamespace(layer_id=layer_id)
-        # Write the current chunk (stages it into the slot + persists the
-        # owned stripe), like the extend forward does before attention.
-        chunk_vals = _mla_value(
-            chunk2_locs + layer_id * 1000, _GATHER_KV_LORA_RANK + _GATHER_QK_ROPE
-        )
-        pool.set_mla_kv_buffer(
-            layer,
-            chunk2_locs,
-            chunk_vals[:, :_GATHER_KV_LORA_RANK].unsqueeze(1),
-            chunk_vals[:, _GATHER_KV_LORA_RANK:].unsqueeze(1),
-        )
-        # Chunked-prefix MHA style: fetch an arbitrary sub-range of the
-        # prefix through get_mla_kv_buffer.
-        sub = chunk1_locs[_GATHER_PAGE_SIZE // 2 : prefix_len - 3]
-        k_nope, k_rope = pool.get_mla_kv_buffer(layer, sub, _GATHER_DTYPE)
-        expect = _mla_value(
-            sub + layer_id * 1000, _GATHER_KV_LORA_RANK + _GATHER_QK_ROPE
-        )
-        _check(
-            rank,
-            f"mla prefix read l{layer_id}",
-            k_nope[:, 0, :],
-            expect[:, :_GATHER_KV_LORA_RANK],
-        )
-        _check(
-            rank,
-            f"mla prefix rope l{layer_id}",
-            k_rope[:, 0, :],
-            expect[:, _GATHER_KV_LORA_RANK:],
-        )
-        # Absorbed-MLA style (what MLA-under-CP uses): read [prefix | chunk]
-        # from get_key_buffer through the translated page table.
-        all_locs = req_to_token[0, :seq_len].long()
-        rows = pool.translate_loc_to_scratch(all_locs)
-        kv_scratch = pool.get_key_buffer(layer_id)
-        _check(
-            rank,
-            f"mla absorbed read l{layer_id}",
-            kv_scratch[rows, 0, :],
-            _mla_value(
-                all_locs + layer_id * 1000, _GATHER_KV_LORA_RANK + _GATHER_QK_ROPE
-            ),
-        )
-
-    torch.distributed.barrier()
-    if rank == 0:
-        print("PASS: MLA page-interleave shard (attn-TP axis)")
-    return pool, req_to_token, prefix_len, seq_len
-
-
-def _run_mha(rank, world, port):
-    _dist_init(rank, world, port, attn_cp_size=world)
-
-    group = get_parallel().attn_cp_group
-    assert group.world_size == world
-    # Topology-first shard-group selection: with an active CP group, both
-    # GQA and MLA shard across CP (CP replicates KV for every attention
-    # type; the TP axis is only the no-CP MLA fallback).
-    assert get_kv_shard_group(use_mla_backend=False) is group
-    assert get_kv_shard_group(use_mla_backend=True) is group
-    spec = _gather_make_spec(shard_rank=group.rank_in_group)
-
-    pool = PageInterleaveMHATokenToKVPool(
-        _GATHER_SIZE,
-        page_size=_GATHER_PAGE_SIZE,
-        dtype=_GATHER_DTYPE,
-        head_num=_GATHER_HEAD_NUM,
-        head_dim=_GATHER_HEAD_DIM,
-        layer_num=_GATHER_LAYER_NUM,
-        device=f"cuda:{rank}",
-        enable_memory_saver=False,
-        start_layer=0,
-        end_layer=_GATHER_LAYER_NUM - 1,
-        enable_alt_stream=False,
-        shard_spec=spec,
-        shard_group=group,
-    )
-    device = pool.k_buffer[0].device
-
-    def kv_value(locs, layer_id, is_v):
-        base = locs.to(torch.float32) + layer_id * 1000 + (500000 if is_v else 0)
-        return (
-            base.view(-1, 1, 1)
-            + torch.arange(_GATHER_HEAD_NUM, device=device).view(1, -1, 1) * 0.01
-            + torch.arange(_GATHER_HEAD_DIM, device=device).view(1, 1, -1) * 0.0001
-        ).to(_GATHER_DTYPE)
-
-    # ---- chunk 1 (prefix-less batch): stage + owner-persist ----------------
-    chunk1_groups = [7, 3]
-    chunk1_locs = _fake_req_to_token(chunk1_groups, 2 * _GATHER_GRANULE, device)[
-        0
-    ].long()
-    req_to_token = _fake_req_to_token(chunk1_groups, 2 * _GATHER_GRANULE, device)
-    pool.begin_shard_extend(req_to_token, torch.tensor([0]), [0], [2 * _GATHER_GRANULE])
-    for layer_id in range(_GATHER_LAYER_NUM):
-        layer = SimpleNamespace(layer_id=layer_id)
-        pool.set_kv_buffer(
-            layer,
-            chunk1_locs,
-            kv_value(chunk1_locs, layer_id, False),
-            kv_value(chunk1_locs, layer_id, True),
-        )
-        # The current chunk must be readable through the scratch right away.
-        k_scratch = pool.get_key_buffer(layer_id)
-        rows = pool.translate_loc_to_scratch(chunk1_locs)
-        _check(
-            rank,
-            f"mha chunk stage l{layer_id}",
-            k_scratch[rows],
-            kv_value(chunk1_locs, layer_id, False),
-        )
-    torch.cuda.synchronize()
-    torch.distributed.barrier()
-
-    # ---- chunk 2: prefix gathered from peers via translated page table -----
-    seq_groups = chunk1_groups + [11]
-    prefix_len = 2 * _GATHER_GRANULE
-    seq_len = prefix_len + _GATHER_GRANULE
-    req_to_token = _fake_req_to_token(seq_groups, seq_len, device)
-    chunk2_locs = req_to_token[0, prefix_len:seq_len].long()
-    pool.begin_shard_extend(req_to_token, torch.tensor([0]), [prefix_len], [seq_len])
-
-    for layer_id in range(_GATHER_LAYER_NUM):
-        layer = SimpleNamespace(layer_id=layer_id)
-        pool.set_kv_buffer(
-            layer,
-            chunk2_locs,
-            kv_value(chunk2_locs, layer_id, False),
-            kv_value(chunk2_locs, layer_id, True),
-        )
-        all_locs = req_to_token[0, :seq_len].long()
-        rows = pool.translate_loc_to_scratch(all_locs)
-        k_scratch = pool.get_key_buffer(layer_id)
-        v_scratch = pool.get_value_buffer(layer_id)
-        _check(
-            rank,
-            f"mha seq read k l{layer_id}",
-            k_scratch[rows],
-            kv_value(all_locs, layer_id, False),
-        )
-        _check(
-            rank,
-            f"mha seq read v l{layer_id}",
-            v_scratch[rows],
-            kv_value(all_locs, layer_id, True),
-        )
-
-    torch.distributed.barrier()
-    if rank == 0:
-        print("PASS: MHA page-interleave shard (attn-CP axis)")
-
-
-@unittest.skipIf(
-    torch.cuda.device_count() < 2, "page-interleave gather needs 2 CUDA devices"
-)
-class TestPageInterleaveGatherMultiGpu(CustomTestCase):
-    """Real pools, real NCCL, 2 ranks — one mp.spawn per phase.
-
-    Separate spawns (and separate ports) because each phase builds its own
-    process group with a different attention-CP width.
-    """
-
-    def test_mla_shard_over_attention_tp(self):
-        mp.spawn(_run_mla, args=(_GATHER_WORLD, 29811), nprocs=_GATHER_WORLD, join=True)
-
-    def test_mha_shard_over_attention_cp(self):
-        mp.spawn(_run_mha, args=(_GATHER_WORLD, 29812), nprocs=_GATHER_WORLD, join=True)
-
-
-def _assert_bytes(got, expected, label):
-    got = got.contiguous().view(torch.uint8)
-    expected = expected.contiguous().view(torch.uint8)
-    assert got.shape == expected.shape, label
-    assert torch.equal(got, expected), f"{label}: cache bytes differ"
-
-
-def _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len):
-    """Names of the GPU kernels and copies one sharded batch's gathers issue."""
-    torch.cuda.synchronize()
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA]
-    ) as prof:
-        pool.begin_shard_extend(
-            req_to_token, torch.tensor([0]), [prefix_len], [seq_len]
-        )
-        for layer_id in range(_GATHER_LAYER_NUM):
-            pool.get_key_buffer(layer_id)
-        torch.cuda.synchronize()
-    return [
-        event.name
-        for event in prof.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-    ]
-
-
-def _run_zero_sm_mla(rank, world, port):
-    pool, req_to_token, prefix_len, seq_len = _run_mla(rank, world, port)
-    assert pool._use_symmetric_scratch and pool._scratch_window_registered
-
-    # NCCL picks copy engines per collective, so a windowed gather can still
-    # land on ring or symmetric SM kernels; only the launched work tells.
-    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
-    nccl_kernels = sorted({name for name in activity if "nccl" in name.lower()})
-    assert not nccl_kernels, f"gather ran on NCCL SM kernels: {nccl_kernels}"
-    assert any("PtoP" in name for name in activity), "no peer copy-engine copy"
-
-    scratch_bytes = sum(
-        tensor.numel() * tensor.element_size()
-        for slot in pool._slots
-        for tensor in slot.tensors.values()
-    )
-    view = pool._slots[1].tensors["kv"]
-    # Deregistration can allocate a CUDA stream whose driver storage persists.
-    # Account for that separately from the backing allocation being released.
-    comm = pool.kv_gather_comm
-    deregister = comm.deregister_comm_window
-    taken_by_deregister = []
-
-    def measured_deregister(window):
-        free_before = torch.cuda.mem_get_info()[0]
-        deregister(window)
-        taken = free_before - torch.cuda.mem_get_info()[0]
-        taken_by_deregister.append(max(taken, 0))
-
-    comm.deregister_comm_window = measured_deregister
-    torch.cuda.synchronize()
-    torch.distributed.barrier()
-    free_with_pool = torch.cuda.mem_get_info()[0]
-    del pool
-    gc.collect()
-    torch.distributed.barrier()
-    free_with_view = torch.cuda.mem_get_info()[0]
-    assert not taken_by_deregister, "window deregistered under a live view"
-    # A peer's window maps this buffer until that peer deregisters too.
-    del view
-    gc.collect()
-    torch.distributed.barrier()
-    free_released = torch.cuda.mem_get_info()[0]
-    assert len(taken_by_deregister) == 1, "window not deregistered exactly once"
-    assert free_with_view - free_with_pool < scratch_bytes, "freed under a live view"
-    freed = free_released - free_with_view + taken_by_deregister[0]
-    assert freed >= scratch_bytes, "window buffer leaked"
-
-
-def _run_cross_node_mla(rank, world, port):
-    with unittest.mock.patch(
-        "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
-        lambda pg, source_rank: [r == source_rank for r in range(world)],
-    ):
-        pool, req_to_token, prefix_len, seq_len = _run_mla(rank, world, port)
-    assert not pool._use_symmetric_scratch and not pool._scratch_window_registered
-    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
-    assert any("nccl" in name.lower() for name in activity)
-
-
-def _run_zero_sm_allgather_comparison(rank, world, init_method):
-    """Compare the pool's in-place window contract with ordinary NCCL."""
-    torch.cuda.set_device(rank)
-    torch.distributed.init_process_group(
-        backend="gloo", rank=rank, world_size=world, init_method=init_method
-    )
-    device = torch.device(f"cuda:{rank}")
-    group = torch.distributed.group.WORLD
-    zero_sm = PyNcclCommunicator(group, device, cta_policy=NCCL_CTA_POLICY_ZERO)
-    ordinary = PyNcclCommunicator(group, device)
-    assert zero_sm.available and ordinary.available
-    max_send_bytes = 1 << 20
-
-    for dtype in (torch.uint8, torch.bfloat16, torch.float32):
-        # Both alternating slots start inside the window, rather than at its
-        # base. The input is each rank's slice of the registered receive view,
-        # exactly as in _prefetch_layer; its offset also changes with payload.
-        offsets, nbytes = _symmetric_scratch_layout(
-            {
-                "padding": ((4096,), torch.uint8),
-                "output": ((world * max_send_bytes // dtype.itemsize,), dtype),
-            },
-            num_slots=2,
-        )
-        buffer, registered = allocate_symmetric_buffer(zero_sm, nbytes)
-        assert registered, "comparison requires a real symmetric window"
-        slots = [
-            buffer[slot["output"] : slot["output"] + world * max_send_bytes].view(dtype)
-            for slot in offsets
-        ]
-        assert all(slot["output"] > 0 for slot in offsets)
-
-        def compare(slot_index, send_bytes, generation, graph=None):
-            count = send_bytes // dtype.itemsize
-            output = slots[slot_index][: world * count]
-            send = output[rank * count : (rank + 1) * count]
-            output.zero_()
-            values = (
-                (torch.arange(count, device=device, dtype=torch.int32) * 17)
-                + rank * 29
-                + generation * 31
-            ) % 251
-            send.copy_(values)
-            reference_input = send.clone()
-            reference = torch.empty_like(output)
-            if graph is None:
-                with zero_sm.change_state(enable=True):
-                    zero_sm.all_gather(output, send)
-            else:
-                graph.replay()
-            # Use the same loaded NCCL library for the ordinary baseline,
-            # with torch allocations and the default communicator policy.
-            with ordinary.change_state(enable=True):
-                ordinary.all_gather(reference, reference_input)
-            _assert_bytes(
-                output,
-                reference,
-                f"rank {rank}, {dtype}, {send_bytes} B, generation {generation}",
-            )
-
-        for send_bytes in (256, 16 << 10, max_send_bytes):
-            for generation in range(6):
-                compare(generation % 2, send_bytes, generation)
-
-        # Profile only the CE call: the ordinary baseline deliberately issues
-        # an NCCL kernel and must not contaminate the zero-SM assertion.
-        output = slots[1]
-        count = max_send_bytes // dtype.itemsize
-        send = output[rank * count : (rank + 1) * count]
-        torch.cuda.synchronize()
-        with torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CUDA]
-        ) as prof:
-            with zero_sm.change_state(enable=True):
-                zero_sm.all_gather(output, send)
-            torch.cuda.synchronize()
-        activity = [
-            event.name
-            for event in prof.events()
-            if event.device_type == torch.autograd.DeviceType.CUDA
-        ]
-        assert not any("nccl" in name.lower() for name in activity), activity
-        assert any("PtoP" in name for name in activity), activity
-
-        # Replay the same registered addresses with fresh contributions. A
-        # comparison only at capture time would miss stale peer data on replay.
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            with zero_sm.change_state(enable=True):
-                zero_sm.all_gather(output, send)
-        for generation in (7, 8, 9):
-            compare(1, max_send_bytes, generation, graph=graph)
-        del graph, send, output
-        slots.clear()
-        del buffer
-        gc.collect()
-        torch.distributed.barrier()
-
-    torch.cuda.synchronize()
-    torch.distributed.destroy_process_group()
-
-
-@unittest.skipIf(
-    torch.cuda.device_count() < 2, "page-interleave gather needs 2 CUDA devices"
-)
-class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
-    def _require_patched_nccl(self):
-        # Gate on the library used by PyNccl, which may differ from torch's.
-        if NCCLLibrary().ncclGetRawVersion() < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
-            self.skipTest("the symmetric gather scratch needs NCCL >= 2.31.2")
-
-    def _compare_allgather(self, world):
-        if torch.cuda.device_count() < world:
-            self.skipTest(f"copy-engine allgather comparison needs {world} GPUs")
-        self._require_patched_nccl()
-        with (
-            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY=None),
-            tempfile.TemporaryDirectory(prefix="sglang-zero-sm-gather-") as tmp,
-        ):
-            mp.spawn(
-                _run_zero_sm_allgather_comparison,
-                args=(world, f"file://{tmp}/rendezvous"),
-                nprocs=world,
-                join=True,
-            )
-
-    def test_copy_engine_matches_ordinary_allgather_two_gpu(self):
-        self._compare_allgather(2)
-
-    def test_copy_engine_matches_ordinary_allgather_four_gpu(self):
-        self._compare_allgather(4)
-
-    def test_copy_engine_window_gather_and_release(self):
-        """The zero-SM pool registers its scratch as a symmetric window, still
-        assembles the canonical prefix, and frees the window buffer only once
-        the pool and every scratch view are gone."""
-        self._require_patched_nccl()
-        # Clear the global override before spawning: only the dedicated
-        # gather communicator requests ZERO. cuMem enables window registration.
-        with (
-            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY=None),
-            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
-        ):
-            mp.spawn(
-                _run_zero_sm_mla,
-                args=(_GATHER_WORLD, 29811),
-                nprocs=_GATHER_WORLD,
-                join=True,
-            )
-
-    def test_cross_node_group_keeps_sm_gather(self):
-        """A shard group spanning nodes keeps the torch scratch and the SM
-        allgather, even with cuMem on."""
-        with (
-            temp_set_env(NCCL_CUMEM_ENABLE="1", NCCL_CTA_POLICY=None),
-            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
-        ):
-            mp.spawn(
-                _run_cross_node_mla,
-                args=(_GATHER_WORLD, 29811),
-                nprocs=_GATHER_WORLD,
-                join=True,
-            )
 
 
 if __name__ == "__main__":

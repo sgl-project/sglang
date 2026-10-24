@@ -757,12 +757,12 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV4_REASONING_EFFORT</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default <code>reasoning_effort</code> for the DeepSeek V4 chat encoder when a request does not set it. The preview profile accepts <code>high</code> and <code>max</code>; the official profile accepts <code>low</code>, <code>high</code>, and <code>max</code>. The profile is detected from the bundled encoder. Override it with <code>--json-model-override-args '&#123;"dsv4_reasoning_effort_profile":"official"&#125;'</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default <code>reasoning_effort</code> for DeepSeek-V4 when a request does not set it: a deepseek-recipe tier name. Unset means deepseek-recipe's default.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSV41_REASONING_EFFORT</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default <code>reasoning_effort</code> for the DeepSeek-V4.1 chat encoder when a request does not set it: one of <code>low</code>, <code>high</code>, <code>xhigh</code>, <code>max</code>, or an integer budget in [1, 100]. Unset means the encoder default <code>high</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default <code>reasoning_effort</code> for DeepSeek-V4.1 when a request does not set it: a deepseek-recipe tier name or an integer budget in [1, 100]. Unset means deepseek-recipe's default.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
     <tr>
@@ -816,7 +816,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use BF16 activations and outputs with FlashInfer CuTe DSL NVFP4 weights on NVIDIA SM100-family GPUs (SM100/SM103). Serialized dense linear layers use this mode with <code>--fp4-gemm-backend flashinfer_cutedsl</code>. With <code>--moe-runner-backend flashinfer_cutedsl</code>, MoE layers support online weight quantization and serialized ModelOpt NVFP4 weights with either no A2A or FlashInfer A2A, and honor <code>SGLANG_FLASHINFER_MOE_FUSED_FINALIZE</code>. With <code>--moe-runner-backend flashinfer_megamoe --moe-a2a-backend flashinfer_megamoe</code>, MoE layers support serialized ModelOpt NVFP4 weights and <code>--quantization nvfp4_online</code> for gated SiLU/SwiGLU or SiTU. MegaMOE uses BF16 activations and combine, with equal TP, attention-DP, and EP sizes.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use BF16 activations and outputs with FlashInfer CuTe DSL NVFP4 weights on NVIDIA SM100-family GPUs (SM100/SM103). Serialized dense linear layers use this mode with <code>--fp4-gemm-backend flashinfer_cutedsl</code>. With <code>--moe-runner-backend flashinfer_cutedsl</code>, MoE layers support online weight quantization and serialized ModelOpt NVFP4 weights with either no A2A or FlashInfer A2A, and honor <code>SGLANG_FLASHINFER_MOE_FUSED_FINALIZE</code>. With <code>--moe-runner-backend flashinfer_megamoe --moe-a2a-backend flashinfer_megamoe</code>, MoE layers support serialized ModelOpt NVFP4 weights and <code>--quantization nvfp4_online</code> for gated SiLU/SwiGLU or SiTU. MegaMOE uses BF16 activations and combine, with equal TP, attention-DP, and EP sizes. For more on the W4A16 MoE design and performance, see <a href="https://humansand.ai/blog/faster-than-light-nvfp4-decode">Faster-than-light NVFP4 decode—with precision</a> by Ziang Li at humans& ai.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>

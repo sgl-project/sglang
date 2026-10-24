@@ -326,6 +326,16 @@ _bcg_prefill_graph_full_topk = eager_on_graph(True)(_prefill_graph_full_topk)
 _bcg_low_ratio_source_projections = eager_on_graph(True)(_low_ratio_source_projections)
 
 
+def _first_rows(act, n: int):
+    """First ``n`` rows of ``act``, cut field by field for HIP's quantized activations
+    (``Mxfp8Activation``, ``Fp8GridActivation``), which refuse a slice."""
+    if isinstance(act, msgspec.Struct):
+        return msgspec.structs.replace(
+            act, **{k: getattr(act, k)[:n] for k in act.__struct_fields__}
+        )
+    return act[:n]
+
+
 def _as_int_list(values) -> Optional[List[int]]:
     if values is None:
         return None
@@ -1020,11 +1030,6 @@ def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
     if t.shape[0] == num_rows:
         return t
     return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
-
-
-# The replayed context limit when the prefill graph's metadata is built at a fixed
-# width (no two-level candidates); the candidate window, 2,048 blocks of 8 tokens.
-_PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN = 16 * 1024
 
 
 def _prefill_graph_max_seq_len() -> Optional[int]:
@@ -3167,8 +3172,9 @@ class DeepseekV4AttnBackend(
         return self.forward_metadata
 
     def _prefill_graph_context_width(self, forward_batch: ForwardBatch) -> int:
-        """One context width for the full rows' and the late-layer tail's metadata."""
-        if self._prefill_graph_replays_any_context():
+        """One context width for the full rows' and the late-layer tail's metadata:
+        the live context, unless c4/c128 compress metadata is captured at a width."""
+        if not self.has_c4 and not self.has_c128:
             seq_lens_cpu = forward_batch.seq_lens_cpu
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
                 return int(seq_lens_cpu.max().item())
@@ -3397,9 +3403,10 @@ class DeepseekV4AttnBackend(
             # extend past them; an eager break in the late-layer tail sees fewer, and
             # there extend_seq_lens still spans the whole extend.
             n = min(hoisted_pos.shape[0], positions.shape[0])
-            x, positions = x[:n], positions[:n]
-            if q_lora is not None:
-                q_lora = q_lora[:n]
+            if n < positions.shape[0]:
+                x, positions = _first_rows(x, n), positions[:n]
+                if q_lora is not None:
+                    q_lora = _first_rows(q_lora, n)
             req, pos = hoisted_req[:n], hoisted_pos[:n]
         if (
             forward_batch.forward_mode.is_extend()
@@ -3974,23 +3981,6 @@ class DeepseekV4AttnBackend(
         if published is None:
             return
         self.forward_metadata.candidate_metadata = published
-
-    def _prefill_graph_replays_any_context(self) -> bool:
-        """Whether a prefill graph replay admits any context length: with two-level
-        candidates only c4/c128 compress metadata would be captured at a width."""
-        return self.low_ratio_prefill_graph and not self.has_c4 and not self.has_c128
-
-    @property
-    def prefill_cuda_graph_default_max_seq_len(self) -> Optional[int]:
-        """DeepSeek-V4.1's fixed metadata width without two-level candidates; prefill
-        context parallelism builds its own metadata and needs none."""
-        if (
-            self.low_ratios != (1, 2)
-            or get_parallel().attn_cp_size > 1
-            or self._prefill_graph_replays_any_context()
-        ):
-            return None
-        return _PREFILL_GRAPH_DEFAULT_MAX_SEQ_LEN
 
     def _prefill_graph_seq_limit(self) -> Optional[int]:
         """The replayed context limit: cuda_graph_config[prefill].max_seq_len when

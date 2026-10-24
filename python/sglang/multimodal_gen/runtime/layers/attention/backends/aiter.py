@@ -10,6 +10,7 @@ import aiter
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.core import ENABLE_CK as _AITER_ENABLE_CK
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -362,7 +363,7 @@ class AITerImpl(AttentionImpl):
             if output is not None:
                 return output
 
-        if USE_AITER_GFX1250:
+        if USE_AITER_GFX1250 or not _AITER_ENABLE_CK:
             return self._forward_bf16_eager(query, key, value)
         return self._forward_bf16(query, key, value)
 
@@ -383,8 +384,6 @@ class AITerImpl(AttentionImpl):
             how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
 
-    # On gfx1250 flash_attn_func dispatches to a FlyDSL kernel whose Python JIT reads
-    # thread-local MLIR context state; Dynamo tracing into it fails at compile time.
     @torch.compiler.disable
     def _forward_bf16_eager(
         self,

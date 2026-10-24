@@ -661,6 +661,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         backend.prefill_candidates = object.__new__(DenseBlocksBackend)
         backend.token_to_kv_pool = SimpleNamespace(request_window=None)
         backend.low_ratios = ()
+        backend.has_c4 = backend.has_c128 = True
         calls = []
 
         def fake_build_forward_metadata(
