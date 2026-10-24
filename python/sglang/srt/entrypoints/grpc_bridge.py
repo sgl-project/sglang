@@ -439,14 +439,7 @@ class RuntimeHandle:
         )
 
     def health_check(self) -> bool:
-        from sglang.srt.managers.tokenizer_manager import ServerStatus
-
-        if self.tokenizer_manager.gracefully_exit:
-            return False
-        return self.tokenizer_manager.server_status not in (
-            ServerStatus.Starting,
-            ServerStatus.UnHealthy,
-        )
+        return self.tokenizer_manager.is_healthy()
 
     def is_pause(self) -> bool:
         """Return the tokenizer manager's authoritative generation pause state."""
