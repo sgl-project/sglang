@@ -257,5 +257,77 @@ def test_ascend_attention_unmasked_inputs_keep_fused_path(
     sdpa_forward.assert_not_called()
 
 
+@pytest.mark.parametrize("seq_lens", [(2, 4, 3), (2,), (4, 4)])
+@pytest.mark.parametrize("output_mode", ["eager", "metadata", "graph"])
+def test_ascend_attention_initializes_padding(
+    monkeypatch,
+    npu_platform,
+    seq_lens,
+    output_mode,
+):
+    monkeypatch.setenv(
+        "SGLANG_VIT_ENABLE_CUDA_GRAPH", "1" if output_mode == "graph" else "0"
+    )
+    bsz, seq_len, num_heads, head_dim = len(seq_lens), 4, 2, 8
+    shape = (bsz * seq_len, num_heads, head_dim)
+    q = torch.arange(bsz * seq_len * num_heads * head_dim).reshape(shape).float()
+    k, v = q + 1, q + 2
+    lengths = torch.tensor(seq_lens, dtype=torch.int32)
+    cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int32), lengths.cumsum(0)])
+    valid_mask = (torch.arange(seq_len)[None, :] < lengths[:, None]).flatten()
+
+    empty_like = torch.empty_like
+    monkeypatch.setattr(
+        torch,
+        "empty_like",
+        lambda *args, **kwargs: empty_like(*args, **kwargs).fill_(float("nan")),
+    )
+    workspace = torch.full_like(q, float("nan"))
+
+    def fake_fused_attention(**kwargs):
+        torch.testing.assert_close(kwargs["query"], q[valid_mask])
+        torch.testing.assert_close(kwargs["key"], k[valid_mask])
+        torch.testing.assert_close(kwargs["value"], v[valid_mask])
+        assert kwargs["actual_seq_lengths"] == cu_seqlens[1:].tolist()
+        assert kwargs["actual_seq_lengths_kv"] == cu_seqlens[1:].tolist()
+        return kwargs["value"] + 1, None
+
+    monkeypatch.setattr(
+        vision,
+        "torch_npu",
+        SimpleNamespace(npu_fused_infer_attention_score=fake_fused_attention),
+        raising=False,
+    )
+    backend = vision.VisionAscendAttention(
+        head_dim=head_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+    )
+    kwargs = {}
+    if output_mode == "metadata":
+        kwargs["forward_metadata"] = vision.VisionAttentionMetadata(
+            cu_seqlens=cu_seqlens, seq_lens=lengths, max_seqlen=max(seq_lens)
+        )
+    elif output_mode == "graph":
+        kwargs["output_ws"] = workspace
+
+    output = backend(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens=cu_seqlens[1:] if output_mode == "graph" else cu_seqlens,
+        bsz=bsz,
+        seq_len=seq_len,
+        **kwargs,
+    )
+
+    expected = torch.zeros_like(v)
+    expected[valid_mask] = v[valid_mask] + 1
+    torch.testing.assert_close(output, expected)
+    assert torch.isfinite(output).all()
+    if output_mode == "graph" and not valid_mask.all():
+        assert output is workspace
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
