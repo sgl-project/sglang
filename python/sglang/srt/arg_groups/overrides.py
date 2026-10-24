@@ -1095,6 +1095,67 @@ def _deterministic_attention_backend(view: Any) -> dict:
         return {}
     from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
 
+    decode_choices = list(DETERMINISTIC_ATTENTION_BACKEND_CHOICES)
+    decode_note = ""
+    if view.decode_attention_backend == "aiter":
+        # AITER paged decode reduces fixed 256-token KV partitions per request, so it is
+        # batch-invariant (verified on gfx950); MLA decode sizes its KV splits by batch
+        # size, and speculative decoding would run AITER's unverified verify kernels.
+        if (
+            is_gfx95_supported()
+            and not use_mla_backend(view)
+            and view.speculative_algorithm is None
+        ):
+            decode_choices.append("aiter")
+        else:
+            decode_note = (
+                " (aiter decode is accepted only on gfx950, for non-MLA models and "
+                "without speculative decoding)"
+            )
+
+    prefill_choices = list(DETERMINISTIC_ATTENTION_BACKEND_CHOICES)
+    prefill_note = ""
+    if view.prefill_attention_backend == "aiter":
+        # AITER batch prefill is batch-invariant when every call gets the same
+        # max_seqlen_q (the backend fixes it) and every split of a prompt, at a chunk
+        # end or a cached prefix, falls on its 128-row query tile (page size 128,
+        # _deterministic_aiter_prefill_page_size). Verified on gfx950.
+        # The fp8 KV-cache prefill kernel was not batch-invariant in the same tests.
+        if (
+            is_gfx95_supported()
+            and not use_mla_backend(view)
+            and view.speculative_algorithm is None
+            and view.kv_cache_dtype in ("auto", "bf16", "bfloat16")
+        ):
+            prefill_choices.append("aiter")
+        else:
+            prefill_note = (
+                " (aiter prefill is accepted only on gfx950, for non-MLA models, "
+                "without speculative decoding and with a bf16 KV cache)"
+            )
+
+    # A per-phase backend overrides --attention-backend for its phase. Unset (None)
+    # means the phase uses --attention-backend, which is checked below.
+    for flag, backend, choices, note in (
+        (
+            "--prefill-attention-backend",
+            view.prefill_attention_backend,
+            prefill_choices,
+            prefill_note,
+        ),
+        (
+            "--decode-attention-backend",
+            view.decode_attention_backend,
+            decode_choices,
+            decode_note,
+        ),
+    ):
+        if backend is not None and backend not in choices:
+            raise ValueError(
+                f"Currently only {choices} attention backends are supported for deterministic inference, "
+                f"but {flag} is '{backend}'{note}."
+            )
+
     if view.attention_backend is None:
         # User didn't specify attention backend, fallback based on GPU architecture
         if get_platform().is_sm100 or get_platform().is_sm120:
@@ -1334,6 +1395,31 @@ def _intel_xpu_page_constraint(view: Any) -> dict:
                 f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."
             )
             return {"page_size": 128}
+    return {}
+
+
+@register_post_process
+def _deterministic_aiter_prefill_page_size(view: Any) -> dict:
+    # AITER batch prefill gives a row the same bits however its prompt is split only
+    # when the split falls on a multiple of its 128-row query tile. Page size 128 puts
+    # radix-cache prefixes and chunk ends there.
+    if not (
+        view.enable_deterministic_inference
+        and view.prefill_attention_backend == "aiter"
+    ):
+        return {}
+    chunk = view.chunked_prefill_size
+    if chunk is not None and chunk > 0 and chunk % 128 != 0:
+        raise ValueError(
+            "Deterministic inference with aiter prefill attention needs a "
+            f"--chunked-prefill-size that is a multiple of 128, got {chunk}."
+        )
+    if view.page_size is None or view.page_size % 128 != 0:
+        logger.warning(
+            "Deterministic inference with aiter prefill attention needs a page_size "
+            f"that is a multiple of 128, changing page_size from {view.page_size} to 128."
+        )
+        return {"page_size": 128}
     return {}
 
 

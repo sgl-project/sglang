@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.overrides import (
     _attention_backend_fa3_fp8_fallback,
     _attention_backend_platform_fallbacks,
     _cutedsl_prefill_backend_fill,
+    _deterministic_aiter_prefill_page_size,
     _deterministic_allreduce_fusion_disable,
     _deterministic_attention_backend,
     _deterministic_rocm_rccl_check,
@@ -276,6 +277,8 @@ def handle_attention_backend_compatibility(server_args: Any):
         _check_xpu_dcp(server_args, model_config)
 
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
+
+    run_post_process_pass(server_args, _deterministic_aiter_prefill_page_size)
 
 
 def handle_linear_attn_backend(server_args: Any):

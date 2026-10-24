@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 
 """
 end to end attention solution with aiter kernels
@@ -531,6 +531,27 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.use_triton_unified_attention = get_bool_env_var(
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
+            )
+        # Deterministic mode allows aiter decode only for the paged_attention_ragged
+        # path and aiter prefill only for the batch prefill path; the unified-attention
+        # and 5D-pool kernels are not verified batch-invariant.
+        if get_exec().deterministic.enable_deterministic_inference and (
+            self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
+        ):
+            raise ValueError(
+                "Deterministic inference supports aiter attention only with the "
+                "default paged KV cache: not with sliding-window models, "
+                "SGLANG_USE_AITER_UNIFIED_ATTN or a vectorized 5D KV cache layout."
+            )
+
+        # Deterministic mode: AITER batch prefill's output depends on max_seqlen_q (it
+        # sizes the launch, and 1 selects a non-causal mask), so every call gets the
+        # same value, one that covers any extend: at most one chunk.
+        self.deterministic_prefill_max_q = None
+        if get_exec().deterministic.enable_deterministic_inference:
+            chunk = get_schedule().chunked_prefill_size
+            self.deterministic_prefill_max_q = (
+                chunk if chunk is not None and chunk > 0 else self.max_context_len
             )
 
         # Decode metadata format. unified_attention and pa_decode_gluon (the
@@ -4616,6 +4637,9 @@ class AiterAttnBackend(AttentionBackend):
                 v_cache = v_cache.view(-1, self.page_size, *v_cache.shape[-2:])
                 extra_kwargs["kv_last_page_lens"] = last_page_len[: bs0 - 1]
 
+            max_q_len = self.forward_metadata.max_q_len
+            if self.deterministic_prefill_max_q is not None:
+                max_q_len = max(max_q_len, self.deterministic_prefill_max_q)
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
@@ -4623,7 +4647,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata.qo_indptr[:bs0],
                 kv_indptr_arg,
                 page_table,
-                self.forward_metadata.max_q_len,
+                max_q_len,
                 self.forward_metadata.max_kv_len,
                 causal=True,
                 logits_soft_cap=self.logits_soft_cap,
