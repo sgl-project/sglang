@@ -350,7 +350,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             model_runner.model_config.hf_config
         )
         self._qwen_bcg_hc_sidechannel = qwen_bcg and not model_runner.is_draft_worker
-        self._qwen_bcg_mtp_draft = qwen_bcg and model_runner.is_draft_worker
+        # With speculative decoding on, the draft runner refuses multimodal
+        # batches and, under DP attention, follows the target's replay vote, so
+        # the target refuses them too. Algorithms without a draft model (NGRAM)
+        # keep refusing as well.
+        self._qwen_bcg_multimodal_eager = (
+            qwen_bcg and model_runner.spec_algorithm.is_speculative()
+        )
         self.prefer_eager_mixed_prefill = (
             self.prefill_backend_name == Backend.BREAKABLE
             and get_parallel().attn_dp_enabled
@@ -1345,9 +1351,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             batch_size, num_tokens, prefix_lens, contains_mm_inputs
         ):
             return False
-        if contains_mm_inputs and (
-            self._qwen_bcg_hc_sidechannel or self._qwen_bcg_mtp_draft
-        ):
+        if contains_mm_inputs and self._qwen_bcg_multimodal_eager:
             return False
         # Full replay bypasses forward_extend's Python image-mask guard.
         # Keep FA4 multimodal prefill eager until its full-graph path is
