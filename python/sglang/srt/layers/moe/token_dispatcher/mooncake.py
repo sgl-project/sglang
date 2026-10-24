@@ -164,8 +164,11 @@ class _MooncakeEPDispatcherImpl:
         self.first_execution = True
         self.timeout_us = 10000000
         self._all_ranks_active = None
-        # The Intel XPU expert path is a BF16 bmm (no FP8 masked GEMM).
+        # The Intel XPU expert path is a BF16 GEMM (no FP8 masked GEMM).
         self.dispatch_use_fp8 = not is_xpu()
+        # On XPU, given the top-k weights at dispatch, the combine sums each
+        # token's rows on the expert side, halving its transfers.
+        self.dispatch_with_topk_weights = is_xpu()
 
         self.handle = None
 
@@ -185,6 +188,12 @@ class _MooncakeEPDispatcherImpl:
             hidden_states,
             topk_ids,
             use_fp8=self.dispatch_use_fp8,
+            # Combine is called with these same weights.
+            topk_weights=(
+                topk_weights.float().contiguous()
+                if self.dispatch_with_topk_weights
+                else None
+            ),
         )
         return (
             hidden_states,
@@ -231,6 +240,7 @@ class _MooncakeEPDispatcherImpl:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         use_fp8: bool = False,
+        topk_weights: Optional[torch.Tensor] = None,
     ):
         buffer = self._get_buffer()
         active_ranks = self._get_active_ranks()
@@ -245,6 +255,7 @@ class _MooncakeEPDispatcherImpl:
                 use_fp8=use_fp8,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
+                **({} if topk_weights is None else {"topk_weights": topk_weights}),
             )
         )
         return packed_recv_hidden, packed_recv_count, event, hook
