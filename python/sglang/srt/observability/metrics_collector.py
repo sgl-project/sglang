@@ -1775,6 +1775,24 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
 
+def tokenizer_metric_labels() -> Dict[str, str]:
+    """The labels on every ``TokenizerMetricsCollector`` metric. The priority
+    and custom labels start empty; each request fills them in."""
+    labels = {
+        "model_name": get_serving().served_model_name,
+        "engine_type": DisaggregationMode.to_engine_type(
+            get_disagg().disaggregation_mode
+        ),
+    }
+    if get_schedule().enable_priority_scheduling:
+        labels["priority"] = ""
+    for label in get_observability().tokenizer_metrics_allowed_custom_labels or ():
+        labels[label] = ""
+    if get_observability().extra_metric_labels:
+        labels.update(get_observability().extra_metric_labels)
+    return labels
+
+
 class TokenizerMetricsCollector(_StatLoggerDIMixin):
     def __init__(
         self,
