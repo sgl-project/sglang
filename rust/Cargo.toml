@@ -42,6 +42,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"
+tonic-health = "0.14"
 tonic-build = "0.14"
 tonic-prost = "0.14"
 tower = { version = "0.5", features = ["util"] }

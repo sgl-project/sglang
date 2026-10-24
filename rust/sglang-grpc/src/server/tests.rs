@@ -1,10 +1,16 @@
 use super::{
-    DEFAULT_GRPC_MAX_MESSAGE_SIZE, openai_status_code, resolve_max_message_size,
-    terminal_error_status,
+    DEFAULT_GRPC_MAX_MESSAGE_SIZE, HealthState, INFERENCE_HEALTH_SERVICE, LIVENESS_HEALTH_SERVICE,
+    openai_status_code, publish_health, publish_shutdown_health, resolve_max_message_size,
+    serving_status, terminal_error_status,
 };
 use crate::bridge::TerminalError;
 use std::collections::HashMap;
-use tonic::Code;
+use tokio_stream::StreamExt;
+use tonic::{Code, Request};
+use tonic_health::pb::HealthCheckRequest;
+use tonic_health::pb::health_check_response::ServingStatus as WireServingStatus;
+use tonic_health::pb::health_server::Health;
+use tonic_health::server::{HealthReporter, HealthService};
 
 // The metadata wire test starts a real server that reads SGLANG_TONIC_PAYLOAD.
 // Keep that read separate from the environment override test below.
@@ -79,6 +85,87 @@ fn resolve_max_message_size_honors_env_var() {
     }
 }
 
+#[test]
+fn standard_health_mapping_covers_all_engine_states() {
+    for (healthy, is_pause, inference, liveness) in [
+        (true, false, true, true),
+        (true, true, false, true),
+        (false, false, false, false),
+        (false, true, false, false),
+    ] {
+        assert_eq!(
+            HealthState::from_engine_state(healthy, is_pause),
+            HealthState {
+                inference: serving_status(inference),
+                liveness: serving_status(liveness),
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn standard_health_reports_pause_and_shutdown() {
+    let ready = HealthState::from_engine_state(true, false);
+    let mut reporter = HealthReporter::new();
+    reporter.clear_service_status("").await;
+    publish_health(&reporter, None, ready).await;
+    let service = HealthService::from_health_reporter(reporter.clone());
+
+    let watch = |name: &str| {
+        Request::new(HealthCheckRequest {
+            service: name.to_owned(),
+        })
+    };
+    let mut inference = service
+        .watch(watch(INFERENCE_HEALTH_SERVICE))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut liveness = service
+        .watch(watch(LIVENESS_HEALTH_SERVICE))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        inference.next().await.unwrap().unwrap().status(),
+        WireServingStatus::Serving
+    );
+    assert_eq!(
+        liveness.next().await.unwrap().unwrap().status(),
+        WireServingStatus::Serving
+    );
+
+    let paused = HealthState::from_engine_state(true, true);
+    publish_health(&reporter, Some(ready), paused).await;
+    assert_eq!(
+        inference.next().await.unwrap().unwrap().status(),
+        WireServingStatus::NotServing
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), liveness.next())
+            .await
+            .is_err()
+    );
+
+    publish_health(&reporter, Some(paused), ready).await;
+    assert_eq!(
+        inference.next().await.unwrap().unwrap().status(),
+        WireServingStatus::Serving
+    );
+
+    publish_shutdown_health(&mut reporter, ready).await;
+    assert_eq!(
+        inference.next().await.unwrap().unwrap().status(),
+        WireServingStatus::NotServing
+    );
+    assert_eq!(
+        liveness.next().await.unwrap().unwrap().status(),
+        WireServingStatus::NotServing
+    );
+    assert!(inference.next().await.is_none());
+    assert!(liveness.next().await.is_none());
+}
+
 #[tokio::test]
 async fn follower_metadata_server_exposes_only_server_info_and_shuts_down() {
     use sglang_api_types::runtime::v1::{GetServerInfoRequest, GetServerInfoResponse};
@@ -114,7 +201,14 @@ async fn follower_metadata_server_exposes_only_server_info_and_shuts_down() {
     };
     let handle = std::thread::spawn(move || {
         runtime
-            .block_on(super::serve_grpc(listener, service, server_shutdown, None))
+            .block_on(super::serve_grpc(
+                listener,
+                service,
+                server_shutdown,
+                None,
+                None,
+                None,
+            ))
             .unwrap();
     });
     assert!(!handle.is_finished());
