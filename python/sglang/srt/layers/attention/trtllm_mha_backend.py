@@ -32,7 +32,9 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferMultiStepDraftBackend
+from sglang.srt.layers.attention.flashinfer_backend import (
+    FlashInferMultiStepDraftBackend,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
