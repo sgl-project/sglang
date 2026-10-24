@@ -24,6 +24,10 @@ from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_e
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_mps, is_npu
+from sglang.srt.utils.field_validators import (
+    get_contained_path,
+    validate_filename_component,
+)
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
@@ -118,6 +122,15 @@ class SchedulerProfilerManager:
                 detailed_annotations=detailed_annotations,
             )
 
+        try:
+            validate_filename_component(profile_prefix, "profile_prefix")
+            validate_filename_component(profile_id, "profile_id")
+            if profile_stages:
+                for stage in profile_stages:
+                    validate_filename_component(stage, "profile_stage")
+        except ValueError as e:
+            return ProfileReqOutput(success=False, message=str(e))
+
         if self.profile_in_progress:
             return ProfileReqOutput(
                 success=False,
@@ -207,7 +220,7 @@ class SchedulerProfilerManager:
 
             rpdTracerControl.skipCreate()
 
-            self.rpd_profile_path = os.path.join(
+            self.rpd_profile_path = get_contained_path(
                 self.torch_profiler_output_dir,
                 "rpd-"
                 + str(time.time())
@@ -358,9 +371,10 @@ class SchedulerProfilerManager:
                     + ".trace.json.gz"
                 )
 
-                self.torch_profiler.export_chrome_trace(
-                    os.path.join(self.torch_profiler_output_dir, filename)
+                trace_path = get_contained_path(
+                    self.torch_profiler_output_dir, filename
                 )
+                self.torch_profiler.export_chrome_trace(trace_path)
             torch.distributed.barrier(self.dp_tp_cpu_group)
 
         if self.rpd_profiler is not None:
@@ -377,13 +391,15 @@ class SchedulerProfilerManager:
             self.rpd_profile_path = None
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
-            memory_profile_path = os.path.join(
-                self.torch_profiler_output_dir,
+            mem_filename = (
                 stage_prefix
                 + str(time.time())
                 + f"-TP-{get_parallel().tp_rank}-memory"
                 + stage_suffix
-                + ".pickle",
+                + ".pickle"
+            )
+            memory_profile_path = get_contained_path(
+                self.torch_profiler_output_dir, mem_filename
             )
             torch.cuda.memory._dump_snapshot(memory_profile_path)
             torch.cuda.memory._record_memory_history(enabled=None)

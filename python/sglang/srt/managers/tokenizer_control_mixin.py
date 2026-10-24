@@ -96,6 +96,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     normalize_serialized_named_tensor_payloads,
 )
+from sglang.srt.utils.field_validators import validate_filename_component
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.utils import TypeBasedDispatcher
 
@@ -411,6 +412,11 @@ class TokenizerControlMixin:
         )
         req.record_shapes = (req.record_shapes is not False) and env_record_shapes
         req.profile_id = req.profile_id or str(time.time())
+        validate_filename_component(req.profile_prefix, "profile_prefix")
+        validate_filename_component(req.profile_id, "profile_id")
+        if req.profile_stages:
+            for stage in req.profile_stages:
+                validate_filename_component(stage, "profile_stages element")
         return await self._execute_profile(req)
 
     async def stop_profile(self: TokenizerManager):

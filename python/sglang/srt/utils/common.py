@@ -110,6 +110,10 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
+from sglang.srt.utils.field_validators import (  # noqa: F401
+    get_contained_path,
+    validate_filename_component,
+)
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 

@@ -1,6 +1,8 @@
 import unittest
 
 from sglang.srt.utils.field_validators import (
+    get_contained_path,
+    validate_filename_component,
     validate_list_i64_1d,
     validate_optional_list_i64_1d_2d,
 )
@@ -95,6 +97,58 @@ class TestValidateOptionalListI64_1d_2d(CustomTestCase):
     def test_reject_overflow_in_2d_reports_index(self):
         with self.assertRaisesRegex(ValueError, "row 0:.*non-int64"):
             validate_optional_list_i64_1d_2d([[2**63], [1, 2]])
+
+
+class TestValidateFilenameComponent(CustomTestCase):
+    """`validate_filename_component` rejects path separators, absolute paths, and traversal."""
+
+    def test_accept_valid(self):
+        for name in (
+            "my_profile",
+            "prefix-123",
+            "run.2026.10",
+            "17288888.12",
+            None,
+            "",
+        ):
+            with self.subTest(name=name):
+                validate_filename_component(name, "test_field")
+
+    def test_reject_traversal(self):
+        for bad in ("../escaped", "..", "foo/../bar", "..\\bad"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(
+                    ValueError, "Must be a safe filename component"
+                ):
+                    validate_filename_component(bad, "profile_prefix")
+
+    def test_reject_path_separators(self):
+        for bad in ("/tmp/evil", "foo/bar", "foo\\bar", "\\escaped"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(
+                    ValueError, "Must be a safe filename component"
+                ):
+                    validate_filename_component(bad, "profile_prefix")
+
+    def test_reject_null_byte(self):
+        with self.assertRaisesRegex(ValueError, "Must be a safe filename component"):
+            validate_filename_component("evil\0file", "profile_id")
+
+
+class TestGetContainedPath(CustomTestCase):
+    """`get_contained_path` ensures the target path remains strictly within base_dir."""
+
+    def test_valid_contained_path(self):
+        base_dir = "/tmp/profiler_dir"
+        p = get_contained_path(base_dir, "my_run-TP-0.trace.json.gz")
+        self.assertTrue(p.endswith("my_run-TP-0.trace.json.gz"))
+
+    def test_reject_escaping_path(self):
+        base_dir = "/tmp/profiler_dir"
+        for bad_filename in ("../escaped.trace.json.gz", "/etc/shadow", "../../bad"):
+            with self.subTest(filename=bad_filename):
+                with self.assertRaisesRegex(ValueError, "escapes output directory"):
+                    get_contained_path(base_dir, bad_filename)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,12 @@ class TestProfileMerger(CustomTestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    def test_reject_traversal_profile_id(self):
+        for bad_id in ("../escaped", "/tmp/bad", "bad/id", "bad\\id", "bad\0id"):
+            with self.subTest(profile_id=bad_id):
+                with self.assertRaises(ValueError):
+                    ProfileMerger(self.temp_dir, bad_id)
+
     def test_rank_extraction_and_labeling(self):
         # Test TP-only
         filename = f"{self.profile_id}-TP-0.trace.json.gz"

@@ -8,6 +8,11 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from sglang.srt.utils.field_validators import (
+    get_contained_path,
+    validate_filename_component,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -15,9 +20,10 @@ class ProfileMerger:
     """Merge profile traces from all parallelism types: TP, DP, PP, EP."""
 
     def __init__(self, output_dir: str, profile_id: str):
+        validate_filename_component(profile_id, "profile_id")
         self.output_dir = output_dir
         self.profile_id = profile_id
-        self.merged_trace_path = os.path.join(
+        self.merged_trace_path = get_contained_path(
             output_dir, f"merged-{profile_id}.trace.json.gz"
         )
 
