@@ -67,7 +67,13 @@ def test_session_release_reaches_owner_over_zmq(client_type):
                 session_id = f"session-{index}"
                 chunks = [
                     await forward(
-                        [Req(realtime_session_id=session_id, block_idx=block)]
+                        [
+                            Req(
+                                prompt="a pear",
+                                realtime_session_id=session_id,
+                                block_idx=block,
+                            )
+                        ]
                     )
                     for block in range(2)
                 ]
@@ -76,7 +82,7 @@ def test_session_release_reaches_owner_over_zmq(client_type):
                 assert chunks[1].output["replica"] == owner
 
                 # unrelated traffic must not change session cleanup ownership
-                ordinary = await forward([Req()])
+                ordinary = await forward([Req(prompt="a pear")])
                 assert ordinary.output["replica"] == index % 2
                 for expected_released in (True, False):
                     release = await forward(ReleaseRealtimeSessionReq(session_id))
