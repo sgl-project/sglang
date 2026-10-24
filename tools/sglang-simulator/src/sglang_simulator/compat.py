@@ -116,6 +116,21 @@ def apply_simulator_server_args(target) -> None:
         setattr(target, name, value)
 
 
+def resolve_simulator_server_args(server_args) -> None:
+    """Run native deferred resolution before launching or reading declarations.
+
+    Native ServerArgs construction preserves raw input. Its resolve_once method
+    is the owner of model defaults, speculative handlers and resolved overlays.
+    Never write those decisions into the raw record in the simulator.
+    """
+    resolve = getattr(server_args, "resolve_once", None)
+    if not callable(resolve):
+        raise SGLangCompatibilityError(
+            "SGLang Simulator requires native ServerArgs.resolve_once"
+        )
+    resolve()
+
+
 def validate_simulator_server_args(server_args) -> None:
     """Fail early if a process bypassed a simulator-owned launch entry point."""
     if endpoint := os.getenv("SGLANG_SIMULATOR_COORDINATOR"):
