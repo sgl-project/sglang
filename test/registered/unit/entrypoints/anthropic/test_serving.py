@@ -17,6 +17,9 @@ from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from sglang.srt.entrypoints.openai.chat_encoding import (  # noqa: E402
+    spec_supports_inline_system,
+)
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -1574,6 +1577,25 @@ class TestAnthropicServing(unittest.TestCase):
             ["system", "user", "system", "user"],
         )
         self.assertEqual(converted.messages[0].content, "Stable instructions")
+
+    def test_dsv41_uses_the_native_inline_system_encoder(self):
+        """DeepSeek-V4.1-Flash ships no ``chat_template`` and renders the conversation
+        with its own encoder, so the Jinja probe cannot answer for it: the encoder
+        converts the message list itself, so a system turn past index 0 stays where
+        it is. The allowlist has to answer for it, otherwise Messages hoists the turn
+        into the leading system block and the prompt prefix changes on every turn,
+        which is what defeats the radix cache."""
+        self.assertTrue(spec_supports_inline_system("dsv41"))
+        self.assertTrue(spec_supports_inline_system("kimi_k3"))
+        # Inkling renders prompt ids natively, but its inline-system handling is
+        # unverified, so it stays out of the allowlist.
+        self.assertFalse(spec_supports_inline_system("inkling"))
+        self.assertFalse(spec_supports_inline_system(None))
+
+        chat = _FakeOpenAIServingChat(chat_template=None)
+        chat.supports_inline_system = spec_supports_inline_system("dsv41")
+        serving = AnthropicServing(chat)
+        self.assertFalse(serving._merge_inline_system)
 
     def test_top_level_system_only_is_unchanged(self):
         """A request with only the top-level ``system`` field (no in-messages
