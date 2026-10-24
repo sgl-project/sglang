@@ -2037,6 +2037,12 @@ class Envs:
     # 2 is the accuracy-safe default: higher values reuse staler selections
     # in the skip layers.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # Repeating group sizes. Each number is one group: the first layer
+    # searches, and the next (number - 1) layers reuse that top-k.
+    # "2,3", "3,4", and "4,5" all work, and so does any longer list.
+    # The list repeats across the sparse layers. Leave this empty to keep
+    # the fixed group size from INDEX_TOPK_FREQ. ROCm gfx95 only.
+    SGLANG_MINIMAX_M3_INDEX_TOPK_PATTERN = EnvTuple(tuple())
     # Opt-in gfx950 TP4 decode indexer context partitioning. Keeps the index
     # cache replicated; gathers Q and exchanges local top-k candidates.
     SGLANG_MINIMAX_M3_INDEXER_CP = EnvBool(False)
