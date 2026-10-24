@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import (
     HiCacheL3Cleaner,
@@ -181,12 +182,127 @@ class TestHiCacheL3Cleaner(CustomTestCase):
         default_config = NixlBackendConfig().get_l3_cleaner_config()
         self.assertTrue(default_config["enabled"])
 
+    def test_nixl_config_parses_l3_cleaner_capacity(self):
+        """The capacity budget is optional and must be positive."""
+        self.assertIsNone(NixlBackendConfig().get_l3_cleaner_config()["capacity_gb"])
+        cfg = NixlBackendConfig({"l3_cleaner_capacity_gb": "512"})
+        self.assertEqual(cfg.get_l3_cleaner_config()["capacity_gb"], 512.0)
+        self.assertEqual(cfg.get_backend_initparams("POSIX"), {})
+        with self.assertRaises(ValueError):
+            NixlBackendConfig({"l3_cleaner_capacity_gb": 0}).get_l3_cleaner_config()
+
     def test_nixl_config_rejects_non_boolean_l3_cleaner_enabled(self):
         """Cleaner enablement uses native config booleans only."""
         cfg = NixlBackendConfig({"l3_cleaner_enabled": "false"})
 
         with self.assertRaises(ValueError):
             cfg.get_l3_cleaner_config()
+
+
+def _fake_statvfs(used_pct: float, total_bytes: int = 1 << 40):
+    """Return a statvfs stand-in for a filesystem at ``used_pct`` usage."""
+    frsize = 4096
+    blocks = total_bytes // frsize
+    bavail = int(blocks * (100.0 - used_pct) / 100.0)
+    return lambda _path: os.statvfs_result(
+        (frsize, frsize, blocks, bavail, bavail, 0, 0, 0, 0, 255)
+    )
+
+
+class TestHiCacheL3CleanerCapacity(CustomTestCase):
+    """Watermarks on a nearly full shared volume, with and without a budget."""
+
+    GROUPS = 10
+    FILE_SIZE = 1000
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="test_nixl_l3_cleaner_cap_")
+        self.base_dirs = [os.path.join(self.test_dir, f"disk{i}") for i in range(2)]
+        self.file_manager = NixlFileManager(self.base_dirs, use_direct_io=False)
+        # Ten logical groups (two TP-rank files each), group i has mtime 100+i.
+        self.group_paths = []
+        for i in range(self.GROUPS):
+            paths = []
+            for rank in range(2):
+                path = self.file_manager.get_file_path(f"page-{i:02d}_model_{rank}_2")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(b"x" * self.FILE_SIZE)
+                os.utime(path, (100.0 + i, 100.0 + i))
+                paths.append(path)
+            self.group_paths.append(paths)
+        self.own_bytes = self.GROUPS * 2 * self.FILE_SIZE
+        # Other tenants' data keeps the shared volume at 90% regardless of what
+        # the cleaner deletes.
+        self.statvfs_patch = mock.patch(
+            "sglang.srt.mem_cache.storage.nixl.nixl_cleaner.os.statvfs",
+            _fake_statvfs(90.0),
+        )
+        self.statvfs_patch.start()
+
+    def tearDown(self):
+        self.statvfs_patch.stop()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _cleaner(self, capacity_bytes=None) -> HiCacheL3Cleaner:
+        return HiCacheL3Cleaner(
+            self.base_dirs,
+            tp_rank=0,
+            high_watermark=80.0,
+            low_watermark=70.0,
+            recheck_groups=1,
+            unlink_workers=1,
+            capacity_gb=(
+                capacity_bytes / (1024**3) if capacity_bytes is not None else None
+            ),
+        )
+
+    def _surviving_groups(self) -> list[int]:
+        return [
+            i
+            for i, paths in enumerate(self.group_paths)
+            if all(os.path.exists(path) for path in paths)
+        ]
+
+    def test_without_capacity_uses_filesystem_usage(self):
+        """Default mode keeps statvfs semantics: a full shared volume empties L3."""
+        cleaner = self._cleaner()
+        with self.assertLogs(
+            "sglang.srt.mem_cache.storage.nixl.nixl_cleaner", level="WARNING"
+        ) as logs:
+            self.assertTrue(cleaner._tick())
+            self.assertFalse(cleaner._tick())
+        self.assertEqual(self._surviving_groups(), [])
+        shared_warnings = [
+            line for line in logs.output if "l3_cleaner_capacity_gb" in line
+        ]
+        self.assertEqual(len(shared_warnings), 1)
+
+    def test_capacity_below_high_watermark_keeps_everything(self):
+        """Own usage at 50% of the budget deletes nothing on a 90% full volume."""
+        cleaner = self._cleaner(capacity_bytes=2 * self.own_bytes)
+        self.assertFalse(cleaner._tick())
+        self.assertEqual(self._surviving_groups(), list(range(self.GROUPS)))
+
+    def test_capacity_above_high_watermark_deletes_oldest_to_low_watermark(self):
+        """Own usage at 100% deletes oldest groups until below 70% of budget."""
+        cleaner = self._cleaner(capacity_bytes=self.own_bytes)
+        self.assertTrue(cleaner._tick())
+        # Each group is 10% of the budget: 100% -> 60% after four groups.
+        self.assertEqual(self._surviving_groups(), list(range(4, self.GROUPS)))
+        self.assertFalse(cleaner._tick())
+        self.assertEqual(self._surviving_groups(), list(range(4, self.GROUPS)))
+
+    def test_capacity_skips_scan_when_filesystem_usage_is_below_budget(self):
+        """Used bytes on the filesystem bound own usage, so no scan is needed."""
+        cleaner = self._cleaner(capacity_bytes=1 << 50)
+        with mock.patch.object(cleaner, "_scan_base_dir") as scan:
+            self.assertFalse(cleaner._tick())
+        scan.assert_not_called()
+
+    def test_rejects_non_positive_capacity(self):
+        with self.assertRaises(ValueError):
+            HiCacheL3Cleaner(self.base_dirs, tp_rank=0, capacity_gb=0)
 
 
 if __name__ == "__main__":
