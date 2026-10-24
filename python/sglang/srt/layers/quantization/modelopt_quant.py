@@ -460,7 +460,8 @@ class ModelOptFp8Config(ModelOptQuantConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 89  # Minimum hardware capability (e.g., Hopper GPUs).
+        # SM80-SM88 have no FP8 tensor cores; linear layers fall back to FP8 Marlin.
+        return 80
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> ModelOptFp8Config:
@@ -1103,6 +1104,12 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
     """
 
     def __init__(self, quant_config: ModelOptFp8Config):
+        # FP8 Marlin covers linear layers only; no FP8 MoE runner supports SM80-SM88.
+        if can_auto_enable_marlin_fp8():
+            raise ValueError(
+                "ModelOpt FP8 MoE requires SM89+; on SM80-SM88 only dense "
+                "ModelOpt FP8 models are supported."
+            )
         self.quant_config = quant_config
         self.cutlass_fp8_supported = cutlass_fp8_supported()
 
