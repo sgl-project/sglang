@@ -330,8 +330,19 @@ jobs:
     secrets: inherit
 
   multimodal-gen-test-1-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') }}
+    needs:
+      [
+        check-changes,
+        pr-gate,
+        set-image-config,
+        base-a-test-npu,
+        base-a-test-npu-cov,
+        recommend-tests-from-coverage,
+      ]
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') &&
+      needs.recommend-tests-from-coverage.outputs.should_run_multimodal_gen_test_1_npu_a3 != 'false' }}
     runs-on: linux-aarch64-a3-800t-2
     strategy:
       fail-fast: false
@@ -389,6 +400,7 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
+          ONLY_TESTS: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_multimodal_gen_test_1_npu_a3 }}
         run: |
           # Coverage mode: enumerate this shard's targets with an NPU-only CI
           # helper (it reuses the shared diffusion runner read-only) and run
@@ -420,11 +432,43 @@ jobs:
             exit 0
           fi
 
+          # Precision mode: ONLY_TESTS holds one pytest -k token per line
+          # ('[case_id]' for parametrized cases, a file stem for standalone
+          # files). It is empty when nothing was recommended, precision mode
+          # is off, or a safety gate forced the full suite; then no filter is
+          # applied and the shard runs its whole assignment.
+          FILTER=""
+          while IFS= read -r line; do
+            if [ -z "${line}" ]; then
+              continue
+            fi
+            # Every line must be a -k token ('[case_id]' or a standalone file
+            # stem). A path means the bucket contract drifted: with a path the
+            # -k expression matches nothing, pytest exits 5, and the shard
+            # would report success after running zero tests.
+            if [[ "${line}" == */* || "${line}" == *.py ]]; then
+              echo "::error::Unexpected only_tests entry '${line}' (expected a pytest -k token)"
+              exit 1
+            fi
+            if [ -n "${FILTER}" ]; then
+              FILTER="${FILTER} or "
+            fi
+            FILTER="${FILTER}${line}"
+          done <<< "${ONLY_TESTS}"
+          FILTER_ARGS=()
+          if [ -n "${FILTER}" ]; then
+            FILTER_ARGS+=(-k "${FILTER}")
+            echo "Precision mode: filtered to ${FILTER}"
+          else
+            echo "Precision mode: no filter (full suite)"
+          fi
+
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-npu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2
+            --total-partitions 2 \
+            "${FILTER_ARGS[@]}"
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -436,8 +480,19 @@ jobs:
           retention-days: 7
 
   multimodal-gen-test-4-npu-a3:
-    needs: [check-changes, pr-gate, set-image-config, base-a-test-npu, base-a-test-npu-cov]
-    if: ${{ !failure() && !cancelled() && (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') }}
+    needs:
+      [
+        check-changes,
+        pr-gate,
+        set-image-config,
+        base-a-test-npu,
+        base-a-test-npu-cov,
+        recommend-tests-from-coverage,
+      ]
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') &&
+      needs.recommend-tests-from-coverage.outputs.should_run_multimodal_gen_test_4_npu_a3 != 'false' }}
     runs-on: linux-aarch64-a3-800t-4
     strategy:
       fail-fast: false
@@ -490,6 +545,7 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
+          ONLY_TESTS: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_multimodal_gen_test_4_npu_a3 }}
         run: |
           # Coverage mode: enumerate this shard's targets with an NPU-only CI
           # helper (it reuses the shared diffusion runner read-only) and run
@@ -521,11 +577,43 @@ jobs:
             exit 0
           fi
 
+          # Precision mode: ONLY_TESTS holds one pytest -k token per line
+          # ('[case_id]' for parametrized cases, a file stem for standalone
+          # files). It is empty when nothing was recommended, precision mode
+          # is off, or a safety gate forced the full suite; then no filter is
+          # applied and the shard runs its whole assignment.
+          FILTER=""
+          while IFS= read -r line; do
+            if [ -z "${line}" ]; then
+              continue
+            fi
+            # Every line must be a -k token ('[case_id]' or a standalone file
+            # stem). A path means the bucket contract drifted: with a path the
+            # -k expression matches nothing, pytest exits 5, and the shard
+            # would report success after running zero tests.
+            if [[ "${line}" == */* || "${line}" == *.py ]]; then
+              echo "::error::Unexpected only_tests entry '${line}' (expected a pytest -k token)"
+              exit 1
+            fi
+            if [ -n "${FILTER}" ]; then
+              FILTER="${FILTER} or "
+            fi
+            FILTER="${FILTER}${line}"
+          done <<< "${ONLY_TESTS}"
+          FILTER_ARGS=()
+          if [ -n "${FILTER}" ]; then
+            FILTER_ARGS+=(-k "${FILTER}")
+            echo "Precision mode: filtered to ${FILTER}"
+          else
+            echo "Precision mode: no filter (full suite)"
+          fi
+
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 2-npu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2
+            --total-partitions 2 \
+            "${FILTER_ARGS[@]}"
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -616,10 +704,14 @@ jobs:
   # continue-on-error so it never blocks the PR gate.
   recommend-tests-from-coverage:
     name: Recommend tests from coverage
-    needs: pr-gate
+    needs: [check-changes, pr-gate]
     runs-on: ubuntu-latest
     continue-on-error: true
-    if: ${{ !failure() && !cancelled() && github.event_name == 'pull_request' && inputs.coverage_mode != true }}
+    if: >-
+      ${{ !failure() && !cancelled() &&
+      github.event_name == 'pull_request' &&
+      inputs.coverage_mode != true &&
+      needs.check-changes.outputs.changes_exist == 'true' }}
     outputs:
       should_run_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_1_npu_a3 }}
       only_tests_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_b_test_1_npu_a3 }}
@@ -721,8 +813,8 @@ jobs:
 
       # Bucket the recommended tests per suite. Downstream jobs consume two
       # outputs per suite: should_run_<suite> ('false' -> skip the job, e.g.
-      # empty bucket/recommendation) and only_tests_<suite> (non-empty only in
-      # precision mode, gated inside the script). On failure outputs stay
+      # empty bucket in precision mode) and only_tests_<suite> (non-empty only
+      # in precision mode, gated inside the script). On failure outputs stay
       # empty -> callers run full suites.
       - name: Bucket recommended tests per suite
         id: bucket-tests

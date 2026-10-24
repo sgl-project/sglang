@@ -590,6 +590,7 @@ async def process_generation_batch(
             save_file_path_list = result.output_file_paths
         elif result.output is not None:
             num_outputs = len(result.output)
+            image_bytes = [] if batch.return_image_bytes else None
             save_file_path_list = save_outputs(
                 result.output,
                 batch.data_type,
@@ -598,6 +599,7 @@ async def process_generation_batch(
                 lambda idx: str(batch.output_file_path(num_outputs, idx)),
                 audio=result.audio,
                 audio_sample_rate=result.audio_sample_rate,
+                image_bytes_out=image_bytes,
                 output_compression=batch.output_compression,
                 x264_preset=batch.x264_preset,
                 enable_frame_interpolation=batch.enable_frame_interpolation,
@@ -608,6 +610,7 @@ async def process_generation_batch(
                 upscaling_model_path=batch.upscaling_model_path,
                 upscaling_scale=batch.upscaling_scale,
             )
+            result.output_image_bytes = image_bytes
 
     total_time = time.perf_counter() - total_start_time
     if get_global_server_args().batching_max_size > 1:
