@@ -39,6 +39,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Optional,
     Union,
 )
@@ -130,6 +131,8 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
     BeginWeightUpdateReqInput,
+    CheckpointReqOutput,
+    CheckpointState,
     CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
@@ -1833,6 +1836,52 @@ async def continue_generation(
     )
 
 
+@app.post("/checkpoint/prepare")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def checkpoint_prepare(mode: Literal["abort", "retract"] = "abort"):
+    """Pause generation with `mode` and release the KV cache for an external
+    process checkpoint. Returns once started. Poll /checkpoint/status."""
+    out = await _global_state.tokenizer_manager.checkpoint_prepare(mode)
+    return _checkpoint_response(out)
+
+
+@app.post("/checkpoint/resume")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def checkpoint_resume():
+    """Bring the KV cache back and continue generation, after a restore or in
+    place. Orchestrators redeliver it, so a resume already done returns 200."""
+    out = await _global_state.tokenizer_manager.checkpoint_resume()
+    return _checkpoint_response(out)
+
+
+@app.get("/checkpoint/status")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def checkpoint_status():
+    """200 once safe to capture, 503 until then and 500 if that cannot happen."""
+    out = await _global_state.tokenizer_manager.checkpoint_state()
+    status_code = HTTPStatus.SERVICE_UNAVAILABLE
+    if out.state == CheckpointState.PREPARED:
+        status_code = HTTPStatus.OK
+    elif out.state == CheckpointState.FAILED:
+        status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+    return _checkpoint_response(out, status_code)
+
+
+def _checkpoint_response(
+    out: CheckpointReqOutput, status_code: Optional[HTTPStatus] = None
+) -> ORJSONResponse:
+    if status_code is None:
+        status_code = HTTPStatus.OK
+        if not out.success:
+            status_code = HTTPStatus.BAD_REQUEST
+        elif out.state == CheckpointState.FAILED:
+            status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+    return ORJSONResponse(
+        content={"state": out.state.value, "message": out.message},
+        status_code=status_code,
+    )
+
+
 ##### OpenAI-compatible API endpoints #####
 
 
@@ -2472,7 +2521,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            _mark_server_up(server_args)
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
@@ -2497,9 +2546,10 @@ def _execute_server_warmup(server_args: ServerArgs):
                     get_disagg().disaggregation_mode,
                     failed_status_codes,
                 )
-            _global_state.tokenizer_manager.server_status = (
-                ServerStatus.Up if not failed_status_codes else ServerStatus.UnHealthy
-            )
+            if failed_status_codes:
+                _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+            else:
+                _mark_server_up(server_args)
 
     except Exception:
         last_traceback = get_exception_traceback()
@@ -2542,6 +2592,40 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
         logger.warning("post-warmup freeze_gc failed", exc_info=True)
 
 
+def _mark_server_up(server_args: ServerArgs):
+    # Prepare before marking the server Up, so no request starts in between.
+    if get_serving().checkpoint_prepare_on_startup and not _prepare_on_startup(
+        server_args
+    ):
+        kill_process_tree(os.getpid())
+        return
+    _global_state.tokenizer_manager.server_status = ServerStatus.Up
+
+
+def _prepare_on_startup(server_args: ServerArgs) -> bool:
+    key = get_serving().admin_api_key or get_serving().api_key
+    # Without warmup this runs before the server listens, so retry like warmup.
+    for _ in range(120):
+        try:
+            res = requests.post(
+                server_args.url() + "/checkpoint/prepare",
+                headers={"Authorization": f"Bearer {key}"} if key else {},
+                timeout=60,
+                verify=ssl_verify_of(server_args),
+            )
+        except requests.exceptions.ConnectionError:
+            time.sleep(1)
+            continue
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Checkpoint prepare on startup failed: {e}")
+            return False
+        if res.status_code != 200:
+            logger.error(f"Checkpoint prepare on startup failed: {res.text}")
+        return res.status_code == 200
+    logger.error("Checkpoint prepare on startup could not reach the server")
+    return False
+
+
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
@@ -2563,7 +2647,7 @@ def _wait_and_warmup(
         if not execute_warmup_func(server_args):
             return
     else:
-        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+        _mark_server_up(server_args)
 
     if post_warmup_callback is not None:
         post_warmup_callback()
