@@ -793,7 +793,7 @@ class VisionAiterAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        cu_seqlens: torch.Tensor | SingletonCache | None,
+        cu_seqlens: torch.Tensor | SingletonCache | list | None,
         bsz: int,
         seq_len: int,
         softmax_scale: Optional[float] = None,
@@ -803,6 +803,11 @@ class VisionAiterAttention(nn.Module):
         if forward_metadata is not None:
             cu_seqlens_gpu = forward_metadata.cu_seqlens
             max_seqlen = forward_metadata.max_seqlen
+        elif isinstance(cu_seqlens, list):
+            # ViT CUDA graph runners pass [cu_seqlens, max_seqlen]; models without
+            # a runner keep passing tensors even when the graph env var is set.
+            cu_seqlens_gpu = cu_seqlens[0]
+            max_seqlen = cu_seqlens[1]
         else:
             cu_seqlens_gpu = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens_gpu = cu_seqlens_gpu.to(dtype=torch.int32).to(q.device)
@@ -1488,9 +1493,11 @@ class VisionAttention(nn.Module):
             # CPU-to-CUDA copy. The eager version is captured as part of the
             # graph, so its pointwise work is still replayed without launch
             # overhead.
+            # On ROCm the compiled version captures cleanly after the runner's
+            # eager warmup and matches eager mode bit for bit, so keep it there.
             rotary_fn = (
                 apply_rotary_pos_emb_native_eager
-                if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+                if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and not _is_hip
                 else apply_rotary_pos_emb
             )
             q, k = rotary_fn(q, k, cos, sin)
