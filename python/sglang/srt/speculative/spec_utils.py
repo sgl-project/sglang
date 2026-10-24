@@ -73,6 +73,10 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 
+if _is_cuda:
+    from sglang.kernels.ops.speculative.simulated_accept import simulated_accept
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -538,6 +542,18 @@ def generate_simulated_accept_index(
     simulate_acc_len = sample_simulated_acc_len(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
     )
+
+    if _is_cuda and accept_index.is_cuda:
+        return simulated_accept(
+            accept_indices=accept_index,
+            predict_tokens=predict,
+            num_correct_drafts=num_correct_drafts,
+            candidate_tokens=candidates,
+            target_tokens=target_predict,
+            width=spec_steps + 1,
+            num_accept_tokens=simulate_acc_len,
+            real_tokens=use_real_draft_tokens,
+        )
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
