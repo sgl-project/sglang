@@ -223,6 +223,14 @@ for name, value in dict(
 scheduler.future_map = FutureMap(torch.device('cpu'), algo, pool, needs_cpu_seq_lens=True)
 worker = DSparkWorkerV2.__new__(DSparkWorkerV2)
 worker.query_token_num, worker.verify_num_draft_tokens = 5, 6
+# Native __getattr__ delegates optional resource hooks to this owning target.
+# A CPU target has no MLX prepare_for_kv_cache_release hook; preserve that
+# ordinary absence instead of bypassing the native result processor.
+target_worker = NS(device='cpu', model_runner=NS(
+    req_to_token_pool=pool, token_to_kv_pool_allocator=allocator))
+worker._target_worker = target_worker
+assert worker.target_worker is target_worker
+assert getattr(worker, 'prepare_for_kv_cache_release', None) is None
 scheduler.model_worker = worker
 metrics = NS(record_scheduler_active=noop, log_batch_result_stats=noop,
              update_device_timer=noop, num_generated_tokens=0, forward_ct_decode=0,
