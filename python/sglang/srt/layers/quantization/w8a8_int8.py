@@ -21,7 +21,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -107,6 +106,9 @@ class W8A8Int8Config(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.quantization.compressed_tensors.utils import (
+            should_ignore_layer,
+        )
 
         if should_ignore_layer(
             prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
