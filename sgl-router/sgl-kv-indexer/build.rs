@@ -10,6 +10,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
-        .compile_with_config(config, &["proto/kv_indexer.proto"], &["proto"])?;
+        .compile_with_config(
+            config,
+            &[
+                "proto/kv_indexer.proto",
+                "proto/tair_kvcache_meta_service.proto",
+            ],
+            &["proto"],
+        )?;
     Ok(())
 }

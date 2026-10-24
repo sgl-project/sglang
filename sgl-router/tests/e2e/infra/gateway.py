@@ -79,6 +79,13 @@ def _resolve_tokenizer_path(tokenizer_path: str) -> str:
     ``tokenizer.json`` directly. Pass paths/URLs through unchanged.
     """
     p = Path(tokenizer_path)
+    if p.is_dir():
+        # A local model directory — what ROUTER_LOCAL_MODEL_PATH produces —
+        # keeps its tokenizer as a file inside it, and the router's loader
+        # wants the file, not the directory around it.
+        tokenizer = p / "tokenizer.json"
+        if tokenizer.is_file():
+            return str(tokenizer)
     if p.exists():
         return str(p)
     try:
