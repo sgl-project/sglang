@@ -20,6 +20,7 @@ from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPWorkerV2
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -421,6 +422,37 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
 
         self.assertIs(worker.last_shared_read_runner, target_runner)
         self.assertEqual(worker.spec_v2_attn_backends, (target_runner.attn_backend,))
+
+
+class _StopAfterAdaptiveActivation(Exception):
+    pass
+
+
+class TestAdaptiveContextCallSites(CustomTestCase):
+    def _assert_decode_calls_context_hook(self, worker_cls):
+        worker = object.__new__(worker_cls)
+        worker.get_adaptive_context = MagicMock(return_value=4096)
+        worker.activate_step_by_batch = MagicMock(
+            side_effect=_StopAfterAdaptiveActivation
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            is_extend_in_batch=False,
+            reqs=[object(), object()],
+            seq_lens=torch.empty(2),
+        )
+
+        with self.assertRaises(_StopAfterAdaptiveActivation):
+            worker.forward_batch_generation(batch)
+
+        worker.get_adaptive_context.assert_called_once_with(batch.reqs)
+        worker.activate_step_by_batch.assert_called_once_with(2, 4096)
+
+    def test_eagle_decode_calls_context_hook_before_activation(self):
+        self._assert_decode_calls_context_hook(EAGLEWorkerV2)
+
+    def test_frozen_kv_mtp_decode_calls_context_hook_before_activation(self):
+        self._assert_decode_calls_context_hook(FrozenKVMTPWorkerV2)
 
 
 if __name__ == "__main__":
