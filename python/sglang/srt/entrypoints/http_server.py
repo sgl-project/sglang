@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from functools import partial
 from http import HTTPStatus
 from typing import (
@@ -2542,6 +2542,28 @@ def _freeze_gc_after_server_warmup(server_args: ServerArgs):
         logger.warning("post-warmup freeze_gc failed", exc_info=True)
 
 
+@contextmanager
+def _multi_tokenizer_warmup_lock():
+    """Serialize general warmups across tokenizer worker processes."""
+    if get_serving().tokenizer_worker_num <= 1:
+        yield
+        return
+
+    import fcntl
+
+    # All tokenizer workers share the server's main PID. Keep the file in place
+    # so queued workers always lock the same inode; process exit releases flock.
+    lock_path = os.path.join(
+        tempfile.gettempdir(), f"sglang_server_warmup_{get_main_process_id()}.lock"
+    )
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
@@ -2560,8 +2582,9 @@ def _wait_and_warmup(
         )
 
     if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
-        if not execute_warmup_func(server_args):
-            return
+        with _multi_tokenizer_warmup_lock():
+            if not execute_warmup_func(server_args):
+                return
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
