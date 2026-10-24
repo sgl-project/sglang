@@ -1780,6 +1780,8 @@ class Envs:
     # below) and gather rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
+    # Single-pass Mega-mHC prefill. SM100 uses DeepGEMM; gfx950 uses aiter
+    # flydsl_mega_mhc (ROCm/aiter#6179). Off by default.
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # "shared" is one buffer for the whole TP group, mapped by every rank, with no
     # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
