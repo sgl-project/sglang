@@ -1008,18 +1008,33 @@ class DeepseekV2MoE(nn.Module):
         self._moe_quant_once: Optional[bool] = None
 
     def get_moe_weights(self):
+        # Resolve the already-registered child without going through
+        # nn.Module.__getattr__. This getter runs inside the model-level
+        # LazyValue creator; a dynamic attribute lookup here can re-enter that
+        # creator before it commits its value on models with lazy wrappers.
+        experts = object.__getattribute__(self, "_modules")["experts"]
+
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.
         num_local_experts_for_eplb = (
-            self.experts.num_local_experts - self.num_fused_shared_experts
+            experts.num_local_experts
+            - object.__getattribute__(self, "num_fused_shared_experts")
         )
 
         return [
             x.data[:num_local_experts_for_eplb]
-            for name, x in self.experts.named_parameters()
+            # FusedMoE stores every migratable expert tensor directly on the
+            # layer. Do not use named_parameters() here: even with recurse=False,
+            # PyTorch hashes every parameter for duplicate removal. EPLB first
+            # materializes this list through LazyValue, so a runner/layer
+            # back-reference can consume the recursion budget before that hash.
+            # Reading Module._parameters directly avoids both child traversal
+            # and the duplicate-removal hash while preserving registration order.
+            for name, x in experts._parameters.items()
+            if x is not None
             if name not in ["correction_bias"]
             and filter_moe_weight_param_global_expert(
-                name, x, self.experts.num_local_experts
+                name, x, experts.num_local_experts
             )
         ]
 

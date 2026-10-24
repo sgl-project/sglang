@@ -11,6 +11,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import fastapi
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.eplb.control import (
+    ExpertDistributionCommunicator,
+    recorder_control_fan_out,
+)
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -85,6 +89,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import (
+    get_device,
     get_disagg,
     get_lora,
     get_parallel,
@@ -185,11 +190,18 @@ class TokenizerControlMixin:
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
-            comm = FanOutCommunicator(
-                self._dispatch_to_scheduler,
-                get_parallel().num_dp_ranks,
-                mode,
-            )
+            if name == "expert_distribution":
+                comm = ExpertDistributionCommunicator(
+                    self._dispatch_to_scheduler,
+                    recorder_control_fan_out(),
+                    timeout=get_device().watchdog_timeout,
+                )
+            else:
+                comm = FanOutCommunicator(
+                    self._dispatch_to_scheduler,
+                    get_parallel().num_dp_ranks,
+                    mode,
+                )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
@@ -207,7 +219,12 @@ class TokenizerControlMixin:
             control_fan_out = worker_count
 
         for spec in _COMMUNICATOR_SPECS:
-            getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
+            fan_out = (
+                recorder_control_fan_out()
+                if spec[0] == "expert_distribution"
+                else worker_count
+            )
+            getattr(self, f"{spec[0]}_communicator").set_fan_out(fan_out)
 
         self.get_internal_state_communicator.set_fan_out(control_fan_out)
 
@@ -425,19 +442,28 @@ class TokenizerControlMixin:
         return result
 
     async def start_expert_distribution_record(self: TokenizerManager):
-        self.auto_create_handle_loop()
-        req = ExpertDistributionReq(action=ExpertDistributionReqType.START_RECORD)
-        await self.expert_distribution_communicator(req)
+        await self._execute_expert_distribution_control(
+            ExpertDistributionReqType.START_RECORD
+        )
 
     async def stop_expert_distribution_record(self: TokenizerManager):
-        self.auto_create_handle_loop()
-        req = ExpertDistributionReq(action=ExpertDistributionReqType.STOP_RECORD)
-        await self.expert_distribution_communicator(req)
+        await self._execute_expert_distribution_control(
+            ExpertDistributionReqType.STOP_RECORD
+        )
 
     async def dump_expert_distribution_record(self: TokenizerManager):
+        await self._execute_expert_distribution_control(
+            ExpertDistributionReqType.DUMP_RECORD
+        )
+
+    async def _execute_expert_distribution_control(self: TokenizerManager, action):
         self.auto_create_handle_loop()
-        req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
-        await self.expert_distribution_communicator(req)
+        try:
+            return await self.expert_distribution_communicator(
+                ExpertDistributionReq(action=action)
+            )
+        except RuntimeError as exc:
+            raise fastapi.HTTPException(status_code=500, detail=str(exc)) from exc
 
     async def init_weights_update_group(
         self: TokenizerManager,

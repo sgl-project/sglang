@@ -4317,12 +4317,21 @@ class LazyValue:
     def __setitem__(self, key, value):
         self.value[key] = value
 
-    @property
-    def value(self):
+    def materialize(self):
+        """Return the created value without ``__getattr__`` fallback masking.
+
+        Calling this method explicitly is important when the creator can raise
+        ``AttributeError``: a property access to ``value`` would otherwise be
+        treated as a missing attribute and recursively enter ``__getattr__``.
+        """
         if self._creator is not None:
             self._value = self._creator()
             self._creator = None
         return self._value
+
+    @property
+    def value(self):
+        return self.materialize()
 
 
 def dynamic_import(func_path: str):

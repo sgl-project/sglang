@@ -41,6 +41,7 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.observability.forward_pass_metrics import FpmTiming
 
@@ -92,6 +93,7 @@ class PPBatchMetadata:
     verify_out_cache_loc: Optional[torch.Tensor] = None
     # Rank-local; never sent over the wire.
     fpm_timing: Optional[FpmTiming] = None
+    expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
 
 class SchedulerPPMixin:
@@ -962,6 +964,9 @@ class SchedulerPPMixin:
             ),
             skipped_output_comm=True,
             fpm_timing=mb_metadata.fpm_timing if mb_metadata else None,
+            expert_distribution_metrics=(
+                mb_metadata.expert_distribution_metrics if mb_metadata else None
+            ),
         )
         d2h_event = self.device_module.Event()
         d2h_event.record(self.device_module.current_stream())
@@ -1051,6 +1056,7 @@ class SchedulerPPMixin:
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
                 fpm_timing=mb_metadata.fpm_timing,
+                expert_distribution_metrics=mb_metadata.expert_distribution_metrics,
             )
             return output_result
 
@@ -1139,6 +1145,7 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
             fpm_timing=mb_metadata.fpm_timing,
+            expert_distribution_metrics=mb_metadata.expert_distribution_metrics,
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
@@ -1660,6 +1667,7 @@ class SchedulerPPMixin:
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                     fpm_timing=result.fpm_timing,
+                    expert_distribution_metrics=result.expert_distribution_metrics,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())

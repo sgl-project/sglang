@@ -108,7 +108,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.control import ExpertDistributionControl
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.moe import initialize_moe_config
@@ -142,8 +142,6 @@ from sglang.srt.managers.io_struct import (
     DumperControlReqOutput,
     EndWeightUpdateReqInput,
     ExpertDistributionReq,
-    ExpertDistributionReqOutput,
-    ExpertDistributionReqType,
     FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
@@ -827,6 +825,10 @@ class Scheduler(
                 or get_observability().enable_metrics_for_all_schedulers
             ),
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
+        )
+        self.expert_distribution_control = ExpertDistributionControl(
+            tokenizer_ipc_name=port_args.tokenizer_ipc_name,
+            get_model=lambda: self.tp_worker.model_runner.model,
         )
 
         self.load_snapshot_writer = None
@@ -6044,16 +6046,12 @@ class Scheduler(
                 )
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
-        action = recv_req.action
-        if action == ExpertDistributionReqType.START_RECORD:
-            get_global_expert_distribution_recorder().start_record()
-        elif action == ExpertDistributionReqType.STOP_RECORD:
-            get_global_expert_distribution_recorder().stop_record()
-        elif action == ExpertDistributionReqType.DUMP_RECORD:
-            get_global_expert_distribution_recorder().dump_record()
-        else:
-            raise ValueError(f"Unrecognized ExpertDistributionReq value: {recv_req=}")
-        return ExpertDistributionReqOutput()
+        return self.expert_distribution_control.handle(
+            recv_req,
+            send_result=self.send_control_output
+            if self.rust_server is not None
+            else None,
+        )
 
     def open_session(self, recv_req: OpenSessionReqInput):
         output = self.session_controller.open(recv_req)

@@ -612,6 +612,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertIsNone(scheduler.run_batch(batch).fpm_timing)
 
     def test_pp_launch_and_relay_keep_rank_local_timing(self):
+        """PP result reconstruction must preserve stage-local EPLB observations."""
         for speculative in (False, True):
             with self.subTest(speculative=speculative):
                 self.scheduler._fpm_publisher.metrics.clear()
@@ -644,6 +645,9 @@ class TestForwardPassMetrics(unittest.TestCase):
                     return_logprob=False,
                 )
                 result = GenerationBatchResult(next_token_ids=torch.tensor([7]))
+                result.expert_distribution_metrics = SimpleNamespace(
+                    eplb_balancedness=torch.tensor(0.75), forward_pass_id=7
+                )
                 if speculative:
                     result.next_token_ids = torch.tensor([7, 8, 0])
                     result.accept_lens = torch.tensor([2])
@@ -674,6 +678,10 @@ class TestForwardPassMetrics(unittest.TestCase):
                     )
                     rebuilt = receiver._pp_prep_batch_result(batch, metadata[0], wire)
                 self.assertIs(rebuilt.fpm_timing, result.fpm_timing)
+                self.assertIs(
+                    rebuilt.expert_distribution_metrics,
+                    result.expert_distribution_metrics,
+                )
                 snapshot = metadata[0].fwd_batch if speculative else batch
                 self.reporter.snapshot_spec_decode_metrics(snapshot, rebuilt)
                 self.reporter._emit_forward_pass_metrics(snapshot, rebuilt)
@@ -689,7 +697,12 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_pp_skipped_output_comm_keeps_timing(self):
         timing = object()
-        metadata = PPBatchMetadata(can_run_cuda_graph=True, fpm_timing=timing)
+        metrics = SimpleNamespace(eplb_balancedness=torch.tensor(0.5))
+        metadata = PPBatchMetadata(
+            can_run_cuda_graph=True,
+            fpm_timing=timing,
+            expert_distribution_metrics=metrics,
+        )
         scheduler = types.SimpleNamespace(
             device="cpu",
             device_module=types.SimpleNamespace(
@@ -702,6 +715,7 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertIsNone(wire)
         self.assertTrue(result.skipped_output_comm)
         self.assertIs(result.fpm_timing, timing)
+        self.assertIs(result.expert_distribution_metrics, metrics)
 
 
 class TestFpmPublisherIdleState(unittest.TestCase):

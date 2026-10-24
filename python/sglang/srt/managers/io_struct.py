@@ -2442,10 +2442,16 @@ class ExpertDistributionReqType(Enum):
 
 class ExpertDistributionReq(BaseReq, kw_only=True):
     action: ExpertDistributionReqType
+    operation_id: str = ""
 
 
 class ExpertDistributionReqOutput(BaseReq, kw_only=True):
-    pass
+    operation_id: str = ""
+    pp_rank: int = 0
+    root_global_rank: int = 0
+    replica_rank: int = 0
+    success: bool = True
+    message: str = ""
 
 
 class Function(msgspec.Struct, kw_only=True, array_like=True):
