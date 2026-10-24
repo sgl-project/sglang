@@ -111,6 +111,18 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
     def _assert_server_alive(self):
         self.assertIsNone(self.process.poll(), "server process crashed")
 
+    def test_reject_mismatched_embedding_width(self):
+        embeds = _embeds_for("The quick brown fox")
+        invalid = [embeds[0], embeds[1][:-1]]
+        response = _generate(self.base_url, invalid, max_new_tokens=4)
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("hidden size", response.text)
+        self._assert_server_alive()
+
+        response = _generate(self.base_url, embeds, max_new_tokens=4)
+        self.assertEqual(response.status_code, 200, response.text)
+        self._assert_server_alive()
+
     def test_chunked_prefill_truncation_and_continuation(self):
         """Regression test for #20376.
 

@@ -1128,6 +1128,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Please add `--disable-radix-cache` when you launch the server "
                     "if you want to use input_embeds as inputs."
                 )
+            hidden_size = self.model_config.hidden_size
+            if any(len(row) != hidden_size for row in obj.input_embeds):
+                raise ValueError(
+                    f"Each input_embeds row must have hidden size {hidden_size}."
+                )
             input_embeds = obj.input_embeds
             input_ids = obj.input_ids
         elif obj.input_ids is not None:
