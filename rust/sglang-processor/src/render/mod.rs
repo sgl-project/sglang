@@ -168,7 +168,10 @@ impl ChatFormatter {
             } => render_qwen38(formatter, *content_parts, request, default_kwargs).map(text),
             _ => Err("this formatter renders through render_prompt".into()),
         }
-        .map_err(|message| TemplateError::Renderer { message })
+        .map_err(|message| match message.ends_with(ENGINE_ONLY) {
+            true => TemplateError::EngineOnly { message },
+            false => TemplateError::Renderer { message },
+        })
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`
@@ -295,6 +298,9 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
     }
 }
 
+/// How the SGLang-parity renderers word a refusal of a valid request.
+const ENGINE_ONLY: &str = "on the engine";
+
 #[derive(Debug, Error)]
 pub enum TemplateError {
     #[error("failed to read {kind} `{path}`: {source}")]
@@ -336,6 +342,12 @@ pub enum TemplateError {
 
     #[error("invalid chat template: {message}")]
     Renderer { message: String },
+
+    /// [`ChatFormatter::render_request`] declines a valid request it cannot
+    /// render byte-for-byte as SGLang does ("... renders on the engine"); the
+    /// host should render it another way, not reject it.
+    #[error("{message}")]
+    EngineOnly { message: String },
 
     #[error("legacy chat template `{path}` must be a JSON object")]
     LegacyNotObject { path: PathBuf },
