@@ -6,14 +6,12 @@ import sys
 import torch
 import torch.nn.functional as F
 import triton
-import triton.language as tl
-from tqdm import tqdm
-from transformers import AutoConfig
-
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     fused_moe,
     get_config_file_name,
 )
+from tqdm import tqdm
+from transformers import AutoConfig
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
@@ -67,7 +65,7 @@ def prune_configs(M, N, K, configs):
         if N * 2 < BLOCK_SIZE_N and BLOCK_SIZE_N != 16:
             continue
         # skip large split_k when not necessary
-        if SPLIT_K != 1 and not need_split_k(M, N, K):
+        if SPLIT_K != 1:
             continue
         # skip split_k that leads to EVEN_K = false
         leap = SPLIT_K * BLOCK_SIZE_K
