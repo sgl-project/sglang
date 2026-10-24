@@ -194,6 +194,8 @@ class PromptTokensDetails(BaseModel):
     """Details about prompt tokens."""
 
     cached_tokens: int = 0
+    # None means unreported/unknown; zero is a measured zero.
+    cache_write_tokens: Optional[int] = Field(default=None, ge=0)
     # Multimodal prompt token counts (only populated when present in the prompt)
     image_tokens: Optional[int] = None
     audio_tokens: Optional[int] = None
@@ -204,7 +206,12 @@ class PromptTokensDetails(BaseModel):
         data = handler(self)
         # Drop multimodal fields when absent so text-only/cache-only responses
         # keep the original {"cached_tokens": N} shape.
-        for key in ("image_tokens", "audio_tokens", "video_tokens"):
+        for key in (
+            "cache_write_tokens",
+            "image_tokens",
+            "audio_tokens",
+            "video_tokens",
+        ):
             if data.get(key) is None:
                 data.pop(key, None)
         return data
@@ -2191,10 +2198,8 @@ class ResponsesRequest(PDRoutingFields):
         return params
 
 
-class PromptTokenUsageInfo(BaseModel):
-    """Prompt token usage details."""
-
-    cached_tokens: int = 0
+class PromptTokenUsageInfo(PromptTokensDetails):
+    """Backward-compatible name for Responses prompt usage details."""
 
 
 class ResponsesResponse(BaseModel):
@@ -2251,12 +2256,19 @@ class ResponsesResponse(BaseModel):
             if usage.prompt_tokens_details
             else 0
         )
+        cache_write = (
+            getattr(usage.prompt_tokens_details, "cache_write_tokens", None)
+            if usage.prompt_tokens_details
+            else None
+        )
         return {
             "input_tokens": usage.prompt_tokens,
             "input_tokens_details": {
                 "cached_tokens": cached,
-                # required (no default) in the SDK's InputTokensDetails model
-                "cache_write_tokens": 0,
+                # Required by the SDK. The explicit vendor flag distinguishes
+                # a compatibility placeholder from a measured zero.
+                "cache_write_tokens": cache_write if cache_write is not None else 0,
+                "cache_write_tokens_reported": cache_write is not None,
             },
             "output_tokens": usage.completion_tokens or 0,
             "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},

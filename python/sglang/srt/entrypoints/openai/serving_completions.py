@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     ErrorResponse,
+    PromptTokensDetails,
     SglExt,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
@@ -241,6 +242,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         completion_tokens = {}
         reasoning_tokens = {}
         cached_tokens = {}
+        cache_write_tokens = {}
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
@@ -267,6 +269,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     "reasoning_tokens", 0
                 )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
+                cache_write_tokens[index] = content["meta_info"].get(
+                    "cache_write_tokens"
+                )
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
                 cached_tokens_details[index] = content["meta_info"].get(
@@ -398,6 +403,22 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
+                        cached_tokens=(
+                            PromptTokensDetails(
+                                cached_tokens=cached_tokens.get(index, 0),
+                                cache_write_tokens=(
+                                    UsageProcessor.cache_write_tokens(
+                                        cache_write_tokens.get(index),
+                                        prompt_tokens.get(index, 0),
+                                        cached_tokens.get(index, 0),
+                                    )
+                                    if request.n == 1
+                                    else None
+                                ),
+                            )
+                            if get_serving().enable_cache_report
+                            else None
+                        ),
                     )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
@@ -482,6 +503,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     reasoning_tokens,
                     completion_tokens,
                     cached_tokens=cached_tokens,
+                    cache_write_tokens=cache_write_tokens,
                     n_choices=request.n,
                     enable_cache_report=get_serving().enable_cache_report,
                 )

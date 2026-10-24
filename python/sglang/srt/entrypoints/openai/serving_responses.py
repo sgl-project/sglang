@@ -91,6 +91,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     _incomplete_tool_call_indices,
 )
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -781,6 +782,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         status = "completed"
         finish_reason = None
+        num_cache_write_tokens = None
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = (
@@ -836,6 +838,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_prompt_tokens = meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
                 num_cached_tokens = meta_info.get("cached_tokens", 0)
+                num_cache_write_tokens = meta_info.get("cache_write_tokens")
                 num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
                 finish_reason = meta_info.get("finish_reason")
                 status = self._status_from_finish_reason(finish_reason)
@@ -874,9 +877,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             total_tokens=num_prompt_tokens + num_generated_tokens,
             reasoning_tokens=num_reasoning_tokens,
         )
-        if self.enable_prompt_tokens_details and num_cached_tokens:
+        if self.enable_prompt_tokens_details:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=num_cached_tokens
+                cached_tokens=num_cached_tokens,
+                cache_write_tokens=UsageProcessor.cache_write_tokens(
+                    num_cache_write_tokens, num_prompt_tokens, num_cached_tokens
+                ),
             )
         request_metadata.final_usage_info = usage
 
@@ -2288,6 +2294,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         prompt_tokens = 0
         completion_tokens = 0
         cached_tokens = 0
+        cache_write_tokens = None
         total_tokens_meta = 0
         reasoning_tokens_meta = 0
         finish_reason: Optional[dict[str, Any]] = None
@@ -2544,6 +2551,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 prompt_tokens = meta.get("prompt_tokens", prompt_tokens)
                 completion_tokens = meta.get("completion_tokens", completion_tokens)
                 cached_tokens = meta.get("cached_tokens", cached_tokens)
+                cache_write_tokens = meta.get("cache_write_tokens")
                 total_tokens_meta = meta.get("total_tokens", total_tokens_meta)
                 reasoning_tokens_meta = meta.get(
                     "reasoning_tokens", reasoning_tokens_meta
@@ -2913,9 +2921,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
             reasoning_tokens=reasoning_tokens_meta,
         )
-        if self.enable_prompt_tokens_details and cached_tokens:
+        if self.enable_prompt_tokens_details:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=cached_tokens
+                cached_tokens=cached_tokens,
+                cache_write_tokens=UsageProcessor.cache_write_tokens(
+                    cache_write_tokens, prompt_tokens, cached_tokens
+                ),
             )
         request_metadata.final_usage_info = usage
 

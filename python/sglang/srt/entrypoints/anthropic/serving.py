@@ -52,6 +52,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
@@ -89,10 +90,20 @@ def _cached_prompt_tokens(usage) -> int:
     return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
 
 
+def _cache_creation_prompt_tokens(usage) -> Optional[int]:
+    details = getattr(usage, "prompt_tokens_details", None)
+    return UsageProcessor.cache_write_tokens(
+        getattr(details, "cache_write_tokens", None),
+        getattr(usage, "prompt_tokens", 0) or 0,
+        _cached_prompt_tokens(usage),
+    )
+
+
 def _anthropic_input_tokens(usage) -> int:
     prompt = getattr(usage, "prompt_tokens", 0) or 0
     cached = _cached_prompt_tokens(usage)
-    if cached > prompt:
+    written = _cache_creation_prompt_tokens(usage) or 0
+    if cached + written > prompt:
         # Upstream telemetry bug: cached cannot exceed the prompt it caches.
         # Clamping silently here would hide the discrepancy from billing
         # dashboards, so make it visible at WARNING level.
@@ -103,7 +114,7 @@ def _anthropic_input_tokens(usage) -> int:
             cached,
             prompt,
         )
-    return max(prompt - cached, 0)
+    return max(prompt - cached - written, 0)
 
 
 def _anthropic_usage_from_openai(
@@ -125,6 +136,9 @@ def _anthropic_usage_from_openai(
         usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
         if cached_tokens:
             usage_fields["cache_read_input_tokens"] = cached_tokens
+        written_tokens = _cache_creation_prompt_tokens(usage)
+        if written_tokens is not None:
+            usage_fields["cache_creation_input_tokens"] = written_tokens
     if include_output:
         usage_fields["output_tokens"] = (
             0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)
@@ -1115,7 +1129,9 @@ class AnthropicServing:
             if chunk.usage is not None:
                 final_usage = _anthropic_usage_from_openai(
                     chunk.usage,
-                    include_input=False,
+                    # Final cumulative usage can update cache creation after
+                    # message_start; billing must use this terminal snapshot.
+                    include_input=True,
                     include_output=True,
                 )
 

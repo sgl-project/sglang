@@ -7,3 +7,27 @@ description: "Documentation for OpenAI-Compatible APIs"
 - [Openai Api Embeddings](./openai_api_embeddings)
 
 For the Anthropic-compatible `/v1/messages` endpoint (including Claude Code integration), see [Anthropic-Compatible API](./anthropic_api).
+
+## Cache write usage
+
+With `--enable-cache-report`, supported unified-cache paths report newly adopted,
+reusable prompt tokens separately from cache reads:
+
+| API | Field |
+| --- | --- |
+| Chat Completions / Completions | `usage.prompt_tokens_details.cache_write_tokens` |
+| Responses | `usage.input_tokens_details.cache_write_tokens` |
+| Messages | `usage.cache_creation_input_tokens` |
+
+These counters exclude generated output, duplicate tree insertions and internal
+recomputation of an originally cached prefix. Hybrid caches count only through a
+reusable recurrent-state checkpoint. Disabled caching reports a measured zero;
+uninstrumented cache paths, sessions and parallel choices can remain unknown.
+
+Chat and Messages omit unknown write counts. Responses keeps the SDK-required
+numeric field and adds `cache_write_tokens_reported`: a false value means its zero
+is a compatibility placeholder, not a measured amount. Use the final cumulative
+stream usage snapshot rather than summing intermediate snapshots. Messages can
+update input/cache usage in its terminal `message_delta`.
+
+Cache write usage does not promise a retention duration or define a billing policy.

@@ -111,6 +111,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     TreeLock,
 )
+from sglang.srt.mem_cache.cache_write_usage import CacheWriteUsage
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     backup_kv_cache,
@@ -1117,6 +1118,9 @@ class Req(ReqDllmMixin):
             if origin_input_ids_unpadded
             else self.origin_input_ids
         )  # Before image padding
+        # Remains unknown until an instrumented cache path handles this request.
+        # Preserve this meter across chunking and retraction attempts.
+        self._cache_write_usage = CacheWriteUsage(len(origin_input_ids))
         # Each decode stage's output ids. Append-only by contract:
         # refresh_fill_ids infers how many output tokens are already in
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
@@ -1502,6 +1506,10 @@ class Req(ReqDllmMixin):
             self.mm_video_tokens,
         ) = other.get_mm_token_counts()
         self.mm_token_counts_ready = True
+
+    @property
+    def cache_write_tokens(self) -> Optional[int]:
+        return self._cache_write_usage.tokens
 
     def advance_cache_request_handle(self) -> None:
         self.cache_request_handle = dataclasses.replace(
