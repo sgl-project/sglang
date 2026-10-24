@@ -1151,6 +1151,9 @@ class Envs:
     # Disable to save the additional weight memory or allow online updates.
     SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
+    # Experimental Kimi K3 prefill optimizations, disabled by default.
+    SGLANG_K3_BCG_MHA = EnvBool(False)
+    SGLANG_K3_KV_B_PROJ_CUTLASS = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8

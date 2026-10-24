@@ -37,6 +37,9 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.k3_mha_context import (
+    in_bcg_mha_eager,
+)
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
     get_prefill_raw_num_tokens,
@@ -137,6 +140,7 @@ class RadixAttention(nn.Module):
             and is_in_prefill_graph_scope()
             and forward_batch.forward_mode.is_extend()
             and (breakable_cg or full_cg)
+            and not in_bcg_mha_eager()
         )
         if use_eager_attention:
             is_sparse = kwargs.get("idx_q") is not None

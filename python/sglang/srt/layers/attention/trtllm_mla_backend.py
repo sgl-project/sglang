@@ -294,6 +294,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
         self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
+        # Initially restrict graph MHA to the configuration validated on Kimi K3.
+        self.bcg_mha_enabled = (
+            envs.SGLANG_K3_BCG_MHA.get()
+            and "KimiK3ForConditionalGeneration"
+            in (config.hf_config.architectures or [])
+            and self.data_type == torch.bfloat16
+            and self.q_data_type == torch.bfloat16
+            and get_parallel().attn_tp_size == 8
+            and get_parallel().attn_dcp_size == 8
+            and get_parallel().attn_cp_size == 1
+            and not get_parallel().attn_dp_enabled
+            and not self.disable_chunked_prefix_cache
+        )
 
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.dense_q_indptr_verify = (
@@ -721,7 +734,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         fallback_to_flashinfer_impl = (
             (self.disable_chunked_prefix_cache and has_prefix)
             or is_in_tc_piecewise_cuda_graph()
-            or is_in_breakable_cuda_graph()
+            or (is_in_breakable_cuda_graph() and not self.bcg_mha_enabled)
         )
         if fallback_to_flashinfer_impl:
             super().init_mha_chunk_metadata(
@@ -792,7 +805,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             fallback_to_flashinfer_impl = (
                 (self.disable_chunked_prefix_cache and has_prefix)
                 or is_in_tc_piecewise_cuda_graph()
-                or is_in_breakable_cuda_graph()
+                or (is_in_breakable_cuda_graph() and not self.bcg_mha_enabled)
             )
             if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)

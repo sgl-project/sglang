@@ -23,6 +23,14 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.k3_mha_context import (
+    bcg_mha_eager_scope,
+)
+from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
@@ -349,6 +357,19 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
         gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Keep the existing eager path unchanged when this opt-in is disabled.
+        if is_in_breakable_cuda_graph() and getattr(
+            resolve_attn_backend(forward_batch), "bcg_mha_enabled", False
+        ):
+            attn_output = self._bcg_chunked_mha(q, k, v)
+            attn_output = attn_output.reshape(
+                -1, self.num_local_heads * self.v_head_dim
+            )
+            if gate is not None:
+                attn_output = self._apply_gated(attn_output, gate)
+            output, _ = self.o_proj(attn_output)
+            return output
+
         has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
             forward_batch.extend_prefix_lens_cpu
         )
@@ -401,6 +422,66 @@ class DeepseekMHAForwardMixin:
             attn_output = self._apply_gated(attn_output, gate)
         output, _ = self.o_proj(attn_output)
         return output
+
+    @eager_on_graph
+    def _bcg_chunked_mha(self, q, k, v):
+        # Replay must read the current request metadata, not captured Python state.
+        # eager_on_graph copies this result into its stable captured output buffer.
+        forward_batch = get_forward_batch()
+        n = forward_batch.global_num_token_non_padded_cpu
+        # Attention sees real rows only; graph segments still consume a full bucket.
+        out = q.new_zeros((q.shape[0], self.num_local_heads * self.v_head_dim))
+        if n:
+            with bcg_mha_eager_scope():
+                result = self._chunked_mha_attention(q[:n], k[:n], v[:n], forward_batch)
+            out[:n].copy_(result.reshape(n, -1))
+        return out
+
+    def _chunked_mha_attention(self, q, k, v, forward_batch):
+        has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
+            forward_batch.extend_prefix_lens_cpu
+        )
+        backend = resolve_attn_backend(forward_batch)
+        prepare_qkv_fn = getattr(backend, "prepare_chunked_prefill_qkv", None)
+        if has_extend_prefix and prepare_qkv_fn is not None:
+            q, k, v = prepare_qkv_fn(q, k, v, forward_batch)
+
+        fused_prefix = has_extend_prefix and use_fused_prefix_extend(
+            backend, forward_batch
+        )
+
+        # Only initialize the info once
+        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
+            forward_batch.prepare_chunked_prefix_cache_info(
+                q.device,
+                pack_all_prefix_chunks=use_packed_prefix_chunks(backend, forward_batch),
+                single_chunk=fused_prefix,
+                dense_metadata=use_dense_prefix_kv(backend),
+            )
+            if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
+                get_attn_backend().init_mha_chunk_metadata(forward_batch)
+
+        if fused_prefix:
+            attn_output = self._fused_prefix_extend_attn_mha(q, k, v, forward_batch)
+            return attn_output
+
+        forward_batch.mha_return_lse = has_extend_prefix
+        # Do mha for extended part without prefix
+        forward_batch.set_attn_attend_prefix_cache(False)
+        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+
+        # Do mha attention with chunked prefix cache if there are any sequence with prefix
+        if has_extend_prefix:
+            attn_output, lse = attn_output
+            forward_batch.set_attn_attend_prefix_cache(True)
+            attn_output = self._chunked_prefix_attn_mha(
+                q=q,
+                accum_output=attn_output,
+                accum_lse=lse,
+                forward_batch=forward_batch,
+            )
+
+        return attn_output
 
     def forward_normal_one_shot_prepare(
         self: DeepseekV2AttentionMLA,
@@ -600,6 +681,11 @@ class DeepseekMHAForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if is_in_breakable_cuda_graph() and getattr(
+            resolve_attn_backend(forward_batch), "bcg_mha_enabled", False
+        ):
+            self._bcg_set_mla_kv(kv_a, k_pe)
+            return
         if _is_cuda:
             # Save latent cache
             get_token_to_kv_pool().set_mla_kv_buffer(
@@ -623,6 +709,18 @@ class DeepseekMHAForwardMixin:
             # Save latent cache
             get_token_to_kv_pool().set_kv_buffer(
                 self.attn_mha, KVWriteLoc.for_batch(forward_batch), latent_cache, None
+            )
+
+    @eager_on_graph
+    def _bcg_set_mla_kv(self, kv_a, k_pe):
+        forward_batch = get_forward_batch()
+        n = forward_batch.global_num_token_non_padded_cpu
+        if n:
+            get_token_to_kv_pool().set_mla_kv_buffer(
+                self.attn_mha,
+                KVWriteLoc.for_batch(forward_batch),
+                kv_a[:n].unsqueeze(1),
+                k_pe[:n],
             )
 
     def _get_mla_kv_buffer(

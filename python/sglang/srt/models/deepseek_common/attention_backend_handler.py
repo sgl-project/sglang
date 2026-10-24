@@ -169,6 +169,17 @@ def handle_attention_fa4(attn, forward_batch):
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):
+    from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
+        resolve_attn_backend,
+    )
+
+    if (
+        is_in_breakable_cuda_graph()
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and attn.__class__.__name__ == "KimiK3MLAAttention"
+        and getattr(resolve_attn_backend(forward_batch), "bcg_mha_enabled", False)
+    ):
+        return AttnForwardMethod.MHA_CHUNKED_KV
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
