@@ -2880,19 +2880,13 @@ class AscendAttnBackend(AttentionBackend):
                     -1, layer.tp_v_head_num, self.page_size, self.kv_lora_rank
                 )
 
-            # DCP verify uses rank-local tables/lengths; ordinary MLA uses full KV.
-            # Graph mode binds the corresponding Host list instead of a CPU tensor.
-            kv_lens_cpu = (
-                self.forward_metadata.dcp_seq_lens_cpu_int
-                if dense_mla_dcp_verify and not self.graph_mode
-                else self.forward_metadata.seq_lens_cpu_int
-            )
-            if kv_lens_cpu is None:
-                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
-            else:
-                actual_seq_lengths_kv = kv_lens_cpu.cpu().int().tolist()
-
             if dense_mla_dcp_verify:
+                if self.graph_mode:
+                    actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
+                else:
+                    actual_seq_lengths_kv = (
+                        self.forward_metadata.dcp_seq_lens_cpu_int.cpu().int().tolist()
+                    )
                 # BSND keeps Q queries per request, including padding rows, so O/LSE
                 # retain the token shape consumed by the DCP merge. The explicit
                 # mask supplies each query's rank-local KV visibility.
@@ -2920,6 +2914,12 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = q.shape[0]
                 q_nope = q_nope[: forward_batch.global_num_token_non_padded_cpu]
                 q_rope = q_rope[: forward_batch.global_num_token_non_padded_cpu]
+            if self.forward_metadata.seq_lens_cpu_int is None:
+                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
+            else:
+                actual_seq_lengths_kv = (
+                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                )
             actual_seq_lengths = np.arange(
                 self.speculative_num_draft_tokens,
                 self.speculative_num_draft_tokens + q_nope.shape[0],
