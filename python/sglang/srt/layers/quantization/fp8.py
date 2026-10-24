@@ -2978,6 +2978,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return self.runner.runner_backend
         return self._moe_runner_backend
 
+    def get_moe_routing_method_type(self, layer, requested_method):
+        backend = self.get_moe_runner_backend(layer)
+        if (
+            requested_method is None
+            and backend is not None
+            and (
+                backend.is_flashinfer_trtllm() or backend.is_flashinfer_trtllm_routed()
+            )
+        ):
+            return RoutingMethodType.DeepSeekV3
+        return requested_method
+
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         use_rocm_mxfp8 = self.use_mxfp8 and _is_hip and _is_gfx95_supported
         return TritonMoeQuantInfo(
@@ -3270,10 +3282,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_gated=self.moe_runner_config.is_gated,
             )
 
-            routing_method_type = layer.routing_method_type
-            if routing_method_type is None:
-                routing_method_type = RoutingMethodType.DeepSeekV3
-
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -3281,7 +3289,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 local_expert_offset=moe_ep_rank * num_local_experts,
                 local_num_experts=num_local_experts,
                 intermediate_size=layer.w2_weight.shape[2],
-                routing_method_type=int(routing_method_type),
+                routing_method_type=int(layer.routing_method_type),
                 block_quant=self.block_quant,
                 use_mxfp8=getattr(self.quant_config, "use_mxfp8", False),
                 weight_block_k=(
