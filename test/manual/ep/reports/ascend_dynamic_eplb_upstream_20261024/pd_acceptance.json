@@ -1,0 +1,362 @@
+{
+  "source_commit": "111a8c52b87869d3904ba00e429bf8bb959cd560",
+  "deployment": "Disaggregated prefill/decode on two Ascend 910C nodes; B103 runtime",
+  "runtime": {
+    "CANN": "9.1.0",
+    "PyTorch": "2.10.0",
+    "torch_npu": "2.10.0.post6",
+    "deepseek_recipe": "0.2.0"
+  },
+  "workload": {
+    "model": "DeepSeek-V4-Flash W8A8",
+    "formal_requests_per_arm": 64,
+    "concurrency": 16,
+    "input_tokens_min": 689,
+    "input_tokens_max": 708,
+    "output_tokens": 128,
+    "preparation_rounds_per_arm": 2,
+    "preparation_requests_per_round": 16,
+    "preparation_output_tokens": 16
+  },
+  "controls": {
+    "fresh_process_each_arm": true,
+    "TP": 16,
+    "EP": 16,
+    "attention_DP": 16,
+    "DP": 1,
+    "initial_placement": "trivial",
+    "offline_optimized_layout": false,
+    "dispatch": "static",
+    "radix_cache": false,
+    "DSpark": false,
+    "Compact": false,
+    "P": {
+      "deepep": "normal",
+      "graphs": false,
+      "redundant_experts": 16,
+      "interval": 4,
+      "window": 4,
+      "memory_fraction": 0.62
+    },
+    "D": {
+      "deepep": "low_latency",
+      "decode_graph_sizes": [
+        1,
+        2,
+        4,
+        6,
+        8,
+        12,
+        16
+      ],
+      "redundant_experts": 0,
+      "interval": 64,
+      "window": 64,
+      "memory_fraction": 0.71
+    },
+    "layout_logging": true,
+    "balancedness_report": "off",
+    "only_enable_eplb_changed": true,
+    "formal_input_output_pairs_exact": 64,
+    "all_preparation_and_formal_pairs_exact": 96,
+    "all_planned_success": 192,
+    "all_planned_failed": 0
+  },
+  "source_manifest": {
+    "python/sglang/srt/eplb/comm_utils.py": "4bb9b6c7b63f68e6d45ebee2d8bd0f1478585f24ac5b8fec77d2e20ec9b42cd4",
+    "python/sglang/srt/eplb/eplb_manager.py": "f4c8d91a1ff5084399ea42c7076cef03fd68a3178937d9ae824c1eaf180f6f75",
+    "python/sglang/srt/eplb/expert_distribution.py": "1b5f61dbf11bbc2a781427f5c27117480dcf01ef25000c1d7a26d5adc54ceb05",
+    "python/sglang/srt/eplb/expert_location_updater.py": "d3d6305d31209b85055da221e6b72851c01875ff2795c740e809c3d301b2821b",
+    "python/sglang/srt/eplb/npu_statistics.py": "311ff4a7da3064af2a4ec94475af7bd8adb476bbad800d009cb8950a8e3fc856",
+    "python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py": "73fbe141ea46f716635e980ccc56a99ae185bdd5cd51269e86d7a5399e78709f",
+    "python/sglang/srt/model_executor/model_runner.py": "2c234dfec3d0ee15c38384868458800be82a2e1e788d9a696a8b0188ae8ba06a",
+    "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py": "3303db05d4a5e6e8ce544b00eec2b632826452dea67e8863a6ac18b23a177fc1",
+    "test/manual/ep/test_eplb_online_loop.py": "d6a83a54dd580b45452ece1185faa643acded869ab9a360d9f532cb6f5c0c7ed",
+    "test/manual/ep/test_eplb_weight_migration.py": "a556d40ce734d8ef7c3ebcd067b6eecb86aa4c5c7a1de25af093e0ccc95ebdf6",
+    "test/registered/unit/eplb/test_draft_distribution_isolation.py": "1ddc6d9e55391ec017b84cdf91ea2187c8ef1db0f54e3024dc6a30c8fa34b697",
+    "test/registered/unit/eplb/test_eplb_threshold.py": "93dbc9cb747d6e490d40958ef2a7ec9d045d8d6298820189c2b58bc3c72ffca4",
+    "test/registered/unit/eplb/test_npu_batched_statistics.py": "4ab861e86e1a96fdf7d88f7d956fc19d995e1d7eacca88b751794f5f20e17f1c",
+    "test/registered/unit/eplb/test_npu_eplb_group.py": "9de76e3ff194807e6960acb8810c80cfe38dd884da1acfcb9bd818441521551f",
+    "test/registered/unit/eplb/test_npu_expert_distribution.py": "b6fa81989f9ef0f88d0941f7c9a74d2cfd434e5e62f2934acb3cae6f0a902825",
+    "test/registered/unit/eplb/test_npu_initial_rebalance.py": "234fe91952592ff7016a3245d22c22b49338df5622285242327db97edba918d9",
+    "test/registered/unit/eplb/test_npu_topk_padding.py": "3907ce75063b3939cdeeff8c3ed87531512bc3d19c64d49f63073779e9e60b8a",
+    "test/registered/unit/eplb/test_npu_unchanged_migration.py": "4e9b2733d7b5aa0deea3e8cc670c0238754880846b1790fb339087fa7d97896d",
+    "test/registered/unit/eplb/test_npu_w8a8_registration.py": "6ef76fe2a0c9e5551d50ce4c4077b64f1720f5fc04b3b909c26a328505e8f1e3",
+    "test/registered/unit/npu/graph_runner/test_npu_cudagraph_backend.py": "6ee8b9a529bfe573309e9108d06c9d0b4e8ecc3863585bdad12812ec7a9db7af"
+  },
+  "source_manifest_format": "SHA-256 of exact runtime bytes. CRLF/LF-normalized contents match the Git blobs at source_commit.",
+  "canonical_lf_source_manifest": {
+    "python/sglang/srt/eplb/comm_utils.py": "30b7611c0e95f53b526ed59781291acfbc2b32a43b5e284f08464e5c3a1ae44f",
+    "python/sglang/srt/eplb/eplb_manager.py": "8b1eb6e29647e664e5c5b84e803de362c7fd87c80d62161c59e438e7d1624317",
+    "python/sglang/srt/eplb/expert_distribution.py": "cb4122a04af137bae6d2bcd3cd59cfbc00d6158381eaacc78c5c0a3aa8bb0bbb",
+    "python/sglang/srt/eplb/expert_location_updater.py": "b3147ae90ecbee841432741fc7cefa5be9ba878b278a21d01e684ed7698cc805",
+    "python/sglang/srt/eplb/npu_statistics.py": "9b5e146636b110b9a0aef097d3bd91275939d2129f4d8aed868f3e7967d36aa9",
+    "python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py": "0a99ffd2b18ea7622814ddffa6f497f063cc7d036ddb3d16b1064b4d9d84d659",
+    "python/sglang/srt/model_executor/model_runner.py": "2098a54300b5a031991d4f8e54807c265cf4f9410247877ca9733b412bbe8a36",
+    "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py": "84ce48ab6edd8c11757ed175b62be0d73f3d059711c08811504a914f5d64389c",
+    "test/manual/ep/test_eplb_online_loop.py": "0d9bc858a5b9460ed205fdc104aeb0f5d954e1b59dfb809d970d6bc69571d3b3",
+    "test/manual/ep/test_eplb_weight_migration.py": "c1b44ea659be83c582ebcdcc5bd82131897e528f318d6c3538ba124c1e6de876",
+    "test/registered/unit/eplb/test_draft_distribution_isolation.py": "8a050d309fbf1a923faf84eca7f05ff43ca0baa5221b294a057b24a52c2b2a1c",
+    "test/registered/unit/eplb/test_eplb_threshold.py": "da1be2bfec64d8531439dbb5814c7314623bd1b55f5d1b6dd21365ec27264c03",
+    "test/registered/unit/eplb/test_npu_batched_statistics.py": "5dc98af92821006f56f5c22a7ca14410c913c1e5804c5420a61ec5046393ead9",
+    "test/registered/unit/eplb/test_npu_eplb_group.py": "9a9c132bde5aa7fdef54c1b190ebea604c02ba2662680d8b54a1e8123cccb3af",
+    "test/registered/unit/eplb/test_npu_expert_distribution.py": "5b53fcb1c307546185150fc0c23264c00d4cef15adb841c55f8f26168a4b5e72",
+    "test/registered/unit/eplb/test_npu_initial_rebalance.py": "b309ab0e3be75e3c3b6eba843d91a36f2e5344a63ca49c2a428142c76ec3bede",
+    "test/registered/unit/eplb/test_npu_topk_padding.py": "92beaab80f86b82d67c182347bce0c1f9a7edb68aa1b09cd133401bfff9d0d81",
+    "test/registered/unit/eplb/test_npu_unchanged_migration.py": "ff977604f9747aa9c18ba83d3d65ff02bcfb3f75cc183ba6d39ee055fddb8edf",
+    "test/registered/unit/eplb/test_npu_w8a8_registration.py": "da2f6b774b509c171725408ff1fc143c39c84f1c2414d21b5a1d038663f3c923",
+    "test/registered/unit/npu/graph_runner/test_npu_cudagraph_backend.py": "eff160935d265cca6261b835f596711e94419b52bd13a475164073d5258ce2aa"
+  },
+  "arms": [
+    {
+      "arm": "OFF",
+      "formal_success": 64,
+      "formal_failed": 0,
+      "copy_matches": 64,
+      "preparation_success": [
+        16,
+        16
+      ],
+      "preparation_failed": [
+        0,
+        0
+      ],
+      "preparation_plus_formal_s": 27.705064296722412,
+      "roles": {
+        "P": {
+          "completed_rebalances_in_client_window": {
+            "0": 0,
+            "1": 0,
+            "2": 0,
+            "3": 0,
+            "4": 0,
+            "5": 0,
+            "6": 0,
+            "7": 0,
+            "8": 0,
+            "9": 0,
+            "10": 0,
+            "11": 0,
+            "12": 0,
+            "13": 0,
+            "14": 0,
+            "15": 0
+          },
+          "layout_change_rows": 0,
+          "positive_layout_change_rows": 0,
+          "max_changed_slots": 0,
+          "request_window_errors": [],
+          "request_window_error_signatures": 0,
+          "before_client_error_signatures": 5,
+          "completed_rebalances_before_client": {
+            "0": 0,
+            "1": 0,
+            "2": 0,
+            "3": 0,
+            "4": 0,
+            "5": 0,
+            "6": 0,
+            "7": 0,
+            "8": 0,
+            "9": 0,
+            "10": 0,
+            "11": 0,
+            "12": 0,
+            "13": 0,
+            "14": 0,
+            "15": 0
+          }
+        },
+        "D": {
+          "completed_rebalances_in_client_window": {
+            "0": 0,
+            "1": 0,
+            "2": 0,
+            "3": 0,
+            "4": 0,
+            "5": 0,
+            "6": 0,
+            "7": 0,
+            "8": 0,
+            "9": 0,
+            "10": 0,
+            "11": 0,
+            "12": 0,
+            "13": 0,
+            "14": 0,
+            "15": 0
+          },
+          "layout_change_rows": 0,
+          "positive_layout_change_rows": 0,
+          "max_changed_slots": 0,
+          "request_window_errors": [],
+          "request_window_error_signatures": 0,
+          "before_client_error_signatures": 2,
+          "completed_rebalances_before_client": {
+            "0": 0,
+            "1": 0,
+            "2": 0,
+            "3": 0,
+            "4": 0,
+            "5": 0,
+            "6": 0,
+            "7": 0,
+            "8": 0,
+            "9": 0,
+            "10": 0,
+            "11": 0,
+            "12": 0,
+            "13": 0,
+            "14": 0,
+            "15": 0
+          }
+        }
+      },
+      "raw_evidence": [
+        {
+          "role": "P",
+          "archive": "upstreampd_OFF_P_20261024.tar.gz",
+          "sha256": "89c06b21da13a7232c86fece6f5cc092ecea173fd8f73cc105a929255dc1e7ba",
+          "members": 38,
+          "all_members_verified": true
+        },
+        {
+          "role": "D",
+          "archive": "upstreampd_OFF_D_20261024.tar.gz",
+          "sha256": "611a2048d5da3bee392d349ce4b90f302afab8f8ea108b926be8bc1894ed04c2",
+          "members": 31,
+          "all_members_verified": true
+        }
+      ]
+    },
+    {
+      "arm": "ON",
+      "formal_success": 64,
+      "formal_failed": 0,
+      "copy_matches": 64,
+      "preparation_success": [
+        16,
+        16
+      ],
+      "preparation_failed": [
+        0,
+        0
+      ],
+      "preparation_plus_formal_s": 38.48412752151489,
+      "roles": {
+        "P": {
+          "completed_rebalances_in_client_window": {
+            "0": 4,
+            "1": 4,
+            "2": 4,
+            "3": 4,
+            "4": 4,
+            "5": 4,
+            "6": 4,
+            "7": 4,
+            "8": 4,
+            "9": 4,
+            "10": 4,
+            "11": 4,
+            "12": 4,
+            "13": 4,
+            "14": 4,
+            "15": 4
+          },
+          "layout_change_rows": 4,
+          "positive_layout_change_rows": 4,
+          "max_changed_slots": 11644,
+          "request_window_errors": [],
+          "request_window_error_signatures": 0,
+          "before_client_error_signatures": 5,
+          "completed_rebalances_before_client": {
+            "0": 2,
+            "1": 2,
+            "2": 2,
+            "3": 2,
+            "4": 2,
+            "5": 2,
+            "6": 2,
+            "7": 2,
+            "8": 2,
+            "9": 2,
+            "10": 2,
+            "11": 2,
+            "12": 2,
+            "13": 2,
+            "14": 2,
+            "15": 2
+          }
+        },
+        "D": {
+          "completed_rebalances_in_client_window": {
+            "0": 9,
+            "1": 9,
+            "2": 9,
+            "3": 9,
+            "4": 9,
+            "5": 9,
+            "6": 9,
+            "7": 9,
+            "8": 9,
+            "9": 9,
+            "10": 9,
+            "11": 9,
+            "12": 9,
+            "13": 9,
+            "14": 9,
+            "15": 9
+          },
+          "layout_change_rows": 9,
+          "positive_layout_change_rows": 9,
+          "max_changed_slots": 10938,
+          "request_window_errors": [],
+          "request_window_error_signatures": 0,
+          "before_client_error_signatures": 0,
+          "completed_rebalances_before_client": {
+            "0": 1,
+            "1": 1,
+            "2": 1,
+            "3": 1,
+            "4": 1,
+            "5": 1,
+            "6": 1,
+            "7": 1,
+            "8": 1,
+            "9": 1,
+            "10": 1,
+            "11": 1,
+            "12": 1,
+            "13": 1,
+            "14": 1,
+            "15": 1
+          }
+        }
+      },
+      "raw_evidence": [
+        {
+          "role": "P",
+          "archive": "upstreampd_ON_P_20261024.tar.gz",
+          "sha256": "8385f5cafe921cf2a85f6286c98964f6a59863573edd531bf79684b47d24d047",
+          "members": 38,
+          "all_members_verified": true
+        },
+        {
+          "role": "D",
+          "archive": "upstreampd_ON_D_20261024.tar.gz",
+          "sha256": "673f08a5a0f269385cf289b2619e74053ce980ac306ecd7ae3280132718aac0d",
+          "members": 31,
+          "all_members_verified": true
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "Short PD switch/copy acceptance, not an AIS performance comparison.",
+    "Rebalance counts include the two preparation rounds.",
+    "Router/startup health traffic was present; rebalance counts are timestamp-window observations.",
+    "Startup address-in-use diagnostics are retained separately from the error-free client window.",
+    "Nonzero layout changes were observed on both roles; migrated bytes were not measured.",
+    "Copy checks do not establish general model accuracy or all-layer weight equality."
+  ]
+}
