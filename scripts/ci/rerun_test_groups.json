@@ -166,6 +166,7 @@
     "registered/kernels/ops/lora/test_moe_lora_shared_outer_numerics.py",
     "registered/kernels/ops/lora/test_moe_lora_small_masked_prepare_paths.py",
     "registered/kernels/ops/lora/test_virtual_experts_kernels.py",
+    "registered/kernels/ops/lora/test_virtual_experts_kernels_matrix.py",
     "registered/lora/test_embedding_lora_support.py",
     "registered/lora/test_lora_deepseek_v3_base_logprob_diff.py",
     "registered/lora/test_lora_gpt_oss_20b_logprob_diff.py",
