@@ -6,9 +6,10 @@ on 2-3) is deliberate: at TP1 the mismatch all-reduce is a no-op, so the hang
 it prevents -- one rank dropping a request its peers keep -- never comes up.
 
 Mismatches are injected from a per-rank generator (the global `random` is
-seeded identically on every rank), so some requests abort on one rank only. Healthy requests must still complete (no false
-positives), injected ones must abort (detection), and both engines must stay
-up (the ranks agreed on what to drop).
+seeded identically on every rank), so some requests abort on one rank only.
+Healthy requests must still complete (no false positives), injected ones must
+abort (detection), and both engines must stay up (the ranks agreed on what to
+drop).
 """
 
 import unittest
