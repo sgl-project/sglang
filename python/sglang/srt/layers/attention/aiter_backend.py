@@ -278,6 +278,18 @@ def _aiter_fp8_asm_supports_gqa(num_q_heads: int, num_kv_heads: int) -> bool:
     return (num_q_heads // num_kv_heads) in _AITER_FP8_ASM_GQA_RATIOS
 
 
+def _aiter_fp8_asm_gqa_repeat(num_q_heads: int, num_kv_heads: int) -> int:
+    """KV-head repeat factor that maps an unsupported GQA ratio onto a supported
+    one (6 -> 2 with a factor of 3); 1 if no repeat is needed or none helps."""
+    if num_kv_heads <= 0 or num_q_heads % num_kv_heads != 0:
+        return 1
+    ratio = num_q_heads // num_kv_heads
+    if ratio in _AITER_FP8_ASM_GQA_RATIOS:
+        return 1
+    pow2 = ratio & -ratio
+    return ratio // pow2 if pow2 in _AITER_FP8_ASM_GQA_RATIOS else 1
+
+
 # Cross-check the per-batch fast indices against the generic gather (syncs).
 _GFX_ASM_CTX_GATHER_CHECK = (
     os.environ.get("SGLANG_GFX_ASM_CTX_GATHER_CHECK", "0") == "1"
@@ -1222,6 +1234,11 @@ class AiterAttnBackend(AttentionBackend):
             (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
             dtype=self.input_dtype,
         )
+        q_descale = None
+        if self.kv_cache_dtype == fp8_dtype:
+            q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+            q_u_2d, _ = scaled_fp8_quant(q_u.reshape(q_u.shape[0], -1), q_descale)
+            q_u = q_u_2d.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         unified_attention(
             q=q_u,
             k=k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
@@ -1236,7 +1253,7 @@ class AiterAttnBackend(AttentionBackend):
             window_size=uni_window,
             block_table=pt,
             softcap=layer.logit_cap,
-            q_descale=None,
+            q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
             sinks=sinks,
@@ -1364,6 +1381,64 @@ class AiterAttnBackend(AttentionBackend):
             cu_k = cu_k.to(torch.int32)
         fm.asm_ctx_tok_idx, fm.asm_ctx_cu_k = tok_idx, cu_k
         return tok_idx, cu_k
+
+    def _forward_extend_fp8_asm_gqa_repeat(
+        self,
+        q: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        repeat: int,
+        bs0: int,
+        k_descale: torch.Tensor,
+        v_descale: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """fp8 ASM varlen prefill over the gathered paged KV with each KV head
+        repeated ``repeat`` times, for GQA ratios the kernel does not take.
+        Returns None when the batch has no usable gather indices."""
+        bs = forward_batch.batch_size
+        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        tok_idx, cu_k = self._asm_context_prefill_indices(
+            forward_batch, bs, k_cache.shape[0]
+        )
+        if tok_idx is None:
+            return None
+        num_kv_heads = layer.tp_k_head_num
+        head_dim = layer.qk_head_dim
+
+        def gather_and_repeat(cache: torch.Tensor) -> torch.Tensor:
+            # Read the already quantized cache; uint8 because index_select is
+            # not implemented for fp8.
+            return (
+                cache.view(-1, num_kv_heads * head_dim)
+                .view(torch.uint8)
+                .index_select(0, tok_idx)
+                .view(-1, num_kv_heads, 1, head_dim)
+                .expand(-1, num_kv_heads, repeat, head_dim)
+                .reshape(-1, num_kv_heads * repeat, head_dim)
+                .view(cache.dtype)
+            )
+
+        q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+        q_fp8, _ = scaled_fp8_quant(
+            q.contiguous().view(-1, layer.tp_q_head_num * head_dim), q_descale
+        )
+        o = flash_attn_varlen_fp8_pertensor_func(
+            q_fp8.view(-1, layer.tp_q_head_num, head_dim),
+            gather_and_repeat(k_cache),
+            gather_and_repeat(v_cache),
+            q_descale.reshape(1),
+            k_descale.reshape(1),
+            v_descale.reshape(1),
+            self.qo_indptr[:bs0],
+            cu_k,
+            self.forward_metadata.max_q_len,
+            int(self.forward_metadata.max_kv_len),
+            softmax_scale=layer.scaling,
+            causal=True,
+        )
+        if o.dtype != self.input_dtype:
+            o = o.to(self.input_dtype)
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _set_uniform_qo_indptr(
         self, bs: int, tokens_per_req: int, device: torch.device
@@ -4540,6 +4615,37 @@ class AiterAttnBackend(AttentionBackend):
                 if o.dtype != self.input_dtype:
                     o = o.to(self.input_dtype)
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # The two hd256 ASM branches above need a GQA ratio the kernel takes.
+            # For other ratios (Qwen3.8-27B: 24/4 = 6) repeat the KV heads instead
+            # of falling through to unified attention or CK batch prefill.
+            gqa_repeat = _aiter_fp8_asm_gqa_repeat(
+                layer.tp_q_head_num, layer.tp_k_head_num
+            )
+            if (
+                gqa_repeat > 1
+                and envs.SGLANG_ENABLE_AITER_FP8_ASM_PREFILL_GQA_REPEAT.get()
+                and is_gfx95_supported()
+                and forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+                and forward_batch.spec_info is None
+                and not layer.is_cross_attention
+                and window_size == (-1, -1)
+                and sinks is None
+                and self.logits_soft_cap == 0.0
+                and layer.qk_head_dim == layer.v_head_dim == 256
+                and layer.tp_k_head_num == layer.tp_v_head_num
+                and self.kv_cache_dtype == fp8_dtype
+                and not self.kv_cache_is_vectorized_5d
+                and not self.use_sliding_window_kv_pool
+                and self.forward_metadata.max_kv_len is not None
+            ):
+                o = self._forward_extend_fp8_asm_gqa_repeat(
+                    q, layer, forward_batch, gqa_repeat, bs0, k_descale, v_descale
+                )
+                if o is not None:
+                    return o
 
             if self.kv_cache_is_vectorized_5d:
                 return forward_extend_vectorized_5d(
