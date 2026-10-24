@@ -36,6 +36,7 @@ _PUBLIC_OVERRIDE_FIELDS = {
     "profile",
     "profile_all_stages",
     "num_profiled_timesteps",
+    "record_execution_trace",
     "perf_dump_path",
 }
 
