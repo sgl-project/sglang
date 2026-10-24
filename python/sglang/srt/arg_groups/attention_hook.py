@@ -607,6 +607,18 @@ def handle_deterministic_inference(server_args: Any):
                 enable_aiter_allreduce_fusion=False,
             )
 
+        # A mixed batch runs its decode tokens through the prefill (extend) kernels,
+        # so a decode step's result would depend on whether a prefill shares the batch.
+        if cfg.enable_mixed_chunk:
+            logger.warning(
+                "Disable --enable-mixed-chunk because deterministic inference is enabled."
+            )
+            declare_resolution(
+                server_args,
+                "_handle_deterministic_inference",
+                enable_mixed_chunk=False,
+            )
+
         # Moved to the resolution pipeline (arg_groups/overrides.py:
         # _deterministic_allreduce_fusion_disable), invoked here at its
         # legacy slot.
