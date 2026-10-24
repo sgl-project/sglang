@@ -189,6 +189,14 @@ async def health(request: Request):
     """Report readiness for normal inference traffic."""
     if not request.app.state.server_warmup_done.is_set():
         return Response(status_code=503)
+    if async_scheduler_client.unrecoverable_device_error is not None:
+        return orjson_response(
+            {
+                "status": "unhealthy",
+                "error": async_scheduler_client.unrecoverable_device_error,
+            },
+            status_code=503,
+        )
     return {"status": "ok"}
 
 

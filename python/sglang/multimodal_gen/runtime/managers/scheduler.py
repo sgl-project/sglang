@@ -341,6 +341,10 @@ class Scheduler(
             raise RuntimeError(
                 "Server is sleeping. Call resume_memory_occupation first."
             )
+        if self.worker.unrecoverable_device_error is not None:
+            return self._reject_on_unrecoverable_device(
+                reqs, separate_items=allow_dynamic_batching
+            )
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._ensure_warmup_progress_bar(warmup_reqs[0])
@@ -385,6 +389,7 @@ class Scheduler(
                     return self._build_dynamic_batch_error_outputs(
                         reqs=reqs,
                         error_msg=output_batch.error,
+                        device_unrecoverable=output_batch.device_unrecoverable,
                     )
 
                 split_outputs = self._split_batched_output(output_batch, reqs)
@@ -434,6 +439,7 @@ class Scheduler(
                 return self._build_dynamic_batch_error_outputs(
                     reqs=reqs,
                     error_msg=output_batch.error,
+                    device_unrecoverable=output_batch.device_unrecoverable,
                 )
 
             split_outputs = self._split_batched_output(output_batch, reqs)
@@ -810,8 +816,24 @@ class Scheduler(
         self,
         reqs: List[Req],
         error_msg: str,
+        device_unrecoverable: bool = False,
     ) -> List[OutputBatch]:
-        return [OutputBatch(error=error_msg) for _ in reqs]
+        return [
+            OutputBatch(error=error_msg, device_unrecoverable=device_unrecoverable)
+            for _ in reqs
+        ]
+
+    def _reject_on_unrecoverable_device(
+        self, reqs: List[Req], *, separate_items: bool
+    ) -> OutputBatch | List[OutputBatch]:
+        # a request group is one queue item and gets one reply
+        error = (
+            "Device is in an unrecoverable state after an earlier error "
+            f"({self.worker.unrecoverable_device_error}); restart the server."
+        )
+        if separate_items and len(reqs) > 1:
+            return [OutputBatch(error=error, device_unrecoverable=True) for _ in reqs]
+        return OutputBatch(error=error, device_unrecoverable=True)
 
     def _should_return_lightweight_warmup_result(self, processed_req: Any) -> bool:
         req = get_first_generation_req(processed_req)
