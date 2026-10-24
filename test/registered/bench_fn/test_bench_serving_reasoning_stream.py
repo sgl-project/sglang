@@ -19,9 +19,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from sglang.benchmark.serving import (
     RequestFuncInput,
+    RequestFuncOutput,
+    _assistant_message_for_next_turn,
     async_request_openai_chat_completions,
     calculate_metrics,
     set_global_args,
+    wrap_multi_turn_request_func,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -195,6 +198,8 @@ class TestBenchServingReasoningStream(CustomTestCase):
 
         self.assertTrue(out.success, msg=f"request failed: {out.error}")
         self.assertEqual(out.generated_text, "step1 step2 answer here")
+        self.assertEqual(out.reasoning_text, "step1 step2 ")
+        self.assertEqual(out.content_text, "answer here")
         self.assertGreater(out.ttft, 0.0)
         self.assertEqual(len(out.itl), 3)
         self.assertEqual(out.text_chunks, ["step2 ", "answer ", "here"])
@@ -348,6 +353,112 @@ class TestBenchServingReasoningNonStream(CustomTestCase):
         self.assertEqual(out.generated_text, "answer")
         self.assertGreater(out.ttft, 0.0)
         self.assertEqual(out.output_len, 1)
+
+
+class TestBenchServingMultiTurnReasoning(CustomTestCase):
+    """The assistant message the multi-turn client sends back: `content` only by
+    default, `content` and `reasoning_content` with echo_reasoning."""
+
+    @classmethod
+    def setUpClass(cls):
+        set_global_args(
+            Namespace(
+                disable_stream=True,
+                disable_ignore_eos=True,
+                print_requests=False,
+                tokenizer="",
+                header=None,
+            )
+        )
+
+    def test_assistant_message_content_only_by_default(self):
+        out = RequestFuncOutput(
+            generated_text="thought answer",
+            reasoning_text="thought",
+            content_text="answer",
+        )
+        self.assertEqual(
+            _assistant_message_for_next_turn(out, echo_reasoning=False),
+            {"role": "assistant", "content": "answer"},
+        )
+
+    def test_assistant_message_echoes_reasoning_when_asked(self):
+        out = RequestFuncOutput(
+            generated_text="thought answer",
+            reasoning_text="thought",
+            content_text="answer",
+        )
+        self.assertEqual(
+            _assistant_message_for_next_turn(out, echo_reasoning=True),
+            {"role": "assistant", "content": "answer", "reasoning_content": "thought"},
+        )
+
+    def test_assistant_message_omits_empty_reasoning(self):
+        out = RequestFuncOutput(generated_text="answer", content_text="answer")
+        self.assertEqual(
+            _assistant_message_for_next_turn(out, echo_reasoning=True),
+            {"role": "assistant", "content": "answer"},
+        )
+
+    def _run_two_rounds(self, echo_reasoning: bool):
+        port = _free_port()
+
+        class Handler(_JSONHandler):
+            request_bodies = []
+
+        Handler.response_body = _make_response(
+            content="answer", reasoning_content="thought", completion_tokens=2
+        )
+        server = HTTPServer(("127.0.0.1", port), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            req = RequestFuncInput(
+                prompt=["first question", "second question"],
+                api_url=f"http://127.0.0.1:{port}/v1/chat/completions",
+                prompt_len=2,
+                output_len=8,
+                model="dummy-model",
+                lora_name="",
+                image_data=None,
+                extra_request_body={},
+            )
+            func = wrap_multi_turn_request_func(
+                async_request_openai_chat_completions,
+                backend="sglang-oai-chat",
+                echo_reasoning=echo_reasoning,
+            )
+            outputs = asyncio.run(func(req))
+        finally:
+            server.shutdown()
+            server.server_close()
+        return outputs, Handler.request_bodies
+
+    def test_second_round_sends_content_only_by_default(self):
+        outputs, bodies = self._run_two_rounds(echo_reasoning=False)
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(all(o.success for o in outputs))
+        self.assertEqual(len(bodies), 2)
+        assistant = [m for m in bodies[1]["messages"] if m["role"] == "assistant"]
+        self.assertEqual(assistant, [{"role": "assistant", "content": "answer"}])
+        self.assertEqual(outputs[0].reasoning_text, "thought")
+        self.assertEqual(outputs[0].content_text, "answer")
+        # Output accounting still sees everything the model produced.
+        self.assertEqual(outputs[0].generated_text, "thoughtanswer")
+
+    def test_second_round_echoes_reasoning_when_asked(self):
+        _, bodies = self._run_two_rounds(echo_reasoning=True)
+        assistant = [m for m in bodies[1]["messages"] if m["role"] == "assistant"]
+        self.assertEqual(
+            assistant,
+            [
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": "thought",
+                }
+            ],
+        )
 
 
 if __name__ == "__main__":
