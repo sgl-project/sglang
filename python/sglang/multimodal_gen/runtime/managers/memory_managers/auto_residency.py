@@ -2135,7 +2135,8 @@ def collect_residency_targets(
     allow_host_pin_reallocation: bool = True,
     mixed_dtype_components: Iterable[str] = (),
     required_resident_components: Iterable[str] = (),
-    layerwise_tuning_of: Callable[[str, bool], tuple[float, float, str]] | None = None,
+    layerwise_tuning_of: Callable[[str, bool], tuple[float, float, str, str]]
+    | None = None,
     layerwise_policy_is_explicit: Callable[[str, bool], bool] | None = None,
     pin_cpu_memory: bool = True,
     used_components: Iterable[str] | None = None,
@@ -2276,7 +2277,7 @@ def collect_residency_targets(
                 and layerwise_tuning_of is not None
                 and name not in mixed_dtype_names
             ):
-                prefetch_value, _, residency_policy = layerwise_tuning_of(
+                prefetch_value, _, residency_policy, _ = layerwise_tuning_of(
                     name, dit_group
                 )
                 virtual_targets, maximum_transfer_work = (

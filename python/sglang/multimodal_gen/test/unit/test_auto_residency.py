@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     RESIDENCY_POLICY_STRIDED,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_MAX_VIDEO_FRAMES,
     _resolve_auto_residency_warmup_shape,
@@ -2868,6 +2869,48 @@ class TestSizeAccounting:
 
 
 class TestCollectResidencyTargets:
+    @pytest.mark.parametrize("lifetime", ["forward", "permanent"])
+    @pytest.mark.parametrize("policy", ["leading", "strided"])
+    def test_lazy_frontier_uses_real_server_args_tuning(self, lifetime, policy):
+        args = ServerArgs.__new__(ServerArgs)
+        args.layerwise_prefetch_size = {"transformer": "1"}
+        args.layerwise_resident_layers = None
+        args.layerwise_residency_policy = {"transformer": policy}
+        args.layerwise_residency_lifetime = {"transformer": lifetime}
+        args.dit_offload_prefetch_size = 0.0
+        args.dit_layerwise_resident_layers = 0.0
+        args.dit_layerwise_residency_policy = "leading"
+        args.dit_layerwise_residency_lifetime = "forward"
+        module = _FakeLazyLayerwiseDit()
+
+        candidates = collect_residency_targets(
+            modules={"transformer": module},
+            residency_mode_of=lambda _name: COMPONENT_OFFLOAD,
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=4,
+            layerwise_tuning_of=lambda name, dit_group: args.layerwise_tuning_for(
+                name, dit_group=dit_group
+            ),
+            layerwise_policy_is_explicit=lambda _name, _dit_group: True,
+        )
+        layerwise = [
+            candidate
+            for candidate in candidates
+            if candidate.target_mode() == LAYERWISE_OFFLOAD
+        ]
+        assert layerwise
+        assert all(
+            candidate.target_layerwise_residency_policies == (policy,)
+            for candidate in layerwise
+        )
+        assert args.layerwise_tuning_for("transformer", dit_group=True) == (
+            1.0,
+            0.0,
+            policy,
+            lifetime,
+        )
+
     def _modes(self, mapping):
         return lambda name: mapping.get(name, RESIDENT)
 
@@ -3295,7 +3338,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=10,
-            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                0.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         assert any(
@@ -3329,7 +3377,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=10,
-            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                0.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         component = next(
@@ -3373,7 +3426,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=4,
-            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                1.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         streamed = next(
@@ -3398,7 +3456,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=10,
-            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                0.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         full_stage = next(
@@ -3609,7 +3672,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=4,
-            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                1.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         assert {candidate.target_mode() for candidate in candidates} == {
@@ -3686,6 +3754,7 @@ class TestCollectResidencyTargets:
                 0.0,
                 0.0,
                 "leading",
+                "forward",
             ),
         )
 
@@ -3794,6 +3863,7 @@ class TestCollectResidencyTargets:
                 1.0,
                 0.0,
                 "leading",
+                "forward",
             ),
         )
 
@@ -3852,7 +3922,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=1,
-            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                1.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         assert {candidate.target_mode() for candidate in candidates} == {
@@ -3873,7 +3948,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=4,
-            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                1.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         streamed = [
@@ -3906,7 +3986,12 @@ class TestCollectResidencyTargets:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=4,
-            layerwise_tuning_of=lambda _name, _dit_group: (1.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                1.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
 
         streamed = next(
@@ -3937,7 +4022,12 @@ class TestApplyAndRollback:
             explicit_residency_mode_of=lambda _name: None,
             custom_strategy_names=(),
             num_inference_steps=10,
-            layerwise_tuning_of=lambda _name, _dit_group: (0.0, 0.0, "leading"),
+            layerwise_tuning_of=lambda _name, _dit_group: (
+                0.0,
+                0.0,
+                "leading",
+                "forward",
+            ),
         )
         target = next(
             candidate
