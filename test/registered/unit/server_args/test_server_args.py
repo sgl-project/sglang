@@ -3324,6 +3324,7 @@ class TestDeepEPv2Args(CustomTestCase):
             "DeepseekV3ForCausalLM",
             "DeepseekV4ForCausalLM",
             "Qwen3MoeForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
             "Glm5NextForConditionalGeneration",
             "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",
