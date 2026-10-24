@@ -11,23 +11,18 @@ from sglang.test.test_utils import CustomTestCase, enter_override, maybe_stub_sg
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
 import asyncio
-import copy
 import gc
 import json
-import tempfile
 import unittest
 import uuid
 from http import HTTPStatus
-from pathlib import Path
 from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
-from sglang.srt.entrypoints.openai.chat_encoding import (
-    resolve_dsv4_reasoning_effort_profile,
-)
+from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     Function,
@@ -155,15 +150,6 @@ _TOOL_RESULT_REORDER_TEMPLATE = """
     {%- endfor -%}
 {%- endfor -%}
 """
-
-
-def _create_dsv4_checkpoint(test_case: unittest.TestCase, source: str) -> str:
-    model_dir = tempfile.TemporaryDirectory()
-    test_case.addCleanup(model_dir.cleanup)
-    encoder_path = Path(model_dir.name) / "encoding" / "encoding_dsv4.py"
-    encoder_path.parent.mkdir(parents=True)
-    encoder_path.write_text(source, encoding="utf-8")
-    return model_dir.name
 
 
 class _MockTokenizerManager:
@@ -1915,7 +1901,6 @@ class ServingChatTestCase(CustomTestCase):
     def test_dsv_tool_choice_none_omits_tools_from_prompt(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
-        self.chat._dsv4_reasoning_effort_profile = "preview"
         tool = {
             "type": "function",
             "function": {
@@ -1924,25 +1909,21 @@ class ServingChatTestCase(CustomTestCase):
             },
         }
 
-        for chat_encoding_spec in ("dsv4", "dsv32", "dsv41"):
-            for tool_choice, expects_tools in (("none", False), ("auto", True)):
-                with self.subTest(
-                    chat_encoding_spec=chat_encoding_spec,
+        self.chat.chat_encoding_spec = "dsv32"
+        for tool_choice, expects_tools in (("none", False), ("auto", True)):
+            with self.subTest(tool_choice=tool_choice):
+                self.tm.tokenizer.encode.reset_mock()
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Solve 100 / 7."}],
+                    tools=[tool],
                     tool_choice=tool_choice,
-                ):
-                    self.chat.chat_encoding_spec = chat_encoding_spec
-                    self.tm.tokenizer.encode.reset_mock()
-                    request = ChatCompletionRequest(
-                        model="x",
-                        messages=[{"role": "user", "content": "Solve 100 / 7."}],
-                        tools=[tool],
-                        tool_choice=tool_choice,
-                    )
+                )
 
-                    self.chat._process_messages(request, is_multimodal=False)
+                self.chat._process_messages(request, is_multimodal=False)
 
-                    prompt = self.tm.tokenizer.encode.call_args.args[0]
-                    self.assertEqual("calculator" in prompt, expects_tools)
+                prompt = self.tm.tokenizer.encode.call_args.args[0]
+                self.assertEqual("calculator" in prompt, expects_tools)
 
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
@@ -2200,76 +2181,70 @@ class ServingChatTestCase(CustomTestCase):
         """DeepSeek encoders should reject history tool call scalars as BadRequest."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
-        self.chat._dsv4_reasoning_effort_profile = "preview"
 
-        for chat_encoding_spec in ("dsv4", "dsv32"):
-            with self.subTest(chat_encoding_spec=chat_encoding_spec):
-                self.chat.chat_encoding_spec = chat_encoding_spec
-                req = ChatCompletionRequest(
-                    model="x",
-                    messages=[
-                        {"role": "user", "content": "Where is it raining?"},
+        self.chat.chat_encoding_spec = "dsv32"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Where is it raining?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
                         {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": "call_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "get_weather",
-                                        "arguments": '"Beijing"',
-                                    },
-                                }
-                            ],
-                        },
-                        {
-                            "role": "tool",
-                            "tool_call_id": "call_1",
-                            "content": "sunny",
-                        },
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '"Beijing"',
+                            },
+                        }
                     ],
-                )
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "sunny",
+                },
+            ],
+        )
 
-                with self.assertRaisesRegex(ValueError, "must be a JSON object"):
-                    self.chat._process_messages(req, is_multimodal=False)
+        with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+            self.chat._process_messages(req, is_multimodal=False)
 
     def test_dsv_encoders_accept_object_tool_call_arguments_string(self):
         """DeepSeek encoders accept object-shaped OpenAI JSON string arguments."""
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
-        self.chat._dsv4_reasoning_effort_profile = "preview"
 
-        for chat_encoding_spec in ("dsv4", "dsv32"):
-            with self.subTest(chat_encoding_spec=chat_encoding_spec):
-                self.chat.chat_encoding_spec = chat_encoding_spec
-                req = ChatCompletionRequest(
-                    model="x",
-                    messages=[
-                        {"role": "user", "content": "Where is it raining?"},
+        self.chat.chat_encoding_spec = "dsv32"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Where is it raining?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
                         {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": "call_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "get_weather",
-                                        "arguments": '{"city": "Beijing"}',
-                                    },
-                                }
-                            ],
-                        },
-                        {
-                            "role": "tool",
-                            "tool_call_id": "call_1",
-                            "content": "sunny",
-                        },
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Beijing"}',
+                            },
+                        }
                     ],
-                )
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "sunny",
+                },
+            ],
+        )
 
-                self.chat._process_messages(req, is_multimodal=False)
+        self.chat._process_messages(req, is_multimodal=False)
 
     def test_stop_str_isolation_between_requests(self):
         """Test that stop strings from one request don't affect subsequent requests.
@@ -3110,17 +3085,14 @@ class ServingChatTestCase(CustomTestCase):
         # Case 4: DeepseekV4 arch -> always dsv4, even with chat_template
         # (release ships a stale V3 jinja we deliberately override).
         mock_hf_config.architectures = ["DeepseekV4ForCausalLM"]
-        mock_hf_config.to_dict.return_value = {
-            "dsv4_reasoning_effort_profile": "preview"
-        }
-        tm.model_path = "deepseek-ai/DeepSeek-V4-Flash"
-        tm.tokenizer.chat_template = "stale v3 jinja"
-        serving_chat = OpenAIServingChat(tm, TemplateManager())
-        self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
-
-        tm.tokenizer.chat_template = None
-        serving_chat = OpenAIServingChat(tm, TemplateManager())
-        self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
+        for chat_template in ("stale v3 jinja", None):
+            tm.tokenizer.chat_template = chat_template
+            self.assertEqual(
+                resolve_chat_encoding_spec(
+                    hf_config=mock_hf_config, tokenizer=tm.tokenizer
+                ),
+                "dsv4",
+            )
 
     def test_kimi_k3_encoding_detection(self):
         from sglang.srt.parser.template_manager import TemplateManager
@@ -3151,7 +3123,7 @@ class ServingChatTestCase(CustomTestCase):
         self.chat.chat_encoding_spec = None
         self.assertFalse(self.chat.supports_native_reasoning_history())
 
-    # ------------- dsv4 task + latest_reminder -------------
+    # ------------- dsv4 task -------------
     def test_dsv4_task_field_schema(self):
         """Top-level `task` accepts the 6 DS task tokens and rejects others."""
         for valid in ("action", "query", "authority", "domain", "title", "read_url"):
@@ -3174,407 +3146,6 @@ class ServingChatTestCase(CustomTestCase):
                 messages=[{"role": "user", "content": "hi"}],
                 task="bogus",
             )
-
-    def test_attach_task_to_last_user_message(self):
-        """Helper attaches task to the nearest user/developer message."""
-        from sglang.srt.entrypoints.openai import encoding_dsv4
-
-        messages = [{"role": "user", "content": "Hi"}]
-        encoding_dsv4.attach_task_to_last_user_message(messages, "domain")
-        self.assertEqual(messages[0]["task"], "domain")
-
-        # Prefers the LAST user message across a multi-turn conversation.
-        messages = [
-            {"role": "user", "content": "first"},
-            {"role": "assistant", "content": "ok"},
-            {"role": "user", "content": "second"},
-        ]
-        encoding_dsv4.attach_task_to_last_user_message(messages, "query")
-        self.assertNotIn("task", messages[0])
-        self.assertEqual(messages[2]["task"], "query")
-
-        # `developer` role is treated like `user` (matches encoder semantics).
-        messages = [{"role": "developer", "content": "dev"}]
-        encoding_dsv4.attach_task_to_last_user_message(messages, "authority")
-        self.assertEqual(messages[0]["task"], "authority")
-
-        # No user/developer present -> raises.
-        with self.assertRaises(ValueError):
-            encoding_dsv4.attach_task_to_last_user_message(
-                [{"role": "system", "content": "s"}], "domain"
-            )
-
-    def test_dsv4_content_parts_list_normalized(self):
-        """OpenAI list-of-parts content flattens to text before reaching the encoder."""
-        from sglang.srt.entrypoints.openai import encoding_dsv4
-        from sglang.srt.parser.jinja_template_utils import (
-            process_content_for_template_format,
-        )
-
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": "say hi"}],
-                }
-            ],
-        )
-        messages = [m.model_dump() for m in req.messages]
-        # Mirror the boundary normalization _process_messages does for any
-        # non-None chat_encoding_spec.
-        for i, msg in enumerate(messages):
-            if isinstance(msg.get("content"), list):
-                messages[i] = process_content_for_template_format(
-                    msg, "string", [], [], [], []
-                )
-        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
-        self.assertIn("<｜User｜>say hi", out)
-
-        # Multiple text parts concat with single space; non-text parts dropped.
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "describe"},
-                    {"type": "image_url", "image_url": {"url": "x"}},
-                ],
-            }
-        ]
-        for i, msg in enumerate(messages):
-            if isinstance(msg.get("content"), list):
-                messages[i] = process_content_for_template_format(
-                    msg, "string", [], [], [], []
-                )
-        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
-        self.assertIn("<｜User｜>describe", out)
-        self.assertNotIn("image_url", out)
-
-    def test_dsv4_task_and_reminder_encode_end_to_end(self):
-        """Task + latest_reminder plumb through to the dsv4 encoder correctly."""
-        from sglang.srt.entrypoints.openai import encoding_dsv4
-
-        # 1) task='domain' in chat mode -> `<｜domain｜>` appended, no Assistant
-        #    prefix (this is a single-shot classification, not a chat turn).
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "What is SGLang?"}],
-            task="domain",
-        )
-        messages = [m.model_dump() for m in req.messages]
-        encoding_dsv4.attach_task_to_last_user_message(messages, req.task)
-        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
-        self.assertIn("<｜domain｜>", out)
-        self.assertTrue(out.rstrip().endswith("<｜domain｜>"))
-        self.assertNotIn("<｜Assistant｜>", out)
-
-        # 2) task='action' in thinking mode -> Assistant + <think> + <｜action｜>
-        #    (action is the one task that still runs a reasoning pass).
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "Hi"}],
-            task="action",
-        )
-        messages = [m.model_dump() for m in req.messages]
-        encoding_dsv4.attach_task_to_last_user_message(messages, req.task)
-        out = encoding_dsv4.encode_messages(messages, thinking_mode="thinking")
-        self.assertIn("<｜Assistant｜>", out)
-        self.assertIn("<think>", out)
-        self.assertTrue(out.rstrip().endswith("<｜action｜>"))
-
-        # 3) latest_reminder preceding user -> reminder renders before user,
-        #    Assistant prefix still comes after user.
-        req = ChatCompletionRequest(
-            model="x",
-            messages=[
-                {"role": "latest_reminder", "content": "Be terse."},
-                {"role": "user", "content": "Hello"},
-            ],
-        )
-        messages = [m.model_dump() for m in req.messages]
-        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
-        self.assertIn("<｜latest_reminder｜>Be terse.", out)
-        self.assertIn("<｜User｜>Hello", out)
-        self.assertLess(
-            out.index("<｜latest_reminder｜>"),
-            out.index("<｜User｜>"),
-        )
-        self.assertIn("<｜Assistant｜>", out)
-
-    def test_dsv4_reasoning_effort_profiles(self):
-        from sglang.srt.entrypoints.openai import encoding_dsv4
-
-        messages = [
-            {"role": "system", "content": ""},
-            {"role": "user", "content": "Solve this."},
-        ]
-        absolute_maximum = (
-            "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
-            "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n"
-            "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n"
-        )
-        beyond_maximum = (
-            "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n"
-            "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n"
-            "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n"
-        )
-
-        def encode(profile, effort):
-            return encoding_dsv4.encode_messages(
-                messages,
-                thinking_mode="thinking",
-                reasoning_effort=effort,
-                reasoning_effort_profile=profile,
-            )
-
-        preview_high = encode("preview", "high")
-        preview_max = encode("preview", "max")
-        official_low = encode("official", "low")
-        official_high = encode("official", "high")
-        official_max = encode("official", "max")
-
-        self.assertNotIn("Reasoning Effort:", preview_high)
-        self.assertTrue(
-            preview_max.startswith(encoding_dsv4.bos_token + absolute_maximum)
-        )
-        self.assertNotIn("Reasoning Effort:", official_low)
-        self.assertEqual(
-            official_high,
-            encoding_dsv4.bos_token
-            + absolute_maximum
-            + official_low.removeprefix(encoding_dsv4.bos_token),
-        )
-        self.assertEqual(
-            official_max,
-            encoding_dsv4.bos_token
-            + beyond_maximum
-            + official_low.removeprefix(encoding_dsv4.bos_token),
-        )
-        self.assertEqual(encode("preview", None), preview_high)
-        self.assertEqual(encode("official", None), official_low)
-        self.assertEqual(len({official_low, official_high, official_max}), 3)
-
-        with self.assertRaises(ValueError):
-            encode("preview", "low")
-
-    def test_dsv4_reasoning_effort_profile_resolution(self):
-        resolve = resolve_dsv4_reasoning_effort_profile
-        preview_model_path = _create_dsv4_checkpoint(self, _DSV4_PREVIEW_ENCODER)
-        official_model_path = _create_dsv4_checkpoint(self, _DSV4_OFFICIAL_ENCODER)
-        inconclusive_model_path = _create_dsv4_checkpoint(
-            self, 'UNRELATED_METADATA = "value"\n'
-        )
-        self.assertEqual(resolve(model_path=preview_model_path), "preview")
-        self.assertEqual(resolve(model_path=official_model_path), "official")
-        self.assertEqual(resolve(model_path=inconclusive_model_path), "preview")
-
-        self.assertEqual(
-            resolve(model_path="renamed/model", override="official"), "official"
-        )
-        self.assertEqual(
-            resolve(model_path="renamed/model", override="preview"), "preview"
-        )
-        with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
-            resolve(model_path="renamed/model", override="auto")
-
-    def test_dsv4_reasoning_effort_profile_from_checkpoint(self):
-        from sglang.srt.parser.template_manager import TemplateManager
-
-        official_model_path = _create_dsv4_checkpoint(self, _DSV4_OFFICIAL_ENCODER)
-        tm = _MockTokenizerManager()
-        tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
-        tm.model_config.hf_config.to_dict.return_value = {}
-        tm.model_config.hf_config.dspark_block_size = 5
-        tm.model_config.hf_config.dspark_markov_rank = 256
-        tm.model_path = official_model_path
-        tm.server_args.model_path = tm.model_path
-        serving_chat = OpenAIServingChat(tm, TemplateManager())
-
-        request = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "Hello"}],
-            reasoning_effort="max",
-        )
-        serving_chat._process_messages(request, is_multimodal=False)
-        prompt = tm.tokenizer.encode.call_args.args[0]
-        self.assertIn("Reasoning Effort: Beyond maximum", prompt)
-
-    def test_dsv4_reasoning_effort_profile_override_from_model_config(self):
-        from sglang.srt.parser.template_manager import TemplateManager
-
-        tm = _MockTokenizerManager()
-        tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
-        tm.model_config.hf_config.to_dict.return_value = {
-            "dsv4_reasoning_effort_profile": "official"
-        }
-        serving_chat = OpenAIServingChat(tm, TemplateManager())
-        request = ChatCompletionRequest(
-            model="x",
-            messages=[{"role": "user", "content": "Hello"}],
-            reasoning_effort="max",
-        )
-
-        serving_chat._process_messages(request, is_multimodal=False)
-
-        prompt = tm.tokenizer.encode.call_args.args[0]
-        self.assertIn("Reasoning Effort: Beyond maximum", prompt)
-
-    def test_dsv4_invalid_profile_override_fails_at_construction(self):
-        from sglang.srt.parser.template_manager import TemplateManager
-
-        tm = _MockTokenizerManager()
-        tm.model_config.hf_config.architectures = ["DeepseekV4ForCausalLM"]
-        tm.model_config.hf_config.to_dict.return_value = {
-            "dsv4_reasoning_effort_profile": "invalid"
-        }
-        with self.assertRaisesRegex(ValueError, "dsv4_reasoning_effort_profile"):
-            OpenAIServingChat(tm, TemplateManager())
-
-    def test_dsv41_rejects_image_placeholder_in_text(self):
-        from sglang.srt.entrypoints.openai import encoding_dsv41
-
-        for role in ("user", "tool"):
-            with self.subTest(role=role):
-                with self.assertRaises(ValueError):
-                    encoding_dsv41.encode_messages(
-                        [
-                            {
-                                "role": role,
-                                "content": f"hi {encoding_dsv41.IMAGE_PLACEHOLDER}",
-                            }
-                        ],
-                        thinking_mode="chat",
-                    )
-
-    def test_dsv41_tool_result_images_follow_prompt_order(self):
-        """Out-of-order tool results are sorted by call order; images must follow."""
-        from sglang.srt.entrypoints.openai import encoding_dsv41
-
-        image = encoding_dsv41.IMAGE_PLACEHOLDER
-        history = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": "history.png"}},
-                ],
-            },
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "id": name,
-                        "type": "function",
-                        "function": {"name": name, "arguments": "{}"},
-                    }
-                    for name in ("a", "b")
-                ],
-            },
-        ]
-        results = [
-            {
-                "type": "tool_result",
-                "tool_use_id": name,
-                "content": [
-                    {"type": "text", "text": f"result {name}"},
-                    {"type": "image_url", "image_url": {"url": f"{name}.png"}},
-                ],
-            }
-            for name in ("b", "a")
-        ]
-
-        for input_format in (
-            "content_blocks",
-            "tool_messages",
-            "tool_content_blocks",
-            "context",
-        ):
-            with self.subTest(input_format=input_format):
-                if input_format in ("tool_messages", "tool_content_blocks"):
-                    content_field = (
-                        "content_blocks"
-                        if input_format == "tool_content_blocks"
-                        else "content"
-                    )
-                    messages = history + [
-                        {
-                            "role": "tool",
-                            "tool_call_id": block["tool_use_id"],
-                            content_field: block["content"],
-                        }
-                        for block in results
-                    ]
-                    context = []
-                elif input_format == "context":
-                    messages = [{"role": "user", "content_blocks": results}]
-                    context = history
-                else:
-                    messages = history + [{"role": "user", "content_blocks": results}]
-                    context = []
-                original = copy.deepcopy((messages, context))
-
-                prompt, media = encoding_dsv41.encode_messages(
-                    messages,
-                    thinking_mode="chat",
-                    context=context,
-                    return_multi_modal_data=True,
-                )
-
-                self.assertTrue(
-                    prompt.endswith(
-                        f"<｜User｜><tool_result>result a\n\n{image}</tool_result>\n\n"
-                        f"<tool_result>result b\n\n{image}</tool_result>"
-                        "<｜Assistant｜></think>"
-                    ),
-                    prompt,
-                )
-                expected_urls = (
-                    ["a.png", "b.png"] if context else ["history.png", "a.png", "b.png"]
-                )
-                self.assertEqual(
-                    media,
-                    {"images": [{"url": url} for url in expected_urls]},
-                )
-                self.assertEqual((messages, context), original)
-
-    def test_dsv41_drop_thinking_without_tools(self):
-        """Tool results do not start a new turn, so current-turn reasoning is kept."""
-        from sglang.srt.entrypoints.openai import encoding_dsv41
-
-        messages = [
-            {"role": "user", "content": "q1"},
-            {"role": "assistant", "content": "a1", "reasoning_content": "r1"},
-            {"role": "user", "content": "q2"},
-            {
-                "role": "assistant",
-                "reasoning_content": "r2",
-                "tool_calls": [
-                    {
-                        "id": "c1",
-                        "type": "function",
-                        "function": {"name": "lookup", "arguments": "{}"},
-                    }
-                ],
-            },
-            {"role": "tool", "tool_call_id": "c1", "content": "value"},
-        ]
-        prompt = encoding_dsv41.encode_messages(
-            messages, thinking_mode="thinking", drop_thinking=True
-        )
-        self.assertIn(
-            "<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜>", prompt
-        )
-        self.assertNotIn("r1", prompt)
-        self.assertIn("<think>r2</think>", prompt)
-        self.assertTrue(
-            prompt.endswith("<tool_result>value</tool_result><｜Assistant｜><think>")
-        )
-
-        next_turn = encoding_dsv41.encode_messages(
-            messages + [{"role": "user", "content": "q3"}],
-            thinking_mode="thinking",
-        )
-        self.assertNotIn("r2", next_turn)
-        self.assertTrue(next_turn.endswith("q3<｜Assistant｜><think>"))
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
@@ -5499,7 +5070,7 @@ class ServingChatTestCase(CustomTestCase):
     # ------------- hook method tests -------------
     def test_encode_messages_returns_none_by_default(self):
         """Default _encode_messages returns None (use standard encoding)."""
-        result = self.chat._encode_messages([], Mock(), False)
+        result = self.chat._encode_messages([], Mock(), False, image_data=[])
         self.assertIsNone(result)
 
 

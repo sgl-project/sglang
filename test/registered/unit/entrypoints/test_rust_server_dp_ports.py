@@ -271,11 +271,13 @@ def test_scale_joiner_hosts_listener():
 
 
 class _HttpRegistry(CommonKVBootstrapServer):
-    pass
+    def __init__(self, host, port):
+        raise AssertionError("the Rust server serves this registry")
 
 
 class _OwnBootstrapServer(BaseKVBootstrapServer):
-    pass
+    def __init__(self, host, port):
+        self.address = (host, port)
 
 
 @pytest.mark.parametrize(
@@ -312,6 +314,35 @@ def test_rust_prefill_bootstrap_port_alias(server_class, bootstrap_port, expecte
             return
         handle_pd_disaggregation(args)
     assert resolving_view(args).disaggregation_bootstrap_port == expected
+
+
+@pytest.mark.parametrize(
+    "mode,server_class,starts",
+    [
+        ("prefill", _HttpRegistry, False),
+        ("prefill", _OwnBootstrapServer, True),
+        ("decode", _OwnBootstrapServer, False),
+    ],
+    ids=["http-registry", "backend-bootstrap-server", "decode"],
+)
+def test_rust_mode_starts_only_a_bootstrap_server_rust_cannot_serve(
+    mode, server_class, starts
+):
+    with (
+        get_context().override_server_args(
+            host="127.0.0.1",
+            disaggregation_mode=mode,
+            disaggregation_transfer_backend="nixl",
+            disaggregation_bootstrap_port=33000,
+        ),
+        patch.object(disagg_service, "get_kv_class", return_value=server_class),
+    ):
+        server = disagg_service.start_disagg_service_for_rust_server()
+
+    if starts:
+        assert server.address == ("127.0.0.1", 33000)
+    else:
+        assert server is None
 
 
 if __name__ == "__main__":
