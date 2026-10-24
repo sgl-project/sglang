@@ -87,6 +87,7 @@ class ToolServer(ABC):
 class MCPToolServer(ToolServer):
     def __init__(self):
         self.harmony_tool_descriptions = {}
+        self.urls: dict[str, str] = {}
 
     async def add_tool_server(self, server_url: str):
         tool_urls = server_url.split(",")
@@ -110,15 +111,16 @@ class MCPToolServer(ToolServer):
                     for tool in list_tools_response.tools
                 ],
             )
-            self.harmony_tool_descriptions[tool_from_mcp.name] = tool_from_mcp
-            if tool_from_mcp.name not in self.urls:
-                self.urls[tool_from_mcp.name] = url
-            else:
+            if tool_from_mcp.name in self.urls:
                 logger.warning(
                     "Tool %s already exists. Ignoring duplicate tool server %s",
                     tool_from_mcp.name,
                     url,
                 )
+                continue
+
+            self.harmony_tool_descriptions[tool_from_mcp.name] = tool_from_mcp
+            self.urls[tool_from_mcp.name] = url
 
     def has_tool(self, tool_name: str):
         return tool_name in self.harmony_tool_descriptions
