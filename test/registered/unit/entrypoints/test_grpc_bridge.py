@@ -3,6 +3,7 @@ import enum
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
@@ -171,6 +172,35 @@ class TestEngineStateNotifications(CustomTestCase):
 
         self.assertEqual(self.notifications, 1)
         self.assertFalse(handle.health_check())
+
+
+class TestServerInfo(CustomTestCase):
+    def test_advertises_each_media_kind_the_processor_places(self):
+        vision = SimpleNamespace(
+            mm_tokens=SimpleNamespace(
+                image_token="<image>", video_token="<video>", audio_token=None
+            )
+        )
+        for mm_processor, features in (
+            (vision, ["image_inputs", "video_inputs"]),
+            (SimpleNamespace(mm_tokens=None), []),
+            (None, []),
+        ):
+            with self.subTest(features=features, mm_processor=mm_processor):
+                handle = RuntimeHandle.__new__(RuntimeHandle)
+                handle.tokenizer_manager = SimpleNamespace(
+                    server_args=None, mm_processor=mm_processor
+                )
+                handle.scheduler_info = {}
+
+                with patch(
+                    "sglang.srt.entrypoints.grpc_bridge.build_server_info",
+                    return_value={"model_path": "model"},
+                ):
+                    info = json.loads(handle.get_server_info())
+
+                self.assertEqual(info["model_path"], "model")
+                self.assertEqual(info["grpc_features"], features)
 
 
 if __name__ == "__main__":
