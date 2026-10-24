@@ -436,6 +436,39 @@ def _build_dsa_device_pool_group(
         target_device_layer_num=num_layers,
         draft_layer_num=len(draft_kv_buffers),
     )
+
+    target_indexer_buffers = []
+    target_indexer_layer_mapping = {}
+    for layer, buffer in enumerate(kvcache.index_k_with_scale_buffer):
+        if buffer.shape[0] == 0:
+            continue
+        target_indexer_layer_mapping[layer] = len(target_indexer_buffers)
+        target_indexer_buffers.append(buffer)
+
+    active_draft_indexer_buffers = []
+    draft_indexer_layer_mapping = {}
+    for depth, buffer in enumerate(draft_indexer_buffers):
+        if buffer.shape[0] == 0:
+            continue
+        draft_indexer_layer_mapping[depth] = len(target_indexer_buffers) + len(
+            active_draft_indexer_buffers
+        )
+        active_draft_indexer_buffers.append(buffer)
+
+    indexer_layer_mapping = {}
+    for layer in range(num_layers):
+        component_indices = []
+        target_index = target_indexer_layer_mapping.get(layer)
+        if target_index is not None:
+            component_indices.append(target_index)
+        draft_index = draft_indexer_layer_mapping.get(layer)
+        if draft_index is not None:
+            component_indices.append(draft_index)
+        if len(component_indices) == 1:
+            indexer_layer_mapping[layer] = component_indices[0]
+        elif component_indices:
+            indexer_layer_mapping[layer] = tuple(component_indices)
+
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
@@ -450,8 +483,8 @@ def _build_dsa_device_pool_group(
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[[*kvcache.index_k_with_scale_buffer, *draft_indexer_buffers]],
-            layer_mapping=layer_mapping,
+            components=[[*target_indexer_buffers, *active_draft_indexer_buffers]],
+            layer_mapping=indexer_layer_mapping,
             page_size=page_size,
             rows_are_pages=True,
         ),
