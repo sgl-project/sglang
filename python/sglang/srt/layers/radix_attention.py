@@ -26,6 +26,8 @@ from sglang.srt.layers.attention.graph_utils import (
     _zero_padded_tokens,
     allocate_attention_outputs,
     attention_input_scope,
+    attention_output_tokens,
+    attention_query_tokens,
     padded_extend_real_tokens,
 )
 from sglang.srt.model_executor.forward_context import (
@@ -190,6 +192,8 @@ class RadixAttention(nn.Module):
         rows = output.shape[0]
         n = forward_batch.global_num_token_non_padded_cpu
         kv_n = n if key_value_num_tokens is None else key_value_num_tokens
+        cache_n = n
+        n = attention_query_tokens(forward_batch, n)
         return_lse = bool(kwargs.get("return_lse") or forward_batch.mha_return_lse)
         lse = None
         if n == 0:
@@ -200,7 +204,7 @@ class RadixAttention(nn.Module):
                 lse = q.new_zeros((rows, q.shape[1]), dtype=torch.float32)
         else:
             with attention_input_scope(
-                forward_batch, output, n, kv_n, kwargs
+                forward_batch, output, n, kv_n, kwargs, cache_tokens=cache_n
             ) as kwargs:
                 result = get_attn_backend().forward(
                     q[:n],
@@ -220,6 +224,7 @@ class RadixAttention(nn.Module):
             if result.data_ptr() != output.data_ptr():
                 output[:n].view(result.shape).copy_(result)
             raw = get_prefill_raw_num_tokens()
+            raw = attention_output_tokens(forward_batch, raw)
             _zero_padded_tokens(output, raw)
             if idx_output is not None:
                 _zero_padded_tokens(idx_output, raw)

@@ -82,6 +82,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
     initialize_current_platform,
@@ -547,9 +548,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         residency_hint = (
             f" Components that can remain on GPU: {can_stay_resident}. "
-            "Make it explicit with --component-residency <name>=resident; "
-            "--performance-mode auto with server warmup applies safe "
-            "adjustments automatically."
+            "Make it explicit with --component-residency <name>=resident."
             if can_stay_resident
             else ""
         )
@@ -889,7 +888,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._async_output_save
             and not req.is_warmup
             and not req.return_raw_frames
-            and bool(req.save_output and req.return_file_paths_only)
+            and self._encodes_on_output_rank(req)
             and req.perf_dump_path is None
             and not envs.SGLANG_DIFFUSION_STAGE_LOGGING
         )
@@ -925,17 +924,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 )
             stream.synchronize()
 
-    def release_cache_if_idle(self) -> None:
+    def release_cache_if_idle(self) -> float | None:
         """Release the allocator cache once no request has finished for a while.
 
-        The scheduler calls this only with nothing queued or in flight.
+        The scheduler calls this only with nothing queued or in flight. Returns
+        the seconds until a pending release is due, or None when none is pending.
         """
         due = self._cache_release_due
-        if due is None or time.monotonic() < due:
-            return
+        if due is None:
+            return None
+        wait_s = due - time.monotonic()
+        if wait_s > 0:
+            return wait_s
         self._cache_release_due = None
         with maybe_record_function("EMPTY_CACHE"):
             torch.get_device_module().empty_cache()
+        return None
 
     def take_deferred_finalize(self) -> Callable[[], None] | None:
         deferred = self._deferred_finalize
@@ -981,10 +985,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     ) -> None:
         if req.return_raw_frames:
             self._materialize_raw_frame_transport(output_batch, req)
-        elif req.save_output and req.return_file_paths_only:
+        elif self._encodes_on_output_rank(req):
             self._materialize_file_path_transport(output_batch, save_output_paths)
         elif getattr(req, "return_frames", False):
             self._materialize_frame_outputs_for_return(output_batch, req)
+
+    @staticmethod
+    def _encodes_on_output_rank(req: Req) -> bool:
+        # the output rank encodes the outputs to save them or to return the image bytes
+        return req.return_file_paths_only and (
+            req.save_output or req.return_image_bytes
+        )
 
     def _materialize_raw_frame_transport(
         self, output_batch: OutputBatch, req: Req
@@ -1291,14 +1302,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             def build_output_path(idx: int) -> str:
                 return req.output_file_path(num_outputs, idx)
 
+        image_bytes = [] if req.return_image_bytes else None
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             req.data_type,
             req.fps,
-            True,
+            req.save_output,
             build_output_path,
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
+            image_bytes_out=image_bytes,
             output_compression=req.output_compression,
             x264_preset=req.x264_preset,
             enable_frame_interpolation=req.enable_frame_interpolation,
@@ -1309,6 +1322,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             upscaling_model_path=req.upscaling_model_path,
             upscaling_scale=req.upscaling_scale,
         )
+        output_batch.output_image_bytes = image_bytes
 
     def _save_group_output_paths(
         self,
@@ -1324,14 +1338,16 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
 
         first_req = reqs[0]
+        image_bytes = [] if first_req.return_image_bytes else None
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             first_req.data_type,
             first_req.fps,
-            True,
+            first_req.save_output,
             lambda idx: output_requests[idx].output_file_path(),
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
+            image_bytes_out=image_bytes,
             output_compression=first_req.output_compression,
             x264_preset=first_req.x264_preset,
             enable_frame_interpolation=first_req.enable_frame_interpolation,
@@ -1342,6 +1358,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             upscaling_model_path=first_req.upscaling_model_path,
             upscaling_scale=first_req.upscaling_scale,
         )
+        output_batch.output_image_bytes = image_bytes
 
     @staticmethod
     def _validate_group_forward_reqs(reqs: list[Req]) -> None:
@@ -1351,6 +1368,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             "save_output",
             "return_frames",
             "return_file_paths_only",
+            "return_image_bytes",
             "data_type",
             "fps",
             "output_compression",
@@ -1594,6 +1612,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
 
     def merge_lora_weights(
@@ -1612,6 +1631,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self.pipeline.merge_lora_weights(target, strength)
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
 
     def unmerge_lora_weights(self, target: str = "all") -> OutputBatch:
@@ -1627,7 +1647,14 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self.pipeline.unmerge_lora_weights(target)
         finally:
             self._update_lora_metrics()
+            self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
+
+    def _drop_breakable_cuda_graphs(self, reason: str) -> None:
+        # captured graphs replay the weights and LoRA branches of capture time
+        for stage in self.pipeline.stages:
+            if isinstance(stage, DenoisingStage):
+                stage.drop_breakable_cuda_graphs(reason)
 
     def _update_lora_metrics(self) -> None:
         if self.metrics is not None and isinstance(self.pipeline, LoRAPipeline):
@@ -1656,7 +1683,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 "sleeping": False,
                 "message": "already awake",
             }
-        return self.memory_occupation.resume_memory_occupation()
+        result = self.memory_occupation.resume_memory_occupation()
+        self._drop_breakable_cuda_graphs("weights moved by resume_memory_occupation")
+        return result
 
 
 OOM_MSG = """
