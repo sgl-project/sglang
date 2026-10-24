@@ -127,10 +127,9 @@ def cgroup_memory_limit_bytes(
 ) -> tuple[int, int] | None:
     """This process's (cap, usage) under its cgroup, or None when uncapped.
 
-    The tightest cap in the chain wins. A nested cgroup -- a systemd scope with
-    MemoryMax, a container started with --cgroup-parent -- holds this process
-    below whatever the mount root allows, and planning against the root would
-    commit memory the process cannot have.
+    The least remaining headroom in the chain wins. A parent with a larger
+    limit can still constrain this process when sibling cgroups consume its
+    budget, so comparing limits alone would overcommit host memory.
 
     A cgroup is charged for the page cache it touches, so its usage grows by
     the whole checkpoint the process maps. ``exclude_file_cache`` reports the
@@ -143,12 +142,13 @@ def cgroup_memory_limit_bytes(
             limit = _read_int(os.path.join(directory, limit_name))
             if limit is None or limit >= _UNLIMITED_ABOVE:
                 continue
-            if tightest is not None and limit >= tightest[0]:
-                continue
             usage = _read_int(os.path.join(directory, usage_name)) or 0
             if exclude_file_cache:
                 usage = max(0, usage - _cgroup_file_cache_bytes(directory))
-            tightest = (limit, usage)
+            if tightest is None or max(0, limit - usage) < max(
+                0, tightest[0] - tightest[1]
+            ):
+                tightest = (limit, usage)
         if tightest is not None:
             return tightest
     return None

@@ -1,5 +1,6 @@
 """Pinned host memory is planned against the cgroup cap, not the whole machine."""
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -144,6 +145,34 @@ class TestHostCopiesWouldNotFit:
 
 
 class TestNestedCgroup:
+    @pytest.mark.parametrize("version", ["v1", "v2"])
+    @pytest.mark.parametrize("child_limit_gib", [32, 64])
+    def test_parent_consumption_limits_host_pin_budget(
+        self, monkeypatch, tmp_path, version, child_limit_gib
+    ):
+        """Sibling allocations can bind before the child's own memory limit."""
+        files = _V1_FILES if version == "v1" else _V2_FILES
+        values = {version: (64 * GIB_BYTES, 60 * GIB_BYTES)}
+        _point_at(monkeypatch, tmp_path, own_path="/model", **values)
+        _write_cgroup(
+            tmp_path / version / "model",
+            files,
+            (child_limit_gib * GIB_BYTES, 10 * GIB_BYTES),
+        )
+        monkeypatch.setattr(
+            host_memory_budget.psutil,
+            "virtual_memory",
+            lambda: type("VM", (), {"available": 128 * GIB_BYTES})(),
+        )
+        monkeypatch.setattr(
+            host_memory_budget, "host_copies_are_redundant", lambda: False
+        )
+
+        assert host_memory_available_bytes() == 4 * GIB_BYTES
+        budget = HostPinBudget()
+        assert budget.available_bytes == 4 * GIB_BYTES
+        assert not budget.request(component_name="dit", weight_bytes=8 * GIB_BYTES)
+
     def test_a_tighter_nested_cap_wins_over_the_root(self, monkeypatch, tmp_path):
         # a systemd scope with MemoryMax, or --cgroup-parent: planning against
         # the root would commit memory this process cannot have
