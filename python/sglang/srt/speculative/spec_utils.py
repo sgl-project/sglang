@@ -34,6 +34,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
+from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.managers.utils import _async_d2h
 from sglang.srt.mem_cache.allocation import (
@@ -70,6 +71,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+
+if _is_cuda:
+    from sglang.kernels.ops.speculative.simulated_accept import simulated_accept
 
 
 logger = logging.getLogger(__name__)
@@ -538,6 +543,18 @@ def generate_simulated_accept_index(
         simulate_acc_len, simulate_acc_method, spec_steps + 1
     )
 
+    if _is_cuda and accept_index.is_cuda:
+        return simulated_accept(
+            accept_indices=accept_index,
+            predict_tokens=predict,
+            num_correct_drafts=num_correct_drafts,
+            candidate_tokens=candidates,
+            target_tokens=target_predict,
+            width=spec_steps + 1,
+            num_accept_tokens=simulate_acc_len,
+            real_tokens=use_real_draft_tokens,
+        )
+
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
         (bs, spec_steps + 1), -1, dtype=torch.int32, device=accept_index.device
@@ -819,8 +836,24 @@ def draft_tp_context(owns_attention: bool):
     """
     if not owns_attention:
         return contextlib.nullcontext()
-    group = getattr(get_parallel(), f"{draft_attn_parallel_group()}_group")
-    return patch_tensor_parallel_group(group, owns_attention=True)
+    parallel = get_parallel()
+    group = getattr(parallel, f"{draft_attn_parallel_group()}_group")
+    tp_context = patch_tensor_parallel_group(group, owns_attention=True)
+    if parallel.enable_prefill_cp:
+        return _draft_without_cp(tp_context)
+    return tp_context
+
+
+@contextmanager
+def _draft_without_cp(tp_context):
+    with (
+        tp_context,
+        get_parallel().override(
+            enable_prefill_cp=False, enable_cp_tp_group_sharing=False
+        ),
+        disable_cp_strategy(),
+    ):
+        yield
 
 
 def spec_stage_span(name: str):
