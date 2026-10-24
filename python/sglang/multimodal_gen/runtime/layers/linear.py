@@ -49,10 +49,14 @@ _USE_AITER_TGEMM = current_platform.is_rocm() and envs.SGLANG_USE_ROCM_AITER_TGE
 if _USE_AITER_TGEMM:
     from aiter.tuned_gemm import tgemm
 _IS_GFX1250_TGEMM = _USE_AITER_TGEMM and is_gfx1250_supported()
-# aiter gemm_a16w16 kernels index operands with int32 offsets and fault beyond this.
-# On gfx1250 the offset is in bytes and output rows past 2**31 bytes come back wrong
-# (no fault), so the 16-bit element bound there is 2**30.
-_AITER_TGEMM_MAX_NUMEL = 2**30 if _IS_GFX1250_TGEMM else 2**31
+
+
+def _aiter_tgemm_max_numel() -> int:
+    # aiter gemm_a16w16 kernels index operands with int32 offsets and fault beyond this.
+    # On gfx1250 the offset is in bytes and output rows past 2**31 bytes come back
+    # wrong (no fault), so the 16-bit element bound there is 2**30.
+    return 2**30 if _IS_GFX1250_TGEMM else 2**31
+
 
 # On gfx1250 the FlyDSL a16w16 GEMM indexes through TDM descriptors (no int32 byte
 # limit) and beats tgemm's gluon kernel by 7-18% on large-M DiT linears.
@@ -254,8 +258,8 @@ def apply_unquantized_linear(
         and x.dtype in (torch.bfloat16, torch.float16)
         and weight.dtype == x.dtype
         and (bias is None or bias.dtype == x.dtype)
-        and x.numel() < _AITER_TGEMM_MAX_NUMEL
-        and x.numel() // x.shape[-1] * weight.shape[0] < _AITER_TGEMM_MAX_NUMEL
+        and x.numel() < _aiter_tgemm_max_numel()
+        and x.numel() // x.shape[-1] * weight.shape[0] < _aiter_tgemm_max_numel()
     ):
         return tgemm.mm(x, weight, bias)
 
