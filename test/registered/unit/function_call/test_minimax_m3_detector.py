@@ -772,6 +772,42 @@ class TestMinimaxM3SchemaLessContainers(CustomTestCase):
         self.assertEqual(calls[0]["args"], expected)
         self.assertEqual(_stream_segments(segments, tools), calls)
 
+    def test_untyped_string_keeps_its_whitespace_when_streamed(self):
+        """A schema-less value that turns out to be a string keeps its leading
+        whitespace when streamed, as when parsed whole; only spacing before a
+        nested tag is markup."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="loose",
+                    description="A parameter declared without a type",
+                    parameters={"type": "object", "properties": {"value": {}}},
+                ),
+            )
+        ]
+        wire = _wire(
+            "<tool_call>",
+            '<invoke name="loose">',
+            "<value>  hello\n  world",
+            "</value>",
+            "</invoke>",
+            "</tool_call>",
+        )
+        result = MinimaxM3Detector().detect_and_parse(wire, tools)
+        whole = json.loads(result.calls[0].parameters)
+        self.assertTrue(whole["value"].startswith("  hello"))
+        for size in (1, 7, len(wire)):
+            detector = MinimaxM3Detector()
+            calls = []
+            for i in range(0, len(wire), size):
+                calls += detector.parse_streaming_increment(
+                    wire[i : i + size], tools
+                ).calls
+            with self.subTest(chunk_size=size):
+                streamed = _collect_streamed_tool_calls(calls)[0]["parameters"]
+                self.assertEqual(json.loads(streamed), whole)
+
     def test_undeclared_tool_streams_like_non_stream(self):
         parser = FunctionCallParser(tools=[], tool_call_parser="minimax-m3")
         wire = _wire(*self._untyped_params("undeclared"))
