@@ -63,6 +63,13 @@ class Parallel(msgspec.Struct):
             aliases=["--pipeline-parallel-size"],
         ),
     ] = 1
+    pp_transport: A[
+        str,
+        Arg(
+            help="Pipeline transport. gloo stages GPU payloads through CPU memory for Gloo communication.",
+            choices=["default", "gloo"],
+        ),
+    ] = "default"
     pp_max_micro_batch_size: A[
         Optional[int], "The maximum micro batch size in pipeline parallelism."
     ] = None

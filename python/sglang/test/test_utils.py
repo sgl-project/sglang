@@ -637,24 +637,45 @@ def _subprocess_popen_with_outputs(
         bufsize=1,
     )
 
-    def _dump(src, sinks):
-        for line in iter(src.readline, ""):
-            for sink in sinks:
-                sink.write(line)
-                sink.flush()
-        src.close()
+    process._sglang_output_errors = []
+    process._sglang_output_threads = []
 
-    threading.Thread(
-        target=_dump,
-        args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
-        daemon=True,
-    ).start()
-    threading.Thread(
-        target=_dump,
-        args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
-        daemon=True,
-    ).start()
+    def _dump(src, sinks):
+        try:
+            for line in iter(src.readline, ""):
+                for sink in sinks:
+                    sink.write(line)
+                    sink.flush()
+        except Exception as exc:
+            process._sglang_output_errors.append(exc)
+            logging.exception("Server output capture failed")
+        finally:
+            src.close()
+
+    for src, sinks in (
+        (process.stdout, [return_stdout_stderr[0], sys.stdout]),
+        (process.stderr, [return_stdout_stderr[1], sys.stderr]),
+    ):
+        thread = threading.Thread(target=_dump, args=(src, sinks), daemon=True)
+        process._sglang_output_threads.append(thread)
+        thread.start()
     return process
+
+
+def wait_for_server_output(process: subprocess.Popen, timeout: float = 10) -> None:
+    """After server shutdown, drain captured output before inspecting/closing sinks.
+
+    A timeout or sink error must fail the caller rather than certify a partial log.
+    Processes launched without output capture have nothing to drain.
+    """
+    deadline = time.monotonic() + timeout
+    for thread in getattr(process, "_sglang_output_threads", ()):
+        thread.join(timeout=max(0, deadline - time.monotonic()))
+        if thread.is_alive():
+            raise TimeoutError("Server output capture did not finish after shutdown")
+    errors = getattr(process, "_sglang_output_errors", ())
+    if errors:
+        raise RuntimeError("Server output capture failed") from errors[0]
 
 
 def _launch_server_process(

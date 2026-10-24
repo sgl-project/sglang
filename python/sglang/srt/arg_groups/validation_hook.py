@@ -173,6 +173,16 @@ def check_server_args(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    if cfg.pp_transport not in ("default", "gloo"):
+        raise ValueError("--pp-transport must be default or gloo")
+    if cfg.pp_transport == "gloo":
+        if cfg.pp_size <= 1 or cfg.device != "cuda":
+            raise ValueError("--pp-transport gloo requires CUDA and --pp-size > 1")
+        if cfg.ep_join_mode == "scale":
+            raise ValueError("CPU-staged PP does not support elastic rank offsets")
+        if cfg.dp_size > 1 and not cfg.enable_dp_attention:
+            raise ValueError("CPU-staged PP does not support independent DP replicas")
+
     # Check parallel size constraints
     if cfg.ep_join_mode != "scale":
         assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (

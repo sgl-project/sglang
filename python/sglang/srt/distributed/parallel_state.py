@@ -261,6 +261,8 @@ class GroupCoordinator:
         based on the tensor size and cuda graph mode).
     """
 
+    pp_cpu_staging = False
+
     # available attributes:
     rank: int  # global rank
     ranks: List[int]  # global ranks in the group
@@ -323,6 +325,7 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        self.pp_cpu_staging = False
         # Which FlashInfer fusion workspace this group owns, or None when the
         # group is not eligible for the allreduce-only kAllReduce path. Stamped
         # by _tag_groups_for_flashinfer_allreduce_only() after group init.
@@ -1555,6 +1558,12 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
+        if self.pp_cpu_staging:
+            received = self.broadcast_tensor_dict({"tensor": input_}, src=src)
+            if self.rank_in_group != src:
+                input_.copy_(received["tensor"])
+            return input_
+
         if self.pynccl_comm is not None and not self.pynccl_comm.disabled:
             self.pynccl_comm.broadcast(input_, src=src)
         else:
@@ -1601,7 +1610,9 @@ class GroupCoordinator:
             return obj_list
         # Broadcast.
         torch.distributed.broadcast_object_list(
-            obj_list, src=self.ranks[src], group=self.device_group
+            obj_list,
+            src=self.ranks[src],
+            group=self.cpu_group if self.pp_cpu_staging else self.device_group,
         )
         return obj_list
 
@@ -1717,6 +1728,14 @@ class GroupCoordinator:
         metadata_group = self.cpu_group
         assert src < self.world_size, f"Invalid src rank ({src})"
 
+        if self.pp_cpu_staging:
+            if self.rank_in_group == src:
+                for rank in range(self.world_size):
+                    if rank != src:
+                        self.send_tensor_dict(tensor_dict, dst=rank)
+                return tensor_dict
+            return self.recv_tensor_dict(src=src)
+
         rank_in_group = self.rank_in_group
         if rank_in_group == src:
             metadata_list: List[Tuple[Any, Any]] = []
@@ -1830,6 +1849,10 @@ class GroupCoordinator:
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
+            if self.pp_cpu_staging:
+                # Own the host snapshot until Gloo finishes the asynchronous send.
+                # The D2H copy completes before this payload's send is submitted.
+                tensor = tensor.to(device="cpu", copy=True).contiguous()
             comm_group = metadata_group if tensor.is_cpu else group
             work = send_func(tensor, self.ranks[dst], group=comm_group)
             if async_send:
@@ -1864,10 +1887,14 @@ class GroupCoordinator:
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                tensor = torch.empty(
+                    value.size,
+                    dtype=value.dtype,
+                    device="cpu" if self.pp_cpu_staging else value.device,
+                )
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
-                    tensor_dict[key] = tensor
+                    tensor_dict[key] = tensor.to(device=value.device)
                     continue
 
                 # send-allgather: send only a slice, then do allgather.
@@ -1886,6 +1913,9 @@ class GroupCoordinator:
                     tensor, src=self.ranks[src], group=comm_group
                 )
                 work.wait()
+                if self.pp_cpu_staging:
+                    # TP all-gather still runs on the tensor's original device.
+                    tensor = tensor.to(device=value.device)
 
                 if use_all_gather:
                     tensor = all_gather_group.all_gather(tensor, dim=0)
@@ -1914,6 +1944,21 @@ class GroupCoordinator:
         """
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return None
+
+        if self.pp_cpu_staging:
+            works = self.send_tensor_dict(
+                send_tensor_dict,
+                dst=send_dst,
+                all_gather_group=send_all_gather_group,
+                async_send=True,
+            )
+            result = self.recv_tensor_dict(
+                src=recv_src,
+                all_gather_group=recv_all_gather_group,
+            )
+            for work in works:
+                work.work.wait()
+            return result
 
         if send_dst is None:
             send_dst = (self.rank_in_group + 1) % self.world_size
@@ -2066,6 +2111,13 @@ class GroupCoordinator:
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
+        if self.pp_cpu_staging:
+            torch.distributed.send(
+                tensor.to(device="cpu", copy=True).contiguous(),
+                dst=self.ranks[dst],
+                group=self.cpu_group,
+            )
+            return
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.send(tensor, dst)
@@ -2080,6 +2132,10 @@ class GroupCoordinator:
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
 
+        if self.pp_cpu_staging:
+            tensor = torch.empty(size, dtype=dtype, device="cpu")
+            torch.distributed.recv(tensor, src=self.ranks[src], group=self.cpu_group)
+            return tensor.to(device=self.device)
         tensor = torch.empty(size, dtype=dtype, device=self.device)
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
@@ -2965,13 +3021,16 @@ def initialize_model_parallel(
     _PP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
-        backend,
+        "gloo" if get_parallel().pp_transport == "gloo" else backend,
+        use_pynccl=False if get_parallel().pp_transport == "gloo" else None,
         use_custom_allreduce=False,
         group_name="pp",
         recovered_rank=recovered_rank,
         rank_offset=rank_offset,
         max_world_size=max_world_size,
     )
+
+    _PP.pp_cpu_staging = get_parallel().pp_transport == "gloo"
 
     # The one-layer draft uses a singleton PP group; every rank creates all groups
     # because new_group is collective.

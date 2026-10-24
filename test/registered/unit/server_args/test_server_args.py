@@ -267,6 +267,42 @@ class TestPrepareServerArgs(CustomTestCase):
                     chunked_prefill_size=-1,
                 ).check_server_args()
 
+    def test_pp_cpu_transport_validation(self):
+        defaults = dict(
+            model_path="dummy",
+            served_model_name="dummy",
+            device="cuda",
+            pp_size=2,
+            pp_transport="gloo",
+            disable_overlap_schedule=True,
+            chunked_prefill_size=-1,
+        )
+        for overrides, error in (
+            ({"pp_size": 1}, "requires CUDA"),
+            ({"device": "cpu"}, "requires CUDA"),
+            ({"dp_size": 2}, "independent DP"),
+            ({"ep_join_mode": "scale"}, "elastic rank"),
+        ):
+            with (
+                self.subTest(overrides=overrides),
+                self.assertRaisesRegex(ValueError, error),
+            ):
+                ServerArgs(**(defaults | overrides)).check_server_args()
+        ServerArgs(**defaults).check_server_args()
+
+    def test_pp_cpu_transport_cli(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--pp-size",
+                "2",
+                "--pp-transport",
+                "gloo",
+            ]
+        )
+        self.assertEqual(args.pp_transport, "gloo")
+
     def test_instanttensor_device_check_allows_cuda_and_other_loaders(self):
         for device, load_format in (
             ("cuda", "instanttensor"),
