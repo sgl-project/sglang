@@ -8,6 +8,7 @@ syntax = "proto3";
 
 package sglang.api.v1;
 
+import "sglang/api/v1/control.proto";
 import "sglang/api/v1/generate.proto";
 import "sglang/api/v1/hicache.proto";
 import "sglang/json/v1/options.proto";
@@ -48,6 +49,10 @@ service SglangService {
   // Duplicate native IDs cancel all matching generations. A later reuse of the
   // ID is unaffected. Internal control/detokenization requests are not targeted.
   rpc Abort(AbortRequest) returns (AbortResponse);
+
+  // `/set_internal_state`: override numeric scheduler knobs on every DP rank;
+  // one `updated` flag per rank.
+  rpc SetInternalState(SetInternalStateRequest) returns (SetInternalStateResponse);
 }
 
 message ListModelsRequest {}

@@ -65,6 +65,9 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "DetokenizeResponse" => check::<api::DetokenizeResponse>(&name, input, canonical),
             "AbortRequest" => check::<api::AbortRequest>(&name, input, canonical),
             "AbortResponse" => check::<api::AbortResponse>(&name, input, canonical),
+            "SetInternalStateRequest" => {
+                check::<api::SetInternalStateRequest>(&name, input, canonical)
+            }
             other => panic!("fixture type {other} has no Rust mapping; add it here"),
         }
     }

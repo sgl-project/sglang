@@ -174,6 +174,18 @@ impl SglangService for GrpcService {
             .map_err(Status::internal)
     }
 
+    async fn set_internal_state(
+        &self,
+        request: Request<api::SetInternalStateRequest>,
+    ) -> Result<Response<api::SetInternalStateResponse>, Status> {
+        let updated = self
+            .core
+            .set_internal_state(request.into_inner().server_args.as_deref())
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::SetInternalStateResponse { updated }))
+    }
+
     async fn get_hi_cache_storage(
         &self,
         _request: Request<api::GetHiCacheStorageRequest>,

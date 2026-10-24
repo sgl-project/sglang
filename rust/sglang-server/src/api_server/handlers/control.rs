@@ -2,7 +2,9 @@
 //! that serves another listener's request on the local scheduler.
 
 use crate::message::ids::Rid;
-use crate::message::io_struct::{CheckWeightsReqInput, ControlRequest, FlushCacheReqInput};
+use crate::message::io_struct::{
+    CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, SetInternalStateReq,
+};
 use crate::message::request::RequestKind;
 use crate::message::response::ResponseItem;
 use crate::message::types::ForwardedControlReq;
@@ -29,6 +31,28 @@ impl CoreHandle {
                 .map(|outcome| (outcome.success, outcome.message.as_str())),
         );
         Ok(FlushCacheOutcome { success, message })
+    }
+
+    /// Override numeric scheduler knobs on every DP rank; one `updated` flag per
+    /// rank in rank order, as Python's `set_internal_state` returns them.
+    /// `server_args` is the client's JSON object, validated here only as far as
+    /// Python's request type does (an object of numbers); the scheduler decides
+    /// which keys it accepts.
+    pub(crate) async fn set_internal_state(
+        &self,
+        server_args: Option<&str>,
+    ) -> Result<Vec<bool>, CoreError> {
+        let server_args = parse_server_args(server_args)?;
+        let outputs = self
+            .control(&|| {
+                ControlRequest::SetInternalStateReq(SetInternalStateReq::new(
+                    Rid::new().to_string(),
+                    server_args.clone(),
+                ))
+            })
+            .await
+            .decode::<SetInternalStateOutput>("set-internal-state")?;
+        Ok(outputs.into_iter().map(|output| output.updated).collect())
     }
 
     /// Run the weight checker on every DP rank; merge as Python's `check_weights` does.
@@ -104,6 +128,37 @@ impl CoreHandle {
     }
 }
 
+/// Python's `SetInternalStateReq.server_args` contract: a JSON object whose
+/// values are numbers. Anything else is the client's error, not the scheduler's.
+fn parse_server_args(
+    text: Option<&str>,
+) -> Result<serde_json::Map<String, serde_json::Value>, CoreError> {
+    let Some(text) = text else {
+        return Err(CoreError::InvalidArgument(
+            "missing field `server_args`".into(),
+        ));
+    };
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| CoreError::InvalidArgument(format!("invalid `server_args`: {error}")))?;
+    let serde_json::Value::Object(map) = value else {
+        return Err(CoreError::InvalidArgument(
+            "`server_args` must be a JSON object".into(),
+        ));
+    };
+    if let Some((key, _)) = map.iter().find(|(_, value)| !value.is_number()) {
+        return Err(CoreError::InvalidArgument(format!(
+            "`server_args.{key}` must be a number"
+        )));
+    }
+    Ok(map)
+}
+
+/// The scheduler's `SetInternalStateReqOutput`.
+#[derive(Debug, serde::Deserialize, PartialEq)]
+struct SetInternalStateOutput {
+    updated: bool,
+}
+
 /// The scheduler's `FlushCacheReqOutput`: whether the flush ran, and why not.
 #[derive(Debug, serde::Deserialize, PartialEq)]
 pub(crate) struct FlushCacheOutcome {
@@ -169,6 +224,66 @@ mod tests {
         assert!(
             intake_rx.try_recv().is_err(),
             "one fan-out submits one local request"
+        );
+    }
+
+    /// Each rank answers for itself: the flags come back in rank order, and a
+    /// body that is not an object of numbers is rejected before any rank sees it.
+    #[tokio::test]
+    async fn set_internal_state_collects_one_flag_per_rank() {
+        use crate::api_server::core::CoreErrorKind;
+        use crate::api_server::core::fanout::testing::DummyTarget;
+        let updated = |flag: bool| {
+            Bytes::from(rmp_serde::to_vec_named(&serde_json::json!({ "updated": flag })).unwrap())
+        };
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let handle = CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Vec::new(),
+                metadata: CoreMetadata::default(),
+                peer_endpoints: vec![DummyTarget::replying(&[1], move |_| Ok(updated(false)))],
+            },
+        );
+
+        let (flags, ()) = tokio::join!(
+            handle.set_internal_state(Some(r#"{"pp_max_micro_batch_size": 4}"#)),
+            async {
+                let request = accept_intake(intake_rx.recv_async().await.unwrap());
+                let RequestKind::Control(control) = &request.kind else {
+                    panic!("expected a control request");
+                };
+                let header = rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap();
+                let rmpv::Value::Array(items) = header else {
+                    panic!("positional wire");
+                };
+                assert_eq!(items[0].as_str(), Some("SetInternalStateReq"));
+                assert_eq!(
+                    items[3],
+                    rmpv::Value::Map(vec![("pp_max_micro_batch_size".into(), 4.into())]),
+                    "the object reaches the scheduler as a msgpack map with its integer intact"
+                );
+                request
+                    .sink
+                    .try_send(ResponseItem::Control(updated(true)))
+                    .unwrap();
+            },
+        );
+        assert_eq!(flags.unwrap(), [true, false]);
+
+        for bad in [None, Some("[]"), Some("{\"k\": \"v\"}"), Some("not json")] {
+            let error = handle.set_internal_state(bad).await.unwrap_err();
+            assert_eq!(error.kind(), CoreErrorKind::InvalidArgument, "{bad:?}");
+        }
+        assert!(
+            intake_rx.try_recv().is_err(),
+            "rejected bodies reach no rank"
         );
     }
 

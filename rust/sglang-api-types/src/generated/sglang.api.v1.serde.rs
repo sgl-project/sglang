@@ -2,6 +2,75 @@
 // The sglang.json.v1 options in the schema are the JSON contract; edit the
 // .proto files and `cargo gen-api`.
 
+impl ::serde::Serialize for SetInternalStateRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.server_args {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "server_args",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for SetInternalStateRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = SetInternalStateRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct SetInternalStateRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_server_args = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "server_args" => {
+                            if f_server_args.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("server_args"));
+                            }
+                            f_server_args = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(SetInternalStateRequest {
+                    server_args: f_server_args.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for SetInternalStateResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.updated.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for SetInternalStateResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(SetInternalStateResponse {
+            updated: <::prost::alloc::vec::Vec<bool> as ::serde::Deserialize>::deserialize(
+                deserializer,
+            )?,
+        })
+    }
+}
+
 impl ::serde::Serialize for TokenIds {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(self.ids.iter())

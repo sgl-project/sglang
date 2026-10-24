@@ -298,6 +298,27 @@ pub mod sglang_service_client {
                 .insert(GrpcMethod::new("sglang.api.v1.SglangService", "Abort"));
             self.inner.unary(req, path, codec).await
         }
+        /// `/set_internal_state`: override numeric scheduler knobs on every DP rank;
+        /// one `updated` flag per rank.
+        pub async fn set_internal_state(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SetInternalStateRequest>,
+        ) -> std::result::Result<tonic::Response<super::SetInternalStateResponse>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/sglang.api.v1.SglangService/SetInternalState",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "sglang.api.v1.SglangService",
+                "SetInternalState",
+            ));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -379,6 +400,12 @@ pub mod sglang_service_server {
             &self,
             request: tonic::Request<super::AbortRequest>,
         ) -> std::result::Result<tonic::Response<super::AbortResponse>, tonic::Status>;
+        /// `/set_internal_state`: override numeric scheduler knobs on every DP rank;
+        /// one `updated` flag per rank.
+        async fn set_internal_state(
+            &self,
+            request: tonic::Request<super::SetInternalStateRequest>,
+        ) -> std::result::Result<tonic::Response<super::SetInternalStateResponse>, tonic::Status>;
     }
     #[derive(Debug)]
     pub struct SglangServiceServer<T> {
@@ -889,6 +916,48 @@ pub mod sglang_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = AbortSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/sglang.api.v1.SglangService/SetInternalState" => {
+                    #[allow(non_camel_case_types)]
+                    struct SetInternalStateSvc<T: SglangService>(pub Arc<T>);
+                    impl<T: SglangService>
+                        tonic::server::UnaryService<super::SetInternalStateRequest>
+                        for SetInternalStateSvc<T>
+                    {
+                        type Response = super::SetInternalStateResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SetInternalStateRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as SglangService>::set_internal_state(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SetInternalStateSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

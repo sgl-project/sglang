@@ -101,6 +101,13 @@ control_messages! {
         selector: String,
     }
 
+    /// `/set_internal_state`'s control request: the numeric knobs to
+    /// override, as the JSON object the client sent (`Dict[str, int | float]`
+    /// on the Python side; the scheduler validates the keys).
+    SetInternalStateReq {
+        server_args: serde_json::Map<String, serde_json::Value>,
+    }
+
     /// Clear the HiCache storage backend.
     ClearHiCacheReqInput {}
 
@@ -173,6 +180,12 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             cache_salt: req.cache_salt.as_deref(),
             kv_hints: req.kv_hints.as_ref(),
         }
+    }
+}
+
+impl SetInternalStateReq {
+    pub fn new(rid: String, server_args: serde_json::Map<String, serde_json::Value>) -> Self {
+        Self { rid, server_args }
     }
 }
 

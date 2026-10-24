@@ -583,6 +583,17 @@
         "hicache_write_policy": ""
       },
       "canonical": "{\"hicache_storage_backend\":\"file\",\"hicache_storage_backend_extra_config_json\":\"\",\"hicache_storage_prefetch_policy\":\"\",\"hicache_write_policy\":\"\"}"
+    },
+    {
+      "type": "SetInternalStateRequest",
+      "name": "server_args passes through as an object with integers and floats intact",
+      "input": {
+        "server_args": {
+          "pp_max_micro_batch_size": 4,
+          "speculative_accept_threshold_single": 0.75
+        }
+      },
+      "canonical": "{\"server_args\":{\"pp_max_micro_batch_size\":4,\"speculative_accept_threshold_single\":0.75}}"
     }
   ]
 }

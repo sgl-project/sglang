@@ -1,0 +1,22 @@
+// Scheduler control APIs shared by HTTP JSON and gRPC: one request per
+// operation, fanned out to every DP rank by the Rust frontend, with the
+// per-rank replies merged the way the Python TokenizerManager merges them.
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/json/v1/options.proto";
+
+// `/set_internal_state`: numeric scheduler knobs to override at runtime.
+message SetInternalStateRequest {
+  // Python's `SetInternalStateReq.server_args: Dict[str, int | float]`. The
+  // key set is the scheduler's (`Scheduler.set_internal_state` rejects
+  // unknown keys), so the object passes through as JSON text.
+  optional string server_args = 1 [(sglang.json.v1.field_json).raw_json = true];
+}
+
+// One `updated` flag per DP rank, in rank order; Python's `List[bool]`.
+message SetInternalStateResponse {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated bool updated = 1;
+}

@@ -19,6 +19,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use sglang_api_types::api::v1 as api;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -39,10 +40,37 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/model_info", get(model_info))
         .route("/flush_cache", get(flush_cache).post(flush_cache))
         .route("/weights_checker", get(check_weights).post(check_weights))
+        .route(
+            "/set_internal_state",
+            post(set_internal_state).put(set_internal_state),
+        )
         .route("/abort_request", post(abort_request))
         // Listener-to-listener: another DP rank's control request for this
         // rank's scheduler (see `api_server::core::peer`).
         .route(FORWARD_PEER_PATH, post(forward_control_req))
+}
+
+/// `POST|PUT /set_internal_state` — Python's `SetInternalStateReq` body; the
+/// response is the bare list of per-rank `updated` flags, 200 whatever the
+/// flags say (a rejected key is `false`, not an error, as in Python).
+async fn set_internal_state(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::SetInternalStateRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    match state
+        .core
+        .set_internal_state(body.server_args.as_deref())
+        .await
+    {
+        Ok(updated) => Json(api::SetInternalStateResponse { updated }).into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
 }
 
 /// `POST /internal/peer` — the body is a control message's wire bytes,
@@ -924,6 +952,55 @@ mod tests {
             }
             drop(request);
         }
+    }
+
+    /// `/set_internal_state` relays the object to the scheduler and answers
+    /// Python's bare list of flags with 200; a non-object body is a 400 that
+    /// reaches no scheduler.
+    #[tokio::test]
+    async fn set_internal_state_answers_the_per_rank_flags() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let response = tokio::spawn(
+            routes().with_state(state.clone()).oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/set_internal_state")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"server_args": {"pp_max_micro_batch_size": 4}}"#,
+                    ))
+                    .unwrap(),
+            ),
+        );
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("set_internal_state must submit one control request");
+        };
+        assert!(admission.try_accept());
+        assert!(matches!(request.kind, RequestKind::Control(_)));
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from(
+                rmp_serde::to_vec_named(&serde_json::json!({"updated": true})).unwrap(),
+            )))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await, serde_json::json!([true]));
+
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/set_internal_state")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"server_args": [1, 2]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(intake_rx.try_recv().is_err());
     }
 
     /// A forwarded control request reaches the local scheduler under the rid
