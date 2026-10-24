@@ -277,7 +277,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 2. Function Name: <function=name>
             # -------------------------------------------------------
-            if current_slice.startswith(self.tool_call_prefix):
+            if self.is_inside_tool_call and current_slice.startswith(
+                self.tool_call_prefix
+            ):
                 end_angle = current_slice.find(">")
                 if end_angle != -1:
                     func_name = current_slice[len(self.tool_call_prefix) : end_angle]
@@ -305,7 +307,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 3. Parameter: <parameter=name>value...
             # -------------------------------------------------------
-            if current_slice.startswith(self.parameter_prefix):
+            if self.is_inside_tool_call and current_slice.startswith(
+                self.parameter_prefix
+            ):
                 name_end = current_slice.find(">")
                 if name_end != -1:
                     value_start_idx = name_end + 1
@@ -389,7 +393,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 4. Function End: </function>
             # -------------------------------------------------------
-            if current_slice.startswith(self.function_end_token):
+            if self.is_inside_tool_call and current_slice.startswith(
+                self.function_end_token
+            ):
                 if not self.json_started:
                     calls.append(
                         ToolCallItem(tool_index=self.current_tool_id, parameters="{")
@@ -406,7 +412,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # -------------------------------------------------------
             # 5. Tool Call End: </tool_call>
             # -------------------------------------------------------
-            if current_slice.startswith(self.tool_call_end_token):
+            if self.is_inside_tool_call and current_slice.startswith(
+                self.tool_call_end_token
+            ):
                 self.parsed_pos += len(self.tool_call_end_token)
                 self.is_inside_tool_call = False  # [FIX] Exit tool call region
                 continue
@@ -431,14 +439,17 @@ class Qwen3CoderDetector(BaseFormatDetector):
             elif next_open_angle == 0:
                 # Looks like a Tag, but doesn't match any known Tag above
 
-                possible_tags = [
-                    self.tool_call_start_token,
-                    self.tool_call_end_token,
-                    self.tool_call_prefix,
-                    self.function_end_token,
-                    self.parameter_prefix,
-                    self.parameter_end_token,
-                ]
+                possible_tags = [self.tool_call_start_token]
+                if self.is_inside_tool_call:
+                    possible_tags.extend(
+                        [
+                            self.tool_call_end_token,
+                            self.tool_call_prefix,
+                            self.function_end_token,
+                            self.parameter_prefix,
+                            self.parameter_end_token,
+                        ]
+                    )
 
                 is_potential_tag = False
                 for tag in possible_tags:
