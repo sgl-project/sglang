@@ -127,6 +127,8 @@ def load_otel_data(path: str | Path):
     p = Path(path)
     with p.open("rt", encoding="utf-8") as f:
         first = f.read(1)
+        while first and first.isspace():
+            first = f.read(1)
         f.seek(0)
         if first == "[":
             data = json.load(f)  # JSON array
@@ -255,6 +257,7 @@ def generate_perfetto_span(engine_root_spans, smg_otel_spans, thread_meta_data):
     smg_pid = "smg"
     thread_meta_data[smg_pid] = new_metadata_level1("smg", smg_pid)
     for span in smg_otel_spans:
+        span["child"] = []
         span["pid"] = smg_pid
         __convert_to_perfetto_span(span, None, None, smg_pid, None)
 
