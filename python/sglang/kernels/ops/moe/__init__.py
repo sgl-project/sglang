@@ -146,7 +146,105 @@ def situ_and_mul_masked_post_quant(
     )
 
 
-__all__ = ["situ_and_mul_masked_post_quant", "moe_align_block_size", "topk_softmax"]
+def nvfp4_masked_grouped_moe(
+    hidden_states: torch.Tensor | tuple[torch.Tensor, Optional[torch.Tensor]],
+    input_global_scale: Optional[torch.Tensor],
+    w1: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2: torch.Tensor,
+    a2_global_scale: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    masked_m: torch.Tensor,
+    down_start_event: Optional[torch.cuda.Event] = None,
+    activation: str = "silu",
+    use_fused_dual_gemm: bool = True,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run Blackwell SM100 CuTe DSL 3D masked NVFP4 grouped MoE."""
+    return get_kernel("moe.nvfp4_masked_grouped_moe", KernelBackend.CUTE_DSL)(
+        hidden_states,
+        input_global_scale,
+        w1,
+        w1_blockscale,
+        w1_alpha,
+        w2,
+        a2_global_scale,
+        w2_blockscale,
+        w2_alpha,
+        masked_m,
+        down_start_event=down_start_event,
+        activation=activation,
+        use_fused_dual_gemm=use_fused_dual_gemm,
+        out=out,
+    )
+
+
+def nvfp4_routed_grouped_moe(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    w1: torch.Tensor,
+    w1_blockscale: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2: torch.Tensor,
+    a2_global_scale: torch.Tensor,
+    w2_blockscale: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    *,
+    m_max: Optional[int] = None,
+    activation: str = "silu",
+    use_fused_dual_gemm: bool = True,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run Blackwell SM100 CuTe DSL end-to-end routed Top-K NVFP4 MoE."""
+    return get_kernel("moe.nvfp4_routed_grouped_moe", KernelBackend.CUTE_DSL)(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        input_global_scale,
+        w1,
+        w1_blockscale,
+        w1_alpha,
+        w2,
+        a2_global_scale,
+        w2_blockscale,
+        w2_alpha,
+        m_max=m_max,
+        activation=activation,
+        use_fused_dual_gemm=use_fused_dual_gemm,
+        out=out,
+    )
+
+
+__all__ = [
+    "situ_and_mul_masked_post_quant",
+    "moe_align_block_size",
+    "nvfp4_masked_grouped_moe",
+    "nvfp4_routed_grouped_moe",
+    "topk_softmax",
+]
+
+
+_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
+register_kernel(
+    KernelSpec(
+        op="moe.nvfp4_masked_grouped_moe",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.moe.cutedsl_nvfp4_moe:nvfp4_masked_grouped_moe",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.nvfp4_routed_grouped_moe",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.moe.cutedsl_nvfp4_moe:nvfp4_routed_grouped_moe",
+        capabilities=_SM10X,
+    )
+)
 
 
 # Triton kernels migrated from srt/layers/moe (RFC #29630, Phase 2.5);

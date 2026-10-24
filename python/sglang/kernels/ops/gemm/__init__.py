@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Union
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.registry import register_kernel
@@ -177,6 +177,46 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.nvfp4_dual_gemm_swiglu",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.cutedsl_nvfp4_dual_gemm:nvfp4_dual_gemm_swiglu",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.nvfp4_gemm_pdl_safe",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.cutedsl_nvfp4_gemm:nvfp4_gemm_pdl_safe",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm100_nvfp4_gemm",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.cutedsl_nvfp4_gemm:try_cutedsl_nvfp4_gemm",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.nvfp4_grouped_gemm",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.cutedsl_nvfp4_group_gemm:nvfp4_grouped_gemm",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.nvfp4_masked_grouped_gemm",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.cutedsl_nvfp4_group_gemm:nvfp4_masked_grouped_gemm",
+        capabilities=_SM10X,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.bmm_fp8",
         backend=KernelBackend.FLASHINFER,
         target="sglang.kernels.ops.gemm.flashinfer_bmm_fp8:bmm_fp8",
@@ -258,7 +298,7 @@ def dual_gemm_swiglu_fp8(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
-    quant_mode: Optional["DualGemmQuantMode"] = None,
+    quant_mode: Optional[DualGemmQuantMode] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse FP8 gate/up projections, SwiGLU, and activation quantization."""
     if quant_mode is None:
@@ -282,6 +322,140 @@ def dual_gemm_swiglu(
     """Fuse BF16/FP16 gate/up projections followed by SwiGLU."""
     return get_kernel("gemm.dual_gemm_swiglu", KernelBackend.CUTE_DSL)(
         x, gate_up_weight
+    )
+
+
+def nvfp4_dual_gemm_swiglu(
+    a: torch.Tensor,
+    b1: torch.Tensor,
+    b2: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb1: torch.Tensor,
+    sfb2: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    alpha: Optional[torch.Tensor] = None,
+    swizzled_scales: bool = False,
+    out_dtype: Optional[torch.dtype] = None,
+    enable_pdl: bool = True,
+    pdl_safe: bool = False,
+    hybrid_rcp_mod_override: Optional[int] = None,
+    nr_steps_override: Optional[int] = None,
+) -> torch.Tensor:
+    """Fuse NVFP4 block-scaled gate/up projections followed by SwiGLU."""
+    return get_kernel("gemm.nvfp4_dual_gemm_swiglu", KernelBackend.CUTE_DSL)(
+        a,
+        b1,
+        b2,
+        sfa,
+        sfb1,
+        sfb2,
+        out,
+        alpha=alpha,
+        swizzled_scales=swizzled_scales,
+        out_dtype=out_dtype,
+        enable_pdl=enable_pdl,
+        pdl_safe=pdl_safe,
+        hybrid_rcp_mod_override=hybrid_rcp_mod_override,
+        nr_steps_override=nr_steps_override,
+    )
+
+
+def nvfp4_gemm_pdl_safe(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    alpha: Optional[torch.Tensor] = None,
+    swizzled_scales: bool = False,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Run Blackwell SM100 PDL-safe NVFP4 block-scaled GEMM."""
+    return get_kernel("gemm.nvfp4_gemm_pdl_safe", KernelBackend.CUTE_DSL)(
+        a,
+        b,
+        sfa,
+        sfb,
+        out,
+        alpha=alpha,
+        swizzled_scales=swizzled_scales,
+        out_dtype=out_dtype,
+    )
+
+
+def try_cutedsl_nvfp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: Optional[torch.Tensor],
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> torch.Tensor | None:
+    """Run the SM100 CuTe DSL PDL-safe NVFP4 GEMM fast path, or return ``None``."""
+    return get_kernel("gemm.sm100_nvfp4_gemm", KernelBackend.CUTE_DSL)(
+        input,
+        weight,
+        input_sf,
+        weight_sf,
+        alpha,
+        out_dtype,
+        out_features,
+    )
+
+
+def nvfp4_grouped_gemm(
+    abc_tensors: Sequence[
+        Union[
+            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+            Tuple[torch.Tensor, torch.Tensor],
+        ]
+    ],
+    sfasfb_tensors: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+    problem_sizes: Optional[Sequence[Tuple[int, int, int, int]]] = None,
+    *,
+    alphas: Optional[Union[Sequence[torch.Tensor], torch.Tensor]] = None,
+    swizzled_scales: bool = False,
+    out_dtype: Optional[torch.dtype] = None,
+    pdl_safe: bool = True,
+) -> list[torch.Tensor]:
+    """Run Blackwell SM100 single-launch fused NVFP4 grouped GEMM."""
+    return get_kernel("gemm.nvfp4_grouped_gemm", KernelBackend.CUTE_DSL)(
+        abc_tensors,
+        sfasfb_tensors,
+        problem_sizes,
+        alphas=alphas,
+        swizzled_scales=swizzled_scales,
+        out_dtype=out_dtype,
+        pdl_safe=pdl_safe,
+    )
+
+
+def nvfp4_masked_grouped_gemm(
+    a_q: torch.Tensor,
+    a_q_sf: torch.Tensor,
+    w: torch.Tensor,
+    w_sf: torch.Tensor,
+    masked_m: torch.Tensor,
+    alpha: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    out_dtype: Optional[torch.dtype] = None,
+    pdl_safe: bool = True,
+) -> torch.Tensor:
+    """Run Blackwell SM100 3D masked NVFP4 grouped GEMM with device-side masked_m early-exit."""
+    return get_kernel("gemm.nvfp4_masked_grouped_gemm", KernelBackend.CUTE_DSL)(
+        a_q,
+        a_q_sf,
+        w,
+        w_sf,
+        masked_m,
+        alpha,
+        out,
+        out_dtype=out_dtype,
+        pdl_safe=pdl_safe,
     )
 
 
@@ -345,6 +519,11 @@ __all__ = [
     "dual_gemm_swiglu_fp8",
     "fp8_scaled_mm",
     "kimi_k3_tiny_gemm",
+    "nvfp4_dual_gemm_swiglu",
+    "nvfp4_gemm_pdl_safe",
+    "nvfp4_grouped_gemm",
+    "nvfp4_masked_grouped_gemm",
+    "try_cutedsl_nvfp4_gemm",
     "try_qwen3x_nvfp4_gemm",
     "try_sm120_fp8_linear",
 ]
