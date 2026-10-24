@@ -1156,6 +1156,27 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {"moe_runner_backend": "flashinfer_trtllm"},
             )
 
+    def test_lfm2_vl_is_registered(self):
+        vl_config = SimpleNamespace(architectures=["Lfm2VlForConditionalGeneration"])
+        with override_platform(is_sm100=True):
+            self.assertEqual(
+                collect_model_override_declarations(
+                    "Lfm2VlForConditionalGeneration",
+                    SimpleNamespace(attention_backend=None),
+                    vl_config,
+                ),
+                [("_lfm2_overrides", {"attention_backend": "flashinfer"})],
+            )
+        with override_platform(is_sm100=False):
+            self.assertEqual(
+                collect_model_override_declarations(
+                    "Lfm2VlForConditionalGeneration",
+                    SimpleNamespace(attention_backend=None),
+                    vl_config,
+                ),
+                [],
+            )
+
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
         # so the declaration is pinned directly for both provider inputs.
