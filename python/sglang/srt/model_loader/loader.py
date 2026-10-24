@@ -41,7 +41,7 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
-from sglang.srt.kernel_plugins.monokernel.binding import (
+from sglang.srt.kernel_plugins.amd.binding import (
     monokernel_weights_iterator,
 )
 from sglang.srt.model_loader.post_load import stage_module_for_post_load

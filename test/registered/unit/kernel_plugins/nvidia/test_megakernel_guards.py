@@ -6,9 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.kernels.plugin_kernels.megakernel import spec as registry
-from sglang.srt.kernel_plugins.megakernel import binding
-from sglang.srt.kernel_plugins.megakernel.binding import (
+from sglang.kernels.plugin_kernels.nvidia import spec as registry
+from sglang.srt.kernel_plugins.nvidia import binding
+from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_disable_reasons,
 )
 from sglang.test.ci.ci_register import register_cpu_ci

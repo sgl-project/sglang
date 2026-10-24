@@ -9,9 +9,9 @@ from unittest.mock import patch
 import torch
 from msgspec.structs import replace
 
-from sglang.kernels.plugin_kernels.megakernel import spec as registry
-from sglang.srt.kernel_plugins.megakernel import binding
-from sglang.srt.kernel_plugins.megakernel.binding import MegakernelBinding
+from sglang.kernels.plugin_kernels.nvidia import spec as registry
+from sglang.srt.kernel_plugins.nvidia import binding
+from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

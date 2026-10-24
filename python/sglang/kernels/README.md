@@ -29,7 +29,7 @@ sglang/kernels/
   kda_kernels/   # agent-generated kernel backend (Kernel Design Agents)
   cake_kernels/  # agent-generated kernel backend (Cake, shipped by FlashInfer)
   plugin_kernels/  # plugin kernel backend: contracts of external kernel
-                   # libraries, as <contract>/<model>/
+                   # libraries, as <hardware>/<model>/
 ```
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
@@ -141,24 +141,24 @@ later. `KernelBackend.PLUGIN` records them. These are kernel plugins, not the
 platform plugins that add a device. The kernels stay in the libraries, and the
 code is split at the kernel/runtime boundary:
 
-- `kernels/plugin_kernels/<contract>/` holds what a plugin implements and
+- `kernels/plugin_kernels/<hardware>/` holds what a plugin implements and
   registers: its spec (registration, API version, requirements, capability and
   width declarations, the build and forward contract) and any thin wrappers
-  around its kernels, under `<contract>/<model>/`. It imports nothing from
+  around its kernels, under `<hardware>/<model>/`. It imports nothing from
   `srt`.
-- `srt/kernel_plugins/<contract>/binding.py` holds SGLang's integration: it
+- `srt/kernel_plugins/<hardware>/binding.py` holds SGLang's integration: it
   reads the server configuration at argument resolution, observes weight
   loading, coordinates TP ranks, plans CUDA graph coverage, installs the
   model-forward dispatch with its fallback, and hands a plugin the runtime
   state it may use.
 
-| Contract | Server flag | Libraries |
+| Hardware | Server flag | Library |
 | --- | --- | --- |
-| `megakernel/` | `--enable-nvidia-megakernel` | [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
-| `monokernel/` | `--monokernel-backend <name>` | `amd`: [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono); `msa`: [MiniMax-AI/MSA](https://github.com/MiniMax-AI/MSA) |
+| `nvidia/` | `--enable-nvidia-megakernel` | [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
+| `amd/` | `--enable-amd-monokernel` | [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono) |
 
 An operator exposed from here registers into its logical group with
-`KernelSpec(op="<group>.<name>", backend=KernelBackend.PLUGIN, target="sglang.kernels.plugin_kernels.<contract>.<model>.<mod>:<fn>")`;
+`KernelSpec(op="<group>.<name>", backend=KernelBackend.PLUGIN, target="sglang.kernels.plugin_kernels.<hardware>.<model>.<mod>:<fn>")`;
 `test_kernels_namespace.py` enforces the pairing. See `plugin_kernels/README.md`.
 
 ## How it works

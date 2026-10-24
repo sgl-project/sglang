@@ -76,10 +76,10 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.kernel_plugins.megakernel.binding import install_megakernel
-from sglang.srt.kernel_plugins.monokernel.binding import (
+from sglang.srt.kernel_plugins.amd.binding import (
     install_monokernel_forward,
 )
+from sglang.srt.kernel_plugins.nvidia.binding import install_megakernel
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env

@@ -6,7 +6,7 @@ from typing import Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.kernel_plugins.megakernel.binding import (
+from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_agree,
     megakernel_draft_sampler,
 )

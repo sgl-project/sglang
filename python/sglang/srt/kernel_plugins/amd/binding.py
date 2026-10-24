@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLang's binding to the monokernel plugin selected by --monokernel-backend:
+"""SGLang's binding to the AMD monokernel plugins behind --enable-amd-monokernel:
 startup validation and graph-size alignment, then weight observation and the
 full-forward dispatch installed on the model."""
 
@@ -13,7 +13,9 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 import torch
 import torch.distributed as dist
 
-from sglang.kernels.plugin_kernels.monokernel.spec import (
+from sglang.kernels.plugin_kernels.amd.spec import (
+    BACKEND,
+    FLAG,
     BuildContext,
     BuiltMonokernels,
     Feature,
@@ -133,7 +135,7 @@ def monokernel_disable_reasons(
         return None, ["no GPU is visible"]
     hf_config = model_config.hf_config
     spec, why = find_spec(
-        backend=cfg.monokernel_backend, architectures=hf_config.architectures, isa=isa
+        backend=BACKEND, architectures=hf_config.architectures, isa=isa
     )
     if spec is None:
         return None, [why]
@@ -200,11 +202,10 @@ def covered_capture_sizes(
     return covered + sorted(b for b in set(sizes) if b > covered[-1])
 
 
-def handle_monokernel(server_args: ServerArgs) -> None:
-    """Validate the selected backend and resolve its decode capture sizes."""
+def handle_amd_monokernel(server_args: ServerArgs) -> None:
+    """Validate --enable-amd-monokernel and resolve its decode capture sizes."""
     cfg = resolving_view(server_args)
-    backend = cfg.monokernel_backend
-    if backend is None:
+    if not cfg.enable_amd_monokernel:
         return
     isa = device_isa()
     spec, reasons = monokernel_disable_reasons(
@@ -212,8 +213,7 @@ def handle_monokernel(server_args: ServerArgs) -> None:
     )
     if reasons:
         raise ValueError(
-            f"--monokernel-backend {backend} cannot run this setup:\n  - "
-            + "\n  - ".join(reasons)
+            f"{FLAG} cannot run this setup:\n  - " + "\n  - ".join(reasons)
         )
     tokens = (
         int(cfg.speculative_num_draft_tokens or 1) if cfg.speculative_algorithm else 1
@@ -230,18 +230,17 @@ def handle_monokernel(server_args: ServerArgs) -> None:
         if sizes and new != sorted(set(sizes)):
             declare_resolution(
                 server_args,
-                "handle_monokernel",
+                "handle_amd_monokernel",
                 cuda_graph_config=with_phase(
                     graph, Phase.DECODE, bs=new, max_bs=max(new)
                 ),
             )
     logger.warning(
-        "--monokernel-backend is experimental. Its kernels, coverage and plugin API "
-        "may change."
+        "%s is experimental. Its kernels, coverage and plugin API may change.", FLAG
     )
     logger.info(
-        "--monokernel-backend %s: %s on %s, widths %s (%d tokens a request)",
-        backend,
+        "%s: %s on %s, widths %s (%d tokens a request)",
+        FLAG,
         spec.name,
         isa,
         list(spec.widths(isa)),
@@ -254,7 +253,7 @@ def _backend() -> Optional[str]:
     # the model loader also runs without a server's config (tools, unit tests)
     if not get_context().is_config_namespace_published("exec"):
         return None
-    return get_exec().kernel.monokernel_backend
+    return BACKEND if get_exec().kernel.enable_amd_monokernel else None
 
 
 def _gather_tp(obj: Any) -> list[Any]:
@@ -347,10 +346,10 @@ def install_monokernel_forward(
         if not is_found
     ]
     if reasons:
-        raise ValueError(f"--monokernel-backend {backend}: " + "; ".join(reasons))
+        raise ValueError(f"{FLAG}: " + "; ".join(reasons))
     if len({identity for *_, identity in lookups}) > 1:
         raise ValueError(
-            f"--monokernel-backend {backend}: the ranks load different specs: "
+            f"{FLAG}: the ranks load different specs: "
             + "; ".join(
                 f"rank {rank}: {name} (API version {api_version})"
                 for rank, (*_, (name, api_version)) in enumerate(lookups)
@@ -377,7 +376,7 @@ def install_monokernel_forward(
         for reason in rank_reasons
     ]
     if reasons:
-        raise ValueError(f"--monokernel-backend {backend}: " + "; ".join(reasons))
+        raise ValueError(f"{FLAG}: " + "; ".join(reasons))
 
     mode, tokens = _server_step()
     if spec.tokens_per_request is not None:
@@ -393,12 +392,10 @@ def install_monokernel_forward(
     served = _served_keys(mode=mode, widths=widths, tokens=tokens)
     # Different routes would leave ranks waiting in incompatible collectives.
     if any(other != served for other in _gather_tp(served)):
-        raise RuntimeError(
-            f"--monokernel-backend {backend}: the ranks route different graph keys"
-        )
+        raise RuntimeError(f"{FLAG}: the ranks route different graph keys")
     if not served:
         raise ValueError(
-            f"--monokernel-backend {backend}: {spec.name} has no width for this "
+            f"{FLAG}: {spec.name} has no width for this "
             f"server's steps ({tokens} tokens a request)"
         )
     build_context = BuildContext(
@@ -409,13 +406,10 @@ def install_monokernel_forward(
     )
     build_start, memory_before = time.perf_counter(), torch.cuda.memory_allocated()
     built = spec.build(model, hf_config, build_context)
-    _install_forward(
-        model=model, built=built, served=served, spec=spec, backend=backend
-    )
+    _install_forward(model=model, built=built, served=served, spec=spec)
     # Captured kernels retain weight copies that online updates cannot refresh.
     model._derived_weight_cache_error = (
-        f"Online weight updates are not supported with --monokernel-backend {backend} "
-        f"({spec.name})"
+        f"Online weight updates are not supported with {FLAG} ({spec.name})"
     )
     logger.info(
         "monokernel %s on %s: widths %s built in %.1f s, %.1f MiB; wait deadline "
@@ -430,9 +424,7 @@ def install_monokernel_forward(
         _format_weight_copies(copies),
     )
     if capture_keys:
-        capture_tail_hooks.append(
-            _CaptureCheck(spec=spec, backend=backend, isa=isa, served=served)
-        )
+        capture_tail_hooks.append(_CaptureCheck(spec=spec, isa=isa, served=served))
     else:
         # Without CUDA graphs every step runs eagerly, routed by its own key.
         logger.info(
@@ -450,8 +442,8 @@ class _CaptureCheck:
     runner none of whose graphs run them.
     """
 
-    def __init__(self, *, spec: MonoSpec, backend: str, isa: str, served: frozenset):
-        self.spec, self.backend, self.isa, self.served = spec, backend, isa, served
+    def __init__(self, *, spec: MonoSpec, isa: str, served: frozenset):
+        self.spec, self.isa, self.served = spec, isa, served
         self.captured: dict[int, Optional[ShapeKey]] = {}
         self.is_done = False
 
@@ -471,7 +463,7 @@ class _CaptureCheck:
         routed = [k for k in self.captured.values() if k in self.served]
         if not routed:
             raise ValueError(
-                f"--monokernel-backend {self.backend}: none of the "
+                f"{FLAG}: none of the "
                 f"{len(self.captured)} captured decode graphs (batch sizes "
                 f"{sorted(self.captured)}) runs {self.spec.name}'s monokernels"
             )
@@ -522,7 +514,6 @@ def _install_forward(
     built: BuiltMonokernels,
     served: frozenset[ShapeKey],
     spec: MonoSpec,
-    backend: str,
 ) -> None:
     """Install shape-based dispatch while preserving the original forward signature."""
     original = model.forward
@@ -545,7 +536,7 @@ def _install_forward(
             attention = get_attn_backend().decode_attention_backend_str or configured
             if attention not in allowed:
                 raise ValueError(
-                    f"--monokernel-backend {backend}: {spec.name} needs a decode "
+                    f"{FLAG}: {spec.name} needs a decode "
                     f"attention backend in {sorted(allowed)}, this runner's is "
                     f"{attention!r}"
                 )
