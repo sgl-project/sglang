@@ -145,5 +145,16 @@
     "pre_commit": "PASS for changed files",
     "system_hooks": "3 unchanged hooks PASS using installed Python"
   },
-  "scope": "Community-port CPU tests and bounded NPU graph checks only. Earlier integration model/PD/performance results are separately identified in the report."
+  "scope": "Community-port CPU tests and bounded NPU graph checks only. Earlier integration model/PD/performance results are separately identified in the report.",
+  "ci_followup": {
+    "files": {
+      "test/registered/unit/disaggregation/test_pd_role_switch.py": "12e326010f7653ed41a90b5c32cfc1183456755e780f40b577ded48a01f46393"
+    },
+    "pd_role_switch_tests": 38,
+    "draft_isolation_tests_repeated": 4,
+    "exit": 0,
+    "npu_initialized": false,
+    "production_code_changed": false,
+    "reason": "Initialize is_draft_worker in the constructor-bypassing PD role-switch test fixture"
+  }
 }
