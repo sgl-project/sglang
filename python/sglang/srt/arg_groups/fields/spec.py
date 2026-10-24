@@ -215,7 +215,9 @@ class Spec(msgspec.Struct):
     speculative_draft_model_quantization: A[
         Optional[str],
         Arg(
-            help="The quantization method for speculative model.",
+            help="The quantization method for the speculative draft model. "
+            "Defaults to the target method, except nvfp4_online keeps the draft's "
+            "checkpoint precision. Set nvfp4_online explicitly to quantize draft MoE experts.",
             choices=QUANTIZATION_CHOICES,
         ),
     ] = None
