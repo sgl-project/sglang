@@ -1579,11 +1579,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_cu_seqlens_q = cu_seqlens_q
                     unpad_sum_seq_lens_q = total_tokens
             else:
-                # draft_extend: handle varying num_correct_drafts_per_req. If total_tokens % bs == 0,
-                # we can directly reshape q; otherwise, pad to max_seq_len_q.
+                # Divisibility alone does not imply uniform request lengths.
                 total_tokens = q.shape[0]
                 tokens_per_seq = total_tokens // bs if bs > 0 else 0
-                can_direct_view = bs > 0 and (total_tokens % bs == 0)
+                can_direct_view = (
+                    bs > 0
+                    and total_tokens % bs == 0
+                    and all(
+                        length == tokens_per_seq
+                        for length in forward_batch.extend_seq_lens_cpu
+                    )
+                )
 
                 if can_direct_view:
                     max_seq_len = metadata.max_seq_len_k + tokens_per_seq
