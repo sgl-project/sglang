@@ -116,13 +116,15 @@ def _select_sampling_mask_rows(
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.tp_sync_group = get_parallel().tp_group.device_group
+        tp_sync_group = get_parallel().tp_group
         self.cp_sync_group = None
         if is_dp_attention_enabled():
-            self.tp_sync_group = get_parallel().attn_tp_group.device_group
+            tp_sync_group = get_parallel().attn_tp_group
             # Single-shard drafts may have no context-parallel group.
             if get_parallel().attn_cp_size > 1:
                 self.cp_sync_group = get_parallel().attn_cp_group.device_group
+        self.tp_sync_group = tp_sync_group.device_group
+        self.tp_sync_group_world_size = tp_sync_group.world_size
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -715,7 +717,10 @@ class Sampler(nn.Module):
     def _sync_token_ids_across_tp(
         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
     ):
-        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+        # A singleton collective is an identity but can lazily initialize NCCL.
+        if (
+            SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars
+        ) and self.tp_sync_group_world_size > 1:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
