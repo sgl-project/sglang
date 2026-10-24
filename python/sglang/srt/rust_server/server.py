@@ -12,17 +12,20 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from array import array
 from itertools import chain
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import msgspec
+import psutil
 
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
+from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
 from sglang.srt.rust_server.config import _build_server_args, _partition_cores
 from sglang.srt.rust_server.multimodal import (
@@ -32,6 +35,7 @@ from sglang.srt.rust_server.multimodal import (
     RustMmSpec,
     settle_shm_buffers,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -40,8 +44,8 @@ from sglang.srt.utils.flatten import (
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.io_struct import BatchTokenIDOutput
-    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+    from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput
+    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput, Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server
 
@@ -67,12 +71,23 @@ class RustServer:
         self.mm_spec = mm_spec
         self._multimodal_enabled = mm_spec is not None
         self._max_per_poll = max_per_poll
+        # The engine-level startup timings `/server_info` reports, set once
+        # the scheduler finishes initializing (see `set_startup_time`).
+        self.startup_time: Optional[Dict[str, Any]] = None
 
     @classmethod
     def _health_generate_headers(cls, scheduler: Scheduler) -> Dict[str, str]:
         """Headers a healthy ``/health_generate`` carries; a deployment's
         router may read its metadata off the deep health probe."""
         return {}
+
+    @classmethod
+    def _default_max_new_tokens(cls, scheduler: Scheduler) -> Optional[int]:
+        """What a ``/generate`` request that omits ``max_new_tokens`` asks for:
+        ``SamplingParams``'s default, as the Python ``TokenizerManager`` leaves
+        it. A subclass may return ``None``, no limit, which the scheduler
+        clamps to what the context window leaves after the prompt."""
+        return SamplingParams().max_new_tokens
 
     @classmethod
     def _load_extension(cls) -> ModuleType:
@@ -177,6 +192,7 @@ class RustServer:
                 scheduler,
                 extension=extension,
                 health_generate_headers=cls._health_generate_headers(scheduler),
+                default_max_new_tokens=cls._default_max_new_tokens(scheduler),
             ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
@@ -235,6 +251,17 @@ class RustServer:
         because ``drain`` settles its ownership after the wrapper returns."""
         assert self.mm_spec is not None
         return RustMmProcessor.wrap_encoded(self.mm_spec, buffers)
+
+    def set_startup_time(self, scheduler_startup_time: Dict[str, Any]) -> None:
+        """Record the startup timings in the shape of Python's
+        ``TokenizerManager.startup_time``. That frontend's end-to-end phase
+        (``tokenizer_e2e``) runs from launch until the schedulers are ready;
+        this one serves from inside the scheduler process, so it runs from
+        the process's spawn until its initialization ends, now."""
+        self.startup_time = build_engine_startup_time(
+            [scheduler_startup_time],
+            tokenizer_e2e=time.time() - psutil.Process().create_time(),
+        )
 
     def mm_transport_stats(self) -> Dict[str, int]:
         """Snapshot of the zero-copy accounting at the multimodal hand-off
@@ -355,6 +382,36 @@ class RustServer:
         encoded = msgspec.msgpack.encode(payload, enc_hook=str)
 
         self.server.push_control_result(recv_req.rid, encoded)
+
+    def push_abort(self, abort: AbortReq, req: Req) -> None:
+        """The terminal frame of a request the scheduler ended outside the output
+        stream (aborted while queued, preempted, retracted or rejected), which
+        Python's ``TokenizerManager._handle_abort_req`` builds from the same
+        ``AbortReq``: a one-request batch carrying no new tokens and the abort
+        finish reason. The counts are the request's own, so the frame does not
+        reset the ones a stream already reported."""
+        finish_reason = abort.finished_reason or {
+            "type": "abort",
+            "message": abort.abort_message or "Abort in waiting queue",
+        }
+        header = msgspec.msgpack.encode(
+            [
+                [abort.rid],
+                [finish_reason],
+                [len(req.origin_input_ids)],
+                [0],
+                [req.cached_tokens],
+                [req.reasoning_tokens],
+            ]
+        )
+        if not self.server.push_decode_result_batch(header, [b""]):
+            logger.warning(
+                "Rust egress closed; dropped abort of %s during shutdown", abort.rid
+            )
+
+    def push_health_ack(self) -> None:
+        """Acknowledge the health probes skipped while the scheduler was busy."""
+        self.server.push_health_ack()
 
     def push_generation(self, payload: BatchTokenIDOutput) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).

@@ -399,6 +399,8 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 
 STEP_MAX_US = 2_000_000
+# Pause windows kept for prefill busy accounting.
+PAUSE_WINDOWS_MAX = 1024
 
 # Min wall-clock between load publishes on the stalled no-batch path, which
 # spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
@@ -590,6 +592,11 @@ class Scheduler(
                 if self.draft_worker is not None
                 else None
             ),
+            draft_swa_window=(
+                self.draft_worker.draft_swa_window
+                if self.draft_worker is not None
+                else 0
+            ),
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -607,6 +614,9 @@ class Scheduler(
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
                 cache_controller.load_fence_stream = (
+                    self.tp_worker.model_runner.forward_stream
+                )
+                cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
                 if self.enable_unified_memory:
@@ -648,6 +658,11 @@ class Scheduler(
 
         self.init_metrics_reporter()
         self.scheduler_stage_metrics = self.metrics_reporter.scheduler_stage_metrics
+
+        # The Rust frontend snapshots local KV-event discovery metadata while it
+        # builds its typed server info, so the publisher must exist before the
+        # frontend starts.
+        self.init_kv_events_publisher()
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
@@ -705,8 +720,6 @@ class Scheduler(
 
         self.init_invariant_checker()
 
-        self.init_kv_events_publisher()
-
         self.init_load_publisher()
 
         self.init_load_inquirer()
@@ -740,6 +753,8 @@ class Scheduler(
                 else self.draft_worker.graph_time_usage
             ),
         )
+        if self.rust_server is not None:
+            self.rust_server.set_startup_time(self.startup_time)
 
     def maybe_init_hccl_dp_prewarm(self) -> None:
         if not (
@@ -1106,6 +1121,11 @@ class Scheduler(
         tic = time.perf_counter()
         self.init_memory_pools()
         self.kv_cache_allocation_time = time.perf_counter() - tic
+        if self.enable_unified_memory:
+            # The first compaction move must not happen while serving with a
+            # full pool (see MultiEndedAllocator.prewarm_compaction); prewarm it
+            # before graph capture and KV sizing account for its memory.
+            self.tp_worker.model_runner.token_to_kv_pool_allocator.prewarm_compaction()
 
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
@@ -1305,7 +1325,7 @@ class Scheduler(
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
-            ipc_channels=self.ipc_channels,
+            send_output=self.send_control_output,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
@@ -1317,6 +1337,9 @@ class Scheduler(
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
+        self.prefill_decode_interval_min_bs = (
+            get_schedule().prefill_decode_interval_min_bs
+        )
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1359,8 +1382,14 @@ class Scheduler(
         if sizer.profile_and_fit():
             self.dynamic_chunk_sizer = sizer
 
-    def _should_defer_prefill(self) -> bool:
+    def _should_defer_prefill(self, running_batch: ScheduleBatch) -> bool:
         if self._prefill_decode_interval_remaining == 0:
+            return False
+
+        # A small running batch admits prefill every round so it can grow;
+        # the interval only protects decode once the batch is large enough.
+        if running_batch.batch_size() < self.prefill_decode_interval_min_bs:
+            self._prefill_decode_interval_remaining = 0
             return False
 
         self._prefill_decode_interval_remaining -= 1
@@ -1470,12 +1499,15 @@ class Scheduler(
             get_disagg().disaggregation_transfer_backend
         )
 
-        # In rust-server mode the KV bootstrap registry is already serving on
-        # the rust api listener (maybe_init_rust_server runs before this
-        # method — the PrefillBootstrapQueue's KVManager below registers to it
-        # synchronously, and a failed registration only retries ~60s then logs,
-        # leaving every PD request unroutable). Only the ascend config store,
-        # which start_disagg_service would otherwise create, is left to do.
+        # In rust-server mode the KV bootstrap server is already up before the
+        # PrefillBootstrapQueue's KVManager below registers to it (synchronously;
+        # a failed registration only retries ~60s then logs, leaving every PD
+        # request unroutable): either the rust api listener serves the HTTP
+        # registry (maybe_init_rust_server runs before this method), or, for a
+        # transfer backend with its own bootstrap server, the main process has
+        # started that server (start_disagg_service_for_rust_server). Only the
+        # ascend config store, which start_disagg_service would otherwise
+        # create, is left to do here.
         if (
             self.disaggregation_mode == DisaggregationMode.PREFILL
             and self._hosts_rust_server()
@@ -2184,16 +2216,11 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
-                if self.rust_server is not None:
-                    # Embedded Rust server: every control-request response goes
-                    # back through the egress ring (the zmq tokenizer socket is
-                    # not consumed); the Rust api_server shapes it per-endpoint.
-                    self.rust_server.push_control_output(recv_req, output)
-                elif isinstance(output, RpcReqOutput):
+                if self.rust_server is None and isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
                 else:
-                    self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+                    self.send_control_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
         if self.external_corpus_manager is not None:
@@ -2205,6 +2232,25 @@ class Scheduler(
         if get_disagg().enable_pd_role_switch and self._event_loop_should_restart:
             self._event_loop_should_restart = False
             raise role_switch.PdRoleSwitchRestart()
+
+    def send_abort_output(self, abort_req: AbortReq, req: Req) -> None:
+        """Report a request the scheduler ends outside the output stream
+        (aborted while queued, preempted, retracted or rejected)."""
+        if self.rust_server is not None:
+            # The zmq tokenizer socket is not consumed in Rust mode.
+            self.rust_server.push_abort(abort_req, req)
+        else:
+            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+
+    def send_control_output(self, output, recv_req) -> None:
+        """Answer a control request, at dispatch or later (a deferred flush)."""
+        if self.rust_server is not None:
+            # Embedded Rust server: every control-request response goes
+            # back through the egress ring (the zmq tokenizer socket is
+            # not consumed); the Rust api_server shapes it per-endpoint.
+            self.rust_server.push_control_output(recv_req, output)
+        else:
+            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
     @staticmethod
     def _tokenized_requests(recv_req):
@@ -2501,6 +2547,11 @@ class Scheduler(
         self._prev_step: Optional[Tuple[int, float, bool]] = None
         self._prev_prefill_end_ts: Optional[float] = None
         self._sched_idled = False
+        # Closed pause windows a later prefill step may still overlap; not busy time.
+        self._pause_intervals: Deque[Tuple[float, float]] = deque(
+            maxlen=PAUSE_WINDOWS_MAX
+        )
+        self._pause_started_at: Optional[float] = None
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             server_args=self.server_args,
@@ -2540,6 +2591,7 @@ class Scheduler(
             ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
+            get_waiting_storage_span=self.tree_cache.waiting_storage_span,
         )
 
     def init_output_streamer(self) -> None:
@@ -3050,7 +3102,7 @@ class Scheduler(
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+            self.send_abort_output(abort_req, req)
             return
 
         if self.spec_algorithm.is_dflash_family():
@@ -3450,7 +3502,7 @@ class Scheduler(
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+            self.send_abort_output(abort_req, req)
             return False
         return True
 
@@ -3493,7 +3545,7 @@ class Scheduler(
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
-        self.ipc_channels.send_to_tokenizer.send_output(
+        self.send_abort_output(
             _make_abort_req(
                 req_to_abort,
                 finished_reason={
@@ -3734,7 +3786,7 @@ class Scheduler(
         self._pending_chunked_abort_req = None
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
-        self.ipc_channels.send_to_tokenizer.send_output(
+        self.send_abort_output(
             _make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
@@ -3809,8 +3861,6 @@ class Scheduler(
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
-        if self.enable_fpm:
-            self._fpm_batch_t0 = time.monotonic()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
@@ -3883,7 +3933,7 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
-        elif self._should_defer_prefill():
+        elif self._should_defer_prefill(running_batch):
             new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
@@ -3894,7 +3944,6 @@ class Scheduler(
         if (
             need_mlp_sync
             and not self.spec_algorithm.is_none()
-            and not get_spec().speculative_skip_dp_mlp_sync
             and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         ):
             # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
@@ -3936,8 +3985,6 @@ class Scheduler(
 
         if ret:
             set_schedule_time_batch(ret)
-            if self.enable_fpm:
-                ret.fpm_start_time = self._fpm_batch_t0
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
@@ -4430,7 +4477,7 @@ class Scheduler(
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
-                self.ipc_channels.send_to_tokenizer.send_output(
+                self.send_abort_output(
                     _make_abort_req(req, finished_reason=abort_reason.to_json()),
                     req,
                 )
@@ -5064,13 +5111,22 @@ class Scheduler(
             if prev_end_ts is not None:
                 # A new burst or mode can still overlap an earlier prefill.
                 start_ts = prev_end_ts if contiguous else max(start_ts, prev_end_ts)
-            step_us = int((end_ts - start_ts) * 1e6)
+            pauses = list(self._pause_intervals)
+            if self._pause_started_at is not None:
+                # A result processed while still paused excludes the pause so far.
+                pauses.append((self._pause_started_at, end_ts))
+            paused = sum(max(0.0, min(end_ts, b) - max(start_ts, a)) for a, b in pauses)
+            step_us = int((end_ts - start_ts - paused) * 1e6)
+            # Later prefill steps start at or after this end.
+            while self._pause_intervals and self._pause_intervals[0][1] <= end_ts:
+                self._pause_intervals.popleft()
         else:
             # Decode regression uses launch cadence and skips boundaries.
             if not contiguous:
                 return
             step_us = int((batch.launch_ts - prev_launch_ts) * 1e6)
-        if not 0 < step_us < STEP_MAX_US:
+        # Only decode cadence is capped; a long prefill chunk is real busy time.
+        if step_us <= 0 or (not is_prefill and step_us >= STEP_MAX_US):
             return
         if is_prefill:
             self.total_prefill_busy_us += step_us
@@ -5089,11 +5145,18 @@ class Scheduler(
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
-            self.ipc_channels.send_to_tokenizer.send_output(
-                HealthCheckOutput(
-                    http_worker_ipc=self.return_health_check_ipcs.popleft()
+            if self.rust_server is not None:
+                # The zmq tokenizer socket is not consumed in Rust mode. Rust
+                # probes share one heartbeat, so one acknowledgement answers
+                # every probe skipped so far.
+                self.return_health_check_ipcs.clear()
+                self.rust_server.push_health_ack()
+            else:
+                self.ipc_channels.send_to_tokenizer.send_output(
+                    HealthCheckOutput(
+                        http_worker_ipc=self.return_health_check_ipcs.popleft()
+                    )
                 )
-            )
 
     def add_external_corpus(
         self, recv_req: AddExternalCorpusReqInput
@@ -5549,7 +5612,7 @@ class Scheduler(
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
-            self.ipc_channels.send_to_tokenizer.send_output(
+            self.send_abort_output(
                 _make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
@@ -5577,9 +5640,7 @@ class Scheduler(
                 recv_req.abort_all, recv_req.rid
             ):
                 self._release_aborted_request(req)
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    _make_abort_req(req), req
-                )
+                self.send_abort_output(_make_abort_req(req), req)
                 if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
@@ -5642,9 +5703,7 @@ class Scheduler(
                             self.tree_cache,
                             get_disagg().disaggregation_decode_retraction_backup,
                         )
-                        self.ipc_channels.send_to_tokenizer.send_output(
-                            _make_abort_req(decode_req), decode_req
-                        )
+                        self.send_abort_output(_make_abort_req(decode_req), decode_req)
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
@@ -5681,6 +5740,8 @@ class Scheduler(
             # chunked_req cleanup, and overlap result processing through
             # the standard code paths. This avoids duplicating batch
             # manipulation logic and the accounting bugs that come with it.
+            if self._pause_started_at is None:
+                self._pause_started_at = time.monotonic()
             return
 
         if self.enable_overlap and self.last_batch:
@@ -5694,6 +5755,9 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
         elif self.enable_overlap_mlx:
             self._drain_mlx_pending_jobs()
+        # A first retract starts the pause once the in-flight result has drained.
+        if self._pause_started_at is None:
+            self._pause_started_at = time.monotonic()
 
         retract_reqs = [r for r in self.running_batch.reqs if not r.finished()]
         if (
@@ -5802,6 +5866,9 @@ class Scheduler(
         ):
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
         self._engine_paused = False
+        if self._pause_started_at is not None:
+            self._pause_intervals.append((self._pause_started_at, time.monotonic()))
+            self._pause_started_at = None
 
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput
@@ -6010,7 +6077,7 @@ class Scheduler(
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
-        freeze_gc("Scheduler")
+        freeze_gc("Scheduler", recv_req.gc_threshold)
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         return None
 

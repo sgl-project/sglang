@@ -138,6 +138,7 @@ def test_smd_admission_rejects_request_overrides_before_encoding():
     [
         {"partition": "fl2va", "tasks": ["t2va"]},
         {"dmd_denoising_steps": [999, 750, 500, 250]},
+        {"pdd_fused_heads": "heads.safetensors"},
         {"sampling_preset": "unknown"},
         {"sigma_shift_scales": {"video": 8.0, "audio": 3.0}},
     ],
@@ -155,6 +156,14 @@ def test_smd_does_not_admit_untrained_tasks_via_a_hybrid_override():
 
 def test_smd_rejects_pdd_or_dmd_before_loading_head_files():
     with patch.object(PipelineStage, "__init__", return_value=None):
+        with (
+            patch.object(envs, "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS", None),
+            pytest.raises(ValueError, match="must not stack PDD"),
+        ):
+            MiniMaxH3TimestepPreparationStage(
+                sampling_preset=MINIMAX_H3_SMD_SAMPLING_PRESET,
+                pdd_heads="unused.safetensors",
+            )
         with (
             patch.object(envs, "SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS", "unused"),
             pytest.raises(ValueError, match="must not stack PDD"),
@@ -176,6 +185,12 @@ def test_default_schedule_and_smd_dedup_identity_stay_distinct():
     stage = _stage(preset=None)
     request = _batch()
     assert _metadata(sampling_preset=None).sampling_preset is None
+    assert (
+        _metadata(
+            sampling_preset=None, pdd_fused_heads="heads.safetensors"
+        ).pdd_fused_heads
+        == "heads.safetensors"
+    )
     with patch.object(
         resolved_plan, "minimax_h3_plan_from_batch", return_value=_plan()
     ):
