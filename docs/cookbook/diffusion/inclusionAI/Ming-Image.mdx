@@ -1,6 +1,5 @@
 ---
 title: Ming-Image
-tag: NEW
 description: "Deploy Ming-Image Design and Design-Layer with SGLang Diffusion for text-to-image, RGBA image editing, and ordered transparent layer decomposition."
 ---
 
