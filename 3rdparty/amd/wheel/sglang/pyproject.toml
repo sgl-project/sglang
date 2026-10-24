@@ -19,7 +19,7 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 runtime_common = [
   "IPython",
   "aiohttp",
-  "anthropic>=0.20.0",
+  "anthropic>=0.20.0,<1",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
