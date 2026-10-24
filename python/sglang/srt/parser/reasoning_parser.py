@@ -2152,6 +2152,16 @@ class MuseGlimmerDetector(BaseReasoningFormatDetector):
                 if i != -1 and (end_idx == -1 or i < end_idx):
                     end_idx, end_tok = i, tok
 
+            # Only unframed prose can recover at a new channel marker.
+            # Explicit answer channels can contain quoted tool headers.
+            if self._recipient is None:
+                next_channel = self._buffer.find(START)
+                if next_channel != -1 and (end_idx == -1 or next_channel < end_idx):
+                    normal_parts.append(self._buffer[:next_channel])
+                    self._buffer = self._buffer[next_channel:]
+                    self._in_body = False
+                    continue
+
             if end_idx != -1:
                 body = self._buffer[:end_idx]
                 self._buffer = self._buffer[end_idx + len(end_tok) :]

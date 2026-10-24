@@ -183,6 +183,17 @@ class MuseGlimmerDetector(BaseFormatDetector):
                 if i != -1 and (end_at == -1 or i < end_at):
                     end_at, end_len = i, len(tok)
 
+            # A reserved start marker ends unframed prose when the model
+            # omits the end marker. Preserve framed content and tool arguments.
+            if self._recipient is None:
+                next_channel = self._buffer.find(START)
+                if next_channel != -1 and (end_at == -1 or next_channel < end_at):
+                    normal_parts.append(self._buffer[:next_channel])
+                    self._buffer = self._buffer[next_channel:]
+                    self._in_body = False
+                    self._recipient = None
+                    continue
+
             if end_at == -1:
                 keep = self._held_back(self._buffer)
                 chunk = self._buffer[: len(self._buffer) - keep]
