@@ -44,8 +44,8 @@ from sglang.srt.utils.flatten import (
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.io_struct import BatchTokenIDOutput
-    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+    from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput
+    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput, Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server
 
@@ -382,6 +382,32 @@ class RustServer:
         encoded = msgspec.msgpack.encode(payload, enc_hook=str)
 
         self.server.push_control_result(recv_req.rid, encoded)
+
+    def push_abort(self, abort: AbortReq, req: Req) -> None:
+        """The terminal frame of a request the scheduler ended outside the output
+        stream (aborted while queued, preempted, retracted or rejected), which
+        Python's ``TokenizerManager._handle_abort_req`` builds from the same
+        ``AbortReq``: a one-request batch carrying no new tokens and the abort
+        finish reason. The counts are the request's own, so the frame does not
+        reset the ones a stream already reported."""
+        finish_reason = abort.finished_reason or {
+            "type": "abort",
+            "message": abort.abort_message or "Abort in waiting queue",
+        }
+        header = msgspec.msgpack.encode(
+            [
+                [abort.rid],
+                [finish_reason],
+                [len(req.origin_input_ids)],
+                [0],
+                [req.cached_tokens],
+                [req.reasoning_tokens],
+            ]
+        )
+        if not self.server.push_decode_result_batch(header, [b""]):
+            logger.warning(
+                "Rust egress closed; dropped abort of %s during shutdown", abort.rid
+            )
 
     def push_health_ack(self) -> None:
         """Acknowledge the health probes skipped while the scheduler was busy."""
