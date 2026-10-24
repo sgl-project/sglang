@@ -95,6 +95,12 @@ class RustServer:
         return SamplingParams().max_new_tokens
 
     @classmethod
+    def _server_kwargs(cls, scheduler: Scheduler) -> Dict[str, Any]:
+        """Keyword arguments a model package's own ``Server`` class takes
+        beyond the shared ones (see ``_load_extension``)."""
+        return {}
+
+    @classmethod
     def _load_extension(cls) -> ModuleType:
         from sglang.srt.rust_extensions import load_rust_extension
 
@@ -202,6 +208,7 @@ class RustServer:
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
             port_offset=local_dp_rank,
+            **cls._server_kwargs(scheduler),
         )
         instance = cls(server, http_port=listen_port)
 
@@ -394,7 +401,9 @@ class RustServer:
         Python's ``TokenizerManager._handle_abort_req`` builds from the same
         ``AbortReq``: a one-request batch carrying no new tokens and the abort
         finish reason. The counts are the request's own, so the frame does not
-        reset the ones a stream already reported."""
+        reset the ones a stream already reported. The frame is marked as ended
+        outside the stream: like ``_handle_abort_req``, the frontend records no
+        request metrics for it."""
         finish_reason = abort.finished_reason or {
             "type": "abort",
             "message": abort.abort_message or "Abort in waiting queue",
@@ -407,9 +416,17 @@ class RustServer:
             [req.cached_tokens],
             [req.reasoning_tokens],
         ]
-        if abort.weight_versions is not None:
-            header_cols += [[]] * _EXTRAS_HEADER_COLS
-            header_cols.append([abort.weight_versions])
+        header_cols += [[]] * _EXTRAS_HEADER_COLS
+        header_cols += [
+            [abort.weight_versions] if abort.weight_versions is not None else [],
+            [],  # image_tokens
+            [],  # audio_tokens
+            [],  # video_tokens
+            [],  # decode_latencies
+            # Ended outside the output stream: `_handle_abort_req` records no
+            # request metrics for it.
+            [True],
+        ]
         header = msgspec.msgpack.encode(header_cols)
         if not self.server.push_decode_result_batch(header, [b""]):
             logger.warning(
@@ -420,7 +437,9 @@ class RustServer:
         """Acknowledge the health probes skipped while the scheduler was busy."""
         self.server.push_health_ack()
 
-    def push_generation(self, payload: BatchTokenIDOutput) -> None:
+    def push_generation(
+        self, payload: BatchTokenIDOutput, decode_latencies: Dict[int, float]
+    ) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
         Push the WHOLE batch into the Rust egress ring as one frame (-> detokenizer
@@ -433,7 +452,9 @@ class RustServer:
             the shape metadata for the optional families (``*_lens`` element counts
             for the flat logprob columns, ``*_reqlens``/``*_poslens`` for the ragged
             and hidden ones), then the finished requests' weight-version
-            spans and a multimodal model's media token counts.
+            spans, a multimodal model's media token counts, and
+            ``decode_latencies`` (by row: a finished non-streaming request's
+            decode latency in seconds).
           - ``data``: the raw little-endian numeric buffer: the token ids
             first, as the 8-byte ``array("q")`` bytes the scheduler already
             holds, then every logprob / hidden column as 4-byte elements
@@ -581,16 +602,22 @@ class RustServer:
             )
 
         # After the extras: the finished requests' weight-version spans (None
-        # for the others) and a multimodal model's media token counts, each
-        # empty when nothing in the batch carries it. The lists are already
-        # built, so a frame pays only their encoding, and the header stops at
-        # its last non-empty column.
+        # for the others), a multimodal model's media token counts and the
+        # finished requests' decode latencies, each empty when nothing in the
+        # batch carries it. Only the last is built here, for finished rows; the
+        # header stops at its last non-empty column.
+        latencies = []
+        if decode_latencies:
+            latencies = [None] * len(rids)
+            for row, latency in decode_latencies.items():
+                latencies[row] = latency
         media = self._multimodal_enabled
         trailing = [
             payload.weight_versions or [],
             (payload.image_tokens or []) if media else [],
             (payload.audio_tokens or []) if media else [],
             (payload.video_tokens or []) if media else [],
+            latencies,
         ]
         while trailing and not trailing[-1]:
             trailing.pop()
