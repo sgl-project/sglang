@@ -4830,7 +4830,7 @@ def get_num_new_pages(
     page_size: int,
     prefix_lens: Optional[torch.Tensor] = None,
     decode: bool = False,
-) -> torch.Tensor:
+) -> int:
     """
     Get the number of new pages for the given prefix and sequence lengths.
     We use cpu tensors to avoid blocking kernel launch.
@@ -4841,7 +4841,7 @@ def get_num_new_pages(
     if prefix_lens is None or decode:
         # NOTE: Special case for handling decode, which prefix lens is `seq_lens - 1`.
         assert decode
-        return (seq_lens % page_size == 1).int().sum().item()
+        return torch.count_nonzero(seq_lens % page_size == 1).item()
 
     assert prefix_lens.device == cpu_device
     num_pages_after = (seq_lens + page_size - 1) // page_size
