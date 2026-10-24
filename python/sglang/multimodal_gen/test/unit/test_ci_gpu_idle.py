@@ -39,7 +39,10 @@ def test_gpu_idle_discounts_reserved_memory_by_uuid(external_gib):
     assert bool(reports) == bool(external_gib)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NVIDIA GPU")
+@pytest.mark.skipif(
+    torch.version.cuda is None or not torch.cuda.is_available(),
+    reason="requires NVIDIA GPU",
+)
 def test_gpu_idle_with_real_cached_allocation_and_other_process():
     """Retained CUDA cache is allowed; another process still blocks startup."""
     pynvml.nvmlInit()
