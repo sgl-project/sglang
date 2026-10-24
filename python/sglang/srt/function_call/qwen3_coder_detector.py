@@ -137,6 +137,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 maybe_convert = (
                     False if "." in param_value or "e" in param_value.lower() else True
                 )
+                if maybe_convert:
+                    # Preserve integer literals before a float can round them.
+                    try:
+                        return int(param_value)
+                    except ValueError:
+                        pass
                 param_value: float = float(param_value)
                 if maybe_convert and param_value.is_integer():
                     param_value = int(param_value)
