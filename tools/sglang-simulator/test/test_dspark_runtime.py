@@ -59,7 +59,7 @@ def runtime(monkeypatch):
     monkeypatch.setattr(
         adapter,
         "sampling_snapshot",
-        lambda params: '{"is_normalized":true,"max_new_tokens":100}',
+        lambda params: '{"ignore_eos":true,"is_normalized":true,"max_new_tokens":100}',
     )
     return adapter.DSparkNativeRuntime(
         session=DSparkSession(Cost(), Progress()),
@@ -77,6 +77,53 @@ def forward(runtime, native_batch, publish=None):
         batch=native_batch,
         on_publish=publish,
     )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"ignore_eos": value} for value in (False, None, 1)]
+    + [
+        {name: ["active stop"]}
+        for name in ("stop", "stop_regex", "stop_strs", "stop_regex_strs")
+    ]
+    + [{"stop_token_ids": [1]}],
+)
+def test_synthetic_output_rejects_content_stops_before_cost_or_state(
+    runtime, monkeypatch, override
+):
+    recipe = {"ignore_eos": True, "is_normalized": True, "max_new_tokens": 100}
+    recipe.update(override)
+    monkeypatch.setattr(
+        adapter, "sampling_snapshot", lambda _: adapter.canonical(recipe)
+    )
+    published = []
+    with pytest.raises(PredictorError, match="ignore_eos=True and no stop rules"):
+        forward(runtime, batch(), published.append)
+    assert runtime.session.cost_model.calls == 0
+    assert runtime.session.progress_model.calls == 0
+    assert runtime._forward_id == 0 and runtime._draft_buffer_capacity == 0
+    assert published == []
+    with pytest.raises(PredictorError, match="no prior injection/commit"):
+        runtime.session.history_for("a")
+
+
+def test_synthetic_output_allows_explicit_empty_normalized_stop_fields(
+    runtime, monkeypatch
+):
+    recipe = {
+        "ignore_eos": True,
+        "is_normalized": True,
+        "max_new_tokens": 100,
+        "stop": None,
+        "stop_regex": None,
+        "stop_strs": [],
+        "stop_regex_strs": [],
+        "stop_token_ids": None,
+    }
+    monkeypatch.setattr(
+        adapter, "sampling_snapshot", lambda _: adapter.canonical(recipe)
+    )
+    assert forward(runtime, batch()).new_seq_lens == [512]
 
 
 def test_prefill_then_native_committed_decode_updates_next_causal_work(runtime):

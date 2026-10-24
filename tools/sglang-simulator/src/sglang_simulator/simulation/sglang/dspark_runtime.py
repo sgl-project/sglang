@@ -318,6 +318,21 @@ class DSparkNativeRuntime:
                     "DSPark grammar progress is not modeled",
                 )
             recipe = sampling_snapshot(req.sampling_params)
+            sampling = json.loads(recipe)
+            if sampling.get("ignore_eos") is not True or any(
+                sampling.get(name) not in (None, [])
+                for name in (
+                    "stop",
+                    "stop_regex",
+                    "stop_strs",
+                    "stop_regex_strs",
+                    "stop_token_ids",
+                )
+            ):
+                raise PredictorError(
+                    "unsupported_execution_profile",
+                    "synthetic DSPark output requires ignore_eos=True and no stop rules",
+                )
             try:
                 history = self.session.history_for(req.rid)
             except PredictorError:
