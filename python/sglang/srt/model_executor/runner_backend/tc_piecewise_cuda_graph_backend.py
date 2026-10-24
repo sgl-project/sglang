@@ -204,7 +204,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
                         for num_tokens in compile_range:
                             if get_parallel().tp_rank == 0:
                                 compile_range.set_description(
-                                    f"Compiling num tokens ({num_tokens=})"
+                                    f"Compiling num tokens ({num_tokens=} bs={num_tokens // cuda_graph_runner.captured_req_width})"
                                 )
                             cuda_graph_runner._run_dummy_forward(num_tokens=num_tokens)
 
