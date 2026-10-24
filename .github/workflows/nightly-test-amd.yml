@@ -103,6 +103,8 @@ on:
           - nightly-4-gpu-mi35x-minimax-m3-mxfp4
           # 8-GPU MiniMax-M2.7 (MI30x only)
           - nightly-8-gpu-minimax-m27
+          # 4-GPU Muse Spark Open MXFP4 + NVFP4 (MI35x only - MXFP4 needs gfx95x)
+          - nightly-4-gpu-mi35x-muse-spark-open
           # Diffusion (MI30x)
           - nightly-1-gpu-zimage-turbo
       job_filter:
@@ -2296,6 +2298,70 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
+  # 4-GPU Muse Spark Open MXFP4 + NVFP4 (MI35x only - MXFP4 needs gfx95x)
+  # ==============================================================================
+
+  nightly-4-gpu-mi35x-muse-spark-open:
+    name: ${{ format('nightly-4-gpu-mi35x-muse-spark-open ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-muse-spark-open,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+      - name: Setup docker (${{ matrix.rocm_version }})
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
+          # Install tabulate for run_suite.py (missing in MI35x container)
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      # The recipe's aiter attention and FlyDSL experts need the Muse Spark
+      # aiter patches, which the Day-0 image bakes in and the CI image does
+      # not. The script fails if a patch no longer applies to the pinned aiter.
+      - name: Apply Muse Spark aiter patches
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            bash 3rdparty/amd/muse_spark/apply_aiter_patches.sh
+
+      - name: Check model cache space
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            bash scripts/ci/amd/check_hf_cache_space.sh \
+            amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4 500
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
+            bash scripts/ci/amd/check_hf_cache_space.sh \
+            meta-models/Muse-Spark-Open-816B-A42B-NVFP4 500
+
+      # Both FP4 cells of the MI355X recipe, one server each: the Quark MXFP4
+      # export, then the NVFP4 checkpoint requantized to MXFP4 at load.
+      - name: Accuracy Test MI35x ROCm (4-GPU Muse Spark Open MXFP4 + NVFP4)
+        timeout-minutes: 420
+        run: |
+          > github_summary.md
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-4-gpu-mi35x-muse-spark-open --nightly --timeout-per-file 21600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # ==============================================================================
   # Diffusion (MI30x)
   # ==============================================================================
 
@@ -2412,6 +2478,8 @@ jobs:
       - nightly-4-gpu-mi35x-minimax-m3-mxfp4
       # 8-GPU MiniMax-M2.7 (MI30x only)
       - nightly-8-gpu-minimax-m27
+      # 4-GPU Muse Spark Open MXFP4 + NVFP4 (MI35x)
+      - nightly-4-gpu-mi35x-muse-spark-open
       # Diffusion (MI30x)
       - nightly-1-gpu-zimage-turbo
     runs-on: ubuntu-latest
