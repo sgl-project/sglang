@@ -767,6 +767,26 @@ class TestRolloutStopStepUnit(unittest.TestCase):
         with self.assertRaises(ValueError):
             truncate_rollout_schedule(scheduler, 4)
 
+    def test_stop_ignored_by_the_timestep_stage_is_rejected(self):
+        """A pipeline whose timestep stage ignores the stop would return a full
+        rollout as if it had stopped; the rollout hook must reject it instead."""
+        batch = Req(
+            sampling_params=SamplingParams(
+                prompt="test", rollout=True, rollout_stop_step_index=2
+            )
+        )
+        batch.scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        batch.scheduler.set_timesteps(4)
+        batch.latents = torch.zeros(1, 4, 8, 8)
+        with self.assertRaises(ValueError):
+            prepare_rollout_if_enabled(
+                batch=batch, pipeline_config=types.SimpleNamespace()
+            )
+
+        truncate_rollout_schedule(batch.scheduler, 2)
+        prepare_rollout_if_enabled(batch=batch, pipeline_config=types.SimpleNamespace())
+        self.assertTrue(batch.rollout_controllers)
+
     def _run_minimax_h3(
         self, stop_step_index: int | None
     ) -> tuple[dict[str, list[float]], list[torch.Tensor], torch.Tensor]:
