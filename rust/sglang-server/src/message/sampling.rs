@@ -509,6 +509,16 @@ impl SamplingParams {
                 }
             }
         }
+        if let Some(stop_token_ids) = &self.stop_token_ids {
+            for &token_id in stop_token_ids {
+                if token_id < 0 || token_id as u64 >= vocab_size {
+                    return Err(bad(format!(
+                        "stop_token_ids must be in [0, {}], got {token_id}.",
+                        vocab_size - 1
+                    )));
+                }
+            }
+        }
         if let Some(value) = self
             .custom_params
             .as_ref()
@@ -1110,6 +1120,25 @@ mod tests {
             let _ = norm_err(json);
         }
         assert!(norm(r#"{"logit_bias": {"7": 1.0}}"#).logit_bias.is_some());
+    }
+
+    /// The min_new_tokens penalizer scatters every stop id in the batch into a
+    /// `vocab_size + 1`-wide row, so one out-of-vocab id crashed the scheduler
+    /// for the whole batch. The bound is `[0, vocab_size)`, as in Python `verify`.
+    #[test]
+    fn stop_token_ids_are_vocab_bounded() {
+        for json in [
+            r#"{"stop_token_ids": [1, 1000]}"#,
+            r#"{"stop_token_ids": [1000000]}"#,
+            r#"{"stop_token_ids": [-1]}"#,
+        ] {
+            let _ = norm_err(json);
+        }
+        assert!(
+            norm(r#"{"stop_token_ids": [0, 999]}"#)
+                .stop_token_ids
+                .is_some()
+        );
     }
 
     /// Both `stop_regex` caps, neither of which had a test: deleting either `if`
