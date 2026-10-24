@@ -326,6 +326,16 @@ _bcg_prefill_graph_full_topk = eager_on_graph(True)(_prefill_graph_full_topk)
 _bcg_low_ratio_source_projections = eager_on_graph(True)(_low_ratio_source_projections)
 
 
+def _first_rows(act, n: int):
+    """First ``n`` rows of ``act``, cut field by field for HIP's quantized activations
+    (``Mxfp8Activation``, ``Fp8GridActivation``), which refuse a slice."""
+    if isinstance(act, msgspec.Struct):
+        return msgspec.structs.replace(
+            act, **{k: getattr(act, k)[:n] for k in act.__struct_fields__}
+        )
+    return act[:n]
+
+
 def _as_int_list(values) -> Optional[List[int]]:
     if values is None:
         return None
@@ -3393,9 +3403,10 @@ class DeepseekV4AttnBackend(
             # extend past them; an eager break in the late-layer tail sees fewer, and
             # there extend_seq_lens still spans the whole extend.
             n = min(hoisted_pos.shape[0], positions.shape[0])
-            x, positions = x[:n], positions[:n]
-            if q_lora is not None:
-                q_lora = q_lora[:n]
+            if n < positions.shape[0]:
+                x, positions = _first_rows(x, n), positions[:n]
+                if q_lora is not None:
+                    q_lora = _first_rows(q_lora, n)
             req, pos = hoisted_req[:n], hoisted_pos[:n]
         if (
             forward_batch.forward_mode.is_extend()
