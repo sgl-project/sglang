@@ -11,11 +11,11 @@ use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use sglang_processor::DynamoTokenizer;
 use sglang_processor::openai::{ChatModel, OpenAiHeaders, OpenAiSettings, Reply, lower_chat};
+use sglang_processor::{DynamoTokenizer, TemplateError};
 
 use super::chat::ChatBody;
-use super::template::{render_body, render_chat};
+use super::template::{RenderedChat, render_chat};
 use super::{AppState, ChatFormatter};
 use crate::api_server::http::native_api::{
     GenerateItem, RequestTiming, drain_unary, generate_requests, generation_event_stream,
@@ -84,13 +84,19 @@ impl OpenAiChat {
         request: &Value,
         defaults: &super::ChatTemplateKwargs,
     ) -> Option<Vec<u32>> {
-        let rendered = match render_body(formatter, request.clone(), defaults) {
-            // A request the SGLang path declines goes to the typed handler,
-            // which renders it through the template.
-            Some(rendered) => rendered.ok()?,
-            None => {
+        // Only the template needs the typed request, so a body the SGLang path
+        // renders need not fit Dynamo's stricter type.
+        let rendered = match formatter.render_request(request.clone(), defaults) {
+            Err(TemplateError::NeedsRenderFallback { .. }) => {
                 let ChatBody { request: chat, raw } = ChatBody::deserialize(request).ok()?;
                 render_chat(formatter, raw, &chat.request, defaults).ok()?
+            }
+            rendered => {
+                let (prompt, continuation) = rendered.ok()?;
+                RenderedChat {
+                    prompt,
+                    continuation,
+                }
             }
         };
         let ids = rendered.encode(&*self.tokenizer).ok()?;

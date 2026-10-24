@@ -3,11 +3,11 @@
 
 use std::collections::HashMap;
 
-use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
-use dynamo_renderer::{OAIChatLikeRequest, RenderedPrompt, TextInput};
+use dynamo_protocols::types::CreateChatCompletionRequest;
+use dynamo_renderer::RenderedPrompt;
 use serde_json::Value;
 
-use super::{ChatFormatter, TemplateError};
+use super::{ChatFormatter, TemplateArgsRequest, TemplateError};
 
 /// What SGLang's chat layer reads off a raw chat body (not re-validated) for its template.
 #[derive(Debug, Clone, Default)]
@@ -34,53 +34,7 @@ impl ChatFormatter {
         request: &CreateChatCompletionRequest,
         args: &TemplateArgs,
     ) -> Result<RenderedPrompt, TemplateError> {
-        let request = TemplateRequest {
-            request,
-            kwargs: (!args.kwargs.is_empty()).then_some(&args.kwargs),
-        };
-        self.render_prompt(&request)
-    }
-}
-
-/// The wire request plus its `chat_template_kwargs`, which the protocol type
-/// does not carry.
-struct TemplateRequest<'a> {
-    request: &'a CreateChatCompletionRequest,
-    kwargs: Option<&'a HashMap<String, Value>>,
-}
-
-impl OAIChatLikeRequest for TemplateRequest<'_> {
-    fn model(&self) -> String {
-        self.request.model()
-    }
-    fn messages(&self) -> minijinja::Value {
-        self.request.messages()
-    }
-    fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
-        self.request.typed_messages()
-    }
-    fn tools(&self) -> Option<minijinja::Value> {
-        self.request.tools()
-    }
-    fn tool_choice(&self) -> Option<minijinja::Value> {
-        self.request.tool_choice()
-    }
-    fn response_format(&self) -> Option<minijinja::Value> {
-        self.request.response_format()
-    }
-    fn reasoning_effort(&self) -> Option<minijinja::Value> {
-        self.request.reasoning_effort()
-    }
-    fn should_add_generation_prompt(&self) -> bool {
-        self.request.should_add_generation_prompt()
-    }
-    fn chat_template_args(&self) -> Option<&HashMap<String, Value>> {
-        self.kwargs
-    }
-    fn extract_text(&self) -> Option<TextInput> {
-        self.request.extract_text()
-    }
-    fn mm_processor_kwargs(&self) -> Option<&Value> {
-        self.request.mm_processor_kwargs()
+        let args = args.kwargs.clone();
+        self.render_prompt(&TemplateArgsRequest { request, args })
     }
 }

@@ -132,19 +132,6 @@ impl ChatFormatter {
         }
     }
 
-    /// Whether [`Self::render_request`] renders SGLang request bodies for this
-    /// formatter; the others render through [`Self::render_prompt`].
-    pub fn renders_requests(&self) -> bool {
-        matches!(
-            self,
-            ChatFormatter::DeepSeekV4(_)
-                | ChatFormatter::DeepSeekV41
-                | ChatFormatter::Glm53(_)
-                | ChatFormatter::KimiK3
-                | ChatFormatter::Qwen38 { .. }
-        )
-    }
-
     /// Render an SGLang chat request body under the server's default
     /// `chat_template_kwargs`, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
@@ -172,7 +159,9 @@ impl ChatFormatter {
                 content_parts,
                 ..
             } => render_qwen38(formatter, *content_parts, request, default_kwargs).map(text),
-            _ => Err("this formatter renders through render_prompt".into()),
+            _ => Err(format!(
+                "this formatter's requests render {RENDER_FALLBACK_SUFFIX}"
+            )),
         }
         .map_err(|message| {
             if message.ends_with(RENDER_FALLBACK_SUFFIX) {
