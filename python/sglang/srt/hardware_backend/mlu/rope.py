@@ -77,6 +77,13 @@ def apply_rotary(
         "fused_set_kv_buffer_arg is not supported for mlu implementation"
     )
 
+    # The MLU kernel requires matching input/cache dtypes. Preserve FP32
+    # cache precision by using the native path when they differ.
+    if (query is not None and self.cos_sin_cache.dtype != query.dtype) or (
+        key is not None and self.cos_sin_cache.dtype != key.dtype
+    ):
+        return self.forward_native(positions, query, key, offsets)
+
     if offsets is not None:
         positions = positions + offsets
     positions = positions.to(torch.int32)

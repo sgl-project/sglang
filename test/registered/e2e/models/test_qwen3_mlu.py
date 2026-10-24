@@ -79,7 +79,6 @@ class TestQwen3MLU(CustomTestCase):
             cuda_graph_config=config,
             skip_server_warmup=True,
             enable_metrics=True,
-            disable_overlap_schedule=True,
         )
         try:
             before = self._graph_passes(engine)
