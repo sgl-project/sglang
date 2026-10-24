@@ -159,23 +159,31 @@ pub(super) async fn chat(
     };
 
     if !stream {
-        let drained = futures::future::join_all(calls.into_iter().map(|mut call| {
+        // One failed choice fails the request, as Python's batch does; the
+        // unfinished choices are dropped, which cancels them.
+        let drained = futures::future::try_join_all(calls.into_iter().map(|mut call| {
             let timing = timing.clone();
             async move {
                 let rid = call.public_id().to_owned();
-                drain_unary(&mut call, &rid, timing).await
+                match drain_unary(&mut call, &rid, timing).await {
+                    (StatusCode::OK, item) => Ok(item),
+                    failed => Err(failed),
+                }
             }
         }))
         .await;
-        // One failed choice fails the request, as Python's batch does.
-        if let Some((status, item)) = drained.iter().find(|(status, _)| *status != StatusCode::OK) {
-            let message = match item {
-                GenerateItem::Error(failure) => failure.error.as_ref().map(|e| e.message.as_str()),
-                GenerateItem::Frame(_) => None,
-            };
-            return Some(error_response(*status, message.unwrap_or_default()));
-        }
-        let items: Vec<_> = drained.into_iter().map(|(_, item)| item).collect();
+        let items = match drained {
+            Ok(items) => items,
+            Err((status, item)) => {
+                let message = match &item {
+                    GenerateItem::Error(failure) => {
+                        failure.error.as_ref().map(|e| e.message.clone())
+                    }
+                    GenerateItem::Frame(_) => None,
+                };
+                return Some(error_response(status, &message.unwrap_or_default()));
+            }
+        };
         let body = match is_batch {
             true => serde_json::to_vec(&items),
             false => serde_json::to_vec(&items[0]),
@@ -344,6 +352,25 @@ mod tests {
         assert_eq!(value["type"], "BadRequestError");
         let message = value["message"].as_str().unwrap();
         assert!(message.contains("exceeds the maximum"), "{message}");
+    }
+
+    /// A failed choice answers at once, without waiting on an unfinished sibling.
+    #[tokio::test]
+    async fn failed_choice_does_not_wait_for_siblings() {
+        let answered = std::sync::atomic::AtomicUsize::new(0);
+        let app = lowered_state(move |rid| {
+            match answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+                0 => ResponseItem::Error(Error::Internal("boom".into())),
+                _ => chunk(rid, "still going", false),
+            }
+        });
+        let body =
+            json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "n": 2});
+        let response = post_json(app, "/v1/chat/completions", body);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+            .await
+            .expect("answered");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     /// A scheduler failure keeps its 500, as Python's `HTTPException` does.
