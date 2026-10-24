@@ -72,7 +72,7 @@ dependencies = [
   "uvicorn",
   "uvloop",
   "xxhash",
-  "xgrammar==0.2.7",
+  "xgrammar==0.2.8",
   "zstandard",
 ]
 
