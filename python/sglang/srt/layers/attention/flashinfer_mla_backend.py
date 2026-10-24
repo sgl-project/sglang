@@ -402,9 +402,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens_sum=seq_lens_sum,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
-                ragged_verify_layout=ragged_layout,
                 seq_lens_cpu=seq_lens_cpu,
                 in_capture=True,
+                ragged_verify_layout=ragged_layout,
             )
             if forward_mode.is_target_verify() and (
                 spec_info is None
@@ -421,8 +421,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens_sum=forward_batch.seq_lens_sum,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
-                ragged_verify_layout=ragged_layout,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
+                ragged_verify_layout=ragged_layout,
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -548,9 +548,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        ragged_verify_layout: Optional[RaggedVerifyLayout],
         seq_lens_cpu: Optional[torch.Tensor],
         in_capture: bool = False,
+        *,
+        ragged_verify_layout: Optional[RaggedVerifyLayout],
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
