@@ -1242,6 +1242,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ret.extend_prefix_lens,
                     ret.extend_seq_lens,
                     ret.extend_num_tokens,
+                    ret.extend_prefix_lens_cpu,
+                    ret.extend_seq_lens_cpu,
                 )
             else:
                 positions, ret.extend_start_loc, _ = extend_position_info
@@ -2345,6 +2347,8 @@ def compute_position(
     extend_prefix_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
+    extend_prefix_lens_cpu: Optional[List[int]] = None,
+    extend_seq_lens_cpu: Optional[List[int]] = None,
 ):
     if support_triton(attn_backend):
         positions, extend_start_loc = compute_position_triton(
@@ -2352,11 +2356,45 @@ def compute_position(
             extend_seq_lens,
             extend_seq_lens_sum,
         )
+    elif extend_prefix_lens_cpu is not None and extend_seq_lens_cpu is not None:
+        positions, extend_start_loc = compute_position_host(
+            extend_prefix_lens_cpu,
+            extend_seq_lens_cpu,
+            device=extend_seq_lens.device,
+            start_loc_dtype=extend_seq_lens.dtype,
+        )
     else:
         positions, extend_start_loc = compute_position_torch(
             extend_prefix_lens, extend_seq_lens
         )
     return positions, extend_start_loc
+
+
+def compute_position_host(
+    extend_prefix_lens_cpu: List[int],
+    extend_seq_lens_cpu: List[int],
+    device: Union[str, torch.device],
+    start_loc_dtype: torch.dtype,
+):
+    """Same result as `compute_position_torch`, built from host-side lengths.
+
+    The ragged arange is assembled on the CPU and copied to the device once,
+    so no device op has a shape set by an individual request's length.
+    """
+    prefix_lens = torch.as_tensor(extend_prefix_lens_cpu, dtype=torch.int64)
+    seq_lens = torch.as_tensor(extend_seq_lens_cpu, dtype=torch.int64)
+    extend_start_loc = torch.cumsum(seq_lens, dim=0) - seq_lens
+    positions = torch.arange(
+        int(seq_lens.sum()), dtype=torch.int64
+    ) + torch.repeat_interleave(prefix_lens - extend_start_loc, seq_lens)
+    extend_start_loc = extend_start_loc.to(start_loc_dtype)
+    if is_pin_memory_available(device):
+        positions = positions.pin_memory()
+        extend_start_loc = extend_start_loc.pin_memory()
+    return (
+        positions.to(device, non_blocking=True),
+        extend_start_loc.to(device, non_blocking=True),
+    )
 
 
 def compute_position_torch(

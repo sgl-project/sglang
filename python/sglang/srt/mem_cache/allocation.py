@@ -67,7 +67,7 @@ def write_cache_indices(
     req_to_token_pool: ReqToTokenPool,
 ):
     # This writer's one caller is `alloc_for_extend`, so the prefill half
-    # decides; the fallback below pays several `.item()` syncs per request.
+    # decides.
     prefill_backend, _ = attention_backends()
     if support_triton(prefill_backend):
         prefix_pointers = torch.tensor(
@@ -87,22 +87,67 @@ def write_cache_indices(
             req_to_token_pool.req_to_token.shape[1],
         )
     else:
-        pt = 0
-        for i in range(req_pool_indices_cpu.shape[0]):
-            req_idx = req_pool_indices_cpu[i].item()
-            prefix_len = prefix_lens_cpu[i].item()
-            seq_len = seq_lens_cpu[i].item()
-            extend_len = extend_lens_cpu[i].item()
+        write_cache_indices_torch(
+            out_cache_loc,
+            req_pool_indices_cpu,
+            prefix_lens_cpu,
+            extend_lens_cpu,
+            prefix_tensors,
+            req_to_token_pool.req_to_token,
+        )
 
-            req_to_token_pool.write(
-                (req_idx, slice(0, prefix_len)),
-                prefix_tensors[i],
-            )
-            req_to_token_pool.write(
-                (req_idx, slice(prefix_len, seq_len)),
-                out_cache_loc[pt : pt + extend_len],
-            )
-            pt += extend_len
+
+def _ragged_arange_cpu(starts: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
+    """``cat([arange(s, s + n) for s, n in zip(starts, lens)])`` on the host."""
+    offsets = torch.cumsum(lens, dim=0) - lens
+    return torch.arange(int(lens.sum()), dtype=torch.int64) + torch.repeat_interleave(
+        starts - offsets, lens
+    )
+
+
+def write_cache_indices_torch(
+    out_cache_loc: torch.Tensor,
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    extend_lens_cpu: torch.Tensor,
+    prefix_tensors: list[torch.Tensor],
+    req_to_token: torch.Tensor,
+):
+    """Non-Triton writer: one ``index_put_`` into the flattened table.
+
+    Equivalent to writing, per request ``i``, ``prefix_tensors[i]`` into
+    ``req_to_token[row_i, :prefix_len_i]`` and its slice of ``out_cache_loc``
+    into ``req_to_token[row_i, prefix_len_i:prefix_len_i + extend_len_i]``.
+    The flat destination indices come from the host-side length mirrors (no
+    device sync, no per-request device op whose shape is a prompt length);
+    the values are every prefix in request order followed by
+    ``out_cache_loc``, which is already the request-order concatenation of
+    the extend slots.
+    """
+    width = req_to_token.shape[1]
+    device = req_to_token.device
+    row_starts = req_pool_indices_cpu.to(torch.int64) * width
+    prefix_lens = prefix_lens_cpu.to(torch.int64)
+    extend_lens = extend_lens_cpu.to(torch.int64)
+    num_extend = int(extend_lens.sum())
+
+    flat_indices = torch.cat(
+        [
+            _ragged_arange_cpu(row_starts, prefix_lens),
+            _ragged_arange_cpu(row_starts + prefix_lens, extend_lens),
+        ]
+    )
+    if flat_indices.numel() == 0:
+        return
+    if is_pin_memory_available(device):
+        flat_indices = flat_indices.pin_memory()
+    flat_indices = flat_indices.to(device, non_blocking=True)
+
+    values = [t.to(device) for t in prefix_tensors if t.numel() > 0]
+    assert sum(t.numel() for t in values) == int(prefix_lens.sum())
+    values.append(out_cache_loc[:num_extend].to(device))
+    values = torch.cat(values).to(req_to_token.dtype)
+    req_to_token.view(-1).index_put_((flat_indices,), values)
 
 
 def get_last_loc(
