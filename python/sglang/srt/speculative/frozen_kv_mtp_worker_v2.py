@@ -813,5 +813,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 spec_stage_span("draft_extend"),
             ):
                 self.draft_worker._draft_extend_for_decode(batch, batch_output)
+            if self._post_verify_graphs is not None:
+                # The mamba state commit may still run on a side stream.
+                self._post_verify_graphs.join()
 
             return batch_output

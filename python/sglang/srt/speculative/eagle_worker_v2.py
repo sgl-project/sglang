@@ -90,8 +90,13 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
+from sglang.srt.speculative.eagle_post_verify_graphs import (
+    EaglePostVerifyGraphs,
+    simulated_acc_len_generator,
+)
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
+    compact_verify_max_top_k,
     default_tree_mask_mode,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
@@ -1288,6 +1293,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
+    # Set in init_attention_backends when the post-verify graphs are turned on:
+    # SGLang's post-verify graphs and the forced acceptance lengths' generator;
+    # class defaults, since unit-test harnesses build workers without __init__.
+    _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
+    _simulated_acc_len_rng: Optional[torch.Generator] = None
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -1367,6 +1378,34 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self._draft_worker.draft_attn_backend,
             self._draft_worker.draft_extend_attn_backend
             or self._draft_worker.draft_runner.attn_backend,
+        )
+
+    def init_attention_backends(self):
+        super().init_attention_backends()
+        # not in __init__, which the standalone and frozen-KV workers do not run
+        if (
+            self._draft_worker is not None
+            and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
+        ):
+            self._init_post_verify_graphs()
+
+    def _init_post_verify_graphs(self) -> None:
+        # A key is captured at its first rounds, which attention-DP ranks do not reach
+        # together, and a capture may end in a collective over the TP group.
+        if not _is_cuda or self.topk != 1 or get_parallel().attn_dp_enabled:
+            logger.warning(
+                "The EAGLE post-verify graphs are disabled: they need CUDA, a chain "
+                "draft (topk 1) and no DP attention"
+            )
+            return
+        # one stream of forced acceptance lengths, from which the post-verify
+        # graphs and the eager verify both draw; the global CPU RNG otherwise
+        self._simulated_acc_len_rng = simulated_acc_len_generator(
+            self.target_worker.random_seed
+        )
+        self._post_verify_graphs = EaglePostVerifyGraphs(
+            target_worker=self.target_worker,
+            simulated_acc_len_rng=self._simulated_acc_len_rng,
         )
 
     def init_cuda_graphs(self):
@@ -1488,6 +1527,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.draft_worker._draft_extend_for_decode(
                         batch, batch_output, kv_loc_plan=verify_input.kv_loc_plan
                     )
+            if self._post_verify_graphs is not None:
+                # The mamba state commit may still run on a side stream.
+                self._post_verify_graphs.join()
 
             if (
                 get_parallel().pp_size > 1
@@ -1658,6 +1700,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             spec_stage_span("draft_extend"),
         ):
             self.draft_worker._draft_extend_for_decode(batch, result)
+        if self._post_verify_graphs is not None:
+            self._post_verify_graphs.join()
         return result
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
@@ -1962,6 +2006,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
+        # SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING: the compact top-k branch, when
+        # every request allows it, in the post-verify graphs and the eager verify
+        max_top_k = compact_verify_max_top_k(batch)
         return run_eagle_verify(
             batch,
             pp_proxy_tensors=pp_proxy_tensors,
@@ -1976,4 +2023,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             grammar_barrier=grammar_barrier,
+            uno_target_max_top_k=max_top_k,
+            post_verify_graphs=self._post_verify_graphs,
+            simulated_acc_len_rng=self._simulated_acc_len_rng,
+            sparse_bonus_argmax=max_top_k is not None,
         )

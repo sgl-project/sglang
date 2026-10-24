@@ -255,6 +255,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    _restage_skip = False
+    _staged_inputs = None
     _draft_glue_logged = 0
 
     dllm_input_preparation = None
@@ -556,6 +558,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._metadata_glue = (
             MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
+        # SGLANG_Q35MF_MKH_N3B: a pre-planned replay skips copying input_ids and
+        # positions again when the full load_batch copied them (_restage_is_redundant)
+        self._restage_skip = envs.SGLANG_Q35MF_MKH_N3B.get()
+        self._staged_inputs: Optional[tuple] = None
         # The DSpark draft runner's prep has no host-fed plan, so the guard above does
         # not apply where its backend says so.
         self._draft_metadata_glue = (
@@ -1644,6 +1650,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_tensors=pp_proxy_tensors,
             skip_slots=STAGED_SLOTS if early_staged else frozenset(),
         )
+        if self._restage_skip and not early_staged:
+            self._staged_inputs = self._staged_signature(forward_batch)
         if self._skips_prefilled_inputs:
             self._prefilled_inputs = (forward_batch.input_ids, forward_batch.positions)
 
@@ -1705,6 +1713,34 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, attention_variant
+        )
+
+    def _staged_signature(self, forward_batch: ForwardBatch) -> Optional[tuple]:
+        input_ids, positions = forward_batch.input_ids, forward_batch.positions
+        # inference tensors (SGLANG_ENABLE_TORCH_INFERENCE_MODE) keep no version
+        if (
+            input_ids is None
+            or positions is None
+            or input_ids.is_inference()
+            or positions.is_inference()
+        ):
+            return None
+        # PyTorch bumps a tensor's version on every in-place write it makes
+        versions = (input_ids._version, positions._version)
+        return input_ids, positions, versions, self.device_module.current_stream()
+
+    def _restage_is_redundant(
+        self, staged: Optional[tuple], forward_batch: ForwardBatch
+    ) -> bool:
+        # a load on another stream, such as the plan stream, is never trusted
+        if staged is None:
+            return False
+        now = self._staged_signature(forward_batch)
+        return (
+            now is not None
+            and staged[0] is now[0]
+            and staged[1] is now[1]
+            and staged[2:] == now[2:]
         )
 
     def _glues_draft_metadata(self) -> bool:
@@ -1905,6 +1941,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _copy_replay_inputs(self, forward_batch: ForwardBatch) -> None:
         prefilled = self._prefilled_inputs
         self._prefilled_inputs = None
+        staged = None
+        if self._restage_skip:
+            staged, self._staged_inputs = self._staged_inputs, None
+        if self._restage_is_redundant(staged, forward_batch):
+            return
         # The plan-time load (or the early stage it took) filled these from the very
         # same tensors.
         if prefilled is None or forward_batch.input_ids is not prefilled[0]:
