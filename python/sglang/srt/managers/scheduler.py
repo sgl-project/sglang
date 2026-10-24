@@ -2651,6 +2651,7 @@ class Scheduler(
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
             abort_request=self.abort_request,
+            mlfq=self.policy.mlfq,
         )
 
     def init_internal_state(self) -> None:
@@ -4107,6 +4108,15 @@ class Scheduler(
             # in the waiting queue.
             return None, running_batch
 
+        # The gate decides what starts; a chunked prefill already started continues.
+        gate_level = self.policy.prefill_gate_level(running_batch.reqs)
+        if (
+            self.chunked_req is None
+            and self.waiting_queue
+            and self.policy.gate_blocks(self.waiting_queue[0], gate_level)
+        ):
+            return None, running_batch
+
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
         if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
@@ -4174,6 +4184,9 @@ class Scheduler(
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if adder.budget_state() == AddReqResult.OTHER:
+                break
+            # The queue is in MLFQ order, so every later request is less urgent too.
+            if self.policy.gate_blocks(req, gate_level):
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
