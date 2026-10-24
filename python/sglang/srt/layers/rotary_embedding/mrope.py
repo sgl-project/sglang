@@ -304,7 +304,10 @@ class MRotaryEmbedding(RotaryEmbedding):
         if positions.ndim == 2 or query.shape[1] > 4096:
             return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half" if self.is_neox_style else "interleave"
-        mrope_section = [0, 0, 0]
+        # npu_mrope reads an all-zero section as "M-RoPE disabled"; pass the real
+        # split when the positions carry the three axes.
+        is_mrope = positions.ndim == 2 and self.mrope_section
+        mrope_section = self.mrope_section if is_mrope else [0, 0, 0]
         query_out, key_out = torch_npu.npu_mrope(
             positions,
             query,
