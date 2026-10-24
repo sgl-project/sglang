@@ -2881,7 +2881,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
             if dense_mla_dcp_verify:
-                if self.graph_mode:
+                if self.forward_metadata.dcp_seq_lens_cpu_int is None:
                     actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
                 else:
                     actual_seq_lengths_kv = (
