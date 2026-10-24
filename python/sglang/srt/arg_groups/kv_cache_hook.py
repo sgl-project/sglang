@@ -412,11 +412,15 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "both build a decode host pool."
             )
 
+    # Model overrides may have filled the ratio; only the raw user input
+    # selects explicit ratio sizing instead of request-cap sizing.
     if cfg._swa_full_tokens_ratio_explicitly_set is None:
         declare_resolution(
             server_args,
             "_handle_cache_compatibility",
-            _swa_full_tokens_ratio_explicitly_set=cfg.swa_full_tokens_ratio is not None,
+            _swa_full_tokens_ratio_explicitly_set=(
+                server_args._raw_input.get("swa_full_tokens_ratio") is not None
+            ),
         )
 
     # Validate the effective ratio: model branches may declare a reset
