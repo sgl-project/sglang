@@ -45,7 +45,7 @@ This image is a browser-rendered report screenshot generated from the verified J
 
 ## Earlier integration: full-model and PD switch acceptance
 
-The [pinned integration report](https://github.com/chenxu214/ci_sglang/blob/d8fcf85542a4ebe8cb5e331311e06991e8630644/test/manual/ep/reports/ascend_dynamic_eplb_delivery_20261024.md) records source identities, raw archive hashes, scenarios and screenshots. Those tests used the earlier integration source, not the community base above.
+The [pinned integration report](https://github.com/chenxu214/ci_sglang/blob/f040177346d5eca8ea38ce8d569444f4a5176206/test/manual/ep/reports/ascend_dynamic_eplb_delivery_20261024.md) records source identities, raw archive hashes, scenarios and screenshots. Those tests used the earlier integration source, not the community base above.
 
 - DeepSeek-V4-Flash W8A8, Ascend 910C, CANN 9.1.0.
 - Final packaged single-node run: 16 successful requests, 0 failed, exact copy oracle 16/16, with a real rebalance on all 16 ranks.
@@ -69,4 +69,4 @@ The two ON runs improved output throughput by 6.61% and 5.71% versus the fresh O
 
 This is reproduction on one fixed workload, without a confidence interval or a general/long-term performance claim. It is not a measured speedup of the rebased community source. Earlier positive/negative PD results and failed runs remain linked in the pinned integration report.
 
-![Earlier integration performance screenshot](https://raw.githubusercontent.com/chenxu214/ci_sglang/d8fcf85542a4ebe8cb5e331311e06991e8630644/test/manual/ep/reports/ascend_dynamic_eplb_delivery_20261024/performance.png)
+![Earlier integration performance screenshot](ascend_dynamic_eplb_upstream_20261024/integration_performance.png)
