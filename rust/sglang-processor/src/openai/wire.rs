@@ -162,14 +162,23 @@ impl StreamState {
             return Ok(Payload::Events(Vec::new()));
         };
         if let Some(message) = content.pointer("/error/message").and_then(Value::as_str) {
+            // Python's `/generate` errors are 400s; another status a host
+            // names stays, as Python's `HTTPException` keeps it.
+            let status = content
+                .pointer("/error/code")
+                .and_then(Value::as_u64)
+                .filter(|&code| code != 400)
+                .and_then(|code| Some((code as u16, http_status_name(code)?)));
+            let (code, unary_type, event_type) = match status {
+                Some((code, name)) => (code, code.to_string(), name),
+                None => (400, "BadRequestError".to_owned(), "BadRequestError"),
+            };
             if !self.started {
-                return Err(error_reply(message, "BadRequestError", 400));
+                return Err(error_reply(message, &unary_type, code));
             }
             self.failed = true;
             return Ok(Payload::Events(vec![stream_error_event(
-                message,
-                "BadRequestError",
-                400,
+                message, event_type, code,
             )]));
         }
         self.started = true;
@@ -238,6 +247,19 @@ pub(super) fn without_nulls(value: Value) -> Value {
 
 pub(super) fn meta_u64(meta: &Value, key: &str) -> u64 {
     meta.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// `output_token_logprobs_length`, or, for frames without it, the count the
+/// frame's list implies.
+pub(super) fn logprobs_length(meta: &Value, prev: usize, incremental: bool) -> usize {
+    if let Some(length) = meta
+        .get("output_token_logprobs_length")
+        .and_then(Value::as_u64)
+    {
+        return length as usize;
+    }
+    let listed = meta["output_token_logprobs"].as_array().map_or(0, Vec::len);
+    if incremental { prev + listed } else { listed }
 }
 
 #[cfg(test)]

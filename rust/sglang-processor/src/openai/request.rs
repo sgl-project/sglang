@@ -104,11 +104,23 @@ pub(super) fn float_logit_bias(bias: &Option<Map<String, Value>>) -> Option<Map<
     })
 }
 
-/// `model:adapter` selects a LoRA adapter over `lora_path`.
-pub(super) fn lora_path(model: &str, lora_path: &Option<OneOrList<Option<String>>>) -> Value {
-    match model.split_once(':') {
-        Some((_, adapter)) if !py_strip(adapter).is_empty() => json!(py_strip(adapter)),
-        _ => json!(lora_path),
+/// `_resolve_lora_path`: a `model:adapter` adapter wins over `lora_path`; the
+/// exact served name, colons and all, has none.
+pub(super) fn lora_path(
+    model: &str,
+    lora_path: &Option<OneOrList<Option<String>>>,
+    served_model_name: Option<&str>,
+) -> Value {
+    let adapter = match served_model_name {
+        Some(served) if model == served => None,
+        Some(served) if model.starts_with(&format!("{served}:")) => {
+            Some(&model[served.len() + 1..])
+        }
+        _ => model.split_once(':').map(|(_, adapter)| adapter),
+    };
+    match adapter.map(py_strip).filter(|adapter| !adapter.is_empty()) {
+        Some(adapter) => json!(adapter),
+        None => json!(lora_path),
     }
 }
 
@@ -138,5 +150,18 @@ pub(super) fn custom_labels(
     match labels.values().all(Value::is_string) {
         true => Ok(Value::Object(labels)),
         false => Err(Unsupported("invalid_request")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lora_path_keeps_the_served_name_whole() {
+        let served = Some("s3://b:m");
+        assert_eq!(lora_path("s3://b:m", &None, served), json!(null));
+        assert_eq!(lora_path("s3://b:m:ad", &None, served), json!("ad"));
+        assert_eq!(lora_path("base:ad", &None, served), json!("ad"));
     }
 }

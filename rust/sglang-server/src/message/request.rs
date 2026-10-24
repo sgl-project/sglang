@@ -46,7 +46,7 @@ const MAX_BROADCAST_CLONE_BYTES: usize = 64 << 20;
 /// Live heap per byte of serialized JSON. Measured across shapes at 1.0–7.0×
 /// (`serde_json::Value` pays for enum tags, `String` headers and map nodes that
 /// the wire form does not); 8 is the ceiling of that range, not a worst case.
-const JSON_TO_HEAP_FACTOR: usize = 8;
+pub(crate) const JSON_TO_HEAP_FACTOR: usize = 8;
 
 /// Validate, normalize and fan the `/generate` wire request into one
 /// [`GenerateRequest`] per prompt + `is_batch` (list form -- a 1-element list

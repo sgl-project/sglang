@@ -11,7 +11,7 @@ use super::request::{
     format_json_schema, lora_path, one, usage_flags, yes,
 };
 use super::wire::{
-    Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
+    Payload, Reply, StreamState, http_status_name, logprobs_length, malformed_output_reply, now,
     stream_error_event, unary_reply, without_nulls,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
@@ -229,7 +229,11 @@ fn generate_body(
         Prompt::Ids(ids) => ("input_ids", json!(ids)),
         Prompt::IdBatch(ids) => ("input_ids", json!(ids)),
     };
-    let lora_path = lora_path(&request.model, &request.lora_path);
+    let lora_path = lora_path(
+        &request.model,
+        &request.lora_path,
+        settings.served_model_name.as_deref(),
+    );
     let mut body = Map::new();
     body.insert(prompt_key.into(), prompt);
     let fields = json!({
@@ -383,7 +387,7 @@ impl CompletionResponder {
         if self.logprobs {
             let echo_input = is_first_chunk && self.echo_logprobs;
             let prev = state.logprob_counts.get(&index).copied().unwrap_or(0);
-            let total = meta_u64(meta, "output_token_logprobs_length") as usize;
+            let total = logprobs_length(meta, prev, incremental);
             if prev < total || echo_input {
                 let slice = |key: &str| -> Value {
                     let items = meta

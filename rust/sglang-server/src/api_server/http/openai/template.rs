@@ -15,7 +15,8 @@ pub(super) use crate::message::request::RenderedChat;
 pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 
 /// Render a chat request for the tokenizer pool: the raw `body` through the
-/// SGLang request path, or `request` through the template when that declines it.
+/// SGLang request path, or `request` through the template when that declines it;
+/// either way the `continue_final_message` text stays apart from the prompt.
 pub(super) fn render_chat(
     formatter: &ChatFormatter,
     body: Value,
@@ -23,18 +24,14 @@ pub(super) fn render_chat(
     defaults: &ChatTemplateKwargs,
 ) -> Result<RenderedChat, TemplateError> {
     let args = TemplateArgs::new(&body, defaults);
-    match formatter.render_request(body, defaults) {
-        Err(TemplateError::NeedsRenderFallback { .. }) => formatter
-            .render_template(request, &args)
-            .map(|prompt| RenderedChat {
-                prompt,
-                continuation: String::new(),
-            }),
-        rendered => rendered.map(|(prompt, continuation)| RenderedChat {
-            prompt,
-            continuation,
-        }),
-    }
+    let rendered = match formatter.render_request(body, defaults) {
+        Err(TemplateError::NeedsRenderFallback { .. }) => formatter.render_template(request, &args),
+        rendered => rendered,
+    };
+    rendered.map(|(prompt, continuation)| RenderedChat {
+        prompt,
+        continuation,
+    })
 }
 
 #[cfg(test)]
