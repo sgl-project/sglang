@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -1420,6 +1421,30 @@ def get_kv_transfer_buf_infos(pool):
     return pool.get_contiguous_buf_infos()
 
 
+def _draft_dsa_pool(draft_token_to_kv_pool):
+    """The draft's DSA pool (own indexer cache + kpool tail), or None.
+
+    EAGLE/NEXTN drafts on DSA models get a single-layer DSATokenToKVPool, or a
+    HybridLinearKVPool wrapping one; both expose get_state_buf_infos().
+    """
+    if draft_token_to_kv_pool is None or not getattr(
+        draft_token_to_kv_pool, "use_dsa", False
+    ):
+        return None
+    pool = getattr(draft_token_to_kv_pool, "full_kv_pool", draft_token_to_kv_pool)
+    if not hasattr(pool, "get_state_buf_infos"):
+        return None
+    return pool
+
+
+def _dsa_pools_match(target_pool, draft_pool) -> bool:
+    """Whether a draft DSA pool can reuse the target's page/tail payloads."""
+    for attr in ("page_size", "index_kpool", "kpool_use_compress", "tail_extra_slots"):
+        if getattr(target_pool, attr, None) != getattr(draft_pool, attr, None):
+            return False
+    return True
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
@@ -1595,6 +1620,38 @@ def setup_state_kv_args(
                     dsa_item_lens,
                 )
                 append_dsa_tail(dsa_pool)
+                # The draft's indexer cache and kpool tail go in components of
+                # their own, after the target's, so the target's pairing (incl.
+                # the PP tail slicing) is untouched.
+                draft_dsa_pool = _draft_dsa_pool(draft_token_to_kv_pool)
+                if draft_dsa_pool is not None and not _dsa_pools_match(
+                    dsa_pool, draft_dsa_pool
+                ):
+                    logging.getLogger(__name__).warning(
+                        "Draft DSA pool geometry differs from the target pool; "
+                        "not transferring the draft indexer cache over PD"
+                    )
+                    draft_dsa_pool = None
+                if draft_dsa_pool is not None:
+                    draft_ptrs, draft_lens, draft_item_lens = (
+                        draft_dsa_pool.get_state_buf_infos()
+                    )
+                    draft_layer_ids = (
+                        _remap_draft_layer_ids(
+                            list(range(len(draft_ptrs))), total_kv_layers
+                        )
+                        if total_kv_layers is not None
+                        else None
+                    )
+                    append_state_component(
+                        kv_args,
+                        StateType.DSA,
+                        draft_ptrs,
+                        draft_lens,
+                        draft_item_lens,
+                        layer_ids=draft_layer_ids,
+                    )
+                    append_dsa_tail(draft_dsa_pool)
             if isinstance(token_to_kv_pool, QSATokenToKVPool):
                 qsa_ptrs, qsa_lens, qsa_item_lens = (
                     token_to_kv_pool.get_qsa_pending_state_buf_infos()
