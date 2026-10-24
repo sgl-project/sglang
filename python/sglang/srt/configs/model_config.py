@@ -1110,6 +1110,18 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] == "AliceAIForCausalLM":
+            if getattr(self.hf_config, "mtp_num_hidden_layers", 0) != 1:
+                raise ValueError(
+                    "AliceAI MTP requires exactly one checkpoint MTP layer"
+                )
+            self.hf_config = copy.deepcopy(self.hf_config)
+            self.hf_text_config = get_hf_text_config(self.hf_config)
+            self.hf_config.architectures = ["AliceAIForCausalLMMTP"]
+            self.hf_text_config.num_hidden_layers = 1
+            self.hf_text_config.layer_types = ["full_attention"]
+            self.hf_text_config.num_nextn_predict_layers = 1
+
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration"

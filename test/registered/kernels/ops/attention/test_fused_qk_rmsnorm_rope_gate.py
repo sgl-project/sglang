@@ -137,6 +137,97 @@ class TestFusedQKRMSNormRoPEGate(CustomTestCase):
             gate_out.float(), packed[..., self.head_dim :].float(), atol=0, rtol=0
         )
 
+    def test_alice_geometry_fp32_cache_and_graph_replay(self):
+        """Preserve per-head gates and the unrotated tail for packed Alice QKV.
+
+        Alice rotates only 64 of 256 coordinates and passes FP32 trigonometry.
+        A packed QKV row also has a larger stride than either Q+gate or K;
+        assuming dense inputs, rotating the tail, or rounding the cache to BF16
+        would silently change attention inputs.
+        """
+        device, dtype = "cuda", torch.bfloat16
+        num_q_heads, num_kv_heads, head_dim, rotary_dim = 16, 2, 256, 64
+        q_gate_size = num_q_heads * 2 * head_dim
+        kv_size = num_kv_heads * head_dim
+        q_weight = torch.randn(head_dim, device=device, dtype=dtype)
+        k_weight = torch.randn(head_dim, device=device, dtype=dtype)
+        inv_freq = 1_000_000 ** (
+            -torch.arange(0, rotary_dim, 2, device=device).float() / rotary_dim
+        )
+        angles = torch.arange(4096, device=device).float().unsqueeze(1) * inv_freq
+        cache = torch.cat([angles.cos(), angles.sin()], dim=-1)
+        tolerance = torch.finfo(dtype).eps
+
+        for tokens in (1, 17, 1024):
+            with self.subTest(tokens=tokens):
+                packed_qkv = torch.randn(
+                    tokens, q_gate_size + 2 * kv_size, device=device, dtype=dtype
+                )
+                q_gate, k, _ = packed_qkv.split([q_gate_size, kv_size, kv_size], dim=-1)
+                positions = (
+                    torch.arange(tokens, device=device, dtype=torch.int64) * 37 + 11
+                ) % cache.shape[0]
+
+                def call():
+                    return fused_qk_gemma_rmsnorm_rope_gate(
+                        q_gate,
+                        k,
+                        q_weight,
+                        k_weight,
+                        cache,
+                        positions,
+                        self.eps,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        rotary_dim,
+                    )
+
+                q_normalized = gemma_rmsnorm(
+                    q_gate.view(tokens, num_q_heads, 2 * head_dim)[..., :head_dim],
+                    q_weight,
+                    self.eps,
+                )
+                k_normalized = gemma_rmsnorm(
+                    k.view(tokens, num_kv_heads, head_dim), k_weight, self.eps
+                )
+
+                def check(outputs):
+                    q_out, k_out, gate_out = outputs
+                    cos, sin = cache[positions].chunk(2, dim=-1)
+                    for actual, normalized in (
+                        (q_out, q_normalized),
+                        (k_out, k_normalized),
+                    ):
+                        # Normalize to BF16 first, then rotate with FP32 cache
+                        # values and round only the final rotated result.
+                        expected = neox_rope(
+                            normalized.float(), cos, sin, rotary_dim
+                        ).to(dtype)
+                        actual = actual.view_as(expected)
+                        torch.testing.assert_close(
+                            actual,
+                            expected,
+                            atol=tolerance,
+                            rtol=tolerance,
+                        )
+                    torch.testing.assert_close(
+                        gate_out,
+                        q_gate.view(tokens, num_q_heads, 2 * head_dim)[..., head_dim:],
+                        atol=0,
+                        rtol=0,
+                    )
+
+                check(call())
+                if tokens == 1:
+                    graph = torch.cuda.CUDAGraph()
+                    torch.cuda.synchronize()
+                    with torch.cuda.graph(graph):
+                        captured = call()
+                    positions.fill_(2047)
+                    graph.replay()
+                    check(captured)
+
     def test_mrope_matches_the_rotary_module(self):
         """With t == h == w every layout agrees, so only distinct rows catch a wrong
         axis. Interleaved [11, 11, 10] is what Qwen3.6-35B-A3B ships, and [24, 20, 20]
