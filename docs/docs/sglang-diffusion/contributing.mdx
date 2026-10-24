@@ -82,7 +82,7 @@ A denoising step or a DiT forward should not block the host on the device. One `
 - `SyncOnRead` is a CPU stand-in for device tensors (timesteps, sigmas, masks): reading its values on the host raises. Run the step once with plain tensors and once with stand-ins, and require bitwise-equal outputs.
 - `forbid_host_syncs()` is a dispatch mode for code that builds its own tensors: it fails on the ops that sync on CUDA whatever tensor they read (scalar reads, `nonzero`, boolean-mask indexing, data-dependent output shapes).
 
-`test_denoising_host_sync.py` shows both on the shared denoising loop. Unit tests run in the `multimodal-gen-unit-test` CI job on an H100, so the CUDA guard runs there.
+`test_host_sync.py` shows both on the shared denoising loop. Unit tests run in the `multimodal-gen-unit-test` CI job on an H100, so the CUDA guard runs there.
 
 ## Out-of-tree platform changes
 
