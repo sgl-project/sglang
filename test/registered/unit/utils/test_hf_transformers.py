@@ -923,6 +923,33 @@ class TestGemma4AttentionOverrides(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "single shape per layer type"):
             _apply_gemma4_attention_overrides(config)
 
+    def test_text_only_checkpoint_gets_the_same_overrides(self):
+        """A text-only Gemma4ForCausalLM export has no `text_config`; its own
+        config must still carry the full-attention head dim (#43434)."""
+        from transformers import Gemma4TextConfig
+
+        from sglang.srt.utils.hf_transformers.config import get_config
+
+        text_config = Gemma4TextConfig(
+            num_hidden_layers=6,
+            head_dim=128,
+            global_head_dim=256,
+            num_key_value_heads=2,
+            num_global_key_value_heads=4,
+            attention_k_eq_v=True,
+            architectures=["Gemma4ForCausalLM"],
+        )
+        with tempfile.TemporaryDirectory() as model_dir:
+            text_config.save_pretrained(model_dir)
+            config = get_config(model_dir, trust_remote_code=False)
+
+        self.assertEqual(config.model_type, "gemma4_text")
+        self.assertFalse(config.is_heterogeneous)
+        self.assertEqual(config.head_dim, 256)
+        self.assertEqual(config.num_key_value_heads, 4)
+        self.assertEqual(config.swa_head_dim, 128)
+        self.assertEqual(config.swa_num_key_value_heads, 2)
+
 
 class TestNormalizeTpStyle(CustomTestCase):
     """Every style a shipped TP plan can name must normalize; a tied-embedding
