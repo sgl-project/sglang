@@ -773,7 +773,14 @@ class ComponentResidencyManager:
             )
             strategy = self.strategy_for(component_name, module)
             if self._track_warmup_memory:
-                self._begin_warmup_phase(f"request:cleanup:{component_name}")
+                will_prepare = self.state.batch_is_warmup and preferred
+                self._begin_warmup_phase(
+                    key=f"request:cleanup:{component_name}",
+                    components=self._warmup_active_components(
+                        (use,) if will_prepare else ()
+                    ),
+                    used_components=(component_name,) if will_prepare else (),
+                )
             was_on_supported_device = self._module_on_supported_device(module)
             strategy.finish_request(module, use, self.state, preferred=preferred)
             self._empty_cache_after_large_release(
@@ -781,8 +788,10 @@ class ComponentResidencyManager:
             )
         if self._track_warmup_memory:
             self._record_warmup_phase_peak()
-            self._warmup_phase_peaks["idle"] = int(
-                torch.get_device_module().memory_allocated()
+            self._warmup_phase_peaks["idle"] = WarmupPhasePeak(
+                active_components=self._warmup_active_components(),
+                allocated_bytes=int(torch.get_device_module().memory_allocated()),
+                used_components=(),
             )
             self._completed_warmup_phase_peaks = dict(self._warmup_phase_peaks)
         self._track_warmup_memory = False
@@ -818,6 +827,19 @@ class ComponentResidencyManager:
                     "prefetch %s for the next request",
                     use.component_name,
                 )
+
+    def _warmup_active_components(
+        self, active_uses: Sequence[ComponentUse] = ()
+    ) -> tuple[str, ...]:
+        components = {use.component_name for use in active_uses}
+        for component_name, module in self.pipeline.modules.items():
+            if not isinstance(module, nn.Module):
+                continue
+            if is_layerwise_offloaded_module(module):
+                continue
+            if self._module_on_supported_device(module):
+                components.add(component_name)
+        return tuple(sorted(components))
 
     def _begin_warmup_phase(
         self,
@@ -855,19 +877,31 @@ class ComponentResidencyManager:
         previous_name = previous.component_name if previous is not None else "idle"
         upcoming_name = upcoming.component_name if upcoming is not None else "idle"
         self._begin_warmup_phase(
-            f"{self.state.stage_index}:{self.state.stage_name}:transition:"
-            f"{previous_name}->{upcoming_name}"
+            key=(
+                f"{self.state.stage_index}:{self.state.stage_name}:transition:"
+                f"{previous_name}->{upcoming_name}"
+            ),
+            components=self._warmup_active_components(
+                tuple(use for use in (previous, upcoming) if use is not None)
+            ),
+            used_components=tuple(
+                use.component_name for use in (previous, upcoming) if use is not None
+            ),
         )
 
     def _begin_warmup_use(self, use: ComponentUse) -> None:
         phase = use.phase or use.component_name
         self._begin_warmup_phase(
-            f"{self.state.stage_index}:{self.state.stage_name}:use:{phase}"
+            key=f"{self.state.stage_index}:{self.state.stage_name}:use:{phase}",
+            components=self._warmup_active_components((use,)),
+            used_components=(use.component_name,),
         )
 
     def _begin_warmup_between_uses(self) -> None:
         self._begin_warmup_phase(
-            f"{self.state.stage_index}:{self.state.stage_name}:between"
+            key=f"{self.state.stage_index}:{self.state.stage_name}:between",
+            components=self._warmup_active_components(),
+            used_components=(),
         )
 
     def _begin_warmup_prefetch(self, use: ComponentUse) -> None:

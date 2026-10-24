@@ -279,7 +279,7 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
     worker.pipeline = SimpleNamespace(stages=[])
     residency_manager = Mock()
     residency_manager.take_warmup_phase_peaks.return_value = {
-        "0:denoise:use:transformer": 8
+        "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
     }
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 9
@@ -293,7 +293,8 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
         ),
     ):
         worker._record_server_warmup_memory(
-            workload=(128, 96, 9),
+            req=SimpleNamespace(metrics=None),
+            workload=(128, 96, 9, 1),
             baseline_allocated_bytes=3,
             baseline_reserved_bytes=3,
             succeeded=True,
@@ -310,7 +311,7 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
     worker.pipeline = SimpleNamespace(stages=[])
     residency_manager = Mock()
     residency_manager.take_warmup_phase_peaks.return_value = {
-        "0:denoise:use:transformer": 8
+        "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
     }
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 8
@@ -324,7 +325,8 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
         ),
     ):
         worker._record_server_warmup_memory(
-            workload=(64, 64, 1),
+            req=SimpleNamespace(metrics=None),
+            workload=(64, 64, 1, 1),
             baseline_allocated_bytes=3,
             baseline_reserved_bytes=12,
             succeeded=True,

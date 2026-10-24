@@ -116,8 +116,7 @@ def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
         return "dynamic batching enabled"
     if not current_platform.is_cuda():
         return "requires CUDA"
-    # nothing applies calibrated placements yet, so warmup skips the probe and step floor
-    return "residency planner not available"
+    return None
 
 
 def fixed_loading_residency_components(

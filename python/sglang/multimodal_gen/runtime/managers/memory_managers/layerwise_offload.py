@@ -3036,6 +3036,10 @@ class LayerwiseOffloadManager:
             ):
                 self.prefetch_layer(index % self.num_layers, non_blocking=True)
 
+        successor = getattr(self.model, "layerwise_prefetch_successor", None)
+        if successor is not None:
+            successor(self, layer_idx)
+
     def finish_layer_forward(self, layer_idx: int) -> None:
         """Release a streamed layer after its forward completes."""
         self._last_forwarded_layer = layer_idx
