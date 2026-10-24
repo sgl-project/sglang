@@ -481,17 +481,20 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
         "triton",
         "trtllm_mla",
         "cutedsl_mla",
-        "tokenspeed_mla",
         "flashmla",
         "flashinfer",
         "fa3",
     }
 )
 
+_SPEC_MHA_AUDITED_BACKENDS = frozenset({"triton", "flashinfer", "fa3", "trtllm_mha"})
+
 # The MHA backends that read through the KV-index translator on every path a
 # draft forward takes. A fused draft region holds dense K/V rows, so a fused
 # draft runs only on these.
-TRANSLATED_MHA_RAILS = frozenset({"triton", "flashinfer", "fa3", "trtllm_mha"})
+# FA4 carries translated draft ids, but speculative admission is audited
+# per algorithm below; currently only DSPARK is validated with FA4.
+TRANSLATED_MHA_RAILS = _SPEC_MHA_AUDITED_BACKENDS | {"fa4"}
 
 
 def _assert_spec_verify_backends(
@@ -613,7 +616,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         eagle_allowed = (
             _SPEC_VERIFY_AUDITED_BACKENDS
             if use_mla_backend(server_args)
-            else TRANSLATED_MHA_RAILS
+            else _SPEC_MHA_AUDITED_BACKENDS
         )
         eagle_backends = set(attention_backends_of(resolved_view(server_args)))
         assert (
@@ -628,20 +631,24 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         # An unset draft backend inherits the target's pair.
         draft_backend = cfg.speculative_draft_attention_backend
         draft_backends = {draft_backend} if draft_backend else eagle_backends
-        assert draft_backends <= TRANSLATED_MHA_RAILS, (
+        assert draft_backends <= _SPEC_MHA_AUDITED_BACKENDS, (
             "--enable-unified-memory + EAGLE/EAGLE3 runs the draft on "
             f"{sorted(draft_backends)}, but a fused draft is MHA-shaped and "
             "reads its KV through the translated MHA rails "
-            f"{sorted(TRANSLATED_MHA_RAILS)}. "
+            f"{sorted(_SPEC_MHA_AUDITED_BACKENDS)}. "
             "Set --speculative-draft-attention-backend to one of them."
         )
     if cfg.speculative_algorithm == "DSPARK":
-        _assert_spec_verify_backends(server_args, algorithm="DSPARK")
+        _assert_spec_verify_backends(
+            server_args,
+            algorithm="DSPARK",
+            allowed=_SPEC_VERIFY_AUDITED_BACKENDS | {"fa4"},
+        )
     if cfg.speculative_algorithm == "DFLASH":
         _assert_spec_verify_backends(
             server_args,
             algorithm="DFLASH",
-            allowed=TRANSLATED_MHA_RAILS,
+            allowed=_SPEC_MHA_AUDITED_BACKENDS,
         )
     assert not cfg.enable_two_batch_overlap, (
         "--enable-unified-memory does not support --enable-two-batch-overlap: "
@@ -741,7 +748,7 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
     # The trtllm_mla family builds its DCP block table through the pool's v2p
     # gather (create_mla_kv_page_table_for_dcp), so it speaks the same
     # two-stage contract as flashinfer.
-    dcp_allowed = {"flashinfer", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
+    dcp_allowed = {"flashinfer", "trtllm_mla", "cutedsl_mla"}
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= dcp_allowed, (
@@ -798,7 +805,6 @@ def handle_page_major_kv_layout(server_args: Any):
             "trtllm_mla",
             "flashinfer",
             "cutedsl_mla",
-            "tokenspeed_mla",
             "flashmla",
         }
     elif model_config.has_asymmetric_kv:
