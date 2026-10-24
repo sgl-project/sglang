@@ -746,7 +746,7 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="mistral",
-        system_template="[SYSTEM_PROMPT]\n{system_message}\n[/SYSTEM_PROMPT]\n\n",
+        system_template="[SYSTEM_PROMPT]\n{system_message}\n[/SYSTEM_PROMPT]\n\n[INST] ",
         roles=("[INST]", "[/INST]"),
         sep_style=SeparatorStyle.LLAMA2,
         sep=" ",
@@ -759,7 +759,7 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="devstral",
-        system_template="[SYSTEM_PROMPT]\n{system_message}\n[/SYSTEM_PROMPT]\n\n",
+        system_template="[SYSTEM_PROMPT]\n{system_message}\n[/SYSTEM_PROMPT]\n\n[INST] ",
         system_message=read_system_prompt_from_file("mistralai/Devstral-Small-2505"),
         roles=("[INST]", "[/INST]"),
         sep_style=SeparatorStyle.LLAMA2,
