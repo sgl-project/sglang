@@ -1487,7 +1487,7 @@ class HybridCacheController(BaseHiCacheController):
 
     def _needs_lookup_confirmation(self, operation: PrefetchOperation) -> bool:
         return bool(
-            self.storage_backend.requires_lookup_confirmation
+            getattr(self.storage_backend, "requires_lookup_confirmation", False)
             and any(
                 transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
                 for transfer in operation.pool_transfers or ()
