@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.nn import functional as F
 
 from sglang.multimodal_gen.configs.models.dits.nomas import NomasArchConfig, NomasConfig
 from sglang.multimodal_gen.configs.models.vaes.nomas import NomasVAEArchConfig
@@ -132,6 +133,27 @@ def test_fused_qk_norm_rope_and_modulate_cast_are_bitwise_exact():
         fused = layers.modulate_for_linear(x, shift, scale)
     assert fused.dtype == torch.bfloat16
     assert torch.equal(fused, layers.modulate(x, shift, scale).to(torch.bfloat16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernels need CUDA")
+@torch.inference_mode()
+def test_pixelumm_fused_norm_and_swiglu_are_bitwise_exact():
+    from sglang.multimodal_gen.runtime.models.vaes import nomas as vae
+
+    torch.manual_seed(9)
+    norm = vae.RMSNorm(4096, 1e-6).cuda().bfloat16()
+    norm.weight.normal_(1, 0.1)
+    x = torch.randn(1, 3000, 4096, device="cuda", dtype=torch.bfloat16) * 3
+    xf = x.float()
+    expected = norm.weight * (
+        xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + norm.eps)
+    ).to(x.dtype)
+    assert torch.equal(norm(x), expected)
+    gate, up = (
+        torch.randn(1, 3000, 1024, device="cuda", dtype=torch.bfloat16) * 4
+        for _ in range(2)
+    )
+    assert torch.equal(vae._compiled_silu_mul()(gate, up), F.silu(gate) * up)
 
 
 def test_segment_mask_against_independent_dense_oracle():

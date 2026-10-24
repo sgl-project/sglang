@@ -34,6 +34,7 @@ LATENT_CHANNELS = 32
 LATENT_TOKEN_GRID = 2
 # Target size of one FP32 Q/K input chunk; intermediate tensors add overhead.
 _QK_CHUNK_INPUT_BYTES = 16 * 2**20
+_QK_FUSED_CHUNK_BYTES = 256 * 2**20
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,69 @@ def _apply_mrope_and_cast(x, cos, sin, sections, dtype):
     return _mrope_to_dtype(x, cos, sin, sections, dtype)
 
 
+def _fused_ok(x: torch.Tensor) -> bool:
+    return (
+        x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
+    )
+
+
+def _compile_exact(fn):
+    # emulate_precision_casts keeps every intermediate rounding, so the fused
+    # elementwise kernels are bit-identical to the eager sequences they replace.
+    # Mean-square reductions stay in ATen to keep their summation order.
+    return torch.compile(
+        fn, dynamic=True, fullgraph=True, options={"emulate_precision_casts": True}
+    )
+
+
+def _square(x):
+    return x.float().pow(2)
+
+
+def _rms_scale(x, mean_square, eps, weight, dtype):
+    return weight * (x.float() * torch.rsqrt(mean_square + eps)).to(dtype)
+
+
+def _qk_norm_mrope(x, ms_t, ms_hw, eps, w_t, w_hw, cos, sin, sections, dtype):
+    t_part, hw_part = x.float().chunk(2, dim=-1)
+    normalized = torch.cat(
+        (
+            w_t * (t_part * torch.rsqrt(ms_t + eps)),
+            w_hw * (hw_part * torch.rsqrt(ms_hw + eps)),
+        ),
+        dim=-1,
+    )
+    return apply_mrope(normalized, cos, sin, sections).to(dtype)
+
+
+@lru_cache(maxsize=1)
+def _compiled_square():
+    return _compile_exact(_square)
+
+
+@lru_cache(maxsize=1)
+def _compiled_rms_scale():
+    return _compile_exact(_rms_scale)
+
+
+@lru_cache(maxsize=1)
+def _compiled_qk_norm_mrope():
+    return _compile_exact(_qk_norm_mrope)
+
+
+def _silu_mul(gate, up):
+    return F.silu(gate) * up
+
+
+@lru_cache(maxsize=1)
+def _compiled_silu_mul():
+    return _compile_exact(_silu_mul)
+
+
+def _mean_square(x):
+    return _compiled_square()(x).mean(-1, keepdim=True)
+
+
 _LOCAL_LAYOUTS: dict = {}
 _COMPILED_FLEX = None
 
@@ -243,6 +307,10 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
+        if _fused_ok(x):
+            return _compiled_rms_scale()(
+                x, _mean_square(x), self.eps, self.weight, dtype
+            )
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return self.weight * x.to(dtype)
@@ -281,6 +349,8 @@ class GenAttention(nn.Module):
         fp32_bytes = torch.finfo(torch.float32).bits // 8
         bytes_per_token = batch * heads * head_dim * fp32_bytes
         chunk = max(1, _QK_CHUNK_INPUT_BYTES // bytes_per_token)
+        if _fused_ok(x):
+            return self._prepare_qk_fused(x, cos, sin, norm_t, norm_hw, dtype)
         if torch.is_grad_enabled() or tokens <= chunk:
             normalized = self._split_norm(x.float(), norm_t, norm_hw)
             return _apply_mrope_and_cast(
@@ -299,6 +369,30 @@ class GenAttention(nn.Module):
             )
             result[:, first:last].copy_(part)
             del normalized, part
+        return result
+
+    def _prepare_qk_fused(self, x, cos, sin, norm_t, norm_hw, dtype):
+        """Same values as the eager path: ATen mean squares, one fused kernel for the rest."""
+        half = x.shape[-1] // 2
+        result = torch.empty_like(x, dtype=dtype)
+        # Only the FP32 squares are materialised now, so far larger chunks fit.
+        chunk = max(
+            1, _QK_FUSED_CHUNK_BYTES // (x.shape[0] * x.shape[2] * x.shape[3] * 4)
+        )
+        for first in range(0, x.shape[1], chunk):
+            part = x[:, first : first + chunk]
+            result[:, first : first + chunk] = _compiled_qk_norm_mrope()(
+                part,
+                _mean_square(part[..., :half]),
+                _mean_square(part[..., half:]),
+                norm_t.eps,
+                norm_t.weight,
+                norm_hw.weight,
+                cos[:, first : first + chunk],
+                sin[:, first : first + chunk],
+                self.arch.rope_sections,
+                dtype,
+            )
         return result
 
     def forward(
@@ -338,7 +432,9 @@ class GenMLP(nn.Module):
         self.down_proj = nn.Linear(arch.intermediate_size, arch.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = self.gate_proj(x), self.up_proj(x)
+        fused = _compiled_silu_mul() if _fused_ok(x) else _silu_mul
+        return self.down_proj(fused(gate, up))
 
 
 class GenLayer(nn.Module):
