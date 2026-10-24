@@ -433,7 +433,8 @@ def softmax_temp_flashinfer(
         temperatures.reshape(bs).to(torch.float32), rows_per_request, dim=0
     ).contiguous()
     logits_2d = logits.to(torch.float32).contiguous()
-    return _flashinfer_softmax(logits=logits_2d, temperature=temp_per_row)
+    probs = _flashinfer_softmax(logits=logits_2d, temperature=temp_per_row)
+    return probs.clamp_(max=1.0)
 
 
 class MixedAcceptSelectResult(msgspec.Struct):
