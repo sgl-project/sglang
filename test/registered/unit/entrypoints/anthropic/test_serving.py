@@ -892,13 +892,19 @@ class TestAnthropicServing(unittest.TestCase):
             f"expected unenforced-budget warning: {log.output}",
         )
 
-    def test_request_thinking_enabled_requires_budget_tokens(self):
-        """SDK requires ``budget_tokens`` for ``type=enabled`` — Pydantic 400."""
-        from pydantic import ValidationError
-
-        with self.assertRaises(ValidationError) as ctx:
-            self._anthropic_request(thinking={"type": "enabled"}, stream=False)
-        self.assertIn("budget_tokens", str(ctx.exception))
+    def test_request_thinking_enabled_without_budget_tokens_is_accepted(self):
+        """DeepSeek-style clients send ``{"type": "enabled"}`` without
+        ``budget_tokens``. The backend never uses the budget, so the request
+        is accepted, reasoning is enabled, and no unenforced-budget warning
+        is logged."""
+        serving = self._serving()
+        request = self._anthropic_request(thinking={"type": "enabled"}, stream=False)
+        self.assertIsNone(request.thinking.budget_tokens)
+        with self.assertNoLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level="WARNING"
+        ):
+            serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
 
     def test_request_thinking_enabled_budget_below_min_is_rejected(self):
         """SDK doc: ``budget_tokens`` must be >= 1024."""

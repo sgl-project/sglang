@@ -261,8 +261,11 @@ class AnthropicThinkingParam(BaseModel):
     union of three variants — see ``anthropic-sdk-python``'s
     ``thinking_config_{enabled,disabled,adaptive}_param.py``:
 
-    * ``enabled`` requires ``budget_tokens`` (≥1024) and accepts
-      ``display``.
+    * ``enabled`` accepts ``budget_tokens`` (≥1024 when given) and
+      ``display``. The SDK requires ``budget_tokens`` here, but the local
+      backend never uses it, so it is optional: DeepSeek-style clients send
+      ``{"type": "enabled"}`` and carry the strength in
+      ``output_config.effort``.
     * ``disabled`` accepts no other fields.
     * ``adaptive`` (Claude 4.7) accepts ``display`` but not
       ``budget_tokens``.
@@ -284,11 +287,9 @@ class AnthropicThinkingParam(BaseModel):
     def _validate_thinking_shape(self):
         # Cross-field rules mirror the SDK's three discriminated variants.
         if self.type == "enabled":
-            if self.budget_tokens is None:
-                raise ValueError(
-                    "thinking.budget_tokens is required when thinking.type is 'enabled'"
-                )
-            if self.budget_tokens < 1024:
+            # Deliberate deviation from the Anthropic API, which rejects
+            # type="enabled" without budget_tokens (see class docstring).
+            if self.budget_tokens is not None and self.budget_tokens < 1024:
                 raise ValueError(
                     "thinking.budget_tokens must be >= 1024 (got {})".format(
                         self.budget_tokens
