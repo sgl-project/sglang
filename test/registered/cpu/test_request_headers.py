@@ -4,7 +4,11 @@ from types import SimpleNamespace
 from fastapi import HTTPException
 from starlette.datastructures import Headers
 
-from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.request_headers import (
+    apply_header_overrides,
+    apply_session_id_header,
+)
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -104,6 +108,54 @@ class TestApplyRoutingHeaders(CustomTestCase):
         obj = _obj()
         with self.assertRaises(HTTPException):
             apply_header_overrides(obj, Headers({"x-override-priority": "high"}))
+
+
+def _session_obj():
+    return SimpleNamespace(session_id=None, session_params=None)
+
+
+class TestApplySessionIdHeader(CustomTestCase):
+    """``X-Session-ID`` is the same header the vLLM OpenAI server accepts."""
+
+    def test_header_fills_missing_session_id(self):
+        obj = _session_obj()
+        apply_session_id_header(obj, Headers({"x-session-id": "conv-1"}))
+        self.assertEqual(obj.session_id, "conv-1")
+
+    def test_body_session_id_wins(self):
+        obj = _session_obj()
+        obj.session_id = "from-body"
+        apply_session_id_header(obj, Headers({"x-session-id": "from-header"}))
+        self.assertEqual(obj.session_id, "from-body")
+
+    def test_absent_header_leaves_session_id_none(self):
+        obj = _session_obj()
+        apply_session_id_header(obj, Headers({}))
+        self.assertIsNone(obj.session_id)
+
+    def test_empty_header_is_ignored(self):
+        obj = _session_obj()
+        apply_session_id_header(obj, Headers({"x-session-id": ""}))
+        self.assertIsNone(obj.session_id)
+
+    def test_configured_header_replaces_the_default(self):
+        headers = Headers({"x-session-id": "default", "x-conversation": "conv-2"})
+        with envs.SGLANG_SESSION_ID_HEADER.override("X-Conversation"):
+            obj = _session_obj()
+            apply_session_id_header(obj, headers)
+            self.assertEqual(obj.session_id, "conv-2")
+        with envs.SGLANG_SESSION_ID_HEADER.override(""):
+            obj = _session_obj()
+            apply_session_id_header(obj, headers)
+            self.assertIsNone(obj.session_id)
+
+    def test_session_params_disables_header(self):
+        # The scheduler treats session_params and session_id as mutually
+        # exclusive, so the header must not create the invalid combination.
+        obj = _session_obj()
+        obj.session_params = {"id": "managed-session"}
+        apply_session_id_header(obj, Headers({"x-session-id": "conv-1"}))
+        self.assertIsNone(obj.session_id)
 
 
 if __name__ == "__main__":

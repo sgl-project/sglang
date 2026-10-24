@@ -10,6 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import NodeId
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ class UnifiedSessionRefTracker:
     enable_session_radix_cache: bool
 
     def __post_init__(self) -> None:
+        self._ref_prompt_tail = envs.SGLANG_OPT_SESSION_REF_PROMPT_TAIL.get()
         self.reset()
 
     def reset(self) -> None:
@@ -73,12 +75,45 @@ class UnifiedSessionRefTracker:
             return
 
         node = self.tree_core.node_by_id(leaf)
+        # A server-managed session (session_params) extends the previous output.
+        if self._ref_prompt_tail and session is None:
+            self._register_prompt_tail_ref(req, session_id, node)
+            return
         if node is self.tree_core.root_node:
             return
 
         for component in self.components:
             component_leaf = component.resolve_session_leaf(req, node)
             component.register_session_leaf(session_id, component_leaf)
+
+    def _register_prompt_tail_ref(self, req: Req, session_id: str, node) -> None:
+        """Move the session's single reference to the end of this request's
+        prompt, releasing its older prompt ends and output branches."""
+        node = self._prompt_tail_node(req, node)
+        for component in self.components:
+            component_leaf = (
+                None
+                if node is self.tree_core.root_node
+                else component.resolve_session_leaf(req, node)
+            )
+            component.register_session_leaf(session_id, component_leaf)
+            component.release_other_session_leaves(session_id, keep=component_leaf)
+
+    def _prompt_tail_node(self, req: Req, node):
+        """The deepest node on the root path of ``node`` that ends within the
+        request's prompt."""
+        root = self.tree_core.root_node
+        # A bigram (EAGLE) key is one shorter than the tokens it spans.
+        prompt_len = len(req.origin_input_ids) - int(self.tree_core.is_eagle)
+        end, cur = 0, node
+        while cur is not root:
+            end += len(cur.key)
+            cur = cur.parent
+        cur = node
+        while cur is not root and end > prompt_len:
+            end -= len(cur.key)
+            cur = cur.parent
+        return cur
 
     def _remember_closed_session(self, session_id: str) -> None:
         self._closed_session_ids[session_id] = None

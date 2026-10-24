@@ -304,6 +304,14 @@ class TreeComponent(ABC):
         if old_ancestor is not None:
             self._unmark_session_leaf(session_id, old_ancestor)
 
+    def release_other_session_leaves(
+        self, session_id: str, keep: Optional[UnifiedTreeNode]
+    ) -> None:
+        for leaf in tuple(self._session_leaves.get(session_id, ())):
+            if leaf is not keep:
+                self._dec_session_coverage(session_id, leaf)
+                self._unmark_session_leaf(session_id, leaf)
+
     def release_session(self, session_id: str) -> int:
         leaves = tuple(self._session_leaves.get(session_id, ()))
         for leaf in leaves:

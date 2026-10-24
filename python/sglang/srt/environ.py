@@ -333,6 +333,9 @@ class Envs:
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+    # Header that fills a request's missing session_id. The default is the one
+    # vLLM's OpenAI server and sgl-router's --session-id-header use; empty disables it.
+    SGLANG_SESSION_ID_HEADER = EnvStr("x-session-id")
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
@@ -743,6 +746,10 @@ class Envs:
     SGLANG_OPT_RELEASE_PREFILL_SWA = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW"
     )
+    # --enable-session-radix-cache: hold a request-level session_id's one reference
+    # at the end of its last prompt, not its output, for clients whose next turn
+    # resends the history rather than extending the generated output.
+    SGLANG_OPT_SESSION_REF_PROMPT_TAIL = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime
