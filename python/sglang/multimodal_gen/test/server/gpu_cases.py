@@ -1661,6 +1661,7 @@ STANDALONE_FILES = {
     ],
     "1-gpu": [
         "../single_test_file/test_generate_zimage_turbo_cli.py",
+        "../single_test_file/test_nomas_offline.py",
         "../single_test_file/test_update_weights_from_disk.py",
     ],
     "2-gpu": [
@@ -1679,6 +1680,7 @@ STANDALONE_FILES = {
         "../unit/test_async_output_save.py",
         "../unit/test_kandinsky6_sequence_parallel.py",
         "../unit/test_kandinsky6_sr_sequence_parallel.py",
+        "../unit/test_nomas_parallel.py",
         "../unit/test_qwen_image21_distributed.py",
     ],
 }
@@ -1710,6 +1712,9 @@ STANDALONE_FILE_EST_TIMES = {
     },
     "1-gpu": {
         "../single_test_file/test_generate_zimage_turbo_cli.py": 180.0,
+        # Initial H200 full-process observation: 97 s; refresh on H100 CI.
+        # This is a partitioning estimate, not a performance gate.
+        "../single_test_file/test_nomas_offline.py": 100.0,
         "../single_test_file/test_update_weights_from_disk.py": 200.0,
     },
     "2-gpu": {
@@ -1736,6 +1741,8 @@ STANDALONE_FILE_EST_TIMES = {
         "../unit/test_async_output_save.py": 20.0,
         "../unit/test_kandinsky6_sequence_parallel.py": 90.0,
         "../unit/test_kandinsky6_sr_sequence_parallel.py": 90.0,
+        # H200: TP/SP parity for SDPA and FA3 (55 s each), window decode (22 s)
+        "../unit/test_nomas_parallel.py": 140.0,
         "../unit/test_qwen_image21_distributed.py": 40.0,
     },
 }
