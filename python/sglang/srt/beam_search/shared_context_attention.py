@@ -49,21 +49,140 @@ def enabled() -> bool:
     return envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.get()
 
 
+def _positive_int(field) -> int:
+    value = field.get()
+    if value <= 0:
+        raise ValueError(f"{field.name} must be positive, got {value}")
+    return value
+
+
+def graph_beam_width() -> int:
+    return _positive_int(envs.SGLANG_BEAM_SHARED_CONTEXT_WIDTH)
+
+
+def graph_max_context() -> int:
+    return _positive_int(envs.SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT)
+
+
+def graph_max_decode() -> int:
+    return _positive_int(envs.SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE)
+
+
+def supports_shared_context(model_runner) -> bool:
+    from sglang.srt.configs.model_config import AttentionArch
+
+    return (
+        model_runner.decode_attention_backend_str == "flashinfer"
+        and model_runner.sliding_window_size is None
+        and not model_runner.model_config.is_encoder_decoder
+        and model_runner.model_config.attention_arch == AttentionArch.MHA
+        and model_runner.kv_cache_dtype in (torch.float16, torch.bfloat16)
+    )
+
+
+def _metadata_tensor(values, dtype, device):
+    if torch.device(device).type == "cuda":
+        return torch.tensor(values, dtype=dtype, pin_memory=True).to(
+            device, non_blocking=True
+        )
+    return torch.tensor(values, dtype=dtype, device=device)
+
+
+def graph_compatible(metadata, num_rows: int, captured_rows: int) -> bool:
+    if (
+        metadata is None
+        or num_rows != captured_rows
+        or metadata.num_rows != num_rows
+        or len(metadata.buckets) != 1
+    ):
+        return False
+    bucket = metadata.buckets[0]
+    if bucket.row_indices.ndim != 2 or bucket.decode_slots.ndim != 2:
+        return False
+    groups = bucket.row_indices.shape[0]
+    return (
+        bucket.beam_width == graph_beam_width()
+        and bucket.row_indices.shape == (groups, bucket.beam_width)
+        and groups * bucket.beam_width == num_rows
+        and bucket.context_slots.numel() <= groups * graph_max_context()
+        and bucket.context_cu_seqlens.shape == (groups + 1,)
+        and bucket.decode_lens.shape == (groups,)
+        and bucket.decode_slots.shape[0] == groups
+        and bucket.decode_slots.shape[1] <= graph_max_decode() * bucket.beam_width
+    )
+
+
+def build_graph_capture_metadata(num_rows: int, device):
+    width = graph_beam_width()
+    if not enabled() or num_rows < width or num_rows % width:
+        return None
+    groups = num_rows // width
+    rows = [
+        [group]
+        + list(range(groups + group * (width - 1), groups + (group + 1) * (width - 1)))
+        for group in range(groups)
+    ]
+    return BeamAttentionMetadata(
+        num_rows=num_rows,
+        buckets=[
+            BeamAttentionBucket(
+                row_indices=_metadata_tensor(rows, torch.int32, device),
+                context_slots=torch.zeros(
+                    groups * graph_max_context(), dtype=torch.int32, device=device
+                ),
+                context_cu_seqlens=torch.arange(
+                    groups + 1, dtype=torch.int32, device=device
+                ),
+                decode_slots=torch.zeros(
+                    (groups, width * graph_max_decode()),
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                beam_width=width,
+                decode_lens=torch.full(
+                    (groups,), graph_max_decode(), dtype=torch.int32, device=device
+                ),
+            )
+        ],
+    )
+
+
+def stage_graph_metadata(target, source) -> None:
+    if not graph_compatible(source, source.num_rows, target.num_rows):
+        raise ValueError("Shared-context metadata does not fit the captured graph")
+    if len(target.buckets) != 1:
+        raise ValueError("Captured shared-context metadata must have one width")
+    destination, current = target.buckets[0], source.buckets[0]
+    if (
+        destination.beam_width != current.beam_width
+        or destination.row_indices.shape != current.row_indices.shape
+        or current.context_slots.numel() > destination.context_slots.numel()
+        or destination.context_cu_seqlens.shape != current.context_cu_seqlens.shape
+        or destination.decode_lens.shape != current.decode_lens.shape
+        or current.decode_slots.shape[0] != destination.decode_slots.shape[0]
+        or current.decode_slots.shape[1] > destination.decode_slots.shape[1]
+    ):
+        raise ValueError("Shared-context metadata exceeds captured buffers")
+    destination.context_slots[current.context_slots.numel() :].zero_()
+    destination.decode_slots[:, current.decode_slots.shape[1] :].zero_()
+    destination.row_indices.copy_(current.row_indices)
+    destination.context_slots[: current.context_slots.numel()].copy_(
+        current.context_slots
+    )
+    destination.context_cu_seqlens.copy_(current.context_cu_seqlens)
+    destination.decode_slots[:, : current.decode_slots.shape[1]].copy_(
+        current.decode_slots
+    )
+    destination.decode_lens.copy_(current.decode_lens)
+
+
 def build_metadata(
     batch: ScheduleBatch,
     model_runner: ModelRunner,
 ) -> Optional[BeamAttentionMetadata]:
     if batch.beam_tail is None or not batch.forward_mode.is_decode() or not enabled():
         return None
-    from sglang.srt.configs.model_config import AttentionArch
-
-    if (
-        model_runner.decode_attention_backend_str != "flashinfer"
-        or model_runner.sliding_window_size is not None
-        or model_runner.model_config.is_encoder_decoder
-        or model_runner.model_config.attention_arch != AttentionArch.MHA
-        or model_runner.kv_cache_dtype not in (torch.float16, torch.bfloat16)
-    ):
+    if not supports_shared_context(model_runner):
         return None
     entries = batch.beam_tail.entries
     if not entries or batch.seq_lens_cpu is None:
@@ -83,7 +202,7 @@ def build_metadata(
 
     buckets = []
     for beam_width, bucket_entries in entries_by_width.items():
-        group_rows_cpu = torch.tensor(
+        group_rows = _metadata_tensor(
             [
                 [entry.leader_idx]
                 + list(
@@ -95,8 +214,8 @@ def build_metadata(
                 for entry in bucket_entries
             ],
             dtype=torch.int64,
+            device=batch.device,
         )
-        group_rows = group_rows_cpu.to(batch.device)
         req_rows = batch.req_pool_indices[group_rows]
 
         context_parts = []
@@ -110,7 +229,9 @@ def build_metadata(
             if decode_len <= 0:
                 return None
             group_req_rows = req_rows[group_index]
-            context_parts.append(req_to_token[group_req_rows[0], :prompt_len])
+            context_parts.append(
+                req_to_token[group_req_rows[:1], :prompt_len].reshape(-1)
+            )
             decode_parts.append(
                 req_to_token[
                     group_req_rows,
@@ -143,14 +264,14 @@ def build_metadata(
             BeamAttentionBucket(
                 row_indices=group_rows.to(dtype=torch.int32),
                 context_slots=torch.cat(context_parts),
-                context_cu_seqlens=torch.tensor(
+                context_cu_seqlens=_metadata_tensor(
                     [0, *itertools.accumulate(prompt_lens)],
                     dtype=torch.int32,
                     device=batch.device,
                 ),
                 decode_slots=torch.stack(padded_decode_parts),
                 beam_width=beam_width,
-                decode_lens=torch.tensor(
+                decode_lens=_metadata_tensor(
                     decode_lens,
                     dtype=torch.int32,
                     device=batch.device,

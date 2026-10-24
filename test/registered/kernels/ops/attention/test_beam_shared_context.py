@@ -79,6 +79,89 @@ class TestBeamSharedContextAttention(CustomTestCase):
             atol=1e-2,
         )
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_graph_replay_refreshes_mixed_depths_and_row_mapping(self):
+        from sglang.srt.beam_search.shared_context_attention import (
+            BeamAttentionBucket,
+            BeamAttentionMetadata,
+            build_graph_capture_metadata,
+            stage_graph_metadata,
+        )
+        from sglang.srt.environ import envs
+
+        torch.manual_seed(17)
+        width = 8
+        for field, value in (
+            (envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION, True),
+            (envs.SGLANG_BEAM_SHARED_CONTEXT_WIDTH, width),
+            (envs.SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT, 8),
+            (envs.SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE, 3),
+        ):
+            self.enterContext(field.override(value))
+        with torch.device("cuda"):
+            q = torch.randn((16, 4, 64), dtype=torch.bfloat16)
+            k = torch.randn((64, 2, 64), dtype=torch.bfloat16)
+            v = torch.randn_like(k)
+            rows = torch.arange(16, dtype=torch.int32).view(2, width)
+            slots = torch.arange(8, 40, dtype=torch.int32).view(2, 16)
+            a = BeamAttentionMetadata(
+                num_rows=16,
+                buckets=[
+                    BeamAttentionBucket(
+                        row_indices=rows,
+                        context_slots=torch.arange(8, dtype=torch.int32),
+                        context_cu_seqlens=torch.tensor([0, 5, 8], dtype=torch.int32),
+                        decode_slots=slots,
+                        beam_width=width,
+                        decode_lens=torch.tensor([1, 2], dtype=torch.int32),
+                    )
+                ],
+            )
+            b = BeamAttentionMetadata(
+                num_rows=16,
+                buckets=[
+                    BeamAttentionBucket(
+                        row_indices=rows.flip((0, 1)),
+                        context_slots=torch.tensor([5, 4, 3], dtype=torch.int32),
+                        context_cu_seqlens=torch.tensor([0, 2, 3], dtype=torch.int32),
+                        decode_slots=slots.flip((1,)),
+                        beam_width=width,
+                        decode_lens=torch.tensor([2, 1], dtype=torch.int32),
+                    )
+                ],
+            )
+            target = build_graph_capture_metadata(16, q.device)
+
+        def run(metadata):
+            bucket = metadata.buckets[0]
+            return shared_context_attention(
+                q,
+                k,
+                v,
+                bucket.row_indices,
+                bucket.context_slots,
+                bucket.context_cu_seqlens,
+                bucket.decode_slots,
+                bucket.decode_lens,
+                softmax_scale=0.125,
+            )
+
+        stage_graph_metadata(target, a)
+        run(target)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run(target)
+        for metadata in (a, b, a):
+            target.buckets[0].context_slots.fill_(63)
+            target.buckets[0].decode_slots.fill_(63)
+            stage_graph_metadata(target, metadata)
+            graph.replay()
+            expected = run(metadata)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                output.float(), expected.float(), rtol=1e-2, atol=1e-2
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

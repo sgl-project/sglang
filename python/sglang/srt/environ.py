@@ -663,6 +663,9 @@ class Envs:
     SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB = EnvBool(False)
     # Experimental shared-context decode attention for wide beam batches.
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
+    SGLANG_BEAM_SHARED_CONTEXT_WIDTH = EnvInt(2000)
+    SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT = EnvInt(32768)
+    SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE = EnvInt(8)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
