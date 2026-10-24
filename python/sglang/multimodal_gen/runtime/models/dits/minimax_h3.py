@@ -853,7 +853,13 @@ def _minimax_h3_attention_core_impl(
             _usp_output_all_to_all,
         )
 
-        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        if (
+            attention._attention_backend_enum
+            is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN_FP8
+        ):
+            q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v, plane_major=True)
+        else:
+            q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:
         attn_metadata = (
