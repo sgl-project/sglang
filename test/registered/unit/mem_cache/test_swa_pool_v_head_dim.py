@@ -60,6 +60,16 @@ class TestSWAPoolVHeadDim(unittest.TestCase):
         pool = _swa_pool(swa_attention_layer_ids=(0,), full_attention_layer_ids=())
         self.assertEqual(pool.get_v_head_dim(), _SWA_V_HEAD_DIM)
 
+    def test_later_pipeline_stage_starts_at_its_first_layer(self):
+        """BUG REGRESSION. A later pipeline stage's pool holds global layer ids,
+        and `TritonAttnBackend.__init__` reads `get_value_buffer(start_layer)`;
+        with start_layer fixed at 0 that raised KeyError at startup."""
+        pool = _swa_pool(swa_attention_layer_ids=(2,), full_attention_layer_ids=(3,))
+        self.assertEqual(pool.start_layer, 2)
+        self.assertEqual(
+            pool.get_value_buffer(pool.start_layer).shape[-1], _SWA_V_HEAD_DIM
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
