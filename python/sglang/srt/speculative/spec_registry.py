@@ -81,6 +81,9 @@ class CustomSpecAlgo:
     def is_dflash(self) -> bool:
         return False
 
+    def is_ubtree(self) -> bool:
+        return False
+
     def is_uno(self) -> bool:
         return False
 
