@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
@@ -107,6 +108,24 @@ class TestDotsToolDetector(unittest.TestCase):
                 {"query": "tables"},
             ],
         )
+
+    def test_non_stream_unclosed_block_with_whitespace_parses_in_linear_time(self):
+        """An unclosed marker followed by a whitespace run must not stall the
+        parser (it runs on the event loop), and earlier complete calls survive."""
+        tools = [_tool("search", {"query": {"type": "string"}})]
+        parser = FunctionCallParser(tools, "dots")
+        text = (
+            '<dots_function_call>\n{"name":"search","arguments":{"query":"a"}}\n'
+            "</dots_function_call><dots_function_call>" + "\n" * 20000
+        )
+
+        start = time.perf_counter()
+        _, calls = parser.parse_non_stream(text)
+        elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual([call.name for call in calls], ["search"])
+        self.assertEqual(json.loads(calls[0].parameters), {"query": "a"})
 
     def test_streaming_buffers_partial_marker_and_emits_all_complete_calls(self):
         tools = [_tool("search", {"query": {"type": "string"}})]
