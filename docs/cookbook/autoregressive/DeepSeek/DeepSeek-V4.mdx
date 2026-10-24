@@ -766,10 +766,15 @@ Three commands follow, one per concurrency range. They share the model, parser, 
 | HiCache | off | on | on | on |
 | `--mem-fraction-static` | 0.86 | 0.86 | 0.92 | 0.85 |
 
+The commands follow the [submitted recipe at `fd09dd949a18`](https://github.com/SemiAnalysisAI/InferenceX/blob/fd09dd949a18ef2f3ff2912411d980b3f6b810a1/inferencex-e2e/benchmarks/single_node/srt-slurm-recipes/dsv4/sglang/mi355x-fp4-mtp/agentic.yaml) ([InferenceX #4315](https://github.com/SemiAnalysisAI/InferenceX/pull/4315)), with benchmark harness settings removed. Run them in `lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261019`, the image that submission pins.
+
 DeepSeek-V4-Pro-0813 bundles the DSpark head, so `--speculative-draft-model-path` is not needed. `--speculative-dspark-block-size 6` is the AL-optimal draft length on the committed golden curve (verify window 7). Keep `SGLANG_DSV4_UNIFIED_KV_FP8=1` on every command. The first three use `--enforce-shared-experts-fusion`; the MegaMoE command uses `--disable-shared-experts-fusion` instead.
 
-Four adjustments are not in the commands below. Add them when they apply:
+Every command sets `SGLANG_DEFAULT_THINKING=1` and `SGLANG_DSV4_REASONING_EFFORT=high`, so a request that sets neither `chat_template_kwargs.thinking` nor `reasoning_effort` runs in thinking mode at high effort, which is how AgentX measures this recipe. A request can still override either. `HSA_NO_SCRATCH_RECLAIM=0` overrides the image's `HSA_NO_SCRATCH_RECLAIM=1`. `GPU_MAX_HW_QUEUES` (HIP default 4) is 2 on the TP8 command and 5 on both DP8 commands.
 
+Five adjustments are not in the commands below. Add them when they apply:
+
+- `--max-running-requests` at twice the concurrency, and `--cuda-graph-max-bs-decode` at the same value capped at 128. At concurrency 48 both are `96`; at 384 they are `768` and `128`.
 - `--cuda-graph-backend-prefill breakable` at concurrency 1–4.
 - `--enable-prefill-cp --cp-strategy interleave --enable-cp-decode-attn-tp` on the TP-only commands at concurrency 16 and above. Prefill context parallelism splits each prompt across all eight ranks (CP size = TP size).
 - `SGLANG_DSV4_GROUPED_ASM=1` on the TP-only commands at concurrency 16 and above — the kernel needs at least 16 requests per draft token.
@@ -786,6 +791,10 @@ SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
 SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
 SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
+SGLANG_DEFAULT_THINKING=1 \
+SGLANG_DSV4_REASONING_EFFORT=high \
+HSA_NO_SCRATCH_RECLAIM=0 \
+GPU_MAX_HW_QUEUES=2 \
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
@@ -831,6 +840,10 @@ SGLANG_SHARED_EXPERT_TP1=1 \
 SGLANG_DP_SHARED_EXPERT_LOCAL=1 \
 SGLANG_DP_USE_GATHERV=1 \
 SGLANG_DP_USE_REDUCE_SCATTER=1 \
+SGLANG_DEFAULT_THINKING=1 \
+SGLANG_DSV4_REASONING_EFFORT=high \
+HSA_NO_SCRATCH_RECLAIM=0 \
+GPU_MAX_HW_QUEUES=5 \
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
@@ -864,7 +877,7 @@ python3 -m sglang.launch_server \
   --watchdog-timeout 3600
 ```
 
-`--chunked-prefill-size` is a global budget divided by `--attn-dp-size`, so 131072 keeps 16384 tokens per rank. `--enable-dp-lm-head` is required for DSpark under DP attention. Front the DP ranks with `sglang_router --policy cache_aware`, so a multi-turn session lands on the rank already holding its prefix; above concurrency 160 add `--balance-abs-threshold 32`. Both apply to the MegaMoE command below as well.
+`--chunked-prefill-size` is a global budget divided by `--attn-dp-size`, so 131072 keeps 16384 tokens per rank. `--enable-dp-lm-head` is required for DSpark under DP attention. Front the DP ranks with `sglang_router --policy cache_aware --dp-aware`, so a multi-turn session lands on the rank already holding its prefix; above concurrency 160 add `--balance-abs-threshold 32`. Both apply to the MegaMoE command below as well. `--dp-aware` registers each DP rank with the router as its own worker; without it the router sees one worker per server and cannot choose the rank.
 
 **DP8 EP8 MegaMoE, concurrency 128–384:**
 ```bash Command
@@ -888,6 +901,9 @@ SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY=1 \
 SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD=1 \
 SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE=7 \
 SGLANG_DP_USE_REDUCE_SCATTER=0 \
+SGLANG_DEFAULT_THINKING=1 \
+SGLANG_DSV4_REASONING_EFFORT=high \
+HSA_NO_SCRATCH_RECLAIM=0 \
 GPU_MAX_HW_QUEUES=5 \
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
