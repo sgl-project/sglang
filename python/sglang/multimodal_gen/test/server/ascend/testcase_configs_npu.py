@@ -1,4 +1,5 @@
 import os
+from dataclasses import replace
 
 from sglang.multimodal_gen.test.server.testcase_configs import (
     T2V_PROMPT,
@@ -6,8 +7,10 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionServerArgs,
     DiffusionTestCase,
     T2I_sampling_params,
+    TI2I_sampling_params,
     TI2V_sampling_params,
 )
+from sglang.srt.environ import envs
 
 MODELSCOPE_MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
 
@@ -29,6 +32,7 @@ LTX_2_WEIGHTS_PATH = use_modelscope("Lightricks/LTX-2")
 MOVA_360_WEIGHTS_PATH = use_modelscope("openmoss/MOVA-360p")
 MINIMAX_H3_WEIGHTS_PATH = use_modelscope("MiniMax/MiniMax-H3")
 QWEN_IMAGE_WEIGHTS_PATH = use_modelscope("Qwen/Qwen-Image")
+QWEN_IMAGE_21_WEIGHTS_PATH = use_modelscope("Qwen/Qwen-Image-2.1")
 WAN2_1_T2V_1_3B_DIFFUSERS_WEIGHTS_PATH = use_modelscope(
     "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 )
@@ -38,6 +42,28 @@ WAN2_2_T2V_A14B_DIFFUSERS_W8A8_WEIGHTS_PATH = use_modelscope(
 Z_IMAGE_WEIGHTS_PATH = use_modelscope("Tongyi-MAI/Z-Image")
 
 EXTRAS_DISABLE_WARMUP = ["--warmup-mode", "request"]
+
+QWEN_IMAGE21_TRANSPARENT_PROMPT = (
+    "A single fluffy orange cat sitting, full body, isolated on a transparent "
+    "background. A clean cutout with an alpha channel, transparent outside the "
+    "cat, no floor, no shadow, no background."
+)
+QWEN_IMAGE21_RECOLOR_PROMPT = (
+    "Change the orange skirt and bow to deep blue, keeping her pose, face, hair, "
+    "and the SGL logo unchanged."
+)
+QWEN_IMAGE21_MULTI_IMAGE_PROMPT = (
+    "The girl from image 1 is standing on the left, and the white rabbit from "
+    "image 2 is sitting on the right, in a park."
+)
+
+
+def _multi_image_inputs():
+    """Both references are staged by prefetch_input_image.py in CI."""
+    first = envs.SGLANG_TEST_TI2I_INPUT_IMAGE.get()
+    second = envs.SGLANG_TEST_MULTI_IMAGE_INPUT_IMAGE.get()
+    return [first, second] if first and second else None
+
 
 ONE_NPU_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
@@ -85,6 +111,30 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         T2I_sampling_params,
         run_consistency_check=False,
     ),
+    DiffusionTestCase(
+        "qwen_image21_t2i_1npu",
+        DiffusionServerArgs(
+            model_path=QWEN_IMAGE_21_WEIGHTS_PATH,
+            extras=EXTRAS_DISABLE_WARMUP,
+        ),
+        # Pins the sampling contract the Ascend GT image is recorded with.
+        replace(
+            T2I_sampling_params,
+            output_size="1024x1024",
+            output_format="png",
+            extras={
+                "num_inference_steps": 40,
+                "guidance_scale": 1,
+                "seed": 42,
+                "quality": "exact",
+            },
+        ),
+        # Enabled together with the NPU GT pin once the GT-gen workflow has
+        # published the image; keeping it off avoids blocking this PR on a GT
+        # that does not exist yet.
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
     # === Text to Video (T2V) ===
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_1_npu",
@@ -102,6 +152,96 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=JOYAI_IMAGE_EDIT_WEIGHTS_PATH,
             extras=EXTRAS_DISABLE_WARMUP,
+        ),
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "qwen_image21_edit_ti2i_1npu",
+        DiffusionServerArgs(
+            model_path=QWEN_IMAGE_21_WEIGHTS_PATH,
+            extras=EXTRAS_DISABLE_WARMUP,
+        ),
+        # Reuses the CI-prefetched edit input, like the other TI2I NPU cases.
+        # Names quality explicitly so a later consistency check would compare on
+        # the same path the GT was recorded on.
+        replace(
+            TI2I_sampling_params,
+            output_size="1024x1024",
+            output_format="png",
+            extras={
+                "num_inference_steps": 40,
+                "guidance_scale": 1,
+                "seed": 42,
+                "quality": "exact",
+            },
+        ),
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
+    # === Qwen-Image 2.1 feature coverage ===
+    DiffusionTestCase(
+        "qwen_image21_transparent_t2i_1npu",
+        DiffusionServerArgs(
+            model_path=QWEN_IMAGE_21_WEIGHTS_PATH,
+            extras=EXTRAS_DISABLE_WARMUP,
+        ),
+        replace(
+            T2I_sampling_params,
+            prompt=QWEN_IMAGE21_TRANSPARENT_PROMPT,
+            output_size="1024x1024",
+            output_format="png",
+            extras={
+                "num_inference_steps": 40,
+                "guidance_scale": 1,
+                "seed": 42,
+                "quality": "exact",
+                "background": "transparent",
+            },
+        ),
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "qwen_image21_edit_multi_image_ti2i_1npu",
+        DiffusionServerArgs(
+            model_path=QWEN_IMAGE_21_WEIGHTS_PATH,
+            extras=EXTRAS_DISABLE_WARMUP,
+        ),
+        # Two references staged by prefetch_input_image.py; the second upload
+        # exercises the <image2> slot.
+        DiffusionSamplingParams(
+            prompt=QWEN_IMAGE21_MULTI_IMAGE_PROMPT,
+            image_path=_multi_image_inputs(),
+            output_size="1024x1024",
+            output_format="png",
+            extras={
+                "num_inference_steps": 40,
+                "guidance_scale": 1,
+                "seed": 42,
+                "quality": "exact",
+            },
+        ),
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "qwen_image21_edit_recolor_ti2i_1npu",
+        DiffusionServerArgs(
+            model_path=QWEN_IMAGE_21_WEIGHTS_PATH,
+            extras=EXTRAS_DISABLE_WARMUP,
+        ),
+        replace(
+            TI2I_sampling_params,
+            prompt=QWEN_IMAGE21_RECOLOR_PROMPT,
+            output_size="1024x1024",
+            output_format="png",
+            extras={
+                "num_inference_steps": 40,
+                "guidance_scale": 1,
+                "seed": 42,
+                "quality": "exact",
+            },
         ),
         run_consistency_check=False,
         run_component_accuracy_check=False,
