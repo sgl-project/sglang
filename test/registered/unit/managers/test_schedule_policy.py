@@ -1,11 +1,14 @@
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -123,6 +126,45 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         self.assertEqual(waiting_queue[0].rid, "a")
         self.assertEqual(waiting_queue[1].rid, "b")
         self.assertEqual(waiting_queue[2].rid, "c")
+
+
+class TestRoutingKeyPolicy(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="test")
+
+    def test_requests_outside_the_running_keys_keep_arrival_order(self):
+        """Requests whose routing key is not running were ordered by the key's
+        string, so a later "apple" always overtook an earlier "zebra"."""
+        running_batch = SimpleNamespace(
+            reqs=[
+                _make_req(f"run-{i}", "a", [1], routing_key=key)
+                for i, key in enumerate(["hot", "hot", "warm"])
+            ]
+        )
+        arrivals = [
+            _make_req("zebra", "a", [1], routing_key="zebra"),
+            _make_req("apple", "a", [1], routing_key="apple"),
+            _make_req("warm", "a", [1], routing_key="warm"),
+            _make_req("no-key", "a", [1]),
+            _make_req("hot", "a", [1], routing_key="hot"),
+        ]
+        waiting_queue = list(arrivals)
+        policy = SchedulePolicy(
+            policy="routing-key",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+
+        policy.calc_priority(waiting_queue, running_batch=running_batch)
+
+        self.assertEqual(
+            [req.rid for req in waiting_queue],
+            ["hot", "warm", "zebra", "apple", "no-key"],
+        )
 
 
 class TestShortestPrefillFirst(CustomTestCase):

@@ -556,7 +556,8 @@ class SchedulePolicy:
                 count = routing_key_counts[key]
                 return (0, -count, key)
             else:
-                return (1, 0, key or "")
+                # Stable sort: requests without a running key keep arrival order.
+                return (1,)
 
         waiting_queue.sort(key=sort_key)
 
