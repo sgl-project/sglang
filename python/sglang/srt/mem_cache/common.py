@@ -84,6 +84,7 @@ def free_swa_out_of_window_slots(
     component_type: ComponentType = ComponentType.SWA,
     free_segment: Callable[..., None] | None = None,
     eviction_interval: int = 1,
+    reprefill_tail_tokens: int = 0,
 ) -> None:
     if not req.kv.holds_kv:
         return
@@ -115,6 +116,14 @@ def free_swa_out_of_window_slots(
         evict_threshold = pre_len - ceil_align(
             max(sliding_window_size, page_size), page_size
         )
+        if reprefill_tail_tokens:
+            # Matching excludes the replay tail before page alignment. Keep the
+            # SWA window behind that earlier boundary too, or a first replay
+            # falls back to an older checkpoint despite a Full-KV cache hit.
+            replay_boundary = (pre_len - reprefill_tail_tokens) // page_size * page_size
+            evict_threshold = min(
+                evict_threshold, replay_boundary - sliding_window_size
+            )
     if retain_floor is not None and supports_prefix_sharing:
         # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
         # this only promises not to free past it. Without prefix sharing a retained
