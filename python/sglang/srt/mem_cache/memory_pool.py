@@ -117,6 +117,15 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+# The fused FP8 prefix-valid commit kernel (set_kv_buffer_prefix_valid_tiled_fp8)
+# compiles fp8e4nv in Triton, which only works on SM89+ (Ada/Hopper). sm_86
+# (Ampere, e.g. RTX 3090) cannot compile it and must fall back to the eager
+# quantization path below instead of crashing.
+_FP8_FUSED_OK = (
+    _is_cuda
+    and torch.cuda.is_available()
+    and torch.cuda.get_device_capability() >= (8, 9)
+)
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
@@ -3355,6 +3364,7 @@ class MHATokenToKVPool(KVCache):
             and self.dtype == fp8_dtype
             and fused_k_scale is not None
             and fused_v_scale is not None
+            and _FP8_FUSED_OK
         ):
             _set_kv_buffer_prefix_valid_impl_fp8(
                 cache_k,
