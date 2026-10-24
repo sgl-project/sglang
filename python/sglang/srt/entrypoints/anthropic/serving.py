@@ -84,6 +84,15 @@ ERROR_TYPE_MAP = {
 }
 
 
+_OPENAI_ERROR_CODE_TYPES = {
+    "not_found": "not_found_error",
+    "model_not_found": "not_found_error",
+    "request_timeout": "request_timeout_error",
+    "request_too_large": "request_too_large",
+    "service_unavailable": "overloaded_error",
+}
+
+
 def _cached_prompt_tokens(usage) -> int:
     prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
     return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
@@ -985,15 +994,8 @@ class AnthropicServing:
             upstream_message = err.get("message") or "Upstream error"
             code = err.get("code")
             upstream_type = err.get("type")
-            code_types = {
-                "not_found": "not_found_error",
-                "model_not_found": "not_found_error",
-                "request_timeout": "request_timeout_error",
-                "request_too_large": "request_too_large",
-                "service_unavailable": "overloaded_error",
-            }
-            if isinstance(code, str) and code in code_types:
-                error_type = code_types[code]
+            if isinstance(code, str) and code in _OPENAI_ERROR_CODE_TYPES:
+                error_type = _OPENAI_ERROR_CODE_TYPES[code]
             elif isinstance(upstream_type, str) and upstream_type in set(
                 ERROR_TYPE_MAP.values()
             ):
@@ -1371,11 +1373,15 @@ class AnthropicServing:
                     upstream_message = error_payload.get("message") or payload.get(
                         "message"
                     )
-                    # Honor the upstream error.type only for 4xx; 5xx is
-                    # normalized below.
+                    # Shared OpenAI envelopes carry specific 4xx meanings in
+                    # code; their generic type must not hide those from Messages.
+                    # Keep 5xx normalized from HTTP status and scrubbed below.
                     if status_code < 500:
+                        code = error_payload.get("code")
                         upstream_type = error_payload.get("type")
-                        if isinstance(upstream_type, str) and upstream_type:
+                        if isinstance(code, str) and code in _OPENAI_ERROR_CODE_TYPES:
+                            error_type = _OPENAI_ERROR_CODE_TYPES[code]
+                        elif isinstance(upstream_type, str) and upstream_type:
                             error_type = upstream_type
                 elif isinstance(error_payload, str):
                     upstream_message = error_payload
