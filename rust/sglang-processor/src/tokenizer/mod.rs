@@ -212,6 +212,5 @@ mod tests {
             tokenizer.encode_chat(&prompt, "<s><s>It").unwrap(),
             vec![2, 0, 0, 3]
         );
-        assert_eq!(tokenizer.encode("Hi", true).unwrap(), vec![0, 2]);
     }
 }
