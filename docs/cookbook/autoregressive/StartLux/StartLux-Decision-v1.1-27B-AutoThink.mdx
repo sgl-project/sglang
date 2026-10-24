@@ -9,7 +9,7 @@ description: "Deploy StartLux-Decision-v1.1-27B-AutoThink with SGLang. A decisio
 
 <Accordion title="Install SGLang">
 
-StartLux-Decision support lands in [#XXXXX](https://github.com/sgl-project/sglang/pull/XXXXX), so until a release includes it, install a [nightly build](/docs/get-started/install#nightly-builds) built after that merge.
+StartLux-Decision support lands in [#45621](https://github.com/sgl-project/sglang/pull/45621), so until a release includes it, install a [nightly build](/docs/get-started/install#nightly-builds) built after that merge.
 
 </Accordion>
 
@@ -22,7 +22,11 @@ import { config }     from "/src/snippets/configs/startlux/startlux-decision-v1.
 
 ## Playground
 
-<Playground playground id="4a9ef5e1e0e2c8b6d3c7f0a1b2c3d4e5" />
+The Playground layers SGLang features on top of the recipe above. Any override changes the badge to **Not Verified** until that exact configuration is tested end to end. The [Configuration Tips](#2-configuration-tips) say which settings were measured.
+
+import { Playground } from "/src/snippets/_playground.jsx"
+
+<Playground config={config} />
 
 ## 1. Model Introduction
 
