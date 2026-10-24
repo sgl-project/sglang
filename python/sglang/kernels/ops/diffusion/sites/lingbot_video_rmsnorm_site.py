@@ -7,36 +7,18 @@ the reference formula still promotes their multiplication through the FP32
 hidden states. For ``quality="high"``, existing diffusion Triton RMSNorm
 kernels replace that chain. Wide rows with FP32 weights use the one-row
 ``norm_infer`` kernel; the remaining sites use the tiled one-pass kernel. Their
-reduction order is not bit-exact, so the default ``quality="lossless"`` path
+reduction order is not bit-exact, so the default ``quality="exact"`` path
 remains unchanged.
 """
 
 from __future__ import annotations
 
-import logging
 from importlib import import_module
 
 import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion.sites.quality_gate import QualityGatedFusion
-
-logger = logging.getLogger(__name__)
-
-_FUSION = QualityGatedFusion(
-    name="LingBot Video fused RMSNorm",
-    marker_attr="_sgl_lingbot_video_rmsnorm_site",
-    enabled_attr="_sgl_lingbot_video_rmsnorm_enabled",
-)
-
-
-def mark_lingbot_video_rmsnorm_site(module: nn.Module) -> None:
-    """Mark a LingBot RMSNorm module; it starts on the reference path."""
-    _FUSION.mark(module)
-
-
-def lingbot_video_rmsnorm_active(module: nn.Module) -> bool:
-    return _FUSION.is_enabled(module)
 
 
 def _site_reject_reason(site: nn.Module) -> str | None:
@@ -54,12 +36,12 @@ def _site_reject_reason(site: nn.Module) -> str | None:
     return None
 
 
-def mount_lingbot_video_rmsnorm(root: nn.Module) -> bool:
-    return _FUSION.mount(root, reject_reason=_site_reject_reason, logger=logger)
-
-
-def unmount_lingbot_video_rmsnorm(root: nn.Module) -> None:
-    _FUSION.unmount(root)
+LINGBOT_VIDEO_RMSNORM = QualityGatedFusion(
+    name="LingBot Video fused RMSNorm",
+    marker_attr="_sgl_lingbot_video_rmsnorm_site",
+    enabled_attr="_sgl_lingbot_video_rmsnorm_enabled",
+    reject_reason=_site_reject_reason,
+)
 
 
 def try_lingbot_video_rmsnorm(
@@ -70,7 +52,7 @@ def try_lingbot_video_rmsnorm(
 ) -> torch.Tensor | None:
     """Return the quality-gated RMSNorm result, or ``None`` to fall back."""
     if not (
-        _FUSION.is_enabled(site)
+        LINGBOT_VIDEO_RMSNORM.is_enabled(site)
         and hidden_states.is_cuda
         and hidden_states.dtype in (torch.float16, torch.bfloat16)
         and hidden_states.is_contiguous()

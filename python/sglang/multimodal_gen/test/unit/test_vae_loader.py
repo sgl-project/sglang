@@ -10,6 +10,8 @@ from safetensors.torch import save_file as safetensors_save_file
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
     MiniMaxH3AudioVAEConfig,
 )
+from sglang.multimodal_gen.configs.models.vaes.sana import SanaVAEConfig
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -43,6 +45,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers import (
     host_memory_budget,
 )
 from sglang.multimodal_gen.runtime.models.vaes import wanvae
+from sglang.multimodal_gen.runtime.models.vaes.autoencoder_dc import AutoencoderDC
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
     LTX2AVDecodingStage,
 )
@@ -64,6 +67,9 @@ class _FakeServerArgs:
 
     def resolve_component_attention_backend(self, _component_name):
         return None, None
+
+    def resolve_component_backend_by_role(self, *_component_names):
+        return {}
 
     def requested_component_attention_backend(self, _component_name):
         return None
@@ -177,6 +183,31 @@ class TestPlainWeightNormCheckpoint(CustomTestCase):
         load_model_state_dict(module, loaded)
 
         self.assertIn("0.parametrizations.weight.original0", module.state_dict())
+
+    def test_lazy_dc_ae_keeps_the_checkpoint_after_state_dict_builds_it(self):
+        """SANA's DC-AE must load its checkpoint even though the loader reads
+        ``state_dict()`` (which builds the lazy inner model) first."""
+        config = SanaVAEConfig()
+        for key, value in dict(
+            latent_channels=4,
+            attention_head_dim=4,
+            encoder_block_types=("ResBlock", "EfficientViTBlock"),
+            decoder_block_types=("ResBlock", "EfficientViTBlock"),
+            encoder_block_out_channels=(8, 16),
+            decoder_block_out_channels=(8, 16),
+            encoder_layers_per_block=(1, 1),
+            decoder_layers_per_block=(1, 1),
+            encoder_qkv_multiscales=((), (5,)),
+            decoder_qkv_multiscales=((), (5,)),
+        ).items():
+            setattr(config.arch_config, key, value)
+        vae = AutoencoderDC(config)
+        checkpoint = {k: torch.randn_like(v) for k, v in vae.state_dict().items()}
+
+        load_model_state_dict(vae, dict(checkpoint), strict=False)
+
+        state = vae.state_dict()
+        self.assertTrue(all(torch.equal(state[k], v) for k, v in checkpoint.items()))
 
     def test_moves_checkpoint_latent_stats_into_arch_config(self):
         config = MiniMaxH3AudioVAEConfig()
@@ -655,6 +686,9 @@ class TestVAELoader(unittest.TestCase):
             (Wan2_2_I2V_A14B_Config, 2, "video_vae", False),
             (LTX2PipelineConfig, 1, "video_vae", True),
             (LTX2PipelineConfig, 2, "video_vae", False),
+            (Cosmos3Config, 1, "vae", True),
+            (Cosmos3Config, 1, "video_vae", True),
+            (Cosmos3Config, 2, "video_vae", False),
         ]
         with (
             patch.dict("os.environ", {}, clear=True),
