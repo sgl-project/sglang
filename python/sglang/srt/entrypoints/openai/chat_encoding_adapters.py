@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Protocol
 import msgspec
 
 if TYPE_CHECKING:
-    from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest, ToolCall
+    from sglang.srt.entrypoints.openai.protocol import (
+        ChatCompletionRequest,
+        ResponsesRequest,
+        ToolCall,
+    )
     from sglang.srt.function_call.core_types import ToolCallItem
 
 EncodingBackend = Literal["builtin", "recipe"]
@@ -17,6 +21,7 @@ EncodingBackend = Literal["builtin", "recipe"]
 class ChatOutputHooks(msgspec.Struct, frozen=True, kw_only=True):
     """Chat-handler policies an output adapter needs, bound to one handler."""
 
+    thinking: Callable[[ChatCompletionRequest], bool]
     tool_call_parsing_active: Callable[[ChatCompletionRequest], bool]
     history_tool_calls_count: Callable[[ChatCompletionRequest], int]
     tool_call_id: Callable[[ToolCallItem, int], str]
@@ -54,6 +59,8 @@ class ChatEncodingOutputAdapter(Protocol):
     def parse_responses_output(
         self,
         *,
+        request: ResponsesRequest,
+        require_reasoning: bool,
         output_ids: list[int],
         finish_reason: Optional[dict[str, Any]],
         separate_reasoning: bool,
@@ -61,7 +68,12 @@ class ChatEncodingOutputAdapter(Protocol):
     ) -> tuple[str, str, list[ToolCallItem]]: ...
 
     def new_responses_stream(
-        self, *, separate_reasoning: bool, parse_tool_calls: bool
+        self,
+        *,
+        request: ResponsesRequest,
+        require_reasoning: bool,
+        separate_reasoning: bool,
+        parse_tool_calls: bool,
     ) -> ResponsesOutputStream: ...
 
 
@@ -92,6 +104,25 @@ class ChatEncodingAdapter(Protocol):
         encoding that collects media itself appends the prompt's images to
         ``image_data`` in placeholder order."""
         ...
+
+
+def select_new_output_ids(
+    *,
+    output_ids: list[int],
+    num_consumed_tokens: int,
+    completion_tokens: int,
+    finish_reason_type: Optional[str],
+    incremental: bool,
+) -> list[int]:
+    """The ids one streamed engine chunk adds for a token-level output parser."""
+    if not incremental:
+        # Intermediate chunks share the live output list; completion_tokens is
+        # this chunk's snapshot, so later tokens wait for their own chunk.
+        return output_ids[num_consumed_tokens:completion_tokens]
+    if finish_reason_type == "abort":
+        # The abort chunk re-sends already-streamed tokens.
+        return output_ids[: max(completion_tokens - num_consumed_tokens, 0)]
+    return output_ids
 
 
 class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
@@ -151,6 +182,9 @@ def _build_deepseek_recipe(
     return DeepSeekRecipeChatEncodingAdapter(
         chat_encoding_spec=ctx.chat_encoding_spec,
         tokenizer=ctx.tokenizer,
+        reasoning_parser=ctx.reasoning_parser,
+        tool_call_parser=ctx.tool_call_parser,
+        chat_hooks=ctx.chat_hooks,
         default_chat_template_kwargs=ctx.default_chat_template_kwargs,
     )
 

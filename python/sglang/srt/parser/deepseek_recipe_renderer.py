@@ -108,16 +108,20 @@ class RecipeEncoder:
         recipe = load_deepseek_recipe()
         self.model = MODEL_NAMES[chat_encoding_spec]
         self.hf_tokenizer = tokenizer
-        special = recipe.SpecialTokens(image=IMAGE_TOKEN)
-        self._options = recipe.ConversionOptions().with_special_tokens(special)
-        encoding = (
-            recipe.DeepseekV4Encoding()
-            if chat_encoding_spec == "dsv4"
-            else recipe.DeepseekV41Encoding()
+        self.special_tokens = recipe.SpecialTokens(image=IMAGE_TOKEN)
+        self._options = recipe.ConversionOptions().with_special_tokens(
+            self.special_tokens
         )
-        self._encoding = encoding.with_special_tokens(special).with_tokenizer(
-            recipe.Tokenizer.from_str(tokenizer.to_str())
-        )
+        if chat_encoding_spec == "dsv4":
+            encoding = recipe.DeepseekV4Encoding()
+            self.model_version = recipe.ModelVersion.DeepseekV4Pro
+        else:
+            encoding = recipe.DeepseekV41Encoding()
+            self.model_version = recipe.ModelVersion.DeepseekV41Flash
+        self.tokenizer = recipe.Tokenizer.from_str(tokenizer.to_str())
+        self._encoding = encoding.with_special_tokens(
+            self.special_tokens
+        ).with_tokenizer(self.tokenizer)
 
     @classmethod
     def from_hf_tokenizer(
@@ -160,6 +164,20 @@ class RecipeEncoder:
         if task is not None:
             prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
         return prompt_ids
+
+    def continuation_stage(self, messages: list[dict[str, Any]]) -> Any:
+        """Where output parsing begins after a thinking-mode prompt that continues
+        the last message of `messages`."""
+        recipe = load_deepseek_recipe()
+        body = pre_normalize(
+            {"messages": messages, "thinking": True, "continue_final_message": True}
+        )
+        body["model"] = self.model
+        try:
+            converted = recipe.ChatCompletionRequest(body).convert(self._options)
+        except recipe.ConversionError as error:
+            raise ValueError(_error_message(error.body)) from error
+        return converted.parsing_options.thinking_initial_stage
 
     def encode_text(self, text: str) -> list[int]:
         return self.hf_tokenizer.encode(text, add_special_tokens=False).ids

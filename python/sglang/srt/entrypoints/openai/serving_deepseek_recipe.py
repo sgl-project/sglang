@@ -1,30 +1,58 @@
 """DeepSeek-V4 / V4.1 serving glue for the ``dsv4`` / ``dsv41`` chat encoding
-specs: prompt encoding through deepseek-recipe under SGLang's request semantics."""
+specs: prompt encoding and output parsing through deepseek-recipe under SGLang's
+request semantics."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+from sglang.srt.entrypoints.openai.chat_encoding_adapters import select_new_output_ids
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionResponseStreamChoice,
+    ChatCompletionStreamResponse,
+    DeltaMessage,
+    FunctionResponse,
+    ToolCall,
+)
+from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.environ import envs
+from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.parser.deepseek_recipe_output import (
+    DeepSeekRecipeOutputParser,
+    RecipeToolCall,
+    RecipeToolCallDelta,
+    whole_tool_calls,
+)
 from sglang.srt.parser.deepseek_recipe_renderer import (
     RecipeEncoder,
+    load_deepseek_recipe,
     parse_effort_budget,
 )
+from sglang.srt.runtime_context import get_serving
 from sglang.srt.utils import ImageData
 
 if TYPE_CHECKING:
-    from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+    from sglang.srt.entrypoints.openai.chat_encoding_adapters import ChatOutputHooks
+    from sglang.srt.entrypoints.openai.protocol import (
+        ChatCompletionRequest,
+        ResponsesRequest,
+    )
 
 DEFAULT_EFFORT_ENVS = {
     "dsv4": envs.SGLANG_DSV4_REASONING_EFFORT,
     "dsv41": envs.SGLANG_DSV41_REASONING_EFFORT,
 }
+PARSERS = {
+    "dsv4": ("deepseek-v4", "deepseekv4"),
+    "dsv41": ("deepseek-v41", "deepseekv41"),
+}
+JSON_RESPONSE_FORMATS = ("json_object", "json_schema")
 
 
 class DeepSeekRecipeChatEncodingAdapter:
     # recipe sorts tool results by call order, so images come from its render.
     collects_openai_media = False
-    output = None
     strict_tool_call_arguments = False  # recipe serializes object arguments itself.
 
     def __init__(
@@ -32,6 +60,9 @@ class DeepSeekRecipeChatEncodingAdapter:
         *,
         chat_encoding_spec: str,
         tokenizer: Any,
+        reasoning_parser: Optional[str],
+        tool_call_parser: Optional[str],
+        chat_hooks: ChatOutputHooks,
         default_chat_template_kwargs: Optional[dict[str, Any]],
     ):
         self._spec = chat_encoding_spec
@@ -44,6 +75,28 @@ class DeepSeekRecipeChatEncodingAdapter:
             {"messages": [{"role": "user", "content": ""}], "thinking": True},
             effort=defaults.get("reasoning_effort"),
         )
+        # recipe parses the output once a DeepSeek parser is configured; other
+        # parsers keep the text path.
+        deepseek_parsers = PARSERS[chat_encoding_spec]
+        configured = (reasoning_parser, tool_call_parser)
+        self._token_output = any(
+            name == expected for name, expected in zip(configured, deepseek_parsers)
+        )
+        if self._token_output and any(
+            name not in (None, expected)
+            for name, expected in zip(configured, deepseek_parsers)
+        ):
+            raise ValueError(
+                f"--reasoning-parser {deepseek_parsers[0]} and --tool-call-parser "
+                f"{deepseek_parsers[1]} cannot be mixed with other parsers, got "
+                f"{reasoning_parser!r} and {tool_call_parser!r}"
+            )
+        self._separate_reasoning = reasoning_parser is not None
+        self._hooks = chat_hooks
+
+    @property
+    def output(self) -> Optional[DeepSeekRecipeChatEncodingAdapter]:
+        return self if self._token_output else None
 
     def encode_messages(
         self,
@@ -125,3 +178,252 @@ class DeepSeekRecipeChatEncodingAdapter:
         return self.encoder.encode(
             body, task=task, effort_budget=budget, image_urls=image_urls
         )
+
+    def parse_chat_response(
+        self,
+        *,
+        request: ChatCompletionRequest,
+        output_ids: list[int],
+        finish_reason: dict[str, Any],
+    ) -> tuple[Optional[str], str, Optional[list[ToolCall]], dict[str, Any]]:
+        delta = self._new_output_parser(request).finish(
+            output_ids, finish_reason, keep_matched_stop=request.no_stop_trim
+        )
+        calls = whole_tool_calls(delta)
+        if not calls:
+            return delta.reasoning or None, delta.content, None, finish_reason
+        history_tool_calls_cnt = self._hooks.history_tool_calls_count(request)
+        tool_calls = [
+            ToolCall(
+                id=self._tool_call_id(call.index, call.name, history_tool_calls_cnt),
+                index=call.index,
+                function=FunctionResponse(name=call.name, arguments=call.arguments),
+            )
+            for call in calls
+        ]
+        if finish_reason["type"] == "stop":
+            finish_reason = {**finish_reason, "type": "tool_calls", "matched": None}
+        return delta.reasoning or None, delta.content, tool_calls, finish_reason
+
+    def stream_chat_chunks(
+        self,
+        *,
+        content: dict[str, Any],
+        index: int,
+        request: ChatCompletionRequest,
+        created: int,
+        parser_dict: dict[int, Any],
+        has_tool_calls: dict[int, bool],
+        choice_logprobs: Optional[dict],
+        finish_reason_type: Optional[str],
+        usage: Optional[dict[str, Any]],
+    ) -> list[str]:
+        if index not in parser_dict:
+            parser_dict[index] = self._new_output_parser(request)
+        parser = parser_dict[index]
+        new_output_ids = select_new_output_ids(
+            output_ids=content["output_ids"],
+            num_consumed_tokens=parser.num_consumed_tokens,
+            completion_tokens=content["meta_info"]["completion_tokens"],
+            finish_reason_type=finish_reason_type,
+            incremental=get_serving().incremental_streaming_output,
+        )
+        if finish_reason_type is None:
+            delta = parser.feed(new_output_ids)
+        else:
+            delta = parser.finish(
+                new_output_ids,
+                content["meta_info"]["finish_reason"],
+                keep_matched_stop=request.no_stop_trim,
+            )
+
+        chunk_fields = dict(
+            chunk_id=content["meta_info"]["id"],
+            created=created,
+            model=request.model,
+            index=index,
+            usage=usage,
+        )
+        chunks = []
+        remaining_logprobs = choice_logprobs
+        if delta.reasoning:
+            chunks.append(
+                build_sse_content(
+                    reasoning_content=delta.reasoning,
+                    logprobs=remaining_logprobs,
+                    **chunk_fields,
+                )
+            )
+            remaining_logprobs = None
+        if delta.content:
+            chunks.append(
+                build_sse_content(
+                    content=delta.content, logprobs=remaining_logprobs, **chunk_fields
+                )
+            )
+            remaining_logprobs = None
+        history_tool_calls_cnt = self._hooks.history_tool_calls_count(request)
+        for piece in delta.tool_calls:
+            has_tool_calls[index] = True
+            # The first piece of a call names it; later pieces extend its arguments.
+            call_id = (
+                self._tool_call_id(piece.index, piece.name, history_tool_calls_cnt)
+                if piece.name is not None
+                else None
+            )
+            tool_call_chunk = ChatCompletionStreamResponse(
+                id=content["meta_info"]["id"],
+                created=created,
+                choices=[
+                    ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(
+                            tool_calls=[
+                                ToolCall(
+                                    id=call_id,
+                                    index=piece.index,
+                                    function=FunctionResponse(
+                                        name=piece.name, arguments=piece.arguments
+                                    ),
+                                )
+                            ]
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                model=request.model,
+                usage=usage,
+            )
+            chunks.append(f"data: {tool_call_chunk.model_dump_json()}\n\n")
+        if remaining_logprobs is not None:
+            chunks.append(
+                build_sse_content(logprobs=remaining_logprobs, **chunk_fields)
+            )
+        return chunks
+
+    def parse_responses_output(
+        self,
+        *,
+        request: ResponsesRequest,
+        require_reasoning: bool,
+        output_ids: list[int],
+        finish_reason: Optional[dict[str, Any]],
+        separate_reasoning: bool,
+        parse_tool_calls: bool,
+    ) -> tuple[str, str, list[ToolCallItem]]:
+        parser = self._new_responses_parser(
+            request, require_reasoning, separate_reasoning, parse_tool_calls
+        )
+        delta = parser.finish(output_ids, finish_reason or {"type": "stop"})
+        return delta.reasoning, delta.content, _tool_call_items(whole_tool_calls(delta))
+
+    def new_responses_stream(
+        self,
+        *,
+        request: ResponsesRequest,
+        require_reasoning: bool,
+        separate_reasoning: bool,
+        parse_tool_calls: bool,
+    ) -> DeepSeekRecipeResponsesStream:
+        return DeepSeekRecipeResponsesStream(
+            self._new_responses_parser(
+                request, require_reasoning, separate_reasoning, parse_tool_calls
+            )
+        )
+
+    def _new_output_parser(
+        self, request: ChatCompletionRequest
+    ) -> DeepSeekRecipeOutputParser:
+        response_format = request.response_format
+        return DeepSeekRecipeOutputParser(
+            self.encoder,
+            thinking_stage=self._thinking_stage(request),
+            parse_tool_calls=request.task is None
+            and self._hooks.tool_call_parsing_active(request),
+            parse_json_output=response_format is not None
+            and response_format.type in JSON_RESPONSE_FORMATS,
+            separate_reasoning=self._separate_reasoning and request.separate_reasoning,
+            stream_reasoning=request.stream_reasoning,
+            stop=_stop_strings(request.stop),
+        )
+
+    def _thinking_stage(self, request: ChatCompletionRequest) -> Any:
+        """Where parsing begins, from the prompt `encode_messages` rendered."""
+        # Other tasks replace the generation header, so the answer is plain text.
+        if request.task not in (None, "action") or not self._hooks.thinking(request):
+            return None
+        stages = load_deepseek_recipe().ThinkingInitialStage
+        last = request.messages[-1] if request.messages else None
+        continued = (
+            request.continue_final_message
+            and last is not None
+            and last.role == "assistant"
+            and isinstance(last.content, str)
+        )
+        if not continued:
+            return stages.ReasoningStart
+        if request.task is not None:
+            return stages.ContentContinuation  # the prefix follows the task token
+        return self.encoder.continuation_stage(
+            [
+                {"role": "user", "content": ""},
+                last.model_dump(exclude_unset=True, by_alias=True, mode="json"),
+            ]
+        )
+
+    def _new_responses_parser(
+        self,
+        request: ResponsesRequest,
+        require_reasoning: bool,
+        separate_reasoning: bool,
+        parse_tool_calls: bool,
+    ) -> DeepSeekRecipeOutputParser:
+        stages = load_deepseek_recipe().ThinkingInitialStage
+        return DeepSeekRecipeOutputParser(
+            self.encoder,
+            thinking_stage=stages.ReasoningStart if require_reasoning else None,
+            parse_tool_calls=parse_tool_calls,
+            separate_reasoning=separate_reasoning,
+            stop=_stop_strings(request.stop),
+        )
+
+    def _tool_call_id(self, index: int, name: str, history_tool_calls_cnt: int) -> str:
+        return self._hooks.tool_call_id(
+            ToolCallItem(tool_index=index, name=name, parameters=""),
+            history_tool_calls_cnt,
+        )
+
+
+class DeepSeekRecipeResponsesStream:
+    def __init__(self, parser: DeepSeekRecipeOutputParser):
+        self._parser = parser
+        self._incremental = get_serving().incremental_streaming_output
+
+    def step(
+        self, chunk: dict[str, Any], finish_reason: Optional[dict[str, Any]]
+    ) -> tuple[str, str, list[ToolCallItem]]:
+        new_output_ids = select_new_output_ids(
+            output_ids=chunk.get("output_ids") or [],
+            num_consumed_tokens=self._parser.num_consumed_tokens,
+            completion_tokens=chunk["meta_info"]["completion_tokens"],
+            finish_reason_type=finish_reason["type"] if finish_reason else None,
+            incremental=self._incremental,
+        )
+        if finish_reason is None:
+            delta = self._parser.feed(new_output_ids)
+        else:
+            delta = self._parser.finish(new_output_ids, finish_reason)
+        return delta.reasoning, delta.content, _tool_call_items(delta.tool_calls)
+
+
+def _stop_strings(stop: Union[str, list[str], None]) -> list[str]:
+    return [stop] if isinstance(stop, str) else stop or []
+
+
+def _tool_call_items(
+    calls: Sequence[Union[RecipeToolCall, RecipeToolCallDelta]],
+) -> list[ToolCallItem]:
+    return [
+        ToolCallItem(tool_index=call.index, name=call.name, parameters=call.arguments)
+        for call in calls
+    ]
