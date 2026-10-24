@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
@@ -68,6 +69,32 @@ class TestDevicePoolEntry(CustomTestCase):
         )
         self.assertEqual(sizes, [[10], [22], [10], [22]])
         self.assertEqual(offsets, [[6], [14], [6], [14]])
+
+    def test_layer_ranges_preserve_layout_and_row_order(self):
+        buffers = [torch.zeros((6, width), dtype=torch.uint8) for width in (3, 5)]
+        for packed in (True, False):
+            pool = DevicePoolEntry(
+                name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[buffers],
+                layer_mapping={0: (0, 1)},
+                page_size=1,
+                rows_are_pages=True,
+                packed=packed,
+            )
+            for rows in ([4, 0, 4], []):
+                ptrs = [[buffer[row].data_ptr() for buffer in buffers] for row in rows]
+                expected = (ptrs, [[3, 5]] * len(rows), [[0, 3]] * len(rows))
+                if not packed:
+                    expected = tuple(
+                        [[value] for row in part for value in row] for part in expected
+                    )
+                for locations in (rows, np.asarray(rows, dtype=np.int64)):
+                    with self.subTest(packed=packed, rows=rows, kind=type(locations)):
+                        self.assertEqual(
+                            pool.get_prepared_layer_range_meta(locations, 0), expected
+                        )
 
     def test_rejects_invalid_pages_and_empty_buffers(self):
         with self.assertRaisesRegex(ValueError, "has no storage buffers"):

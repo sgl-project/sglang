@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
@@ -127,34 +128,37 @@ class DevicePoolEntry:
     def prepare_locations(self, indices: torch.Tensor) -> list[int]:
         return self._rows(indices)
 
-    def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
+    def get_prepared_layer_range_meta(
+        self, locations: list[int] | np.ndarray, layer: int
+    ):
+        """Range metadata for one layer, one nested list per object.
+
+        Every row emits the same (size, offset) items, so all rows share one
+        read-only list each; the pointers are affine in the row.
+        """
         mapped = self.layer_mapping.get(layer)
         if mapped is None:
             return None
         buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
 
-        items = []
-        for component, offsets in zip(self.buffer_meta, self._component_offsets):
-            for buffer_index in buffer_indices:
-                base_ptr, row_stride, size = component[buffer_index]
-                items.append((base_ptr, row_stride, size, offsets[buffer_index]))
-
-        ptrs, sizes, offsets = [], [], []
-        for row in locations:
-            row_ptrs = [
-                base_ptr + row * row_stride for base_ptr, row_stride, _, _ in items
-            ]
-            row_sizes = [size for _, _, size, _ in items]
-            row_offsets = [offset for _, _, _, offset in items]
-            if self.packed:
-                ptrs.append(row_ptrs)
-                sizes.append(row_sizes)
-                offsets.append(row_offsets)
-            else:
-                ptrs.extend([[value] for value in row_ptrs])
-                sizes.extend([[value] for value in row_sizes])
-                offsets.extend([[value] for value in row_offsets])
-        return ptrs, sizes, offsets
+        items = [
+            (*component[buffer_index], offsets[buffer_index])
+            for component, offsets in zip(self.buffer_meta, self._component_offsets)
+            for buffer_index in buffer_indices
+        ]
+        base = np.array([item[0] for item in items], dtype=np.int64)
+        stride = np.array([item[1] for item in items], dtype=np.int64)
+        rows = np.asarray(locations, dtype=np.int64)
+        ptrs = rows[:, None] * stride + base
+        row_sizes = [item[2] for item in items]
+        row_offsets = [item[3] for item in items]
+        if self.packed:
+            return ptrs.tolist(), [row_sizes] * len(rows), [row_offsets] * len(rows)
+        return (
+            ptrs.reshape(-1, 1).tolist(),
+            [[value] for value in row_sizes] * len(rows),
+            [[value] for value in row_offsets] * len(rows),
+        )
 
 
 class DevicePoolGroup:
