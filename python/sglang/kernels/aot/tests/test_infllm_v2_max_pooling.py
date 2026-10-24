@@ -54,7 +54,9 @@ def _ref_varlen(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("num_heads", [1, 4])
 @pytest.mark.parametrize("seq_lens", [[37], [16, 48], [8, 8, 24]])
-def test_max_pooling_varlen_matches_reference(dtype, num_heads, seq_lens):
+# 32 is max_context_len // kernel_stride; 128 mimics stage-1's key-axis round-up.
+@pytest.mark.parametrize("max_k", [32, 128])
+def test_max_pooling_varlen_matches_reference(dtype, num_heads, seq_lens, max_k):
     torch.manual_seed(0)
     block_size = 64
     kernel_stride = 16
@@ -63,7 +65,6 @@ def test_max_pooling_varlen_matches_reference(dtype, num_heads, seq_lens):
     max_context_len = 512
 
     total_q = sum(seq_lens)
-    max_k = max_context_len // kernel_stride
     cu = [0]
     for n in seq_lens:
         cu.append(cu[-1] + n)
