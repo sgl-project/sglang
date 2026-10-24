@@ -180,6 +180,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    TokenKVSnapshotReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -1871,6 +1872,7 @@ class Scheduler(
                     self.weight_updater.check_weights,
                 ),
                 (SlowDownReqInput, self.slow_down),
+                (TokenKVSnapshotReqInput, self.handle_token_kv_snapshot),
                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
                 (
                     ProfileReq,
@@ -3293,6 +3295,26 @@ class Scheduler(
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
             self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
 
+        if os.environ.get("SGLANG_ENABLE_TOKEN_KV_SNAPSHOT") == "1" and not hasattr(
+            self, "token_kv_snapshot_manager"
+        ):
+            from sglang.srt.managers.token_kv_snapshot import TokenKVSnapshotManager
+
+            self.token_kv_snapshot_manager = TokenKVSnapshotManager(self)
+        if recv_req.token_kv_restore is not None:
+            if not hasattr(self, "token_kv_snapshot_manager"):
+                from sglang.srt.managers.token_kv_snapshot import TokenKVSnapshotManager
+
+                self.token_kv_snapshot_manager = TokenKVSnapshotManager(self)
+            try:
+                self.token_kv_snapshot_manager.import_for_generation(
+                    req, recv_req.token_kv_restore
+                )
+            except Exception as error:
+                prepare_abort(req, str(error), status_code=HTTPStatus.BAD_REQUEST)
+                self.output_streamer.stream_output([req], req.return_logprob)
+            return
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
@@ -4586,6 +4608,7 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        _tkv_intervals = None
         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
@@ -4667,6 +4690,11 @@ class Scheduler(
                                 )
 
                         # FIXME: pp is not compatible with overlap
+                        _tkv_manager = getattr(self, "token_kv_snapshot_manager", None)
+                        if _tkv_manager is not None:
+                            _tkv_intervals = (
+                                _tkv_manager.capture_native_input_intervals(batch)
+                            )
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
@@ -4722,6 +4750,9 @@ class Scheduler(
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
+                _tkv_manager = getattr(self, "token_kv_snapshot_manager", None)
+                if _tkv_manager is not None:
+                    _tkv_intervals = _tkv_manager.capture_native_input_intervals(batch)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
                 batch.input_ids = None
@@ -4779,6 +4810,11 @@ class Scheduler(
                             verify_forward_batch.out_cache_loc
                         )
                     else:
+                        _tkv_manager = getattr(self, "token_kv_snapshot_manager", None)
+                        if _tkv_manager is not None:
+                            _tkv_intervals = (
+                                _tkv_manager.capture_native_input_intervals(batch)
+                            )
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, pp_proxy_tensors=pp_proxy_tensors
                         )
@@ -4792,6 +4828,11 @@ class Scheduler(
                     # future_map relay / on_publish).
                     resolve_forward_inputs(batch, self.future_map)
                     with self._forward_isolation(batch, overlap=False):
+                        _tkv_manager = getattr(self, "token_kv_snapshot_manager", None)
+                        if _tkv_manager is not None:
+                            _tkv_intervals = (
+                                _tkv_manager.capture_native_input_intervals(batch)
+                            )
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, pp_proxy_tensors=pp_proxy_tensors
                         )
@@ -4833,6 +4874,9 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                _tkv_manager = getattr(self, "token_kv_snapshot_manager", None)
+                if _tkv_manager is not None:
+                    _tkv_intervals = _tkv_manager.capture_native_input_intervals(batch)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
@@ -4898,6 +4942,8 @@ class Scheduler(
 
         self._maybe_report_active_ranks()
 
+        if _tkv_intervals is not None:
+            ret._token_kv_native_input_intervals = _tkv_intervals
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
@@ -5072,6 +5118,12 @@ class Scheduler(
         self.tree_cache.flush_pending_backups()
 
         self._record_step_counters(batch, result)
+        snapshot_manager = getattr(self, "token_kv_snapshot_manager", None)
+        if snapshot_manager is not None:
+            snapshot_manager.observe_native_input_intervals(
+                getattr(result, "_token_kv_native_input_intervals", None)
+            )
+            snapshot_manager.observe_batch_result(batch)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
@@ -5591,6 +5643,16 @@ class Scheduler(
             inflight_batches.extend(batch for batch, _ in self.result_queue)
         return inflight_batches
 
+    def handle_token_kv_snapshot(self, recv_req: TokenKVSnapshotReqInput):
+        from sglang.srt.managers.token_kv_snapshot import TokenKVSnapshotManager
+
+        manager = getattr(self, "token_kv_snapshot_manager", None)
+        if manager is None:
+            manager = TokenKVSnapshotManager(self)
+            if os.environ.get("SGLANG_ENABLE_TOKEN_KV_SNAPSHOT") == "1":
+                self.token_kv_snapshot_manager = manager
+        return manager.handle(recv_req)
+
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
@@ -5851,6 +5913,9 @@ class Scheduler(
         self.kv_events_publisher.publish_kv_events()
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        snapshot_manager = getattr(self, "token_kv_snapshot_manager", None)
+        if snapshot_manager is not None and snapshot_manager.has_released_request:
+            raise ValueError("Cannot continue before released snapshot is restored")
         if recv_req.torch_empty_cache:
             before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
             torch.cuda.empty_cache()

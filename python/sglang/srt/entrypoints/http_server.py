@@ -155,6 +155,7 @@ from sglang.srt.managers.io_struct import (
     SeparateReasoningReqInput,
     SetInternalStateReq,
     SlowDownReqInput,
+    TokenKVSnapshotReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
@@ -1549,6 +1550,25 @@ async def get_weights_by_name(
             return ORJSONResponse(ret, status_code=200)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.post("/token_kv_snapshot")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def token_kv_snapshot(obj: Annotated[TokenKVSnapshotReqInput, Body()]):
+    """Persist and restore a settled same-version hybrid decode request."""
+    try:
+        result = await _global_state.tokenizer_manager.token_kv_snapshot(obj)
+        return ORJSONResponse(
+            result,
+            status_code=HTTPStatus.OK
+            if result["status"] == "PASS"
+            else HTTPStatus.CONFLICT,
+        )
+    except Exception as error:
+        return ORJSONResponse(
+            {"status": "FAILED", "error": str(error)},
+            status_code=HTTPStatus.CONFLICT,
+        )
 
 
 @app.api_route("/release_memory_occupation", methods=["GET", "POST"])

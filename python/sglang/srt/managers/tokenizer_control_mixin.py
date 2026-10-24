@@ -4,6 +4,7 @@ import asyncio
 import copy
 import hashlib
 import logging
+import os
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -72,6 +73,8 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    TokenKVSnapshotReqInput,
+    TokenKVSnapshotReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -108,6 +111,7 @@ logger = logging.getLogger(__name__)
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
 _COMMUNICATOR_SPECS = [
+    ("token_kv_snapshot", TokenKVSnapshotReqOutput),
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
@@ -193,6 +197,72 @@ class TokenizerControlMixin:
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+
+    async def token_kv_snapshot(self: TokenizerManager, obj: TokenKVSnapshotReqInput):
+        self.auto_create_handle_loop()
+        responses = await self.token_kv_snapshot_communicator(obj)
+        ranks = [rank for response in responses for rank in response.results]
+        success = bool(ranks) and all(rank["status"] == "PASS" for rank in ranks)
+        manifest = None
+        manifest_ref = None
+        manifest_commit_s = None
+        physical_export = obj.operation == "export" or (
+            obj.operation == "preempt"
+            and bool(ranks)
+            and all(
+                rank.get("source_disposition") == "ACTIVE_EXPORTED" for rank in ranks
+            )
+        )
+        if success and physical_export:
+            # All TP ranks have written their payload before this commit. A
+            # release command must independently verify the committed files.
+            import time
+
+            from sglang.srt.mem_cache.token_kv_snapshot_store import (
+                TokenKVSnapshotStore,
+            )
+
+            store = TokenKVSnapshotStore(obj.storage_dir)
+            commit_started = time.perf_counter()
+            manifest = store.commit(
+                obj.snapshot_id, tp_size=ranks[0]["identity"]["tp_size"]
+            )
+            manifest_ref = store.receipt(obj.snapshot_id)["manifest_ref"]
+            manifest_commit_s = time.perf_counter() - commit_started
+        if success and obj.operation == "release":
+            # A detached request no longer belongs to the source batch. Other
+            # native requests may resume while it is restored on another worker.
+            detached = all(
+                rank.get("detached") is True
+                and rank.get("engine_generation_unblocked") is True
+                for rank in ranks
+            )
+            if not detached:
+                self._token_kv_pending_restore = obj.snapshot_id
+        if success and obj.operation == "restore":
+            self._token_kv_pending_restore = None
+        first = ranks[0] if ranks else {}
+        return {
+            "status": "PASS" if success else "FAILED",
+            "operation": obj.operation,
+            "snapshot_id": obj.snapshot_id,
+            "identity": first.get("identity"),
+            "engine_instance_id": first.get("engine_instance_id"),
+            "portable_restore_supported": first.get("supported", False),
+            "supported": first.get("supported", success),
+            "runtime_constraints": first.get("runtime_constraints", []),
+            "ranks": ranks,
+            "output_ids": first.get("output_ids"),
+            "output_logprobs": first.get("output_logprobs"),
+            "source_binding": first.get("source_binding"),
+            "output_weight_versions": first.get("output_weight_versions"),
+            "manifest": manifest,
+            "manifest_ref": manifest_ref,
+            "manifest_commit_s": manifest_commit_s,
+            "snapshot_committed": manifest is not None,
+            "save_ref": obj.storage_dir,
+            "recovery_scope": "LOCAL_FRESH_SLOT_RESTORE",
+        }
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
@@ -1054,6 +1124,22 @@ class TokenizerControlMixin:
     ) -> None:
         self.auto_create_handle_loop()
         await self.update_weight_version_communicator(obj)
+        if os.environ.get("SGLANG_ENABLE_TOKEN_KV_SNAPSHOT") == "1":
+            observed = await self.token_kv_snapshot(
+                TokenKVSnapshotReqInput(operation="inspect")
+            )
+            ranks = observed.get("ranks", [])
+            if (
+                observed.get("status") != "PASS"
+                or len(ranks) != get_parallel().tp_size
+                or {row.get("tp_rank") for row in ranks}
+                != set(range(get_parallel().tp_size))
+                or any(
+                    row.get("identity", {}).get("weight_version") != obj.new_version
+                    for row in ranks
+                )
+            ):
+                raise RuntimeError("Native scheduler weight-version readback differs")
         self._update_weight_version_if_provided(obj.new_version)
 
     def _update_weight_version_if_provided(

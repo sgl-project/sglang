@@ -915,6 +915,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.auto_create_handle_loop()
 
         # Normalize the request
+        if isinstance(obj, GenerateReqInput) and obj.token_kv_restore is not None:
+            from sglang.srt.managers.token_kv_snapshot import (
+                prepare_portable_generate_input,
+            )
+
+            prepare_portable_generate_input(obj)
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
         if (
@@ -1577,8 +1583,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             custom_params = dict(sampling_kwargs.get("custom_params") or {})
             custom_params["thinking_budget"] = obj.max_thinking_tokens
             sampling_kwargs["custom_params"] = custom_params
-        sampling_params = self.sampling_params_class(**sampling_kwargs)
-        sampling_params.normalize(self.tokenizer)
+        if isinstance(obj, GenerateReqInput) and obj.token_kv_restore is not None:
+            from sglang.srt.managers.token_kv_snapshot import (
+                sampling_params_from_snapshot,
+            )
+
+            sampling_params = sampling_params_from_snapshot(obj.sampling_params)
+        else:
+            sampling_params = self.sampling_params_class(**sampling_kwargs)
+            sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
         _validate_watermark_request(sampling_params)
 
@@ -1639,6 +1652,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
                 encoder_urls=obj.encoder_urls,
+                token_kv_restore=obj.token_kv_restore,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -2295,6 +2309,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
+        if getattr(self, "_token_kv_pending_restore", None) is not None:
+            raise ValueError("Cannot continue before released snapshot is restored")
         async with self.is_pause_cond:
             self.is_pause = False
             await self._async_dispatch_to_scheduler(obj)

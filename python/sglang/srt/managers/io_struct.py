@@ -379,6 +379,9 @@ class GenerateReqInput:
         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
     ] = None
 
+    # Opt-in restoration of one committed same-version native request.
+    token_kv_restore: Optional[Dict[str, Any]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -1177,6 +1180,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+
+    # Opt-in restoration of one committed same-version native request.
+    token_kv_restore: Optional[Dict[str, Any]] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -2488,6 +2494,22 @@ class VertexGenerateReqInput(BaseReq, kw_only=True):
     # msgpack-native.
     instances: List[Dict[str, Any]]
     parameters: Optional[Dict[str, Any]] = None
+
+
+class TokenKVSnapshotReqInput(BaseReq, kw_only=True):
+    operation: str
+    snapshot_id: Optional[str] = None
+    target_rid: Optional[str] = None
+    storage_dir: Optional[str] = None
+    expected_weight_version: Optional[str] = None
+    identity: Optional[Dict[str, Any]] = None
+    release_full_gpu_pool: bool = False
+    source_binding: Optional[Dict[str, Any]] = None
+
+
+class TokenKVSnapshotReqOutput(BaseReq, kw_only=True):
+    success: bool
+    results: List[Dict[str, Any]]
 
 
 class RpcReqInput(BaseReq, kw_only=True):
