@@ -577,6 +577,7 @@ class ServerArgs(DisaggServerArgsMixin):
     batching_config: str | None = None
     enable_batching_metrics: bool = False
     async_output_save: bool = False
+    sleep_on_idle: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -3083,6 +3084,14 @@ class ServerArgs(DisaggServerArgsMixin):
             action="store_true",
             default=ServerArgs.enable_batching_metrics,
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
+        )
+        parser.add_argument(
+            "--sleep-on-idle",
+            action="store_true",
+            default=ServerArgs.sleep_on_idle,
+            help="Reduce idle CPU usage by waiting for requests instead of busy polling. "
+            "Disabled by default to minimize wake-up latency. Applies only to "
+            "single-rank monolithic replicas; TP/SP/CFG multi-rank replicas keep polling.",
         )
         parser.add_argument(
             "--async-output-save",
