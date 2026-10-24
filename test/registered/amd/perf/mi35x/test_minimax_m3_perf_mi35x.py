@@ -6,7 +6,7 @@ quick INT4 all-reduce), so a throughput regression cannot be confused with a
 configuration difference. MI35x (gfx950 / CDNA4) has hardware MX-scaled matmul,
 so the MXFP8 MoE weights are served natively.
 
-This runs as the step after the eval inside nightly-4-gpu-mi35x-minimax-m3-rocm720
+This runs as the step after the eval inside nightly-4-gpu-mi35x-minimax-m3
 rather than as a job of its own, which is how the other combined accuracy plus
 performance jobs in that workflow are arranged. Sharing the job reuses the
 already-cached checkpoint and one MI35x runner slot, and step ordering supplies
