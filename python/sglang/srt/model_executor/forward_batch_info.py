@@ -723,6 +723,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # shape from the live batch. None preserves eager/default graph behavior.
     max_seq_len_override: Optional[int] = None
 
+    # Host-side max of the allocated seq lens (spec decode, mirrorless
+    # opt-out); NPU attention metadata prep sizes the graph block-table
+    # gather from it without a device sync.
+    max_seq_len_host: Optional[int] = None
+
     # For logits and logprobs post processing
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None
@@ -1042,6 +1047,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
+            max_seq_len_host=getattr(batch, "max_seq_len_host", None),
             req_pool_indices_cpu=(
                 getattr(batch, "req_pool_indices_cpu", None)
                 if batch.forward_mode.is_extend_without_speculative()
@@ -2306,6 +2312,8 @@ def build_inner_fb_view(
         kv_loc_cols=getattr(forward_batch, "kv_loc_cols", None),
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+        # A caller may hand in another view that does not carry this field.
+        max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         spec_info=forward_batch.spec_info,
     )
 
