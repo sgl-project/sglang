@@ -83,6 +83,7 @@ class TestW4AFP8DeepEPNormalPostReorder(CustomTestCase):
             w2_input_scale=torch.ones(1),
         )
 
+        quant_mock = Mock()
         with (
             patch.object(
                 w4a8_moe,
@@ -110,16 +111,123 @@ class TestW4AFP8DeepEPNormalPostReorder(CustomTestCase):
             patch.object(
                 w4a8_moe,
                 "per_tensor_quant_fp8",
+                new=quant_mock,
+            ),
+            patch.object(w4a8_moe, "silu_and_mul", new=lambda *args, **kwargs: None),
+        ):
+            for input_dtype, expected_quant_calls in (
+                (torch.bfloat16, 2),
+                (torch.float8_e4m3fn, 1),
+            ):
+                with self.subTest(input_dtype=input_dtype):
+                    quant_mock.reset_mock()
+                    output = w4a8_moe.cutlass_w4a8_moe_deepep_normal(
+                        torch.ones((num_tokens, hidden_size), dtype=input_dtype),
+                        layer.w13_weight,
+                        layer.w2_weight,
+                        layer.w13_weight_scale_inv,
+                        layer.w2_weight_scale_inv,
+                        topk_weights,
+                        topk_ids,
+                        strides,
+                        strides,
+                        strides,
+                        strides,
+                        strides,
+                        strides,
+                        strides,
+                        strides,
+                        expert_offsets,
+                        problem_sizes,
+                        problem_sizes,
+                        layer.w13_input_scale,
+                        layer.w2_input_scale,
+                    )
+
+                    self.assertEqual(output.shape, (num_tokens, hidden_size))
+                    self.assertEqual(output.dtype, torch.bfloat16)
+                    # Static-FP8 payloads skip the receive-side requantization;
+                    # only the intermediate SiLU*up quant remains.
+                    self.assertEqual(quant_mock.call_count, expected_quant_calls)
+                    self.assertEqual(
+                        quant_mock.call_args.args[0].shape[-1], intermediate_size
+                    )
+
+    def test_static_fp8_payload_permuted_via_bf16_view(self):
+        """The FP8 payload reuses the exact BF16 element-copy permute path."""
+
+        num_tokens, hidden_size, intermediate_size = 2, 8, 4
+        num_experts, topk = 2, 2
+        topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+        topk_weights = torch.full((num_tokens, topk), 0.5, dtype=torch.float32)
+        src2dst = torch.arange(num_tokens * topk, dtype=torch.int64)
+
+        permute_calls = []
+
+        def fake_permute(a_perm, out, _src2dst, _topk_ids, _unused, _topk, _k, **kw):
+            permute_calls.append((a_perm.dtype, tuple(a_perm.shape), out.dtype))
+
+        preprocess_result = (
+            torch.arange(num_tokens * topk),
+            src2dst,
+            torch.empty(0),
+        )
+        strides = torch.zeros((num_experts, 3), dtype=torch.int64)
+        expert_offsets = torch.zeros(num_experts + 1, dtype=torch.int32)
+        problem_sizes = torch.zeros((num_experts, 3), dtype=torch.int32)
+
+        mm_a_inputs = []
+
+        def fake_mm(_c, a, *_args, **_kwargs):
+            mm_a_inputs.append((a.dtype, tuple(a.shape)))
+
+        with (
+            patch.object(
+                w4a8_moe,
+                "deepep_run_moe_deep_preprocess",
+                return_value=preprocess_result,
+            ),
+            patch.object(
+                w4a8_moe,
+                "deepep_permute_triton_kernel",
+                _KernelLauncher(fake_permute),
+            ),
+            patch.object(
+                w4a8_moe,
+                "deepep_post_reorder_triton_kernel",
+                _KernelLauncher(lambda *args, **kwargs: None),
+            ),
+            patch.object(
+                w4a8_moe,
+                "get_cutlass_w4a8_moe_mm_data",
+                new=lambda *args, **kwargs: None,
+                create=True,
+            ),
+            patch.object(
+                w4a8_moe,
+                "cutlass_w4a8_moe_mm",
+                new=fake_mm,
+                create=True,
+            ),
+            patch.object(
+                w4a8_moe,
+                "per_tensor_quant_fp8",
                 new=lambda *args, **kwargs: None,
             ),
             patch.object(w4a8_moe, "silu_and_mul", new=lambda *args, **kwargs: None),
         ):
-            output = w4a8_moe.cutlass_w4a8_moe_deepep_normal(
-                torch.ones((num_tokens, hidden_size), dtype=torch.bfloat16),
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale_inv,
-                layer.w2_weight_scale_inv,
+            w4a8_moe.cutlass_w4a8_moe_deepep_normal(
+                torch.ones((num_tokens, hidden_size), dtype=torch.float8_e4m3fn),
+                torch.zeros(
+                    (num_experts, intermediate_size * 2, hidden_size // 2),
+                    dtype=torch.int8,
+                ),
+                torch.zeros(
+                    (num_experts, hidden_size, intermediate_size // 2),
+                    dtype=torch.int8,
+                ),
+                torch.ones((num_experts, 1, 1)),
+                torch.ones((num_experts, 1, 1)),
                 topk_weights,
                 topk_ids,
                 strides,
@@ -133,12 +241,26 @@ class TestW4AFP8DeepEPNormalPostReorder(CustomTestCase):
                 expert_offsets,
                 problem_sizes,
                 problem_sizes,
-                layer.w13_input_scale,
-                layer.w2_input_scale,
+                torch.ones(1),
+                torch.ones(1),
             )
 
-        self.assertEqual(output.shape, (num_tokens, hidden_size))
-        self.assertEqual(output.dtype, torch.bfloat16)
+        # The permute kernel sees a BF16 view with half the columns, and the
+        # first GEMM receives the restored FP8 tensor with the full hidden size.
+        self.assertEqual(
+            permute_calls,
+            [
+                (
+                    torch.bfloat16,
+                    (num_tokens, hidden_size // 2),
+                    torch.bfloat16,
+                )
+            ],
+        )
+        self.assertEqual(
+            mm_a_inputs[0],
+            (torch.float8_e4m3fn, (num_tokens * topk, hidden_size)),
+        )
 
 
 if __name__ == "__main__":
