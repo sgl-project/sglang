@@ -267,6 +267,8 @@ class TopKConfig:
     shared_experts: SharedExpertsConfig = SharedExpertsConfig()
     custom_routing_function: Optional[Callable] = None
     correction_bias: Optional[torch.Tensor] = None
+    # Route with correction_bias as stored instead of in the gating dtype on aiter.
+    fp32_correction_bias: bool = False
     torch_native: bool = False
     routed_scaling_factor: Optional[float] = None
     apply_routed_scaling_factor_on_output: bool = False
@@ -683,6 +685,8 @@ class TopK(BaseFusedOp):
     --fused_shared_experts_scaling_factor: absolute appended weight on the global AITER
       path; otherwise multiplies the router's existing shared weight under standard EP.
       Models include 1/ep_size when the per-rank shared-expert outputs are all-reduced.
+    --fp32_correction_bias: on aiter grouped routing, pass correction_bias as stored instead
+      of casting it to the gating dtype; an fp32 bias then upcasts the logits.
     """
 
     def __init__(
@@ -707,6 +711,7 @@ class TopK(BaseFusedOp):
         allow_routed_experts_capture: bool = True,
         sqrtsoftplus_log1p: bool = False,
         fused_gate_packed_ids: bool = False,
+        fp32_correction_bias: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -739,6 +744,7 @@ class TopK(BaseFusedOp):
             shared_experts=shared_experts,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
+            fp32_correction_bias=fp32_correction_bias,
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
@@ -2108,12 +2114,12 @@ def biased_grouped_topk_gpu(
         assert hidden_states.shape[0] == gating_output.shape[0], (
             f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
         )
-        bias = correction_bias.to(dtype=gating_output.dtype)
         scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
 
         if envs.SGLANG_K3_RADIX4_TOPK.get():
             from sglang.kernels.ops.moe import moe_route_radix4
 
+            bias = correction_bias.to(dtype=gating_output.dtype)
             # Gated on the routing shape. Kimi-K3 (896 experts, top-16,
             # ungrouped) is the only config covered for now; anything else
             # falls back to aiter.
@@ -2136,7 +2142,7 @@ def biased_grouped_topk_gpu(
             aiter_bias = correction_bias
         else:
             aiter_gating_output = gating_output
-            aiter_bias = bias
+            aiter_bias = correction_bias.to(dtype=gating_output.dtype)
         aiter_biased_grouped_topk(
             aiter_gating_output,
             aiter_bias,
@@ -2892,12 +2898,14 @@ def select_experts(
     # Only aiter_biased_grouped_topk wants the bias in the gating dtype. The JIT
     # router returns before it in biased_grouped_topk_gpu and upcasts the bias
     # in-register, so downcasting here would only buy it a per-call cast back.
+    # With fp32_correction_bias, biased_grouped_topk_gpu upcasts the logits instead.
     if (
         _use_aiter
         and use_grouped_topk
         and correction_bias is not None
         and not envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
         and dynamic_expert_bias is None
+        and not topk_config.fp32_correction_bias
     ):
         correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
 
