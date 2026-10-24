@@ -87,10 +87,17 @@ class BaseTpWorker(ABC):
         pass
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        ctx_repr: int = 0,
     ) -> None:
         """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
         process relayed spec results through a plain worker."""
+
+    def get_adaptive_context(self, reqs) -> int:
+        """Plain workers never own a context-aware adaptive controller."""
+        return 0
 
     @property
     def last_shared_read_runner(self):
