@@ -124,6 +124,10 @@ Each runtime has a process-local hook registry. SRT retains its single
 resolving a dotted hook target can import that target's entire module graph.
 Both runtimes honor `SGLANG_PLUGINS`.
 
+SRT also loads general plugins when you construct or reconstruct `ServerArgs`,
+including unpickling it in a spawned subprocess. This makes model/config/tokenizer
+hooks available to embedders before they construct `Engine` or read model metadata.
+
 The loader is called at these SRT entry points:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
