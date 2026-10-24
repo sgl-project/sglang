@@ -154,6 +154,10 @@ from sglang.srt.utils.network import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
+from sglang.srt.utils.xpu_tensor_shm import (
+    monkey_patch_xpu_tensor_reductions,
+    staged_xpu_segments,
+)
 from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
 from sglang.srt.weight_cache.protocol import (
     cleanup_stale_daemon_files,
@@ -1682,17 +1686,18 @@ class Engine(EngineScoreMixin, EngineBase):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
-        serialized_named_tensors = self._serialize_tensors_per_rank(
-            named_tensors, load_format
-        )
-        obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=serialized_named_tensors,
-            load_format=load_format,
-            flush_cache=flush_cache,
-        )
-        return self.loop.run_until_complete(
-            self.tokenizer_manager.update_weights_from_tensor(obj, None)
-        )
+        with staged_xpu_segments(pp_size=get_parallel().pp_size):
+            serialized_named_tensors = self._serialize_tensors_per_rank(
+                named_tensors, load_format
+            )
+            obj = UpdateWeightsFromTensorReqInput(
+                serialized_named_tensors=serialized_named_tensors,
+                load_format=load_format,
+                flush_cache=flush_cache,
+            )
+            return self.loop.run_until_complete(
+                self.tokenizer_manager.update_weights_from_tensor(obj, None)
+            )
 
     def update_weights_from_disk(
         self,
@@ -1760,18 +1765,19 @@ class Engine(EngineScoreMixin, EngineBase):
         config_dict: Dict,
         load_format: Optional[str] = None,
     ):
-        serialized_named_tensors = self._serialize_tensors_per_rank(
-            tensors, load_format
-        )
-        lora_req = LoadLoRAAdapterFromTensorsReqInput(
-            lora_name=lora_name,
-            config_dict=config_dict,
-            serialized_named_tensors=serialized_named_tensors,
-            load_format=load_format,
-        )
-        return self.loop.run_until_complete(
-            self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
-        )
+        with staged_xpu_segments(pp_size=get_parallel().pp_size):
+            serialized_named_tensors = self._serialize_tensors_per_rank(
+                tensors, load_format
+            )
+            lora_req = LoadLoRAAdapterFromTensorsReqInput(
+                lora_name=lora_name,
+                config_dict=config_dict,
+                serialized_named_tensors=serialized_named_tensors,
+                load_format=load_format,
+            )
+            return self.loop.run_until_complete(
+                self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
+            )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
         """Load a new LoRA adapter without re-launching the engine."""
@@ -1992,6 +1998,10 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set gc threshold
     if gc_threshold := cfg.gc_threshold:
         gc.set_threshold(*gc_threshold)
+
+    # PyTorch has no XPU tensor IPC; without this, a caller that serializes its own
+    # update_weights_from_tensor payloads here fails where a CUDA caller needs no setup.
+    monkey_patch_xpu_tensor_reductions()
 
 
 def _scheduler_died_error(rank: int, proc) -> RuntimeError:
