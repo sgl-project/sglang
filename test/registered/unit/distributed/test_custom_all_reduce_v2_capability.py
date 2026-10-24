@@ -1,3 +1,23 @@
+"""Capability selection for custom all-reduce v2.
+
+`can_use_custom_all_reduce_v2()` answers one question: is this process group one
+custom AR v2 can serve? Two shapes qualify, and they are gated differently.
+
+* **Intra-node** defers to the node-local NVLink/P2P capability check, which
+  covers the cudaIpc graph-input path as well as the eager one.
+* **Multi-node (MNNVL)** is gated on the group being a single NVLink fabric
+  clique (one NVL72 / MNNVL domain): such a clique shares one address space
+  across nodes, so the symm-mem workspace and fabric peer VAs are valid
+  group-wide.
+
+Multi-node is deliberately *not* gated on the caching allocator being
+VMM-backed. That probe's only consumer is graph zero-copy input registration,
+and `CustomAllReduceV2` already disables graph mode on a multi-node group
+outright (`_is_graph_mode_supported`), so the path can never run there.
+
+    python -m pytest test/registered/unit/distributed/test_custom_all_reduce_v2_capability.py -v
+"""
+
 from unittest.mock import Mock
 
 import pytest
@@ -30,17 +50,14 @@ def _patch_group(monkeypatch, *, world_size, same_node):
 
 
 @pytest.mark.parametrize(
-    ("same_node", "has_fabric_clique", "uses_vmm", "expected"),
+    ("same_node", "has_fabric_clique", "expected"),
     [
-        (False, True, True, True),
-        (False, False, True, False),
-        (False, True, False, False),
-        (True, None, None, True),
+        (False, True, True),
+        (False, False, False),
+        (True, None, True),
     ],
 )
-def test_topology_capability(
-    monkeypatch, same_node, has_fabric_clique, uses_vmm, expected
-):
+def test_topology_capability(monkeypatch, same_node, has_fabric_clique, expected):
     world_size = 8 if same_node else 16
     group, device = _patch_group(
         monkeypatch,
@@ -53,22 +70,12 @@ def test_topology_capability(
             pytest.fail("intra-node groups do not need a fabric clique")
         return has_fabric_clique
 
-    def is_vmm_backed(device):
-        if same_node:
-            pytest.fail("intra-node groups do not need VMM")
-        return uses_vmm
-
     intra_node_capability = Mock(return_value=True)
 
     monkeypatch.setattr(
         custom_all_reduce_v2,
         "is_one_nvlink_clique",
         is_one_clique,
-    )
-    monkeypatch.setattr(
-        custom_all_reduce_v2,
-        "_is_vmm_backed_allocator",
-        is_vmm_backed,
     )
     monkeypatch.setattr(
         custom_all_reduce_v2,
@@ -86,6 +93,37 @@ def test_topology_capability(
         )
     else:
         intra_node_capability.assert_not_called()
+
+
+def test_multinode_is_not_gated_on_the_allocator(monkeypatch):
+    """BUG REGRESSION (#36429). Multi-node v2 required a VMM-backed caching
+    allocator, but that probe guards graph zero-copy input registration, which a
+    multi-node group never runs. The requirement was stale from the moment
+    graph mode was disabled for multi-node, and it rejected v2 on every default
+    launch -- silently costing ~19% throughput on a GB300 NVL72.
+
+    A default launch is exactly this case: plain cudaMalloc from the caching
+    allocator, so `is_vmm_pointer` answers False for every probe. The capability
+    answer must not depend on it.
+    """
+    group, device = _patch_group(monkeypatch, world_size=16, same_node=False)
+    monkeypatch.setattr(custom_all_reduce_v2, "is_one_nvlink_clique", lambda g, d: True)
+    monkeypatch.setattr(custom_all_reduce_v2, "is_vmm_pointer", lambda ptr: False)
+
+    assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is True
+
+
+def test_multinode_without_the_clique_is_still_rejected(monkeypatch):
+    """The topology half stays a hard requirement: admitting v2 on a cross-node
+    group that is not one fabric clique would use fabric peer VAs that are not
+    valid group-wide."""
+    group, device = _patch_group(monkeypatch, world_size=16, same_node=False)
+    monkeypatch.setattr(
+        custom_all_reduce_v2, "is_one_nvlink_clique", lambda g, d: False
+    )
+    monkeypatch.setattr(custom_all_reduce_v2, "is_vmm_pointer", lambda ptr: True)
+
+    assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is False
 
 
 if __name__ == "__main__":
