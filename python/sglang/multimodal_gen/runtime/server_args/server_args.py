@@ -561,6 +561,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # http server endpoint config
     host: str | None = "127.0.0.1"
     port: int | None = 30000
+    http_graceful_shutdown_timeout: int | None = None
     enable_metrics: bool = False
 
     # TODO: webui and their endpoint, check if webui_port is available.
@@ -699,6 +700,14 @@ class ServerArgs(DisaggServerArgsMixin):
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
         self._validate_scheduler_rpc_timeout()
+        timeout = self.http_graceful_shutdown_timeout
+        if timeout is not None and (
+            not isinstance(timeout, int) or isinstance(timeout, bool) or timeout < 0
+        ):
+            raise ValueError(
+                "http_graceful_shutdown_timeout must be None or a non-negative "
+                "integer in seconds"
+            )
         self._validate_pipeline()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
@@ -3040,6 +3049,14 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=ServerArgs.port,
             help="Port for the HTTP API server.",
+        )
+        parser.add_argument(
+            "--http-graceful-shutdown-timeout",
+            type=int,
+            default=ServerArgs.http_graceful_shutdown_timeout,
+            help="Seconds to wait for HTTP connections and tasks to finish on shutdown "
+            "before cancelling them. Unset waits indefinitely; 0 cancels immediately. "
+            "Does not bound GPU worker teardown or preserve asynchronous video jobs.",
         )
         parser.add_argument(
             "--enable-metrics",

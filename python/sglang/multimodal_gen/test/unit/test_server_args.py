@@ -3596,6 +3596,39 @@ class TestSchedulerRpcTimeoutArgs(unittest.TestCase):
                     )
 
 
+class TestHttpGracefulShutdownTimeoutArgs(unittest.TestCase):
+    def test_cli_default_and_explicit_timeout(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = ["--model-path", "/fake"]
+        self.assertIsNone(parser.parse_args(argv).http_graceful_shutdown_timeout)
+        for timeout in (0, 30):
+            with self.subTest(timeout=timeout):
+                args = parser.parse_args(
+                    argv + ["--http-graceful-shutdown-timeout", str(timeout)]
+                )
+                self.assertEqual(args.http_graceful_shutdown_timeout, timeout)
+
+    def test_config_values(self):
+        for timeout in (None, 0, 30):
+            with self.subTest(timeout=timeout):
+                args = _from_dict_without_model_resolution(
+                    {"model_path": "/fake", "http_graceful_shutdown_timeout": timeout}
+                )
+                self.assertEqual(args.http_graceful_shutdown_timeout, timeout)
+        for timeout in (-1, True, 1.5, "1"):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(
+                    ValueError, "http_graceful_shutdown_timeout"
+                ):
+                    _from_dict_without_model_resolution(
+                        {
+                            "model_path": "/fake",
+                            "http_graceful_shutdown_timeout": timeout,
+                        }
+                    )
+
+
 class TestDisaggTransferBackendArgs(unittest.TestCase):
     def test_transfer_backend_cli_arg_is_parsed(self):
         parser = FlexibleArgumentParser()
