@@ -1655,7 +1655,7 @@ mod tests {
         let view = RoutingView {
             input_ids: &[1, 2, 3],
             text: None,
-            sampling_params: Some(&sglang_api_types::runtime::v1::SamplingParams {
+            sampling_params: Some(&sglang_runtime_v1_types::SamplingParams {
                 max_new_tokens: Some(10),
                 ..Default::default()
             }),

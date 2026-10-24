@@ -3673,7 +3673,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "prost",
- "prost-types",
  "serde",
  "serde_json",
  "tonic",
@@ -3710,7 +3709,7 @@ dependencies = [
  "prost-types",
  "pyo3",
  "serde_json",
- "sglang-api-types",
+ "sglang-runtime-v1-types",
  "tokenizers",
  "tokio",
  "tokio-stream",
@@ -3756,6 +3755,16 @@ dependencies = [
  "thiserror",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "sglang-runtime-v1-types"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

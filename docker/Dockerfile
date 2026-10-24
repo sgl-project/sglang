@@ -208,7 +208,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
 COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
-COPY rust/sglang-api-types /tmp/sglang_deps/rust/sglang-api-types
+COPY rust/sglang-runtime-v1-types /tmp/sglang_deps/rust/sglang-runtime-v1-types
 
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.

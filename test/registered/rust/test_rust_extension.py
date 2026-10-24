@@ -591,8 +591,9 @@ crate-type = ["cdylib"]
 
     def test_checked_in_crates_are_discovered_from_wheel_metadata(self):
         # No crate reads `proto/` at build time: the generated bindings are
-        # checked in under rust/sglang-api-types (`cargo gen-api`), so the
-        # workspace is every extension's only source input.
+        # checked in under rust/sglang-api-types and
+        # rust/sglang-runtime-v1-types (`cargo gen-api`), so the workspace is
+        # every extension's only source input.
         for python_module, package, library, features, source_inputs in (
             (
                 "sglang.srt.rust_extensions._server",

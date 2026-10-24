@@ -25,7 +25,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures::StreamExt;
-use sglang_api_types::runtime::v1::DisaggregatedParams;
+use sglang_runtime_v1_types::DisaggregatedParams;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
