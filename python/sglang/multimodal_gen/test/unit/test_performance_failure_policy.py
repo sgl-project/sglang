@@ -3,6 +3,7 @@ import subprocess
 import sys
 import textwrap
 import time
+import xml.etree.ElementTree as ET
 from types import SimpleNamespace
 
 import pytest
@@ -298,6 +299,7 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path):
         SGLANG_GEN_BASELINE="0",
         SGLANG_GEN_GT="0",
     )
+    env.pop("SGLANG_DIFFUSION_RETRY_DEADLINE", None)
     command = (
         "from sglang.multimodal_gen.test.runner.pytest_runner import run_pytest; "
         f"result = run_pytest([{str(test_file)!r}], junit_xml_path={str(report)!r}); "
@@ -316,6 +318,10 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path):
     assert "[performance]" in output, output
     assert output.count("Starting pytest attempt") == 7, output
     assert "Max retry exceeded (6)" in output, output
+    cases = {case.attrib["name"]: case for case in ET.parse(report).iter("testcase")}
+    assert set(cases) == {f"test_guard[{p}]" for p in problems} | {
+        "test_unrelated_timeout"
+    }, output
     for problem in problems:
         retained = (
             0 if problem in {"missing_record", "missing_e2e", "missing_log"} else 1
@@ -326,3 +332,9 @@ def test_performance_failure_survives_real_pytest_runner(tmp_path):
         )
         assert output.count(marker) == 7, output
         assert f"'{problem}': 'fail'" in output, output
+        failure = cases[f"test_guard[{problem}]"].find("failure")
+        assert failure is not None, output
+        assert "[performance]" in failure.attrib["message"], output
+    timeout_failure = cases["test_unrelated_timeout"].find("failure")
+    assert timeout_failure is not None, output
+    assert "independent infrastructure failure" in timeout_failure.attrib["message"]
