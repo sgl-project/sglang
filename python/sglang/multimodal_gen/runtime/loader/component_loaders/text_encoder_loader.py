@@ -9,6 +9,7 @@ from transformers import AutoConfig, PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
     LongCatImageEditPipelineConfig,
     LongCatImagePipelineConfig,
@@ -82,6 +83,9 @@ from sglang.multimodal_gen.runtime.models.encoders.base import (
 from sglang.multimodal_gen.runtime.models.encoders.gemma_4_unified import (
     NATIVE_LAYERWISE_ADAPTERS,
 )
+from sglang.multimodal_gen.runtime.models.encoders.mistral_3 import (
+    Mistral3ForConditionalGeneration,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -122,6 +126,17 @@ _TRANSFORMERS_ENCODER_ONLY_CLASSES = {
     "MT5Model": transformers.MT5EncoderModel,
     "MT5ForConditionalGeneration": transformers.MT5EncoderModel,
 }
+
+
+def _drop_unread_layers(model: nn.Module, output_layers: tuple[int, ...]) -> None:
+    # hidden_states[k] is the input of layer k. shortcut: also keep layer max(k) so
+    # the final-norm path is unchanged; dropping it needs a change inside each model.
+    decoder = (
+        model.language_model
+        if isinstance(model, Mistral3ForConditionalGeneration)
+        else model
+    )
+    del decoder.layers[max(output_layers) + 1 :]
 
 
 def _delegate_quantized_checkpoint_to_transformers(
@@ -762,6 +777,10 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             self.validate_checkpoint_keys(
                 weights_to_load - loaded_weights, [], component_name
             )
+            if isinstance(server_args.pipeline_config, Flux2PipelineConfig):
+                _drop_unread_layers(
+                    model, server_args.pipeline_config.text_encoder_output_layers
+                )
 
             if quant_config is not None and not isinstance(quant_config, GGUFConfig):
                 postprocess_device: torch.device | None = local_torch_device

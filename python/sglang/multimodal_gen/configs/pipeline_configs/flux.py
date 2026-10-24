@@ -461,10 +461,12 @@ def _prepare_image_ids(
     return image_latent_ids
 
 
-def flux2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
-    hidden_states_layers: list[int] = [10, 20, 30]
+FLUX2_TEXT_LAYERS = (10, 20, 30)
+FLUX2_KLEIN_TEXT_LAYERS = (9, 18, 27)
 
-    out = torch.stack([outputs.hidden_states[k] for k in hidden_states_layers], dim=1)
+
+def flux2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+    out = torch.stack([outputs.hidden_states[k] for k in FLUX2_TEXT_LAYERS], dim=1)
     batch_size, num_channels, seq_len, hidden_dim = out.shape
     prompt_embeds = out.permute(0, 2, 1, 3).reshape(
         batch_size, seq_len, num_channels * hidden_dim
@@ -476,9 +478,9 @@ def flux2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Te
 def flux2_klein_postprocess_text(
     outputs: BaseEncoderOutput, _text_inputs
 ) -> torch.Tensor:
-    hidden_states_layers: list[int] = [9, 18, 27]
-
-    out = torch.stack([outputs.hidden_states[k] for k in hidden_states_layers], dim=1)
+    out = torch.stack(
+        [outputs.hidden_states[k] for k in FLUX2_KLEIN_TEXT_LAYERS], dim=1
+    )
     batch_size, num_channels, seq_len, hidden_dim = out.shape
     prompt_embeds = out.permute(0, 2, 1, 3).reshape(
         batch_size, seq_len, num_channels * hidden_dim
@@ -504,6 +506,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     vae_precision: str = "bf16"
 
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
+    text_encoder_output_layers: tuple[int, ...] = FLUX2_TEXT_LAYERS
 
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Flux2MistralTextConfig(),)
@@ -799,6 +802,7 @@ class Flux2KleinPipelineConfig(Flux2PipelineConfig):
     should_use_guidance: bool = False
 
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
+    text_encoder_output_layers: tuple[int, ...] = FLUX2_KLEIN_TEXT_LAYERS
 
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Qwen3TextConfig(),)
