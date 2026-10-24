@@ -1154,3 +1154,16 @@ def generate_glm_grammar(
         deduped_lines.append(line)
 
     return "\n".join(deduped_lines)
+
+
+@lru_cache(maxsize=1)
+def glm47_thinking_grammar_prefix() -> str:
+    grammar = generate_glm_grammar(
+        enable_thinking=True,
+        functions=None,
+        special_tokens=GlmSpecialTokenConfig(),
+        chat_template_version="glm47",
+        accommodate_chat_template=True,
+        allow_multiple_assistant_turns=False,
+    )
+    return grammar.split("\ntext_without_special_tokens ::=", 1)[0] + "\n"

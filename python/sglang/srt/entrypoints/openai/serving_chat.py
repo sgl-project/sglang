@@ -1509,6 +1509,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # `ignore_eos`, so only install it when the request allows tool calls.
         glm_constraint = (
             self.tool_call_parser == "glm47"
+            and envs.SGLANG_ENABLE_GLM47_FULL_ASSISTANT_CONSTRAINT.get()
             and bool(effective_tools)
             and request.tool_choice != "none"
             and not any(tool.function.strict for tool in effective_tools)
