@@ -76,7 +76,10 @@ from sglang.srt.layers.joint_schema_head import (
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
-from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.embed_types import (
+    PositionalEmbeds,
+    validate_positional_embed_overrides,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -1596,6 +1599,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_room = self.fake_bootstrap_room_counter
                 self.fake_bootstrap_room_counter += 1
 
+            if obj.positional_embed_overrides is not None:
+                validate_positional_embed_overrides(
+                    obj.positional_embed_overrides,
+                    hidden_size=self.model_config.hidden_size,
+                )
+
             tokenized_obj = self.tokenized_generate_req_type(
                 input_text=input_text,
                 input_ids=input_ids_arr,
@@ -1650,6 +1659,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 positional_embed_overrides = self._resolve_embed_overrides(
                     input_ids_arr, obj.embed_override_token_id, obj.embed_overrides
+                )
+
+            if positional_embed_overrides is not None:
+                validate_positional_embed_overrides(
+                    positional_embed_overrides,
+                    hidden_size=self.model_config.hidden_size,
                 )
 
             tokenized_obj = TokenizedEmbeddingReqInput(

@@ -41,6 +41,7 @@ class EngineScoreMixin:
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
         stacked_query_item_embed_overrides: Optional[List[torch.Tensor]] = None,
+        rid: Optional[str] = None,
     ) -> ScoreResult:
         """
         Score items against a query using the loaded model.
@@ -78,6 +79,12 @@ class EngineScoreMixin:
                 nested — one ``[Ni x num_labels]`` matrix per item
                 (``len(scores) == len(items)``), where ``Ni`` is the number of
                 extraction tokens (candidates) in item ``i``.
+            rid: Optional base request id. A scoring call fans out into one
+                sub-request per item, so it is expanded to ``<rid>_<i>`` (``i``
+                zero-padded to a common width) and used
+                as the cross-process correlation key that appears in
+                TokenizerManager / scheduler / detokenizer logs. Auto-generated
+                when None.
             return_pooled_hidden_states: Whether to include raw pooled transformer
                 hidden states (before the task head) in the result. Only supported
                 for non-generation models (SequenceClassification, RewardModel).
@@ -107,6 +114,7 @@ class EngineScoreMixin:
                 item_embed_overrides=item_embed_overrides,
                 score_extraction_token_id=score_extraction_token_id,
                 stacked_query_item_embed_overrides=stacked_query_item_embed_overrides,
+                rid=rid,
                 request=None,
                 return_pooled_hidden_states=return_pooled_hidden_states,
                 temperature=temperature,
@@ -129,6 +137,7 @@ class EngineScoreMixin:
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
         stacked_query_item_embed_overrides: Optional[List[torch.Tensor]] = None,
+        rid: Optional[str] = None,
     ) -> ScoreResult:
         """Asynchronous version of score(). See score() for full documentation."""
         return await self.tokenizer_manager.score_request(
@@ -142,6 +151,7 @@ class EngineScoreMixin:
             item_embed_overrides=item_embed_overrides,
             score_extraction_token_id=score_extraction_token_id,
             stacked_query_item_embed_overrides=stacked_query_item_embed_overrides,
+            rid=rid,
             request=None,
             return_pooled_hidden_states=return_pooled_hidden_states,
             temperature=temperature,
