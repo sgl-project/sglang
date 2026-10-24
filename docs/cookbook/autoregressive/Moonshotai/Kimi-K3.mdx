@@ -496,7 +496,7 @@ Chat Completions accepts a function subset through `tool_choice`:
 }
 ```
 
-Declare each referenced function in `tools` or a system/developer message's
+Declare each referenced function in `tools` or a root/system/developer message's
 `tools` list. The server filters these declarations before prompt encoding,
 constrained decoding and output parsing, then uses `auto` or `required` as the
 normal tool-choice mode. Historical tool calls and results are preserved.

@@ -90,7 +90,8 @@ class TestAllowedTools(CustomTestCase):
         self.assertEqual(request.tool_choice, "auto")
         self.assertEqual([t.function.name for t in request.tools], ["keep"])
         self.assertEqual(
-            ChatCompletionRequest.model_validate(request.model_dump()), request
+            ChatCompletionRequest.model_validate(request.model_dump()).model_dump(),
+            request.model_dump(),
         )
         empty = self._request([])
         self.assertEqual(empty.tool_choice, "auto")
@@ -122,6 +123,44 @@ class TestAllowedTools(CustomTestCase):
         self.assertEqual(messages[0]["tools"][0]["function"]["name"], "drop")
         params = request.to_sampling_params([], {}, ("json_schema", {"type": "object"}))
         self.assertIn("json_schema", params)
+
+    def test_root_declarations_keep_only_allowed_tools_and_schema_fields(self):
+        for strict in (None, False):
+            with self.subTest(strict=strict):
+                function = {"parameters": {"type": "object"}}
+                if strict is not None:
+                    function["strict"] = strict
+                function.update(name="keep", description="kept schema")
+                tools = [
+                    {"type": "function", "function": function},
+                    self._tool("drop"),
+                ]
+                request = ChatCompletionRequest(
+                    messages=[{"role": "root", "content": "", "tools": tools}],
+                    tool_choice=self._choice(["keep"], mode="required"),
+                )
+                self.assertEqual(request.tool_choice, "required")
+                self.assertEqual(
+                    [tool.function.name for tool in request.messages[0].tools],
+                    ["keep"],
+                )
+                serialized = request.messages[0].tools[0].function.model_dump()
+                self.assertEqual(serialized, function)
+                self.assertEqual(list(serialized), list(function))
+                self.assertEqual(len(tools), 2)
+
+    def test_root_and_request_declarations_are_both_filtered(self):
+        messages = [{"role": "root", "content": "", "tools": [self._tool("drop")]}]
+        tools = [self._tool("keep"), self._tool("drop")]
+        request = ChatCompletionRequest(
+            messages=messages,
+            tools=tools,
+            tool_choice=self._choice(["keep"]),
+        )
+        self.assertEqual([tool.function.name for tool in request.tools], ["keep"])
+        self.assertEqual(request.messages[0].tools, [])
+        self.assertEqual(messages[0]["tools"][0]["function"]["name"], "drop")
+        self.assertEqual(len(tools), 2)
 
     def test_invalid_subsets_are_rejected(self):
         for names, mode, expected in [
@@ -228,6 +267,24 @@ class TestChatCompletionRequest(unittest.TestCase):
             ChatCompletionMessageContentImageURL(
                 url="https://example.com/image.jpg", content_hash="not-a-hash"
             )
+
+    def test_image_detail_default_is_auto(self):
+        """Clients send detail="default"; it must parse as auto instead of a 400."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:,", "detail": "default"},
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(request.messages[0].content[0].image_url.detail, "auto")
 
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
@@ -763,20 +820,18 @@ class TestModelSerialization(unittest.TestCase):
 class TestFunctionDeferLoading(unittest.TestCase):
     """Test defer_loading field behavior on Function/Tool."""
 
-    def test_function_defaults_preserve_strict(self):
-        """strict must default to False and be present in dumps so downstream
-        code (function_call_parser, chat templates) sees the expected shape."""
+    def test_function_defaults_omit_optional_contract_fields(self):
         f = Function(name="foo")
         data = f.model_dump()
         self.assertEqual(data["name"], "foo")
-        self.assertEqual(data["strict"], False)
+        self.assertNotIn("strict", data)
         self.assertNotIn("defer_loading", data)
 
     def test_function_defer_loading_true_serialized(self):
         f = Function(name="foo", defer_loading=True)
         data = f.model_dump()
         self.assertTrue(data["defer_loading"])
-        self.assertEqual(data["strict"], False)
+        self.assertNotIn("strict", data)
 
     def test_function_defer_loading_false_serialized(self):
         """defer_loading=False is an explicit value and must be preserved."""
@@ -784,6 +839,24 @@ class TestFunctionDeferLoading(unittest.TestCase):
         data = f.model_dump()
         self.assertIn("defer_loading", data)
         self.assertFalse(data["defer_loading"])
+
+    def test_function_explicit_strict_false_is_preserved(self):
+        data = Function(name="foo", strict=False).model_dump()
+        self.assertIs(data["strict"], False)
+
+    def test_function_serialization_preserves_input_key_order(self):
+        function = Function.model_validate(
+            {
+                "parameters": {"type": "object"},
+                "name": "lookup",
+                "strict": False,
+                "description": "Look up a value.",
+            }
+        )
+        self.assertEqual(
+            list(function.model_dump(exclude_none=True)),
+            ["parameters", "name", "strict", "description"],
+        )
 
     def test_tool_level_defer_loading_propagates_to_function(self):
         """defer_loading at the Tool level should propagate to Function."""
