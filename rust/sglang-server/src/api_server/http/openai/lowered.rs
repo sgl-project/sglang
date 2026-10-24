@@ -12,18 +12,13 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sglang_processor::DynamoTokenizer;
-use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
-use sglang_processor::openai::{
-    ChatModel, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Reply, TokenPieces, lower_chat,
-};
+use sglang_processor::openai::{ChatModel, OpenAiHeaders, OpenAiSettings, Reply, lower_chat};
 
-use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
 use super::template::{render_body, render_chat};
 use super::{AppState, ChatFormatter};
-use crate::api_server::core::CoreError;
 use crate::api_server::http::native_api::{
-    GenerateItem, RequestTiming, drain_unary, generate_requests, generation_event_stream_with,
+    GenerateItem, RequestTiming, drain_unary, generate_requests, generation_event_stream,
 };
 use crate::message::config::ServerArgs;
 use crate::message::request::check_prompt_copies;
@@ -34,26 +29,6 @@ pub struct OpenAiChat {
     settings: OpenAiSettings,
     model: ChatModel,
     tokenizer: Arc<DynamoTokenizer>,
-    /// Token text and bytes for logprobs.
-    pieces: Arc<dyn OpenAiTokenizer>,
-}
-
-struct LogprobPieces {
-    tokenizer: Tokenizer,
-    /// `None` for a tokenizer without `tokenizer.json` (tiktoken).
-    pieces: Option<TokenPieces>,
-}
-
-impl OpenAiTokenizer for LogprobPieces {
-    fn decode(&self, ids: &[u32]) -> Option<String> {
-        match self.tokenizer.decode(ids, true).ok()? {
-            DecodeResult::Complete(text) | DecodeResult::Partial(text) => Some(text),
-        }
-    }
-
-    fn byte_level_bytes(&self, id: u32) -> Option<Vec<u8>> {
-        self.pieces.as_ref()?.byte_level_bytes(id)
-    }
 }
 
 impl OpenAiChat {
@@ -76,19 +51,6 @@ impl OpenAiChat {
         .into_iter()
         .filter_map(|(key, value)| Some((key.to_owned(), value?)))
         .collect();
-        let revision = server_args.revision.as_deref();
-        let pieces = sglang_processor::resolve_model_file(
-            &server_args.tokenizer_path,
-            revision,
-            "tokenizer.json",
-        )
-        .and_then(|file| std::fs::read(file).ok())
-        .and_then(|json| serde_json::from_slice(&json).ok())
-        .map(|json| TokenPieces::from_tokenizer_json(&json));
-        let pieces = Arc::new(LogprobPieces {
-            tokenizer: tokenizer.tokenizer().clone(),
-            pieces,
-        });
         Self {
             settings: OpenAiSettings {
                 allow_auto_truncate: server_args.allow_auto_truncate,
@@ -112,7 +74,6 @@ impl OpenAiChat {
                 ..ChatModel::for_formatter(formatter)
             },
             tokenizer,
-            pieces,
         }
     }
 
@@ -168,7 +129,7 @@ pub(super) async fn chat(
             &openai.settings,
             &openai.model,
             render,
-            Some(openai.pieces.clone()),
+            None,
         )
         .ok()
     })
@@ -178,12 +139,6 @@ pub(super) async fn chat(
     let stream = generate["stream"] == true;
     if let Err(error) = copy_prompt_per_choice(&mut generate) {
         return Some(error_response(StatusCode::BAD_REQUEST, &error.to_string()));
-    }
-    // Python's `adapted_request` takes the router's override headers.
-    if state.server_args.enable_request_header_overrides
-        && let Err(error) = apply_header_overrides(&mut generate, headers)
-    {
-        return Some(error_response(StatusCode::BAD_REQUEST, &error));
     }
     // Failures before the first frame answer unary even for a stream: Python
     // awaits the first chunk before it starts the stream.
@@ -231,7 +186,7 @@ pub(super) async fn chat(
         .map(|call| (call, timing.clone()))
         .collect();
     let incremental = state.server_args.incremental_streaming_output;
-    let frames = generation_event_stream_with(calls, incremental, is_batch, python_error_frame);
+    let frames = generation_event_stream(calls, incremental, is_batch);
     let mut frames = Box::pin(frames);
     // An error before the first frame answers the whole request, as on Python.
     let mut first = Vec::new();
@@ -281,56 +236,7 @@ fn copy_prompt_per_choice(generate: &mut Value) -> Result<(), Error> {
     check_prompt_copies(per_clone, n)?;
     generate["sampling_params"]["n"] = 1.into();
     generate["input_ids"] = Value::Array(vec![generate["input_ids"].take(); n]);
-    // Python's parallel sampling repeats the prompt's list-form fields with it,
-    // and a rid list names the one prompt.
-    for key in [
-        "bootstrap_host",
-        "bootstrap_port",
-        "bootstrap_room",
-        "extra_key",
-        "cache_salt",
-        "lora_path",
-    ] {
-        if let Some(Value::Array(items)) = generate.get_mut(key) {
-            *items = items
-                .iter()
-                .cycle()
-                .take(items.len() * n)
-                .cloned()
-                .collect();
-        }
-    }
-    if let Some(Value::Array(rids)) = generate.get_mut("rid")
-        && rids.len() == 1
-    {
-        generate["rid"] = rids.remove(0);
-    }
     Ok(())
-}
-
-/// Python's `/generate` streams a scheduler abort as a frame whose
-/// `finish_reason` carries its status, which its chat layer answers as an error event.
-fn python_error_frame(error: &CoreError, index: Option<u32>) -> String {
-    let CoreError::RuntimeRejected {
-        message,
-        legacy_http_status,
-        ..
-    } = error
-    else {
-        return serde_json::to_string(&error.stream_error(index))
-            .expect("api.v1 types serialize to JSON");
-    };
-    let finish_reason = serde_json::json!({
-        "type": "abort",
-        "message": message,
-        "status_code": legacy_http_status,
-    });
-    serde_json::json!({
-        "text": "",
-        "index": index,
-        "meta_info": {"finish_reason": finish_reason},
-    })
-    .to_string()
 }
 
 /// `OpenAIServingBase.create_error_response`: a 400 is a `BadRequestError`;
@@ -362,11 +268,11 @@ mod tests {
 
     use axum::Router;
 
-    use super::super::test_utils::{
-        answering_app_state_with_item, body_json, chunk, oneshot, post_json,
-    };
+    use sglang_processor::dynamo_tokenizers::Tokenizer;
+
+    use super::super::test_utils::{answering_app_state_with_item, body_json, chunk, post_json};
     use super::*;
-    use crate::message::response::{ChunkExtras, ResponseItem};
+    use crate::message::response::ResponseItem;
 
     /// A byte-level word tokenizer's `tokenizer.json`; id 3 is `é`'s bytes.
     fn tokenizer_path() -> &'static str {
@@ -432,92 +338,6 @@ mod tests {
         assert!(message.contains("exceeds the maximum"), "{message}");
     }
 
-    /// With `n` choices, a prompt's one-element lists cover every choice, as
-    /// Python's parallel sampling repeats them.
-    #[tokio::test]
-    async fn n_choices_repeat_the_prompts_list_fields() {
-        let app = lowered_state(|rid| chunk(rid, "ok", true));
-        let messages = json!([{"role": "user", "content": "hi"}]);
-        let body = json!({
-            "model": "model",
-            "messages": messages,
-            "n": 2,
-            "rid": ["x"],
-            "bootstrap_host": ["h"],
-            "bootstrap_room": [5],
-        });
-        let value = body_json(post_json(app, "/v1/chat/completions", body).await).await;
-        assert_eq!(value["choices"].as_array().unwrap().len(), 2);
-    }
-
-    /// A scheduler abort in a stream, whatever its status, is Python's error
-    /// event under that status, then the stream's end, not a unary 400.
-    #[tokio::test]
-    async fn streamed_abort_keeps_its_status() {
-        for (status, name) in [(503, "SERVICE_UNAVAILABLE"), (400, "BAD_REQUEST")] {
-            let app = lowered_state(move |rid| {
-                let mut item = chunk(rid, "", true);
-                let ResponseItem::Done(output) = &mut item else {
-                    unreachable!()
-                };
-                let abort = json!({"type": "abort", "message": "aborted", "status_code": status});
-                output.finish_reason = Some(serde_json::from_value(abort).unwrap());
-                item
-            });
-            let messages = json!([{"role": "user", "content": "hi"}]);
-            let body = json!({"model": "model", "messages": messages, "stream": true});
-            let response = post_json(app, "/v1/chat/completions", body).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(
-                response.headers()[CONTENT_TYPE],
-                "text/event-stream; charset=utf-8"
-            );
-            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
-                .await
-                .unwrap();
-            let text = String::from_utf8(bytes.to_vec()).unwrap();
-            let error: Value = text
-                .split("\n\n")
-                .filter_map(|event| event.strip_prefix("data: "))
-                .find_map(|data| {
-                    serde_json::from_str::<Value>(data)
-                        .ok()?
-                        .get("error")
-                        .cloned()
-                })
-                .unwrap_or_else(|| panic!("no error event: {text}"));
-            assert_eq!(
-                (error["type"].as_str(), error["code"].as_u64()),
-                (Some(name), Some(status))
-            );
-            assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
-        }
-    }
-
-    /// The router's override headers reach the request, as they reach
-    /// Python's `adapted_request`.
-    #[tokio::test]
-    async fn override_headers_reach_the_request() {
-        let args = ServerArgs {
-            enable_request_header_overrides: true,
-            ..Default::default()
-        };
-        let app = lowered_state_with(args, |rid| chunk(rid, "ok", true));
-        let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
-        let post = |header: &str, value: &str| {
-            let request = axum::http::Request::post("/v1/chat/completions")
-                .header("content-type", "application/json")
-                .header(header, value)
-                .body(Body::from(body.to_string()))
-                .unwrap();
-            oneshot(app.clone(), request)
-        };
-        let response = post("x-override-rid", "routed").await;
-        assert_eq!(body_json(response).await["id"], "routed");
-        let response = post("x-override-priority", "high").await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
     /// A scheduler failure keeps its 500, as Python's `HTTPException` does,
     /// and a validation failure is the 400 `BadRequestError`.
     #[tokio::test]
@@ -559,44 +379,6 @@ mod tests {
             joined["choices"][0]["message"]["content"],
             "17*23</think>391"
         );
-    }
-
-    /// Logprobs are served by the processor: a partial character's `bytes`
-    /// are its byte-level token's, as on Python, not the replacement text's.
-    #[tokio::test]
-    async fn processor_serves_logprobs() {
-        let args = ServerArgs {
-            tokenizer_path: tokenizer_path().into(),
-            ..Default::default()
-        };
-        let app = lowered_state_with(args, |rid| {
-            let mut item = chunk(rid, "\u{FFFD}", true);
-            let ResponseItem::Done(output) = &mut item else {
-                unreachable!()
-            };
-            output.extras = Some(Box::new(ChunkExtras {
-                out_lp_val: vec![-0.25],
-                out_lp_idx: vec![3],
-                out_lp_txt: vec!["\u{FFFD}".into()],
-                out_top_val: vec![-0.25, -2.0],
-                out_top_idx: vec![3, 1],
-                out_top_lens: vec![2],
-                out_top_txt: vec!["\u{FFFD}".into(), "!".into()],
-                ..Default::default()
-            }));
-            item
-        });
-        let messages = json!([{"role": "user", "content": "hi"}]);
-        let body =
-            json!({"model": "model", "messages": messages, "logprobs": true, "top_logprobs": 2});
-        let value = body_json(post_json(app, "/v1/chat/completions", body).await).await;
-        let token = &value["choices"][0]["logprobs"]["content"][0];
-        assert_eq!(token["token"], "\u{FFFD}");
-        assert_eq!(token["logprob"], -0.25);
-        assert_eq!(token["bytes"], json!([0xC3, 0xA9]));
-        assert_eq!(token["top_logprobs"][1]["token"], "!");
-        assert_eq!(token["top_logprobs"][1]["bytes"], json!([b'!']));
-        assert!(value["usage"].get("reasoning_tokens").is_some());
     }
 
     /// A request the processor does not reproduce reaches the typed handler.
