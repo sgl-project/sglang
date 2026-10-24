@@ -13,7 +13,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -46,6 +46,7 @@ from sglang.srt.configs.muse_spark import (
     should_skip_weight_loading,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
@@ -84,12 +85,13 @@ from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
@@ -1089,7 +1091,16 @@ class MuseSpark1xModel(nn.Module):
         # torch.cuda.Stream() raises outright in a CPU-only build, so the CPU
         # path never builds one; _forward_experts skips the overlap there.
         side_stream = None if _is_cpu else torch.cuda.Stream()
+        self.pp_group = get_parallel().pp_group
+        self.start_layer, self.end_layer = get_pp_indices(
+            config.num_hidden_layers,
+            self.pp_group.rank_in_group,
+            self.pp_group.world_size,
+        )
         for layer_idx in range(config.num_hidden_layers):
+            if not self.start_layer <= layer_idx < self.end_layer:
+                self.layers.append(PPMissingLayer())
+                continue
             layer_prefix = add_prefix(f"layers.{layer_idx}", prefix)
             layer = MuseSpark1xDecoderLayer(
                 config,
@@ -1102,7 +1113,8 @@ class MuseSpark1xModel(nn.Module):
                 layer.mlp.side_stream = side_stream
             _install_pre_attn_norm(config, layer)
             self.layers.append(layer)
-        for layer, next_layer in zip(self.layers[:-1], self.layers[1:]):
+        local_layers = list(self.layers)[self.start_layer : self.end_layer]
+        for layer, next_layer in zip(local_layers[:-1], local_layers[1:]):
             layer.bind_next_pre_attn_norm(next_layer.input_layernorm)
         self._sp_moe_dispatcher = None
         self._finalize_ar_workspace = None
@@ -1126,7 +1138,7 @@ class MuseSpark1xModel(nn.Module):
                     "without DP attention. Using separate finalize and AR."
                 )
             else:
-                moe_layers = [layer.mlp for layer in self.layers if layer.is_moe_layer]
+                moe_layers = [layer.mlp for layer in local_layers if layer.is_moe_layer]
                 comm = tp_group.ca_comm
                 if not moe_layers:
                     logger.warning("Finalize AR fusion unavailable: no MoE layers")
@@ -1161,13 +1173,13 @@ class MuseSpark1xModel(nn.Module):
         if layernorm_sp.layernorm_sp_enabled():
             # Scope CUTLASS collectives to Muse; leave the generic Qwen SP
             # path unchanged. Decode never calls the SP participant hooks.
-            for layer in self.layers:
+            for layer in local_layers:
                 linears = [layer.self_attn.qkv_proj, layer.self_attn.o_proj]
                 if not layer.is_moe_layer:
                     linears.extend([layer.mlp.gate_up_proj, layer.mlp.down_proj])
                 for linear in linears:
                     linear._sp_use_cutlass = True
-            moe_layers = [layer.mlp for layer in self.layers if layer.is_moe_layer]
+            moe_layers = [layer.mlp for layer in local_layers if layer.is_moe_layer]
             if moe_layers and not getattr(
                 get_parallel(), "enable_megamoe_for_layernorm_sp", False
             ):
@@ -1204,24 +1216,51 @@ class MuseSpark1xModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        hidden_states = (
-            self.embed_tokens(input_ids) if input_embeds is None else input_embeds
-        )
-        if input_embeds is None and self.embed_norm is not None:
-            hidden_states = self.embed_norm(hidden_states)
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
         sp_active = layernorm_sp.runs_sp(forward_batch.forward_mode)
+        if sp_active and self.pp_group.world_size > 1:
+            raise ValueError(
+                "Muse Spark pipeline parallelism does not support layernorm SP"
+            )
         get_forward().set("sp_active", sp_active)
-        if sp_active:
-            hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
-        stream = hidden_states.to(self.residual_dtype)
-        attn_input = self.layers[0].self_attn_input_norm(stream)
-        aux_hidden_states = []
-        for layer_idx, layer in enumerate(self.layers):
-            stream, attn_input = layer(positions, stream, attn_input, forward_batch)
+        if self.pp_group.is_first_rank:
+            hidden_states = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
+            if input_embeds is None and self.embed_norm is not None:
+                hidden_states = self.embed_norm(hidden_states)
+            if sp_active:
+                hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
+            stream = hidden_states.to(self.residual_dtype)
+            aux_hidden_states = []
+        else:
+            # The fp32 stream arrives as its bf16 head plus the bf16 rounding error.
+            stream = pp_proxy_tensors["hidden_states"].to(
+                self.residual_dtype
+            ) + pp_proxy_tensors["residual"].to(self.residual_dtype)
+            # Earlier stages' DFLASH taps, packed in layer order.
+            relayed = pp_proxy_tensors.tensors.get("dspark_hidden_states")
+            aux_hidden_states = (
+                list(relayed.split(self.config.hidden_size, dim=-1))
+                if relayed is not None
+                else []
+            )
+        attn_input = self.layers[self.start_layer].self_attn_input_norm(stream)
+        for layer_idx in range(self.start_layer, self.end_layer):
+            stream, attn_input = self.layers[layer_idx](
+                positions, stream, attn_input, forward_batch
+            )
             if layer_idx in self.layers_to_capture:
                 # Draft context projection reads operator dtype, not residual_dtype.
                 aux_hidden_states.append(stream.to(self.operator_dtype))
+        if not self.pp_group.is_last_rank:
+            head = stream.to(self.operator_dtype)
+            tail = (stream - head.to(self.residual_dtype)).to(self.operator_dtype)
+            proxy = {"hidden_states": head, "residual": tail}
+            if aux_hidden_states:
+                proxy["dspark_hidden_states"] = torch.cat(aux_hidden_states, dim=-1)
+            return PPProxyTensors(proxy)
         norm_input = stream.to(self.operator_dtype)
         hidden_states = self.norm(norm_input).to(self.operator_dtype)
         if aux_hidden_states:
@@ -1236,10 +1275,29 @@ class MuseSparkModel(nn.Module):
             config, quant_config, add_prefix("language_model", prefix)
         )
 
-    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+    def forward(
+        self,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        pp_proxy_tensors=None,
+    ):
         return self.language_model(
-            input_ids, positions, forward_batch, input_embeds=input_embeds
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+
+    @property
+    def start_layer(self):
+        return self.language_model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.language_model.end_layer
 
     @property
     def layers(self):
@@ -1293,10 +1351,17 @@ class MuseSparkTextForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds=input_embeds
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
+        if isinstance(hidden_states, PPProxyTensors):
+            return hidden_states
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
@@ -1331,6 +1396,22 @@ class MuseSparkTextForCausalLM(nn.Module):
             get_forward().set("sp_active", False)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+        )
+
+    @property
+    def start_layer(self) -> int:
+        return self.model.language_model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.model.language_model.end_layer
+
+    def get_pp_proxy_dspark_hidden_size(self) -> int:
+        """Width of the DFLASH taps the earlier stages relay to this one."""
+        language_model = self.model.language_model
+        return self.config.hidden_size * sum(
+            layer < language_model.start_layer
+            for layer in language_model.layers_to_capture
         )
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]) -> None:
@@ -1535,8 +1616,12 @@ class MuseSparkTextForCausalLM(nn.Module):
         stacked.append((".qkv_proj", ".gate_proj", "g"))
 
         skipped = 0
+        start_layer, end_layer = self.start_layer, self.end_layer
         for raw_name, loaded_weight in weights:
             name = raw_name
+            layer_id = get_layer_id(name)
+            if layer_id is not None and not start_layer <= layer_id < end_layer:
+                continue
             if name.endswith((".self_attn.q_proj.weight", ".self_attn.k_proj.weight")):
                 # For below, using padding logic will have this "original_",
                 # and currently it only exists under CPU path. Thus no impacts on others paths.
@@ -1618,6 +1703,8 @@ class MuseSparkTextForCausalLM(nn.Module):
     @torch.no_grad()
     def post_load_weights(self) -> None:
         for layer in self.model.language_model.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
             for residual in (
                 layer.post_attention_residual_gate,
                 layer.post_feedforward_residual_gate,
