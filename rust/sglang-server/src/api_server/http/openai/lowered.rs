@@ -317,6 +317,35 @@ fn stream_data(responder: &mut ChatResponder, data: &str) -> Result<Vec<String>,
     }
 }
 
+/// The prompt ids lowered chat would send for a chat `body`, or `None` where
+/// chat leaves the request to the typed handler.
+pub(super) async fn prompt_ids(state: &Arc<AppState>, body: Vec<u8>) -> Option<Vec<u32>> {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let openai = state.openai_chat.as_ref()?;
+        let formatter = state.chat_formatter.as_ref()?;
+        let defaults = &state.server_args.default_chat_template_kwargs;
+        let mut ids = None;
+        let render = |request: &Value| {
+            ids = openai.render(formatter, request, defaults);
+            ids.clone()
+        };
+        let headers = OpenAiHeaders::default();
+        lower_chat(
+            &body,
+            &headers,
+            &openai.settings,
+            &openai.model,
+            render,
+            None,
+        )
+        .ok()?;
+        ids
+    })
+    .await
+    .ok()?
+}
+
 /// A prompt's fields whose list form is repeated with it across `n` choices.
 const PROMPT_LIST_FIELDS: [&str; 6] = [
     "bootstrap_host",
@@ -822,6 +851,17 @@ mod tests {
             ),
             (Some("work"), Some("answer"))
         );
+    }
+
+    /// `/tokenize` takes what chat takes, such as a mixed-case role Dynamo's
+    /// typed request rejects, and returns the ids chat would send.
+    #[tokio::test]
+    async fn tokenize_takes_what_chat_takes() {
+        let app = lowered_state(|rid| chunk(rid, "ok", true));
+        let messages =
+            json!([{"role": "System", "content": "Be brief."}, {"role": "user", "content": "hi"}]);
+        let response = post_json(app, "/v1/tokenize", json!({"messages": messages})).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// A request the processor does not reproduce reaches the typed handler.

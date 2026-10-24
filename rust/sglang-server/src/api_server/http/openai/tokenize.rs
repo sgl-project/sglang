@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 
 use super::chat::{ChatBody, ChatRequest};
 use super::template::{RenderedChat, render_chat};
-use super::{AppState, contains_media};
+use super::{AppState, contains_media, lowered};
 use crate::api_server::core::CoreError;
 use crate::message::types::{OneOrMany, TokenIds};
 
@@ -116,7 +116,13 @@ async fn tokenize(
         (Some(prompt), None) => (prompt, body.add_special_tokens),
         // Encoded as on the chat path (Python's `add_special_tokens=False`).
         (None, Some(messages)) => {
-            let rendered = match render_chat_prompt(&state, messages, body.rest) {
+            let chat = chat_body(messages, body.rest);
+            // The ids chat would send, from the lowered path where chat takes it.
+            let bytes = serde_json::to_vec(&chat).expect("JSON values serialize");
+            if let Some(ids) = lowered::prompt_ids(&state, bytes).await {
+                return Json(one(ids.into_iter().map(i64::from).collect())).into_response();
+            }
+            let rendered = match render_chat_prompt(&state, chat) {
                 Ok(rendered) => rendered,
                 Err((error_type, message)) => {
                     return error_body(StatusCode::BAD_REQUEST, error_type, message);
@@ -150,27 +156,30 @@ async fn tokenize(
     Json(response).into_response()
 }
 
-/// Render `messages` through the chat template, like Python's
+/// The chat request for `messages`, like Python's
 /// `TokenizeRequest.to_chat_completion_request`: every other tokenize field
-/// except `prompt` and `add_special_tokens` carries over to the chat request.
-/// A failure is a 400, returned as its error type and message.
-fn render_chat_prompt(
-    state: &AppState,
-    messages: Value,
-    mut fields: Map<String, Value>,
-) -> Result<RenderedChat, (&'static str, String)> {
-    const INVALID_BODY: &str = "Bad Request";
-    const BAD_REQUEST: &str = "BadRequestError";
+/// except `prompt` and `add_special_tokens` carries over.
+fn chat_body(messages: Value, mut fields: Map<String, Value>) -> Value {
     fields.insert("messages".into(), messages);
     // Python's `TokenizeRequest.model` default; the chat request requires one.
     fields
         .entry("model")
         .or_insert_with(|| Value::from("default"));
+    Value::Object(fields)
+}
+
+/// Render a chat request through the typed handler's path. A failure is a 400,
+/// returned as its error type and message.
+fn render_chat_prompt(
+    state: &AppState,
+    body: Value,
+) -> Result<RenderedChat, (&'static str, String)> {
+    const INVALID_BODY: &str = "Bad Request";
+    const BAD_REQUEST: &str = "BadRequestError";
     let ChatBody {
         request: ChatRequest { request, .. },
         raw: body,
-    } = ChatBody::deserialize(Value::Object(fields))
-        .map_err(|error| (INVALID_BODY, error.to_string()))?;
+    } = ChatBody::deserialize(body).map_err(|error| (INVALID_BODY, error.to_string()))?;
     if request.messages.is_empty() {
         return Err((BAD_REQUEST, "messages cannot be empty".into()));
     }
