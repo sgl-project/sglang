@@ -1,4 +1,4 @@
-"""CPU-only tests for Quark MXFP4 AITER ASM layout helpers."""
+"""CPU-only tests for Quark MXFP4 AITER layout and kernel-selection helpers."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4
 from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+    _afp4wfp4_even_k_block,
     _asm_fp4_prequantized_input,
     _asm_fp4_scale_swizzle_supported,
     _shuffle_asm_fp4_act_scale,
@@ -115,6 +116,21 @@ class TestQuarkMxfp4AsmNarrowLayer(CustomTestCase):
 
         self.assertFalse(layer.use_aiter_asm_fp4_gemm)
         self.assertIs(layer.weight, weight)
+
+
+class TestAfp4wfp4EvenKBlock(CustomTestCase):
+    def test_narrows_to_whole_k_blocks(self):
+        # Kimi-K3 TP8 shared-expert down (K=768) and dense down (K=4224).
+        self.assertEqual(_afp4wfp4_even_k_block(512, 768), 256)
+        self.assertEqual(_afp4wfp4_even_k_block(1024, 768), 256)
+        self.assertEqual(_afp4wfp4_even_k_block(512, 4224), 128)
+
+    def test_keeps_even_or_unnarrowable_blocks(self):
+        self.assertIsNone(_afp4wfp4_even_k_block(1024, 7168))
+        # A block wider than K is already shrunk to K by the kernel wrapper.
+        self.assertIsNone(_afp4wfp4_even_k_block(2048, 1024))
+        # No power-of-two divisor of K at or above the minimum block.
+        self.assertIsNone(_afp4wfp4_even_k_block(256, 160))
 
 
 if __name__ == "__main__":
