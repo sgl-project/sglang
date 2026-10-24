@@ -3956,4 +3956,9 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.tree_core.root_node_handle(extra_key)
 
     def dfs_weight_order(self, node_handles: Sequence[NodeId]) -> list[int]:
-        return self.tree_core.dfs_weight_order(node_handles)
+        # A streaming session's virtual node has no path in the tree; order its
+        # request with the requests that match nothing.
+        root = self.root_node_handle()
+        return self.tree_core.dfs_weight_order(
+            [root if is_virtual_node(handle) else handle for handle in node_handles]
+        )
