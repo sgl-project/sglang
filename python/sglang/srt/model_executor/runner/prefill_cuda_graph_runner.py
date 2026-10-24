@@ -1985,6 +1985,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             mamba_track_seqlens=mamba_track_seqlens,
+            # CP replay plans attention against this static view, including
+            # KDA's host-side checkpoint plan for the current request.
+            mamba_prefill_track_mask_cpu=forward_batch.mamba_prefill_track_mask_cpu,
+            mamba_track_seqlens_cpu=forward_batch.mamba_track_seqlens_cpu,
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=(
                 forward_batch.return_logprob
@@ -2042,6 +2046,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # The n-gram hasher runs outside the graph and reads this at replay.
         static_forward_batch.ngram_embedding_info = forward_batch.ngram_embedding_info
         static_forward_batch.engram_history = forward_batch.engram_history
+        # The engram lookup break reads the staged rows at replay.
+        static_forward_batch.engram_staged_rows = forward_batch.engram_staged_rows
         # The encoder replay fold: a replay builds the same window floors and
         # compressor slots as an eager prefill.
         static_forward_batch.encoder_swa_replay = forward_batch.encoder_swa_replay

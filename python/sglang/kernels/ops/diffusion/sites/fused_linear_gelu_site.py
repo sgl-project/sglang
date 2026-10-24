@@ -9,13 +9,16 @@ tanh-approximate GELU (max abs diff ~5e-6 vs ``F.gelu(approximate="tanh")`` in
 fp32), so for half-precision inference the fused path differs from the
 reference only at bf16/fp16 rounding-order level -- close, but not bit-exact.
 
-Because it is not bit-exact, the fused path is **mounted only for
-``quality="high"`` requests** (see ``SamplingParams.quality``): model code marks
-its GELU up-projection sites with ``FUSED_LINEAR_GELU.mark`` (default: off,
-reference path, bit-exact), and the denoising stage mounts / unmounts
-``FUSED_LINEAR_GELU`` at batch boundaries. Mounting is all-or-nothing per transformer: if any marked site
-fails the static guards (quantized weights, missing bias, non-half dtype, ...)
-no site on that transformer is fused.
+Because it is not bit-exact, the fused path is a ``"lossless"``-tier fast path
+(see ``SamplingParams.quality``): model code marks its GELU up-projection sites
+with ``FUSED_LINEAR_GELU.mark`` (unmounted: bit-exact reference path), and the
+denoising stage mounts it at batch boundaries for ``quality="lossless"`` (the
+default) and ``"high"`` requests and unmounts it for ``"exact"``. Mounting is
+all-or-nothing per transformer: if any marked site fails the static guards
+(quantized weights, missing bias, non-half dtype, ...) no site on that
+transformer is fused. A mounted site still runs its linear's forward while a
+LoRA adapter on that linear adds output: the epilogue multiplies only the base
+weight.
 
 The fused GEMM is exposed as a registered custom op (``register_custom_op``)
 exactly like the other diffusion kernels (e.g. qknorm_rope), so it stays a
@@ -91,7 +94,13 @@ def _static_reject_reason(linear: Any) -> str | None:
     exactly what the reference forward multiplies. The weight's *device* is
     deliberately not checked here -- under CPU offload the weights live on CPU
     between requests -- the runtime guard checks the input device per call.
+    A LoRA wrapper is judged by the layer it wraps, whose weight the epilogue
+    multiplies; whether its adapter adds output is a per-call check.
     """
+    from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
+
+    if isinstance(linear, BaseLayerWithLoRA):
+        linear = linear.base_layer
     if not _HAS_ADDMM_ACTIVATION:
         return "torch._addmm_activation unavailable"
     if not _is_unquantized(linear):
@@ -134,10 +143,18 @@ def _input_independent_ok(linear: Any) -> bool:
 
 def can_use_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
     """Whether ``gelu(linear(x))`` can use the fused cublasLt epilogue now."""
+    from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
+
     if not (x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
+        return False
+    # the epilogue reads the base weight only; an active adapter needs the forward
+    if isinstance(linear, BaseLayerWithLoRA) and linear.lora_active:
         return False
     if getattr(linear, "weight", None) is None or x.dtype != linear.weight.dtype:
         return False
+    if torch.compiler.is_compiling():
+        # dynamo guards on the cache's size, so reading it recompiles per linear
+        return _input_independent_ok(linear)
     verdict = _VERDICTS.get(linear)
     if verdict is None:
         verdict = _VERDICTS[linear] = _input_independent_ok(linear)
