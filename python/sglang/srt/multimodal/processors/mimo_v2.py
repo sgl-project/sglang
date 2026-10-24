@@ -483,7 +483,16 @@ class MiMoProcessor:
         ):
             source = BytesIO(base64.b64decode(path_or_data.split(";base64,")[1]))
         else:
-            source = path_or_data  # local path or file://
+            if isinstance(path_or_data, str) and (
+                path_or_data.startswith("file://")
+                or path_or_data.startswith("/")
+                or (len(path_or_data) < 4096 and os.path.exists(path_or_data))
+            ):
+                from sglang.srt.utils.common import _assert_local_media_path_allowed
+
+                source = _assert_local_media_path_allowed(path_or_data)
+            else:
+                source = path_or_data  # local path or file://
         try:
             AudioDecoder(source)
             return True
@@ -1429,8 +1438,11 @@ class MiMoProcessor:
             if image.startswith("http://") or image.startswith("https://"):
                 with BytesIO(download_remote_media(image, timeout=3)) as bio:
                     image_obj = copy.deepcopy(Image.open(bio))
-            elif image.startswith("file://"):
-                image_obj = Image.open(image[7:])
+            elif image.startswith("file://") or image.startswith("/"):
+                from sglang.srt.utils.common import read_local_media
+
+                with BytesIO(read_local_media(image)) as bio:
+                    image_obj = copy.deepcopy(Image.open(bio))
             elif image.startswith("data:image"):
                 if "base64," in image:
                     _, base64_data = image.split("base64,", 1)
@@ -1438,7 +1450,10 @@ class MiMoProcessor:
                     with BytesIO(data) as bio:
                         image_obj = copy.deepcopy(Image.open(bio))
             else:
-                image_obj = Image.open(image)
+                from sglang.srt.utils.common import read_local_media
+
+                with BytesIO(read_local_media(image)) as bio:
+                    image_obj = copy.deepcopy(Image.open(bio))
         else:
             image_obj = Image.open(BytesIO(image))
         if image_obj is None:
