@@ -95,6 +95,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.unquant import finalize_gfx11_weight_padding
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
@@ -1087,6 +1088,7 @@ class DefaultModelLoader(BaseModelLoader):
             # parameters onto device for processing and back off after.
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
+        finalize_gfx11_weight_padding(model)
 
     @staticmethod
     def restore_weights_before_loading(model, target_device):
