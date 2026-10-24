@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -123,8 +123,46 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         )
 
 
+class _INT8Activation(NamedTuple):
+    data: torch.Tensor
+    scale: torch.Tensor
+    source_dtype: torch.dtype
+
+
 class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
+    accepts_int8_input = True
+
+    def __init__(
+        self,
+        quant_config: Optional["QuantizationConfig"] = None,
+        *,
+        online_weights: bool = False,
+    ):
+        super().__init__(quant_config)
+        self.online_weights = online_weights
+
+    def quantize_swiglu(self, x: torch.Tensor) -> _INT8Activation | None:
+        from sglang.srt.hardware_backend.npu.moe.activation import NPUSwigluQuant
+
+        result = NPUSwigluQuant.apply(x)
+        if result is None:
+            return None
+        data, scale = result
+        return _INT8Activation(data, scale, x.dtype)
+
     def process_weights_after_loading(self, layer: torch.nn.Module):
+        if self.online_weights:
+            weight = layer.weight.data
+            if weight.dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    f"Online W8A8 requires FP16 or BF16 weights, got {weight.dtype}"
+                )
+            if not weight.is_npu:
+                weight = weight.to(f"npu:{torch.npu.current_device()}")
+            quantized_weight, weight_scale = torch.ops.npu.npu_dynamic_quant(weight)
+            layer.weight = Parameter(quantized_weight, requires_grad=False)
+            layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
 
@@ -136,12 +174,13 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | _INT8Activation | Tuple[torch.Tensor, torch.Tensor],
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
-        if isinstance(x, tuple):
-            """dynamic_scale is calculated in malprolog kernel"""
+        if isinstance(x, _INT8Activation):
+            quant_out, dynamic_scale, original_dtype = x
+        elif isinstance(x, tuple):
+            # MLAProlog supplies quantized activations with BF16 output.
             original_dtype = torch.bfloat16
             quant_out, dynamic_scale = x
         else:

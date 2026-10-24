@@ -18,16 +18,11 @@ import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 
-from sglang.kernels.ops.activation.activation import (
-    silu_and_mul_with_activation_rounding,
-    silu_and_mul_with_activation_rounding_,
-)
 from sglang.kernels.ops.diffusion import (
     MINIMAX_H3_NORM_MODULATE,
     can_use_fused_inplace_qknorm_rope,
     can_use_mxfp8_swizzled,
     can_use_rmsnorm_indexed_scale_shift,
-    can_use_silu_mul_mxfp8,
     fused_inplace_qknorm_rope,
     fused_qknorm_rope_out_of_place,
     indexed_gate_bf16,
@@ -38,7 +33,6 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_fp32_,
     indexed_scale_shift_mxfp8_,
     rmsnorm_indexed_scale_shift,
-    silu_mul_mxfp8,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
@@ -63,6 +57,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_ulysses_ctx,
 )
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
@@ -75,6 +70,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
     get_component_forced_attn_backend,
     get_global_forced_attn_backend,
 )
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
@@ -381,11 +377,8 @@ def _copy_grouped_qkv_tp_shard(
     return True
 
 
-def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> nn.RMSNorm:
-    # RMSNorm uses fp32 accumulation with bf16 inputs and outputs.
-    # torch.nn.RMSNorm upcasts reduced-precision inputs for the variance
-    # reduction, matching that accumulation semantic.
-    return nn.RMSNorm(size, eps=eps, dtype=dtype)
+def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm:
+    return RMSNorm(size, eps=eps, preserve_residual_rounding=True).to(dtype=dtype)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -395,7 +388,7 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def _modulate_rmsnorm_scale_shift(
     x: torch.Tensor,
-    norm: nn.RMSNorm,
+    norm: RMSNorm,
     shift: torch.Tensor,
     scale: torch.Tensor,
     indices: torch.Tensor,
@@ -487,27 +480,11 @@ def _modulate_gate(
     return (x + gate.index_select(0, indices) * other).to(dtype)
 
 
-def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
-    if (
-        hidden.is_cuda
-        and hidden.dtype == _BF16_DTYPE
-        and hidden.is_contiguous()
-        and hidden.shape[-1] % 16 == 0
-    ):
-        if reuse_input:
-            return silu_and_mul_with_activation_rounding_(hidden)
-        # Quantized fc2 needs contiguous rows, so keep the fused result out of
-        # the packed fc1 buffer while preserving the eager BF16 SiLU rounding.
-        return silu_and_mul_with_activation_rounding(hidden)
-    gate, up = hidden.chunk(2, dim=-1)
-    return nn.functional.silu(gate) * up
-
-
 def _apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
-    q_norm: nn.RMSNorm,
-    k_norm: nn.RMSNorm,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
     head_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if (
@@ -1021,8 +998,7 @@ class MiniMaxH3Attention(nn.Module):
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         # cache width covers cos/sin for temporal, height, and width frequencies
         rope_dim = 6 * arch.rope_inv_freq_len
-        # Not apply_qk_norm_rope: Q/K are [tokens, heads, head_dim] and the norms
-        # are torch nn.RMSNorm, so the fused kernel is called directly.
+        # Q/K are [tokens, heads, head_dim]; preserve rounding before RoPE.
         self._use_fused_qknorm_rope = (
             current_platform.is_cuda()
             and can_use_fused_inplace_qknorm_rope(
@@ -1268,7 +1244,7 @@ class MiniMaxH3Attention(nn.Module):
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
-        ``x_prequant``: ``x`` already quantized for ``qkv_proj`` as ``(fp8, scales)``.
+        ``x_prequant`` carries an activation in ``qkv_proj``'s quantized format.
 
         Operation order: fused qkv projection -> per-head q/k RMSNorm -> RoPE
         on q/k -> variable-length non-causal flash attention -> output projection.
@@ -1458,9 +1434,11 @@ class MiniMaxH3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
         )
-        self.reuse_fc1_activation = quant_config is None or (
-            quant_config.get_name() == "gguf"
+        self.act = SiluAndMul(
+            preserve_activation_rounding=True,
+            reuse_input=quant_config is None or quant_config.get_name() == "gguf",
         )
+        self.act.fuse_input_quant(self.fc2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not isinstance(x, tuple) and x.device.type == "mps":
@@ -1468,7 +1446,7 @@ class MiniMaxH3MLP(nn.Module):
             for start in range(0, x.shape[0], _MPS_MLP_TOKEN_CHUNK_SIZE):
                 stop = min(start + _MPS_MLP_TOKEN_CHUNK_SIZE, x.shape[0])
                 hidden, _ = self.fc1(x[start:stop])
-                hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+                hidden = self.act(hidden)
                 chunk, _ = self.fc2(hidden)
                 out[start:stop].copy_(chunk)
                 del hidden, chunk
@@ -1476,10 +1454,7 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.empty_cache()
             return out
         hidden, _ = self.fc1(x)
-        if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
-            out, _ = self.fc2(silu_mul_mxfp8(hidden))
-            return out
-        hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
+        hidden = self.act(hidden)
         out, _ = self.fc2(hidden)
         return out
 
@@ -1567,6 +1542,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             cube_sparse_capable=False,
         )
         self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
+        self.norm2.fuse_input_quant(self.mlp.fc1)
 
     def forward(
         self,
@@ -1576,15 +1552,15 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
     ) -> torch.Tensor:
-        x = x + self.attn(
+        h = self.attn(
             self.norm1(x),
             rope_cache=None,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
-        x = x + self.mlp(self.norm2(x))
-        return x
+        h, x = self.norm2(h, x)
+        return x + self.mlp(h)
 
 
 class MiniMaxH3TokenRefiner(nn.Module):

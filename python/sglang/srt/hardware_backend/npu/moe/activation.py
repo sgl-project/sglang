@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from typing import Any, Optional, Tuple
 
 import torch
@@ -28,7 +29,40 @@ class NPUSwiglu(BaseActivation):
         return torch.ops.npu.npu_swiglu(hidden_states), None
 
 
+@lru_cache(maxsize=None)
+def _supports_swiglu_int8(device: torch.device, dtype: torch.dtype, width: int) -> bool:
+    try:
+        probe = torch.zeros((1, width), device=device, dtype=dtype)
+        data, scale = NPUSwigluQuant()._apply_activation(probe)
+        return (
+            data.dtype == torch.int8
+            and data.shape == (1, width // 2)
+            and scale.dtype == torch.float32
+            and scale.shape == (1,)
+        )
+    except torch.OutOfMemoryError:
+        raise
+    except (AttributeError, NotImplementedError, RuntimeError):
+        return False
+
+
 class NPUSwigluQuant(BaseActivation):
+    @classmethod
+    def apply(cls, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if (
+            x.device.type != "npu"
+            or x.dtype not in (torch.float16, torch.bfloat16)
+            or x.ndim != 2
+            or x.shape[0] == 0
+            or x.shape[1] == 0
+            or x.shape[1] % 2
+            or not x.is_contiguous()
+        ):
+            return None
+        if not _supports_swiglu_int8(x.device, x.dtype, x.shape[1]):
+            return None
+        return cls()._apply_activation(x)
+
     def _apply_activation(self, hidden_states: torch.Tensor):
         hidden_states, swiglu_out_scale = torch.ops.npu.npu_dequant_swiglu_quant(
             hidden_states,
