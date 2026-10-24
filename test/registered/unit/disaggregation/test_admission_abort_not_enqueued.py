@@ -67,6 +67,7 @@ def _make_scheduler():
         output_streamer=MagicMock(),
         beam_coordinator=MagicMock(),
         _release_aborted_request=MagicMock(),
+        hisparse_coordinator=None,
     )
     sched.retire_unadmitted_request = MagicMock(
         side_effect=lambda req: Scheduler.retire_unadmitted_request(sched, req)
