@@ -374,6 +374,22 @@ class TestKVCRStorage(CustomTestCase):
             self.assertIs(indices, partial_indices)
             self.assertEqual(span, 8)
 
+            # Checkpoint confirmation is a KVCR opt-in. Other backends must
+            # retain their existing partial host-staging behavior even when
+            # the operation has a trailing-state transfer.
+            controller.storage_backend = SimpleNamespace(
+                requires_lookup_confirmation=False
+            )
+            indices, span = controller.allocate_storage_hit(
+                trailing,
+                12,
+                allow_partial=True,
+                min_tokens=2,
+                evict_host=lambda _tokens: 0,
+            )
+            self.assertIs(indices, partial_indices)
+            self.assertEqual(span, 8)
+
     def test_whole_page_components_round_trip_to_different_slots(self):
         """A restore must move every unequal-sized component, not only primary KV."""
         for part, buffer in enumerate(self.pool.buffers):
@@ -935,10 +951,81 @@ class TestKVCRStorage(CustomTestCase):
             )
         )
 
+        # A device-resident KV head can be trimmed after physical confirmation.
+        # The trailing state still belongs to the confirmed prefix endpoint,
+        # not to the narrowed KV transfer's first page or the advisory full hit.
+        for trim_tokens in (2, 4):
+            with self.subTest(trim_tokens=trim_tokens):
+                trimmed, confirmed = submit(4)
+                self.assertEqual(confirmed, 4)
+                trimmed.hash_value = hashes[:2]
+                trimmed.storage_hit_count = confirmed
+                trimmed.storage_start = 0
+                controller.trim_prefetch_full_head(trimmed, trim_tokens)
+                trimmed.host_indices = torch.arange(8, 8 + confirmed - trim_tokens)
+                self.assertEqual(trimmed.hash_value, hashes[trim_tokens // 2 : 2])
+                self.assertEqual(trimmed.sidecar_hash_values, hashes[:2])
+                self.assertEqual(trimmed.sidecar_hit_pages, 2)
+                for buffer in destination_pools[PoolName.MAMBA].buffers:
+                    buffer[4].zero_()
+                reads_before = len(transport.reads)
+                controller._page_transfer(trimmed)
+                self.assertFalse(transport.claims)
+                self.assertEqual(trimmed.pool_transfers[1].keys, hashes[1:2])
+                self.assertTrue(
+                    any(
+                        block_key(hashes[1], reader._namespace, "mamba") in group
+                        for group in transport.reads[reads_before:]
+                    )
+                )
+                for source_buffer, destination_buffer in zip(
+                    source_pools[PoolName.MAMBA].buffers,
+                    destination_pools[PoolName.MAMBA].buffers,
+                    strict=True,
+                ):
+                    self.assertTrue(
+                        torch.equal(source_buffer[0], destination_buffer[4])
+                    )
+
         dropped, confirmed = submit(4)
         self.assertEqual(confirmed, 4)
         self.assertEqual(len(transport.claims), 1)
         controller.release_unqueued_prefetch_claims(dropped)
+        self.assertFalse(transport.claims)
+        self.assertFalse(reader._lookup_claims)
+
+        # A queue failure after confirmation must not strand the source pin.
+        rejected, confirmed = submit(4)
+        self.assertEqual(confirmed, 4)
+        self.assertEqual(len(transport.claims), 1)
+        with (
+            patch.object(
+                controller.prefetch_buffer,
+                "put",
+                side_effect=RuntimeError("prefetch queue unavailable"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "prefetch queue unavailable"),
+        ):
+            controller.enqueue_prefetch_transfer(rejected)
+        self.assertFalse(rejected.storage_transfer_enqueued)
+        self.assertFalse(transport.claims)
+        self.assertFalse(reader._lookup_claims)
+
+        # Delivery can fail after the transfer has been queued. Its finally
+        # path must still release the physical Mamba copy held by lookup.
+        failed_transfer, confirmed = submit(4)
+        self.assertEqual(confirmed, 4)
+        self.assertEqual(len(transport.claims), 1)
+        controller.enqueue_prefetch_transfer(failed_transfer)
+        with (
+            patch.object(
+                controller,
+                "_page_transfer_with_stable_layout",
+                side_effect=RuntimeError("host transfer failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "host transfer failed"),
+        ):
+            controller._page_transfer(failed_transfer)
         self.assertFalse(transport.claims)
         self.assertFalse(reader._lookup_claims)
 
