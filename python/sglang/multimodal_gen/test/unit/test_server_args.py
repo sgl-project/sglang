@@ -885,6 +885,90 @@ class TestServerArgsPathExpansion(_CudaPlatformTestCase):
             server_args.component_quantization_ignored_layers,
         )
 
+    def test_load_config_file_normalizes_empty_documents(self):
+        for suffix, contents in (
+            (".yaml", ""),
+            (".yaml", "# comment only\n"),
+            (".yaml", "null\n"),
+            (".json", "null"),
+        ):
+            with self.subTest(suffix=suffix, contents=contents):
+                with tempfile.NamedTemporaryFile("w", suffix=suffix) as config_file:
+                    config_file.write(contents)
+                    config_file.flush()
+                    self.assertEqual(ServerArgs.load_config_file(config_file.name), {})
+
+    def test_load_config_file_rejects_non_mapping_documents(self):
+        for suffix, contents in (
+            (".yaml", "[]\n"),
+            (".yaml", "[value]\n"),
+            (".yaml", "text\n"),
+            (".yaml", "0\n"),
+            (".yaml", "false\n"),
+            (".yaml", "''\n"),
+            (".json", "[]"),
+            (".json", "[1]"),
+            (".json", '"text"'),
+            (".json", "0"),
+            (".json", "false"),
+            (".json", '""'),
+        ):
+            with self.subTest(suffix=suffix, contents=contents):
+                with tempfile.NamedTemporaryFile("w", suffix=suffix) as config_file:
+                    config_file.write(contents)
+                    config_file.flush()
+                    with self.assertRaisesRegex(
+                        ValueError, "config file must contain a mapping"
+                    ):
+                        ServerArgs.load_config_file(config_file.name)
+
+    def test_load_config_file_preserves_mapping_documents(self):
+        for suffix, contents in (
+            (".yaml", "model_path: /from/yaml\nnum_gpus: 2\n"),
+            (".json", '{"model_path": "/from/json", "num_gpus": 2}'),
+        ):
+            with self.subTest(suffix=suffix):
+                with tempfile.NamedTemporaryFile("w", suffix=suffix) as config_file:
+                    config_file.write(contents)
+                    config_file.flush()
+                    self.assertEqual(
+                        ServerArgs.load_config_file(config_file.name),
+                        {
+                            "model_path": f"/from/{suffix.removeprefix('.')}",
+                            "num_gpus": 2,
+                        },
+                    )
+
+    def test_load_config_file_preserves_existing_errors(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
+            with self.assertRaises(json.JSONDecodeError):
+                ServerArgs.load_config_file(config_file.name)
+
+        with self.assertRaises(FileNotFoundError):
+            ServerArgs.load_config_file("/missing/config.json")
+
+        with self.assertRaisesRegex(ValueError, "Unsupported config file format"):
+            ServerArgs.load_config_file("config.toml")
+
+    def test_cli_rejects_non_mapping_config_before_merge(self):
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+        )
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
+            config_file.write("false")
+            config_file.flush()
+            parser = FlexibleArgumentParser()
+            add_multimodal_gen_serve_args(parser)
+            argv = ["--config", config_file.name, "--model-path", "/from/cli"]
+
+            with patch.object(sys, "argv", ["sglang"] + argv):
+                args, unknown_args = parser.parse_known_args(argv)
+                with self.assertRaisesRegex(
+                    ValueError, "config file must contain a mapping"
+                ):
+                    ServerArgs.from_cli_args(args, unknown_args)
+
     def test_serve_cli_defaults_warmup_on(self):
         from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
             add_multimodal_gen_serve_args,

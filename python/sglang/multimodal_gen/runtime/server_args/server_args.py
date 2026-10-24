@@ -12,6 +12,7 @@ import os
 import random
 import sys
 import tempfile
+from collections.abc import Mapping
 from dataclasses import field
 from enum import Enum
 from typing import Any, List, Literal, Optional
@@ -3809,7 +3810,7 @@ class ServerArgs(DisaggServerArgsMixin):
         """Load a config file."""
         if config_file.endswith(".json"):
             with open(config_file, "r") as f:
-                return json.load(f)
+                config = json.load(f)
         elif config_file.endswith((".yaml", ".yml")):
             try:
                 import yaml
@@ -3819,9 +3820,18 @@ class ServerArgs(DisaggServerArgsMixin):
                     "`pip install pyyaml`"
                 )
             with open(config_file, "r") as f:
-                return yaml.safe_load(f)
+                config = yaml.safe_load(f)
         else:
             raise ValueError(f"Unsupported config file format: {config_file}")
+
+        if config is None:
+            return {}
+        if not isinstance(config, Mapping):
+            raise ValueError(
+                f"The config file must contain a mapping, got {type(config).__name__}: "
+                f"{config_file}"
+            )
+        return dict(config)
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
