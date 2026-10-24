@@ -1054,7 +1054,9 @@ def generate_glm_grammar(
         f'{root_name} ::= assistant_turn ( "{special_tokens.assistant_token}" assistant_turn )*'
         if allow_multiple_assistant_turns
         else f"{root_name} ::= assistant_turn",
-        "assistant_turn ::= thinking_block text_block tool_call_blocks",
+        "assistant_turn ::= thinking_block "
+        + ("" if required and functions else "text_block ")
+        + "tool_call_blocks",
     ]
 
     thinking_exclusions = [
