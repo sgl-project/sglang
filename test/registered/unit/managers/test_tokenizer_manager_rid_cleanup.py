@@ -1124,6 +1124,28 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         tm._send_one_request.assert_not_called()
         self.assertNotIn(obj.rid, tm.rid_to_state)
 
+    def test_unknown_adapter_rejection_releases_nothing(self):
+        """A request rejected before its adapter is acquired must not schedule a release."""
+        for n in (1, 3):
+            with self.subTest(n=n):
+                tm = _make_tm_for_generate(self, enable_lora=True)
+                tm.lora_ref_cache = {}
+                obj = GenerateReqInput(
+                    text="prompt",
+                    rid=f"unknown_adapter_n{n}",
+                    lora_path="missing",
+                    sampling_params={"n": n},
+                )
+
+                async def drive():
+                    with self.assertRaisesRegex(ValueError, "never been loaded"):
+                        await tm.generate_request(obj).__anext__()
+                    self.assertEqual(tm._lora_release_tasks, set())
+
+                asyncio.run(drive())
+                self.assertEqual(tm.rid_to_state, {})
+                self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+
     def test_batch_failure_before_dispatch_cleans_up_all(self):
         tm = _make_tm_for_generate(self)
         rids = ["b0", "b1", "b2"]
