@@ -1,13 +1,4 @@
-"""Unit tests for what a draining retiree counts as work of its own.
-
-A retiree can only leave from a tick where it reports idle. Under dp-attention it is
-pulled into a request-free forward on every iteration any survivor holds tokens, and
-that batch lands in ``result_queue``, which the strict predicate refuses on. So the
-retiree's idle test discounts request-free batches and every other caller does not.
-
-That is what makes holding only the pinned requests safe, so the shrink gate's scope is
-covered here too.
-"""
+"""What a draining retiree counts as its own work, and the shrink gate's scope."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -15,108 +6,116 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import asyncio
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
+from sglang.srt.managers import tokenizer_manager
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.test_utils import CustomTestCase
 
-
-class FakeBatch:
-    def __init__(self, empty: bool):
-        self._empty = empty
-
-    def is_empty(self) -> bool:
-        return self._empty
+IDLE = SimpleNamespace(is_empty=lambda: True)
+BUSY = SimpleNamespace(is_empty=lambda: False)
 
 
-def _sched(*batches: FakeBatch) -> SimpleNamespace:
-    """Enough of a Scheduler for the unbound predicate: just the queue."""
-    return SimpleNamespace(result_queue=[(b, object()) for b in batches])
+def _gate(*, closed, retiring):
+    event = asyncio.Event()
+    if not closed:
+        event.set()
+    return SimpleNamespace(
+        _elastic_shrink_pause_event=event, _elastic_shrink_retiring=set(retiring)
+    )
 
 
 class TestPendingResults(CustomTestCase):
-    def test_strict_count_includes_idle_batches(self):
-        sched = _sched(FakeBatch(empty=True), FakeBatch(empty=False))
-        self.assertEqual(Scheduler._pending_results(sched, False), 2)
+    CASES = [
+        # (case, batches, ignore_idle_batches, expected)
+        ("strict count includes idle batches", (IDLE, BUSY), False, 2),
+        ("idle batches discounted", (IDLE, BUSY), True, 1),
+        ("all idle reads as drained", (IDLE,) * 4, True, 0),
+        ("all idle, strict", (IDLE,) * 4, False, 4),
+        ("real work still blocks", (BUSY,), True, 1),
+        ("empty queue, strict", (), False, 0),
+        ("empty queue, discounted", (), True, 0),
+    ]
 
-    def test_idle_batches_discounted(self):
-        sched = _sched(FakeBatch(empty=True), FakeBatch(empty=False))
-        self.assertEqual(Scheduler._pending_results(sched, True), 1)
-
-    def test_all_idle_reads_as_drained(self):
-        """The retiree's actual shape: forwards in flight, none of them its own."""
-        sched = _sched(*[FakeBatch(empty=True)] * 4)
-        self.assertEqual(Scheduler._pending_results(sched, True), 0)
-        self.assertEqual(Scheduler._pending_results(sched, False), 4)
-
-    def test_real_work_still_blocks(self):
-        sched = _sched(FakeBatch(empty=False))
-        self.assertEqual(Scheduler._pending_results(sched, True), 1)
-
-    def test_empty_queue(self):
-        sched = _sched()
-        for ignore in (False, True):
-            with self.subTest(ignore_idle_batches=ignore):
-                self.assertEqual(Scheduler._pending_results(sched, ignore), 0)
+    def test_pending_results(self):
+        for case, batches, ignore, expected in self.CASES:
+            with self.subTest(case):
+                sched = SimpleNamespace(result_queue=[(b, object()) for b in batches])
+                self.assertEqual(Scheduler._pending_results(sched, ignore), expected)
 
 
 class TestShrinkGateScope(CustomTestCase):
     """Only a pin onto a departing slot waits. Everything else goes through."""
 
-    def _gate(self, *, closed: bool, retiring=(1, 2)) -> SimpleNamespace:
-        event = asyncio.Event()
-        if not closed:
-            event.set()
-        return SimpleNamespace(
-            _elastic_shrink_pause_event=event,
-            _elastic_shrink_retiring=set(retiring),
-        )
+    CASES = [
+        # (case, closed, retiring, request, admitted)
+        ("open gate admits everything", False, (1, 2), {"routed_dp_rank": 1}, True),
+        ("closed gate admits unpinned", True, (1, 2), {"routed_dp_rank": None}, True),
+        ("closed gate admits a live pin", True, (2, 3), {"routed_dp_rank": 0}, True),
+        ("closed gate holds retiring pin", True, (2, 3), {"routed_dp_rank": 3}, False),
+        ("no pin attribute is admitted", True, (1, 2), {}, True),
+    ]
 
-    def _admitted(self, tm, obj, *, timeout=0.05) -> bool:
-        """True if the gate let the request through without waiting."""
-
-        async def run():
-            try:
-                await asyncio.wait_for(
-                    TokenizerManager._await_elastic_shrink_gate(tm, obj), timeout
+    def test_gate_scope(self):
+        for case, closed, retiring, request, admitted in self.CASES:
+            with self.subTest(case):
+                tm = _gate(closed=closed, retiring=retiring)
+                wait = TokenizerManager._await_elastic_shrink_gate(
+                    tm, SimpleNamespace(**request)
                 )
-                return True
-            except asyncio.TimeoutError:
-                return False
-
-        return asyncio.new_event_loop().run_until_complete(run())
-
-    def test_open_gate_admits_everything(self):
-        tm = self._gate(closed=False)
-        self.assertTrue(self._admitted(tm, SimpleNamespace(routed_dp_rank=1)))
-
-    def test_closed_gate_admits_unpinned(self):
-        """The DPC routes these, and it already skips the draining slots."""
-        tm = self._gate(closed=True)
-        self.assertTrue(self._admitted(tm, SimpleNamespace(routed_dp_rank=None)))
-
-    def test_closed_gate_admits_a_surviving_pin(self):
-        tm = self._gate(closed=True, retiring=(2, 3))
-        self.assertTrue(self._admitted(tm, SimpleNamespace(routed_dp_rank=0)))
-
-    def test_closed_gate_holds_a_retiring_pin(self):
-        tm = self._gate(closed=True, retiring=(2, 3))
-        self.assertFalse(self._admitted(tm, SimpleNamespace(routed_dp_rank=3)))
-
-    def test_a_request_with_no_pin_attribute_is_admitted(self):
-        """Non-generate inputs carry no routed_dp_rank at all."""
-        tm = self._gate(closed=True)
-        self.assertTrue(self._admitted(tm, SimpleNamespace()))
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(asyncio.wait_for(wait, 0.05))
+                    got = True
+                except asyncio.TimeoutError:
+                    got = False
+                self.assertEqual(got, admitted)
 
     def test_close_records_the_retiring_slots_and_open_clears_them(self):
-        tm = self._gate(closed=False, retiring=())
+        tm = _gate(closed=False, retiring=())
         TokenizerManager._close_elastic_shrink_gate(tm, range(2, 4))
         self.assertEqual(tm._elastic_shrink_retiring, {2, 3})
         self.assertFalse(tm._elastic_shrink_pause_event.is_set())
         TokenizerManager._open_elastic_shrink_gate(tm)
         self.assertEqual(tm._elastic_shrink_retiring, set())
         self.assertTrue(tm._elastic_shrink_pause_event.is_set())
+
+
+class TestRejectedStageReleasesDrainingSlots(CustomTestCase):
+    """The DPC stops routing to the tail on a shrink, so an unstarted stage frees it."""
+
+    def test_rejected_stage(self):
+        reject = SimpleNamespace(
+            success=False,
+            old_ep_size=8,
+            scale_phase="serving",
+            pending_ep_size=None,
+            message="rejected",
+        )
+        exec_ctx = SimpleNamespace(moe=SimpleNamespace(elastic_ep_scale_timeout=60))
+        for target, clears in ((6, 1), (10, 0)):
+            with self.subTest(target=target):
+                tm = _gate(closed=False, retiring=())
+                vars(tm).update(
+                    _elastic_ep_size=8,
+                    attn_replica_size=1,
+                    elastic_worker_count=8,
+                    elastic_operation_id=None,
+                    scale_elastic_ep_communicator=AsyncMock(return_value=[reject]),
+                    _clear_staged_scale=Mock(),
+                    _clear_elastic_draining=Mock(),
+                )
+                for name in ("_close_elastic_shrink_gate", "_open_elastic_shrink_gate"):
+                    setattr(tm, name, MethodType(getattr(TokenizerManager, name), tm))
+                with patch.object(tokenizer_manager, "get_exec", return_value=exec_ctx):
+                    asyncio.new_event_loop().run_until_complete(
+                        TokenizerManager._drive_next_elastic_stage(tm, target)
+                    )
+                self.assertEqual(tm._clear_elastic_draining.call_count, clears)
+                self.assertEqual(tm.elastic_scale_phase, "failed")
+                self.assertTrue(tm._elastic_shrink_pause_event.is_set())
 
 
 if __name__ == "__main__":
