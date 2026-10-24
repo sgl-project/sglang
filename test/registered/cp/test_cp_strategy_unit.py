@@ -712,6 +712,35 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertTrue(torch.equal(calls[1][0], q[2:]))
         self.assertTrue(torch.equal(out, q + 100))
 
+    def test_zigzag_attention_slices_query_components_without_copying(self):
+        metadata = self._metadata_for_rank(
+            0, cp_size=2, seq_lens=[8], extend_seq_lens=[8]
+        )
+        fb = SimpleNamespace(attn_cp_metadata=metadata)
+        q_nope = torch.arange(5 * 2 * 3).view(5, 2, 3)
+        q_rope = torch.arange(5 * 2 * 4).view(5, 2, 4)[..., ::2]
+        calls = []
+
+        def attn_fn(components, cu_seqlens_q, cache_seqlens, max_seqlen_q):
+            calls.append(components)
+            for chunk, original in zip(components, (q_nope, q_rope)):
+                self.assertEqual(
+                    chunk.untyped_storage().data_ptr(),
+                    original.untyped_storage().data_ptr(),
+                )
+            return torch.cat(components, dim=-1)
+
+        out = ZigzagCPStrategy(cp_size=2).run_attention(
+            (q_nope, q_rope), fb, device=torch.device("cpu"), attn_fn=attn_fn
+        )
+        self.assertEqual(len(calls), 2)
+        for i, original in enumerate((q_nope, q_rope)):
+            self.assertTrue(torch.equal(calls[0][i], original[:2]))
+            self.assertTrue(torch.equal(calls[1][i], original[2:4]))
+        expected = torch.cat((q_nope[:4], q_rope[:4]), dim=-1)
+        expected = torch.cat((expected, torch.zeros_like(expected[:1])), dim=0)
+        self.assertTrue(torch.equal(out, expected))
+
     def test_zigzag_combined_attention_matches_two_half_reference(self):
         def reference_attention(
             q,
