@@ -60,6 +60,20 @@ class _IndexerBackend:
         return idx_out.reshape(q.shape[0], -1), torch.ones(q.shape[0], 2)
 
 
+class _BatchedOutputBackend:
+    """Stand-in with a sparse MLA kernel's output layout: [1, rows, heads, dim]."""
+
+    def forward(self, q, k, v, layer, forward_batch, save_kv_cache, **kwargs):
+        return torch.full((1, q.shape[0], layer.tp_q_head_num, layer.v_head_dim), 3.0)
+
+
+class _RowsFirst4DOutputBackend:
+    """Stand-in returning a rows-first 4-D output: [rows, 1, heads, dim]."""
+
+    def forward(self, q, k, v, layer, forward_batch, save_kv_cache, **kwargs):
+        return torch.full((q.shape[0], 1, layer.tp_q_head_num, layer.v_head_dim), 3.0)
+
+
 def _rows(value):
     if isinstance(value, list):
         return [t.shape[0] for t in value]
@@ -244,6 +258,46 @@ class TestPaddedExtendAttention(CustomTestCase):
                 self.assertIsNone(batch._attn_output)
                 torch.testing.assert_close(output[:5], torch.full((5, 2), 3.0))
                 torch.testing.assert_close(output[5:], torch.zeros(3, 2))
+
+    def test_a_batched_output_is_padded_along_its_rows(self):
+        """A [1, rows, heads, dim] output must come back with the padded rows too:
+        an a2a MoE's reduce-scatter after attention needs them to divide by attention TP."""
+        with patch.object(
+            radix_attention, "get_attn_backend", return_value=_BatchedOutputBackend()
+        ):
+            output = radix_attention._attention_on_real_rows(
+                _LAYER,
+                5,
+                torch.zeros(8, 2),
+                torch.zeros(8, 2),
+                torch.zeros(8, 2),
+                _batch(ForwardMode.EXTEND, 5),
+                False,
+            )
+        self.assertEqual(tuple(output.shape), (1, 8, 1, 2))
+        torch.testing.assert_close(output[0, :5], torch.full((5, 1, 2), 3.0))
+        torch.testing.assert_close(output[0, 5:], torch.zeros(3, 1, 2))
+
+    def test_a_rows_first_4d_output_with_one_real_row_keeps_its_layout(self):
+        """With one real row, [1, 1, heads, dim] is also a rows-first output; it must
+        come back padded along its first dimension, as other rows-first outputs do."""
+        with patch.object(
+            radix_attention,
+            "get_attn_backend",
+            return_value=_RowsFirst4DOutputBackend(),
+        ):
+            output = radix_attention._attention_on_real_rows(
+                _LAYER,
+                1,
+                torch.zeros(8, 2),
+                torch.zeros(8, 2),
+                torch.zeros(8, 2),
+                _batch(ForwardMode.EXTEND, 1),
+                False,
+            )
+        self.assertEqual(tuple(output.shape), (8, 1, 1, 2))
+        torch.testing.assert_close(output[:1], torch.full((1, 1, 1, 2), 3.0))
+        torch.testing.assert_close(output[1:], torch.zeros(7, 1, 1, 2))
 
 
 if __name__ == "__main__":
