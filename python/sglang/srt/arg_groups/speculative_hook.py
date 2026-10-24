@@ -299,13 +299,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
-    # DFLASH + dp attention is validated on NPU only.
-    if attn_dp_enabled_of(cfg) and not cfg.device == "npu":
-        raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp "
-            "attention on non-NPU devices."
-        )
-
     if cfg.pp_size != 1:
         raise ValueError(
             "Currently DFLASH speculative decoding only supports pp_size == 1."
@@ -315,6 +308,43 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         raise ValueError(
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."
         )
+
+    if attn_dp_enabled_of(cfg) and cfg.device != "npu":
+        if not cfg.device.startswith("cuda"):
+            raise ValueError("DFLASH with dp attention requires CUDA or NPU.")
+        # Validated on Beam targets only.
+        target_archs = model_config_of(server_args).hf_config.architectures
+        if "BeamForCausalLM" not in target_archs:
+            raise ValueError(
+                "DFLASH with dp attention on CUDA currently supports only Beam targets."
+            )
+        if not cfg.enable_dp_lm_head:
+            raise ValueError("DFLASH with dp attention requires --enable-dp-lm-head.")
+        if cfg.attn_cp_size != 1:
+            raise ValueError(
+                "DFLASH with dp attention does not support context parallel."
+            )
+        if cfg.moe_a2a_backend not in ("none", "flashinfer_megamoe"):
+            raise ValueError(
+                "DFLASH with dp attention requires moe_a2a_backend 'none' or "
+                "'flashinfer_megamoe'."
+            )
+        from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+        from sglang.srt.utils.hf_transformers_utils import get_config
+
+        draft_hf_config = get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+            model_override_args=json.loads(cfg.json_model_override_args),
+        )
+        if parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_domino or (
+            "LiLiCorrDraftModel" in (draft_hf_config.architectures or [])
+        ):
+            raise ValueError(
+                "DFLASH with dp attention on CUDA supports plain DFlash and "
+                "DFlash2 drafts; Domino and LiLiCorr heads are not supported."
+            )
 
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
