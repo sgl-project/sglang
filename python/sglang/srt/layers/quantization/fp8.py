@@ -836,7 +836,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 or envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get()
             )
         ):
-            from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
+            from sglang.srt.hardware_backend.npu.quantization.linear_utils import (
                 process_npu_arch35_mxfp8_linear_weights,
             )
 
@@ -2255,7 +2255,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if self.is_fp4_expert:
                 if _is_npu:
-                    from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                    from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
                         process_npu_fp4_expert_weights,
                     )
 
@@ -3007,11 +3007,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
                 NPUW4A8MXFP4MoEMethod,
             )
+            from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+                create_ascend_moe_runner,
+            )
 
-            layer.w13_kernel = NPUW4A8MXFP4MoEMethod()
-            layer.w2_kernel = NPUW4A8MXFP4MoEMethod()
-            moe_runner_config.layer = layer
-            self.runner = MoeRunner(MoeRunnerBackend.ASCEND, moe_runner_config)
+            self.runner = create_ascend_moe_runner(
+                layer,
+                moe_runner_config,
+                w13_kernel=NPUW4A8MXFP4MoEMethod(),
+                w2_kernel=NPUW4A8MXFP4MoEMethod(),
+            )
             return
 
         moe_runner_backend = get_moe_runner_backend()
@@ -3106,14 +3111,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         if _is_npu and self.is_fp4_expert:
-            from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
-
-            quant_info = AscendQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_weight_scale=layer.w13_weight_scale_inv,
-                w2_weight_scale=layer.w2_weight_scale_inv,
+            from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+                build_ascend_quant_info,
             )
+
+            quant_info = build_ascend_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
 
         if use_intel_amx_backend(layer):
