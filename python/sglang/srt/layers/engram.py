@@ -1262,7 +1262,7 @@ class EngramEmbedding(nn.Module):
 def _uniform_sum_len_scatter_rows(
     forward_batch: ForwardBatch, tp_size: int, rows: int
 ) -> Optional[int]:
-    """Select a fixed-size collective using only rank-common metadata.
+    """Select a large-prefill collective using only rank-common metadata.
 
     The padded CPU counts and graph vote come from DP synchronization. Never
     use a rank-local tensor shape or forward mode to select this collective.
@@ -1292,8 +1292,10 @@ def _uniform_sum_len_scatter_rows(
     ):
         return None
     local_rows = counts[0]
+    # Keep small batches on the existing path. This conservative threshold
+    # covers the measured large-prefill regime, not an optimal crossover.
     if (
-        local_rows <= 0
+        local_rows < 32768
         or any(count != local_rows for count in counts)
         or rows != sum(counts)
     ):
