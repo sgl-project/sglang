@@ -21,6 +21,7 @@ from sglang.srt.layers.dcp import (
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
+    is_dsa_dcp_gathered_prefill,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
@@ -123,7 +124,14 @@ class DeepseekMLAForwardMixin:
         return (
             mode.is_decode()
             or mode.is_target_verify()
-            or (self.use_dsa and mode.is_extend())
+            or (
+                self.use_dsa
+                # ROCm only: the draft shards its KV like the target, and the
+                # DSA backend may plan a gathered prefix, in which case the MLA
+                # path attends this rank's heads instead of merging partials.
+                and mode.is_extend(include_draft_extend_v2=_is_hip)
+                and not is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
+            )
         )
 
     def is_dcp_q_replicate_phase(

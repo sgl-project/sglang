@@ -14,7 +14,11 @@ from typing import (
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    dsa_draft_shards_under_dcp,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
     get_buffer,
@@ -62,7 +66,9 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     DcpPageTableCache,
+    dcp_gathered_page_table,
     dcp_trtllm_sparse_attention,
+    dcp_use_gathered_prefill,
     localize_dcp_page_table,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
@@ -97,6 +103,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dcp import is_dsa_dcp_gathered_prefill
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -541,7 +548,9 @@ class DeepseekSparseAttnBackend(
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
-        if model_runner.is_draft_worker:
+        if model_runner.is_draft_worker and not dsa_draft_shards_under_dcp(
+            model_runner.model_config.hf_config, get_parallel().attn_dcp_size
+        ):
             self.dcp_size, self.dcp_rank = 1, 0
         else:
             self.dcp_size = get_parallel().attn_dcp_size
@@ -1423,6 +1432,68 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
+        # Re-plan only over this backend's own plan: another planner's metadata
+        # (prepare_context_parallel_metadata_for_dcp) is not ours to replace.
+        existing = forward_batch.attn_dcp_metadata
+        if (
+            _is_hip
+            and self.dcp_size > 1
+            and (existing is None or is_dsa_dcp_gathered_prefill(existing))
+        ):
+            forward_batch.attn_dcp_metadata = self._plan_dcp_gathered_prefill(
+                forward_batch, page_table.shape[1]
+            )
+
+    def _dcp_gathered_prefill(self, forward_batch: ForwardBatch) -> bool:
+        return is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
+
+    def _plan_dcp_gathered_prefill(
+        self, forward_batch: ForwardBatch, page_table_width: int
+    ):
+        """Gathered-prefix DCP prefill plan, or None to attend owned slots."""
+        if not (
+            _is_hip
+            and self.dsa_prefill_impl == "triton"
+            and not self.use_mha
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not self._is_in_tc_piecewise_cuda_graph()
+            and not self._is_in_breakable_cuda_graph()
+            and forward_batch.extend_prefix_lens is not None
+            and dcp_use_gathered_prefill(
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_num_tokens,
+                self.num_dcp_q_heads,
+            )
+        ):
+            return None
+        from sglang.srt.layers.dcp.planner import (
+            prepare_decode_context_parallel_metadata,
+        )
+        from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+            create_chunked_prefix_cache_kv_indices,
+        )
+
+        dcp_meta = prepare_decode_context_parallel_metadata(
+            seq_lens=forward_batch.seq_lens,
+            extend_prefix_lens=forward_batch.extend_prefix_lens,
+            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+            extend_seq_lens=forward_batch.extend_seq_lens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            req_to_token=self.req_to_token,
+            seq_lens_sum=forward_batch.seq_lens_sum,
+            kv_buffer_shape=self.token_to_kv_pool.get_kv_buffer_shape()[0],
+            kv_cache_dtype=self.token_to_kv_pool.dtype,
+            kv_cache_device=forward_batch.seq_lens.device,
+            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices,
+        )
+        dcp_meta.dsa_page_table_1 = dcp_gathered_page_table(
+            dcp_meta.dcp_kv_indptr,
+            dcp_meta.dcp_kv_indices,
+            forward_batch.seq_lens,
+            page_table_width,
+        )
+        dcp_meta.dsa_gathered_prefill = True
+        return dcp_meta
 
     def _cal_indexer_k_start_end(
         self,
@@ -2258,6 +2329,12 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        prefill_page_table_1 = metadata.page_table_1
+        dcp_gathered = self._dcp_gathered_prefill(forward_batch)
+        if dcp_gathered:
+            # The caller all-gathered the prefix and appended this extend's KV.
+            kv_cache = forward_batch.attn_dcp_metadata.dcp_kv_buffer
+            prefill_page_table_1 = forward_batch.attn_dcp_metadata.dsa_page_table_1
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2272,6 +2349,7 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        shared_topk_indices = topk_indices
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
@@ -2289,7 +2367,7 @@ class DeepseekSparseAttnBackend(
                 "--dllm-algorithm; --enable-mixed-chunk is rejected at launch)."
             )
 
-        if self.use_fused_topk:
+        if self.use_fused_topk and not dcp_gathered:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -2312,7 +2390,7 @@ class DeepseekSparseAttnBackend(
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(
-                    page_table=metadata.page_table_1,
+                    page_table=prefill_page_table_1,
                     topk_indices=topk_indices,
                     extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                     page_size=1,
@@ -2359,6 +2437,18 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
+            if _is_hip and self.dcp_size > 1 and not dcp_gathered:
+                assert topk_transform_method == TopkTransformMethod.PAGED
+                return self._forward_triton_dcp(
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    kv_cache=kv_cache,
+                    v_head_dim=layer.v_head_dim,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    layer=layer,
+                    topk_indices=shared_topk_indices,
+                )
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
             )
@@ -2616,6 +2706,7 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
+        shared_topk_indices = topk_indices
         # Align topk_indices with q dimensions
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
@@ -2687,6 +2778,19 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
+            # CUDA keeps upstream's dispatch: #43735 wires DCP to the trtllm
+            # backends, and this localized path has only been run on ROCm.
+            if _is_hip and self.dcp_size > 1:
+                return self._forward_triton_dcp(
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    kv_cache=kv_cache,
+                    v_head_dim=layer.v_head_dim,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    layer=layer,
+                    topk_indices=shared_topk_indices,
+                )
             return self._forward_triton_decode(
                 q_nope=q_nope,
                 q_rope=q_rope,
@@ -3493,6 +3597,52 @@ class DeepseekSparseAttnBackend(
             workspace=workspace,
         )
 
+    def _forward_triton_dcp(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+        layer: RadixAttention,
+        topk_indices: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend the owned slots of the global top-k; one query row per token."""
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk,
+        )
+
+        rows, heads = q_nope.shape[0], q_nope.shape[1]
+        if rows == 0:
+            return (
+                q_nope.new_empty((rows, heads, v_head_dim), dtype=torch.bfloat16),
+                q_nope.new_empty((rows, heads), dtype=torch.float32),
+            )
+        local_page_table, owned_counts = localize_dcp_page_table(
+            self._dcp_page_table_cache,
+            metadata=self.forward_metadata,
+            layer_id=layer.layer_id,
+            topk_indices=topk_indices,
+            page_table=page_table_1[:rows].contiguous(),
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
+        )
+        stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
+        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
+        out, lse = triton_sparse_mla_decode_splitk(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv=kv_cache,
+            indices=local_page_table.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=v_head_dim,
+            workspace=workspace,
+            return_lse=True,
+            lengths=owned_counts,
+        )
+        return out.view(rows, heads, v_head_dim), lse
+
     def _forward_intel_xpu_sparse_decode(
         self,
         q_nope: torch.Tensor,
@@ -4120,12 +4270,17 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
-        force_unfused = not self.use_fused_topk or (
-            self.hisparse_coordinator is not None
-            and (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
+        force_unfused = (
+            not self.use_fused_topk
+            or (
+                self.hisparse_coordinator is not None
+                and (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
             )
+            # The gathered prefix is addressed by position, not by slot.
+            or self._dcp_gathered_prefill(forward_batch)
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
@@ -4136,6 +4291,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,
+            dcp_size=self.dcp_size,
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):

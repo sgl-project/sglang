@@ -4980,6 +4980,8 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope,
                 cache_k_rope,
                 fp8_dtype,
+                dcp_world_size=self._write_loc_dcp_span,
+                dcp_rank=get_parallel().attn_dcp_rank,
             )
         elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead

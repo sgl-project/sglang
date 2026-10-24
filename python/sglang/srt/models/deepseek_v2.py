@@ -54,6 +54,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
+    dsa_draft_shards_under_dcp,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -2049,9 +2050,13 @@ class DeepseekV2AttentionMLA(
         self.is_nextn = is_nextn
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
-        self.dcp_size = (
-            1 if (is_nextn and self.use_dsa) else get_parallel().attn_dcp_size
-        )
+        self.dcp_size = get_parallel().attn_dcp_size
+        if (
+            is_nextn
+            and self.use_dsa
+            and not dsa_draft_shards_under_dcp(config, self.dcp_size)
+        ):
+            self.dcp_size = 1
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size

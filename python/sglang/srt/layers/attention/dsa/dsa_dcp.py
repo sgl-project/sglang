@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import msgspec
 import torch
@@ -9,6 +9,8 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
 )
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 
 TRTLLM_MAX_BATCH_ROWS = 65535
 # FlashInfer carves heads * rows * 256 float2 softmax slots out of the workspace per call;
@@ -116,3 +118,58 @@ def dcp_trtllm_sparse_attention(
         outputs.append(output)
     output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
     return output.view(rows, 1, heads, -1), lse
+
+
+def dcp_use_gathered_prefill(
+    extend_prefix_lens_cpu: List[int], extend_num_tokens: int, gathered_heads: int
+) -> bool:
+    """Whether a DCP prefill all-gathers the cached prefix KV and attends with
+    this rank's heads, instead of all-gathering Q and LSE-merging owned slots.
+
+    The gathered path moves one latent per prefix token; the owned path moves
+    every extend token's Q for all heads plus the head partials back. The
+    prefix all-gather reads position p from rank p % W, so every prefix must
+    be a whole number of widened pages.
+    """
+    w = get_parallel().dcp_group.world_size
+    if any(p % w for p in extend_prefix_lens_cpu):
+        return False
+    ratio = envs.SGLANG_DSA_DCP_OWNED_PREFILL_RATIO.get()
+    if ratio < 0:
+        return True
+    return sum(extend_prefix_lens_cpu) < ratio * gathered_heads * extend_num_tokens
+
+
+def dcp_gathered_page_table(
+    dcp_kv_indptr: torch.Tensor,
+    dcp_kv_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    width: int,
+) -> torch.Tensor:
+    """[bs, width] sequence position -> row of the all-gathered ``dcp_kv_buffer``."""
+    cols = torch.arange(width, device=seq_lens.device)
+    valid = cols < seq_lens[:, None]
+    flat = torch.where(valid, dcp_kv_indptr[:-1, None].long() + cols, 0)
+    return torch.where(valid, dcp_kv_indices[flat], 0).to(torch.int32)
+
+
+def dcp_split_rows(rows: int) -> Tuple[int, int, int, int]:
+    """``(per, slot, lo, hi)``: every rank owns a stride of ``per`` rows starting
+    at ``slot``, and scores the rows ``[lo, hi)`` of it that exist.
+
+    The uniform stride makes the rank-major concatenation of the strides land
+    row ``i`` back at row ``i``. ``slot`` is not clamped to ``rows``: the
+    in-place all-gather needs this rank's own slot even when it has no rows.
+    """
+    group = get_parallel().dcp_group
+    per = -(-rows // group.world_size)
+    slot = group.rank_in_group * per
+    return per, slot, min(slot, rows), min(slot + per, rows)
+
+
+def dcp_all_gather_rows_(buf: torch.Tensor, per: int, slot: int) -> None:
+    """In-place inverse of ``dcp_split_rows`` on ``world_size * per`` rows of
+    ``buf``. Rows at and past the real row count are left unspecified."""
+    group = get_parallel().dcp_group
+    out = buf[: group.world_size * per]
+    group.all_gather_into_tensor(out, out[slot : slot + per])
