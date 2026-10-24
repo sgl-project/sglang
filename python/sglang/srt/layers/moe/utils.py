@@ -143,6 +143,11 @@ class AscendOpsConfig:
                 f"invalid ascend-ops-config decode mode {self.decode!r}; "
                 f"expected one of {self.DECODE_CHOICES}"
             )
+        if self.decode == "fused_op":
+            raise ValueError(
+                "ascend-ops-config decode mode 'fused_op' is not implemented; "
+                "use 'low_latency'"
+            )
 
     @classmethod
     def from_json_str(cls, s: Optional[str]) -> "AscendOpsConfig":

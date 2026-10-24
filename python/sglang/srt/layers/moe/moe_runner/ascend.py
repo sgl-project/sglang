@@ -398,6 +398,9 @@ def pre_permute_ascend_ops_to_ascend(
         return _pre_permute_allgather(dispatch_output, runner_config, running_state)
     if mode == "mc2":
         # Decode MC2 dispatch already groups rows per expert.
+        if dispatch_output.forward_state is None:
+            raise RuntimeError("MC2 dispatch output is missing forward state")
+        running_state["ascend_ops_forward_state"] = dispatch_output.forward_state
         return AscendRunnerInput(
             hidden_states=dispatch_output.hidden_states,
             hidden_states_scale=dispatch_output.hidden_states_scale,
@@ -459,9 +462,11 @@ def _pre_permute_alltoallv(
     if quant_mode != -1 and num_local_experts > 1:
         local_permuted = local_permuted.view(quant_mode_dtype(quant_mode))
 
-    running_state["ascend_ops_alltoallv"] = {
-        "local_expanded_row_idx": local_expanded_row_idx,
-    }
+    state = dispatch_output.forward_state
+    if state is None:
+        raise RuntimeError("alltoallv dispatch output is missing forward state")
+    state.local_expanded_row_idx = local_expanded_row_idx
+    running_state["ascend_ops_forward_state"] = state
     return AscendRunnerInput(
         hidden_states=local_permuted,
         hidden_states_scale=local_scale,
@@ -502,13 +507,15 @@ def _pre_permute_allgather(
         ~is_local.reshape(-1), local_ids.numel() - 1
     )
 
-    running_state["ascend_ops_allgather"] = {
-        "topk_weights": topk_weights,
-        "expanded_row_idx": expanded_row_idx,
-        "topk_ids": local_ids,
-        "expert_tokens": routed.expert_tokens,
-        "num_routes": local_ids.numel(),
-    }
+    state = dispatch_output.forward_state
+    if state is None:
+        raise RuntimeError("allgather dispatch output is missing forward state")
+    state.topk_weights = topk_weights
+    state.expanded_row_idx = expanded_row_idx
+    state.topk_ids = local_ids
+    state.expert_tokens = routed.expert_tokens
+    state.num_routes = local_ids.numel()
+    running_state["ascend_ops_forward_state"] = state
     return AscendRunnerInput(
         hidden_states=routed.hidden_states,
         hidden_states_scale=routed.scale,
@@ -612,56 +619,72 @@ def post_permute_ascend_to_ascend_ops(
     """Undo the pre-permute's regrouping before the dispatcher's combine."""
     from sglang.srt.layers.moe.token_dispatcher.ascend_ops import (
         AscendOpsCombineInput,
+        _AllGatherState,
+        _AllToAllState,
     )
 
-    if "ascend_ops_alltoallv" in running_state:
-        state = running_state.pop("ascend_ops_alltoallv")
+    state = running_state.pop("ascend_ops_forward_state", None)
+    if state is None:
+        raise RuntimeError("Ascend Ops dispatch output is missing forward state")
+    if isinstance(state, _AllToAllState):
+        local_expanded_row_idx = state.local_expanded_row_idx
+        if local_expanded_row_idx is None:
+            raise RuntimeError("alltoallv forward state is missing local row map")
         hidden_states = runner_output.hidden_states
         if runner_config.num_local_experts > 1 and hidden_states.shape[0] > 0:
             hidden_states = npu_moe_finalize_routing(
-                hidden_states, state["local_expanded_row_idx"]
+                hidden_states, local_expanded_row_idx
             )
-        return AscendOpsCombineInput(hidden_states=hidden_states)
-
-    if "ascend_ops_allgather" in running_state:
-        state = running_state.pop("ascend_ops_allgather")
-        return AscendOpsCombineInput(
-            hidden_states=_allgather_weighted_sum(runner_output, runner_config, state)
+    elif isinstance(state, _AllGatherState):
+        hidden_states = _allgather_weighted_sum(
+            runner_output, runner_config, state
         )
-
-    # MC2 / decode: the combine op applies the top-k weights itself.
-    return AscendOpsCombineInput(hidden_states=runner_output.hidden_states)
+    else:
+        # MC2 / decode: the combine op applies the top-k weights itself.
+        hidden_states = runner_output.hidden_states
+    return AscendOpsCombineInput(
+        hidden_states=hidden_states,
+        forward_state=state,
+    )
 
 
 def _allgather_weighted_sum(
     runner_output: AscendRunnerOutput,
     runner_config: MoeRunnerConfig,
-    state: dict,
+    state,
 ) -> torch.Tensor:
     """Weighted top-k sum over the full gathered route capacity.
 
     Finalize mode 2 requires the full ``[global_tokens * top_k, hidden]``
     shape; unused capacity rows are zeroed so dropped routes never read NaN.
     """
+    if (
+        state.num_routes is None
+        or state.expert_tokens is None
+        or state.expanded_row_idx is None
+        or state.topk_weights is None
+        or state.topk_ids is None
+    ):
+        raise RuntimeError("allgather forward state is incomplete")
     hidden_states = runner_output.hidden_states
     expert_output = torch.zeros(
-        (state["num_routes"], runner_config.hidden_size),
+        (state.num_routes, runner_config.hidden_size),
         dtype=torch.float32,
         device=hidden_states.device,
     )
     expert_output[: hidden_states.shape[0]].copy_(hidden_states)
     unused_rows = (
         torch.arange(expert_output.shape[0], device=expert_output.device)
-        >= state["expert_tokens"].sum()
+        >= state.expert_tokens.sum()
     )
     expert_output.masked_fill_(unused_rows[:, None], 0)
     # Keep weighted expert sums in FP32 across ranks: rounding each rank's
     # partial output to BF16 before the ReduceScatter loses precision.
     return npu_moe_finalize_routing(
         expert_output,
-        state["expanded_row_idx"],
-        topk_weights=state["topk_weights"],
-        topk_ids=state["topk_ids"],
+        state.expanded_row_idx,
+        topk_weights=state.topk_weights,
+        topk_ids=state.topk_ids,
     )
 
 
