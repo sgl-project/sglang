@@ -942,6 +942,11 @@ class Scheduler(
             )
             if think_end_ids:
                 self.model_config.think_end_ids = think_end_ids
+                self.model_config.self_opened_think_start_ids = (
+                    reasoning_parser.detector.get_self_opened_think_start_token_ids(
+                        self.tokenizer
+                    )
+                )
             else:
                 logger.warning(
                     "Reasoning parser think_end_token %r could not be encoded; "

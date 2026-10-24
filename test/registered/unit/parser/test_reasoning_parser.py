@@ -1320,6 +1320,18 @@ class TestMiniMaxM3Detector(CustomTestCase):
         result = self._detector().detect_and_parse("Just a normal answer.")
         self.assertEqual(result.normal_text, "Just a normal answer.")
 
+    def test_only_m3_declares_a_self_opened_think_start(self):
+        tokenizer = type(
+            "Tok", (), {"encode": lambda self, text, add_special_tokens: [len(text)]}
+        )()
+        self.assertEqual(
+            self._detector().get_self_opened_think_start_token_ids(tokenizer),
+            [len("<mm:think>")],
+        )
+        self.assertIsNone(
+            Qwen3Detector().get_self_opened_think_start_token_ids(tokenizer)
+        )
+
     def test_real_reasoning_block_non_stream(self):
         result = self._detector().detect_and_parse(
             "<mm:think>reasoning here</mm:think>final"

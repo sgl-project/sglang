@@ -160,7 +160,7 @@ class FunctionCallParser:
         Returns:
             True if the text contains a tool call, False otherwise
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return False
         return self.detector.has_tool_call(text)
 
@@ -176,7 +176,7 @@ class FunctionCallParser:
             - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
             - A list of tool calls parsed from the text
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return full_text, []
         has_tool_call = self.detector.has_tool_call(full_text)
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
@@ -198,7 +198,7 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return chunk_text, []
         final_normal_text = ""
         final_calls = []
@@ -218,7 +218,7 @@ class FunctionCallParser:
         Text a detector held back waiting for a marker (which can no longer
         arrive) is released as normal text; see BaseFormatDetector.finish().
         """
-        if not self.tools:
+        if not self.tools and not self.detector.parses_without_tools():
             return "", []
         sp_result = self.detector.finish(self.tools)
         return sp_result.normal_text, sp_result.calls
