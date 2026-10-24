@@ -1,9 +1,13 @@
+use std::sync::OnceLock;
+
 use axum::{
     body::Body,
     extract::Request,
     http::{HeaderMap, HeaderValue},
 };
 use http::header::HeaderName;
+
+use crate::observability::otel_trace;
 
 static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-worker");
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
@@ -213,9 +217,38 @@ pub fn should_forward_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
         || name.eq_ignore_ascii_case("x-smg-routing-key")
+        || engine_recorded_headers()
+            .iter()
+            .any(|header| name.eq_ignore_ascii_case(header))
         || name
             .get(..REQUEST_ID_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
+}
+
+fn engine_recorded_headers() -> &'static [String] {
+    static HEADERS: OnceLock<Vec<String>> = OnceLock::new();
+    HEADERS.get_or_init(|| {
+        let logged = std::env::var("SGLANG_LOG_REQUEST_HEADERS").unwrap_or_default();
+        otel_trace::traced_request_headers()
+            .iter()
+            .cloned()
+            .chain(otel_trace::parse_traced_request_headers(&logged))
+            .map(|header| header.name)
+            .filter(|name| {
+                let forward = can_forward_configured_header(name);
+                if !forward {
+                    tracing::warn!("Not forwarding configured request header {name:?} to workers");
+                }
+                forward
+            })
+            .collect()
+    })
+}
+
+/// Hop-by-hop headers and `content-length` can't be copied onto the request SMG: SMG sets
+/// its own, and the client's would misroute or misframe the request.
+fn can_forward_configured_header(name: &str) -> bool {
+    should_forward_header_no_alloc(name) && !name.eq_ignore_ascii_case("content-length")
 }
 
 #[cfg(test)]
@@ -278,6 +311,23 @@ mod tests {
         assert!(should_forward_request_header("x-request-id-123"));
         assert!(should_forward_request_header("x-smg-routing-key"));
         assert!(should_forward_request_header("X-SMG-Routing-Key"));
+    }
+
+    #[test]
+    fn test_configured_hop_by_hop_and_framing_headers_are_not_forwarded() {
+        for name in [
+            "Host",
+            "content-length",
+            "transfer-encoding",
+            "connection",
+            "proxy-authorization",
+            "upgrade",
+        ] {
+            assert!(!can_forward_configured_header(name), "{name}");
+        }
+        for name in ["x-upstream-request-id", "cookie"] {
+            assert!(can_forward_configured_header(name), "{name}");
+        }
     }
 
     #[test]
