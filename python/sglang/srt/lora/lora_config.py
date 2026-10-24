@@ -40,6 +40,28 @@ class LoRAConfig:
             self.added_tokens_config = self.get_added_tokens_config()
 
         self.target_modules = self.hf_config["target_modules"]
+        # PEFT ParamWrapper-only adapters save target_modules=[] and declare
+        # expert projections in target_parameters instead. Include their module
+        # names for LoRAManager's target inference and CLI validation, without
+        # changing the saved config used to resolve the flattened factors.
+        target_parameters = self.hf_config.get("target_parameters")
+        if isinstance(target_parameters, list) and (
+            self.target_modules is None or isinstance(self.target_modules, list)
+        ):
+            parameter_modules = []
+            for target in target_parameters:
+                if not isinstance(target, str):
+                    continue
+                for projection in ("gate_up_proj", "down_proj"):
+                    if target in (
+                        projection,
+                        f"experts.{projection}",
+                    ) or target.endswith(f".experts.{projection}"):
+                        parameter_modules.append(projection)
+            if parameter_modules:
+                self.target_modules = list(
+                    dict.fromkeys((self.target_modules or []) + parameter_modules)
+                )
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
         self.use_dora = self.hf_config.get("use_dora", False)
