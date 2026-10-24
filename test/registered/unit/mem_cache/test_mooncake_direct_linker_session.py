@@ -1,9 +1,10 @@
-"""Unit tests for the Mooncake direct linker's layer-wise load sessions."""
+"""Regression tests for concurrent Mooncake load sessions."""
 
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -13,122 +14,85 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-POOLS = ("kv", "index")
-
-
-class _Store:
-    def __init__(self, start):
-        self.start = start
-        self.ended = []
-
-    def batch_get_session_start(self, keys):
-        return self.start(keys)
-
-    def batch_get_session_end(self, keys):
-        self.ended.append(list(keys))
-
-
-class _Counter:
-    def __init__(self):
-        self.completed = []
-        self.failures = []
-
-    def complete(self, index, layer):
-        self.completed.append(layer)
-
-    def fail(self, index, error):
-        self.failures.append(error)
-
-
-def _linker(start):
-    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
-    linker.storage = SimpleNamespace(
-        store=_Store(start),
-        _get_hybrid_page_component_keys=lambda keys, transfer: (keys, None),
-        _tag_keys=lambda keys: keys,
-    )
-    pool = SimpleNamespace(
-        prepare_locations=lambda host_indices: list(host_indices),
-        get_prepared_layer_range_meta=lambda locations, layer: None,
-    )
-    linker.pools = {name: pool for name in POOLS}
-    linker.num_layers = 2
-    linker.layer_done_counter = _Counter()
-    linker.session_executor = ThreadPoolExecutor(max_workers=len(POOLS))
-    return linker
-
-
-def _transfers():
-    return [
-        [
-            SimpleNamespace(name=name, keys=[f"{name}-page"], host_indices=[0])
-            for name in POOLS
-        ]
-    ]
-
 
 class TestLayerWiseLoadSessions(CustomTestCase):
-    def test_pool_session_starts_run_concurrently(self):
-        # Each start waits for the other pool's start: a serial issue times out.
-        both_started = threading.Barrier(len(POOLS), timeout=5)
+    def setUp(self):
+        self.linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        self.store = Mock()
+        self.linker.storage = SimpleNamespace(
+            store=self.store,
+            _get_hybrid_page_component_keys=lambda keys, transfer: (keys, None),
+            _tag_keys=lambda keys: keys,
+        )
+        self.linker.pools = {
+            name: Mock(get_prepared_layer_range_meta=Mock(return_value=None))
+            for name in ("kv", "index")
+        }
+        self.linker.num_layers = 1
+        self.linker.layer_done_counter = Mock()
+        self.linker.session_executor = ThreadPoolExecutor(max_workers=2)
+        self.addCleanup(self.linker.session_executor.shutdown)
+        self.transfers = [
+            [
+                SimpleNamespace(name=name, keys=[f"{name}-{row}"], host_indices=[row])
+                for name in self.linker.pools
+            ]
+            for row in (4, 0)
+        ]
+
+    def test_concurrent_starts_before_fence_and_ordered_ranges_after(self):
+        both_started = threading.Barrier(2, timeout=5)
+        fence = Mock()
 
         def start(keys):
+            fence.synchronize.assert_not_called()
             both_started.wait()
             return [0] * len(keys)
 
-        linker = _linker(start)
-        self.addCleanup(linker.session_executor.shutdown)
-        linker.load_layer_wise(0, _transfers())
+        def locations(indices):
+            fence.synchronize.assert_called_once_with()
+            return indices
 
-        self.assertEqual(linker.layer_done_counter.failures, [])
-        self.assertEqual(linker.layer_done_counter.completed, [0, 1])
-        self.assertCountEqual(
-            linker.storage.store.ended, [[f"{name}-page"] for name in POOLS]
-        )
-
-    def test_sessions_start_before_the_slot_fence(self):
-        # Sessions need only keys; the slot locations wait for the GPU fence.
-        order = []
-
-        def start(keys):
-            order.append(("start", keys[0]))
-            return [0] * len(keys)
-
-        linker = _linker(start)
-        self.addCleanup(linker.session_executor.shutdown)
-        for pool in linker.pools.values():
-            pool.prepare_locations = lambda host_indices: (
-                order.append(("locations",)) or list(host_indices)
+        self.store.batch_get_session_start.side_effect = start
+        self.store.batch_get_into_multi_buffer_ranges.return_value = [3, 3]
+        for pool in self.linker.pools.values():
+            pool.prepare_locations.side_effect = locations
+            pool.get_prepared_layer_range_meta.side_effect = lambda rows, layer: (
+                [[100 + int(row) * 3] for row in rows],
+                [[3], [3]],
+                [[0], [0]],
             )
-        fence = SimpleNamespace(synchronize=lambda: order.append(("fence",)))
-        linker.load_layer_wise(0, _transfers(), fence)
+        self.linker.load_layer_wise(7, self.transfers, fence)
 
-        self.assertEqual(linker.layer_done_counter.failures, [])
-        fence_at = order.index(("fence",))
-        self.assertCountEqual(
-            order[:fence_at], [("start", f"{name}-page") for name in POOLS]
+        self.linker.layer_done_counter.fail.assert_not_called()
+        self.linker.layer_done_counter.complete.assert_called_once_with(7, 0)
+        self.assertEqual(
+            self.store.batch_get_into_multi_buffer_ranges.call_args_list,
+            [
+                call([f"{name}-4", f"{name}-0"], [[112], [100]], [[3], [3]], [[0], [0]])
+                for name in self.linker.pools
+            ],
         )
-        self.assertEqual(order[fence_at + 1 :], [("locations",)] * len(POOLS))
+        self.store.batch_get_session_end.assert_has_calls(
+            [call([f"{name}-4", f"{name}-0"]) for name in self.linker.pools],
+            any_order=True,
+        )
 
-    def test_failed_start_still_ends_the_sessions_that_started(self):
-        def start(keys):
-            return [1] if keys == ["index-page"] else [0]
+    def test_failed_start_ends_successful_sessions(self):
+        self.store.batch_get_session_start.side_effect = lambda keys: (
+            [1, 1] if keys[0].startswith("index") else [0, 0]
+        )
+        with self.assertLogs(MooncakeDirectLinker.__module__, level="ERROR"):
+            self.linker.load_layer_wise(7, self.transfers)
 
-        linker = _linker(start)
-        self.addCleanup(linker.session_executor.shutdown)
-        with self.assertLogs(
-            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker",
-            level="ERROR",
-        ) as logs:
-            linker.load_layer_wise(0, _transfers())
-
-        self.assertIn("Mooncake layer-wise load batch failed", logs.output[0])
-        self.assertEqual(linker.layer_done_counter.completed, [])
-        self.assertEqual(len(linker.layer_done_counter.failures), 1)
+        self.linker.layer_done_counter.complete.assert_not_called()
+        self.linker.layer_done_counter.fail.assert_called_once()
         self.assertIn(
-            "get session start failed", str(linker.layer_done_counter.failures[0])
+            "get session start failed",
+            str(self.linker.layer_done_counter.fail.call_args.args[1]),
         )
-        self.assertEqual(linker.storage.store.ended, [["kv-page"]])
+        self.store.batch_get_into_multi_buffer_ranges.assert_not_called()
+        self.store.batch_get_session_end.assert_called_once_with(["kv-4", "kv-0"])
 
 
 if __name__ == "__main__":
