@@ -2237,9 +2237,11 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.minimax_h3_adaln_cache_path,
             help=(
-                "Path to a precomputed MiniMax H3 AdaLN cache. This only "
-                "supports the matching unquantized H3 checkpoint and rejects "
-                "requests whose timestep embeddings are not present in the cache."
+                "Path to a precomputed MiniMax H3 AdaLN cache. It replaces only "
+                "the AdaLN branches, so it supports the matching H3 checkpoint "
+                "unquantized or with quantized linears (e.g. ConvRot INT8), and "
+                "rejects requests whose timestep embeddings are not present in "
+                "the cache."
             ),
         )
         parser.add_argument(

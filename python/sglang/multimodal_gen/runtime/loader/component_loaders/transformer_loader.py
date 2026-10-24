@@ -69,6 +69,24 @@ def _minimax_h3_adaln_cache_key_filter(name: str) -> bool:
     return ".adaln_proj.linear." not in name
 
 
+def _comfy_quant_and_minimax_h3_adaln_cache_key_filter(name: str) -> bool:
+    return comfy_quant_key_filter(name) and _minimax_h3_adaln_cache_key_filter(name)
+
+
+def _select_checkpoint_key_filter(
+    *, uses_comfy_layer_markers: bool, drops_adaln_proj: bool
+) -> Callable[[str], bool] | None:
+    # Comfy markers have no parameter to load into, and adaln_proj has no module
+    # when a sidecar or the online rebuild supplies the AdaLN outputs.
+    if uses_comfy_layer_markers and drops_adaln_proj:
+        return _comfy_quant_and_minimax_h3_adaln_cache_key_filter
+    if uses_comfy_layer_markers:
+        return comfy_quant_key_filter
+    if drops_adaln_proj:
+        return _minimax_h3_adaln_cache_key_filter
+    return None
+
+
 def _default_quantized_attention_backend(
     quant_spec: TransformerQuantLoadSpec, server_args: ServerArgs
 ) -> AttentionBackendEnum | None:
@@ -424,9 +442,6 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             "hf_config": config,
             "quant_config": quant_spec.runtime_quant_config,
         }
-        checkpoint_key_filter: Callable[[str], bool] | None = (
-            comfy_quant_key_filter if quant_spec.uses_comfy_layer_markers else None
-        )
         adaln_cache_path = component_server_args.minimax_h3_adaln_cache_path
         if adaln_cache_path is not None:
             if not is_minimax_h3:
@@ -441,7 +456,6 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             init_params["adaln_cache_model_variant"] = (
                 component_server_args.model_variant
             )
-            checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
         if component_server_args.minimax_h3_adaln_online:
             if not is_minimax_h3:
                 raise ValueError(
@@ -476,7 +490,11 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             init_params["adaln_precision"] = (
                 "fp32" if envs.SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32 else "match"
             )
-            checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
+        checkpoint_key_filter = _select_checkpoint_key_filter(
+            uses_comfy_layer_markers=quant_spec.uses_comfy_layer_markers,
+            drops_adaln_proj=adaln_cache_path is not None
+            or component_server_args.minimax_h3_adaln_online,
+        )
 
         runtime_quant_config = init_params["quant_config"]
         if runtime_quant_config is not None:

@@ -2153,6 +2153,16 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                 )
 
     @staticmethod
+    def _validate_adaln_precompute_config(*, quantized: bool, online: bool) -> None:
+        # A sidecar holds the original BF16 AdaLN outputs and no adaln_proj is
+        # built, so it pairs with quantized linears; the online rebuild streams
+        # adaln_proj from the checkpoint and needs it unquantized.
+        if quantized and online:
+            raise ValueError(
+                "MiniMax H3 --minimax-h3-adaln-online requires unquantized weights"
+            )
+
+    @staticmethod
     def _validate_sequence_parallel_config(
         *,
         arch: MiniMaxH3DiTArchConfig,
@@ -2201,12 +2211,10 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
-        if (
-            adaln_cache_path is not None or adaln_weight_files is not None
-        ) and quant_config is not None:
-            raise ValueError(
-                "MiniMax H3 AdaLN cache is only compatible with unquantized weights"
-            )
+        self._validate_adaln_precompute_config(
+            quantized=quant_config is not None,
+            online=adaln_weight_files is not None,
+        )
         if arch.adaln_curve_grid is not None and (
             adaln_cache_path is not None or adaln_weight_files is not None
         ):
