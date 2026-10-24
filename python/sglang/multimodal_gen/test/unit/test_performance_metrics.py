@@ -929,14 +929,13 @@ def test_real_stage_metrics_reach_warmup_record(
             super().__init__()
             self.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
 
-    metrics = RequestMetrics("warmup-contract")
     req = Req(
         sampling_params=SamplingParams(num_inference_steps=2),
-        metrics=metrics,
         is_warmup=is_warmup,
         perf_dump_path="metrics",
         extra={"warmup_target_num_inference_steps": 8},
     )
+    metrics = req.metrics
     model = TinyTransformer()
     stage = DenoisingStage.__new__(DenoisingStage)
     stage.server_args = SimpleNamespace(
