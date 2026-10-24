@@ -254,5 +254,7 @@
   ],
   "full_model_test": false,
   "end_to_end_performance": "NOT_MEASURED",
-  "new_model_requests": 0
+  "new_model_requests": 0,
+  "scope": "This manifest records bounded correctness and operation-count checks. Later full-model AIS results at the same production/test source are recorded separately in performance.json.",
+  "full_model_followup": "performance.json"
 }
