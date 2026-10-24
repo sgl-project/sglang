@@ -12,6 +12,7 @@ _LAZY_CLASSES = {
     "MLTimePredictor": "ml",
     "ReplayTimePredictor": "replay",
     "InferCastTimePredictor": "infercast",
+    "InferCastDSparkTimePredictor": "infercast_dspark",
 }
 
 
@@ -26,8 +27,8 @@ def __getattr__(name: str):
 
 
 __all__ = (
-    "ScheduleRequest",
-    "ScheduleBatch",
     "InferTimePredictor",
     "PredictorError",
+    "ScheduleBatch",
+    "ScheduleRequest",
 )

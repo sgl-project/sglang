@@ -2,7 +2,6 @@ import json
 import os
 from dataclasses import replace
 from pathlib import Path
-from typing import Optional
 
 from sglang_simulator.simulation.manager.env import Envs
 from sglang_simulator.simulation.types import PlatformConfig, SchedulerConfig
@@ -20,10 +19,10 @@ logger = get_logger()
 class ConfigManager:
     """Centralized configuration manager with caching."""
 
-    _model_info: Optional[ModelInfo] = None
-    _platform_config: Optional[PlatformConfig] = None
-    _scheduler_config: Optional[SchedulerConfig] = None
-    _raw_config: Optional[dict] = None
+    _model_info: ModelInfo | None = None
+    _platform_config: PlatformConfig | None = None
+    _scheduler_config: SchedulerConfig | None = None
+    _raw_config: dict | None = None
     _memory_budget_metrics: dict | None = None
 
     @classmethod
@@ -283,6 +282,48 @@ class ConfigManager:
                 miss_strategy=predictor_config.get("miss_strategy", "zero"),
                 miss_knn_k=predictor_config.get("miss_knn_k", 3),
             )
+        elif predictor_name == "infercast_dspark":
+            from sglang_simulator.time_predictor.infercast_dspark import (
+                InferCastDSparkTimePredictor,
+            )
+
+            supported_fields = {
+                "name",
+                "model_id",
+                "model_revision",
+                "provider_revision",
+                "systems_root",
+                "runtime_profile",
+                "progress_artifact",
+                "proposal_profile_id",
+                "output_token_id",
+            }
+            unknown_fields = sorted(predictor_config.keys() - supported_fields)
+            if unknown_fields:
+                raise ValueError(
+                    "unknown InferCast DSPark predictor configuration fields: "
+                    + ", ".join(unknown_fields)
+                )
+            options = {
+                key: value for key, value in predictor_config.items() if key != "name"
+            }
+            options["systems_root"] = cls.resolve_infercast_path(
+                options.get("systems_root")
+            )
+            for key in ("runtime_profile", "progress_artifact"):
+                ref = options.get(key)
+                if isinstance(ref, dict) and type(ref.get("path")) is str:
+                    options[key] = {
+                        **ref,
+                        "path": cls.resolve_infercast_path(ref["path"]),
+                    }
+            return InferCastDSparkTimePredictor(
+                model,
+                hw=hw,
+                config=sched_config,
+                system=config.get("platform", {}).get("accelerator", {}).get("name"),
+                **options,
+            )
         elif predictor_name == "infercast":
             from sglang_simulator.time_predictor.infercast import (
                 InferCastTimePredictor,
@@ -342,5 +383,5 @@ class ConfigManager:
         else:
             raise ValueError(
                 f"Unknown predictor name: {predictor_name}. "
-                f"Supported: aiconfigurator, ml, replay, infercast"
+                f"Supported: aiconfigurator, ml, replay, infercast, infercast_dspark"
             )

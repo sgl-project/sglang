@@ -116,11 +116,49 @@ Reading them neither admits a phase cost nor supplies current native acceptance;
 missing measurements and complete-boundary checks still fail before sampling.
 
 Actual multi-DP scheduling/heterogeneous coordination, complete measured worker
-costs (including allocation), independently reviewed progress data and predictor
-launch wiring remain required for a complete V4.1 AgentX run. The native runtime
+costs (including allocation), independently reviewed progress data and target
+source resolution remain required for a complete V4.1 AgentX run. The native runtime
 supports homogeneous TP2/TP4 ADP1; ADP2 fails until actual peer partitions and
 publication exist. CPU fixtures and native-type checks must not be reported as
 actual Simulator accuracy or hardware performance data.
+
+Select the minimal JSON factory with `predictor.name="infercast_dspark"`. It
+assembles the existing UMD cost adapter, independent empirical progress model,
+session and native CPU runtime for modeled TP2/ADP1/PP1. It binds the local
+checkpoint and native text configuration to the SDK's revision-pinned source
+configuration, and requires full model and installed-provider commits plus
+hash-pinned runtime and progress assets. It opens the selected FIDB database and
+records the stack digest; this does not certify its manifest or complete table
+coverage. Asset paths resolve from the configuration directory. The
+factory currently prepares only the existing proposal module; complete prefill
+and decode phases remain explicit data gaps. Constructing it does not establish
+a complete runnable cost model, source resolver or accuracy admission.
+
+```json
+{
+  "name": "infercast_dspark",
+  "model_id": "deepseek-ai/DeepSeek-V4.1-Flash",
+  "model_revision": "5254448103b6254fc646dacbca1cbbf20e9216c1",
+  "provider_revision": "<installed InferCast full commit>",
+  "systems_root": "../systems",
+  "runtime_profile": {"path": "runtime.json", "sha256": "<file SHA-256>"},
+  "progress_artifact": {"path": "progress.json", "sha256": "<file SHA-256>"},
+  "proposal_profile_id": "<existing proposal profile SHA-256>",
+  "output_token_id": 1
+}
+```
+
+This is the predictor object inside the ordinary simulation configuration;
+replace digest/commit placeholders with verified values. Configure the modeled
+scheduler/backend and platform normally. There is no JSON callback, latency
+override, fallback table or live acceptance option. Generic forward prediction
+is rejected: the scheduler consumes the result attached by the native DSPark
+worker. Use explicit `--skip-server-warmup`, no custom warmups, `/health` for
+readiness, and a bounded page-aligned native KV capacity for the initial run;
+default warmup and `/health_generate` submit separate unsupported recipes.
+The coordinator and optional InferCast `memory_budget` do not support this path.
+Synthetic token content requires `ignore_eos=true` and no token, string or regex
+stop rules. Unsupported stop semantics fail before cost, progress or publication.
 
 The progress artifact has `schema_version: 1`, definition
 `dspark_recipe_prefix_history_empirical_commit_v1`, `source_pin`,
@@ -593,6 +631,10 @@ Target TP topology remains part of the cost/runtime profile. Unsupported ragged,
 adaptive, coordinated and constrained paths fail before simulator declarations.
 This removes native accelerator-only argument rejection; complete cost/progress
 assets and predictor launch wiring remain necessary for a full run.
+Native `ServerArgs.from_cli_args()` only constructs the raw record. The simulator
+launcher explicitly calls `resolve_once()` before launch; the native engine's
+later call is idempotent. Resolution declarations preserve the raw argument
+values. Argument smokes must perform resolution before reading the resolved view.
 
 For offline DSPark timing, the native adapter records its entire CPU replacement
 worker call as simulation overhead. The scheduler excludes that wall time from
