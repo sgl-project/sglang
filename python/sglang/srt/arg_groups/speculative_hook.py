@@ -458,6 +458,11 @@ def _handle_uno(server_args: ServerArgs) -> None:
             "UNO does not support --enable-strict-thinking because it requires "
             "grammar decoding."
         )
+    if envs.SGLANG_MAX_THINK_TOKENS.get() >= 0:
+        raise ValueError(
+            "UNO does not support SGLANG_MAX_THINK_TOKENS because the thinking "
+            "budget requires grammar decoding."
+        )
 
     verify_width = cfg.speculative_num_draft_tokens
     if verify_width is None or int(verify_width) < 1:

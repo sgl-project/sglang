@@ -62,6 +62,9 @@ from sglang.srt.beam_search.output import (
 )
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.constrained.base_grammar_backend import (
+    grammar_backend_supports_token_filter,
+)
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.elastic_ep.topology import (
@@ -920,11 +923,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if (
             isinstance(obj, GenerateReqInput)
             and obj.max_thinking_tokens is not None
-            and not get_serving().enable_strict_thinking
+            and not (
+                get_serving().reasoning_parser
+                and grammar_backend_supports_token_filter(
+                    get_exec().kernel.grammar_backend
+                )
+            )
         ):
             raise ValueError(
                 "max_thinking_tokens requires the server to be launched with "
-                "--enable-strict-thinking"
+                "--reasoning-parser and a grammar backend that supports token "
+                "filtering (e.g., xgrammar)"
             )
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:

@@ -135,6 +135,16 @@ class ThinkingBudgetLogitProcessor(CustomLogitProcessor):
         return logits
 
 
+def consumes_thinking_budget(serialized_processor: str) -> bool:
+    try:
+        return isinstance(
+            CustomLogitProcessor.from_str(serialized_processor),
+            ThinkingBudgetLogitProcessor,
+        )
+    except Exception:
+        return False
+
+
 class Glm4MoeThinkingBudgetLogitProcessor(ThinkingBudgetLogitProcessor):
     """A logit processor that controls the length of thinking for GLM-4.5 / GLM-4.6 / GLM-4.5V / GLM-4.6V models."""
 

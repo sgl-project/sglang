@@ -1167,7 +1167,7 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
 
         self.assertFalse(tm.rid_to_state)
 
-    def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
+    def test_thinking_budget_rejects_runtime_without_reasoning_parser(self):
         tm = _make_tm_for_generate(self)
         obj = GenerateReqInput(
             text="hello",
@@ -1179,7 +1179,7 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         async def drive():
             await tm.generate_request(obj).__anext__()
 
-        with self.assertRaisesRegex(ValueError, "--enable-strict-thinking"):
+        with self.assertRaisesRegex(ValueError, "--reasoning-parser"):
             asyncio.run(drive())
 
         self.assertFalse(tm.rid_to_state)

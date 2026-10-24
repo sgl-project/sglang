@@ -5,13 +5,14 @@ Test Coverage:
 - BaseGrammarBackend: caching, dispatch routing, unsupported fallback,
   thread pool execution, cache hit/miss
 - create_grammar_backend: factory routing, "none" backend, invalid name,
-  custom registry, reasoner wrapping
+  custom registry, reasoner wrapping, SGLANG_MAX_THINK_TOKENS prerequisites
 
 Usage:
     python -m pytest test_base_grammar_backend.py -v
 """
 
 import json
+import os
 import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
@@ -213,6 +214,13 @@ class TestCreateGrammarBackend(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "enable-strict-thinking"):
             create_grammar_backend(args, None, 32000)
 
+    def test_none_backend_with_env_thinking_budget_raises(self):
+        """A server-wide budget is a hard requirement, strict flag or not."""
+        with patch.dict(os.environ, {"SGLANG_MAX_THINK_TOKENS": "128"}):
+            args = self._make_server_args("none")
+            with self.assertRaisesRegex(ValueError, "SGLANG_MAX_THINK_TOKENS"):
+                create_grammar_backend(args, None, 32000)
+
     def test_invalid_backend_raises(self):
         args = self._make_server_args("nonexistent_backend")
         with self.assertRaises(ValueError):
@@ -308,6 +316,27 @@ class TestCreateGrammarBackend(unittest.TestCase):
 
         result = create_grammar_backend(args, tokenizer, 32000, think_end_ids=[42])
         self.assertIs(result, mock_backend)
+
+    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
+    def test_env_thinking_budget_requires_reasoner_wrapping(self, mock_xgrammar_cls):
+        """Without a reasoning wrapper nothing enforces the server-wide cap; fail startup."""
+        mock_xgrammar_cls.return_value = MagicMock(spec=BaseGrammarBackend)
+        register_grammar_backend("custom_tf", lambda *a: MagicMock())
+        cases = [
+            ("no_reasoning_parser", "xgrammar", None, [42], "--reasoning-parser"),
+            ("no_think_end_ids", "xgrammar", "deepseek-r1", None, "think-end"),
+            ("custom_backend", "custom_tf", "deepseek-r1", [42], "custom_tf"),
+        ]
+        for name, backend, parser, think_end_ids, missing in cases:
+            with (
+                self.subTest(name),
+                patch.dict(os.environ, {"SGLANG_MAX_THINK_TOKENS": "0"}),
+            ):
+                args = self._make_server_args(backend, reasoning_parser=parser)
+                with self.assertRaisesRegex(ValueError, missing):
+                    create_grammar_backend(
+                        args, MagicMock(), 32000, think_end_ids=think_end_ids
+                    )
 
     @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
     def test_xgrammar_eos_none(self, mock_xgrammar_cls):

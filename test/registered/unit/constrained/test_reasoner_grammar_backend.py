@@ -100,7 +100,6 @@ class TestReasonerGrammarObject(CustomTestCase):
             think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=2,
-            enable_token_filter=True,
             token_filter_fn=set_token_filter_torch,
             allocate_vocab_mask_fn=lambda vocab_size, batch_size, device: torch.zeros(
                 (batch_size, (vocab_size + 31) // 32), dtype=torch.int32
@@ -144,7 +143,6 @@ class TestReasonerGrammarObject(CustomTestCase):
             grammar=None,
             think_end_ids=[7, 8],
             max_think_tokens=1,
-            enable_token_filter=True,
             token_filter_fn=set_token_filter_torch,
         )
         obj.maybe_init_reasoning(True)
@@ -256,6 +254,59 @@ class TestReasonerGrammarBackend(CustomTestCase):
         )
 
         self.assertIsNone(reasoner.init_strict_reasoning_grammar(reasoning=True))
+
+    def test_env_budget_enables_filter_without_strict_thinking(self):
+        """A server-wide budget must not require --enable-strict-thinking."""
+        os.environ["SGLANG_MAX_THINK_TOKENS"] = "2"
+        backend = _DummyGrammarBackend(support_token_filter=True)
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            self._make_tokenizer(),
+            enable_strict_thinking=False,
+        )
+
+        obj = reasoner.init_strict_reasoning_grammar(reasoning=True)
+
+        self.assertIsInstance(obj, ReasonerGrammarObject)
+        self.assertTrue(obj.enable_token_filter)
+        self.assertEqual(obj.max_think_tokens, 2)
+        self.assertIsNone(obj.think_excluded_token_ids)
+
+    def test_request_budget_enables_filter_without_strict_thinking(self):
+        """A per-request budget must not require --enable-strict-thinking."""
+        backend = _DummyGrammarBackend(support_token_filter=True)
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            self._make_tokenizer(),
+            enable_strict_thinking=False,
+        )
+
+        obj = reasoner.init_strict_reasoning_grammar(
+            reasoning=True, request_thinking_budget=5
+        )
+
+        self.assertIsInstance(obj, ReasonerGrammarObject)
+        self.assertTrue(obj.enable_token_filter)
+        self.assertEqual(obj.max_think_tokens, 5)
+        self.assertIsNone(obj.think_excluded_token_ids)
+
+    def test_request_budget_returns_none_when_backend_lacks_token_filter(self):
+        """An unenforceable per-request budget must not produce an inert object."""
+        backend = _DummyGrammarBackend(support_token_filter=False)
+        reasoner = ReasonerGrammarBackend(
+            backend,
+            self._make_parser(),
+            self._make_tokenizer(),
+            enable_strict_thinking=False,
+        )
+
+        self.assertIsNone(
+            reasoner.init_strict_reasoning_grammar(
+                reasoning=True, request_thinking_budget=5
+            )
+        )
 
     def test_wraps_inner_grammar_with_reasoning_state_machine(self):
         os.environ["SGLANG_MAX_THINK_TOKENS"] = "1"
@@ -848,7 +899,6 @@ class TestReasonerGrammarObjectRollback(CustomTestCase):
             think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=-1,
-            enable_token_filter=True,
             token_filter_fn=set_token_filter_torch,
             allocate_vocab_mask_fn=lambda vs, bs, d: torch.zeros(
                 (bs, (vs + 31) // 32), dtype=torch.int32
@@ -995,7 +1045,6 @@ class TestReasonerGrammarObjectFillVocabMask(CustomTestCase):
             think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=-1,
-            enable_token_filter=True,
             token_filter_fn=set_token_filter_torch,
             allocate_vocab_mask_fn=lambda vs, bs, d: torch.zeros(
                 (bs, (vs + 31) // 32), dtype=torch.int32
@@ -1023,7 +1072,6 @@ class TestReasonerGrammarObjectFillVocabMask(CustomTestCase):
             think_end_ids=[7],
             think_excluded_token_ids=[3, 5],
             max_think_tokens=-1,
-            enable_token_filter=True,
             token_filter_fn=set_token_filter_torch,
             allocate_vocab_mask_fn=lambda vs, bs, d: torch.zeros(
                 (bs, (vs + 31) // 32), dtype=torch.int32
@@ -1047,7 +1095,6 @@ class TestReasonerGrammarObjectFillVocabMask(CustomTestCase):
             think_end_ids=[7],
             think_excluded_token_ids=None,
             max_think_tokens=-1,
-            enable_token_filter=False,
             token_filter_fn=None,
         )
         obj.maybe_init_reasoning(True)
@@ -1075,7 +1122,6 @@ class TestReasonerGrammarObjectCurrentToken(CustomTestCase):
             think_end_ids=[7],
             think_excluded_token_ids=None,
             max_think_tokens=-1,
-            enable_token_filter=False,
             token_filter_fn=None,
         )
         return obj, inner_grammar
