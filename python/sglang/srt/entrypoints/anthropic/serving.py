@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import uuid
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
 from fastapi import HTTPException, Request
@@ -52,6 +53,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.environ import envs
 from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
@@ -178,6 +180,43 @@ def _scrub_error_message(message: str, status_code: int) -> str:
     if len(cleaned) > 500:
         cleaned = cleaned[:500] + "…"
     return cleaned or "Request failed"
+
+
+async def _sse_keepalive(
+    stream: AsyncGenerator[str, None], interval: float
+) -> AsyncGenerator[str, None]:
+    """Keep idle SSE connections active without cancelling a pending model output.
+
+    Comments are ignored by SSE clients. Closing the response cancels the pending
+    read and closes the source, preserving its disconnect cleanup.
+    """
+    if interval <= 0:
+        try:
+            async for item in stream:
+                yield item
+        finally:
+            await stream.aclose()
+        return
+
+    pending = asyncio.ensure_future(anext(stream))
+    try:
+        while True:
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+            if not done:
+                yield ": keepalive\n\n"
+                continue
+            try:
+                item = pending.result()
+            except StopAsyncIteration:
+                return
+            yield item
+            pending = asyncio.ensure_future(anext(stream))
+    finally:
+        if not pending.done():
+            pending.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await pending
+        await stream.aclose()
 
 
 class AnthropicServing:
@@ -821,11 +860,14 @@ class AnthropicServing:
             )
 
         return StreamingResponse(
-            self._generate_anthropic_stream(
-                adapted_request,
-                processed_request,
-                anthropic_request,
-                raw_request,
+            _sse_keepalive(
+                self._generate_anthropic_stream(
+                    adapted_request,
+                    processed_request,
+                    anthropic_request,
+                    raw_request,
+                ),
+                interval=envs.SGLANG_SSE_KEEPALIVE_S.get(),
             ),
             media_type="text/event-stream",
             background=self.openai_serving_chat.tokenizer_manager.create_abort_task(
