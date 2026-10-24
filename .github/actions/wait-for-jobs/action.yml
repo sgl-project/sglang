@@ -47,6 +47,9 @@ runs:
         INPUT_FAIL_ON_TIMEOUT: ${{ inputs.fail-on-timeout }}
       with:
         github-token: ${{ inputs.github-token }}
+        # Retries 5xx/429 and dropped connections so a transient jobs-API blip
+        # does not fail the gate; 4xx is exempt by default.
+        retries: 2
         script: |
           const stageName = process.env.INPUT_STAGE_NAME;
           const jobSpecs = JSON.parse(process.env.INPUT_JOBS);
