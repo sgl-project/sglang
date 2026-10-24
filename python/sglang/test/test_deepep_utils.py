@@ -8,6 +8,10 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+# DeepEP on CUDA (deep_ep) or Intel XPU (deep_ep_xpu).
+DEVICE = "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cuda"
+_accelerator = getattr(torch, DEVICE)
+
 
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings
@@ -18,14 +22,14 @@ def init_dist(local_rank: int, num_local_ranks: int):
     assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
 
     dist.init_process_group(
-        backend="nccl",
+        backend="xccl" if DEVICE == "xpu" else "nccl",
         init_method=f"tcp://{ip}:{port}",
         world_size=num_nodes * num_local_ranks,
         rank=node_rank * num_local_ranks + local_rank,
     )
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device("cuda")
-    torch.cuda.set_device(local_rank)
+    torch.set_default_device(DEVICE)
+    _accelerator.set_device(local_rank)
 
     return (
         dist.get_rank(),
@@ -84,8 +88,8 @@ def create_grouped_scores(
 
 def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
     # Flush L2 cache with 256 MB data
-    torch.cuda.synchronize()
-    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device="cuda")
+    _accelerator.synchronize()
+    cache = torch.empty(int(256e6 // 4), dtype=torch.int, device=DEVICE)
 
     # Warmup
     for _ in range(num_warmups):
@@ -95,8 +99,8 @@ def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
     cache.zero_()
 
     # Testing
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_tests)]
+    start_events = [_accelerator.Event(enable_timing=True) for _ in range(num_tests)]
+    end_events = [_accelerator.Event(enable_timing=True) for _ in range(num_tests)]
     for i in range(num_tests):
         # Record
         start_events[i].record()
@@ -104,7 +108,7 @@ def bench(fn, num_warmups: int = 20, num_tests: int = 30, post_fn=None):
         end_events[i].record()
         if post_fn is not None:
             post_fn()
-    torch.cuda.synchronize()
+    _accelerator.synchronize()
 
     times = np.array(
         [s.elapsed_time(e) / 1e3 for s, e in zip(start_events, end_events)]
