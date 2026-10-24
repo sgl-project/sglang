@@ -407,3 +407,26 @@ def test_apply_composed_adapter_end_to_end():
         + _reference_delta(x, a_list, b_list, adapter_alpha) * strength
     )
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_failed_reload_keeps_previous_adapter():
+    pipeline = _make_loader_pipeline()
+    _load_adapter(pipeline, _qkv_state_dict(), lora_alpha=4)
+    before = pipeline.lora_adapters["adapter"]
+    tensors = dict(before)
+
+    replacement = {k: v + 1 for k, v in _qkv_state_dict().items()}
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline."
+            "_store_fused_lora_groups",
+            side_effect=RuntimeError("boom"),
+        ),
+        pytest.raises(RuntimeError, match="boom"),
+    ):
+        _load_adapter(pipeline, replacement, lora_alpha=8)
+
+    assert pipeline.lora_adapters["adapter"] is before
+    assert before.keys() == tensors.keys()
+    assert all(before[k] is tensors[k] for k in tensors)
+    assert pipeline.loaded_adapter_alphas["adapter"] == 4
