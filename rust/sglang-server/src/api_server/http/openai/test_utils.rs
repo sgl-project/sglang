@@ -180,9 +180,12 @@ pub(super) fn answering_app_state_with_item(
 ) -> Arc<super::AppState> {
     let (intake_tx, intake_rx) = flume::unbounded();
     tokio::spawn(async move {
+        // Held open, so an unfinished answer stays unfinished.
+        let mut open = Vec::new();
         while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
             assert!(admission.try_accept());
             request.sink.try_send(answer(request.rid.as_str())).unwrap();
+            open.push(request);
         }
     });
     let core = CoreHandle::new(
