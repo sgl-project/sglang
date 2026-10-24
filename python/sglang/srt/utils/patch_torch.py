@@ -71,9 +71,14 @@ def register_sgl_tp_rank(rank: int):
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
-    output_args = _modify_tuple(
-        output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
-    )
+    # Only the CUDA form carries a device index at this position. A CPU tensor
+    # reduces to a shorter tuple with no device slot at all, so rewriting the
+    # position unconditionally raises IndexError. reduce_tensor is the reducer
+    # for every tensor once installed, CPU ones included.
+    if len(output_args) > _REDUCE_TENSOR_ARG_DEVICE_INDEX:
+        output_args = _modify_tuple(
+            output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
+        )
     return output_fn, output_args
 
 
