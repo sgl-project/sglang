@@ -108,6 +108,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.token_to_kv_pool_allocator = allocator
     manager.kv_cache = MagicMock()
     manager.page_size = page_size
+    manager.is_eagle = False
     manager.tree_cache = tree_cache
     manager.offloaded_state = WeakKeyDict()
     manager.ongoing_offload = {}
@@ -144,6 +145,48 @@ class TestReleaseFinishedReq(unittest.TestCase):
                 self.assertEqual(
                     prefix + tail,
                     get_storage_hash_str(RadixKey(tokens, **namespace), page_size=2),
+                )
+
+    def test_decode_offload_continues_prefill_storage_chain(self):
+        """Decode-offloaded pages must extend the chain the prefill stored and the next
+        turn looks up; under EAGLE that chain is keyed by token bigrams."""
+        page_size = 4
+        prompt, outputs = list(range(100, 108)), list(range(200, 206))
+        for is_eagle in (False, True):
+            with self.subTest(is_eagle=is_eagle):
+                manager, _ = _make_manager(pool_size=32, page_size=page_size)
+                manager.is_eagle = is_eagle
+                manager.cache_controller = MagicMock(get_hash_str=get_hash_str)
+                manager.cache_controller.write.return_value = torch.arange(8)
+                manager.decode_host_mem_pool = MagicMock()
+                manager.request_counter = 0
+                manager.offload_stride = page_size
+                req = _make_mock_req(
+                    req_pool_idx=0, kv_committed_len=14, kv_allocated_len=14
+                )
+                req.origin_input_ids, req.output_ids = prompt, outputs
+                req.finished.return_value = False
+
+                self.assertTrue(manager.offload_kv_cache(req))
+                manager.cache_controller.ack_write_queue = [
+                    HiCacheAck(None, _FinishedEvent(), [1])
+                ]
+                manager._check_offload_progress(1)
+
+                written = manager.cache_controller.write_storage.call_args.kwargs[
+                    "hash_value"
+                ]
+                # Same key shapes as the prefill tree insert and the storage lookup.
+                stored, looked_up = (
+                    get_storage_hash_str(
+                        RadixKey(tokens, is_bigram=is_eagle).page_aligned(page_size),
+                        page_size=page_size,
+                    )
+                    for tokens in (prompt, prompt + outputs)
+                )
+                self.assertTrue(written)
+                self.assertEqual(
+                    stored + written, looked_up[: len(stored) + len(written)]
                 )
 
     def test_reused_rid_does_not_share_offload_lifecycle(self):
