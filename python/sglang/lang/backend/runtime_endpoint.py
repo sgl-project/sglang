@@ -347,7 +347,7 @@ class RuntimeEndpoint(BaseBackend):
 
 
 def compute_normalized_prompt_logprobs(input_logprobs):
-    values = [x[0] for x in input_logprobs if x[0]]
+    values = [x[0] for x in input_logprobs if x[0] is not None]
     return sum(values) / len(values)
 
 
