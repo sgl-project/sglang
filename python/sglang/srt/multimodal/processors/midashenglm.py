@@ -104,7 +104,6 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
         logger.info("=" * 80)
         logger.info("process_mm_data_async called")
         logger.info(f"audio_data is not None: {audio_data is not None}")
-        logger.info(f"input_text: {input_text}")
         logger.info("=" * 80)
 
         if audio_data and not self.AUDIO_TOKEN_REGEX.search(input_text):
