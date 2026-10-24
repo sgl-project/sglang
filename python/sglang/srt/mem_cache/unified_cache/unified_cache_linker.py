@@ -131,8 +131,15 @@ class LayerWiseLoadCounter:
 
 
 class UnifiedCacheLinker(ABC):
-    """External KV store reached directly from the device pools."""
+    """External KV store reached directly from the device pools.
 
+    A backend that sets ``requires_page_generations`` receives Full/SWA page
+    identities and must wait each descriptor's readiness event on a different
+    CUDA stream before reading them. Identity equality never proves physical
+    transfer termination or authorizes page reuse.
+    """
+
+    requires_page_generations = False
     layer_done_counter: object
     pools: dict[PoolName, object]
     # The stream the forward writes the device pools on; None when the current
@@ -267,6 +274,24 @@ class UnifiedCacheLinkerWrapper:
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
 
+        if getattr(cache_linker, "requires_page_generations", False):
+            if ComponentType.MAMBA in cache.tree_components:
+                raise ValueError(
+                    "page-generation external linkers support Full/SWA only"
+                )
+            allocator = cache.token_to_kv_pool_allocator
+            device_type = torch.device(allocator.device).type
+            if device_type not in ("cpu", "cuda"):
+                raise ValueError(
+                    "page-generation external linkers support CPU/CUDA allocators only"
+                )
+            for component in self._components:
+                if component.component_type == ComponentType.FULL:
+                    getattr(
+                        allocator, "full_attn_allocator", allocator
+                    ).enable_allocation_generations()
+                elif component.component_type == ComponentType.SWA:
+                    allocator.swa_attn_allocator.enable_allocation_generations()
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
 

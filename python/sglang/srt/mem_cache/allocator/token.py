@@ -59,6 +59,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         select_index = self.free_pages[:need_size]
+        self._issue_allocation_generations(select_index)
         self.free_pages = self.free_pages[need_size:]
         return select_index
 

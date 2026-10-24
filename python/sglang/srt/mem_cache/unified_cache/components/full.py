@@ -487,9 +487,15 @@ class FullComponent(TreeComponent):
             value = node.component_data[self.component_type].value
             if value is None:
                 return None
+            indices = value.to(torch.int64)
+            generations, ready = self._full_allocator().allocation_generation_snapshot(
+                indices
+            )
             return PoolTransfer(
                 name=PoolName.KV,
-                device_indices=value.to(torch.int64),
+                device_indices=indices,
+                device_generations=generations,
+                device_generations_ready=ready,
                 keys=list(node.hash_value),
             )
 
@@ -509,9 +515,12 @@ class FullComponent(TreeComponent):
             if slots is None:
                 return None
 
+            generations, ready = allocator.allocation_generation_snapshot(slots)
             return PoolTransfer(
                 name=PoolName.KV,
                 device_indices=slots.to(torch.int64),
+                device_generations=generations,
+                device_generations_ready=ready,
                 keys=list(keys),
             )
 

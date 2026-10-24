@@ -1253,9 +1253,14 @@ class SWAComponent(TreeComponent):
                 return None
 
             num_pages = len(value) // page
+            allocator = self.cache.token_to_kv_pool_allocator.swa_attn_allocator
+            indices = value[-num_pages * page :].to(torch.int64)
+            generations, ready = allocator.allocation_generation_snapshot(indices)
             return PoolTransfer(
                 name=self.pool_name,
-                device_indices=value[-num_pages * page :].to(torch.int64),
+                device_indices=indices,
+                device_generations=generations,
+                device_generations_ready=ready,
                 keys=node.hash_value[-num_pages:],
                 hit_policy=PoolHitPolicy.TRAILING_PAGES,
             )
@@ -1284,6 +1289,10 @@ class SWAComponent(TreeComponent):
             if transfer.device_indices is None:
                 return None
             transfer.device_indices = transfer.device_indices.to(torch.int64)
+            (
+                transfer.device_generations,
+                transfer.device_generations_ready,
+            ) = allocator.allocation_generation_snapshot(transfer.device_indices)
         return transfer
 
     def update_external_linker_load(

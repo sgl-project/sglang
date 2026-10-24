@@ -1390,6 +1390,28 @@ def test_external_cache_linker_enablement():
     assert core.enable_external_cache_linker is False
 
 
+def test_external_linker_offload_enriches_rust_transfers_with_generations():
+    from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+    allocator = TokenToKVPoolAllocator(8, torch.float16, "cpu", None, False)
+    allocator.enable_allocation_generations()
+    indices = allocator.alloc(2)
+    assert indices is not None
+    core = _tree_core(token_to_kv_pool_allocator=allocator, page_size=1)
+    core.enable_external_cache_linker = True
+    inserted = _insert(core, [1, 2], indices.tolist())
+
+    transfers = core.build_external_linker_offload_transfers(inserted.last_device_node)
+
+    assert transfers is not None
+    assert len(transfers) == 1
+    assert transfers[0].device_generations is not None
+    assert torch.equal(
+        transfers[0].device_generations,
+        allocator.allocation_generations(transfers[0].device_indices),
+    )
+
+
 def test_sanity_check_passes_after_the_full_flow():
     core = _tree_core()
     _insert(core, [1, 2, 3], [10, 11, 12])

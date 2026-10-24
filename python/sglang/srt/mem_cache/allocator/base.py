@@ -58,6 +58,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         self.free_pages = None
         self.release_pages = None
+        self._next_allocation_generation = 1
+        self._allocation_generations: torch.Tensor | None = None
         # None: free right away. A list: hold frees until free_group_end().
         self.free_group: list[torch.Tensor] | None = None
 
@@ -210,6 +212,63 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             return self.free_pages
         return torch.cat((self.free_pages, self.release_pages))
 
+    def _issue_allocation_generations(self, page_ids: torch.Tensor) -> None:
+        """Assign identities to physical pages handed to new writers."""
+        if self._allocation_generations is None:
+            return
+        count = page_ids.numel()
+        if count == 0:
+            return
+        generation = self._next_allocation_generation
+        if generation > torch.iinfo(torch.int64).max:
+            raise RuntimeError("KV page allocation generation exhausted")
+        self._allocation_generations.index_fill_(0, page_ids, generation)
+        self._next_allocation_generation += 1
+
+    def enable_allocation_generations(self) -> None:
+        """Enable page identities for a consumer before serving allocations."""
+        if self._allocation_generations is None:
+            self._allocation_generations = torch.zeros(
+                self.size // self.page_size + 1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+
+    def allocation_generations(self, indices: torch.Tensor) -> torch.Tensor | None:
+        """Snapshot allocator identities for complete physical pages.
+
+        The caller supplies complete page-aligned indices owned by this
+        allocator. The result remains on the allocator device, avoiding a host
+        synchronization in the allocation or external-linker path. Zero means
+        a page has not received an identity. The snapshot fences stale control
+        completions; it is not a device-transfer termination receipt.
+        """
+        if indices.numel() == 0 or indices.numel() % self.page_size:
+            return None
+        if self._allocation_generations is None:
+            return None
+        page_ids = indices[:: self.page_size] // self.page_size
+        return torch.index_select(self._allocation_generations, 0, page_ids)
+
+    def allocation_generation_snapshot(
+        self, indices: torch.Tensor
+    ) -> tuple[torch.Tensor | None, object | None]:
+        """Return page identities and the CUDA event that makes them ready."""
+        generations = self.allocation_generations(indices)
+        if generations is None or generations.device.type != "cuda":
+            return generations, None
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(generations.device))
+        return generations, ready
+
+    def _resize_allocation_generations(self) -> None:
+        if self._allocation_generations is not None:
+            self._allocation_generations = torch.zeros(
+                self.size // self.page_size + 1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+
     def free_group_begin(self):
         assert self.free_group is None, "free groups cannot be nested"
         self.free_group = []
@@ -262,6 +321,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.size = config.max_total_num_tokens
         if self.page_size > 1:
             self.num_pages = config.max_total_num_tokens // self.page_size
+        self._resize_allocation_generations()
         self.clear()
 
     @abc.abstractmethod

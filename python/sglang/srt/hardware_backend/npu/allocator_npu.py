@@ -94,6 +94,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
+        self._issue_allocation_generations(self.free_pages[:num_new_pages_item])
         self.free_pages = self.free_pages[num_new_pages_item:]
         return out_indices.int()
 
@@ -133,6 +134,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
+        self._issue_allocation_generations(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices.int()
 

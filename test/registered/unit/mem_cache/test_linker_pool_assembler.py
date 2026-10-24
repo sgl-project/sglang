@@ -25,6 +25,12 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDevicePoolEntry(CustomTestCase):
+    def test_pool_transfer_preserves_legacy_positional_keys(self):
+        transfer = PoolTransfer(PoolName.KV, None, None, ["key"])
+
+        self.assertEqual(transfer.keys, ["key"])
+        self.assertIsNone(transfer.device_generations)
+
     def test_sparse_multi_component_layer_ranges(self):
         k0 = torch.zeros((8, 3), dtype=torch.uint8)
         k2 = torch.zeros((8, 5), dtype=torch.uint8)
