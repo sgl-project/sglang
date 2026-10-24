@@ -254,11 +254,11 @@ Create request parameters only for values users can set at runtime.
 # python/sglang/multimodal_gen/configs/sample/my_model.py
 from dataclasses import dataclass
 
-from sglang.multimodal_gen.configs.sample.sampling_params import ImageSamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 
 @dataclass
-class MyModelSamplingParams(ImageSamplingParams):
+class MyModelSamplingParams(SamplingParams):
     guidance_scale: float = 4.0
     num_inference_steps: int = 28
 ```
