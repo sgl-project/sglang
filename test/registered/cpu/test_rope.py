@@ -262,30 +262,100 @@ class TestROPE(CustomTestCase):
                 )
 
     def test_apply_rotary_pos_emb(self):
-        num_tokens = 1024
-        num_heads = 8
-        head_size = 72
-        qkv = torch.randn(num_tokens, num_heads * head_size * 3).to(torch.bfloat16)
-        query, key, _ = qkv.split(
-            [num_heads * head_size, num_heads * head_size, num_heads * head_size],
-            dim=-1,
-        )
-        query = query.view(num_tokens, num_heads, head_size)
-        key = key.view(num_tokens, num_heads, head_size)
-        for sincos_dtype in [torch.float32, torch.bfloat16]:
-            cos = torch.rand(num_tokens, head_size).to(sincos_dtype)
-            sin = torch.rand(num_tokens, head_size).to(sincos_dtype)
-            q_out_ref, k_out_ref = apply_rotary_pos_emb_native(query, key, cos, sin)
+        torch.manual_seed(1234)
+
+        def split_qk(lead_shape, num_heads, num_kv_heads, head_size, dtype):
+            # non-contiguous q/k views sliced out of a fused qkv projection
+            q_size = num_heads * head_size
+            kv_size = num_kv_heads * head_size
+            qkv = torch.randn(*lead_shape, q_size + 2 * kv_size).to(dtype)
+            query, key, _ = qkv.split([q_size, kv_size, kv_size], dim=-1)
+            return (
+                query.view(*lead_shape, num_heads, head_size),
+                key.view(*lead_shape, num_kv_heads, head_size),
+            )
+
+        def single_test(query, key, cos_shape, unsqueeze_dim, sincos_dtype):
+            cos = torch.rand(*cos_shape).to(sincos_dtype)
+            sin = torch.rand(*cos_shape).to(sincos_dtype)
+            query_clone = query.clone()
+            key_clone = key.clone()
+
+            q_out_ref, k_out_ref = apply_rotary_pos_emb_native(
+                query, key, cos, sin, unsqueeze_dim
+            )
             q_out_eager, k_out_eager = apply_rotary_pos_emb_native_eager(
-                query, key, cos, sin
+                query, key, cos, sin, unsqueeze_dim
             )
             q_out_sgl, k_out_sgl = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(
-                query, key, cos, sin
+                query, key, cos, sin, unsqueeze_dim
             )
             torch.testing.assert_close(q_out_ref, q_out_eager)
             torch.testing.assert_close(k_out_ref, k_out_eager)
             torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
             torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
+            # the cpu kernel must be out-of-place like the native impl
+            torch.testing.assert_close(query, query_clone)
+            torch.testing.assert_close(key, key_clone)
+
+        num_tokens = 1024
+        num_heads = 8
+        num_kv_heads = 2
+        head_size = 72
+        batch_size = 4
+        seq_len = 64
+        for dtype in [torch.bfloat16, torch.float32]:
+            for sincos_dtype in [torch.float32, torch.bfloat16]:
+                # 3D: [num_tokens, num_heads, head_size], unsqueeze_dim=1
+                single_test(
+                    torch.randn(num_tokens, num_heads, head_size).to(dtype),
+                    torch.randn(num_tokens, num_heads, head_size).to(dtype),
+                    (num_tokens, head_size),
+                    1,
+                    sincos_dtype,
+                )
+                # 3D with GQA, q/k split from qkv (non-contiguous)
+                single_test(
+                    *split_qk((num_tokens,), num_heads, num_kv_heads, head_size, dtype),
+                    (num_tokens, head_size),
+                    1,
+                    sincos_dtype,
+                )
+                # 4D: [batch, num_heads, seq_len, head_size], unsqueeze_dim=1
+                single_test(
+                    torch.randn(batch_size, num_heads, seq_len, head_size).to(dtype),
+                    torch.randn(batch_size, num_kv_heads, seq_len, head_size).to(dtype),
+                    (batch_size, seq_len, head_size),
+                    1,
+                    sincos_dtype,
+                )
+                # 4D: split from qkv, transposed to [batch, num_heads, seq_len, head]
+                query, key = split_qk(
+                    (batch_size, seq_len), num_heads, num_kv_heads, head_size, dtype
+                )
+                single_test(
+                    query.transpose(1, 2),
+                    key.transpose(1, 2),
+                    (batch_size, seq_len, head_size),
+                    1,
+                    sincos_dtype,
+                )
+                # 4D: [batch, seq_len, num_heads, head_size], unsqueeze_dim=2
+                single_test(
+                    torch.randn(batch_size, seq_len, num_heads, head_size).to(dtype),
+                    torch.randn(batch_size, seq_len, num_kv_heads, head_size).to(dtype),
+                    (batch_size, seq_len, head_size),
+                    2,
+                    sincos_dtype,
+                )
+                # 4D: [batch, seq_len, num_heads, head_size], negative unsqueeze_dim=-2
+                single_test(
+                    torch.randn(batch_size, seq_len, num_heads, head_size).to(dtype),
+                    torch.randn(batch_size, seq_len, num_kv_heads, head_size).to(dtype),
+                    (batch_size, seq_len, head_size),
+                    -2,
+                    sincos_dtype,
+                )
 
     def test_apply_multidimensional_rope(self):
         """Test apply_multidimensional_rope_cpu against the native Python reference."""
