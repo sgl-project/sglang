@@ -977,6 +977,13 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # gfx1250 GPT-OSS W4A8 MoE (aiter moe_gemm_a8w4): backend of both expert
+    # GEMMs. "" lets aiter choose (gluon on gfx1250); "triton" or "gluon" forces one.
+    SGLANG_GFX1250_W4A8_BACKEND = EnvStr("")
+    # gfx1250 GPT-OSS W4A8 MoE: GEMM 1 gathers its fp8 activation rows in-kernel
+    # instead of a torch gather of num_tokens * topk bf16 rows. Needs
+    # SGLANG_GFX1250_W4A8_BACKEND=triton; expert parallelism keeps the torch gather.
+    SGLANG_GFX1250_W4A8_KERNEL_GATHER = EnvBool(False)
     # aiter opus moe_sorting dispatch policy (0 auto, 1 oneshot, 2 multi-phase). Auto picks
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
