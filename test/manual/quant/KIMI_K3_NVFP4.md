@@ -57,4 +57,42 @@ The following isolated B1 prefill measurements use the PR attention changes thro
 | 32768 | 31232 | 95.31% | 1536 | 316.9 | 175.7 | 8742.2 |
 | 131072 | 124416 | 94.92% | 6656 | 554.5 | 554.2 | 12010.1 |
 
-These show a graph benefit versus eager MHA at 8k and 32k; 128k has no demonstrated improvement. They do not isolate MHA versus MLA. Cold-prefill and full decode coverage remain pending. The single-node adaptation used prefill Mamba ratio0.9 and HiCache180; it does not substitute for the decode configuration with Mamba ratio0.015.
+These show a graph benefit versus eager MHA at 8k and 32k; 128k has no demonstrated improvement. They do not isolate MHA versus MLA. Cold-prefill coverage remains pending; the separate decode configuration comparison below covers the requested input lengths and batch sizes. The single-node adaptation used prefill Mamba ratio0.9 and HiCache180; it does not substitute for the decode configuration with Mamba ratio0.015.
+
+## Decode communication configuration comparison
+
+Measured on B300x8 using runtime commit `e973588745`, based on main `a77998e157`. Both arms use NVIDIA NVFP4 weights (revision `b2428a0b83a8b712ff2e1a8448a103d4175341f1`), Modal DFlash (revision `c192d15a43407bf758b5ae0880d5c72052fef1de`), TP8/DCP1, FP8 E4M3 KV, block8, ReplaySSM, and `--enable-symm-mem`. Only `--disable-custom-all-reduce` differs. These are configuration gains, not additional optimization code gains.
+
+The single-node adaptation removes PD transport options and explicitly disables radix cache, matching PD decode's automatic setting. It preserves Mamba ratio0.015 and uses maximum batch4. Each result is steady full-batch output throughput per user, with OSL1024 and fixed acceptance4: median of three formal runs after one discarded run. All runs produced the requested token count without early stopping. Profiler runs are separate.
+
+| Input tokens | Batch | Custom AR disabled (tok/s/user) | Custom AR enabled (tok/s/user) | Gain |
+|---|---|---|---|---|
+| 8192 | 1 | 239.55 | 253.67 | 5.89% |
+| 8192 | 4 | 187.23 | 193.02 | 3.10% |
+| 32768 | 1 | 233.49 | 250.95 | 7.48% |
+| 32768 | 4 | 173.03 | 179.48 | 3.73% |
+| 131072 | 1 | 213.49 | 224.90 | 5.34% |
+| 131072 | 4 | 148.92 | 153.42 | 3.02% |
+
+Trace verification: the baseline uses `ncclSymkDevKernel_AllReduce_RSxLDMC_AGxSTMC_sum_bf16`; the enabled arm uses `sglang::all_reduce_2shot_push_kernel`. At 8k/B4, TP0 VERIFY graphs contain 187 all-reduce calls each. Their median cumulative duration across ten graphs changes from2432.161 to1525.979µs, while median graph span changes from17898.042 to17664.688µs. These profiled durations are not the formal benchmark or an estimate of critical-path savings. One enabled-arm all-reduce outside the graphs took23101.501µs; its cause is unresolved, so whole-trace cumulative communication time is not used to infer speedup.
+
+Both traces execute the existing `set_mla_kv_concat_q_fp8_kernel` and routing/NVFP4 quant fusion. Symmetric memory remains enabled under DCP1; K3 AR/norm fusion's automatic path skips this configuration. Disabling symmetric memory is a separate pending experiment. Natural-acceptance accuracy for these communication configurations remains pending; these fixed-acceptance timings do not validate accuracy or PD SLOs.
+
+Dependencies: PyTorch2.14.1, FlashInfer0.7.2, fastsafetensors0.5.0, transformers5.19.0. From the repository root with the environment active:
+
+```bash
+# Start one arm at a time. Stop it before starting the other arm.
+bash test/manual/quant/launch_kimi_k3_nvfp4_decode_bench.sh --disable-custom-all-reduce
+# Enabled arm:
+bash test/manual/quant/launch_kimi_k3_nvfp4_decode_bench.sh
+```
+
+In a separate terminal, repeat the following with input lengths8192/32768/131072 and batch sizes1/4, using a distinct result file for each repetition. Discard the first repetition and take the next three medians. The launch script uses the model names; for exact reproduction, use the checkpoint revisions listed above.
+
+```bash
+python -m sglang.bench_one_batch_server \
+  --model-path nvidia/Kimi-K3-NVFP4 --base-url http://127.0.0.1:30000 \
+  --backend sglang --dataset-name random-ids --seed 42 \
+  --batch-size 1 --input-len 8192 --output-len 1024 --cache-hit-rate 0 \
+  --result-filename decode-8192-b1-r0.jsonl --show-report
+```
