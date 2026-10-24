@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
+from sglang.kernels.ops.quantization.fp8_utils import use_fp8_e4b15_for_e4m3fn
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.dcp import (
@@ -77,12 +78,15 @@ if is_flashinfer_available():
 @dataclass
 class DecodeMetadata:
     decode_wrapper: BatchMLAPagedAttentionWrapper
+    # Compact plans use arange(n); forward must gather these physical rows.
+    kv_rows: Optional[torch.Tensor] = None
 
 
 @dataclass
 class PrefillMetadata:
     prefill_wrapper: BatchMLAPagedAttentionWrapper
     use_ragged: bool
+    kv_rows: Optional[torch.Tensor] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -209,6 +213,64 @@ class FlashInferMhaChunkKVRunner:
         return o
 
 
+class _Fp8KvRowReader:
+    """Convert referenced FP8 rows using compact copies or a shared graph shadow."""
+
+    def __init__(self, token_to_kv_pool):
+        self.pool = token_to_kv_pool
+        # Rows in one per-layer pool buffer (incl. the padded slot page).
+        self.pool_rows = token_to_kv_pool.size + token_to_kv_pool.page_size
+        self.supports_graph = (
+            token_to_kv_pool.dtype != torch.float8_e4m3fn
+            or not use_fp8_e4b15_for_e4m3fn()
+        )
+        self._shadow: Optional[torch.Tensor] = None
+        self._arange: Optional[torch.Tensor] = None
+
+    def use_compact(self, num_kv_ids: int) -> bool:
+        """Repeated physical rows must not make the compact copy larger than the pool."""
+        return num_kv_ids <= self.pool_rows
+
+    @staticmethod
+    def enabled(token_to_kv_pool, q_dtype: torch.dtype) -> bool:
+        dtype = token_to_kv_pool.dtype
+        return dtype != q_dtype and dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+
+    def compact_ids(self, n: int, device) -> torch.Tensor:
+        """``arange(n)`` view of a grow-only cached buffer (plan-time only)."""
+        if self._arange is None or self._arange.numel() < n:
+            self._arange = torch.arange(max(n, 1024), dtype=torch.int32, device=device)
+        return self._arange[:n]
+
+    def gather(
+        self, layer_id: int, kv_rows: torch.Tensor, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Compact ``[len(kv_rows), 1, dim]`` copy of the referenced rows."""
+        from sglang.kernels.ops.kvcache.mla_kv_gather import gather_mla_kv_rows
+
+        return gather_mla_kv_rows(self.pool.get_key_buffer(layer_id), kv_rows, dtype)
+
+    def refresh(
+        self,
+        layer_id: int,
+        kv_indices: torch.Tensor,
+        n_live: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Refresh before each attention call; layers and TBO children share the shadow."""
+        from sglang.kernels.ops.kvcache.mla_kv_gather import refresh_mla_kv_shadow
+
+        kv = self.pool.get_key_buffer(layer_id)
+        if (
+            self._shadow is None
+            or self._shadow.shape != kv.shape
+            or self._shadow.dtype != dtype
+        ):
+            self._shadow = torch.empty(kv.shape, dtype=dtype, device=kv.device)
+        refresh_mla_kv_shadow(kv, self._shadow, kv_indices, n_live)
+        return self._shadow
+
+
 class FlashInferMLAAttnBackend(AttentionBackend):
     """Flashinfer attention kernels."""
 
@@ -234,6 +296,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
+        self.cuda_graph_kv_indices = None
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
@@ -246,6 +309,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             and not get_exec().kernel.flashinfer_mla_disable_ragged
         )
         self.page_size = model_runner.page_size
+        self.fp8_kv_reader = (
+            _Fp8KvRowReader(self.token_to_kv_pool)
+            if _Fp8KvRowReader.enabled(self.token_to_kv_pool, model_runner.dtype)
+            else None
+        )
 
         # Allocate buffers
         # different from flashinfer zero_init_global_workspace_buffer
@@ -423,15 +491,18 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
-            self.indices_updater_decode.update(
+            kv_rows = self.indices_updater_decode.update(
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
                 decode_wrapper=self.decode_wrapper,
                 init_metadata_replay=False,
                 req_pool_indices=forward_batch.req_pool_indices,
                 plan=forward_batch.kv_loc_plan,
+                compact_fp8_kv=(
+                    forward_batch.spec_info is None and not self.skip_prefill
+                ),
             )
-            self.forward_metadata = DecodeMetadata(self.decode_wrapper)
+            self.forward_metadata = DecodeMetadata(self.decode_wrapper, kv_rows)
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -479,7 +550,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 kv_indptr_cpu = self.fast_plan_kv_indptr_cpu[: bs + 1]
                 kv_len_arr_cpu = self.fast_plan_kv_len_arr_cpu[:bs]
 
-            self.indices_updater_prefill.update(
+            kv_rows = self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens_sum,
@@ -491,9 +562,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 kv_indptr_cpu=kv_indptr_cpu,
                 kv_len_arr_cpu=kv_len_arr_cpu,
                 plan=forward_batch.kv_loc_plan,
+                compact_fp8_kv=(
+                    spec_info is None
+                    and not forward_batch.forward_mode.is_draft_extend_v2()
+                ),
             )
             self.forward_metadata = PrefillMetadata(
-                self.prefill_wrapper_paged, use_ragged
+                self.prefill_wrapper_paged, use_ragged, kv_rows
             )
 
     def init_cuda_graph_state(
@@ -690,6 +765,33 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def share_tbo_scratch(self, primary: AttentionBackend) -> None:
+        assert isinstance(primary, FlashInferMLAAttnBackend)
+        assert self.token_to_kv_pool is primary.token_to_kv_pool
+        self.fp8_kv_reader = primary.fp8_kv_reader
+
+    def _mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        kv_rows: Optional[torch.Tensor],
+        dtype: torch.dtype,
+        graph_decode_bs: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Return KV data addressed by the compact or physical-index plan."""
+        reader = self.fp8_kv_reader
+        if reader is None or dtype == reader.pool.dtype:
+            return self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(dtype)
+        if kv_rows is not None:
+            return reader.gather(layer.layer_id, kv_rows, dtype)
+        if graph_decode_bs is not None:
+            return reader.refresh(
+                layer.layer_id,
+                self.cuda_graph_kv_indices,
+                self.kv_indptr[graph_decode_bs : graph_decode_bs + 1],
+                dtype,
+            )
+        return self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(dtype)
+
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
     ):
@@ -758,7 +860,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             ):
                 k_buf = forward_batch.attn_dcp_metadata.dcp_kv_buffer.to(q.dtype)
             else:
-                k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+                k_buf = self._mla_kv_buffer(
+                    layer, self.forward_metadata.kv_rows, q.dtype
+                )
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -819,7 +923,26 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
-        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
+        kv_rows = self.forward_metadata.kv_rows
+        # Plain captured decode graph: wrappers live in decode_cuda_graph_metadata
+        # and read sglang's capture-stable cuda_graph_kv_indices / kv_indptr.
+        is_graph_decode = (
+            kv_rows is None
+            and self.fp8_kv_reader is not None
+            and self.fp8_kv_reader.supports_graph
+            and not self.skip_prefill
+            and forward_batch.spec_info is None
+            and not get_parallel().dcp_enabled
+            and decode_wrapper
+            is self.decode_cuda_graph_metadata.get(forward_batch.batch_size)
+            and self.cuda_graph_kv_indices is not None
+        )
+        k_buffer = self._mla_kv_buffer(
+            layer,
+            kv_rows,
+            q.dtype,
+            graph_decode_bs=forward_batch.batch_size if is_graph_decode else None,
+        )
 
         o = q_nope.new_empty(q_nope.shape)
         # for decode and dcp_world_size > 1, lse should be returned to compute final attn_out
@@ -871,10 +994,11 @@ class FlashInferMLAIndicesUpdaterDecode:
         *,
         plan: KVLocPlan,
         req_pool_indices: torch.Tensor,
+        compact_fp8_kv: bool = False,
         **fast_decode_kwargs,
-    ):
+    ) -> Optional[torch.Tensor]:
         decode_wrapper = decode_wrapper or self.decode_wrapper
-        self.call_begin_forward(
+        return self.call_begin_forward(
             decode_wrapper,
             seq_lens,
             seq_lens_sum,
@@ -884,6 +1008,7 @@ class FlashInferMLAIndicesUpdaterDecode:
             spec_info,
             plan=plan,
             req_pool_indices=req_pool_indices,
+            compact_fp8_kv=compact_fp8_kv,
             **fast_decode_kwargs,
         )
 
@@ -899,8 +1024,10 @@ class FlashInferMLAIndicesUpdaterDecode:
         *,
         plan: KVLocPlan,
         req_pool_indices: torch.Tensor,
+        compact_fp8_kv: bool = False,
         **fast_decode_kwargs,
-    ):
+    ) -> Optional[torch.Tensor]:
+        """Return physical rows when the wrapper is planned over compact IDs."""
         bs = len(paged_kernel_lens)
         q_indptr = q_indptr[: bs + 1]
         kv_lens = paged_kernel_lens.to(torch.int32)
@@ -955,6 +1082,19 @@ class FlashInferMLAIndicesUpdaterDecode:
                 # Replay plans through fast_mla_decode_plan, which skips that check.
                 kv_lens = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
 
+        kv_rows = None
+        reader = self.attn_backend.fp8_kv_reader
+        if (
+            compact_fp8_kv
+            and reader is not None
+            and spec_info is None
+            and not init_metadata_replay
+            and not get_parallel().dcp_enabled
+            and reader.use_compact(kv_indices.numel())
+        ):
+            kv_rows = kv_indices
+            kv_indices = reader.compact_ids(kv_rows.numel(), kv_rows.device)
+
         if not init_metadata_replay:
             wrapper.plan(
                 q_indptr,
@@ -985,6 +1125,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.data_type,
                 self.data_type,
             )
+        return kv_rows
 
 
 class FlashInferMLAIndicesUpdaterPrefill:
@@ -1023,7 +1164,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         kv_len_arr_cpu: Optional[torch.Tensor] = None,
-    ):
+        compact_fp8_kv: bool = False,
+    ) -> Optional[torch.Tensor]:
         if use_ragged:
             paged_kernel_lens = prefix_lens
             paged_kernel_lens_sum = paged_kernel_lens.sum().item()
@@ -1031,7 +1173,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             paged_kernel_lens = seq_lens
             paged_kernel_lens_sum = seq_lens_sum
 
-        self.call_begin_forward(
+        return self.call_begin_forward(
             self.prefill_wrapper_ragged,
             prefill_wrapper_paged,
             req_pool_indices,
@@ -1049,6 +1191,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             qo_indptr_cpu=qo_indptr_cpu,
             kv_indptr_cpu=kv_indptr_cpu,
             kv_len_arr_cpu=kv_len_arr_cpu,
+            compact_fp8_kv=compact_fp8_kv,
         )
 
     def call_begin_forward(
@@ -1071,9 +1214,12 @@ class FlashInferMLAIndicesUpdaterPrefill:
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         kv_len_arr_cpu: Optional[torch.Tensor] = None,
-    ):
+        compact_fp8_kv: bool = False,
+    ) -> Optional[torch.Tensor]:
+        """Return physical rows when the wrapper is planned over compact IDs."""
         bs = len(seq_lens)
         sm_scale = self.scaling
+        kv_rows = None
 
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
@@ -1165,6 +1311,18 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 else kv_len_arr_cpu
             )
 
+            reader = self.attn_backend.fp8_kv_reader
+            if (
+                compact_fp8_kv
+                and reader is not None
+                and spec_info is None
+                and attn_dcp_metadata is None
+                and not get_parallel().dcp_enabled
+                and reader.use_compact(kv_indices.numel())
+            ):
+                kv_rows = kv_indices
+                kv_indices = reader.compact_ids(kv_rows.numel(), kv_rows.device)
+
             wrapper_paged.plan(
                 plan_qo_indptr,
                 plan_kv_indptr,
@@ -1179,6 +1337,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 self.q_data_type,
                 self.data_type,
             )
+        return kv_rows
 
 
 class FlashInferMLAMultiStepDraftBackend:
