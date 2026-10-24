@@ -728,6 +728,21 @@ class Glm47MoeDetector(BaseFormatDetector):
         Outputs JSON increments immediately as XML data arrives.
         """
         self._buffer += new_text
+        normal_text_parts = []
+        calls = []
+        while True:
+            buffer_length = len(self._buffer)
+            result = self._parse_streaming_buffer(tools)
+            normal_text_parts.append(result.normal_text)
+            calls.extend(result.calls)
+            # A completed call leaves the unconsumed suffix in the buffer.
+            # Drain it now: there may not be another incoming chunk. Stop when
+            # parsing needs more input, including a partial next tool call.
+            if not self._buffer or len(self._buffer) >= buffer_length:
+                break
+        return StreamingParseResult(normal_text="".join(normal_text_parts), calls=calls)
+
+    def _parse_streaming_buffer(self, tools: List[Tool]) -> StreamingParseResult:
         current_text = self._buffer
 
         # Check if we have a tool call
