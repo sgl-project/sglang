@@ -45,6 +45,11 @@ class _ReplicatedLinearModel(_UniformDtypeModel):
         self.proj = ReplicatedLinear(4, 4, bias=False)
 
 
+class _TransposedReplicatedLinear(ReplicatedLinear):
+    def weight_loader(self, param, loaded_weight):
+        super().weight_loader(param, loaded_weight.T)
+
+
 class _CustomEntrypointModel(_UniformDtypeModel):
     _fsdp_forward_methods = ("refine_prompt_embeds",)
 
@@ -289,6 +294,29 @@ class TestOrdinaryWeightLoading(unittest.TestCase):
         self.assertFalse(
             fsdp_load._can_assign_tensor_without_copy(tp_param, tensor, tp_param)
         )
+
+    def test_custom_linear_loader_is_not_bypassed(self):
+        """Storage adoption must preserve a subclass's checkpoint transformation."""
+        devices = ["cpu", "cuda:0"] if torch.cuda.is_available() else ["cpu"]
+        for device in devices:
+            with torch.device("meta"):
+                model = _UniformDtypeModel()
+                model.proj = _TransposedReplicatedLinear(4, 4, bias=False)
+            checkpoint_weight = torch.arange(
+                16, dtype=torch.float32, device=device
+            ).reshape(4, 4)
+            fsdp_load.load_model_from_full_model_state_dict(
+                model,
+                iter((("proj.weight", checkpoint_weight),)),
+                checkpoint_load_device=torch.device(device),
+                param_dtype=torch.float32,
+                strict=True,
+                param_names_mapping=fsdp_load.get_param_names_mapping({}),
+                allow_device_tensor_assignment=True,
+            )
+            torch.testing.assert_close(
+                model.proj.weight, checkpoint_weight.T, rtol=0, atol=0
+            )
 
 
 class TestDevicePostprocessMove(unittest.TestCase):
