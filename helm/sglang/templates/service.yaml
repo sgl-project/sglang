@@ -1,0 +1,66 @@
+{{- $defaultModel := dict "distInitPort" 5000 -}}
+{{- $model := mustMerge (deepCopy (default dict .Values.model)) $defaultModel -}}
+---
+# Headless service for StatefulSet stable network identities
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sglang.fullname" . }}-headless
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "sglang.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 30000
+      targetPort: http
+      protocol: TCP
+    {{- if gt (int .Values.replicaCount) 1 }}
+    - name: dist-init
+      port: {{ $model.distInitPort }}
+      targetPort: dist-init
+      protocol: TCP
+    {{- end }}
+---
+# Main serving service (points to pod-0)
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sglang.fullname" . }}
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "sglang.selectorLabels" . | nindent 4 }}
+    apps.kubernetes.io/pod-index: "0"
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      protocol: TCP
+{{- if .Values.service.metrics.enabled }}
+---
+# Metrics service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sglang.fullname" . }}-metrics
+  labels:
+    {{- include "sglang.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "sglang.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.service.metrics.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}
