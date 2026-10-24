@@ -492,7 +492,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 reasoning_parser=self.reasoning_parser,
                 tool_call_parser=self.tool_call_parser,
                 chat_hooks=chat_encoding_adapters.ChatOutputHooks(
-                    thinking=self._thinking_requested,
+                    thinking_requested=self._thinking_requested,
                     tool_call_parsing_active=self._tool_call_parsing_active,
                     history_tool_calls_count=self._get_history_tool_calls_cnt,
                     tool_call_id=self._process_tool_call_id,

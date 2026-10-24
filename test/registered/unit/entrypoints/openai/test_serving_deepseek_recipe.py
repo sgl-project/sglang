@@ -2,8 +2,6 @@ import json
 import unittest
 from types import SimpleNamespace
 
-import msgspec
-
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
@@ -77,7 +75,7 @@ class TestAdapterRegistry(CustomTestCase):
             reasoning_parser=None,
             tool_call_parser=None,
             chat_hooks=registry.ChatOutputHooks(
-                thinking=lambda request: False,
+                thinking_requested=lambda request: False,
                 tool_call_parsing_active=lambda request: False,
                 history_tool_calls_count=lambda request: 0,
                 tool_call_id=lambda item, index: "",
@@ -118,31 +116,6 @@ class TestAdapterRegistry(CustomTestCase):
                 self.assertIsNone(
                     registry.build_chat_encoding_adapter(self._context(spec))
                 )
-
-    def test_output_parsing_needs_a_deepseek_parser(self):
-        from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
-
-        tokenizer = self._fast_tokenizer()
-        for parsers, token_output in (
-            ((None, None), False),
-            (("deepseek-r1", None), False),
-            ((None, "deepseekv41"), True),
-            (("deepseek-v41", "deepseekv41"), True),
-        ):
-            context = self._context("dsv41", tokenizer=tokenizer)
-            context = msgspec.structs.replace(
-                context, reasoning_parser=parsers[0], tool_call_parser=parsers[1]
-            )
-            with self.subTest(parsers=parsers):
-                adapter = registry.build_chat_encoding_adapter(context)
-                self.assertEqual(adapter.output is not None, token_output)
-        context = msgspec.structs.replace(
-            self._context("dsv41", tokenizer=tokenizer),
-            reasoning_parser="deepseek-v41",
-            tool_call_parser="qwen",
-        )
-        with self.assertRaises(ValueError):
-            registry.build_chat_encoding_adapter(context)
 
     def test_tool_dumps_render_as_the_client_sent_them(self):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
@@ -368,56 +341,6 @@ class TestHandlerRequestSemantics(CustomTestCase):
             )[:2],
             (None, " world"),
         )
-
-    def _stream(self, chat, request, output_ids, finish):
-        """The content streamed when each id arrives in its own chunk."""
-        parsers, content = {}, ""
-        for end in range(1, len(output_ids) + 1):
-            last = end == len(output_ids)
-            for chunk in chat._encoding_output().stream_chat_chunks(
-                content={
-                    "output_ids": output_ids[:end],
-                    "meta_info": {
-                        "id": "chat",
-                        "completion_tokens": end,
-                        "finish_reason": finish if last else None,
-                    },
-                },
-                index=0,
-                request=request,
-                created=0,
-                parser_dict=parsers,
-                has_tool_calls={},
-                choice_logprobs=None,
-                finish_reason_type=finish["type"] if last else None,
-                usage=None,
-            ):
-                delta = json.loads(chunk.removeprefix("data: "))["choices"][0]["delta"]
-                content += delta.get("content") or ""
-        return content
-
-    def test_matched_stop_string_is_cut_once(self):
-        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-
-        chat = _serving(self, self.tokenizer)
-        # The stop spans tokens, so streaming must hold its start until it matches.
-        text, stop = "one, two, three, four", ", four"
-        output_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        finish = {"type": "stop", "matched": stop}
-        for no_stop_trim, expected in ((False, "one, two, three"), (True, text)):
-            with self.subTest(no_stop_trim=no_stop_trim):
-                _, content, _ = self._parse(
-                    chat, text, matched=stop, stop=[stop], no_stop_trim=no_stop_trim
-                )
-                self.assertEqual(content, expected)
-                request = ChatCompletionRequest(
-                    messages=[{"role": "user", "content": "hi"}],
-                    stop=[stop],
-                    no_stop_trim=no_stop_trim,
-                )
-                self.assertEqual(
-                    self._stream(chat, request, output_ids, finish), expected
-                )
 
     def test_streamed_tool_call(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest

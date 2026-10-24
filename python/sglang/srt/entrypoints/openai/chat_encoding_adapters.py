@@ -21,7 +21,7 @@ EncodingBackend = Literal["builtin", "recipe"]
 class ChatOutputHooks(msgspec.Struct, frozen=True, kw_only=True):
     """Chat-handler policies an output adapter needs, bound to one handler."""
 
-    thinking: Callable[[ChatCompletionRequest], bool]
+    thinking_requested: Callable[[ChatCompletionRequest], bool]
     tool_call_parsing_active: Callable[[ChatCompletionRequest], bool]
     history_tool_calls_count: Callable[[ChatCompletionRequest], int]
     tool_call_id: Callable[[ToolCallItem, int], str]

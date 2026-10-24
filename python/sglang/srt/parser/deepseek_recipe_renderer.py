@@ -29,6 +29,8 @@ TASK_TOKENS = {
     "title": "<｜title｜>",
     "read_url": "<｜read_url｜>",
 }
+# `action` follows the generation header; the other tasks replace it.
+TASKS_AFTER_HEADER = ("action",)
 # V4.1 renders an integer budget as this line; recipe's "high" tier is budget 75.
 BUDGET_TIER, BUDGET_TIER_VALUE = "high", 75
 BUDGET_LINE = "Reasoning Effort: {budget}"
@@ -212,6 +214,6 @@ class RecipeEncoder:
                 "task requires the conversation to end with a user message"
             )
         task_id = self.hf_tokenizer.token_to_id(TASK_TOKENS[task])
-        if task == "action":
+        if task in TASKS_AFTER_HEADER:
             return prompt_ids + [task_id]
         return prompt_ids[: -len(header)] + [task_id]

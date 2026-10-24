@@ -25,6 +25,7 @@ from sglang.srt.parser.deepseek_recipe_output import (
     whole_tool_calls,
 )
 from sglang.srt.parser.deepseek_recipe_renderer import (
+    TASKS_AFTER_HEADER,
     RecipeEncoder,
     load_deepseek_recipe,
     parse_effort_budget,
@@ -77,18 +78,17 @@ class DeepSeekRecipeChatEncodingAdapter:
         )
         # recipe parses the output once a DeepSeek parser is configured; other
         # parsers keep the text path.
-        deepseek_parsers = PARSERS[chat_encoding_spec]
-        configured = (reasoning_parser, tool_call_parser)
-        self._token_output = any(
-            name == expected for name, expected in zip(configured, deepseek_parsers)
+        reasoning_name, tool_name = PARSERS[chat_encoding_spec]
+        self._token_output = (
+            reasoning_parser == reasoning_name or tool_call_parser == tool_name
         )
-        if self._token_output and any(
-            name not in (None, expected)
-            for name, expected in zip(configured, deepseek_parsers)
+        if self._token_output and (
+            reasoning_parser not in (None, reasoning_name)
+            or tool_call_parser not in (None, tool_name)
         ):
             raise ValueError(
-                f"--reasoning-parser {deepseek_parsers[0]} and --tool-call-parser "
-                f"{deepseek_parsers[1]} cannot be mixed with other parsers, got "
+                f"--reasoning-parser {reasoning_name} and --tool-call-parser "
+                f"{tool_name} cannot be mixed with other parsers, got "
                 f"{reasoning_parser!r} and {tool_call_parser!r}"
             )
         self._separate_reasoning = reasoning_parser is not None
@@ -112,13 +112,8 @@ class DeepSeekRecipeChatEncodingAdapter:
         wire_messages = wire["messages"]
         continue_final = request.continue_final_message
         task_prefix = None
-        # SGLang's trailing-assistant rule, as `_handle_last_assistant_message`.
-        last = wire_messages[-1] if wire_messages else None
-        if (
-            last
-            and last["role"] == "assistant"
-            and isinstance(last.get("content"), str)
-        ):
+        last = _trailing_assistant_turn(wire_messages)
+        if last is not None:
             if not continue_final:
                 wire_messages[-1] = {"role": "user", "content": last["content"]}
             elif request.task is not None:
@@ -350,26 +345,23 @@ class DeepSeekRecipeChatEncodingAdapter:
     def _thinking_stage(self, request: ChatCompletionRequest) -> Any:
         """Where parsing begins, from the prompt `encode_messages` rendered."""
         # Other tasks replace the generation header, so the answer is plain text.
-        if request.task not in (None, "action") or not self._hooks.thinking(request):
+        task = request.task
+        if (task is not None and task not in TASKS_AFTER_HEADER) or not (
+            self._hooks.thinking_requested(request)
+        ):
             return None
         stages = load_deepseek_recipe().ThinkingInitialStage
-        last = request.messages[-1] if request.messages else None
-        continued = (
-            request.continue_final_message
-            and last is not None
-            and last.role == "assistant"
-            and isinstance(last.content, str)
-        )
-        if not continued:
-            return stages.ReasoningStart
-        if request.task is not None:
-            return stages.ContentContinuation  # the prefix follows the task token
-        return self.encoder.continuation_stage(
+        last = request.continue_final_message and _trailing_assistant_turn(
             [
-                {"role": "user", "content": ""},
-                last.model_dump(exclude_unset=True, by_alias=True, mode="json"),
+                message.model_dump(exclude_unset=True, by_alias=True, mode="json")
+                for message in request.messages[-1:]
             ]
         )
+        if not last:
+            return stages.ReasoningStart
+        if task is not None:
+            return stages.ContentContinuation  # the prefix follows the task token
+        return self.encoder.continuation_stage([{"role": "user", "content": ""}, last])
 
     def _new_responses_parser(
         self,
@@ -414,6 +406,17 @@ class DeepSeekRecipeResponsesStream:
         else:
             delta = self._parser.finish(new_output_ids, finish_reason)
         return delta.reasoning, delta.content, _tool_call_items(delta.tool_calls)
+
+
+def _trailing_assistant_turn(
+    messages: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """The trailing text turn SGLang continues or, without continue_final_message,
+    re-sends as a user turn (as `_handle_last_assistant_message`)."""
+    last = messages[-1] if messages else None
+    if last and last["role"] == "assistant" and isinstance(last.get("content"), str):
+        return last
+    return None
 
 
 def _stop_strings(stop: Union[str, list[str], None]) -> list[str]:
