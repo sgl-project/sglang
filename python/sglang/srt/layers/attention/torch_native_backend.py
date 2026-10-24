@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence, Union
 
 import torch
+from torch.nn.attention.bias import causal_lower_right
 from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -14,6 +15,21 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def _prefer_cpu_metadata(
+    metadata: Optional[torch.Tensor],
+    cpu_metadata: Optional[Union[torch.Tensor, Sequence[int]]],
+) -> Optional[Union[torch.Tensor, Sequence[int]]]:
+    # Encoder CPU lengths are not padded alongside their device tensor.
+    if metadata is None or cpu_metadata is None or len(cpu_metadata) != len(metadata):
+        return metadata
+    # Convert only existing CPU tensors: never introduce a device-to-host copy.
+    return (
+        cpu_metadata.tolist()
+        if isinstance(cpu_metadata, torch.Tensor)
+        else cpu_metadata
+    )
 
 
 class TorchNativeAttnBackend(AttentionBackend):
@@ -65,11 +81,11 @@ class TorchNativeAttnBackend(AttentionBackend):
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         req_to_token: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
-        extend_seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor] = None,
+        req_pool_indices: Union[torch.Tensor, Sequence[int]],
+        seq_lens: Union[torch.Tensor, Sequence[int]],
+        extend_prefix_lens: Union[torch.Tensor, Sequence[int]],
+        extend_seq_lens: Union[torch.Tensor, Sequence[int]],
+        encoder_lens: Optional[Union[torch.Tensor, Sequence[int]]] = None,
         scaling=None,
         enable_gqa=False,
         causal=False,
@@ -98,14 +114,14 @@ class TorchNativeAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
         """
 
-        assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
-        assert seq_lens.shape[0] == extend_seq_lens.shape[0]
+        assert len(seq_lens) == len(extend_prefix_lens)
+        assert len(seq_lens) == len(extend_seq_lens)
 
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
         start_q, start_kv = 0, 0
-        for seq_idx in range(seq_lens.shape[0]):
+        for seq_idx in range(len(seq_lens)):
             # TODO: this loop process a sequence per iter, this is inefficient.
             # Need optimize the performance later.
 
@@ -125,13 +141,6 @@ class TorchNativeAttnBackend(AttentionBackend):
                 start_kv = 0
                 end_kv = start_kv + seq_len_kv
             per_req_query = query[:, start_q:end_q, :]
-            per_req_query_redudant = torch.empty(
-                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
-                dtype=per_req_query.dtype,
-                device=per_req_query.device,
-            )
-
-            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
@@ -149,16 +158,26 @@ class TorchNativeAttnBackend(AttentionBackend):
             is_causal = causal
             if sliding_window_size is not None and sliding_window_size > -1:
                 attn_mask = self._make_sliding_window_mask(
-                    q_len=seq_len_kv,
+                    q_len=extend_seq_len_q,
                     kv_len=seq_len_kv,
                     sliding_window_size=sliding_window_size,
                     device=per_req_query.device,
+                    query_offset=prefill_seq_len_q,
+                )
+                is_causal = False
+            elif causal and prefill_seq_len_q > 0:
+                # SDPA's is_causal mask is upper-left aligned; prefix queries
+                # need their absolute positions in the full key sequence.
+                # The native bias keeps fused SDPA eligible on CUDA and
+                # materializes the same rectangular mask on other backends.
+                attn_mask = causal_lower_right(
+                    per_req_query.shape[-2], per_req_key.shape[-2]
                 )
                 is_causal = False
 
-            per_req_out_redudant = (
+            per_req_out = (
                 scaled_dot_product_attention(
-                    per_req_query_redudant.unsqueeze(0),
+                    per_req_query.unsqueeze(0),
                     per_req_key.unsqueeze(0),
                     per_req_value.unsqueeze(0),
                     attn_mask=attn_mask,
@@ -169,7 +188,7 @@ class TorchNativeAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
+            output[start_q:end_q, :, :] = per_req_out
             start_q, start_kv = end_q, end_kv
         return output
 
@@ -309,17 +328,35 @@ class TorchNativeAttnBackend(AttentionBackend):
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
+        metadata = (
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.extend_prefix_lens,
+            forward_batch.extend_seq_lens,
+            forward_batch.encoder_lens,
+        )
+        # Speculative passes may update device metadata without refreshing host
+        # mirrors. Reuse only the mirrors maintained for ordinary extend.
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            cpu_metadata = (
+                forward_batch.req_pool_indices_cpu,
+                forward_batch.seq_lens_cpu,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens_cpu,
+                forward_batch.encoder_lens_cpu,
+            )
+            metadata = tuple(
+                _prefer_cpu_metadata(device, cpu)
+                for device, cpu in zip(metadata, cpu_metadata)
+            )
+
         self._run_sdpa_forward_extend(
             q_,
             o_,
             self.token_to_kv_pool.get_key_buffer(layer.layer_id),
             self.token_to_kv_pool.get_value_buffer(layer.layer_id),
             self.req_to_token_pool.req_to_token,
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch.extend_prefix_lens,
-            forward_batch.extend_seq_lens,
-            forward_batch.encoder_lens,
+            *metadata,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=causal,
