@@ -35,6 +35,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.layers.dcp.layout import get_extend_query_order_indices
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_fi_a2a_supported
@@ -204,7 +205,6 @@ def all_gather_kv_cache_for_mha_extend(
     token_to_kv_pool,
     attn_mqa,
     dcp_local_prefix_kv_indices,
-    seq_lens,
     extend_prefix_lens,
     extend_prefix_lens_cpu: list[int],
     extend_seq_lens,
@@ -224,35 +224,26 @@ def all_gather_kv_cache_for_mha_extend(
         [kv_a.shape[-1], k_pe.shape[-1]], dim=-1
     )
     prefix_kv_a = prefix_kv_a.squeeze(1)
-    # torch.cat can't promote fp8 (gathered prefix) + bf16 (current extend), so
-    # align dtypes first (dequant the fp8 prefix; exact for the scale=1.0 default).
+    # fp8 prefix cache + bf16 extend KV share the reorder buffer, so dequant the
+    # prefix to the extend dtype first (exact for the scale=1.0 default).
     if prefix_kv_a.dtype != kv_a.dtype:
         prefix_kv_a = prefix_kv_a.to(kv_a.dtype)
     if prefix_k_pe.dtype != k_pe.dtype:
         prefix_k_pe = prefix_k_pe.to(k_pe.dtype)
-    # re-organize kv with query orders
-    prefix_lens_cu = torch.zeros(
-        len(seq_lens) + 1,
-        dtype=torch.int32,
-        device=kv_a.device,
+    prefix_index, extend_index = get_extend_query_order_indices(
+        prefix_lens=extend_prefix_lens,
+        extend_lens=extend_seq_lens,
+        num_prefix_rows=prefix_kv_a.shape[0],
+        num_extend_rows=kv_a.shape[0],
     )
-    extend_lens_cu = torch.zeros_like(prefix_lens_cu)
-    prefix_lens_cu[1:] = torch.cumsum(extend_prefix_lens, dim=0)
-    extend_lens_cu[1:] = torch.cumsum(extend_seq_lens, dim=0)
-    kv_a_tuple = ()
-    k_pe_tuple = ()
-    for i in range(len(seq_lens)):
-        kv_a_tuple += (
-            prefix_kv_a[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
-            kv_a[extend_lens_cu[i] : extend_lens_cu[i + 1]],
-        )
-        k_pe_tuple += (
-            prefix_k_pe[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
-            k_pe[extend_lens_cu[i] : extend_lens_cu[i + 1]],
-        )
-    kv_a = torch.cat(kv_a_tuple, dim=0)
-    k_pe = torch.cat(k_pe_tuple, dim=0)
-    return kv_a.contiguous(), k_pe.contiguous()
+    num_rows = prefix_kv_a.shape[0] + kv_a.shape[0]
+    reordered_kv_a = kv_a.new_empty((num_rows, *kv_a.shape[1:]))
+    reordered_kv_a[prefix_index] = prefix_kv_a
+    reordered_kv_a[extend_index] = kv_a
+    reordered_k_pe = k_pe.new_empty((num_rows, *k_pe.shape[1:]))
+    reordered_k_pe[prefix_index] = prefix_k_pe
+    reordered_k_pe[extend_index] = k_pe
+    return reordered_kv_a.contiguous(), reordered_k_pe.contiguous()
 
 
 def all_gather_q_for_mla_decode(

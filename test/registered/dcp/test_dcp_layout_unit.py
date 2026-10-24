@@ -25,6 +25,7 @@ from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dcp.layout import (
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
+    get_extend_query_order_indices,
 )
 from sglang.srt.layers.linear import QKVParallelLinear, ReplicatedParallelGroup
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
@@ -543,6 +544,83 @@ class TestGetDcpLens(CustomTestCase):
 
         self.assertEqual(pool.get_kv_buffer_shape(), expected)
         pool.full_kv_pool.get_kv_buffer_shape.assert_called_once_with()
+
+
+class TestGetExtendQueryOrderIndices(CustomTestCase):
+    """Mixed prefix/extend rows must land in per-request query order
+    ``[seq0 prefix | seq0 extend | seq1 prefix | ...]``, slots included for a
+    request with no prefix (or no extend) rows."""
+
+    PREFIX_BASE = 1000
+    EXTEND_BASE = 2000
+
+    def _rows(self, base, lens):
+        return torch.arange(base, base + sum(lens), dtype=torch.int64)
+
+    def _reorder(self, prefix_lens, extend_lens):
+        prefix_rows = self._rows(self.PREFIX_BASE, prefix_lens)
+        extend_rows = self._rows(self.EXTEND_BASE, extend_lens)
+        prefix_index, extend_index = get_extend_query_order_indices(
+            prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
+            extend_lens=torch.tensor(extend_lens, dtype=torch.int32),
+            num_prefix_rows=prefix_rows.shape[0],
+            num_extend_rows=extend_rows.shape[0],
+        )
+        out = torch.empty(
+            prefix_rows.shape[0] + extend_rows.shape[0], dtype=torch.int64
+        )
+        out[prefix_index] = prefix_rows
+        out[extend_index] = extend_rows
+        return out.tolist()
+
+    def _reference(self, prefix_lens, extend_lens):
+        """Layout spec: the per-request slicing loop that defines the row order."""
+        prefix_rows = self._rows(self.PREFIX_BASE, prefix_lens)
+        extend_rows = self._rows(self.EXTEND_BASE, extend_lens)
+        parts = []
+        prefix_start = extend_start = 0
+        for prefix_len, extend_len in zip(prefix_lens, extend_lens):
+            parts.append(prefix_rows[prefix_start : prefix_start + prefix_len])
+            parts.append(extend_rows[extend_start : extend_start + extend_len])
+            prefix_start += prefix_len
+            extend_start += extend_len
+        return torch.cat(parts).tolist() if parts else []
+
+    def test_matches_per_request_loop(self):
+        cases = [
+            ([], []),
+            ([0], [4]),
+            ([5], [0]),
+            ([0, 3, 0, 2], [4, 0, 1, 0]),
+            ([3, 1, 4, 1, 5], [2, 7, 1, 8, 2]),
+        ]
+        cases += [
+            ([p0, p1], [e0, e1])
+            for p0 in range(4)
+            for p1 in range(4)
+            for e0 in range(4)
+            for e1 in range(4)
+        ]
+        for prefix_lens, extend_lens in cases:
+            with self.subTest(prefix_lens=prefix_lens, extend_lens=extend_lens):
+                self.assertEqual(
+                    self._reorder(prefix_lens, extend_lens),
+                    self._reference(prefix_lens, extend_lens),
+                )
+
+    def test_indices_are_a_permutation(self):
+        prefix_lens = torch.tensor([0, 3, 0, 2], dtype=torch.int32)
+        extend_lens = torch.tensor([4, 0, 1, 0], dtype=torch.int32)
+        prefix_index, extend_index = get_extend_query_order_indices(
+            prefix_lens=prefix_lens,
+            extend_lens=extend_lens,
+            num_prefix_rows=5,
+            num_extend_rows=5,
+        )
+        self.assertEqual(prefix_index.dtype, torch.int64)
+        self.assertEqual(
+            sorted(prefix_index.tolist() + extend_index.tolist()), list(range(10))
+        )
 
 
 if __name__ == "__main__":
