@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.utils.common import parse_size
 from sglang.multimodal_gen.runtime.utils.image_io import (
     ensure_path_within_root,
     save_base64_image_to_path,
+    save_image_bytes_to_path,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
@@ -384,7 +385,6 @@ async def save_image_to_path(
 async def _save_upload_to_path(
     upload: Union[UploadFile, bytes], target_path: str
 ) -> str:
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
     if isinstance(upload, bytes):
         content = upload
     elif isinstance(upload, (bytearray, memoryview)):
@@ -402,9 +402,7 @@ async def _save_upload_to_path(
             raise TypeError(
                 f"Image upload read() returned {type(content).__name__}, expected bytes"
             )
-    with open(target_path, "wb") as f:
-        f.write(content)
-    return target_path
+    return save_image_bytes_to_path(content, target_path)
 
 
 async def _maybe_url_image(
