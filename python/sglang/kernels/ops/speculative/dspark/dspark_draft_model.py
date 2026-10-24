@@ -14,9 +14,10 @@ _MARKOV_BLOCK_R = 32
 
 
 class MarkovGreedyStep:
-    """One greedy markov draft step, fused.
+    """One greedy Markov draft step.
 
-    Computes ``argmax_v(base_logits[:, v] + dot(w2_weight[v, :], prev_embeds))``
+    The CUDA implementation computes
+    ``argmax_v(base_logits[:, v] + dot(w2_weight[v, :], prev_embeds))``
     in a single pass over the (vocab x rank) weight: no full-vocab bias or
     step-logits materialization, no separate GEMV / add / two-pass argmax
     launches. Numerics: the dot and the add accumulate in fp32, while
@@ -24,6 +25,9 @@ class MarkovGreedyStep:
     winners can differ, so a one-row block can draft differently from the same
     row in a larger batch. Drafts are proposals only (target verify guards the
     output), so the impact is bounded to accept-rate noise on near ties.
+
+    NPU uses a native projection followed by dtype-rounded add and argmax,
+    matching the torch reference's rounding.
     """
 
     @classmethod
@@ -34,6 +38,12 @@ class MarkovGreedyStep:
         prev_embeds: torch.Tensor,
         w2_weight: torch.Tensor,
     ) -> torch.Tensor:
+        if base_logits.device.type == "npu":
+            from sgl_kernel_npu.sample import markov_greedy_step_triton
+
+            return markov_greedy_step_triton(
+                base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
+            )
         if base_logits.is_cuda:
             return cls.triton(
                 base_logits=base_logits, prev_embeds=prev_embeds, w2_weight=w2_weight
