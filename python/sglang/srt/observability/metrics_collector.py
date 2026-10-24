@@ -1900,7 +1900,15 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         )
 
         if bucket_time_to_first_token is None:
+            # The first buckets sit below 0.1 s: a short prompt on an H100 gets its
+            # first token in 20 to 60 ms, and with 0.1 as the lowest bucket every
+            # quantile below it reads the same value.
             bucket_time_to_first_token = [
+                0.01,
+                0.02,
+                0.04,
+                0.06,
+                0.08,
                 0.1,
                 0.2,
                 0.4,
