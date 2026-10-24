@@ -70,6 +70,11 @@ class SenseNovaU1SamplingParams(SamplingParams):
             if key in _PUBLIC_OVERRIDE_FIELDS
         }
 
+    def should_use_classifier_free_guidance(self) -> bool:
+        # The model builds its own empty-prompt unconditional branch, so CFG
+        # depends on the guidance scale alone, not on negative_prompt.
+        return self.guidance_scale > 1.0
+
     def __post_init__(self) -> None:
         if isinstance(self.cfg_interval, list):
             self.cfg_interval = tuple(float(x) for x in self.cfg_interval)

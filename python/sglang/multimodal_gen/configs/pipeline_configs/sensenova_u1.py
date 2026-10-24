@@ -48,6 +48,32 @@ def _component_residency_requests_offload(value) -> bool:
     return False
 
 
+def validate_sensenova_u1_parallelism(server_args) -> None:
+    # ServerArgs rejects CFG parallel on one GPU, so one GPU needs no more checks.
+    if server_args.num_gpus == 1:
+        return
+    if not (
+        server_args.num_gpus == 2
+        and server_args.enable_cfg_parallel
+        and server_args.cfg_parallel_degree == 2
+        and server_args.tp_size == 1
+        and server_args.sp_degree == 1
+        and server_args.dp_size == 1
+    ):
+        raise ValueError(
+            "SenseNovaU1Pipeline supports num_gpus=1, or num_gpus=2 with "
+            "--enable-cfg-parallel (one CFG branch per GPU). Native tensor, "
+            "sequence and data parallelism are not implemented yet."
+        )
+    # Each rank times the batching delay on its own clock, so the two CFG
+    # ranks can dispatch different batches and deadlock in a collective.
+    if server_args.batching_max_size > 1:
+        raise ValueError(
+            "SenseNovaU1Pipeline does not support dynamic batching "
+            "(--batching-max-size > 1) with --enable-cfg-parallel yet."
+        )
+
+
 def _set_compatible_runtime_defaults(server_args) -> None:
     compatible_defaults = {
         "component_residency": None,
@@ -82,7 +108,6 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
     task_type: ModelTaskType = ModelTaskType.T2I
     model_precision: str = "bf16"
     should_use_guidance: bool = True
-    supports_cfg_parallel: bool = False
 
     def supports_dynamic_batching(self):
         return True
@@ -110,11 +135,7 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
         return True
 
     def validate_server_args(self, server_args) -> None:
-        if server_args.num_gpus != 1:
-            raise ValueError(
-                "SenseNovaU1Pipeline currently supports num_gpus=1. "
-                "Native tensor/pipeline parallelism is not implemented yet."
-            )
+        validate_sensenova_u1_parallelism(server_args)
         if getattr(server_args, "enable_torch_compile", False):
             raise ValueError(
                 "SenseNovaU1Pipeline does not support torch.compile yet. "
@@ -195,7 +216,6 @@ class SenseNovaU1PipelineConfig(PipelineConfig):
             speed_mode_enable_torch_compile_by_default=False,
             keep_resident_min_available_gb=80,
             auto_enable_cfg_parallel=False,
-            supports_cfg_parallel=False,
         )
 
 
