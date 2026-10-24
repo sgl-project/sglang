@@ -14,6 +14,7 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_embedding_nemotron3,
     is_multimodal_model,
     load_decision_config,
     register_model_config_factory,
@@ -64,6 +65,28 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
             model_type="gemma3_text", use_bidirectional_attention=False
         )
         self.assertFalse(is_embedding_gemma(config))
+
+
+class TestEmbeddingNemotron3Config(CustomTestCase):
+    def test_detects_bidirectional_mean_pooled_ministral3(self):
+        config = SimpleNamespace(
+            architectures=["Ministral3Model"], is_causal=False, pooling="avg"
+        )
+        self.assertTrue(is_embedding_nemotron3(config))
+
+    def test_does_not_misclassify_other_ministral3_checkpoints(self):
+        for fields in (
+            {"architectures": ["Ministral3Model"]},
+            {"architectures": ["Ministral3Model"], "is_causal": False},
+            {"architectures": ["Ministral3Model"], "pooling": "avg"},
+            {
+                "architectures": ["Ministral3ForCausalLM"],
+                "is_causal": False,
+                "pooling": "avg",
+            },
+        ):
+            with self.subTest(fields=fields):
+                self.assertFalse(is_embedding_nemotron3(SimpleNamespace(**fields)))
 
 
 class TestDraftModelConfig(CustomTestCase):

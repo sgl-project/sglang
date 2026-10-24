@@ -858,6 +858,20 @@ def handle_model_capability_adjustments(server_args: Any):
             "_handle_model_capability_adjustments",
             chunked_prefill_size=-1,
         )
+    # Encoder-only embedding models run one bidirectional prefill per request,
+    # so the KV pool is never read back; the FA backend then uses raw K/V.
+    if (
+        embedding_model_spec is not None
+        and embedding_model_spec.safe_disable_kv_cache
+        and embedding_model_spec.encoder_only_attention
+        and attention_backends_of(cfg)[0] in ("fa3", "fa4")
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            prefill_only_disable_kv_cache=True,
+        )
+        run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
 
     is_embedding_gemma = (
         embedding_model_spec is not None
