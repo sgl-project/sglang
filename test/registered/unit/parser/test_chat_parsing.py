@@ -22,6 +22,7 @@ output dicts. Any divergence indicates a regression in the new executor."""
 import copy
 import random
 import unittest
+from decimal import localcontext
 
 from sglang.srt.parser.chat_parsing import ResponseParser, parse_response
 from sglang.srt.parser.chat_parsing.response_parser import _coerce, _schema_types
@@ -1548,7 +1549,56 @@ def _parser_with_tools(tools):
     return ResponseParser(_XML_STRING_ARGS_TEMPLATE, prefix="", tools=tools)
 
 
-class ToolArgCoercionTest(unittest.TestCase):
+class ToolArgCoercionTest(CustomTestCase):
+    def test_integer_tool_args_preserve_decimal_precision(self):
+        """Integer tool arguments retain exact whole values and reject tiny fractional parts."""
+        cases = (
+            ("9007199254740993.0", 9007199254740993),
+            ("-9007199254740993.0", -9007199254740993),
+            ("9.007199254740993e15", 9007199254740993),
+            ("3.0000000000000001", "3.0000000000000001"),
+            ("-3.0000000000000001", "-3.0000000000000001"),
+            ("1e-400", "1e-400"),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw), localcontext(prec=1, Emax=1, Emin=-1):
+                text = f"<tool_call><function=set_alarm><parameter=hour>{raw}</parameter></function></tool_call>"
+                parsed = parse_response(text, _XML_STRING_ARGS_TEMPLATE, prefix="", tools=_SET_ALARM_TOOLS)
+                self.assertEqual(_first_tool_args(parsed), {"hour": expected})
+                self.assertIs(type(_first_tool_args(parsed)["hour"]), type(expected))
+
+                stream = ResponseParser(_XML_STRING_ARGS_TEMPLATE, prefix="", tools=_SET_ALARM_TOOLS)
+                events = [event for char in text for event in stream.feed(char)]
+                message, final_events = stream.finalize()
+                closes = [event["value"] for event in events + final_events if event["type"] == "region_close"]
+                self.assertEqual(message, parsed)
+                self.assertEqual(closes, parsed["tool_calls"])
+
+    def test_integer_tool_args_keep_range_guards_and_number_fallback(self):
+        """Invalid or overflowing integer text stays raw; number schemas keep float semantics."""
+        cases = (
+            ("NaN", {"type": "integer"}, "NaN"),
+            ("inf", {"type": "integer"}, "inf"),
+            ("1e309", {"type": "integer"}, "1e309"),
+            ("1e999999999", {"type": "integer"}, "1e999999999"),
+            ("1e-9999999999999999999999999999999999999", {"type": "integer"}, "1e-9999999999999999999999999999999999999"),
+            ("not-a-number", {"type": "integer"}, "not-a-number"),
+            ("3.0", {"type": "integer"}, 3),
+            ("3e2", {"type": "integer"}, 300),
+            ("007", {"type": "integer"}, 7),
+            ("3.5", {"type": "integer"}, "3.5"),
+            ("3.5", {"type": ["integer", "number"]}, 3.5),
+            ("3.0000000000000001", {"type": ["integer", "number"]}, 3.0),
+            ("9007199254740993.0", {"type": "number"}, 9007199254740992.0),
+        )
+        for raw, schema, expected in cases:
+            with self.subTest(raw=raw, schema=schema):
+                text = f"<tool_call><function=set_alarm><parameter=hour>{raw}</parameter></function></tool_call>"
+                parsed = parse_response(text, _XML_STRING_ARGS_TEMPLATE, prefix="", tools=_set_alarm_tools(hour=schema))
+                value = _first_tool_args(parsed)["hour"]
+                self.assertEqual(value, expected)
+                self.assertIs(type(value), type(expected))
+
     def test_coerce_tool_calls_casts_declared_types(self):
         tools = _set_alarm_tools(
             count={"type": "integer"},
