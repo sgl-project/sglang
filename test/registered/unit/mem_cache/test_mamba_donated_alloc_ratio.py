@@ -417,6 +417,7 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
         from sglang.srt import runtime_context as rc
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_schedule
+        from sglang.srt.server_args import ServerArgs
 
         fake = SimpleNamespace(
             mambaish_config=SimpleNamespace(
@@ -441,7 +442,11 @@ class TestExtraMambaCacheSizing(unittest.TestCase):
             speculative_num_draft_tokens=draft_tokens,
         )
         args.update(schedule)
-        with rc.get_context().override_server_args(**args):
+        # These limits represent user input, not resolved defaults.
+        context = rc.create_context(
+            ServerArgs(model_path="dummy", **args), role="scheduler"
+        )
+        with rc.use_context(context):
             remaining = KVCacheConfigurator._handle_max_mamba_cache(fake, 120 / 1024)
             return get_schedule().max_mamba_cache_size, remaining * (1 << 30)
 
