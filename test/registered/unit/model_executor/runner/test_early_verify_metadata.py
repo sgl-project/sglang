@@ -274,6 +274,7 @@ def test_early_verify_graphs_share_one_packed_query_buffer(monkeypatch):
         capture_mode, "_capture_attention_variant", DSV41_CANDIDATE_UNFILTERED
     )
     backend = _building_backend()
+    allocated = torch.zeros(12, 64, 512)
     for graph_key in (4, 2):  # captured largest first
         DeepseekV4AttnBackend._install_early_verify_metadata(
             backend,
@@ -283,10 +284,10 @@ def test_early_verify_graphs_share_one_packed_query_buffer(monkeypatch):
         )
         if graph_key == 4:
             # What the captured forward's first MegaAttention layer allocates.
-            backend.forward_metadata.q_mega_pad_buffer = torch.zeros(12, 64, 512)
+            backend.forward_metadata.q_mega_pad_buffer = allocated
     bucket = backend.cuda_graph_metadata_of_bucket_and_bs[_GraphBucket.TARGET_VERIFY]
-    shared = bucket[(4, "early")].q_mega_pad_buffer
-    assert bucket[(2, "early")].q_mega_pad_buffer is shared
+    assert bucket[(4, "early")].q_mega_pad_buffer is allocated
+    assert bucket[(2, "early")].q_mega_pad_buffer is allocated
 
 
 if __name__ == "__main__":

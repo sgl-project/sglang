@@ -439,8 +439,12 @@ class TestMegaAttention(CustomTestCase):
         prefill_indices = torch.randint(
             0, 512, (tokens, 1, topk), device="cuda", dtype=torch.int32
         )
+        # "decode_swa" passes no extra cache, as the model does on its
+        # compress_ratio 0 layers and the SWA-only DSpark draft blocks.
         for (heads, padded), use_legacy, op in itertools.product(
-            ((16, 64), (64, 64), (128, 128)), (True, False), ("decode", "prefill")
+            ((16, 64), (64, 64), (128, 128)),
+            (True, False),
+            ("decode", "decode_swa", "prefill"),
         ):
             with self.subTest(heads=heads, use_legacy=use_legacy, op=op):
                 q_real = torch.randn(
@@ -452,8 +456,15 @@ class TestMegaAttention(CustomTestCase):
                     topk_length=lengths,
                     use_legacy=use_legacy,
                 )
-                if op == "decode":
+                if op != "prefill":
                     main_kv, extra_kv = decode_caches[use_legacy]
+                    extra = {}
+                    if op == "decode":
+                        extra = dict(
+                            extra_kv=extra_kv,
+                            extra_indices=extra_indices,
+                            extra_topk_length=extra_lengths,
+                        )
                     flash_mla_mega_decode(
                         q,
                         main_kv,
@@ -461,9 +472,7 @@ class TestMegaAttention(CustomTestCase):
                         positions,
                         table,
                         512**-0.5,
-                        extra_kv=extra_kv,
-                        extra_indices=extra_indices,
-                        extra_topk_length=extra_lengths,
+                        **extra,
                         **common,
                     )
                 else:
