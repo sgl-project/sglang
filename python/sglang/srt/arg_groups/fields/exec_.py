@@ -285,6 +285,20 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    dsa_prefill_policy: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Opt-in ROCm DSA prefill policy. Select AITER or TileLang once "
+                "per eager sparse-prefill batch using host shape metadata. "
+                "Profiles are fitted for GLM-5.3-MXFP4 on gfx950 attention TP4; "
+                "require --dsa-prefill-backend tilelang. Decode and speculative "
+                "phases retain their configured backend. The FP8 profile needs "
+                "a separately validated AITER numerical fix (ROCm/aiter#5535)."
+            ),
+            choices=["glm53-mi350x-tp4-bf16-v1", "glm53-mi350x-tp4-fp8-v1"],
+        ),
+    ] = None
     dsv4_prefill_backend: A[
         str,
         Arg(

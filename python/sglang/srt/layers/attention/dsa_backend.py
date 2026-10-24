@@ -77,6 +77,10 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
 )
+from sglang.srt.layers.attention.dsa.rocm_prefill_policy import (
+    DSAPrefillShape,
+    RocmDSAPrefillPolicy,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_interleave,
     compute_dsa_seqlens,
@@ -316,6 +320,9 @@ class DSAMetadata:
     pooled_topk_v2_plan: Optional[torch.Tensor] = None
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
     kpool_write_plan: Optional[KPoolWritePlan] = None
+    # Decided once for this eager prefill batch, then reused by every layer.
+    # Graph/decode/speculative metadata leaves this unset.
+    selected_prefill_impl: Optional[_DSA_IMPL_T] = None
 
 
 @torch.compile
@@ -340,6 +347,7 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
+    "aiter",
     "flashmla_sparse",
     "flashmla_sparse_q8",
     "flashmla_kv",
@@ -570,6 +578,8 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        self.rocm_prefill_policy = self._init_rocm_prefill_policy()
+        self._rocm_prefill_logged_backends: set[str] = set()
         if (
             not _is_hip
             and self.token_to_kv_pool.dtype == torch.float8_e4m3fn
@@ -649,7 +659,9 @@ class DeepseekSparseAttnBackend(
             )
 
             if (
-                self.dsa_prefill_impl == "aiter" or self.dsa_decode_impl == "aiter"
+                self.dsa_prefill_impl == "aiter"
+                or self.dsa_decode_impl == "aiter"
+                or self.rocm_prefill_policy is not None
             ) and model_runner.kv_cache_dtype == fp8_dtype:
                 self._ensure_aiter_dsa_decode_metadata_buffer(
                     max_seqlen_q=1,
@@ -783,6 +795,79 @@ class DeepseekSparseAttnBackend(
             )
         else:
             self.workspace_buffer = None
+
+    def _init_rocm_prefill_policy(self) -> Optional[RocmDSAPrefillPolicy]:
+        policy_id = get_exec().kernel.dsa_prefill_policy
+        if policy_id is None:
+            return None
+        if not _is_hip:
+            raise ValueError("--dsa-prefill-policy is supported only on ROCm")
+        if not callable(globals().get("mla_decode_fwd")):
+            raise ImportError(
+                "--dsa-prefill-policy requires AITER with working MLA imports; "
+                "check the AITER import warning above."
+            )
+
+        policy = RocmDSAPrefillPolicy(policy_id)
+        graph_config = get_exec().graph.cuda_graph_config
+        policy.validate_runtime(
+            architecture=torch.cuda.get_device_properties(self.device).gcnArchName,
+            attn_tp_size=get_parallel().attn_tp_size,
+            attn_cp_size=get_parallel().attn_cp_size,
+            dcp_size=get_parallel().dcp_size,
+            kv_dtype=str(self.token_to_kv_pool.dtype).removeprefix("torch."),
+            prefill_backend=self.dsa_prefill_impl,
+            prefill_graph_enabled=(
+                graph_config is not None and graph_config.prefill.backend != "disabled"
+            ),
+            deterministic=get_exec().deterministic.enable_deterministic_inference,
+            index_topk=self.dsa_index_topk,
+            index_kpool=self.dsa_index_kpool,
+            num_q_heads=self.num_q_heads,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+        )
+        logger.info("ROCm DSA prefill policy: %s", policy_id)
+        if policy.kv_dtype == "float8_e4m3fn":
+            logger.warning(
+                "The FP8 prefill policy does not fix AITER softmax numerics; "
+                "validate the selected AITER kernel before use. See "
+                "https://github.com/ROCm/aiter/pull/5535."
+            )
+        return policy
+
+    def _select_rocm_prefill_impl(
+        self,
+        forward_batch: ForwardBatch,
+        extend_seq_lens_cpu: List[int],
+        max_kv_len: int,
+    ) -> Optional[_DSA_IMPL_T]:
+        if (
+            self.rocm_prefill_policy is None
+            or forward_batch.forward_mode != ForwardMode.EXTEND
+            or self.use_mha
+        ):
+            return None
+        return self.rocm_prefill_policy.select(
+            DSAPrefillShape(
+                total_q_tokens=sum(extend_seq_lens_cpu),
+                max_q_len=max(extend_seq_lens_cpu, default=0),
+                batch_size=len(extend_seq_lens_cpu),
+                max_kv_len=max_kv_len,
+            )
+        )
+
+    def _get_extend_impl(self, forward_batch: ForwardBatch) -> _DSA_IMPL_T:
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            return self.dsa_decode_impl
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            selected = getattr(self.forward_metadata, "selected_prefill_impl", None)
+            if selected is not None:
+                return selected
+        return self.dsa_prefill_impl
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -1346,6 +1431,23 @@ class DeepseekSparseAttnBackend(
         else:
             assert False, f"Unsupported {forward_batch.forward_mode = }"
 
+        selected_prefill_impl = self._select_rocm_prefill_impl(
+            forward_batch, extend_seq_lens_cpu, max_seqlen_k
+        )
+        if selected_prefill_impl is not None:
+            dsa_impl_for_batch = selected_prefill_impl
+            if selected_prefill_impl not in self._rocm_prefill_logged_backends:
+                logger.info(
+                    "ROCm DSA policy chose %s: fresh_rows=%d, max_q_len=%d, "
+                    "batch_size=%d, max_kv_len=%d",
+                    selected_prefill_impl,
+                    sum(extend_seq_lens_cpu),
+                    max(extend_seq_lens_cpu, default=0),
+                    len(extend_seq_lens_cpu),
+                    max_seqlen_k,
+                )
+                self._rocm_prefill_logged_backends.add(selected_prefill_impl)
+
         indexer_k_start_end, token_to_batch_idx = self._cal_indexer_k_start_end(
             forward_batch, bs_idx_cpu
         )
@@ -1415,6 +1517,7 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            selected_prefill_impl=selected_prefill_impl,
         )
         metadata = self._init_kpool_metadata(
             metadata,
@@ -2183,14 +2286,7 @@ class DeepseekSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "DSA is causal only"
 
-        dsa_impl = (
-            self.dsa_decode_impl
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            )
-            else self.dsa_prefill_impl
-        )
+        dsa_impl = self._get_extend_impl(forward_batch)
         if attn_sink is not None and dsa_impl != "flashmla_sparse":
             raise RuntimeError(
                 f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
