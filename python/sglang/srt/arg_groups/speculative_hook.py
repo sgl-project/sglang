@@ -1049,7 +1049,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             cfg.speculative_algorithm,
         )
 
-    model_arch = model_config_of(server_args).hf_config.architectures[0]
+    hf_config = model_config_of(server_args).hf_config
+    model_arch = hf_config.architectures[0]
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
@@ -1103,6 +1104,16 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             speculative_num_steps=steps,
             speculative_eagle_topk=topk,
             speculative_num_draft_tokens=draft_tokens,
+        )
+
+    from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+
+    # Check the effective top-k after defaults/adaptive params are resolved,
+    # before loading weights or constructing the QSA draft/verify backends.
+    if is_qwen_qsa(hf_config) and cfg.speculative_eagle_topk != 1:
+        raise ValueError(
+            "Qwen QSA speculative decoding requires --speculative-eagle-topk=1; "
+            f"got {cfg.speculative_eagle_topk}."
         )
 
     if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
