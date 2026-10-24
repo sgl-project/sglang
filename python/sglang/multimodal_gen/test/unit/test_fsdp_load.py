@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 from safetensors.torch import safe_open, save_file
 from torch import nn
@@ -520,6 +521,7 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
                 rank_local_checkpoint.tp_local_shape(sources, 1, 2), (8, 2)
             )
 
+    @pytest.mark.usefixtures("single_process_model_parallel")
     def test_rank_local_row_segments_reach_final_parameters(self):
         weight = torch.arange(96, dtype=torch.bfloat16).reshape(4, 24)
         bias = torch.arange(4, dtype=torch.bfloat16)
