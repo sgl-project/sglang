@@ -78,6 +78,23 @@ def handle_hicache(server_args: Any):
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
 
+    if cfg.enable_mla_hicache_host_dedup and (
+        cfg.hicache_io_backend != "direct"
+        or cfg.hicache_mem_layout != "page_first_direct"
+        or cfg.hicache_storage_backend is not None
+        or cfg.enable_hisparse
+        or cfg.disaggregation_mode == "decode"
+        or cfg.pp_size > 1
+        or cfg.nnodes > 1
+        or cfg.attn_cp_size > 1
+        or cfg.dcp_size > 1
+    ):
+        raise ValueError(
+            "--enable-mla-hicache-host-dedup requires --hicache-io-backend direct "
+            "and --hicache-mem-layout page_first_direct on one node and PP stage, "
+            "without a storage backend, hisparse, attention CP/DCP or PD decode."
+        )
+
 
 def handle_hicache_ratio_default(server_args: Any):
     """Default the host/device ratio per host memory mode.

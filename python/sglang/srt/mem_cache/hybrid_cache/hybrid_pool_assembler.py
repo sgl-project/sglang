@@ -24,6 +24,10 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4StateHostPool,
     LogicalHostPool,
 )
+from sglang.srt.mem_cache.mla_host_dedup import (
+    MLAHostDedupContext,
+    maybe_create_mla_host_dedup_context,
+)
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.host_pool_decl import HostPoolDecl
@@ -53,6 +57,21 @@ logger = logging.getLogger(__name__)
 
 def _get_allocator_type() -> str:
     return get_allocator_type()
+
+
+def _maybe_create_mla_host_dedup(
+    kv_pool: Any, params: CacheInitParams
+) -> Optional[MLAHostDedupContext]:
+    """--enable-mla-hicache-host-dedup: host layers with rotating owners."""
+    return maybe_create_mla_host_dedup_context(
+        kv_pool,
+        params.tp_cache_group,
+        params.attn_cp_cache_group,
+        params.attn_tp_cache_group,
+        storage_backend=None,
+        enabled=get_memory().enable_mla_hicache_host_dedup,
+        rotate_owners=True,
+    )
 
 
 def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
@@ -166,6 +185,7 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
+    mla_dedup: Optional[MLAHostDedupContext] = None,
 ):
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
@@ -209,6 +229,9 @@ def build_kv_host_pool(
         )
     else:
         kwargs.update(mha_kwargs)
+    if mla_dedup is not None:
+        kwargs["dedup_rank"] = mla_dedup.broadcaster.dedup_rank
+        kwargs["dedup_size"] = mla_dedup.broadcaster.owner_size
     parallel = get_parallel()
     if parallel.dcp_enabled:
         assert use_mla, (
@@ -284,6 +307,7 @@ def build_kv_only_group(
     override_kv_cache_dim: Optional[int] = None,
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
+    mla_dedup: Optional[MLAHostDedupContext] = None,
 ) -> HostPoolGroup:
     """Anchor-only host pool group for a flat MHA/MLA device pool."""
     transfer_layer_id_max = len(full_layer_mapping)
@@ -294,6 +318,7 @@ def build_kv_only_group(
         override_kv_cache_dim=override_kv_cache_dim,
         host_size=host_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        mla_dedup=mla_dedup,
     )
     if mtp_draft_device_pools:
         full_layer_mapping = with_packed_draft_layer_mapping(
@@ -529,6 +554,7 @@ def build_kv_only_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     transfer_layer_id_max = len(full_layer_mapping)
+    mla_dedup = _maybe_create_mla_host_dedup(kv_pool, params)
     host_pool_group = build_kv_only_group(
         page_size=params.page_size,
         kv_pool=kv_pool,
@@ -536,6 +562,7 @@ def build_kv_only_stack(
         use_mla=use_mla,
         override_kv_cache_dim=override_kv_cache_dim,
         mtp_draft_device_pools=params.mtp_draft_device_pools,
+        mla_dedup=mla_dedup,
     )
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
@@ -555,6 +582,7 @@ def build_kv_only_stack(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=get_memory().hicache_host_memory_mode,
+        mla_dedup_context=mla_dedup,
     )
     return host_pool_group, cache_controller
 
@@ -1525,6 +1553,7 @@ def build_hybrid_mamba_swa_stack(
 def build_host_pool_group(
     *,
     config: HostPoolGroupConfig,
+    mla_dedup: Optional[MLAHostDedupContext] = None,
 ) -> HostPoolGroup:
     """Allocate host pools and transfer entries from prepared configs."""
     root = config.pools[0]
@@ -1532,6 +1561,7 @@ def build_host_pool_group(
         kv_pool=root.decl.device_pool,
         page_size=config.transfer_page_size,
         mtp_draft_device_pools=root.packed_draft_device_pools,
+        mla_dedup=mla_dedup,
     )
     return HostPoolGroup(
         _build_pool_entries(config=config, root_host_pool=root_host_pool)
@@ -2383,7 +2413,8 @@ class _DsaStrategy(StackStrategy):
             transfer_page_size=params.page_size,
             packed_draft_device_pools=params.mtp_draft_device_pools,
         )
-        host_pool_group = build_host_pool_group(config=config)
+        mla_dedup = _maybe_create_mla_host_dedup(kvcache, params)
+        host_pool_group = build_host_pool_group(config=config, mla_dedup=mla_dedup)
         cache_controller = HybridCacheController(
             params.token_to_kv_pool_allocator,
             host_pool_group,
@@ -2403,6 +2434,7 @@ class _DsaStrategy(StackStrategy):
             transfer_layer_id_max=kvcache.layer_num,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=get_memory().hicache_host_memory_mode,
+            mla_dedup_context=mla_dedup,
         )
         return StackBuildResult(
             host_pool_group=host_pool_group,

@@ -96,6 +96,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     the shared HostKVCache signature but use the captured tensors and slot map.
     """
 
+    # Rotating MLA host dedup: this rank stores target layers rank, rank + size, ...
+    dedup_rank = 0
+    dedup_size = 1
+
     def __init__(
         self,
         buffer_info: MLABufferInfo | MLAHostAllocation,
@@ -117,8 +121,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         target_layer_num: int,
         layer_shard_enabled: bool = False,
         pool_label: str = "kv",
+        dedup_rank: int = 0,
+        dedup_size: int = 1,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
+        self.dedup_rank = dedup_rank
+        self.dedup_size = dedup_size
+        # Token capacity follows the largest dedup share, so every rank holds the
+        # same tokens and the radix tree stays replicated.
+        self._capacity_layer_num = -(-target_layer_num // dedup_size)
+        if dedup_size > 1:
+            buffer_info = self._dedup_buffer_info(
+                buffer_info, layer_shard_enabled=layer_shard_enabled
+            )
+            target_layer_num = len(buffer_info.layer_indices)
         self.override_kv_cache_dim = override_kv_cache_dim
         if _is_xpu and not self._is_dummy:
             require_kvcacheio_ops(
@@ -191,8 +207,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     for i in range(self._draft_layer_num)
                 }
             )
+            capacity_layer_num = self.layer_num
+            if self.dedup_size > 1:
+                capacity_layer_num = self._capacity_layer_num + self._draft_layer_num
             self._size_per_token = (
-                self.kv_cache_dim * self.dtype.itemsize * self.layer_num
+                self.kv_cache_dim * self.dtype.itemsize * capacity_layer_num
             )
             if isinstance(buffer_info.buffers, MLASplitBuffers):
                 self._native_buffers = buffer_info.buffers
@@ -253,6 +272,40 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return
 
         self._initialize_transfer_views()
+
+    def _dedup_buffer_info(
+        self, buffer_info: MLABufferInfo | MLAHostAllocation, *, layer_shard_enabled
+    ) -> MLABufferInfo:
+        """Keep the target layers this dedup rank owns; packed drafts stay on all."""
+        if (
+            self._is_dummy
+            or layer_shard_enabled
+            or not isinstance(buffer_info.buffers, tuple)
+        ):
+            raise ValueError(
+                "MLA host dedup needs physical per-layer MLA buffers without "
+                "layer sharding"
+            )
+        positions = [
+            i
+            for i, layer in enumerate(buffer_info.layer_indices)
+            if layer % self.dedup_size == self.dedup_rank
+        ]
+        return msgspec.structs.replace(
+            buffer_info,
+            buffers=tuple(buffer_info.buffers[i] for i in positions),
+            data_ptrs=(
+                None
+                if buffer_info.data_ptrs is None
+                else buffer_info.data_ptrs[positions]
+            ),
+            layer_indices=tuple(buffer_info.layer_indices[i] for i in positions),
+            scales=(
+                None
+                if buffer_info.scales is None
+                else tuple(buffer_info.scales[i] for i in positions)
+            ),
+        )
 
     def _initialize_transfer_views(self) -> None:
         # The JIT HiCache kernels also build with hipcc (ROCm): the PTX-only

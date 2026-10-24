@@ -185,6 +185,11 @@ class DSAIndexerPoolHost(HostKVCache):
             for layer in range(owned_start, owned_end)
             if declared is None or layer in declared
         ]
+        if anchor_host.dedup_size > 1:
+            # Rotating MLA host dedup: index-key layers continue the KV rotation.
+            size = anchor_host.dedup_size
+            first = (anchor_host.dedup_rank - device_pool.layer_num) % size
+            self._live_target_layers = self._live_target_layers[first::size]
         self._device_to_host_layer = {
             layer: i for i, layer in enumerate(self._live_target_layers)
         }
