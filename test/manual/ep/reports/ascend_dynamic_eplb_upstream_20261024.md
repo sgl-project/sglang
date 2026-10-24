@@ -3,7 +3,7 @@
 ## Source and validation scope
 
 Community base: `de7055f59645ebe03784b0980e1f222789f468a3`.
-The [verification manifest](ascend_dynamic_eplb_upstream_20261024/verification.json) binds all 17 Python files to their SHA-256 values.
+The [verification manifest](ascend_dynamic_eplb_upstream_20261024/verification.json) binds the original 17 Python files to their SHA-256 values and separately records the CI fixture follow-up.
 Seven production files are changed; the existing community TopK padding and shared-expert masking implementation is retained.
 
 The current community port passed the CPU and bounded NPU graph checks below. Full-model, disaggregated P/D and AIS measurements come from the earlier integration described separately below; they have **not** been rerun on this community base.
@@ -28,6 +28,8 @@ Runtime: Ascend 910C, CANN 9.1.0, PyTorch 2.10.0, torch_npu 2.10.0.post6.
 All **39 CPU tests passed without NPU initialization**. During port adaptation, an old test expected nonzero weights in padded rows. The test now checks the community's existing zero-padding behavior; production TopK code was not changed.
 
 The NPU probe ran 43 layers, 272 physical experts, 6 routes/token, and descending BS 16/8/1 capture. It executed the actual `run_once` callback extracted from this port, with attention/model stubs. There was no normal recorder reset between warmups and capture. Capture fallback counts were 0/0/0. Eight replay cases varied valid rows from zero to the full batch and matched independent CPU bincount oracles exactly. Two eager overflow cases retained all counts. Shared storage pointers remained stable and route tensors were unchanged. This is a counter/capture test, not a full-model graph or throughput test.
+
+CI compatibility follow-up: the existing PD role-switch test bypasses `ModelRunner.__init__`; its fixture now sets `is_draft_worker=False`, matching a normal target runner. The full **38-case PD role-switch file** and the existing **4-case draft-isolation suite** passed in an isolated source copy without NPU initialization. The 4 draft cases repeat coverage in the 39-test group above; they are not additional distinct cases. Production code was unchanged by this fixture repair.
 
 Changed-file pre-commit checks passed. Three unchanged system hooks expecting a `python3` executable on Windows were also executed successfully using the installed Python.
 
