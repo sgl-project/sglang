@@ -38,6 +38,8 @@ class FluxPipelineConfig(ImagePipelineConfig):
     """Configuration for the FLUX pipeline."""
 
     embedded_cfg_scale: float = 3.5
+    # FLUX.1 true CFG deltas drift substantially over a long reuse interval.
+    cfg_gate_max_reused_steps: int | None = 1
 
     task_type: ModelTaskType = ModelTaskType.T2I
 
@@ -498,6 +500,7 @@ def flux2_pack_latents(latents):
 @dataclass
 class Flux2PipelineConfig(FluxPipelineConfig):
     embedded_cfg_scale: float = 4.0
+    cfg_gate_max_reused_steps: int | None = None
 
     task_type: ModelTaskType = ModelTaskType.TI2I
 
