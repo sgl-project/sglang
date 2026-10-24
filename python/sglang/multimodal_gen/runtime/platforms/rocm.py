@@ -284,15 +284,9 @@ class RocmPlatform(Platform):
         use_bf16 = envs.SGLANG_USE_ROCM_VAE_CONV2D_BF16
         use_conv2d = envs.SGLANG_USE_ROCM_VAE_CONV2D or use_bf16
         if use_conv2d:
-            # The rewrite below feeds MIOpen 2-D shapes it has never seen: the
-            # temporal axis is folded into the channel dimension, so C_in
-            # becomes Kt*C_in (768 for a 256-channel 3x3x3 kernel) at full
-            # frame resolution. The default find mode enumerates every solver
-            # for each of those shapes, and on gfx1151 that costs minutes on
-            # the first decode of a given (resolution, frame count): the same
-            # settings took 1378 s cold vs 25 s warm at 832x480 / 21 frames.
-            # Heuristics land at 34 s instead, so the one-off cost disappears
-            # for ~1.4x of the steady state. Users can still override this.
+            # The rewrite creates shapes MIOpen has never seen (C_in becomes
+            # Kt*C_in at full resolution). Default find stalls for minutes on the
+            # first decode of each new shape; FAST bounds it to ~1.4x warm state.
             if os.environ.get("MIOPEN_FIND_MODE") is None:
                 os.environ["MIOPEN_FIND_MODE"] = "FAST"
                 logger.info(
