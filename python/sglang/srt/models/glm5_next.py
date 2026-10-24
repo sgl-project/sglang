@@ -82,6 +82,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_loader.weight_utils import (
+    clone_if_runai_streamed_tensor,
     default_weight_loader,
     sharded_weight_loader,
 )
@@ -1862,7 +1863,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     if fuse_qkv_a_proj and (
                         "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                     ):
-                        cached_a_proj[name] = loaded_weight
+                        cached_a_proj[name] = clone_if_runai_streamed_tensor(
+                            loaded_weight
+                        )
                         q_a_proj_name = (
                             name
                             if "q_a_proj" in name

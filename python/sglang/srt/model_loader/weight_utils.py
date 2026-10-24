@@ -1737,6 +1737,12 @@ def set_runai_streamer_env(load_config: LoadConfig):
         os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = aws_endpoint_url
 
 
+def clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
+        return tensor.clone().detach()
+    return tensor
+
+
 @torch.no_grad()
 def initialize_capture_safe_weights(
     model: torch.nn.Module,
