@@ -22,6 +22,7 @@ limitations under the License.
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -50,6 +51,27 @@ using namespace host;
 using namespace cute;
 
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+
+// CTA swizzle for GB10 (DGX Spark, SM121: 24 MiB L2, LPDDR5X). The heuristic raster re-reads the
+// smaller operand once per tile row or column of the larger one, which goes to DRAM once neither
+// fits in L2; grouping 8 tiles keeps shared tiles resident. The rule and its 3/4 margin are measured
+// on GB10 only: on a 128 MiB L2 SM120 part the same rule is slower just past the margin, so SM120
+// keeps the default order. vLLM's SM120 blockwise kernel swizzles whenever the weight exceeds L2.
+inline int blockwise_fp8_swizzle_size(int device_id, int64_t weight_bytes, int64_t act_bytes) {
+  // L2 size on SM121, 0 elsewhere (no swizzle).
+  static host::runtime::DeviceCacheMap<int, -1> sm121_l2_cache;
+  const int64_t l2_bytes = sm121_l2_cache.get_cached(device_id, true, [](int32_t device_id) {
+    int major, minor, bytes;
+    CHECK_CUDA(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id));
+    CHECK_CUDA(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id));
+    if (major != 12 || minor != 1) {
+      return 0;
+    }
+    CHECK_CUDA(cudaDeviceGetAttribute(&bytes, cudaDevAttrL2CacheSize, device_id));
+    return bytes;
+  });
+  return (l2_bytes > 0 && 4 * std::min(weight_bytes, act_bytes) > 3 * l2_bytes) ? 8 : 1;
+}
 
 template <
     typename OutType,
@@ -154,6 +176,10 @@ void launch_sm120_fp8_blockwise_scaled_mm(
         mainloop_args,
         epilogue_args,
     };
+
+    // FP8 operands, one byte per element: weight b is [K, N], activation a is [M, K].
+    args.scheduler.max_swizzle_size =
+        blockwise_fp8_swizzle_size(a.device().device_id, static_cast<int64_t>(k) * n, static_cast<int64_t>(m) * k);
 
     auto can_implement = gemm_op.can_implement(args);
     if (can_implement != cutlass::Status::kSuccess) {
