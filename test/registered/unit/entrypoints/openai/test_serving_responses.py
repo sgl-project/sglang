@@ -1448,7 +1448,7 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
             )
 
         with patch.dict(sys.modules, {"tml_renderers": None}):
-            for encoding in ("kimi_k3", "dsv4", "dsv41", "dsv32"):
+            for encoding in ("kimi_k3", "dsv32"):
                 with self.subTest(encoding=encoding):
                     self.assertIsNone(
                         chat_encoding_adapters.build_chat_encoding_adapter(
