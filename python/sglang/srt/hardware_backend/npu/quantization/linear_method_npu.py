@@ -54,6 +54,19 @@ def _get_float4_e2m1fn_x2_dtype():
     return getattr(torch, "float4_e2m1fn_x2", None)
 
 
+def _prepare_mxfp4_w4a8_bias(
+    bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Match the A8W4 ``npu_quant_matmul`` bias contract."""
+    if bias is None:
+        return None
+    if bias.dtype != torch.bfloat16:
+        bias = bias.to(torch.bfloat16)
+    if bias.dim() == 1:
+        bias = bias.unsqueeze(0)
+    return bias
+
+
 class _NPULinearMethodBase(LinearMethodBase):
     def __init__(
         self,
@@ -412,6 +425,55 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
         )
 
 
+def npu_w4a8_mxfp4_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Execute W4A8 with a prepared packed-FP4 weight and paired UE8M0 scales.
+
+    Online and offline callers prepare the FRACTAL_NZ transposed weight and
+    transposed scales in their own post-load paths. This function only quantizes
+    activations to MXFP8 and runs the matmul; it does not quantize or repack weights.
+    """
+    e8m0_dtype = _get_float8_e8m0fnu_dtype()
+    fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+
+    original_dtype = x.dtype
+    if original_dtype not in (torch.float16, torch.bfloat16):
+        x = x.to(torch.bfloat16)
+        original_dtype = torch.bfloat16
+
+    # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant.
+    input_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+
+    # Dynamic MXFP8 activation quantisation (A8 — FP8, not FP4).
+    quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
+        x_2d, dst_type=torch.float8_e4m3fn
+    )
+
+    # A8W4 requires BF16 bias with shape [1, out_features].
+    quant_bias = _prepare_mxfp4_w4a8_bias(bias)
+    output = torch.ops.npu.npu_quant_matmul(
+        quantized_x,
+        weight,
+        weight_scale,
+        scale_dtype=e8m0_dtype,
+        pertoken_scale=dynamic_scale,
+        pertoken_scale_dtype=e8m0_dtype,
+        bias=quant_bias,
+        output_dtype=original_dtype,
+        x2_dtype=fp4_dtype,
+        group_sizes=[0, 0, MXFP4_BLOCK_SIZE],
+    )
+
+    # Restore original shape (replace last dim with output features).
+    output_shape = list(input_shape[:-1]) + [output.shape[-1]]
+    return output.reshape(output_shape)
+
+
 class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
     """NPU W4A8 online quantization: MXFP4 weights + MXFP8 activations.
 
@@ -517,69 +579,13 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             w_scale = w_scale.reshape(n, k // 2, 2)
         layer.weight_scale = Parameter(w_scale.transpose(-3, -2), requires_grad=False)
 
-        # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
-        if (
-            getattr(layer, "bias", None) is not None
-            and layer.bias.dtype != torch.float32
-        ):
-            layer.bias_fp32 = Parameter(
-                layer.bias.data.to(torch.float32), requires_grad=False
-            )
-        else:
-            layer.bias_fp32 = None
-
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        e8m0_dtype = _get_float8_e8m0fnu_dtype()
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-
-        original_dtype = x.dtype
-        if original_dtype not in (torch.float16, torch.bfloat16):
-            x = x.to(torch.bfloat16)
-            original_dtype = torch.bfloat16
-
-        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant.
-        input_shape = x.shape
-        x_2d = x.reshape(-1, x.shape[-1])
-
-        # Dynamic MXFP8 activation quantisation (A8 — FP8, not FP4).
-        quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=torch.float8_e4m3fn
-        )
-
-        # Use the cached FP32 bias from process_weights_after_loading; fall back
-        # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
-        if bias is None:
-            quant_bias = None
-        elif (
-            bias is getattr(layer, "bias", None)
-            and getattr(layer, "bias_fp32", None) is not None
-        ):
-            quant_bias = layer.bias_fp32
-        else:
-            quant_bias = bias.to(torch.float32)
-
-        # True W4(weight)A8(activation) matmul, identical to the offline path.
-        output = torch.ops.npu.npu_quant_matmul(
-            quantized_x,
-            layer.weight,
-            layer.weight_scale,
-            scale_dtype=e8m0_dtype,
-            pertoken_scale=dynamic_scale,
-            pertoken_scale_dtype=e8m0_dtype,
-            bias=quant_bias,
-            output_dtype=original_dtype,
-            x2_dtype=fp4_dtype,
-            group_sizes=[0, 0, MXFP4_BLOCK_SIZE],
-        )
-
-        # Restore original shape (replace last dim with output features).
-        output_shape = list(input_shape[:-1]) + [output.shape[-1]]
-        return output.reshape(output_shape)
+        return npu_w4a8_mxfp4_linear(x, layer.weight, layer.weight_scale, bias)
 
 
 class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
@@ -656,43 +662,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        e8m0_dtype = _get_float8_e8m0fnu_dtype()
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-
-        original_dtype = x.dtype
-        if original_dtype not in (torch.float16, torch.bfloat16):
-            x = x.to(torch.bfloat16)
-            original_dtype = torch.bfloat16
-
-        # Flatten to 2D [tokens, hidden] for npu_dynamic_mx_quant.
-        input_shape = x.shape
-        x_2d = x.reshape(-1, x.shape[-1])
-
-        # Dynamic MXFP8 activation quantisation (A8).
-        quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=torch.float8_e4m3fn
-        )
-
-        if bias is not None and bias.dtype != torch.float32:
-            bias = bias.to(torch.float32)
-
-        # W4(weight)A8(activation) matmul.
-        output = torch.ops.npu.npu_quant_matmul(
-            quantized_x,
-            layer.weight,
-            layer.weight_scale,
-            scale_dtype=e8m0_dtype,
-            pertoken_scale=dynamic_scale,
-            pertoken_scale_dtype=e8m0_dtype,
-            bias=bias,
-            output_dtype=original_dtype,
-            x2_dtype=fp4_dtype,
-            group_sizes=[0, 0, MXFP4_BLOCK_SIZE],
-        )
-
-        # Restore original shape (replace last dim with output features).
-        output_shape = list(input_shape[:-1]) + [output.shape[-1]]
-        return output.reshape(output_shape)
+        return npu_w4a8_mxfp4_linear(x, layer.weight, layer.weight_scale, bias)
 
 
 class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
