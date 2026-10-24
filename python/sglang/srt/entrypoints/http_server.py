@@ -1024,6 +1024,8 @@ def _refuse_decision_layout(obj: EmbeddingReqInput) -> None:
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     """Flush the radix cache."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
     ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
     if ret.success:
         content = (
@@ -1634,6 +1636,8 @@ async def load_lora_adapter(
     obj: Annotated[LoadLoRAAdapterReqInput, Body()], request: Request
 ):
     """Load a new LoRA adapter without re-launching the server."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
     result = await _global_state.tokenizer_manager.load_lora_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
@@ -1645,6 +1649,8 @@ async def load_lora_adapter_from_tensors(
     obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()], request: Request
 ):
     """Load a new LoRA adapter from tensors without re-launching the server."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
     result = await _global_state.tokenizer_manager.load_lora_adapter_from_tensors(
         obj, request
     )
@@ -1658,6 +1664,8 @@ async def unload_lora_adapter(
     obj: Annotated[UnloadLoRAAdapterReqInput, Body()], request: Request
 ):
     """Load a new LoRA adapter without re-launching the server."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
