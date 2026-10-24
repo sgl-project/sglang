@@ -162,6 +162,31 @@ class TestAllowedTools(CustomTestCase):
         self.assertEqual(messages[0]["tools"][0]["function"]["name"], "drop")
         self.assertEqual(len(tools), 2)
 
+    def test_allowed_mode_is_preserved_for_template_rendering(self):
+        for mode in ("auto", "required"):
+            for template_kwargs in (
+                None,
+                {},
+                {"tool_choice": None},
+                {"tool_choice": mode},
+            ):
+                with self.subTest(mode=mode, template_kwargs=template_kwargs):
+                    original = (
+                        None if template_kwargs is None else dict(template_kwargs)
+                    )
+                    request = ChatCompletionRequest(
+                        messages=[{"role": "user", "content": "Hi"}],
+                        tools=[self._tool("keep"), self._tool("drop")],
+                        tool_choice=self._choice(["keep"], mode),
+                        chat_template_kwargs=template_kwargs,
+                    )
+                    self.assertEqual(request.tool_choice, mode)
+                    self.assertEqual(request.chat_template_kwargs["tool_choice"], mode)
+                    self.assertEqual(template_kwargs, original)
+                    self.assertEqual(
+                        [tool.function.name for tool in request.tools], ["keep"]
+                    )
+
     def test_invalid_subsets_are_rejected(self):
         for names, mode, expected in [
             (["missing"], "auto", "undeclared"),

@@ -1186,11 +1186,16 @@ class ChatCompletionRequest(PDRoutingFields):
             )
         if allowed.mode == "required" and not names:
             raise ValueError("allowed_tools must not be empty in required mode")
-        template_choice = (self.chat_template_kwargs or {}).get("tool_choice")
+        template_kwargs = dict(self.chat_template_kwargs or {})
+        template_choice = template_kwargs.get("tool_choice")
         if template_choice is not None and template_choice != allowed.mode:
             raise ValueError(
                 "chat_template_kwargs.tool_choice conflicts with allowed_tools.mode"
             )
+        # Carry the explicit mode into rendering too: null template hints and
+        # server defaults must not replace the choice used by output parsers.
+        template_kwargs["tool_choice"] = allowed.mode
+        self.chat_template_kwargs = template_kwargs
         # Normalize once, before prompt encoders, grammars and output parsers
         # consume the request. Historical tool calls are left intact.
         allowed_names = set(names)
