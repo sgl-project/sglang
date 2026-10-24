@@ -201,6 +201,10 @@ All strategies enable multimodal serving. Image and video input use `Glm5NextPro
 
 The default multimodal feature transport is automatic, and on a single CUDA node auto resolves to CPU transport. The MI355X selection explicitly emits CPU transport, matching its image-serving check. CUDA IPC is opt-in: pass `--mm-feature-transport cuda_ipc` when lower transfer latency matters more than the GPU memory the IPC pool reserves. CUDA VMM transport applies only to multi-node GB200/GB300 systems on the MNNVL fabric, where auto selects it.
 
+### Render prompts with the Python chat template
+
+The recipes pass `--chat-template glm-5.3-flash`, which renders prompts, including image and video placeholders, with SGLang's built-in Python port of the checkpoint's `chat_template.jinja`; it requires a build that includes [PR #45154](https://github.com/sgl-project/sglang/pull/45154). Prompts are identical token for token, rendering is 4.7–17x faster, and request preprocessing of long agent conversations is up to 1.9x faster. `--reasoning-parser auto` and `--tool-call-parser auto` still resolve to `glm45` and `glm47`. The flag applies to SGLang's default Python HTTP frontend; leave it out with the Rust frontend (`SGLANG_RUST_SERVER=1`), which renders GLM-5.3-Flash from the checkpoint's template on its own and reads `--chat-template` as a file path. To serve a customized template, pass its path instead (`--chat-template /path/to/chat_template.jinja`).
+
 ## 3. Advanced usage
 
 ### 3.1 Reasoning
@@ -259,6 +263,7 @@ sglang serve \
   --language-only \
   --encoder-urls http://localhost:30001 \
   --mem-fraction-static 0.78 \
+  --chat-template glm-5.3-flash \
   --host 0.0.0.0 \
   --port 30000
 ```
@@ -294,6 +299,7 @@ sglang serve \
   --dsa-decode-backend trtllm \
   --kv-cache-dtype fp8_e4m3 \
   --moe-runner-backend flashinfer_trtllm \
+  --chat-template glm-5.3-flash \
   --reasoning-parser auto \
   --tool-call-parser auto \
   --host 0.0.0.0 \
@@ -325,6 +331,7 @@ sglang serve \
   --disaggregation-mode prefill \
   --disaggregation-bootstrap-port 8998 \
   --disaggregation-transfer-backend nixl \
+  --chat-template glm-5.3-flash \
   --host 0.0.0.0 \
   --port 31000
 ```
@@ -340,6 +347,7 @@ sglang serve \
   --moe-runner-backend triton \
   --disaggregation-mode decode \
   --disaggregation-transfer-backend nixl \
+  --chat-template glm-5.3-flash \
   --host 0.0.0.0 \
   --port 32000
 ```
