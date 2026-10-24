@@ -131,6 +131,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
@@ -1167,6 +1168,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "Multimodal inputs are not supported when --language-model-only "
                 "is set; the encoder is not loaded. Restart without the flag."
             )
+
+        # Reject audio input early for models that declare audio support
+        # (the processor exposes an audio token) but have no audio tower,
+        # e.g. gemma-4-31B-it, a non-audio variant of the Gemma 4 family
+        # whose config ships audio_config: null. Without this guard the
+        # audio items reach the scheduler, where get_audio_feature()
+        # raises inside model.forward and kills the scheduler process.
+        # Processors without an audio token never carry audio to the
+        # scheduler (the base processor drops it), so those models keep
+        # their existing behavior.
+        declares_audio = getattr(
+            getattr(self.mm_processor, "mm_tokens", None), "audio_token", None
+        )
+        if (
+            has_valid_data(obj.audio_data)
+            and declares_audio
+            and not self.model_config.is_audio_understandable_model
+        ):
+            raise ValueError(
+                f"Audio inputs are not supported by {self.served_model_name}"
+            )
+
         is_mossvl = (
             "MossVLForConditionalGeneration"
             in self.model_config.hf_config.architectures

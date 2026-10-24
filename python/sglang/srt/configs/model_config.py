@@ -843,10 +843,13 @@ class ModelConfig:
             enable_multimodal
             and not self.is_lm_only
             and (
-                hasattr(self.hf_config, "audio_config")
-                or hasattr(
-                    getattr(self.hf_config, "thinker_config", None), "audio_config"
+                getattr(self.hf_config, "audio_config", None) is not None
+                or getattr(
+                    getattr(self.hf_config, "thinker_config", None),
+                    "audio_config",
+                    None,
                 )
+                is not None
                 or getattr(self.hf_config, "sound_config", None) is not None
                 or is_audio_model(self.hf_config.architectures)
             )
