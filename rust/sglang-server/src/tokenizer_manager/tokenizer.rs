@@ -2,7 +2,7 @@
 //! executor). Each worker pulls a `Request` from the shared `flume` receiver,
 //! fills `input_ids`, and moves the request back to the TokenizerManager inbox.
 //!
-//! The text→ids step is behind [`TextTokenizer`], implemented by
+//! The text→ids step is `sglang_processor`'s [`TextTokenizer`], implemented by
 //! [`DynamoTokenizer`] (dynamo-tokenizers: HuggingFace / tiktoken / fastokens).
 //! A non-skip server requires a real tokenizer (enforced at startup); under
 //! `skip_tokenizer_init` the pool isn't spawned at all.
@@ -13,163 +13,50 @@
 
 use std::sync::Arc;
 
-use sglang_processor::dynamo_tokenizers::EncodeSegment;
+use sglang_processor::{DynamoTokenizer, ProcessorError, TextTokenizer};
 
-use crate::message::request::{RenderedChat, Request, RequestKind, TokenizeInput};
+use crate::message::request::{Request, RequestKind, TokenizeInput};
 use crate::message::response::ResponseItem;
 use crate::message::types::TokenIds;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::{error::Error, fsm::Event};
 
-/// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
-/// (read-only) across all pinned workers.
-pub trait TextTokenizer: Send + Sync {
-    fn encode(&self, text: &str) -> Result<TokenIds, Error>;
-
-    /// The special tokens this tokenizer auto-prepends on every `encode` —
-    /// Python's `encode("")` probe (`serving_chat._tokenizer_auto_adds_specials`).
-    /// Empty when it adds none (tiktoken backends, no BOS/EOS post-processor).
-    fn auto_specials(&self) -> Vec<i64> {
-        Vec::new()
-    }
-
-    /// Python's `tokenizer.bos_token_id`.
-    fn bos_token_id(&self) -> Option<i64> {
-        self.auto_specials().first().copied()
-    }
-
-    /// Encode rendered segments, each with its own special-token policy.
-    fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<TokenIds, Error> {
-        self.encode(
-            &segments
-                .iter()
-                .map(|segment| segment.text)
-                .collect::<String>(),
-        )
-    }
-}
-
-/// Load the tokenizer shared (Arc-backed) by the encode pool and detok shards.
-/// `None` under `skip_tokenizer_init`, else required (missing/failed load → `Err`).
-/// `tokenizer_path` is a tokenizer file, a model dir, or an HF Hub repo id
-/// (resolved from the local cache — no network).
+/// Load the tokenizer the encode pool uses; its [`DynamoTokenizer::tokenizer`]
+/// handle is shared by the detok shards. `None` under `skip_tokenizer_init`,
+/// else required (missing/failed load → `Err`). `tokenizer_path` is a
+/// tokenizer file, a model dir, or an HF Hub repo id (resolved from the local
+/// cache — no network).
 pub fn load_tokenizer(
     tokenizer_path: Option<&str>,
     revision: Option<&str>,
     skip_tokenizer_init: bool,
-) -> Result<Option<sglang_processor::dynamo_tokenizers::Tokenizer>, String> {
+) -> Result<Option<DynamoTokenizer>, String> {
     if skip_tokenizer_init {
         tracing::info!("skip_tokenizer_init: token ids in and out; no tokenizer/detokenizer");
         return Ok(None);
     }
-    sglang_processor::load_tokenizer(tokenizer_path, revision, true).map(Some)
+    let path =
+        tokenizer_path.ok_or_else(|| "no tokenizer configured: set tokenizer_path".to_string())?;
+    DynamoTokenizer::load(path, revision).map(Some)
 }
 
-/// Real tokenizer over an already-loaded dynamo `Tokenizer` (Arc inside).
-pub struct DynamoTokenizer {
-    inner: sglang_processor::dynamo_tokenizers::Tokenizer,
-    bos: Option<i64>,
-}
-
-impl DynamoTokenizer {
-    /// `bos_token` comes from `tokenizer_config.json`, as Python's does.
-    pub fn new(
-        inner: sglang_processor::dynamo_tokenizers::Tokenizer,
-        path: &str,
-        revision: Option<&str>,
-    ) -> Self {
-        let bos = sglang_processor::resolve_model_file(path, revision, "tokenizer_config.json")
-            .and_then(|file| std::fs::read_to_string(file).ok())
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|config| {
-                let bos = &config["bos_token"];
-                let bos = bos.as_str().or_else(|| bos["content"].as_str())?.to_owned();
-                // The last id: an auto-added BOS may precede it.
-                let ids = inner
-                    .encode_segments(&[EncodeSegment::new(&bos, true)])
-                    .ok()?;
-                ids.token_ids().last().map(|&id| i64::from(id))
-            });
-        Self { inner, bos }
+/// Widened once here, in the parallel pool: the scheduler's `array("q")` is
+/// int64, and the ids move into their ring buffer untouched from here.
+fn widen(encoded: Result<Vec<i32>, ProcessorError>) -> Result<TokenIds, Error> {
+    match encoded {
+        Ok(ids) => Ok(ids.into_iter().map(i64::from).collect()),
+        Err(ProcessorError::Tokenize(message)) => Err(Error::Tokenize(message)),
+        Err(error) => Err(Error::Tokenize(error.to_string())),
     }
-}
-
-impl TextTokenizer for DynamoTokenizer {
-    fn encode(&self, text: &str) -> Result<TokenIds, Error> {
-        if text.is_empty() {
-            // Match Python sglang: reject an empty prompt as a 400 (`Validation`),
-            // not the misleading 500 a tokenize error would give.
-            return Err(Error::Validation("prompt cannot be empty".into()));
-        }
-        let encoding = self
-            .inner
-            .encode(text)
-            .map_err(|e| Error::Tokenize(e.to_string()))?;
-        // Widened once here, in the parallel pool: the scheduler's `array("q")`
-        // is int64, and the ids move into their ring buffer untouched from here.
-        Ok(encoding
-            .token_ids()
-            .iter()
-            .map(|&id| i64::from(id))
-            .collect())
-    }
-
-    /// The post-processor prepends exactly what `encode("")` returns, so the
-    /// probe is the same prefix [`strip_auto_specials`] removes.
-    fn auto_specials(&self) -> Vec<i64> {
-        self.inner
-            .encode("")
-            .map(|encoding| {
-                encoding
-                    .token_ids()
-                    .iter()
-                    .map(|&id| i64::from(id))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn bos_token_id(&self) -> Option<i64> {
-        self.bos
-    }
-
-    fn encode_segments(&self, segments: &[EncodeSegment<'_>]) -> Result<TokenIds, Error> {
-        let encoding = self
-            .inner
-            .encode_segments(segments)
-            .map_err(|e| Error::Tokenize(e.to_string()))?;
-        Ok(encoding
-            .token_ids()
-            .iter()
-            .map(|&id| i64::from(id))
-            .collect())
-    }
-}
-
-/// Remove one leading run of auto-added specials — exactly what an
-/// `add_special_tokens=false` encode would have produced, without a second
-/// tokenizer instance (the post-processor always prepends the same prefix, so
-/// a template-rendered copy of those tokens is preserved).
-fn strip_auto_specials(mut ids: Vec<i64>, auto_specials: &[i64]) -> Vec<i64> {
-    if ids.starts_with(auto_specials) {
-        ids.drain(..auto_specials.len());
-    }
-    ids
 }
 
 /// One tokenizer worker: pulls a `Request` off the shared inbox, fills
 /// `input_ids`, returns it to the TokenizerManager. Pinned; backend shared.
-///
-/// The `auto_specials` prefix (probed once at construction, Python's
-/// `encode("")` probe) is stripped from template-rendered prompts —
-/// [`GenerateRequest`]'s `skip_special_tokens` — so chat prompts gain no
-/// extra BOS/EOS while plain text keeps the post-processor specials.
 pub struct TokenizerWorker {
     rx: flume::Receiver<Request>,
     tm: flume::Sender<TmEvent>,
     tokenizer: Arc<dyn TextTokenizer>,
-    auto_specials: Vec<i64>,
 }
 
 impl TokenizerWorker {
@@ -178,48 +65,7 @@ impl TokenizerWorker {
         tm: flume::Sender<TmEvent>,
         tokenizer: Arc<dyn TextTokenizer>,
     ) -> Self {
-        let auto_specials = tokenizer.auto_specials();
-        Self {
-            rx,
-            tm,
-            tokenizer,
-            auto_specials,
-        }
-    }
-}
-
-impl TokenizerWorker {
-    /// `RequestKind::Tokenize`: Python's `tokenizer.encode(text,
-    /// add_special_tokens=...)`. An empty text is not an error here, unlike a
-    /// generate prompt: it encodes to just the auto-added specials.
-    fn tokenize(&self, text: &str, add_special_tokens: bool) -> Result<TokenIds, Error> {
-        let ids = if text.is_empty() {
-            self.auto_specials.clone()
-        } else {
-            self.tokenizer.encode(text)?
-        };
-        Ok(if add_special_tokens {
-            ids
-        } else {
-            strip_auto_specials(ids, &self.auto_specials)
-        })
-    }
-
-    /// Python's chat encode: the template output without auto specials, then
-    /// the continuation on its own without its BOS.
-    fn encode_chat(&self, chat: &RenderedChat) -> Result<TokenIds, Error> {
-        let ids = match chat.prompt.encode_segments() {
-            Some(segments) => self.tokenizer.encode_segments(&segments)?,
-            None => self.tokenizer.encode(chat.prompt.as_str())?,
-        };
-        let mut ids = strip_auto_specials(ids, &self.auto_specials);
-        if !chat.continuation.is_empty() {
-            let suffix = self.tokenizer.encode(&chat.continuation)?;
-            let bos = self.tokenizer.bos_token_id();
-            let skip = usize::from(bos.is_some() && suffix.first() == bos.as_ref());
-            ids.extend_from_slice(&suffix[skip..]);
-        }
-        Ok(ids)
+        Self { rx, tm, tokenizer }
     }
 }
 
@@ -233,8 +79,8 @@ impl Runnable for TokenizerWorker {
                     TokenizeInput::Text {
                         text,
                         add_special_tokens,
-                    } => self.tokenize(text, *add_special_tokens),
-                    TokenizeInput::Chat(chat) => self.encode_chat(chat),
+                    } => widen(self.tokenizer.encode(text, *add_special_tokens)),
+                    TokenizeInput::Chat(chat) => widen(chat.encode(&*self.tokenizer)),
                 };
                 let item = match encoded {
                     Ok(ids) => ResponseItem::TokenIds(ids),
@@ -259,23 +105,26 @@ impl Runnable for TokenizerWorker {
                     // A stop that won't encode falls back to its byte length rather
                     // than failing the request: still an over-estimate, never an
                     // under-estimate, so the scheduler cannot miss that stop.
-                    .map(|s| self.tokenizer.encode(s).map_or(s.len(), |ids| ids.len()))
+                    .map(|s| {
+                        self.tokenizer
+                            .encode(s, false)
+                            .map_or(s.len(), |ids| ids.len())
+                    })
                     .max();
                 if let Some(n) = stop_tokens {
                     g.sampling_params.stop_str_max_len = n;
                 }
                 let encoded = match g.chat_prompt.take() {
-                    Some(chat) => self.encode_chat(&chat),
-                    None => self
-                        .tokenizer
-                        .encode(g.text.as_deref().unwrap_or(""))
-                        .map(|ids| {
-                            if g.skip_special_tokens {
-                                strip_auto_specials(ids, &self.auto_specials)
-                            } else {
-                                ids
-                            }
-                        }),
+                    Some(chat) => widen(chat.encode(&*self.tokenizer)),
+                    // Match Python sglang: reject an empty prompt as a 400
+                    // (`Validation`), not the misleading 500 a tokenize error
+                    // would give.
+                    None => match g.text.as_deref().unwrap_or("") {
+                        "" => Err(Error::Validation("prompt cannot be empty".into())),
+                        // Template-rendered text gains no specials the
+                        // template did not render.
+                        text => widen(self.tokenizer.encode(text, !g.skip_special_tokens)),
+                    },
                 };
                 match encoded {
                     Ok(ids) => {
@@ -302,7 +151,7 @@ impl Runnable for TokenizerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::request::{GenerateRequest, RequestKind};
+    use crate::message::request::{GenerateRequest, RenderedChat, RequestKind};
     use crate::message::response::ResponseSink;
     use crate::message::sampling::SamplingParams;
     use crate::utils::fsm::{AfterTokenize, RequestState};
@@ -313,8 +162,8 @@ mod tests {
     /// from its byte count and the two units cannot be confused.
     struct WordTokenizer;
     impl TextTokenizer for WordTokenizer {
-        fn encode(&self, text: &str) -> Result<TokenIds, Error> {
-            Ok(text.split_whitespace().map(|_| 1i64).collect())
+        fn encode(&self, text: &str, _: bool) -> Result<Vec<i32>, ProcessorError> {
+            Ok(text.split_whitespace().map(|_| 1).collect())
         }
     }
 
@@ -403,34 +252,25 @@ mod tests {
         );
     }
 
-    /// The strip reproduces `add_special_tokens=false`: one leading run of
-    /// auto-added specials is removed, a template-rendered copy is kept, and
-    /// tokenizers with no auto specials (empty probe) are untouched.
-    #[test]
-    fn strip_auto_specials_matches_add_special_tokens_false() {
-        assert_eq!(strip_auto_specials(vec![0, 0, 1, 2], &[0]), vec![0, 1, 2]);
-        assert_eq!(strip_auto_specials(vec![1, 2], &[0]), vec![1, 2]);
-        assert_eq!(strip_auto_specials(vec![1, 2], &[]), vec![1, 2]);
-        assert_eq!(strip_auto_specials(vec![0], &[0, 9]), vec![0]);
-    }
-
-    /// Word tokens plus a prepended BOS marker (id 0) — like an HF tokenizer
-    /// whose post-processor adds specials.
+    /// One id per text (its length), after a BOS (id 0) when specials are
+    /// added — like an HF tokenizer whose post-processor prepends one.
     struct MarkedTokenizer;
     impl TextTokenizer for MarkedTokenizer {
-        fn encode(&self, text: &str) -> Result<TokenIds, Error> {
-            Ok(vec![0, text.len() as i64])
+        fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<i32>, ProcessorError> {
+            let bos = add_special_tokens.then_some(0);
+            let text = (!text.is_empty()).then_some(text.len() as i32);
+            Ok(bos.into_iter().chain(text).collect())
         }
-        fn auto_specials(&self) -> Vec<i64> {
-            vec![0]
+        fn bos_token_id(&self) -> Option<i32> {
+            Some(0)
         }
     }
 
-    /// `skip_special_tokens` strips the probed prefix: template-rendered
-    /// prompts (chat) must not gain a BOS the template didn't render — Python's
-    /// `add_special_tokens=False` at the chat-template encode site.
+    /// Template-rendered prompts (`skip_special_tokens`, and chat) encode
+    /// without the tokenizer's specials — Python's `add_special_tokens=False`
+    /// at the chat-template encode site — and the continuation loses its BOS.
     #[test]
-    fn skip_special_tokens_strips_the_auto_added_specials() {
+    fn rendered_prompts_encode_without_specials() {
         let run = |skip_special_tokens: bool, chat_prompt: Option<Box<RenderedChat>>| {
             let (req_tx, req_rx) = flume::unbounded::<Request>();
             let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
