@@ -15,6 +15,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.video_encoders import (
+    open_video_encoder,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
@@ -102,12 +105,10 @@ class EncodeWhileDecoding:
             self._fail()
 
     def _open(self, frames: torch.Tensor):
-        from sglang.multimodal_gen.runtime.entrypoints.utils import CudaVideoEncoder
-
         height, width = int(frames.shape[-2]), int(frames.shape[-1])
         os.makedirs(os.path.dirname(self.save_file_path) or ".", exist_ok=True)
-        return CudaVideoEncoder.open(
-            self.save_file_path,
+        return open_video_encoder(
+            save_file_path=self.save_file_path,
             device=frames.device,
             height=height,
             width=width,
@@ -125,12 +126,22 @@ class EncodeWhileDecoding:
         if self._failed or self._encoder is None:
             return None
         try:
-            self._encoder.close()
+            reported = self._encoder.close()
         except Exception:
             self._fail()
             return None
+        # An encoder that writes elsewhere says so here; the built-in returns None
+        # and the path it was opened with stands. One path per request, because
+        # the pipeline counts paths against requests.
+        path = reported or self.save_file_path
+        if reported is None and not os.path.exists(self.save_file_path):
+            # Report a contract violation without changing the return value.
+            logger.warning(
+                "video encoder reported %s but wrote nothing there",
+                self.save_file_path,
+            )
         logger.info(f"Output saved to {CYAN}{self.save_file_path}{RESET}")
-        return [self.save_file_path]
+        return [path]
 
     def abort(self) -> None:
         if self._encoder is not None:
