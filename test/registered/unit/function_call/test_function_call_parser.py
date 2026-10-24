@@ -2747,8 +2747,36 @@ class TestGlm4MoeDetector(unittest.TestCase):
                     },
                 ),
             ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="api_fetch",
+                    description="Fetch an API resource",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "body": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                            "params": {"type": ["null", "string"]},
+                        },
+                    },
+                ),
+            ),
         ]
         self.detector = Glm4MoeDetector()
+
+    def _collect_streaming_tool_calls(self, chunks):
+        tool_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for tool_call_chunk in result.calls:
+                while len(tool_calls) <= tool_call_chunk.tool_index:
+                    tool_calls.append({"name": "", "parameters": ""})
+                tc = tool_calls[tool_call_chunk.tool_index]
+                if tool_call_chunk.name:
+                    tc["name"] = tool_call_chunk.name
+                if tool_call_chunk.parameters:
+                    tc["parameters"] += tool_call_chunk.parameters
+        return tool_calls
 
     def test_multiple_tool_calls(self):
         text = (
@@ -3134,6 +3162,167 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertTrue(is_good)
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
+
+    def test_nullable_string_null_preserved_non_streaming(self):
+        text = (
+            "<tool_call>api_fetch\n"
+            "<arg_key>body</arg_key>\n<arg_value>null</arg_value>\n"
+            "<arg_key>params</arg_key>\n<arg_value>null</arg_value>\n"
+            "</tool_call>"
+        )
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "api_fetch")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters),
+            {"body": None, "params": None},
+        )
+
+    def test_nullable_string_non_null_values_remain_strings(self):
+        cases = (
+            ('"null"', "null"),
+            ("None", "None"),
+            ("nullish", "nullish"),
+        )
+        for raw_value, expected in cases:
+            with self.subTest(raw_value=raw_value):
+                text = (
+                    "<tool_call>api_fetch\n"
+                    f"<arg_key>body</arg_key>\n<arg_value>{raw_value}</arg_value>\n"
+                    "</tool_call>"
+                )
+
+                result = Glm4MoeDetector().detect_and_parse(text, self.tools)
+
+                params = json.loads(result.calls[0].parameters)
+                self.assertEqual(params, {"body": expected})
+                self.assertIsInstance(params["body"], str)
+
+    def test_nullable_string_null_preserved_streaming(self):
+        text = (
+            "<tool_call>api_fetch\n"
+            "<arg_key>body</arg_key>\n<arg_value>null</arg_value>\n"
+            "<arg_key>params</arg_key>\n<arg_value>null</arg_value>\n"
+            "</tool_call>"
+        )
+
+        tool_calls = self._collect_streaming_tool_calls(list(text))
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "api_fetch")
+        self.assertEqual(
+            json.loads(tool_calls[0]["parameters"]),
+            {"body": None, "params": None},
+        )
+        self.assertEqual(
+            self.detector.streamed_args_for_tool[0], tool_calls[0]["parameters"]
+        )
+
+    def test_nullable_string_null_prefix_remains_string_streaming(self):
+        for value in ("n", "nu", "nul", "nullish"):
+            with self.subTest(value=value):
+                self.detector = Glm4MoeDetector()
+                text = (
+                    "<tool_call>api_fetch\n"
+                    f"<arg_key>body</arg_key>\n<arg_value>{value}</arg_value>\n"
+                    "</tool_call>"
+                )
+
+                tool_calls = self._collect_streaming_tool_calls(list(text))
+
+                params = json.loads(tool_calls[0]["parameters"])
+                self.assertEqual(params, {"body": value})
+                self.assertIsInstance(params["body"], str)
+
+    def _parse_raw_null_argument(self, parameters):
+        """`x` from a raw `null` value: the non-streaming result, and the distinct
+        streamed results over whole-chunk, per-character and every single cut."""
+        text = (
+            "<tool_call>f\n"
+            "<arg_key>x</arg_key>\n<arg_value>null</arg_value>\n"
+            "</tool_call>"
+        )
+        self.tools = [
+            Tool(type="function", function=Function(name="f", parameters=parameters))
+        ]
+        result = Glm4MoeDetector().detect_and_parse(text, self.tools)
+        non_streaming = json.loads(result.calls[0].parameters)["x"]
+        plans = [[text], list(text)]
+        plans += [[text[:cut], text[cut:]] for cut in range(1, len(text))]
+        streamed = set()
+        for chunks in plans:
+            self.detector = Glm4MoeDetector()
+            tool_calls = self._collect_streaming_tool_calls(chunks)
+            streamed.add(json.loads(tool_calls[0]["parameters"])["x"])
+        return non_streaming, streamed
+
+    def test_nullable_check_follows_refs(self):
+        """A `$ref` branch makes an argument nullable only if its target allows null;
+        `anyOf: [string, $ref -> integer]` must keep a raw `null` as a string."""
+        for count_schema, expected in (
+            ({"type": "integer"}, ("None", {"null"})),
+            ({"type": "null"}, (None, {None})),
+        ):
+            with self.subTest(count=count_schema):
+                parameters = {
+                    "type": "object",
+                    "properties": {
+                        "x": {"anyOf": [{"type": "string"}, {"$ref": "#/$defs/count"}]}
+                    },
+                    "$defs": {"count": count_schema},
+                    "required": ["x"],
+                }
+                self.assertEqual(self._parse_raw_null_argument(parameters), expected)
+
+    def test_nullable_check_keeps_string_when_null_is_not_established(self):
+        """Null that one schema branch allows but the full parameters schema rejects
+        must not be emitted; the raw `null` keeps its string form."""
+        cases = {
+            "root allOf narrows x to string": {
+                "type": "object",
+                "allOf": [
+                    {"properties": {"x": {"type": ["string", "null"]}}},
+                    {"properties": {"x": {"type": "string"}}},
+                ],
+                "required": ["x"],
+            },
+            "ref resolves inside an embedded $id resource": {
+                "type": "object",
+                "properties": {
+                    "x": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {
+                                "$id": "https://example.com/integer-branch",
+                                "$defs": {"count": {"type": "integer"}},
+                                "$ref": "#/$defs/count",
+                            },
+                        ]
+                    }
+                },
+                "$defs": {"count": {"type": "null"}},
+                "required": ["x"],
+            },
+            "root enum": {
+                "type": "object",
+                "properties": {"x": {"type": ["string", "null"]}},
+                "required": ["x"],
+                "enum": [{"x": "null"}, {"x": "None"}],
+            },
+            "root const": {
+                "type": "object",
+                "properties": {"x": {"type": ["string", "null"]}},
+                "required": ["x"],
+                "const": {"x": "null"},
+            },
+        }
+        for name, parameters in cases.items():
+            with self.subTest(name):
+                self.assertEqual(
+                    self._parse_raw_null_argument(parameters), ("None", {"null"})
+                )
 
 
 class TestGlm47MoeDetector(unittest.TestCase):

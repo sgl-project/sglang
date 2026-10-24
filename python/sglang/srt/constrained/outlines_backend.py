@@ -56,6 +56,16 @@ class OutlinesGrammar(BaseGrammarObject):
     def accept_token(self, token: int):
         self.state = self.guide.get_next_state(self.state, token)
 
+    def try_accept_tokens(self, tokens: List[int]) -> bool:
+        state = self.state
+        for token in tokens:
+            # RegexGuide reports a rejected token as the dead state -1, not an error.
+            state = self.guide.get_next_state(state, token)
+            if state == -1:
+                return False
+        self.state = state
+        return True
+
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
     ) -> torch.Tensor:
