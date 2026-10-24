@@ -12,6 +12,7 @@ from safetensors.torch import save_file
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_int8 import (
     ComfyInt8EmbeddingMethod,
@@ -42,6 +43,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
     _configure_encoder_quantization,
+    _drop_unread_layers,
     _get_encoder_quant_config,
     _require_quantized_encoder_layers,
     _resolve_and_configure_encoder_quantization,
@@ -57,6 +59,9 @@ from sglang.multimodal_gen.runtime.models.encoders.base import (
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3ConditioningProjection,
     MiniMaxH3Qwen3VLEncoder,
+)
+from sglang.multimodal_gen.runtime.models.encoders.mistral_3 import (
+    Mistral3ForConditionalGeneration,
 )
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -1194,6 +1199,19 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
 
         self.assertEqual(model.quantized.weight.device, torch.device("cpu"))
         self.assertEqual(model.unquantized.weight.device, torch.device("cpu"))
+
+
+def test_flux2_mistral3_drops_layers_after_the_last_read_one():
+    model = Mistral3ForConditionalGeneration.__new__(Mistral3ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.model = nn.Module()
+    model.model.language_model = nn.Module()
+    model.model.language_model.layers = nn.ModuleList(nn.Identity() for _ in range(40))
+    output_layers = Flux2PipelineConfig().text_encoder_output_layers
+
+    _drop_unread_layers(model, output_layers)
+
+    assert len(model.language_model.layers) == max(output_layers) + 1
 
 
 if __name__ == "__main__":
