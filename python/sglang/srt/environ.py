@@ -1453,6 +1453,9 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
+    # Pass the real token count of all DP ranks to the tile heuristic on eager
+    # forwards, so idle and busy ranks pick the same tile for the actual load.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_GLOBAL_TOKENS_HINT = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels

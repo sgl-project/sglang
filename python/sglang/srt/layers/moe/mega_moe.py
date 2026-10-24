@@ -524,6 +524,9 @@ def run_mega_routed_experts(
             mma_type=mma_type,
         )
     else:
+        global_num_tokens = _mega_moe_global_tokens_hint(buf)
+        if global_num_tokens is not None:
+            mega_kwargs["global_num_tokens"] = global_num_tokens
         shared_block_m = 0
         if shared_l1_weights is not None:
             shared_block_m = deep_gemm.get_block_m_for_mega_moe(
@@ -535,6 +538,7 @@ def run_mega_routed_experts(
                 num_tokens=max(num_tokens, 1),
                 num_topk=buf.num_topk,
                 mma_type=buf.mma_type,
+                global_num_tokens=global_num_tokens,
             )
         if not (
             routing_in_buffer
@@ -577,6 +581,19 @@ def run_mega_routed_experts(
             **mega_kwargs,
         )
     return y[:num_tokens]
+
+
+def _mega_moe_global_tokens_hint(buf) -> Optional[int]:
+    if (
+        not envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_GLOBAL_TOKENS_HINT.get()
+        or get_is_capture_mode()
+        or is_dsa_enable_prefill_cp()
+    ):
+        return None
+    counts = get_dp_global_num_tokens()
+    if not counts or len(counts) != buf.group.size():
+        return None
+    return min(int(sum(counts)), buf.group.size() * buf.num_max_tokens_per_rank)
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
