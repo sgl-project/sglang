@@ -325,7 +325,7 @@ def dense_prefill_topk(
 # ---------- torch ----------
 
 
-# Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
+# Arbitrary cap on one bf16 [rows, heads, lc] score chunk; scores() works in place.
 _TORCH_SCORE_BUDGET_BYTES = 1 << 30
 
 
