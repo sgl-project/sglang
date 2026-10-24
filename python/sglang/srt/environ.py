@@ -1194,6 +1194,10 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # TRT-LLM MLA attention workspace in MB. The prefill softmax-stats region
+    # grows with the chunked prefill batch; a 64K-token batch needs ~175 MB.
+    # Raise this (e.g. 512) when chunked-prefill-size >= 32768.
+    SGLANG_TRTLLM_WORKSPACE_MB = EnvInt(150)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # sizes it from the per-rank prefill chunk, with a 4096 floor.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)

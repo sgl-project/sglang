@@ -427,6 +427,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>402653184</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TRTLLM_WORKSPACE_MB</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>TRT-LLM MLA attention workspace size in MB. The prefill softmax-stats region grows with the chunked prefill batch; a 64K-token batch needs ~175 MB. Raise this (e.g. <code>512</code>) when <code>chunked-prefill-size</code> is 32768 or larger.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>150</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_EAGER_INPUT_NO_COPY</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>In eager forward, wrap the ForwardBatch's own tensors instead of copying them into the CUDA graph buffer registry (skips a per-iter device-to-device copy).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
