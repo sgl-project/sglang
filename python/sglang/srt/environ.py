@@ -1953,6 +1953,9 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # Split k-pool indexer prefill rows across attention-TP ranks and all-gather the
+    # top-k once query rows x pooled keys reach this many elements; 0 disables.
+    SGLANG_DSA_INDEXER_ROW_SPLIT_MIN_ELEMS = EnvInt(0)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
