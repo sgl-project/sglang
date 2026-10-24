@@ -134,10 +134,9 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
     def _run_prefetch_to_completion(self, cache, req_id, timeout: float = 10.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            # Host memory is reserved (and IO started) by the scheduler-thread
-            # drain once the L3 hit count is known, and the buffer-mode fill
-            # commits at its H2D ack in loading_check — pump the full event
-            # round like the real scheduler loop does.
+            # Pump the full event round like the scheduler loop: host reservation
+            # happens at the scheduler-thread drain, and the buffer-mode fill
+            # commits at its H2D ack.
             cache.check_hicache_events()
             if cache.check_prefetch_progress(req_id):
                 # Buffer mode parks a completed fetch as a staged prefetch;
@@ -175,7 +174,7 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         f = cache.buffer_pipeline.staged_prefetches[req_id]
         if prefix_len is None:
             prefix_len = f.matched_len
-        req = mock.Mock()
+        req = self._make_req(cache.req_to_token_pool)
         req.rid = req_id.rid
         req.cache_request_handle = req_id
         req.extra_key = extra_key
@@ -391,9 +390,8 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         cons.enable_storage_metrics = True
         cons.storage_metrics_collector = mock.Mock()
 
-        # Masked state: nodes born with live FULL under SWA tombstones (a
-        # sibling insert whose SWA ring had slid past the span). live_tail is
-        # how far short of the span end the ring stopped.
+        # Nodes born with live FULL under SWA tombstones; live_tail is how far short
+        # of the span end the ring stopped.
         live_from = len(seq) - live_tail
         value = self._alloc(cons_alloc, len(seq))
         cons.insert(
@@ -407,8 +405,7 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         self.assertEqual(masked.device_prefix_len, 0, "unified match not masked")
         self.assertEqual(masked.full_kv_hit_length, len(seq), "live FULL not resident")
         masked_full = value[: len(seq)].clone()
-        # Model the real SWA-eviction path: tombstoned positions have their
-        # allocator mapping cleared, while the live trailing portion remains.
+        # Tombstoned positions have their allocator mapping cleared; the tail stays.
         cons_alloc.free_swa(masked_full[:live_from])
         self._fill_full_kv(cons_alloc, masked_full, marker=7)
         masked_kv = self._snapshot_full_kv(cons_alloc, masked_full)
@@ -421,7 +418,6 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         cons.prefetch_from_storage(
             req_id, cons.root_node_handle(), array("q", seq), None, None
         )
-        # A parked SWA-only retry has no FULL suffix, but must re-pin its prefix.
         with mock.patch.object(cons.swa_kv_pool_host, "alloc", return_value=None):
             self._pump_hicache_until(
                 cons,
@@ -500,7 +496,6 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         after = match_prefix(cons, seq)
         self.assertEqual(after.full_kv_hit_length, len(seq))
         self.assertEqual(after.device_prefix_len, len(seq))
-        # Only the fetched SWA tail made the resident FULL reusable.
         self.assertEqual((req.storage_hit_start, req.storage_hit_length), (0, len(seq)))
         cons.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_not_called()
         cons.sanity_check()
@@ -552,7 +547,6 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
             )
             self.assertGreater(aux_max, len(seq) - len(head))
 
-        # The surfaced host hit is the splice-able tail, not the full span.
         req = SimpleNamespace(
             rid=req_id.rid,
             cache_request_handle=req_id,
@@ -585,7 +579,6 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         self.assertTrue(torch.equal(hk, head_k))
         self.assertTrue(torch.equal(hv, head_v))
 
-        # The whole bounce (trimmed head included) frees at the ack.
         self.assertEqual(self._host_avail_sizes(cons), avail0)
         self.assertEqual(cons.cache_controller.prefetch_tokens_occupied, 0)
         cons.sanity_check()
@@ -596,7 +589,6 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
 
         cc = cache.cache_controller
 
-        # Fake _reduce_prefetch_ack to drop SWA pool_hits when drop_swa is True.
         def fake_reduce(ack):
             if drop_swa and ack.pool_hits is not None:
                 if PoolName.SWA.value in ack.pool_hits:
@@ -608,7 +600,6 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         p_reduce.start()
         self.addCleanup(p_reduce.stop)
 
-        # Make all_reduce no-op.  The real all_reduce fails in unit tests with tp_world_size=2.
         p_dist = mock.patch.object(dist, "all_reduce", return_value=None)
         p_dist.start()
         self.addCleanup(p_dist.stop)
@@ -774,25 +765,26 @@ class UnifiedRadixCacheStorageAttachBackfillFixtures:
         return hashes
 
 
-class AnchorLockOutcomePolicyFixtures:
-    def _make_pipeline(self, cache, cap_tokens=10_000):
-        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+class AnchorLockOutcomePolicyFixtures(UnifiedRadixCacheStorageFixtures):
+    def _insert_tokens(self, cache, tokens):
+        value = cache.token_to_kv_pool_allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        cache.insert(InsertParams(key=RadixKey(array("q", tokens)), value=value))
 
-        pipeline = BufferModePipeline.__new__(BufferModePipeline)
-        pipeline.anchor_locks = {}
-        pipeline.anchor_locked_tokens_ = 0
-        pipeline.anchor_lock_cap_tokens = cap_tokens
-        pipeline._anchor_lock_cap_skips = 0
-        pipeline._prefetch_prefix_ctx = {self._REQ: (list(self._PREFIX), None, None)}
-        pipeline._cache = cache
-        return pipeline
-
-    def _make_cache(self, live_match_len, pinned_len=None):
-        cache = mock.MagicMock()
-        cache.tree_core.is_eagle = False
-        cache.tree_core.match_full_device_prefix.return_value = (
-            live_match_len,
-            99,
-            live_match_len if pinned_len is None else pinned_len,
+    def _make_buffer_cache(
+        self, resident=(), cap_tokens=None, prefix=(), storage_dir=None
+    ):
+        """A buffer-mode cache holding ``resident`` on device, with the
+        request's matched prefix recorded as prefetch enqueue records it."""
+        cache, _, _ = self._build_buffer_hicache_fixture(
+            storage_dir or self._make_storage_dir()
         )
-        return cache
+        if resident:
+            self._insert_tokens(cache, list(resident))
+        pipeline = cache.buffer_pipeline
+        if cap_tokens is not None:
+            pipeline.anchor_lock_cap_tokens = cap_tokens
+        pipeline.set_prefix_ctx(
+            self._REQ, self._PREFIX if prefix == () else (prefix or [])
+        )
+        return cache, pipeline
