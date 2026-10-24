@@ -1928,6 +1928,12 @@ class KimiK3DeltaAttention(nn.Module):
                 backend == "aiter"
                 and kda_fused_decode_aiter_hip.available(f_b_weight.device)
             )
+            if backend_available:
+                from sglang.srt.models.kimi_k3_rocm_quant import (
+                    k3_fused_decode_f_b_weight,
+                )
+
+                f_b_weight = k3_fused_decode_f_b_weight(self.f_b_proj)
             if (
                 backend_available
                 and w is not None

@@ -6,11 +6,17 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
 from sglang.srt.models.kimi_k3 import _is_unquantized_mergeable
-from sglang.srt.models.kimi_k3_rocm_quant import _k3_channel_fp8_to_bf16
+from sglang.srt.models.kimi_k3_rocm_quant import (
+    _k3_channel_fp8_to_bf16,
+    k3_fused_decode_f_b_weight,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -92,6 +98,40 @@ class TestMergeDtypeGuard(CustomTestCase):
         check that only asks whether the operands match each other."""
         weights = [torch.zeros(4, 4, dtype=torch.float32) for _ in range(2)]
         self.assertFalse(_is_unquantized_mergeable(weights))
+
+
+class TestFusedDecodeFbWeight(CustomTestCase):
+    """The fused KDA decode takes a dense f_b with no scale argument, so a Quark
+    per-channel FP8 f_b must reach it with every channel's scale applied."""
+
+    def test_quark_fp8_f_b_is_dequantized_and_bf16_passes_through(self):
+        weight, scale, _ = _per_channel_fp8(out_features=16, in_features=8)
+        quark_f_b = SimpleNamespace(
+            weight=torch.nn.Parameter(weight, requires_grad=False),
+            weight_scale=scale.squeeze(1),
+            quant_method=mock.Mock(spec=QuarkLinearMethod),
+            scheme=QuarkW8A8Fp8(
+                {"qscheme": "per_channel"},
+                {"qscheme": "per_channel", "is_dynamic": True},
+            ),
+        )
+
+        out = k3_fused_decode_f_b_weight(quark_f_b)
+
+        self.assertEqual(out.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            out.float(), weight.float() * scale, rtol=0.01, atol=0.0
+        )
+        # The FP8 layer keeps serving the unfused path.
+        self.assertEqual(quark_f_b.weight.dtype, torch.float8_e4m3fn)
+
+        bf16 = torch.nn.Parameter(
+            torch.randn(16, 8, dtype=torch.bfloat16), requires_grad=False
+        )
+        plain_f_b = SimpleNamespace(weight=bf16, quant_method=mock.Mock())
+        self.assertEqual(
+            k3_fused_decode_f_b_weight(plain_f_b).data_ptr(), bf16.data_ptr()
+        )
 
 
 if __name__ == "__main__":

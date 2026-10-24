@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
 
 from sglang.srt.utils import is_hip
 
+logger = logging.getLogger(__name__)
+
 _HEADS = 12
 _DIM = 128
 _CHANNELS = 3 * _HEADS * _DIM
+_SGLANG_MODULE = "sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode"
+# ROCm/aiter#6026 publishes the kernel here; older AITER builds ship this module
+# with only the GDR decode ops.
+_AITER_MODULE = "aiter.ops.flydsl.linear_attention_kernels"
+# [cache, 4608, 3], or SGLang's [cache, 3, 4608] conv cache viewed through
+# transpose(-1, -2); AITER rejects any other slot layout.
+_CONV_SLOT_STRIDES = ((3, 1), (1, _CHANNELS))
+_STATE_SLOT_STRIDES = ((_DIM * _DIM, _DIM, 1),)
 _WARMED: set[tuple[int, float, float]] = set()
 
 
@@ -19,28 +30,44 @@ def enabled() -> bool:
 
 
 def _ops():
+    """(run, supported, recurrent-state dtypes) of the selected kernel."""
     try:
         from sglang.kernels.ops.attention.kda_flydsl.source import load_module
 
-        module = load_module(
-            "sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode",
-            "aiter.ops.flydsl.kimi_k3_kda_decode",
-        )
+        module = load_module(_SGLANG_MODULE, _AITER_MODULE)
     except (ImportError, ModuleNotFoundError):
-        return None, None
-    return (
-        module.flydsl_kimi_k3_kda_decode_with_f_b,
-        module.is_flydsl_kimi_k3_kda_decode_supported,
-    )
+        return None, None, ()
+    if module.__name__ == _SGLANG_MODULE:
+        return (
+            module.flydsl_kimi_k3_kda_decode_with_f_b,
+            module.is_flydsl_kimi_k3_kda_decode_supported,
+            (torch.float32,),
+        )
+    try:
+        op = module.flydsl_kda_decode_with_f_b
+        return op, module.is_flydsl_kda_decode_supported, tuple(op.state_dtypes)
+    except AttributeError:
+        return None, None, ()
+
+
+def _state_dtypes(device: torch.device | None) -> tuple[torch.dtype, ...]:
+    """State dtypes the selected kernel takes on ``device``; empty if unavailable."""
+    if not is_hip() or not enabled() or not torch.cuda.is_available():
+        return ()
+    _, supported, state_dtypes = _ops()
+    if supported is None or not supported(device):
+        return ()
+    return state_dtypes
 
 
 def available(device: torch.device | None = None) -> bool:
-    if not is_hip() or not enabled() or not torch.cuda.is_available():
-        return False
-    _, supported = _ops()
-    if supported is None:
-        return False
-    return bool(supported(device))
+    return bool(_state_dtypes(device))
+
+
+def _dense_slots(tensor: torch.Tensor, layouts: tuple[tuple[int, ...], ...]) -> bool:
+    return (
+        tensor.stride()[1:] in layouts and tensor.stride(0) >= tensor.shape[1:].numel()
+    )
 
 
 def covered(
@@ -54,7 +81,8 @@ def covered(
     output_gate: torch.Tensor,
     norm_weight: torch.Tensor,
 ) -> bool:
-    if not available(f_a.device) or f_a.ndim != 2:
+    state_dtypes = _state_dtypes(f_a.device)
+    if not state_dtypes or f_a.ndim != 2:
         return False
     batch = f_a.shape[0]
     return (
@@ -70,20 +98,24 @@ def covered(
         and mixed_qkv.stride(-1) == 1
         and raw_beta.shape == (1, batch, _HEADS)
         and raw_beta.dtype == torch.bfloat16
+        and raw_beta.stride(-1) == 1
         and conv_state.ndim == 3
         and conv_state.shape[1:] == (_CHANNELS, 3)
         and conv_state.dtype == torch.bfloat16
+        and _dense_slots(conv_state, _CONV_SLOT_STRIDES)
         and state.ndim == 4
         and state.shape[1:] == (_HEADS, _DIM, _DIM)
-        and state.dtype == torch.float32
-        and state.stride()[-3:] == (_DIM * _DIM, _DIM, 1)
+        and state.dtype in state_dtypes
+        and _dense_slots(state, _STATE_SLOT_STRIDES)
         and state_indices.shape == (batch,)
         and state_indices.dtype == torch.int32
         and state_indices.stride(0) == 1
         and output_gate.shape == (batch, _HEADS, _DIM)
         and output_gate.dtype == torch.bfloat16
+        and output_gate.stride(-1) == 1
         and norm_weight.shape == (_DIM,)
         and norm_weight.dtype == torch.bfloat16
+        and norm_weight.stride(-1) == 1
     )
 
 
@@ -105,7 +137,7 @@ def run(
     norm_eps: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    op, _ = _ops()
+    op, _, _ = _ops()
     if op is None:
         raise RuntimeError("AITER Kimi-K3 fused KDA decode is unavailable")
     return op(
@@ -138,7 +170,8 @@ def warmup(
     norm_weight: torch.Tensor,
     norm_eps: float,
 ) -> None:
-    if not available(f_b_weight.device):
+    state_dtypes = _state_dtypes(f_b_weight.device)
+    if not state_dtypes:
         return
     device_index = -1 if f_b_weight.device.index is None else f_b_weight.device.index
     key = (device_index, float(norm_eps), float(lower_bound))
@@ -146,21 +179,35 @@ def warmup(
         return
 
     device = f_b_weight.device
-    run(
-        f_a=torch.zeros(1, _DIM, dtype=torch.bfloat16, device=device),
-        f_b_weight=f_b_weight,
-        mixed_qkv=torch.zeros(1, _CHANNELS, dtype=torch.bfloat16, device=device),
-        conv_weight=conv_weight,
-        conv_state=torch.zeros(1, _CHANNELS, 3, dtype=torch.bfloat16, device=device),
-        raw_beta=torch.zeros(1, 1, _HEADS, dtype=torch.bfloat16, device=device),
-        A_log=A_log,
-        dt_bias=dt_bias,
-        lower_bound=lower_bound,
-        state=torch.zeros(1, _HEADS, _DIM, _DIM, dtype=torch.float32, device=device),
-        state_indices=torch.zeros(1, dtype=torch.int32, device=device),
-        output_gate=torch.zeros(1, _HEADS, _DIM, dtype=torch.bfloat16, device=device),
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
-    )
+    # Each state dtype is its own JIT build; warm every one the kernel takes so
+    # the --mamba-ssm-dtype in use never compiles during graph capture.
+    for state_dtype in state_dtypes:
+        run(
+            f_a=torch.zeros(1, _DIM, dtype=torch.bfloat16, device=device),
+            f_b_weight=f_b_weight,
+            mixed_qkv=torch.zeros(1, _CHANNELS, dtype=torch.bfloat16, device=device),
+            conv_weight=conv_weight,
+            conv_state=torch.zeros(
+                1, _CHANNELS, 3, dtype=torch.bfloat16, device=device
+            ),
+            raw_beta=torch.zeros(1, 1, _HEADS, dtype=torch.bfloat16, device=device),
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            state=torch.zeros(1, _HEADS, _DIM, _DIM, dtype=state_dtype, device=device),
+            state_indices=torch.zeros(1, dtype=torch.int32, device=device),
+            output_gate=torch.zeros(
+                1, _HEADS, _DIM, dtype=torch.bfloat16, device=device
+            ),
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
     torch.cuda.synchronize(device)
     _WARMED.add(key)
+    op, _, _ = _ops()
+    logger.info(
+        "Kimi-K3 fused KDA decode armed: %s.%s, state dtypes %s",
+        op.__module__,
+        op.__name__,
+        ", ".join(str(dtype) for dtype in state_dtypes),
+    )
