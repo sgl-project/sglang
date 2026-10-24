@@ -9,9 +9,9 @@ from unittest.mock import patch
 import torch
 from msgspec.structs import replace
 
-from sglang.srt.megakernels import runtime
-from sglang.srt.megakernels import spec as registry
-from sglang.srt.megakernels.binding import MegakernelBinding
+from sglang.kernels.plugin_kernels.nvidia import spec as registry
+from sglang.srt.kernel_plugins.nvidia import binding
+from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -35,18 +35,20 @@ def install(
     lm, hooks = Lm(), [] if hooks is None else hooks
     gpu = SimpleNamespace(multi_processor_count=160)
     with (
-        patch.object(runtime, "device_isa", return_value=ISA),
-        patch.object(runtime, "deadline_s", return_value=30.0),
+        patch.object(binding, "device_isa", return_value=ISA),
+        patch.object(binding, "deadline_s", return_value=30.0),
         patch.object(
-            runtime, "_gather_tp", side_effect=gathered or (lambda x, group=None: [x])
+            binding,
+            "_gather_tp",
+            side_effect=gathered or (lambda x, group=None: [x]),
         ),
-        patch.object(runtime, "_tokens_per_request", return_value=tokens),
-        patch.object(runtime, "_decode_graphs_enabled", return_value=True),
+        patch.object(binding, "_tokens_per_request", return_value=tokens),
+        patch.object(binding, "_decode_graphs_enabled", return_value=True),
         patch.object(torch.cuda, "current_device", return_value=0),
         patch.object(torch.cuda, "get_device_properties", return_value=gpu),
         patch.object(torch.cuda, "mem_get_info", return_value=(0, 0)),
     ):
-        runtime.install_megakernel(
+        binding.install_megakernel(
             model=lm,
             hf_config=SimpleNamespace(architectures=list(archs)),
             capture_tail_hooks=hooks,
@@ -71,12 +73,12 @@ class TestMegakernelRuntime(CustomTestCase):
         self.addCleanup(view_patch.stop)
 
     def _install_spec(self, spec, **kw):
-        with patch.object(runtime, "find_spec", return_value=(spec, "")):
+        with patch.object(binding, "find_spec", return_value=(spec, "")):
             return install(**kw)
 
     def test_covered_steps_run_the_megakernel_and_others_the_forward(self):
         lm = install(tokens=1)
-        built = runtime.built_megakernel(lm)
+        built = binding.built_megakernel(lm)
         with patch.object(
             torch.cuda, "is_current_stream_capturing", return_value=False
         ):
@@ -95,8 +97,8 @@ class TestMegakernelRuntime(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "tp_size 4"):
             self._install_spec(tp8)
         # an empty field accepts any value
-        self.assertIsNotNone(runtime.built_megakernel(self._install_spec(ANY_TP)))
-        with self.assertLogs(runtime.logger, "INFO") as logs:
+        self.assertIsNotNone(binding.built_megakernel(self._install_spec(ANY_TP)))
+        with self.assertLogs(binding.logger, "INFO") as logs:
             lm = install(archs=["DraftWithoutSpec"], is_draft=True)
         self.assertNotIn("forward", lm.__dict__)
         self.assertIn("keeps its own forward", "".join(logs.output))
@@ -104,7 +106,7 @@ class TestMegakernelRuntime(CustomTestCase):
         # a draft spec offers only its draft sampler
         lm = install(archs=["Draft"], is_draft=True)
         self.assertNotIn("forward", lm.__dict__)
-        self.assertIs(runtime.megakernel_draft_sampler(lm), print)
+        self.assertIs(binding.megakernel_draft_sampler(lm), print)
 
     def test_ranks_that_disagree_are_refused_on_every_rank(self):
         """A rank that differs would wait in a different collective."""
