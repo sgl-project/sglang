@@ -628,6 +628,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
         Both the DP vote and forward-time gate reject multimodal batches;
         image batches are rejected before image_token_ranges is installed.
+        Media batches also fall back when the body graph drops deepstack.
         """
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._capture_req_slots = 4
@@ -657,22 +658,29 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         audio = MultimodalInputs(mm_items=[MultimodalDataItem(modality=Modality.AUDIO)])
         video = MultimodalInputs(mm_items=[MultimodalDataItem(modality=Modality.VIDEO)])
-        for backend, fa4 in (
-            (Backend.FULL, True),
-            (Backend.FULL, False),
-            (Backend.BREAKABLE, True),
-            (Backend.TC_PIECEWISE, True),
+        for backend, fa4, drops_deepstack in (
+            (Backend.FULL, True, False),
+            (Backend.FULL, False, False),
+            (Backend.BREAKABLE, True, False),
+            (Backend.TC_PIECEWISE, True, False),
+            (Backend.BREAKABLE, False, True),
         ):
             runner.prefill_backend_name = backend
             runner._is_full_backend = backend == Backend.FULL
             runner._fa4_prefill = fa4
+            runner._body_drops_deepstack = drops_deepstack
             # Text -> mixed text/image -> text also checks that the fallback
             # is per batch, not a permanent disabling of captured graphs.
             for mm_inputs in (None, [None, image], [None, audio], [None, video], None):
-                with self.subTest(backend=backend, fa4=fa4, mm_inputs=mm_inputs):
+                with self.subTest(
+                    backend=backend,
+                    fa4=fa4,
+                    drops_deepstack=drops_deepstack,
+                    mm_inputs=mm_inputs,
+                ):
                     batch.mm_inputs = mm_inputs
-                    expected = not (
-                        backend == Backend.FULL and fa4 and mm_inputs is not None
+                    expected = mm_inputs is None or not (
+                        drops_deepstack or (backend == Backend.FULL and fa4)
                     )
                     self.assertEqual(runner.can_run_graph(batch), expected)
                     schedule_batch = SimpleNamespace(
