@@ -38,6 +38,78 @@ The following server arguments are relevant for multi-LoRA serving:
 From client side, the user needs to provide a list of strings as input batch, and a list of adaptor names that each input sequence corresponds to.
 
 
+## Adapter compatibility
+
+SGLang loads PEFT-format adapters without rewriting the adapter files. It normalizes some layouts in memory and resolves each target to a module that the runtime exposes. Before you serve an adapter, check its `adapter_config.json` and the model implementation's `supported_lora_modules` list.
+
+### `target_modules` must be a list
+
+SGLang reads `target_modules` from each adapter config to infer the LoRA target set. Use a list of module-name suffixes:
+
+```json
+{
+  "target_modules": [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj"
+  ]
+}
+```
+
+The strings `"all"` and `"all-linear"` are also accepted and are resolved against the base model. Arbitrary regular expressions are not accepted. For example, a PEFT config containing a regex such as:
+
+```json
+{
+  "target_modules": "^(model\\.layers\\..*\\.(q_proj|k_proj|v_proj))$"
+}
+```
+
+fails during LoRA initialization with an error such as:
+
+```text
+SGLang does not recognize target_modules='...'
+```
+
+Older versions may report `Only 'all' or 'all-linear' can be used as the string for target module`. Rewrite the regex as the list of module suffixes it matches. SGLang resolves targets by module name, so a regex that restricts matches to specific layer indices or to one submodule subtree cannot be represented exactly; check the resolved target set before serving.
+
+Passing `--lora-target-modules` does not bypass this check. SGLang still validates each adapter's `target_modules` field and raises before the flag can help.
+
+### Fused target modules
+
+SGLang may fuse projections at runtime. It normalizes some common target names and weight layouts automatically:
+
+| Adapter module names | Runtime target | Notes |
+| --- | --- | --- |
+| `q_proj`, `k_proj`, `v_proj` | `qkv_proj` | Target names and weight keys are normalized automatically. |
+| `gate_proj`, `up_proj` | `gate_up_proj` | Target names and weight keys are normalized automatically. |
+| `in_proj_q`, `in_proj_k`, `in_proj_v`, `in_proj_z` | `in_proj_qkvz` | GDN models only. Weight keys may be packed; set `target_modules` to the fused name if your version does not map the split target names. |
+| `in_proj_qkv` + `in_proj_z` | `in_proj_qkvz` | Two-way GDN weight packing. Target-name support depends on the SGLang version. |
+| `in_proj_b` + `in_proj_a` | `in_proj_ba` | Requires the model to list `in_proj_ba` in `supported_lora_modules`. Do not assume automatic mapping. |
+| `out_proj`, `o_proj`, `down_proj`, `lm_head` | Same name | Check the model support list. |
+
+Target-name normalization and weight-layout normalization are separate steps. A version may pack split weight keys while still not mapping the split names in `target_modules`. If SGLang rejects the adapter's target set, use the fused name that appears in `supported_lora_modules`, or use a version that maps the split names.
+
+Name normalization is necessary but not sufficient. The model class must also expose the module in `supported_lora_modules` and implement its input and output dimensions. If a fused target is absent from that list, the adapter cannot be applied even when its tensor names look correct. Check the model implementation for the SGLang version you run. Starting the server with `--lora-target-modules all` logs the resolved target set and is a quick way to inspect what the current model and version expose.
+
+### Repacking an adapter
+
+If the adapter layout is not supported by your SGLang version, repack the adapter before serving it. Repacking changes module names and tensor layout only. It must preserve `r`, `lora_alpha`, `lora_dropout`, and the values of the A and B matrices. A correct repack is mathematically equivalent to the original adapter.
+
+Do not drop projections merely to make an adapter fit. For example, removing the GDN `b` and `a` deltas changes the model even if the server starts successfully.
+
+### Verify that the adapter is active
+
+1. Start the server with `--lora-paths` and, if needed, `--lora-target-modules`.
+2. Query `/v1/models` and confirm that the adapter name is present.
+3. Start with `--lora-strict-loading` to fail on missing or unexpected adapter keys.
+4. Send the same prompt to the base model and the adapter with `temperature=0`. Use a prompt that exercises the fine-tune. Also compare logprobs, because a small adapter can leave greedy text unchanged.
+5. Check the startup log for the adapter load message and the resolved target modules.
+
+
 ## Usage
 
 ### Serving Single Adaptor
