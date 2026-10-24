@@ -60,6 +60,8 @@ impl ChatFormatter {
     ) -> Result<(RenderedPrompt, String), TemplateError> {
         let (messages, continuation) = match self {
             ChatFormatter::Legacy(_) => None,
+            // SGLang's K3 encoder splits a trailing assistant turn off only to continue it.
+            ChatFormatter::KimiK3 if !args.continuing => None,
             _ => last_assistant_message(request, args.continuing),
         }
         .map_or((None, String::new()), |(messages, prefix)| {
@@ -178,6 +180,27 @@ mod tests {
             render(&formatter, body, &none).0,
             "<user>Hi<user><assistant>"
         );
+    }
+
+    /// Kimi K3's template fallback keeps a trailing assistant turn closed
+    /// unless it is continued, as SGLang's K3 encoder does.
+    #[test]
+    fn kimi_k3_trailing_assistant_message_is_only_continued() {
+        let formatter = ChatFormatter::KimiK3;
+        let none = HashMap::new();
+        let messages = json!([
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hel"}
+        ]);
+        let body = json!({"model": "m", "messages": messages});
+        let request: CreateChatCompletionRequest = serde_json::from_value(body.clone()).unwrap();
+        let closed = formatter.render_prompt(&request).unwrap().into_text();
+        assert_eq!(render(&formatter, body, &none), (closed, String::new()));
+
+        let body = json!({"model": "m", "messages": messages, "continue_final_message": true});
+        let (prompt, continuation) = render(&formatter, body, &none);
+        assert_eq!(continuation, "Hel");
+        assert!(!prompt.contains("Hel"), "{prompt}");
     }
 
     /// The request's effort reaches the template with the thinking toggle it
