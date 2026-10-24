@@ -381,7 +381,7 @@ class PagedIndexerMetadata:
 
 
 def maybe_copy_inplace(dst, *, src) -> None:
-    assert type(src) == type(dst)
+    assert type(src) is type(dst)
     if dst is not None:
         dst.copy_(src)
 
