@@ -153,7 +153,7 @@ class OffloaderV1(BaseOffloader):
         if self._cpu_offload_bytes >= self._cpu_offload_max_bytes:
             return module
 
-        pin_memory = is_pin_memory_available()
+        pin_memory = is_pin_memory_available() or device.type == "npu"
         # offload parameters to CPU
         # use pin_memory if possible, which helps cudagraph capture speed
         offloaded_parameters = False
