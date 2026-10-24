@@ -54,11 +54,11 @@ class DisallowedTokensLogitsProcessor(CustomLogitProcessor):
         logits: torch.Tensor,
         custom_param_list: Optional[List[Dict[str, Any]]] = None,
     ) -> torch.Tensor:
-        disallowed_token_ids = custom_param_list[0]["token_ids"]
-        assert all(disallowed_token_ids == c["token_ids"] for c in custom_param_list), (
-            f"{custom_param_list=}"
-        )
-        logits[..., disallowed_token_ids] = -float("inf")
+        # Each batch row carries its own disallowed token set; apply per row so
+        # requests with different custom_params can share a batch instead of
+        # one request's bans leaking into another's logits.
+        for i, c in enumerate(custom_param_list):
+            logits[i, c["token_ids"]] = -float("inf")
         return logits
 
 
