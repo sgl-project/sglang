@@ -361,6 +361,52 @@ class TestSamplingParamsVerify(CustomTestCase):
             with self.subTest(grammar=grammar):
                 self._make(**{grammar: value}).verify(self.VOCAB_SIZE)
 
+    # --- Issue #41466: Type checking and overflow tests ---
+    def test_max_new_tokens_rejects_non_integer(self):
+        """max_new_tokens must be an integer, not float, bool or str (Issue #41466)."""
+        invalid_values = [1.5, True, False, "100", [100]]
+        for val in invalid_values:
+            with self.subTest(val=val):
+                sp = self._make(max_new_tokens=val)
+                with self.assertRaises(ValueError):
+                    sp.verify(self.VOCAB_SIZE)
+
+    def test_beam_width_rejects_non_integer(self):
+        """beam_width must be an integer >= 1, not float or bool (Issue #41466)."""
+        invalid_values = [1.5, True, False, "2", 0, -1]
+        for val in invalid_values:
+            with self.subTest(val=val):
+                sp = self._make(beam_width=val)
+                with self.assertRaises(ValueError):
+                    sp.verify(self.VOCAB_SIZE)
+
+    def test_grammar_fields_reject_non_string(self):
+        """Grammar fields (regex, json_schema, ebnf, structural_tag) must be strings (Issue #41466)."""
+        for field in ("regex", "json_schema", "ebnf", "structural_tag"):
+            for invalid_val in (["a"], {"type": "object"}, 123, True):
+                with self.subTest(field=field, val=invalid_val):
+                    sp = self._make(**{field: invalid_val})
+                    with self.assertRaises(ValueError):
+                        sp.verify(self.VOCAB_SIZE)
+
+    def test_skip_special_tokens_rejects_non_boolean(self):
+        """skip_special_tokens must be a bool, not str, int, or float (Issue #41466)."""
+        invalid_values = ["false", "true", 0, 1, 1.5, []]
+        for val in invalid_values:
+            with self.subTest(val=val):
+                sp = self._make(skip_special_tokens=val)
+                with self.assertRaises(ValueError):
+                    sp.verify(self.VOCAB_SIZE)
+
+    def test_top_k_rejects_overflow_and_non_integer(self):
+        """top_k must be an int within signed 32-bit range, rejecting 2**31, float, bool (Issue #41466)."""
+        invalid_values = [2**31, 2**31 + 1, 1.5, True, False, "10"]
+        for val in invalid_values:
+            with self.subTest(val=val):
+                sp = self._make(top_k=val)
+                with self.assertRaises(ValueError):
+                    sp.verify(self.VOCAB_SIZE)
+
 
 class TestSamplingParamsNormalize(CustomTestCase):
     def _mock_tokenizer(self, encode_map=None):
