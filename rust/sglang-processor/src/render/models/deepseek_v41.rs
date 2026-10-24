@@ -26,7 +26,7 @@ pub(crate) fn render(
         // Dynamo renders developer turns as system turns, and media expands
         // into image tokens only on the engine.
         if message["role"] == "developer" {
-            return Err("DeepSeek-V4.1 developer messages render on the engine".into());
+            return Err("DeepSeek-V4.1 developer messages require a fallback renderer".into());
         }
         if message["content"]
             .as_array()
