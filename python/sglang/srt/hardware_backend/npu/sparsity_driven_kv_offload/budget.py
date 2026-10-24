@@ -3,6 +3,13 @@
 from dataclasses import dataclass
 
 
+def sparse_batch_capacity(request_rows: int, graph_batch_capacity: int = 0) -> int:
+    """Size batch workspaces without widening the valid request-ID range."""
+    if request_rows <= 0 or graph_batch_capacity < 0:
+        raise ValueError("Sparse KV capacities must be positive/nonnegative.")
+    return max(request_rows, graph_batch_capacity)
+
+
 @dataclass(frozen=True)
 class SparseKVBudget:
     cache_tokens: int
@@ -38,6 +45,7 @@ def resolve_sparse_kv_budget(
     indexer_impl: str = "legacy",
     copy_sfa: bool = False,
     copy_sfa_query_heads: int = 128,
+    graph_batch_capacity: int = 0,
 ) -> SparseKVBudget:
     """Size persistent manager allocations, including padding and one workspace.
 
@@ -57,6 +65,7 @@ def resolve_sparse_kv_budget(
     for name, value in (
         ("cache_tokens", cache_tokens),
         ("hbm_budget_bytes", hbm_budget_bytes),
+        ("graph_batch_capacity", graph_batch_capacity),
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"{name} must be a nonnegative integer, got {value!r}.")
@@ -74,11 +83,12 @@ def resolve_sparse_kv_budget(
         cache_tokens = cache_tokens or top_k
     experimental = indexer_impl != "legacy"
     native = indexer_impl == "lim"
+    batch_rows = sparse_batch_capacity(request_rows, graph_batch_capacity)
     map_width = (
         ((context_len + 127) // 128 * 128) if native else (context_len // 8 + 1) * 8
     )
     slot_map_bytes = num_layers * (request_rows + 1) * map_width * 4
-    selected_kv_bytes = request_rows * top_k * kv_bytes_per_token
+    selected_kv_bytes = batch_rows * top_k * kv_bytes_per_token
     slot_ids_bytes = top_k * 8
     adapter_bytes = 0
     if experimental:
@@ -87,9 +97,9 @@ def resolve_sparse_kv_budget(
                 "LIM/reference requires TopK=2048 and context length <= 2**21."
             )
         adapter_bytes = (
-            request_rows
+            batch_rows
             * (
-                (top_k + (0 if copy_sfa else 128)) * (kv_bytes_per_token + 4)
+                (0 if copy_sfa else (top_k + 128) * (kv_bytes_per_token + 4))
                 + 2 * top_k * 4
                 + 2 * 32768 * 4
                 + 64 * 4
@@ -144,9 +154,9 @@ def resolve_sparse_kv_budget(
     if copy_sfa:
         copy_sfa_bytes = (
             num_layers * (request_rows + 1) * cache_tokens * 4
-            + request_rows * (2 * top_k + 2 * cache_tokens + 5) * 4
-            + (request_rows + 1) * ((cache_tokens + context_len) // 128) * 4
-            + request_rows * copy_sfa_query_heads * 512 * (kv_bytes_per_token // 576)
+            + batch_rows * (2 * top_k + 2 * cache_tokens + 5) * 4
+            + (batch_rows + 1) * ((cache_tokens + context_len) // 128) * 4
+            + batch_rows * copy_sfa_query_heads * 512 * (kv_bytes_per_token // 576)
         )
     result = SparseKVBudget(
         cache_tokens=cache_tokens,

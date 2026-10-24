@@ -1,0 +1,37 @@
+LIM Copy-SFA opt-217 capacity integration, 2026-10-24
+
+Combines the gpqa branch capacity and DeepEP launch fixes with opt-217's
+direct native miss-plan handoff, padded graph workspace sizing, empty-row
+output handling and native dynamic TND support. Framework serving remains
+non-speculative full-visible Q1, TopK2048 and page128. Resident capacities
+2048,4096 and8192 are supported with native LIM; cold fills copy allC tokens.
+Request-ID/resident storage remains separate from graph scratch capacity.
+
+Ascend A3 host217, CANN9.1, torch/torch_npu2.10, private matching operator
+library. Both LIM and Copy-SFA device archives and the Copy-SFA host adapter
+were rebuilt in a fresh private build directory, with installed libraries
+and the canonical serving source preserved.
+
+Validation passed:
+- 14 registered framework CPU tests, including C>K boundary and graph scratch
+  checks for request storage7/batch8/C8192 and storage3/batch16/C2048.
+- 14 existing manual sparse-cache CPU tests.
+- 61 native LIM/planner/Copy-SFA tests, including C2048/4096/8192 crossed with
+  eager/graph and packed/direct32768-wide native miss rows. AllC cold payloads
+  and selected KV are checked bitwise, with partial pages, PAD, slot reuse,
+  rollback/reset and source IDs through163842.
+- Real manager + registered host allocator + attention at each capacity
+  2048,4096,8192, with16 graph batch rows and3 request storage rows. TopK,
+  resident payloads, CPU FP32 attention oracle(rtol.02/atol.002), native plan
+  storage sharing, graph reset/PAD/reuse, ragged prefill gather and mixed
+  short/long eager fallback followed by graph reentry all passed.
+
+Run these checks using the matching merged operator library:
+  python3 -m pytest test/registered/unit/hardware_backend/test_npu_lim_state.py test/registered/unit/npu/graph_runner/test_npu_graph_runner.py -q
+  python3 test/manual/npu/test_sparse_kv_offload_cache.py
+  python3 benchmark/hisparse/check_lim_copy_sfa.py --padded-batch --capacity 8192 --output /tmp/c8192.json
+
+These fixtures do not establish a full GPQA score, repair of real long-output
+repetition, cache-hit rate or end-to-end performance improvement. The earlier
+opt-217 subpath timing result is a separate C2048 fixture. Full GPQA uses a
+separate tag with the requested long generation limit and frozen grading.

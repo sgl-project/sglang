@@ -11,6 +11,7 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
     slot_map_lookup,
     unidex_copy_inplace,
 )
+
 from sglang.kernels.ops.attention.npu_copy_sfa import (
     fused_scatter_copy_sparse_flash_attention,
     load_copy_sfa_operator,
@@ -20,6 +21,9 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
     fill_request_block_table,
     prepare_prefill_gather_rows,
+)
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
+    sparse_batch_capacity,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparse_kv_budget,
@@ -42,6 +46,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     import torch.npu
+
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import Req
 
@@ -94,6 +99,7 @@ class SparseKVCacheManager:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         sparse_context_len: int,
         copy_sfa_padded_query_heads: Optional[int] = None,
+        graph_batch_capacity: int = 0,
     ) -> None:
         enable_memory_saver = False
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -103,6 +109,8 @@ class SparseKVCacheManager:
         # Include the padding row because real request IDs can equal the
         # configured capacity when row 0 is reserved for graph padding.
         self.size = int(req_to_token_pool.req_to_token.shape[0])
+        self.batch_capacity = sparse_batch_capacity(self.size, graph_batch_capacity)
+        self.last_decode_path = "unselected"
         self.logical_max_context_len = int(req_to_token_pool.max_context_len)
         self.copy_sfa_enabled = envs.SGLANG_NPU_ENABLE_COPY_SFA.get()
         self.max_context_len = copy_sfa_host_row_stride(
@@ -140,6 +148,7 @@ class SparseKVCacheManager:
             top_k=self.sparse_context_len,
             kv_bytes_per_token=self.head_dim * self.store_dtype.itemsize,
             copy_sfa_query_heads=copy_sfa_padded_query_heads or 128,
+            graph_batch_capacity=self.batch_capacity,
         )
         self.device_cache_size = self.budget.cache_tokens
         self.indexer_impl = get_sparse_kv_indexer_impl()
@@ -235,7 +244,12 @@ class SparseKVCacheManager:
                 # One compact workspace is reused across layers and steps. The
                 # attention path joins refill_done before the next reuse.
                 self.selected_kv_buffer = torch.empty(
-                    (self.size, self.sparse_context_len, self.head_num, self.head_dim),
+                    (
+                        self.batch_capacity,
+                        self.sparse_context_len,
+                        self.head_num,
+                        self.head_dim,
+                    ),
                     dtype=self.store_dtype,
                     device=self.device,
                 )
@@ -267,7 +281,7 @@ class SparseKVCacheManager:
                         for _ in range(self.layer_num)
                     ]
                     self.planner_topk_src_ids = torch.full(
-                        (self.size, 1, self.sparse_context_len),
+                        (self.batch_capacity, 1, self.sparse_context_len),
                         -1,
                         dtype=torch.int32,
                         device=self.device,
@@ -276,10 +290,10 @@ class SparseKVCacheManager:
                         self.planner_topk_src_ids, -1
                     )
                     self.planner_topk_miss_counts = torch.zeros(
-                        (self.size,), dtype=torch.int32, device=self.device
+                        (self.batch_capacity,), dtype=torch.int32, device=self.device
                     )
                     self.planner_miss_src_ids = torch.full(
-                        (self.size, self.cache_capacity),
+                        (self.batch_capacity, self.cache_capacity),
                         -1,
                         dtype=torch.int32,
                         device=self.device,
@@ -288,10 +302,13 @@ class SparseKVCacheManager:
                         self.planner_miss_src_ids, -1
                     )
                     self.planner_miss_counts = torch.zeros(
-                        (self.size,), dtype=torch.int32, device=self.device
+                        (self.batch_capacity,), dtype=torch.int32, device=self.device
                     )
                     self.planner_actual_seq_lengths_query = torch.arange(
-                        1, self.size + 1, dtype=torch.int32, device=self.device
+                        1,
+                        self.batch_capacity + 1,
+                        dtype=torch.int32,
+                        device=self.device,
                     )
                     self.planner_actual_seq_lengths_kv = torch.empty_like(
                         self.planner_actual_seq_lengths_query
@@ -310,18 +327,18 @@ class SparseKVCacheManager:
                         device=self.device,
                     )
                     self.planner_hbm_block_table = torch.empty(
-                        (self.size, self.cache_capacity // 128),
+                        (self.batch_capacity, self.cache_capacity // 128),
                         dtype=torch.int32,
                         device=self.device,
                     )
                     self.planner_dram_block_table = torch.empty(
-                        (self.size, self.max_context_len // 128),
+                        (self.batch_capacity, self.max_context_len // 128),
                         dtype=torch.int32,
                         device=self.device,
                     )
                     self.planner_attn_out = torch.empty(
                         (
-                            self.size,
+                            self.batch_capacity,
                             copy_sfa_padded_query_heads,
                             self.kv_lora_rank,
                         ),
