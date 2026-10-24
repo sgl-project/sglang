@@ -105,6 +105,57 @@ class TestPleFileTableAllocator(CustomTestCase):
         self.assertTrue(table.is_pinned())
         self.assertIsNone(make_ple_file_prefetcher(table))
 
+    def test_pinned_table_locks_exactly_its_size(self):
+        # The caching host allocator would round 2.5 GiB up to 4 GiB.
+        if not torch.cuda.is_available():
+            self.skipTest("pinned memory needs a CUDA runtime")
+        torch.zeros(1, device="cuda")
+        shape, dtype = (5 * 2**27, 2), torch.bfloat16  # 2.5 GiB
+        before = _process_rss_bytes()
+        table = allocate_ple_host_table(shape, dtype, "pinned", None)
+        grown = _process_rss_bytes() - before
+        self.assertEqual(tuple(table.shape), shape)
+        self.assertEqual(table.dtype, dtype)
+        self.assertTrue(table.is_pinned())
+        self.assertLess(grown, 3 * 2**30)
+        self.assertGreater(grown, 2 * 2**30)
+
+    def test_triton_gather_reads_pinned_table(self):
+        # The production gather kernel dereferences the host pointer directly.
+        if not torch.cuda.is_available():
+            self.skipTest("pinned memory needs a CUDA runtime")
+        import triton
+
+        from sglang.srt.models.qwen4_exp import (
+            _gather_ple_embedding_from_pinned_kernel,
+        )
+
+        rows, dim = 4096, 160
+        table = allocate_ple_host_table((rows, dim), torch.bfloat16, "pinned", None)
+        table.copy_(torch.randn(rows, dim).to(torch.bfloat16))
+        ids = torch.randint(0, rows, (2048,), device="cuda")
+        out = torch.empty(2048, dim, dtype=torch.bfloat16, device="cuda")
+        _gather_ple_embedding_from_pinned_kernel[(ids.numel(),)](
+            table.data_ptr(),
+            ids,
+            out,
+            embedding_dim=dim,
+            tp_vocab_start=0,
+            tp_vocab_end=rows,
+            is_fp8=False,
+            BLOCK_D=triton.next_power_of_2(dim),
+        )
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(out, table[ids.cpu()].to("cuda")))
+
+
+def _process_rss_bytes() -> int:
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    raise RuntimeError("VmRSS not found")
+
 
 class TestPleFilePrefetcher(CustomTestCase):
     def test_page_set_covers_row_start_and_end(self):
