@@ -859,6 +859,8 @@ python3 -m sglang_router.launch_router \
 
 Both parameters must be provided together. The gateway uses rustls with the ring crypto provider for TLS termination. If TLS is not configured, the gateway falls back to plain HTTP.
 
+Both HTTP and HTTPS client connections use `TCP_NODELAY` to avoid Nagle/delayed-ACK stalls when streaming responses.
+
 ### mTLS for Worker Communication
 
 Enable mutual TLS (mTLS) for secure communication with workers in HTTP mode:
