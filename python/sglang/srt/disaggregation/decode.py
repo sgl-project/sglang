@@ -1593,6 +1593,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
                 if prefix_match is not None:
                     total_prefix_len = prefix_match.decode_prefix_len
+            decode_req.req.pd_prefill_fill_len = self._pre_alloc_fill_len(
+                decode_req.req
+            )
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -3372,6 +3375,11 @@ class SchedulerDisaggregationDecodeMixin:
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_decode_queue(self: Scheduler):
         if self.enable_decode_hicache:
+            self.tree_cache.check_hicache_events()
+        elif (
+            getattr(self.tree_cache, "linker", None) is not None
+            and self.tree_cache.linker.pending_offloads
+        ):
             self.tree_cache.check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:

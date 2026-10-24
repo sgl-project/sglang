@@ -26,6 +26,8 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
+from contextlib import contextmanager
+from dataclasses import replace
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -266,6 +268,8 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_index = -1
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[_PendingOffload] = []
+        # Path prefix the PD prefill already stored, set during a decode insert.
+        self.stored_prefix_len = 0
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
@@ -491,10 +495,51 @@ class UnifiedCacheLinkerWrapper:
             transfers = self.cache.tree_core.build_external_linker_offload_transfers(
                 node_id
             )
-            if transfers is not None:
-                if self._skip_swa:
-                    transfers = [t for t in transfers if t.name != PoolName.SWA]
-                self._offload_node(node_id, transfers)
+            if transfers is None:
+                continue
+            if self._skip_swa:
+                transfers = [t for t in transfers if t.name != PoolName.SWA]
+            if self.stored_prefix_len:
+                transfers = self._drop_stored_prefix(node_id, transfers)
+                if transfers is None:
+                    continue
+            self._offload_node(node_id, transfers)
+
+    @contextmanager
+    def prefill_stored_prefix(self, length: int):
+        """Skip offloading the first ``length`` path tokens during an insert."""
+        self.stored_prefix_len = length
+        try:
+            yield
+        finally:
+            self.stored_prefix_len = 0
+
+    def _drop_stored_prefix(
+        self, node_id: NodeId, transfers: list[PoolTransfer]
+    ) -> Optional[list[PoolTransfer]]:
+        info = self.cache.tree_core.collect_path_info([node_id])[0][-1]
+        page = self.cache.page_size
+        kept = []
+        for transfer in transfers:
+            first = info.path_end - len(transfer.keys) * page
+            drop = min(
+                len(transfer.keys), max(0, (self.stored_prefix_len - first) // page)
+            )
+            if drop == len(transfer.keys):
+                if transfer.name == PoolName.KV:
+                    self.cache.tree_core.mark_external_cache_stored_path(
+                        node_id, info.parent_id
+                    )
+                    return None
+                continue
+            if drop:
+                transfer = replace(
+                    transfer,
+                    keys=transfer.keys[drop:],
+                    device_indices=transfer.device_indices[drop * page :],
+                )
+            kept.append(transfer)
+        return kept
 
     def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
         cache = self.cache
