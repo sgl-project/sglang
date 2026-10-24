@@ -145,12 +145,14 @@ fn pydantic_effort(effort: &Value) -> Value {
     number.map_or_else(|| effort.clone(), Value::from)
 }
 
-/// `chat_encoding.parse_dsv41_reasoning_effort`, as the encoder's budget;
+/// `chat_encoding.parse_dsv41_reasoning_effort`, as the encoder's budget
+/// (OpenAI's `minimal` and `medium` map to 50 and 62);
 /// integers only arrive verbatim through `chat_template_kwargs`.
 fn effort_budget(effort: &Value) -> Option<u8> {
     match effort {
         Value::String(tier) => match tier.as_str() {
-            "low" => Some(50),
+            "minimal" | "low" => Some(50),
+            "medium" => Some(62),
             "high" | "xhigh" => Some(75),
             "max" => Some(100),
             _ => None,
@@ -163,5 +165,26 @@ fn effort_budget(effort: &Value) -> Option<u8> {
                 .map(|effort| (effort * 100.0).round_ties_even().max(1.0) as u8),
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Request and `SGLANG_DSV41_REASONING_EFFORT` values both resolve here.
+    #[test]
+    fn openai_effort_levels_map_to_budgets() {
+        for (effort, budget) in [
+            ("minimal", 50),
+            ("low", 50),
+            ("medium", 62),
+            ("high", 75),
+            ("xhigh", 75),
+            ("max", 100),
+        ] {
+            assert_eq!(effort_budget(&json!(effort)), Some(budget), "{effort}");
+        }
+        assert_eq!(effort_budget(&json!("none")), None);
     }
 }
