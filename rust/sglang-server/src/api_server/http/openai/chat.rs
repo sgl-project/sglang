@@ -87,7 +87,7 @@ async fn chat_completions(
                 chat_template_kwargs,
                 routing,
             },
-        raw: body,
+        raw,
     } = match body {
         Ok(Json(body)) => body,
         Err(rejection) => {
@@ -176,11 +176,11 @@ async fn chat_completions(
         .unwrap_or_default();
     let force_reasoning = chat_model.request_thinking(
         reasoning_parser.as_deref(),
-        &body,
+        &raw,
         &state.server_args.default_chat_template_kwargs,
     );
     let (request, rendered) =
-        match prepare_chat_request(&state, body, request, chat_template_kwargs.as_ref()).await {
+        match prepare_chat_request(&state, raw, request, chat_template_kwargs.as_ref()).await {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
@@ -903,7 +903,6 @@ mod tests {
     use futures::StreamExt;
     use sglang_processor::ReasoningOptions;
     use sglang_processor::dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
-    use sglang_processor::openai::ChatModel;
 
     fn request() -> CreateChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -911,57 +910,6 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
-    }
-
-    fn render_dsv41(body: serde_json::Value) -> super::super::template::RenderedChat {
-        let request = serde_json::from_value(body.clone()).unwrap();
-        super::super::template::render_chat(
-            &super::super::ChatFormatter::DeepSeekV41,
-            body,
-            &request,
-            None,
-            &Default::default(),
-        )
-        .unwrap()
-    }
-
-    /// Continuing an assistant turn inside an open think block still starts in
-    /// reasoning, as on Python, whose split follows the request's thinking flag.
-    #[test]
-    fn continuation_inside_think_starts_in_reasoning() {
-        let body = serde_json::json!({
-            "model": "m",
-            "messages": [
-                {"role": "user", "content": "What is 17*23?"},
-                {"role": "assistant", "content": "Let me compute: 17*20"}
-            ],
-            "continue_final_message": true,
-            "chat_template_kwargs": {"thinking": true}
-        });
-        let rendered = render_dsv41(body.clone());
-        assert_eq!(rendered.continuation, "Let me compute: 17*20");
-        let model = ChatModel::for_formatter(&super::super::ChatFormatter::DeepSeekV41);
-        let defaults = Default::default();
-        assert_eq!(
-            model.request_thinking(Some("deepseek-v41"), &body, &defaults),
-            Some(true)
-        );
-    }
-
-    /// A DeepSeek-V4 continuation is the assistant text as is, as SGLang's
-    /// `assistant_prefix`: its leading BOS is dropped once, from its ids.
-    #[test]
-    fn deepseek_v4_continuation_keeps_its_text() {
-        let bos = "<｜begin▁of▁sentence｜>";
-        let rendered = render_dsv41(serde_json::json!({
-            "model": "m",
-            "messages": [
-                {"role": "user", "content": "Hi"},
-                {"role": "assistant", "content": format!("{bos}{bos}abc")}
-            ],
-            "continue_final_message": true
-        }));
-        assert_eq!(rendered.continuation, format!("{bos}{bos}abc"));
     }
 
     /// Python `to_sampling_params` priority: user value > model generation

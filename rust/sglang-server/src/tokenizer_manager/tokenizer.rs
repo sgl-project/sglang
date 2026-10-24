@@ -36,8 +36,9 @@ pub fn load_tokenizer(
         tracing::info!("skip_tokenizer_init: token ids in and out; no tokenizer/detokenizer");
         return Ok(None);
     }
-    let path =
-        tokenizer_path.ok_or_else(|| "no tokenizer configured: set tokenizer_path".to_string())?;
+    let path = tokenizer_path.ok_or_else(|| {
+        "no tokenizer configured: set tokenizer_path or enable skip_tokenizer_init".to_string()
+    })?;
     DynamoTokenizer::load(path, revision).map(Some)
 }
 
@@ -121,9 +122,7 @@ impl Runnable for TokenizerWorker {
                     // would give.
                     None => match g.text.as_deref().unwrap_or("") {
                         "" => Err(Error::Validation("prompt cannot be empty".into())),
-                        // Template-rendered text gains no specials the
-                        // template did not render.
-                        text => widen(self.tokenizer.encode(text, !g.skip_special_tokens)),
+                        text => widen(self.tokenizer.encode(text, true)),
                     },
                 };
                 match encoded {
@@ -266,12 +265,12 @@ mod tests {
         }
     }
 
-    /// Template-rendered prompts (`skip_special_tokens`, and chat) encode
-    /// without the tokenizer's specials — Python's `add_special_tokens=False`
-    /// at the chat-template encode site — and the continuation loses its BOS.
+    /// Plain text keeps the tokenizer's specials; a rendered chat encodes
+    /// without them — Python's `add_special_tokens=False` at the
+    /// chat-template encode site — and its continuation loses its BOS.
     #[test]
     fn rendered_prompts_encode_without_specials() {
-        let run = |skip_special_tokens: bool, chat_prompt: Option<Box<RenderedChat>>| {
+        let run = |chat_prompt: Option<Box<RenderedChat>>| {
             let (req_tx, req_rx) = flume::unbounded::<Request>();
             let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
             req_tx
@@ -285,7 +284,6 @@ mod tests {
                         rid: "1".into(),
                         text: Some("hi".into()),
                         chat_prompt,
-                        skip_special_tokens,
                         ..Default::default()
                     })),
                 })
@@ -300,22 +298,13 @@ mod tests {
             };
             g.input_ids.clone().expect("tokenized")
         };
-        assert_eq!(
-            run(false, None),
-            vec![0, 2],
-            "plain text prompts keep specials"
-        );
-        assert_eq!(
-            run(true, None),
-            vec![2],
-            "rendered prompts lose the auto BOS"
-        );
+        assert_eq!(run(None), vec![0, 2], "plain text prompts keep specials");
         let chat = RenderedChat {
             prompt: RenderedPrompt::text("hi".into()),
             continuation: "abc".into(),
         };
         assert_eq!(
-            run(false, Some(Box::new(chat))),
+            run(Some(Box::new(chat))),
             vec![2, 3],
             "chat and continuation lose it too"
         );
