@@ -355,6 +355,45 @@ def resolve_draft_decode_window(model_runner) -> Tuple[int, int]:
     return window_size, int(cfg.speculative_draft_sink_size or 0)
 
 
+def build_draft_window_mask(
+    seq_lens: torch.Tensor,
+    kv_lens: torch.Tensor,
+    window_size: int,
+    sink_size: int,
+    total_width: int,
+) -> torch.Tensor:
+    """Boolean KV mask (True = masked out) for draft-decode sink+window attention.
+
+    Implements the same visible set as the ``generate_draft_decode_kv_indices``
+    Triton kernel (the Triton/FlashInfer draft-decode index builder): attend the
+    first ``sink`` prefix tokens plus the most recent ``window`` tokens, while the
+    draft tree tokens beyond the prefix ([seq_len, kv_len)) are always attended.
+    The two ranges collapse into ONE contiguous masked band per row:
+
+        attend [0, s_eff) u [recent_start, kv_len)
+        s_eff = min(sink, seq_len)
+        recent_start = max(seq_len - window, s_eff)
+
+    When seq_len <= window + sink the band is empty (full attention), matching the
+    kernel. Positions >= kv_len are masked so the mask can be preallocated at a
+    fixed buffer width.
+
+    seq_lens: [bs] prefix KV lengths (before this step's draft tokens).
+    kv_lens: [bs] KV lengths visible to this draft step (prefix + step).
+    """
+    if window_size <= 0:
+        return torch.zeros(
+            (seq_lens.shape[0], total_width), dtype=torch.bool, device=seq_lens.device
+        )
+    indices = torch.arange(total_width, device=seq_lens.device, dtype=seq_lens.dtype)
+    s_eff = seq_lens.clamp(max=sink_size)
+    recent_start = (seq_lens - window_size).clamp(min=0).maximum(s_eff)
+    band = (indices.unsqueeze(0) >= s_eff.unsqueeze(1)) & (
+        indices.unsqueeze(0) < recent_start.unsqueeze(1)
+    )
+    return band | (indices.unsqueeze(0) >= kv_lens.unsqueeze(1))
+
+
 def record_stream_each(tensors, stream):
     """Call record_stream(stream) on each cuda tensor in `tensors`, skipping
     non-tensor / non-cuda entries. Tells the caching allocator that the
