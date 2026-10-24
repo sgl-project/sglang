@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Union
+from typing import List, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -113,6 +113,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_forward_context,
     has_forward_context,
 )
 from sglang.srt.model_executor.graph_memory_usage import (
@@ -390,6 +391,8 @@ class ModelRunner:
             get_spec().speculative_algorithm
         )
         self.capture_tail_hooks = []
+        # Called as hook(graph_runner, forward_batch) first inside each decode graph capture.
+        self.capture_head_hooks = []
         self.page_size = get_schedule().page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -465,9 +468,6 @@ class ModelRunner:
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
-        # Scoped by a speculative worker to stage its shared reads before
-        # the target prefill graph publishes the read-done event.
-        self.prefill_shared_read_stager: Optional[Callable[[ForwardBatch], bool]] = None
 
         # CPU offload
         set_offloader(create_offloader())
@@ -1968,9 +1968,14 @@ class ModelRunner:
         if prepare is not None:
             prepare(forward_batch)
         if has_forward_context():
-            ctx_mgr = contextlib.nullcontext()
+            ctx_mgr = forward_context(
+                get_forward_context(), forward_batch=forward_batch
+            )
         else:
-            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
+            ctx_mgr = forward_context(
+                ForwardContext(attn_backend=self.attn_backend),
+                forward_batch=forward_batch,
+            )
         with (
             get_model().override(shared_experts=self.model.shared_experts_config),
             ctx_mgr,

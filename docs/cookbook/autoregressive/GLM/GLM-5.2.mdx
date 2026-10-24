@@ -1,6 +1,6 @@
 ---
 title: GLM-5.2
-description: "Deploy GLM-5.2 with SGLang — Z.ai's DeepSeek-Sparse-Attention (DSA) Mixture-of-Experts model with MTP speculative decoding and 1M context, on H200, B200, B300, GB300, and AMD MI300X/MI325X/MI355X."
+description: "Deploy GLM-5.2 with SGLang — Z.ai's DeepSeek-Sparse-Attention (DSA) Mixture-of-Experts model with MTP speculative decoding and 1M context, on H200, B200, B300, GB300, and AMD MI300X/MI325X/MI355X, plus Ascend NPU recipes."
 ---
 
 ## Deployment
@@ -36,6 +36,55 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 </Tab>
 
 </Tabs>
+
+</Accordion>
+
+<Accordion title="Install and prepare Ascend NPUs">
+
+Use a Linux host with the Ascend driver and a compatible CANN / TorchNPU environment. Follow the
+[Ascend installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) and the
+[GLM-5.2 deployment tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2#installation) to start a container with the NPU devices, driver mounts, and checkpoint directory. Run the setup and the generated **Python** command inside that container.
+
+<Tabs>
+<Tab title="A3">
+
+```bash Command
+docker pull quay.io/ascend/sglang:cann9.0.0-a3-v0.5.16
+```
+
+Run the following setup before copying the generated command (CANN 9.0.0). CPU tuning requires host privileges.
+
+```bash Command
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+```
+
+</Tab>
+<Tab title="950PR/DT series">
+
+Use the compatible 950PR/DT series SGLang checkout, CANN environment, and custom operators used for your deployment. Set `SGLANG_ROOT` to that checkout; these recipes do not prescribe an image tag.
+
+```bash Command
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
+unset HCCL_IF_IP HCCL_SOCKET_FAMILY RANK_TABLE_FILE
+SGLANG_ROOT=/path/to/sglang
+export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
+```
+
+</Tab>
+</Tabs>
+
+Replace the model path in the generated command with your mounted ModelSlim checkpoint directory. Include its configuration, tokenizer, quantization metadata, and MTP weights.
+
+For A3, use the locally prepared **GLM-5.2-w8a8** checkpoint described in the [model-weight prerequisites](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2#model-weights).
+For 950PR/DT series, use your locally prepared GLM-5.2 **W8A8C8_MXFP8** checkpoint, including MTP weights, and replace the model path in the generated command with its mounted path.
+
+Replace network placeholders such as `<network-interface>`, `<prefill-head-ip>`, and `<decode-head-ip>` in the generated NPU command with your cluster settings.
 
 </Accordion>
 
