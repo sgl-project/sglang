@@ -1925,6 +1925,45 @@ class ServingChatTestCase(CustomTestCase):
                 prompt = self.tm.tokenizer.encode.call_args.args[0]
                 self.assertEqual("calculator" in prompt, expects_tools)
 
+    def test_dsv_tool_choice_none_omits_message_level_tools_from_prompt(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat._dsv4_reasoning_effort_profile = "preview"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "parameters": {"type": "object"},
+            },
+        }
+
+        for chat_encoding_spec in ("dsv4", "dsv32", "dsv41"):
+            with self.subTest(chat_encoding_spec=chat_encoding_spec):
+                self.chat.chat_encoding_spec = chat_encoding_spec
+                self.tm.tokenizer.encode.reset_mock()
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[
+                        {
+                            "role": "developer",
+                            "content": "Follow the request.",
+                            "tools": [tool],
+                        },
+                        {"role": "user", "content": "Solve 100 / 7."},
+                    ],
+                    tool_choice="none",
+                )
+
+                self.chat._process_messages(request, is_multimodal=False)
+
+                prompt = self.tm.tokenizer.encode.call_args.args[0]
+                self.assertNotIn("## Tools", prompt)
+                self.assertNotIn("calculator", prompt)
+                # The strip happens on a copy; the wire request is untouched.
+                self.assertEqual(
+                    request.messages[0].tools[0].function.name, "calculator"
+                )
+
     def test_kimi_k3_encoder_receives_wire_request_fields(self):
         self.template_manager.chat_template_name = None
         self.chat.chat_encoding_spec = "kimi_k3"

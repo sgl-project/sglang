@@ -1635,6 +1635,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages, request
             )
 
+            # `tools` is already gated on tool_choice != "none" upstream, so
+            # request tools are omitted here; the encoders also render
+            # message-level tool schemas, which must be stripped when tool
+            # calls cannot be parsed.
+            if request.tool_choice == "none":
+                for msg in messages:
+                    msg.pop("tools", None)
+
             request_tools = request.tools if tools else None
 
             # An empty system message hosts the request tools.
