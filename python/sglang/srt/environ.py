@@ -477,6 +477,10 @@ class Envs:
     SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
+    # Format of Prometheus metric names: "colon" (legacy default: sglang:...) or
+    # "underscore" (standard: sglang_...). "underscore" conforms with Prometheus
+    # conventions forbidding colons in direct instrumentation.
+    SGLANG_PROMETHEUS_METRIC_STYLE = EnvStr("colon")
     SGLANG_TRACE_LOGITS_E2E = EnvBool(False)
     SGLANG_TRACE_LOGITS_E2E_SYNC = EnvBool(False)
     SGLANG_TRACE_SAMPLER_E2E = EnvBool(False)
