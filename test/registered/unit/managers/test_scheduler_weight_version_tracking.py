@@ -1,17 +1,27 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
+from sglang.srt.constants import (
+    GPU_MEMORY_ALL_TYPES,
+    GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_KV_CACHE,
+    GPU_MEMORY_TYPE_WEIGHTS,
+)
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
+    ReleaseMemoryOccupationReqInput,
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
     _WeightUpdateSession,
 )
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.aio_rwlock import RWLock
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -146,6 +156,102 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             # update_weights_from_* require an open session
             manager._session = _WeightUpdateSession(selector="all")
         return manager
+
+
+class TestDiskUpdateMemoryState(_WeightUpdaterManagerTestBase):
+    def test_released_weights_reject_update_without_side_effects(self):
+        """A disk update while weights are offloaded must fail without changing either model."""
+        for tags in ({GPU_MEMORY_TYPE_WEIGHTS}, set(GPU_MEMORY_ALL_TYPES)):
+            for flush_cache in (True, False):
+                with self.subTest(tags=tags, flush_cache=flush_cache):
+                    target, draft = _runner(), _runner()
+                    manager = self._manager(target, draft)
+                    manager.offload_tags = tags.copy()
+                    manager.flush_cache = Mock(return_value=True)
+
+                    output = manager.update_weights_from_disk(
+                        _request(flush_cache=flush_cache)
+                    )
+
+                    self.assertFalse(output.success)
+                    self.assertIn("resume_memory_occupation", output.message)
+                    self.assertEqual(output.num_paused_requests, 0)
+                    target.weight_updater.update_weights_from_disk.assert_not_called()
+                    draft.weight_updater.update_weights_from_disk.assert_not_called()
+                    manager.flush_cache.assert_not_called()
+                    self.assertEqual(self.recorded, [])
+                    self.assertEqual(manager.offload_tags, tags)
+
+    def test_other_released_regions_allow_disk_update(self):
+        """RL may reload weights before resuming the KV cache and CUDA graphs."""
+        for tags in (
+            set(),
+            {GPU_MEMORY_TYPE_KV_CACHE},
+            {GPU_MEMORY_TYPE_CUDA_GRAPH},
+            {GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH},
+        ):
+            with self.subTest(tags=tags):
+                self.recorded.clear()
+                manager = self._manager(_runner())
+                manager.offload_tags = tags.copy()
+
+                output = manager.update_weights_from_disk(_request())
+
+                self.assertTrue(output.success)
+                self.assertEqual(self.recorded, ["v2"])
+                self.assertEqual(manager.offload_tags, tags)
+
+    def test_queued_update_is_rejected_after_memory_release(self):
+        """A release can overtake an update waiting for the generation reader lock."""
+        target = _runner()
+        manager = self._manager(target)
+        manager.memory_saver_adapter = Mock()
+        manager.scheduler._engine_paused = False
+
+        async def run():
+            async def dispatch(request):
+                output = manager.update_weights_from_disk(request)
+                return output.success, output.message, output.num_paused_requests
+
+            tokenizer = SimpleNamespace(
+                auto_create_handle_loop=Mock(),
+                is_pause_cond=asyncio.Condition(),
+                is_pause=False,
+                model_update_lock=RWLock(),
+                mm_processor=None,
+                _wait_for_model_update_from_disk=AsyncMock(side_effect=dispatch),
+            )
+            request = _request(
+                load_format="safetensors", abort_all_requests=False, weight_version=None
+            )
+            async with tokenizer.model_update_lock.reader_lock:
+                update = asyncio.create_task(
+                    TokenizerManager.update_weights_from_disk(tokenizer, request)
+                )
+                await asyncio.sleep(0)
+                self.assertFalse(update.done())
+                self.assertEqual(tokenizer.model_update_lock._waiting_writers, 1)
+                tokenizer._wait_for_model_update_from_disk.assert_not_awaited()
+                manager.release_memory_occupation(
+                    ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_WEIGHTS])
+                )
+
+            success, message, _ = await asyncio.wait_for(update, timeout=5)
+            self.assertFalse(success)
+            self.assertIn("resume_memory_occupation", message)
+            target.weight_updater.update_weights_from_disk.assert_not_called()
+            self.assertEqual(self.recorded, [])
+
+        module = "sglang.srt.managers.scheduler_components.weight_updater"
+        with (
+            patch(f"{module}._export_static_state", return_value={}),
+            patch(
+                f"{module}.get_model",
+                return_value=SimpleNamespace(weight_cache_mode="off"),
+            ),
+            patch("torch.get_device_module"),
+        ):
+            asyncio.run(run())
 
 
 class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
