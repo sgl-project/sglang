@@ -1143,6 +1143,32 @@ def _drop_file_cache_after_load(path: str) -> None:
             os.close(fd)
 
 
+def _drop_unmapped_file_caches(pending: List[str], force: bool = False) -> None:
+    """Drop the page cache of loaded shards that this process no longer maps.
+
+    DONTNEED skips mapped pages, and any live tensor from a shard keeps the
+    whole-file mmap, so shards still mapped stay in `pending` and are retried
+    on the next call. With `force`, or if the maps check fails, all pending
+    shards are advised now.
+    """
+    if not pending:
+        return
+    unmapped = list(pending)
+    if not force:
+        try:
+            with open("/proc/self/maps", "rb") as f:
+                parts = (line.split(None, 5) for line in f)
+                mapped = {p[5].rstrip(b"\n") for p in parts if len(p) == 6}
+            unmapped = [
+                p for p in pending if os.fsencode(os.path.realpath(p)) not in mapped
+            ]
+        except Exception as e:
+            logger.debug("Failed to check mapped checkpoint files: %s", e)
+    for path in unmapped:
+        pending.remove(path)
+        _drop_file_cache_after_load(path)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
@@ -1161,6 +1187,7 @@ def safetensors_weights_iterator(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
 
+    pending_drop: List[str] = []
     for st_file in tqdm(
         hf_weights_files,
         desc="Loading safetensors checkpoint shards",
@@ -1178,7 +1205,9 @@ def safetensors_weights_iterator(
                 for name in f.keys():
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
-            _drop_file_cache_after_load(st_file)
+            pending_drop.append(st_file)
+            _drop_unmapped_file_caches(pending_drop)
+    _drop_unmapped_file_caches(pending_drop, force=True)
     if prefetch_handle is not None:
         prefetch_handle.stop()
 
@@ -1357,6 +1386,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
 
     # Sliding window: max_workers loading + 1 prefetched.
     buffer_size = max_workers + 1
+    pending_drop: List[str] = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         file_iter = iter(hf_weights_files)
@@ -1389,8 +1419,10 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 if drop_cache_after_load:
                     # DONTNEED reduces page-cache pressure after copying weights,
                     # but later mmap-backed tensor access may fault pages again.
-                    _drop_file_cache_after_load(st_file)
+                    pending_drop.append(st_file)
+                    _drop_unmapped_file_caches(pending_drop)
                 pbar.update(1)
+    _drop_unmapped_file_caches(pending_drop, force=True)
     if prefetch_handle is not None:
         prefetch_handle.stop()
 
