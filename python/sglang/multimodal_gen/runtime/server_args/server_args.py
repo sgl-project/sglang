@@ -840,6 +840,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 or self._is_breakable_cuda_graph_supported_model()
             )
         ):
+            if pipeline_config is not None:
+                pipeline_config.validate_breakable_cuda_graph(self)
             logger.warning(
                 "[Diffusion BCG] not validated for %s (%s); enabling it as "
                 "requested. Warmup warns if nothing gets captured; compare outputs "

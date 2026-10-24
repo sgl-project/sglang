@@ -4,6 +4,11 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "Ovis-Image",
+      modelIds: ["ATH-MaaS/Ovis-Image-7B", "AIDC-AI/Ovis-Image-7B"],
+      cookbook: "/cookbook/diffusion/Ovis/Ovis-Image",
+    },
+    {
       name: "MOSS-Image",
       modelIds: ["OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"],
       cookbook: "/cookbook/diffusion/OpenMOSS/MOSS-Image",

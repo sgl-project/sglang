@@ -3,10 +3,14 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
-from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    get_tp_world_size,
+    tensor_model_parallel_all_gather,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm as MMGenRMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -30,6 +34,38 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 
 
+class Qwen3HfRowParallelLinear(RowParallelLinear):
+    """Preserve HF's full GEMM while retaining checkpoint-backed TP shards."""
+
+    def forward(self, input_) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if (
+            self.tp_size == 1
+            or self.quant_config is not None
+            or not self.reduce_results
+            or input_.dtype not in (torch.float16, torch.bfloat16)
+        ):
+            return super().forward(input_)
+
+        if self.input_is_parallel:
+            full_input = tensor_model_parallel_all_gather(
+                input_.contiguous(), dim=-1, tp_group=self.tp_group
+            )
+        else:
+            full_input = input_
+        full_weight = tensor_model_parallel_all_gather(
+            self.weight, dim=1, tp_group=self.tp_group
+        )
+
+        # Even FP32 split-K partials change the reduction order enough to
+        # accumulate beyond Ovis conditioning tolerances. Reconstruct only
+        # this projection for the exact full GEMM, then release its gathered
+        # weight. Do not cache it: offload and weight updates own the shards.
+        bias = None if self.skip_bias_add else self.bias
+        with torch.autocast(device_type=input_.device.type, enabled=False):
+            output = F.linear(full_input, full_weight, bias)
+        return output, self.bias if self.skip_bias_add else None
+
+
 class Qwen3MLP(nn.Module):
     """Qwen3 MLP with SwiGLU activation and tensor parallelism."""
 
@@ -41,8 +77,10 @@ class Qwen3MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         bias: bool = False,
         prefix: str = "",
+        preserve_hf_numerics: bool = False,
     ) -> None:
         super().__init__()
+        self.preserve_hf_numerics = preserve_hf_numerics
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[intermediate_size] * 2,
@@ -50,7 +88,10 @@ class Qwen3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
-        self.down_proj = RowParallelLinear(
+        row_parallel_cls = (
+            Qwen3HfRowParallelLinear if preserve_hf_numerics else RowParallelLinear
+        )
+        self.down_proj = row_parallel_cls(
             input_size=intermediate_size,
             output_size=hidden_size,
             bias=bias,
@@ -65,7 +106,11 @@ class Qwen3MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, _ = self.gate_up_proj(x)
-        x = self.act_fn(x)
+        if self.preserve_hf_numerics:
+            gate, up = x.chunk(2, dim=-1)
+            x = F.silu(gate) * up
+        else:
+            x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
 
@@ -91,6 +136,7 @@ class Qwen3Attention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.preserve_hf_numerics = config.preserve_hf_numerics
         tp_size = get_tp_world_size()
         self.total_num_heads = num_heads
         self.total_num_kv_heads = num_kv_heads
@@ -106,6 +152,12 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
+        self.rope_scaling_factor = (
+            float(rope_scaling.get("factor", 1.0))
+            if rope_scaling
+            and rope_scaling.get("rope_type", rope_scaling.get("type")) == "linear"
+            else 1.0
+        )
         self.max_position_embeddings = max_position_embeddings
 
         # QKV projection with tensor parallelism
@@ -120,7 +172,10 @@ class Qwen3Attention(nn.Module):
         )
 
         # Output projection
-        self.o_proj = RowParallelLinear(
+        row_parallel_cls = (
+            Qwen3HfRowParallelLinear if self.preserve_hf_numerics else RowParallelLinear
+        )
+        self.o_proj = row_parallel_cls(
             input_size=self.total_num_heads * self.head_dim,
             output_size=hidden_size,
             bias=bias,
@@ -131,8 +186,22 @@ class Qwen3Attention(nn.Module):
         # QK-Norm: Key difference from LLaMA
         rms_norm_eps = getattr(config, "rms_norm_eps", 1e-6)
         # Keep the small-hidden one-pass kernel used by diffusion QK norm.
-        self.q_norm = MMGenRMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = MMGenRMSNorm(self.head_dim, eps=rms_norm_eps)
+        if self.preserve_hf_numerics:
+            self.q_norm = RMSNorm(
+                self.head_dim,
+                eps=rms_norm_eps,
+                cast_x_before_out_mul=True,
+                force_native=True,
+            )
+            self.k_norm = RMSNorm(
+                self.head_dim,
+                eps=rms_norm_eps,
+                cast_x_before_out_mul=True,
+                force_native=True,
+            )
+        else:
+            self.q_norm = MMGenRMSNorm(self.head_dim, eps=rms_norm_eps)
+            self.k_norm = MMGenRMSNorm(self.head_dim, eps=rms_norm_eps)
 
         # Rotary embeddings
         self.rotary_emb = get_rope(
@@ -179,7 +248,10 @@ class Qwen3Attention(nn.Module):
         k = k.reshape(batch_size, seq_len, -1)
 
         # Apply rotary embeddings
-        q, k = self.rotary_emb(positions, q, k)
+        if self.preserve_hf_numerics:
+            q, k = self._apply_hf_rope(positions, q, k)
+        else:
+            q, k = self.rotary_emb(positions, q, k)
 
         # Reshape for attention
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -193,6 +265,82 @@ class Qwen3Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _apply_hf_rope(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # HF casts cos/sin and rounds each product before their sum.
+        inv_freq = 1.0 / (
+            self.rope_theta
+            ** (
+                torch.arange(
+                    0, self.rotary_dim, 2, dtype=torch.float32, device=query.device
+                )
+                / self.rotary_dim
+            )
+        )
+        if self.rope_scaling_factor != 1.0:
+            inv_freq = inv_freq / self.rope_scaling_factor
+        frequencies = positions.float().unsqueeze(-1) * inv_freq
+        cos = torch.cat([frequencies.cos()] * 2, dim=-1).to(query.dtype).unsqueeze(-2)
+        sin = torch.cat([frequencies.sin()] * 2, dim=-1).to(query.dtype).unsqueeze(-2)
+
+        def rotate(value):
+            shape = value.shape
+            value = value.reshape(*shape[:2], -1, self.head_dim)
+            first, second = value.chunk(2, dim=-1)
+            rotated = torch.cat((-second, first), dim=-1)
+            return (value * cos + rotated * sin).reshape(shape)
+
+        return rotate(query), rotate(key)
+
+    def _hf_masked_causal_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_lengths: tuple[int, ...] | None,
+    ) -> torch.Tensor:
+        # A full padding mask also preserves HF's SDPA kernel selection.
+        batch_size, seq_len = q.shape[:2]
+        if attention_lengths is None or all(
+            length == seq_len for length in attention_lengths
+        ):
+            # HF omits the mask for an unpadded causal prefill and enables GQA.
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                dropout_p=0.0,
+                is_causal=seq_len > 1,
+                scale=self.scaling,
+                enable_gqa=self.num_heads != self.num_kv_heads,
+            ).transpose(1, 2)
+        mask = torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool).tril()
+        mask = mask[None, None].expand(batch_size, 1, seq_len, seq_len)
+        if attention_lengths is not None:
+            valid = (
+                torch.arange(seq_len, device=q.device)[None, :]
+                < torch.tensor(attention_lengths, device=q.device)[:, None]
+            )
+            mask = mask & valid[:, None, None, :]
+        q, k, v = (value.transpose(1, 2) for value in (q, k, v))
+        if self.num_heads != self.num_kv_heads:
+            repeat = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeat, dim=1)
+            v = v.repeat_interleave(repeat, dim=1)
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.scaling,
+        ).transpose(1, 2)
+
     def _masked_causal_attention(
         self,
         q: torch.Tensor,
@@ -200,6 +348,8 @@ class Qwen3Attention(nn.Module):
         v: torch.Tensor,
         attention_lengths: tuple[int, ...] | None,
     ) -> torch.Tensor:
+        if self.preserve_hf_numerics:
+            return self._hf_masked_causal_attention(q, k, v, attention_lengths)
         if attention_lengths is None:
             return self.attn(q, k, v)
 
@@ -257,6 +407,7 @@ class Qwen3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.preserve_hf_numerics = config.preserve_hf_numerics
         rope_theta = config.rope_parameters["rope_theta"]
         rope_scaling = config.rope_parameters
         max_position_embeddings = getattr(config, "max_position_embeddings", 40960)
@@ -283,10 +434,19 @@ class Qwen3DecoderLayer(nn.Module):
             quant_config=quant_config,
             bias=getattr(config, "mlp_bias", False),
             prefix=f"{prefix}.mlp",
+            preserve_hf_numerics=self.preserve_hf_numerics,
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            cast_x_before_out_mul=self.preserve_hf_numerics,
+            force_native=self.preserve_hf_numerics,
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            cast_x_before_out_mul=self.preserve_hf_numerics,
+            force_native=self.preserve_hf_numerics,
         )
 
     def forward(
@@ -297,7 +457,12 @@ class Qwen3DecoderLayer(nn.Module):
         attention_lengths: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
+        if self.preserve_hf_numerics:
+            if residual is not None:
+                hidden_states = hidden_states + residual
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        elif residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
@@ -310,7 +475,13 @@ class Qwen3DecoderLayer(nn.Module):
         )
 
         # MLP
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.preserve_hf_numerics:
+            residual = hidden_states + residual
+            hidden_states = self.post_attention_layernorm(residual)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -332,6 +503,7 @@ class Qwen3ForCausalLM(TextEncoder):
 
         self.config = config
         self.quant_config = config.quant_config
+        self.preserve_hf_numerics = config.preserve_hf_numerics
 
         # Embedding layer with tensor parallelism
         if config.lora_config is not None:
@@ -363,7 +535,12 @@ class Qwen3ForCausalLM(TextEncoder):
         )
 
         # Final layer norm
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            cast_x_before_out_mul=self.preserve_hf_numerics,
+            force_native=self.preserve_hf_numerics,
+        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -417,7 +594,12 @@ class Qwen3ForCausalLM(TextEncoder):
                 position_ids, hidden_states, residual, attention_lengths
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if self.preserve_hf_numerics:
+            if residual is not None:
+                hidden_states = hidden_states + residual
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
 
         # Add hidden states from the last decoder layer
         if all_hidden_states is not None:
