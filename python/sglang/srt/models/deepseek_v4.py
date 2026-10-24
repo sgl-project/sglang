@@ -3442,6 +3442,27 @@ class DeepseekV4DecoderLayerBase(nn.Module):
             and mhc.can_fuse_post(self.hc_cfg)
         )
 
+    @functools.cached_property
+    def _can_overlap_attn_stats(self) -> bool:
+        """The static half of the wide-prefill stats overlap for attention: the
+        TP4 attention all-reduce the transport completes. `mhc.use_prefill_stats_overlap`
+        is the per-forward half."""
+        return (
+            self.boundary_pre_from_prev
+            and self.hc_stats_stream is not None
+            and get_parallel().tp_size == self.self_attn.attn_tp_size == 4
+        )
+
+    @functools.cached_property
+    def _can_overlap_ffn_stats(self) -> bool:
+        """The MoE counterpart of `_can_overlap_attn_stats`."""
+        return (
+            self.boundary_pre_from_prev
+            and self.hc_stats_stream is not None
+            and self.mlp.tp_size == 4
+            and get_moe_a2a_backend().is_none()
+        )
+
 
 def _gather_late_layer_ids(
     input_ids: torch.Tensor, counts: List[int], forward_batch: ForwardBatch

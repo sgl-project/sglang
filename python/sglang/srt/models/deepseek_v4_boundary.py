@@ -57,6 +57,9 @@ class ReadState(msgspec.Struct):
     stats: object = None
     stats_stream: object = None
     call: object = None
+    # Wide prefill: the stream ``stats`` was issued on beside the sublayer's TP
+    # all-reduce (issue_prefill_stats); the post joins it before reading them.
+    stats_join: object = None
 
 
 class HcUpdate:
@@ -82,6 +85,8 @@ class HcUpdate:
         if not self.layer.boundary_pre_from_prev:
             return self.layer.hc_post(output, state.streams, state.post, state.comb)
         hc = self.layer.attn_hc if self.attention else self.layer.ffn_hc
+        if state.stats_join is not None:
+            torch.cuda.current_stream().wait_stream(state.stats_join)
         if self.attention:
             return mhc.run_attn_post(
                 hc,
@@ -458,6 +463,19 @@ def stages(config, layer_id, *, layer=None):
     )
 
 
+def _issue_prefill_stats(layer, batch, *, attention):
+    """Wide prefill: issue the sublayer's triplet on the stats stream beside the
+    TP all-reduce its transport is about to complete, for the post to join."""
+    state = batch.residual_stream.residual
+    if not isinstance(state, ReadState) or state.stats is not None:
+        return
+    if not mhc.use_prefill_stats_overlap(layer.hc_cfg, batch, state.streams):
+        return
+    hc = layer.attn_hc if attention else layer.ffn_hc
+    state.stats = mhc.issue_prefill_stats(hc, state.streams, layer.hc_stats_stream)
+    state.stats_join = layer.hc_stats_stream
+
+
 class AttentionTransport(ComputeTransport):
     def __init__(self, layer, hidden_states, batch, call, rows):
         if rows.source != rows.compute or rows.source != rows.returned:
@@ -470,6 +488,8 @@ class AttentionTransport(ComputeTransport):
         self.num_rows = hidden_states.shape[0]
         self.rows = rows
         self.input = hidden_states
+        self.layer = layer
+        self.batch = batch
         self.defers_sum = (
             layer.boundary_mhc_fusions
             and layer.boundary_pre_from_prev
@@ -491,6 +511,12 @@ class AttentionTransport(ComputeTransport):
         group = self.rows.decode_group if ctx.use_decode_attn_tp else self.rows.group
         if group is None:
             raise ValueError("attention output owes no declared transport sum")
+        if (
+            not self.defers_sum
+            and not ctx.use_decode_attn_tp
+            and self.layer._can_overlap_attn_stats
+        ):
+            _issue_prefill_stats(self.layer, self.batch, attention=True)
         return UnreducedOutput(output.partial, group=_sum_group(group))
 
 
@@ -515,6 +541,7 @@ class MoeTransport(MoeRowTransport):
             and TokenAxis.ATTN_TP in rows.compute.sharded - rows.source.sharded,
         )
         self.sum_in_return = self.mlp_reduce_scatter and rows.group is not None
+        self.layer = layer
         self.return_moe_output = self.defers_sum = (
             layer.boundary_mhc_fusions
             and layer.boundary_pre_from_prev
@@ -527,6 +554,9 @@ class MoeTransport(MoeRowTransport):
 
     def prepare_output(self, hidden_states):
         self.input = None
+        owes_sum = self.rows.group is not None and not self.mlp_reduce_scatter
+        if owes_sum and not self.defers_sum and self.layer._can_overlap_ffn_stats:
+            _issue_prefill_stats(self.layer, self.batch, attention=False)
         if isinstance(hidden_states, MoEOutput):
             completion = MoeFinalize(hidden_states)
             return (
@@ -534,7 +564,7 @@ class MoeTransport(MoeRowTransport):
                 if self.mlp_reduce_scatter
                 else completion
             )
-        if self.rows.group is not None and not self.mlp_reduce_scatter:
+        if owes_sum:
             return MoeFinalize(partial=hidden_states)
         return hidden_states
 
