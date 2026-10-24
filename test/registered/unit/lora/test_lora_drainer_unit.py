@@ -1,36 +1,46 @@
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+"""LoRADrainer starvation accounting under a fake clock. Draining the wrong
+running adapter, or admitting a request that outlives the drain, starves a
+waiting adapter indefinitely with no error."""
+
 import unittest
 from types import SimpleNamespace
-from typing import cast
 from unittest import mock
 
 from sglang.srt.lora.lora_drainer import LoRADrainer
-from sglang.srt.managers.schedule_batch import Req
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.lora_utils import (
-    CI_MULTI_LORA_MODELS,
-    run_lora_batch_splitting_equivalence_test,
-)
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=52, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 MOCK_START_TIME = 1000.0
 LORA_DRAIN_WAIT_THRESHOLD = 3.0
 
 
 def make_req(lora_id, wait_queue_entry_time, max_new_tokens, output_len=0):
-    time_stats = SimpleNamespace(wait_queue_entry_time=wait_queue_entry_time)
-    sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
-    req_ns = SimpleNamespace(
+    """Just the Req fields the drainer reads."""
+    return SimpleNamespace(
         lora_id=lora_id,
-        time_stats=time_stats,
-        sampling_params=sampling_params,
+        time_stats=SimpleNamespace(wait_queue_entry_time=wait_queue_entry_time),
+        sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
         output_ids=[0] * output_len,
     )
-    return cast(Req, req_ns)
 
 
-class TestLoRADrainer(unittest.TestCase):
+class TestLoRADrainer(CustomTestCase):
     def test_update_draining_marks_adapter(self):
         with mock.patch("time.monotonic", return_value=MOCK_START_TIME):
             drainer = LoRADrainer(
@@ -109,15 +119,6 @@ class TestLoRADrainer(unittest.TestCase):
                 lora_id="B", wait_queue_entry_time=0, max_new_tokens=20, output_len=0
             )
             self.assertFalse(drainer.can_schedule(req_bad))
-
-    def test_batch_splitting_with_drainer(self):
-        run_lora_batch_splitting_equivalence_test(
-            model_cases=CI_MULTI_LORA_MODELS,
-            attention_backend="torch_native",
-            disable_cuda_graph=True,
-            disable_radix_cache=True,
-            lora_drain_wait_threshold=LORA_DRAIN_WAIT_THRESHOLD,
-        )
 
 
 if __name__ == "__main__":

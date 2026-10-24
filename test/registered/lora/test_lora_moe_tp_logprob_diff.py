@@ -11,182 +11,69 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-
+"""MoE LoRA under TP=2 must match the vLLM reference: wrong expert-LoRA
+sharding or a missing reduce changes tokens or logprobs with no error."""
 
 import multiprocessing as mp
 import unittest
-from typing import Any, Dict, List
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.lora_utils import (
-    MOE_BASE_MODEL_PATH,
-    MOE_LORA_PATH,
     MOE_LORA_TEST_PROMPTS,
+    MOE_LORA_VLLM_REFERENCE,
+    MOE_LORA_VLLM_REFERENCE_STATS,
+    run_moe_lora_tp_generation,
 )
-from sglang.test.runners import SRTRunner
-from sglang.test.test_utils import (
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
-    CustomTestCase,
-    is_in_ci,
-)
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=130, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=65, stage="base-b", runner_config="2-gpu-large")
 
-LOGPROB_THRESHOLD = 5e-04
-# Chunked vs non-chunked runs differ only in lm_head matmul shape (16-row
-# chunks vs one full pass), which shifts bf16 rounding slightly.
-CHUNK_LOGPROB_THRESHOLD = 5e-03
-MAX_NEW_TOKENS = 10
-
-
-def _run_sglang_moe_lora(
-    tp_size: int,
-    prompts: List[str],
-    port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
-) -> Dict[str, Any]:
-    lora_paths_per_prompt = [MOE_LORA_PATH] * len(prompts)
-
-    with SRTRunner(
-        model_path=MOE_BASE_MODEL_PATH,
-        torch_dtype=torch.bfloat16,
-        model_type="generation",
-        tp_size=tp_size,
-        lora_paths=[MOE_LORA_PATH],
-        max_loras_per_batch=1,
-        trust_remote_code=True,
-        disable_radix_cache=True,
-        port=port,
-        attention_backend="flashinfer",
-        mem_fraction_static=0.80,
-    ) as runner:
-        outputs = runner.forward(
-            prompts,
-            max_new_tokens=MAX_NEW_TOKENS,
-            lora_paths=lora_paths_per_prompt,
-        )
-
-    return {
-        "top_input_logprobs": outputs.top_input_logprobs,
-        "top_output_logprobs": outputs.top_output_logprobs,
-        "output_strs": outputs.output_strs,
-    }
+# The TP=1 run stays within stats + 2e-4 of vLLM and TP=2 within 5e-4 of TP=1.
+LOGPROB_EPS = 7e-04
 
 
 class TestMoELoRATP2Logprobs(CustomTestCase):
-    """Compare TP=1 vs TP=2 MoE LoRA: output strings must match and logprobs
-    must stay within threshold."""
+    def test_moe_lora_tp2_matches_vllm_reference(self):
+        tp2 = run_moe_lora_tp_generation(tp_size=2, prompts=MOE_LORA_TEST_PROMPTS)
 
-    def _assert_tp_parity(
-        self,
-        prompts: List[str],
-        label: str,
-    ):
-        print(f"\n{'=' * 100}")
-        print(f"  {label}: running TP=1")
-        print(f"{'=' * 100}")
-
-        tp1 = _run_sglang_moe_lora(tp_size=1, prompts=prompts)
-        torch.cuda.empty_cache()
-
-        print(f"\n{'=' * 100}")
-        print(f"  {label}: running TP=2")
-        print(f"{'=' * 100}")
-
-        tp2 = _run_sglang_moe_lora(tp_size=2, prompts=prompts)
-
-        print(f"\n{'=' * 100}")
-        print(
-            f"{'ID':<4} | {'String':<8} | {'Decode Max Diff':<18} | "
-            f"{'Decode Mean Diff':<18} | {'Status':<8} | {'Output (TP1)'}"
-        )
-        print("-" * 100)
-
-        for i in range(len(prompts)):
-            tp1_str = tp1["output_strs"][i].strip()
-            tp2_str = tp2["output_strs"][i].strip()
-
+        for i, prompt in enumerate(MOE_LORA_TEST_PROMPTS):
+            ref = MOE_LORA_VLLM_REFERENCE[i]
             self.assertEqual(
-                tp1_str,
-                tp2_str,
-                f"Output string mismatch on prompt {i}: "
-                f"TP1='{tp1_str}' vs TP2='{tp2_str}'",
+                ref["text"].strip(),
+                tp2["output_strs"][i].strip(),
+                f"String mismatch on prompt {i} ({prompt[:40]!r})",
             )
-
-            tp1_raw = tp1["top_output_logprobs"][i]
-            tp2_raw = tp2["top_output_logprobs"][i]
-            tp1_lps = torch.tensor(
-                [t[0] if isinstance(t, list) else t for t in tp1_raw]
+            lps = torch.tensor(
+                [
+                    t[0] if isinstance(t, list) else t
+                    for t in tp2["top_output_logprobs"][i]
+                ]
             )
-            tp2_lps = torch.tensor(
-                [t[0] if isinstance(t, list) else t for t in tp2_raw]
-            )
-            min_len = min(tp1_lps.shape[0], tp2_lps.shape[0])
-            diff = torch.abs(tp1_lps[:min_len] - tp2_lps[:min_len])
-            max_diff = torch.max(diff).item() if min_len > 0 else 0.0
-            mean_diff = torch.mean(diff).item() if min_len > 0 else 0.0
-
-            status = "PASS" if max_diff < LOGPROB_THRESHOLD else "FAIL"
-            print(
-                f"{i:<4} | {'OK':<8} | {max_diff:<18.6e} | "
-                f"{mean_diff:<18.6e} | {status:<8} | {tp1_str[:40]}"
-            )
-
-            self.assertLessEqual(
-                max_diff,
-                LOGPROB_THRESHOLD,
-                f"Decode logprob diff too large on prompt {i}: "
-                f"max_diff={max_diff:.6e} > threshold={LOGPROB_THRESHOLD:.0e}",
-            )
-
-        print("=" * 100)
-
-    def test_moe_lora_tp2_vs_tp1_basic(self):
-        """Basic TP=1 vs TP=2 parity with a small prompt set."""
-        self._assert_tp_parity(
-            prompts=MOE_LORA_TEST_PROMPTS[:5],
-            label="MoE LoRA TP parity (basic)",
-        )
-
-    def test_moe_lora_tp2_chunked_vs_unchunked_logprobs(self):
-        """TP=2 input logprobs must match between chunked and non-chunked runs.
-
-        Fixing tp_size isolates the chunk grid as the only variable (a TP1 vs
-        TP2 comparison is polluted by MoE router near-ties on input positions).
-        The tiny chunk size forces multi-chunk stitching and the per-chunk
-        vocab all-gather under TP=2.
-        """
-        prompts = MOE_LORA_TEST_PROMPTS[:3]
-        baseline = _run_sglang_moe_lora(tp_size=2, prompts=prompts)
-        torch.cuda.empty_cache()
-        with envs.SGLANG_LOGPROB_CHUNK_SIZE.override(16):
-            chunked = _run_sglang_moe_lora(tp_size=2, prompts=prompts)
-
-        for i in range(len(prompts)):
+            ref_lps = torch.tensor(ref["lps"])
+            # One logprob per generated token on both sides, including the EOS
+            # token that ends a short answer: compare the whole reference, never
+            # a common prefix.
+            self.assertGreater(lps.numel(), 0, f"No output logprobs on prompt {i}")
             self.assertEqual(
-                baseline["output_strs"][i].strip(),
-                chunked["output_strs"][i].strip(),
+                lps.shape, ref_lps.shape, f"Logprob count mismatch on prompt {i}"
             )
-            base_in = torch.tensor(baseline["top_input_logprobs"][i])
-            chunk_in = torch.tensor(chunked["top_input_logprobs"][i])
-            self.assertEqual(base_in.shape, chunk_in.shape)
-            max_diff = torch.max(torch.abs(base_in - chunk_in)).item()
+            self.assertTrue(
+                torch.isfinite(lps).all(), f"Non-finite logprob on prompt {i}"
+            )
+            diff = torch.abs(lps - ref_lps)
+            stats = MOE_LORA_VLLM_REFERENCE_STATS[i]
             self.assertLessEqual(
-                max_diff,
-                CHUNK_LOGPROB_THRESHOLD,
-                f"Chunked vs non-chunked input logprob diff too large on "
-                f"prompt {i}: max_diff={max_diff:.6e}",
+                diff.max().item(),
+                stats["max"] + LOGPROB_EPS,
+                f"Max logprob diff exceeded on prompt {i}",
             )
-
-    @unittest.skipIf(is_in_ci(), "Skipping full test in CI")
-    def test_moe_lora_tp2_vs_tp1_full(self):
-        """Full TP=1 vs TP=2 parity across all prompts."""
-        self._assert_tp_parity(
-            prompts=MOE_LORA_TEST_PROMPTS,
-            label="MoE LoRA TP parity (full)",
-        )
+            self.assertLessEqual(
+                diff.mean().item(),
+                stats["mean"] + LOGPROB_EPS,
+                f"Mean logprob diff exceeded on prompt {i}",
+            )
 
 
 if __name__ == "__main__":

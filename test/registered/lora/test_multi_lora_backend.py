@@ -12,47 +12,37 @@
 # limitations under the License.
 # ==============================================================================
 
-import dataclasses
+"""Mixed-adapter batches, split across LoRA slots, must match HF row by row."""
+
 import multiprocessing as mp
-import os
 import unittest
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
-    ALL_OTHER_MULTI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,
-    run_lora_batch_splitting_equivalence_test,
-    run_lora_multiple_batch_on_model_cases,
+    TEST_MULTIPLE_BATCH_PROMPTS,
+    TORCH_DTYPES,
+    assert_lora_routes_match_hf,
+    create_multiple_batch_test_samples,
+    lora_split_batches,
 )
-from sglang.test.test_utils import CustomTestCase, is_in_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-large")
-register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=65, stage="base-b", runner_config="1-gpu-large")
+# backend-specific: ROCm's Triton build of the chunked-SGMV LoRA kernels on
+# mixed-adapter batches.
+register_amd_ci(est_time=65, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestMultiLoRABackend(CustomTestCase):
-    def test_ci_lora_models_batch_splitting(self):
-        run_lora_batch_splitting_equivalence_test(CI_MULTI_LORA_MODELS)
-
     def test_ci_lora_models_multi_batch(self):
-        model_cases = [
-            dataclasses.replace(case, rouge_l_tolerance=0.9)
-            for case in CI_MULTI_LORA_MODELS
-        ]
-        run_lora_multiple_batch_on_model_cases(model_cases)
-
-    def test_all_lora_models(self):
-        if is_in_ci():
-            return
-
-        # Retain ONLY_RUN check here
-        filtered_models = []
-        for model_case in ALL_OTHER_MULTI_LORA_MODELS:
-            if "ONLY_RUN" in os.environ and os.environ["ONLY_RUN"] != model_case.base:
-                continue
-            filtered_models.append(model_case)
-
-        run_lora_multiple_batch_on_model_cases(filtered_models)
+        for model_case in CI_MULTI_LORA_MODELS:
+            for torch_dtype in TORCH_DTYPES:
+                a, b = [adaptor.name for adaptor in model_case.adaptors]
+                batches = create_multiple_batch_test_samples(
+                    TEST_MULTIPLE_BATCH_PROMPTS, [a, b]
+                ) + lora_split_batches(a, b)
+                assert_lora_routes_match_hf(self, model_case, torch_dtype, batches)
 
 
 if __name__ == "__main__":

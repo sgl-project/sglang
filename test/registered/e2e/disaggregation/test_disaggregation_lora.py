@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=400, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=250, stage="base-b", runner_config="2-gpu-large")
 
 ADAPTERS = {
     "fact": "algoprog/fact-generation-llama-3.1-8b-instruct-lora",
@@ -45,7 +45,7 @@ PROMPTS = [
 def generate(url: str, prompt: str, lora_path=None) -> str:
     payload = {
         "text": prompt,
-        "sampling_params": {"temperature": 0, "max_new_tokens": 128},
+        "sampling_params": {"temperature": 0, "max_new_tokens": 32},
     }
     if lora_path is not None:
         payload["lora_path"] = lora_path

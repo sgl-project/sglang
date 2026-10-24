@@ -650,6 +650,58 @@ class TestLinearParallelGroups(CustomTestCase):
             actual = wrapped.slice_lora_a_weights(full)
         torch.testing.assert_close(actual, full[:, 6:], rtol=0, atol=0)
 
+    def test_lora_slicing_of_inkling_qkvr_and_padded_lm_head(self):
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+        from sglang.srt.lora.layers import (
+            InklingQKVRLinearWithLoRA,
+            ParallelLMHeadWithLoRA,
+        )
+        from sglang.srt.lora.utils import get_lm_head_lora_b_shard_size
+
+        # Inkling's adapter stacks LoRA-B unreplicated, [q | k | v | r], while
+        # this rank (1 of 2 attention ranks) serves q head 1, r head 1 and,
+        # with one kv head, a replica of kv head 0.
+        head_dim, heads, d_rel = 2, 2, 1
+        for kv_heads, rows in (
+            (1, [2, 3, 4, 5, 6, 7, 9]),
+            (2, [2, 3, 6, 7, 10, 11, 13]),
+        ):
+            with self.subTest(kv_heads=kv_heads):
+                kv_rows = head_dim * max(kv_heads, 2)
+                qkvr = MergedColumnParallelLinear(
+                    8,
+                    [head_dim * heads, kv_rows, kv_rows, d_rel * heads],
+                    bias=False,
+                    parallel_group="attn_tp",
+                )
+                qkvr.inkling_head_dim = head_dim
+                qkvr.inkling_num_heads = heads
+                qkvr.inkling_num_kv_heads = kv_heads
+                qkvr.inkling_d_rel = d_rel
+                self.assertEqual(rank_size(qkvr), (1, 2))
+                wrapped = InklingQKVRLinearWithLoRA.__new__(InklingQKVRLinearWithLoRA)
+                torch.nn.Module.__init__(wrapped)
+                wrapped.base_layer = qkvr
+                full_rows = (heads + 2 * kv_heads) * head_dim + d_rel * heads
+                full = torch.arange(full_rows * 2, dtype=torch.float32).reshape(-1, 2)
+                with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+                    actual = wrapped.slice_lora_b_weights(full)
+                torch.testing.assert_close(actual, full[rows], rtol=0, atol=0)
+
+        with self.subTest(layer="lm_head"):
+            # 100 rows pad to 128 over 4 ranks: rank 3 keeps rows 96-99 only.
+            lm_head = ParallelLMHead(100, 8)
+            wrapped = ParallelLMHeadWithLoRA.__new__(ParallelLMHeadWithLoRA)
+            torch.nn.Module.__init__(wrapped)
+            wrapped.base_layer = lm_head
+            full = torch.arange(200, dtype=torch.float32).reshape(100, 2)
+            with parallel_scope(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0):
+                actual = wrapped.slice_lora_b_weights(full)
+            torch.testing.assert_close(actual, full[96:], rtol=0, atol=0)
+            self.assertEqual(
+                get_lm_head_lora_b_shard_size(100, lm_head.shard_indices), 4
+            )
+
     def test_two_stream_lora_row_gates_on_the_retained_input_partition(self):
         from sglang.srt.lora.trtllm_lora_temp import attention
 
