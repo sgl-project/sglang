@@ -59,9 +59,11 @@ def capture_pre_sample_logits(
         n = batch.beam_tail.num_base_rows
         logits = logits_output.next_token_logits
         logits_output.next_token_logits = logits[:n]
-        leader_rows = [e.leader_idx for e in batch.beam_tail.entries]
         logits_output.beam = BeamLogitsCapture(
-            leader_logits=logits[leader_rows].clone(),
+            # index_select (not a python-list index): a list index would stage a
+            # blocking H2D copy of the indices, syncing on the pending forward and
+            # stalling the host every decode step.
+            leader_logits=logits.index_select(0, batch.beam_tail.leader_idx_dev),
             tail_logits=logits[n:],
         )
         if logits_output.hidden_states is not None:
