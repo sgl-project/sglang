@@ -105,10 +105,11 @@ def find_matched_target(
     module: Module,
     targets: Iterable[str],
     fused_mapping: Mapping[str, List[str]] = MappingProxyType({}),
-) -> str:
+) -> Optional[str]:
     """
     Helper function to look up which "target" in the compressed-tensors
-    config that a layer corresponds to.
+    config that a layer corresponds to. Returns None when no target matches;
+    such a layer is stored unquantized.
 
     Recall that a compressed-tensors configs has a concept of
     config_groups, where each layer can be quantized with with a different
@@ -121,7 +122,8 @@ def find_matched_target(
     Second, we try to match the module's name with a target
     Third, we try to map the layer_name to a list of fused module names.
         *All* component module names must match in order for a match to be
-        successful. A successful match returns the first component target
+        successful. A successful match returns the first component target.
+        A partial match raises ValueError.
 
     :param layer_name: layer name
     :param module: torch.nn.Module
@@ -139,12 +141,6 @@ def find_matched_target(
         or _find_first_match(module.__class__.__name__, targets, True)
         or _match_fused_layer(layer_name, targets, fused_mapping)
     )
-
-    if matched_target is None:
-        raise ValueError(
-            f"Unable to find matching target for {layer_name} in the "
-            "compressed-tensors config."
-        )
 
     return matched_target
 
@@ -199,7 +195,7 @@ def _match_fused_layer(
     target_layers. Returns first value in fused_mapping which matches targets
 
     Implements an "all" matching strategy where a fused layer matches iff
-    "all" of its components match
+    "all" of its components match, and raises if only some of them match
 
     :param layer_name: layer name
     :param target_layers: list of targets to match the layer against
@@ -231,4 +227,13 @@ def _match_fused_layer(
         else:
             unfused_matches.append(None)
 
-    return unfused_matches[0] if all(unfused_matches) else None
+    if all(unfused_matches):
+        return unfused_matches[0]
+
+    if any(unfused_matches):
+        raise ValueError(
+            f"Found different quantization schemes for {fused_mapping[fused]} "
+            f"in {layer_name}. SGLang requires all to use the same scheme."
+        )
+
+    return None

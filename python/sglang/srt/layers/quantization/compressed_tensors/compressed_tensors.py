@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-from contextlib import suppress
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -1044,14 +1043,15 @@ class CompressedTensorsConfig(QuantizationConfig):
         sparsity_targets = self.sparsity_scheme_map.keys() - set(
             self.sparsity_ignore_list
         )
+        matched_target = find_matched_target(
+            layer_name=layer_name,
+            module=layer,
+            targets=sparsity_targets,
+            fused_mapping=self.packed_modules_mapping,
+        )
+
         sparsity_scheme: Optional[SparsityCompressionConfig] = None
-        with suppress(ValueError):
-            matched_target = find_matched_target(
-                layer_name=layer_name,
-                module=layer,
-                targets=sparsity_targets,
-                fused_mapping=self.packed_modules_mapping,
-            )
+        if matched_target is not None:
             sparsity_scheme = self.sparsity_scheme_map[matched_target]
 
         if self.supports_cutlass_24(
@@ -1103,8 +1103,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         targets like ``Linear`` are not consulted: llm-compressor emits those
         for decoder linears, and checkpoints following the common convention
         leave the head out of both ``targets`` and ``ignore`` — matching by
-        name keeps such heads on the unquantized path instead of tripping
-        ``find_matched_target``'s unmatched-layer error.
+        name keeps such heads on the unquantized path.
         """
         if layer_name is None or not self.target_scheme_map:
             return None
@@ -1176,6 +1175,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                     targets=self.target_scheme_map.keys(),
                     fused_mapping=self.packed_modules_mapping,
                 )
+
+                if matched_target is None:
+                    logger.warning_once(
+                        "Some layers match no compressed-tensors target and are "
+                        "not in `ignore`; loading them unquantized."
+                    )
+                    return None
 
             return self.target_scheme_map[matched_target]
 
