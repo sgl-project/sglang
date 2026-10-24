@@ -6,7 +6,7 @@ Community base: `de7055f59645ebe03784b0980e1f222789f468a3`.
 The [initial verification manifest](ascend_dynamic_eplb_upstream_20261024/verification.json) binds the original 17 Python files and separately records the CI fixture follow-up. The [optimization manifest](ascend_dynamic_eplb_upstream_20261024/optimization.json) identifies the later optimized source, including exact snapshot and canonical LF SHA-256 values.
 Eight production files are changed; the existing community TopK padding and shared-expert masking implementation is retained.
 
-The current community port passed the CPU and bounded NPU graph checks below. Full-model, disaggregated P/D and AIS measurements come from the earlier integration described separately below; they have **not** been rerun on this community base.
+The optimized community source passed CPU, bounded NPU graph, two-rank weight migration and fresh-process full-model AIS checks. Current-source single-node performance is reported separately from the earlier integration results. Disaggregated P/D has not been rerun on this community base.
 
 ## Optimization follow-up
 
@@ -26,13 +26,80 @@ Two unnecessary-work paths were removed after reviewing upstream revision `a7ae5
 
 The graph check captures descending token sizes 128/16/8/1 using the actual NPU backend and actual decode `run_once` callback with model/attention stubs. Replay alternates large fallback-only and small batched graphs, including zero valid rows. Route values and storage pointers remain unchanged. The input-update replay entry point is additionally checked by the CPU backend fixture.
 
-For an unchanged layer with six tensors, the former workspace path performed 12 whole-tensor copy calls; the new path skips the allocation and copies. This is an operation-count observation. No end-to-end throughput or latency gain is claimed for this optimization.
+For an unchanged layer with six tensors, the former workspace path performed 12 whole-tensor copy calls; the new path skips the allocation and copies. This is an operation-count observation. The full-model ON/OFF measurements below cover the complete EPLB feature; they do not isolate the incremental gain of these two optimizations versus the parent revision.
 
 Two initial migration-test exits are retained in the evidence: first an overwritten CANN Python path prevented `acl` import; then the default NPU HCCL port was already occupied by an existing service. Preserving the CANN path and using OS-assigned test ports allowed the same production source to pass. The test used a 32 MiB communication buffer. These are test-environment/communication-setup failures, not successful migration runs.
 
 ![Optimization validation scenarios and results](ascend_dynamic_eplb_upstream_20261024/optimization_verification.png)
 
-This is a browser-rendered screenshot of the verified result summary. Full-model requests, PD integration and AIS performance have not been rerun on the optimized community source. The earlier results below retain their original scope.
+This is a browser-rendered screenshot of the verified correctness and operation-count results. Current-source full-model AIS measurements are reported below; the earlier integration results retain their original scope.
+
+## Current community source: fresh-process single-node performance
+
+Source: `0d019b6ac5d6149eca8d3b975dc06d02bdc41877`. The [verified performance records](ascend_dynamic_eplb_upstream_20261024/performance.json) retain all four arms, raw archive hashes, whole-run statistics and native stable-subset rows.
+
+DeepSeek-V4-Flash W8A8 on Ascend 910C with the B103 runtime; TP/EP/attention-DP 16, DP1. Original AIS copy workload: N320/C128/target 6 req/s, actual input 16388/output 1024 tokens, cache hit 0%. DSpark and Compact were disabled, so AL and strict draft acceptance are not applicable.
+
+The order was **OFF -> ON -> ON -> OFF**. Every arm loaded a fresh model process with trivial initial placement, no offline optimized layout, and 16 redundant experts. The static dispatch setting is a routing mode, not a precomputed balancing layout. The same source, environment, entry point, original request records and 16x64 preparation requests were checked across all arms; only `--enable-eplb` differed. Cache was flushed before formal measurement. Rebalance interval/window were 640/320, with per-forward balancedness reporting disabled.
+
+| Execution order | Output tokens/s | Mean TTFT (s) | Mean TPOT (ms) | Mean E2E (s) | Success / failed |
+|---|---:|---:|---:|---:|---:|
+| 1. OFF | 1289.48 | 25.42 | 57.10 | 83.84 | 320 / 0 |
+| 2. ON | 1383.06 | 20.12 | 55.90 | 77.34 | 320 / 0 |
+| 3. ON | 1386.71 | 20.84 | 55.80 | 77.97 | 320 / 0 |
+| 4. OFF | 1285.73 | 25.50 | 57.30 | 84.12 | 320 / 0 |
+
+ON changes relative to the matched OFF:
+
+| Pair order | Output throughput | Mean TTFT | Mean TPOT | Mean E2E | Preparation + formal time |
+|---|---:|---:|---:|---:|---:|
+| OFF -> ON | +7.26% | -20.84% | -2.10% | -7.76% | -4.82% |
+| ON -> OFF | +7.85% | -18.27% | -2.62% | -7.31% | -4.97% |
+
+| Execution order | P99 TTFT (s) | P99 TPOT (ms) | P99 E2E (s) | Maximum ITL (ms) | Preparation (s) | Formal duration (s) |
+|---|---:|---:|---:|---:|---:|---:|
+| 1. OFF | 46.19 | 80.30 | 94.67 | 39968.30 | 10.19 | 254.12 |
+| 2. ON | 40.26 | 77.20 | 88.64 | 32767.40 | 14.65 | 236.92 |
+| 3. ON | 40.32 | 77.40 | 88.90 | 32815.80 | 15.34 | 236.30 |
+| 4. OFF | 46.20 | 80.40 | 94.74 | 40073.00 | 9.94 | 254.86 |
+
+All 1280 formal requests and 64 preparation requests succeeded. The copy oracle passed 320/320 per formal arm, and all 320 input/output triplets matched exactly across all four arms. OFF completed zero rebalance passes on every rank. Each ON completed one preparation and four formal rebalance passes on each of 16 ranks. Placement logging was disabled equally, so actual layout differences and bytes moved are **NOT_OBSERVED**; completion counts are not a measurement of nonzero weight moves.
+
+The primary table uses the entire fixed AIS workload. Native stable rows were generated by reusing the same completed records without inference resubmission; original total results were hash-checked unchanged. The following automatic subsets are secondary, not a separately matched benchmark:
+
+| Execution order | Native stable N | Mean TTFT (s) | Mean TPOT (ms) | Mean E2E (s) |
+|---|---:|---:|---:|---:|
+| 1. OFF | 184 | 27.78 | 55.10 | 84.18 |
+| 2. ON | 184 | 24.17 | 55.40 | 80.87 |
+| 3. ON | 183 | 24.29 | 55.20 | 80.77 |
+| 4. OFF | 184 | 27.84 | 55.30 | 84.43 |
+
+Native `OutputTokenThroughput` is per-request token/s and must not be interpreted as aggregate output throughput. The JSON retains all metric directions and sample counts. Preparation-plus-formal time excludes model loading, AIS initialization, orchestration and collection.
+
+This confirms the observed ON/OFF effect in two pairs on one fixed workload. It does not establish a confidence interval, a general speedup guarantee, current-source PD performance, or the incremental gain of the latest two optimizations versus the parent revision.
+
+An initial OFF startup failed after weight loading and graph capture, before any requests, because `deepseek-recipe==0.2.0` (already pinned by community packaging) was absent from B103. The exact official wheel was installed without dependencies; the actual chat adapter and all 320 serialized input lengths were checked before restart. This incurred an extra full load. The failed startup archive is retained, SHA-256 `a713c203d33c1a2c10a434b9d40a3007ac17803913814f35a0b72c8a51ba13c0`.
+
+| Raw arm archive | SHA-256 |
+|---|---|
+| 1. OFF | `55133889818974d4e54833fbbcde2835cfe43cb03769e63b6e418f66e442ef01` |
+| 2. ON | `4f27fb01ff314ecf0784c783c803fd860ed0f4d3955cd7616b414db09fd04928` |
+| 3. ON | `ab8198c8830b9572a23abe3f32f76d17c56ff1a58a22b43bf8a3d3fab00eb18d` |
+| 4. OFF | `77233eed4ced99d818bc3bd993286cccbdcce55d7afbdb05dc6bb914cf097ceb` |
+
+![Current-source AIS scenarios and ABBA results](ascend_dynamic_eplb_upstream_20261024/performance_confirmation.png)
+
+The image is a browser-rendered screenshot of the verified records. Historical positive/negative PD measurements and failed runs remain available in the pinned integration report below.
+
+### Community CI at the tested source
+
+At source `0d019b6ac5d6149eca8d3b975dc06d02bdc41877`, [lint passed](https://github.com/sgl-project/sglang/actions/runs/40070517623) and all [17 CPU partitions passed](https://github.com/sgl-project/sglang/actions/runs/40070517808). The nine EPLB suites and existing NPU graph-backend fixture were observed in the successful CPU logs. The CI run as a whole is not green.
+
+- Intel SPR image construction exhausted runner disk before tests.
+- Two NVIDIA partitions failed importing DeepEP because the driver exposed no usable CUDA device; subsequent partitions failed fast.
+- An NPU HiCache test failed allocating host pinned memory with EPLB disabled. A separate GLM image distributed test returned no output; its root cause is unresolved.
+- An AMD LoRA latency test exceeded its threshold with EPLB disabled; this is an observed failure, without a matched baseline attribution.
+- Extra-suite gates require maintainer opt-in; some hardware jobs remain queued. No gate bypass, latency-threshold change or unrelated production fix was made.
 
 ## Initial community-port tests
 
