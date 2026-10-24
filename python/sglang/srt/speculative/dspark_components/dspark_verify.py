@@ -937,6 +937,18 @@ class DsparkVerifyEpilogue:
         self.future_relay.new_seq_lens[rows] = self.new_seq_lens_buf[:bs]
         self.future_relay.output_tokens[rows] = self.bonus_buf[:bs]
 
+    def accept_buffers(self, bs: int) -> AcceptOuts:
+        """Views of the static accept buffers, the ``out=`` target of the in-graph
+        accept. Readers of a step's result take ``read_accept``."""
+        return AcceptOuts(
+            correct_len=self.correct_len_buf[:bs],
+            bonus=self.bonus_buf[:bs],
+            cap_trim_lens=self.cap_trim_lens_buf[:bs],
+            commit_lens=self.commit_lens_buf[:bs],
+            new_seq_lens=self.new_seq_lens_buf[:bs],
+            out_tokens=self.out_tokens_buf[:bs],
+        )
+
     def read_accept(self, bs: int) -> AcceptOuts:
         # These buffers are rewritten by the next target-verify graph replay.
         # Under the overlap scheduler the result D2H (accept lens / next token
@@ -944,14 +956,16 @@ class DsparkVerifyEpilogue:
         # copy that runs late would read step N+1's values -- per rank, so TP
         # ranks could commit different token counts. Return allocator-owned
         # copies made here, right after the replay; async_d2h's record_stream
-        # keeps them alive until the copy has run.
+        # keeps them alive until the copy has run. Writers use accept_buffers:
+        # results written into these copies would never reach the buffers.
+        bufs = self.accept_buffers(bs)
         return AcceptOuts(
-            correct_len=self.correct_len_buf[:bs].clone(),
-            bonus=self.bonus_buf[:bs].clone(),
-            cap_trim_lens=self.cap_trim_lens_buf[:bs].clone(),
-            commit_lens=self.commit_lens_buf[:bs].clone(),
-            new_seq_lens=self.new_seq_lens_buf[:bs].clone(),
-            out_tokens=self.out_tokens_buf[:bs].clone(),
+            correct_len=bufs.correct_len.clone(),
+            bonus=bufs.bonus.clone(),
+            cap_trim_lens=bufs.cap_trim_lens.clone(),
+            commit_lens=bufs.commit_lens.clone(),
+            new_seq_lens=bufs.new_seq_lens.clone(),
+            out_tokens=bufs.out_tokens.clone(),
         )
 
     def read_block_accept_lens(self, bs: int) -> Optional[torch.Tensor]:
@@ -1065,7 +1079,7 @@ class DsparkVerifyEpilogue:
             sync_site=SpecTpSyncSite.DSPARK_ACCEPT_GRAPH,
             simulated_correct_len=self.simulated_correct_len,
             target_logits=None if self.simulate_fold else logits,
-            out=self.read_accept(bs),
+            out=self.accept_buffers(bs),
             block_accept_lens_out=self.read_block_accept_lens(bs),
         )
         return accept.commit_lens
