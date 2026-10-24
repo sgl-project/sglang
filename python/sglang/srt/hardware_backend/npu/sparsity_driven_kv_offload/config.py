@@ -27,11 +27,16 @@ if TYPE_CHECKING:
 
 
 def is_copy_sfa_decode_graph_eligible(seq_lens_cpu) -> bool:
-    """Fixed-window Copy-SFA graphs require every live row to contain 2048 KV."""
+    """Require every live row to have enough tokens to populate its cache.
+
+    C defaults to K=2048. Larger native LIM caches use host gather until C
+    visible tokens exist, so those batches must also stay outside this graph.
+    """
     if not envs.SGLANG_NPU_ENABLE_COPY_SFA.get():
         return True
+    capacity = envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get() or 2048
     return seq_lens_cpu is not None and not any(
-        0 < int(length) < 2048 for length in seq_lens_cpu.tolist()
+        0 < int(length) < capacity for length in seq_lens_cpu.tolist()
     )
 
 

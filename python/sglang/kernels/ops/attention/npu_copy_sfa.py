@@ -39,7 +39,9 @@ def fused_scatter_copy_sparse_flash_attention(
     *,
     operator=None,
 ) -> None:
-    """Fill Q1, C=K=2048 resident KV and attend to the selected combined cache.
+    """Fill Q1 resident KV and attend to K=2048 selected combined-cache tokens.
+
+    Resident capacity C is 2048, 4096 or 8192; request miss rows have width C.
 
     Native host validation checks the remaining metadata/layout/device contract
     without device scalar reads. Buffer ownership stays with the runtime manager.

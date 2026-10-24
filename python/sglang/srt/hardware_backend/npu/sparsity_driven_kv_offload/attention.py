@@ -51,7 +51,7 @@ def _copy_sfa_decode_eligible(backend, forward_batch, layer, q, topk_indices):
         if seq_lens_cpu is None:
             return False
         live = [length for length in seq_lens_cpu if int(length) > 0]
-        if not live or min(map(int, live)) < 2048:
+        if not live or min(map(int, live)) < manager.cache_capacity:
             return False
     return (
         layer.tp_k_head_num == 1
@@ -59,7 +59,7 @@ def _copy_sfa_decode_eligible(backend, forward_batch, layer, q, topk_indices):
         and backend.qk_rope_head_dim == 64
         and q.dtype in (torch.bfloat16, torch.float16)
         and normalize_batch_topk_indices(topk_indices).shape[1] == 2048
-        and manager.cache_capacity == 2048
+        and manager.cache_capacity in (2048, 4096, 8192)
         and manager.sparse_context_len == 2048
         and q.shape[0] == forward_batch.batch_size
     )

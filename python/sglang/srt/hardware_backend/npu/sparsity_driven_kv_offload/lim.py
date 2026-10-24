@@ -1,7 +1,8 @@
 """Q1 framework bridge from the DSA indexer to native LIM cache plans.
 
 By default LIM selects a page-aligned prefix and appends its visible tail.
-With Copy-SFA, Q1 and C=K=2048 select over the complete visible sequence.
+With Copy-SFA, Q1 and K=2048 select over the complete visible sequence;
+the resident cache capacity C can be larger than K.
 Runtime state belongs to this manager-owned adapter, while the current plan
 travels on Ascend ForwardMetadata for IndexShare consumers.
 """
@@ -151,7 +152,7 @@ class LIMDecodeAdapter:
             # Mixed/short batches use a host gather without populating resident
             # KV. Force the following fused step to cold-fill its cache.
             if cpu_lengths is None or any(
-                0 < int(length) < self.top_k for length in cpu_lengths.tolist()
+                0 < int(length) < self.capacity for length in cpu_lengths.tolist()
             ):
                 next_prefix = torch.full_like(next_prefix, -1)
         table = self.block_table[:batch]
@@ -236,17 +237,18 @@ class LIMDecodeAdapter:
             torch.where(valid, plan.topk_misses, 0)
         )
         # Native LIM's ABI has a 32768-wide miss row. A slice alone is strided
-        # at B>1; Copy-SFA requires tightly packed [B,2048] rows.
+        # at B>1; Copy-SFA requires tightly packed [B,C] rows. A cold fill can
+        # contain C misses even though only K tokens are selected for attention.
         manager.planner_miss_src_ids[:batch].copy_(
-            torch.where(valid[:, None], plan.miss_sources[:, : self.top_k], -1)
+            torch.where(valid[:, None], plan.miss_sources[:, : self.capacity], -1)
         )
         manager.planner_miss_dst_slots[:batch].copy_(
-            torch.where(valid[:, None], plan.miss_slots[:, : self.top_k], -1)
+            torch.where(valid[:, None], plan.miss_slots[:, : self.capacity], -1)
         )
         manager.planner_miss_counts[:batch].copy_(
             torch.where(valid, plan.miss_counts, 0)
         )
-        lengths = valid.to(torch.int32) * self.top_k
+        lengths = valid.to(torch.int32) * self.capacity
         manager.planner_actual_seq_lengths_kv[:batch].copy_(lengths)
         manager.planner_num_cache_tokens[:batch].copy_(lengths)
         for pages, offsets, output in (

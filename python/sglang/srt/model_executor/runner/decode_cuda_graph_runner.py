@@ -1099,7 +1099,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and sparse_kv_manager is not None
             and self.captured_req_width == 1
             and forward_batch.forward_mode.is_decode()
-            and sparse_kv_manager.cache_capacity == 2048
+            and sparse_kv_manager.cache_capacity in (2048, 4096, 8192)
         )
         self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
 

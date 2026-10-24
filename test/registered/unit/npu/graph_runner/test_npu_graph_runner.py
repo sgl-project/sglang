@@ -53,6 +53,19 @@ class TestCopySFAGraphAdmission(CustomTestCase):
                     )
                     batch.batch_size = 1 if lengths is None else len(lengths)
                     self.assertEqual(runner.can_run_graph(batch), expected)
+            for capacity in (4096, 8192):
+                with mod.envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(capacity):
+                    for lengths, expected in (
+                        ([2048], False),
+                        ([capacity - 1], False),
+                        ([capacity], True),
+                        ([0, capacity + 1], True),
+                        ([capacity, 2048], False),
+                    ):
+                        with self.subTest(capacity=capacity, lengths=lengths):
+                            batch.seq_lens_cpu = torch.tensor(lengths)
+                            batch.batch_size = len(lengths)
+                            self.assertEqual(runner.can_run_graph(batch), expected)
         with mod.envs.SGLANG_NPU_ENABLE_COPY_SFA.override(False):
             batch.seq_lens_cpu = torch.tensor([11])
             self.assertTrue(runner.can_run_graph(batch))
