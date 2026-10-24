@@ -24,7 +24,7 @@ page ids:
 ONE builder computes that formula for every family -- the iteration plan's
 read table (`KVLocPlan.read_table`) -- and the backends only differ in how
 they consume it:
-  - trtllm_mla / cutedsl_mla / tokenspeed_mla / flashmla: the plan's rows
+  - trtllm_mla / cutedsl_mla / flashmla: the plan's rows
     copied into their padded block tables (`KVIndexTranslator.copy_page_table`);
   - the flashinfer updaters: token ids reconstructed from the table by
     `create_flashinfer_kv_indices_triton[ENTRY_PAGE_SIZE=ps]`;

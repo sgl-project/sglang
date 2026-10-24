@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     BYTES_PER_GB,
+    checkpoint_component_sizes,
     dit_parameter_count,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
@@ -26,12 +27,16 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
     LAYERWISE_OFFLOAD_VAE_GROUP,
+    is_dit_component_name,
     normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.model_overlay import resolve_model_overlay
-from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
+from sglang.multimodal_gen.runtime.utils.precision import (
+    resolve_component_precision,
+    resolve_precision,
+)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
@@ -40,6 +45,8 @@ logger = init_logger(__name__)
 
 # Picked, not measured; what stays free holds activations and the other components.
 AUTO_DIT_MAX_DEVICE_FRACTION = 0.8
+# auto keeps every component resident once the least-free GPU holds all weights this many times
+AUTO_ALL_RESIDENT_WEIGHT_MULTIPLE = 2
 
 
 def _uses_svdquant(nunchaku_config) -> bool:
@@ -93,7 +100,8 @@ def auto_residency_args_skip_reason(server_args: ServerArgs) -> str | None:
         return "dynamic batching enabled"
     if not current_platform.is_cuda():
         return "requires CUDA"
-    return None
+    # nothing applies calibrated placements yet, so warmup skips the probe and step floor
+    return "residency planner not available"
 
 
 PERFORMANCE_MODES = ("manual", "auto", "speed", "memory")
@@ -109,6 +117,12 @@ DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES = (
 # larger so it only stays resident on very-high-memory gpus
 IMAGE_GEN_KEEP_RESIDENT_MIN_AVAILABLE_GB = 45.0
 DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB = 120.0
+ALL_OFFLOAD_COMPONENTS = (
+    LAYERWISE_OFFLOAD_DIT_GROUP,
+    LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
+    LAYERWISE_OFFLOAD_IMAGE_ENCODER_GROUP,
+    LAYERWISE_OFFLOAD_VAE_GROUP,
+)
 
 
 # torch's CPU allocator (mimalloc since 2.13) keeps freed pages in its arenas
@@ -140,6 +154,8 @@ class ServerArgsAutoTuner:
         self.server_args = server_args
         self._explicit_dit_residency = self._has_explicit_dit_residency()
         self._dit_fit_checked = False
+        # memory-rich tier decision, resolved on first use
+        self._all_resident: bool | None = None
 
     def _deployment_config(self) -> ModelDeploymentConfig:
         return self.server_args.pipeline_config.get_model_deployment_config()
@@ -241,13 +257,18 @@ class ServerArgsAutoTuner:
         disable_threshold_gb = self._resolve_keep_resident_min_available_gb(
             deployment_config
         )
-        if (
+        all_resident = self._keeps_all_components_resident()
+        if all_resident or (
             min_available_gb is not None
             and disable_threshold_gb is not None
             and min_available_gb >= disable_threshold_gb
         ):
             changed = []
-            components = set(deployment_config.keep_resident_components)
+            components = set(
+                ALL_OFFLOAD_COMPONENTS
+                if all_resident
+                else deployment_config.keep_resident_components
+            )
             if args.pipeline_config.task_type.is_image_gen():
                 components.add(LAYERWISE_OFFLOAD_DIT_GROUP)
             if (
@@ -712,6 +733,8 @@ class ServerArgsAutoTuner:
         args = self.server_args
         if args.performance_mode != "auto" or current_platform.is_cpu():
             return components
+        if self._keeps_all_components_resident():
+            return []
 
         deployment_config = self._deployment_config()
         threshold_gb = self._resolve_keep_resident_min_available_gb(deployment_config)
@@ -748,6 +771,7 @@ class ServerArgsAutoTuner:
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
             or args.explicit_residency_mode("transformer") is not None
+            or self._keeps_all_components_resident()
         ):
             return False
 
@@ -755,6 +779,66 @@ class ServerArgsAutoTuner:
         if args.performance_mode in deployment_config.dit_layerwise_offload_modes:
             return True
         return self._dit_overflows_device_in_auto(deployment_config)
+
+    def _keeps_all_components_resident(self) -> bool:
+        if self._all_resident is None:
+            self._all_resident = self._fits_all_components_resident()
+        return self._all_resident
+
+    def _fits_all_components_resident(self) -> bool:
+        """Memory-rich auto tier: the least-free GPU holds every weight twice over.
+
+        Sized from the local checkpoint, so overrides, quantization and weights not
+        yet downloaded keep the per-model policy; one request's activations are
+        assumed, so batching and shared host/device pools are excluded too.
+        """
+        args = self.server_args
+        if (
+            args.performance_mode != "auto"
+            or current_platform.is_cpu()
+            or current_platform.is_mps()
+            or current_platform.device_shares_host_memory()
+            or args.batching_max_size > 1
+            or args.quantization is not None
+            or args.transformer_weights_path is not None
+            or _uses_svdquant(args.nunchaku_config)
+            or args.component_paths
+            or args.component_weights_paths
+            or args.component_quantizations
+            or resolve_model_overlay(args.model_path) is not None
+        ):
+            return False
+        available_gb = self._get_min_available_device_memory_gb()
+        if available_gb is None:
+            return False
+        sizes = checkpoint_component_sizes(
+            args.model_path, subfolder=args.model_subfolder, revision=args.revision
+        )
+        if sizes is None:
+            return False
+        weight_bytes = 0
+        for name, (num_params, stored_bytes) in sizes.items():
+            # loaded in the component's configured precision, else as stored
+            dtype = resolve_component_precision(args, name)
+            nbytes = num_params * dtype.itemsize if dtype is not None else stored_bytes
+            # tensor parallelism shards the DiT's linear layers across the ranks
+            weight_bytes += (
+                nbytes / (args.tp_size or 1) if is_dit_component_name(name) else nbytes
+            )
+        weight_gb = weight_bytes / BYTES_PER_GB
+        fits = available_gb >= AUTO_ALL_RESIDENT_WEIGHT_MULTIPLE * weight_gb
+        if fits:
+            logger.info(
+                "Auto memory policy for %s: %.1f GiB free on the least-free "
+                "selected GPU holds the %.1f GiB of weights per GPU at least "
+                "%dx, so every component without an explicit placement stays "
+                "resident.",
+                args.pipeline_config.__class__.__name__,
+                available_gb,
+                weight_gb,
+                AUTO_ALL_RESIDENT_WEIGHT_MULTIPLE,
+            )
+        return fits
 
     def _dit_overflows_device_in_auto(
         self, deployment_config: ModelDeploymentConfig
