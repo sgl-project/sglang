@@ -97,6 +97,7 @@ from sglang.srt.utils import (
     normalize_serialized_named_tensor_payloads,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.utils.sleep_comm import validate_tags
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -163,6 +164,15 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
         error_message=" | ".join(error_messages),
         loaded_adapters=failed[0].loaded_adapters,
     )
+
+
+def _raise_on_memory_occupation_error(results: List) -> None:
+    """The scheduler reports client-caused release/resume rejections in the
+    output payload (raising there would kill the server); re-raise here so
+    the HTTP layer turns them into a 400."""
+    errors = [r.error for r in results if getattr(r, "error", None)]
+    if errors:
+        raise ValueError(errors[0])
 
 
 def _lora_load_needs_cleanup(results: List[LoRAUpdateOutput], lora_name: str) -> bool:
@@ -874,7 +884,12 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.release_memory_occupation_communicator(obj)
+        # Fail fast in this (HTTP-facing) process: tag errors raised here
+        # surface to the caller as an HTTP 400, whereas an exception inside
+        # the scheduler would kill the whole server.
+        validate_tags(obj.tags or [])
+        results = await self.release_memory_occupation_communicator(obj)
+        _raise_on_memory_occupation_error(results)
 
     async def resume_memory_occupation(
         self: TokenizerManager,
@@ -882,7 +897,9 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.resume_memory_occupation_communicator(obj)
+        validate_tags(obj.tags or [])
+        results = await self.resume_memory_occupation_communicator(obj)
+        _raise_on_memory_occupation_error(results)
 
     async def check_weights(
         self: TokenizerManager,

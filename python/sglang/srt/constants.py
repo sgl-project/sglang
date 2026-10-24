@@ -2,7 +2,15 @@
 GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
 GPU_MEMORY_TYPE_WEIGHTS = "weights"
 GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
+# Platform-gated tag: only honored where a platform registered a sleep-comm
+# backend (see sglang.srt.utils.sleep_comm). It releases device-side
+# communication resources and, on those platforms, implies CUDA graph drop +
+# recapture (captured graphs embed comm buffer addresses).
+GPU_MEMORY_TYPE_COMM = "comm"
 
+# Tags every platform can release. Platform-specific tags (see
+# sglang.srt.utils.sleep_comm.tags.PLATFORM_GATED_TAGS) are appended by the
+# platform itself.
 GPU_MEMORY_ALL_TYPES = [
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,

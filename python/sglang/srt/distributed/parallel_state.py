@@ -250,6 +250,33 @@ def reg_all_to_all_single(
     group._all_to_all_single(output, input)
 
 
+@dataclass
+class _DeviceGroupSnapshot:
+    """Resolved parameters needed to rebuild a GroupCoordinator's device_group.
+
+    Snapshotted at the END of GroupCoordinator.__init__, i.e. after every
+    constructor transformation (rank_offset shift, use_local_synchronization
+    derivation, backend resolution), so a rebuild replays final values instead
+    of re-deriving them. Recorded for every group; a platform whose sleep-mode
+    comm cleanup wants to rebuild device groups consumes it through
+    ``can_rebuild_device_group`` / ``destroy_device_group`` /
+    ``rebuild_device_group``.
+    """
+
+    # FULL post-shift subgroup list, not just this rank's own subgroup:
+    # torch.distributed.new_group requires every rank in the world to enter
+    # with the same group list in the same order (group names come from a
+    # process-level counter, so replaying only own subgroups would collide
+    # store prefixes across disjoint subgroups).
+    group_ranks: List[List[int]]
+    backend: str  # resolved torch_distributed_backend (e.g. "hccl")
+    group_name: str  # resolved group_name (defaults to "anonymous")
+    group_desc: str  # f"{group_name}:device"
+    use_local_synchronization: bool  # derived in __init__
+    timeout: Optional[timedelta]  # _MODEL_PARALLEL_GROUP_TIMEOUT at init time
+    pg_options: Optional[Any]  # get_torch_distributed_pg_options(group_name)
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -572,6 +599,28 @@ class GroupCoordinator:
             # Recovered ranks create their mq_broadcaster in elastic_ep.py
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
+            )
+
+        # Snapshot for sleep-mode comm cleanup. Captured here, after all
+        # constructor transformations, so a rebuild replays final values.
+        # Mooncake-backend groups and elastic-EP joiner groups
+        # (recovered_rank / rank_offset > 0) cannot be replayed by the
+        # process-level new_group counter and are excluded.
+        if (
+            "mooncake" in str(torch_distributed_backend)
+            or recovered_rank
+            or rank_offset > 0
+        ):
+            self._device_group_snapshot: Optional[_DeviceGroupSnapshot] = None
+        else:
+            self._device_group_snapshot = _DeviceGroupSnapshot(
+                group_ranks=[list(ranks) for ranks in group_ranks],
+                backend=str(torch_distributed_backend),
+                group_name=group_name,
+                group_desc=f"{group_name}:device",
+                use_local_synchronization=use_local_synchronization,
+                timeout=_MODEL_PARALLEL_GROUP_TIMEOUT,
+                pg_options=get_torch_distributed_pg_options(group_name),
             )
 
     def __repr__(self):
@@ -2109,6 +2158,67 @@ class GroupCoordinator:
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
+    # ------------------------------------------------------------------
+    # Device group lifecycle (used by platform sleep-mode comm cleanup)
+    # ------------------------------------------------------------------
+
+    @property
+    def can_rebuild_device_group(self) -> bool:
+        """Whether this group carries a replayable device group snapshot."""
+        return self._device_group_snapshot is not None
+
+    @property
+    def rebuild_group_ranks(self) -> Optional[List[List[int]]]:
+        """The full subgroup list a rebuild will replay, or None."""
+        if self._device_group_snapshot is None:
+            return None
+        return self._device_group_snapshot.group_ranks
+
+    def destroy_device_group(self) -> bool:
+        """Destroy only the device-side process group, keeping cpu_group.
+
+        cpu_group and mq_broadcaster are intentionally retained by callers
+        that use this: they are a pure CPU/shared-memory control plane holding
+        no device memory, and they serve as the cross-rank control plane while
+        the device group is gone.
+
+        Idempotent: returns False when there is nothing to destroy.
+        """
+        if self._device_group_snapshot is None or self.device_group is None:
+            return False
+        torch.distributed.destroy_process_group(self.device_group)
+        self.device_group = None
+        return True
+
+    def rebuild_device_group(self) -> bool:
+        """Rebuild device_group by replaying the snapshot.
+
+        Idempotent: returns False when the device group is already present.
+        """
+        if self._device_group_snapshot is None or self.device_group is not None:
+            return False
+        spec = self._device_group_snapshot
+        # Replay the FULL subgroup list exactly like __init__ does: every
+        # world rank must enter new_group for every subgroup in the same
+        # order (non-members get NON_GROUP_MEMBER), otherwise group names
+        # (from a process-level counter) collide across disjoint subgroups.
+        for ranks in spec.group_ranks:
+            device_group = torch.distributed.new_group(
+                ranks,
+                backend=spec.backend,
+                pg_options=spec.pg_options,
+                timeout=spec.timeout,
+                group_desc=spec.group_desc,
+                use_local_synchronization=spec.use_local_synchronization,
+            )
+            if self.rank in ranks:
+                self.device_group = device_group
+        assert self.device_group is not None, (
+            f"Group {self.unique_name}: rank {self.rank} not found in "
+            f"rebuild group_ranks={spec.group_ranks}"
+        )
+        return True
+
 
 def _group_coordinator_device(local_rank: int) -> torch.device:
     if is_cuda_alike():
@@ -2129,6 +2239,16 @@ def _group_coordinator_device(local_rank: int) -> torch.device:
 
 
 _WORLD: Optional[GroupCoordinator] = None
+
+
+def get_all_groups() -> List[GroupCoordinator]:
+    """All still-alive registered GroupCoordinators, unsorted."""
+    groups = []
+    for ref in _groups.values():
+        group = ref()
+        if group is not None:
+            groups.append(group)
+    return groups
 
 
 def get_world_group() -> GroupCoordinator:

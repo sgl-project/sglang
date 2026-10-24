@@ -39,6 +39,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
+    get_global_graph_memory_pool,
     set_global_graph_memory_pool,
 )
 from sglang.srt.model_loader.utils import resolve_language_model
@@ -447,6 +448,83 @@ def capture_cuda_graphs(
         finalize_cuda_graph_capture(model_runner)
 
     return CudaGraphsCapture(eager_runner=eager_runner, prefill=prefill, decode=decode)
+
+
+# ----------------------------------------------------------------------
+# Sleep-mode comm cleanup graph lifecycle
+#
+# Captured graphs may embed comm buffer addresses, so destroying device
+# communicators requires destroying the graphs first, and rebuilt comms
+# require graph recapture afterwards. Graph memory is released through the
+# normal free path (torch_memory_saver free included), which is strictly
+# stronger than pausing: physical pages go back to the driver instead of
+# being unmapped.
+#
+# These are optional helpers: a platform's sleep-comm backend decides whether
+# and when to call them.
+# ----------------------------------------------------------------------
+
+
+def drop_cuda_graphs_for_sleep(model_runner: ModelRunner) -> None:
+    """Destroy the prefill+decode graph runners of one model runner.
+
+    The caller (a platform sleep-comm backend) must invoke
+    release_shared_graph_pool() once after ALL runners (target + draft) have
+    been dropped, because the graph memory pool is shared. Forward naturally
+    falls back to eager while the runners are None (guarded in _forward_raw).
+    """
+    current_platform.synchronize()
+    for attr in ("prefill_cuda_graph_runner", "decode_cuda_graph_runner"):
+        runner = getattr(model_runner, attr, None)
+        if runner is None or isinstance(runner, EagerRunner):
+            continue
+        cleanup = getattr(getattr(runner, "backend", None), "cleanup", None)
+        if callable(cleanup):
+            cleanup()
+        setattr(model_runner, attr, None)
+    model_runner.decode_cuda_graph_captured = False
+    model_runner.decode_cuda_graph_capture_bs = []
+
+
+def release_shared_graph_pool(model_runner: ModelRunner) -> None:
+    """Release the shared graph memory pool after all graph runners are gone."""
+    if get_global_graph_memory_pool() is not None:
+        set_global_graph_memory_pool(None)
+    gc.collect()
+    current_platform.empty_cache()
+
+
+def force_eager_graphs(model_runner: ModelRunner) -> None:
+    """Drop any captured (or half-captured) graph runners and pin the runner
+    to eager execution. Used on recapture failure so every rank ends in the
+    same, collective-safe state."""
+    drop_cuda_graphs_for_sleep(model_runner)
+    model_runner.prefill_cuda_graph_runner = model_runner.eager_runner
+
+
+def recapture_cuda_graphs_after_sleep(model_runner: ModelRunner) -> bool:
+    """Recapture prefill+decode graphs after comms have been rebuilt.
+
+    Reuses the runner's own startup entries, so capture, runner assignment
+    and memory/time bookkeeping stay identical to init_cuda_graphs(). The
+    pre-sleep eager_runner, attention backends and graph_shared_output are
+    reused as-is. Used for target model runners; draft workers recapture
+    through their startup entry (draft_worker.init_cuda_graphs()) which
+    wraps the required contexts.
+
+    Returns False on failure: runners stay in the eager fallback and serving
+    remains correct, just without graph replay.
+    """
+    try:
+        model_runner.init_prefill_cuda_graph()
+        model_runner.init_decode_cuda_graph()
+        return True
+    except Exception:
+        logger.exception(
+            "[sleep-comm] CUDA graph recapture failed; falling back to eager."
+        )
+        force_eager_graphs(model_runner)
+        return False
 
 
 def finalize_cuda_graph_capture(model_runner: ModelRunner) -> None:
