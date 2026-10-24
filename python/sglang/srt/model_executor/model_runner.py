@@ -718,6 +718,8 @@ class ModelRunner:
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
         self.maybe_init_expert_backup_client()
+        if self.eplb_manager is not None:
+            self.eplb_manager.on_model_loaded(self.model)
         self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,

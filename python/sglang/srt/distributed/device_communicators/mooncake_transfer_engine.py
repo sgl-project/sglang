@@ -342,6 +342,7 @@ def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
             and get_exec().moe.elastic_ep_backend is not None
         )
         or get_exec().moe.elastic_ep_backend == "mooncake"
+        or get_exec().moe.eplb_async_rebalance
     )
 
     if use_mooncake_te:

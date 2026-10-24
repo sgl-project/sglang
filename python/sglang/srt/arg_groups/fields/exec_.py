@@ -894,6 +894,10 @@ class ExecMoe(msgspec.Struct):
         Optional[int],
         "Number of layers to rebalance per forward pass.",
     ] = None
+    eplb_async_rebalance: A[
+        bool,
+        "Rebalance without stalling forward passes: the placement is computed on a worker thread and expert weights are pulled through the Mooncake transfer engine, one layer installed between two forward passes once every rank has it.",
+    ] = False
     eplb_min_rebalancing_utilization_threshold: A[
         float,
         "Minimum threshold for GPU average utilization to trigger EPLB rebalancing. Must be in the range [0.0, 1.0].",

@@ -790,6 +790,20 @@ def handle_eplb_and_dispatch(server_args: Any):
     if cfg.enable_eplb and cfg.ep_join_mode != "scale":
         assert resolved_view(server_args).ep_size > 1
 
+    if cfg.eplb_async_rebalance:
+        if not cfg.enable_eplb:
+            raise ValueError("--eplb-async-rebalance needs --enable-eplb.")
+        if cfg.elastic_ep_backend is not None:
+            raise ValueError(
+                "--eplb-async-rebalance does not support elastic EP; its "
+                "post-scale rebalance reloads experts from disk between chunks."
+            )
+        if cfg.eplb_rebalance_layers_per_chunk is not None:
+            logger.warning(
+                "--eplb-rebalance-layers-per-chunk is ignored with "
+                "--eplb-async-rebalance, which installs one layer per pass."
+            )
+
 
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)

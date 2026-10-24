@@ -52,6 +52,16 @@ class EPLBManager:
         self._rebalance_disabled_reason = None
         self._rebalance_disabled_logged = False
 
+        self._async_migrator = None
+        self._async_job = None
+        if get_exec().moe.eplb_async_rebalance:
+            from sglang.srt.eplb.eplb_async_migrator import (
+                AsyncExpertMigrator,
+                MooncakeExpertTransport,
+            )
+
+            self._async_migrator = AsyncExpertMigrator(MooncakeExpertTransport())
+
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
         assert (
             get_exec().moe.eplb_rebalance_num_iterations
@@ -73,6 +83,9 @@ class EPLBManager:
         next(self._main_generator)
 
     def reset_generator(self):
+        if self._async_migrator is not None:
+            self._async_migrator.cancel(self._async_job)
+            self._async_job = None
         self._main_generator = self._entrypoint()
 
     def disable_rebalance(self, reason: str):
@@ -110,6 +123,10 @@ class EPLBManager:
             elastic_state.pending_ep_size is not None
             or elastic_state.scale_phase not in ("serving_expanded", "failed")
         ):
+            return
+
+        if self._async_migrator is not None and not is_post_scale_rebalance:
+            yield from self._rebalance_async()
             return
 
         logger.info("[EPLBManager] rebalance start")
@@ -183,6 +200,70 @@ class EPLBManager:
             time_end = time.time()
             msg += f" time={time_end - time_start:.3f}s"
         logger.info(msg)
+
+    def on_model_loaded(self, model: nn.Module):
+        if self._async_migrator is not None:
+            self._async_migrator.prepare(model.routed_experts_weights_of_layer)
+
+    def _rebalance_async(self):
+        logger.info("[EPLBManager] rebalance start (async)")
+        passes = 0
+
+        dump_record_output = get_global_expert_distribution_recorder().dump_record(
+            output_mode="object"
+        )
+        if not self._check_rebalance_needed(
+            dump_record_output["average_utilization_rate_over_window"]
+        ):
+            return
+
+        model = self._get_model()
+        model_config = self._model_config
+        job = self._async_migrator.start(
+            logical_count=dump_record_output["logical_count"],
+            old_metadata=get_global_expert_location_metadata(),
+            routed_experts_weights_of_layer=model.routed_experts_weights_of_layer,
+            compute_placement=lambda count: (
+                ExpertLocationMetadata.compute_placement_by_eplb(model_config, count)
+            ),
+        )
+        self._async_job = job
+
+        while not self._async_migrator.placement_ready(job):
+            yield
+            passes += 1
+
+        new_expert_location_metadata = self._async_migrator.build_metadata(job)
+        self._log_rebalance_layout_before_update(
+            new_expert_location_metadata,
+            update_layer_ids=job.layer_ids,
+        )
+
+        for layer_id in job.layer_ids:
+            self._async_migrator.issue_layer(job, layer_id)
+            while True:
+                yield
+                passes += 1
+                if self._async_migrator.layer_ready(job, layer_id):
+                    break
+            self._async_migrator.install_layer(job, layer_id)
+
+        self._async_job = None
+
+        if get_exec().moe.ep_dispatch_algorithm == "lp":
+            from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+                init_lplb_solvers,
+            )
+
+            init_lplb_solvers(model_config=model_config)
+
+        self._log_rebalance_layout_after_update(update_layer_ids=job.layer_ids)
+        logger.info(
+            "[EPLBManager] rebalance end (async) layers=%d passes=%d wall=%.3fs",
+            len(job.layer_ids),
+            passes,
+            time.time() - job.time_start,
+        )
 
     def _compute_expert_location_metadata(
         self, logical_count, *, broadcast_over_world: bool

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, List, Optional
 
+import msgspec
 import torch
 import torch.distributed
 import torch.nn.functional as F
@@ -57,6 +58,12 @@ def _compute_elastic_expert_layout(
         num_local_physical_experts * effective_ep_size,
         num_local_physical_experts,
     )
+
+
+class EplbPlacement(msgspec.Struct):
+    physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
+    logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
+    logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
 
 
 @dataclass
@@ -174,17 +181,17 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
-    def init_by_eplb(
+    def compute_placement_by_eplb(
         model_config: ModelConfig,
         logical_count: torch.Tensor,
         *,
         use_flat_topology: bool = False,
-    ):
+        moe_ep_rank: Optional[int] = None,
+    ) -> Optional[EplbPlacement]:
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
         if len(logical_count.shape) == 2:
             logical_count = logical_count.unsqueeze(0)
-        logical_count = logical_count.to(get_device().device)
 
         common = ExpertLocationMetadata._init_common(model_config)
 
@@ -213,11 +220,64 @@ class ExpertLocationMetadata:
             )
         )
 
+        logical_to_rank_dispatch_physical_map = None
+        if get_exec().moe.ep_dispatch_algorithm == "static":
+            logical_to_rank_dispatch_physical_map = (
+                compute_logical_to_rank_dispatch_physical_map(
+                    logical_to_all_physical_map=logical_to_all_physical_map,
+                    ep_size=common["ep_size"],
+                    num_physical_experts=num_physical_experts,
+                    ep_rank=(
+                        moe_ep_rank
+                        if moe_ep_rank is not None
+                        else torch.distributed.get_rank() % common["ep_size"]
+                    ),
+                    device=logical_to_all_physical_map.device,
+                )
+            )
+
+        return EplbPlacement(
+            physical_to_logical_map=physical_to_logical_map,
+            logical_to_all_physical_map=logical_to_all_physical_map,
+            logical_to_rank_dispatch_physical_map=logical_to_rank_dispatch_physical_map,
+        )
+
+    @staticmethod
+    def init_by_eplb(
+        model_config: ModelConfig,
+        logical_count: torch.Tensor,
+        *,
+        use_flat_topology: bool = False,
+    ):
+        if not isinstance(logical_count, torch.Tensor):
+            logical_count = torch.tensor(logical_count)
+        logical_count = logical_count.to(get_device().device)
+
+        placement = ExpertLocationMetadata.compute_placement_by_eplb(
+            model_config,
+            logical_count,
+            use_flat_topology=use_flat_topology,
+        )
+        if placement is None:
+            return None
+        return ExpertLocationMetadata.init_by_placement(
+            placement,
+            ep_size=ExpertLocationMetadata._init_common(model_config)["ep_size"],
+        )
+
+    @staticmethod
+    def init_by_placement(placement: EplbPlacement, *, ep_size: int):
+        device = get_device().device
         return ExpertLocationMetadata._init_raw(
-            ep_size=common["ep_size"],
-            physical_to_logical_map=physical_to_logical_map.to(get_device().device),
-            logical_to_all_physical_map=logical_to_all_physical_map.to(
-                get_device().device
+            ep_size=ep_size,
+            physical_to_logical_map=placement.physical_to_logical_map.to(device),
+            logical_to_all_physical_map=placement.logical_to_all_physical_map.to(
+                device
+            ),
+            logical_to_rank_dispatch_physical_map=(
+                None
+                if placement.logical_to_rank_dispatch_physical_map is None
+                else placement.logical_to_rank_dispatch_physical_map.to(device)
             ),
         )
 
@@ -270,6 +330,7 @@ class ExpertLocationMetadata:
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
         moe_ep_rank: Optional[int] = None,
+        logical_to_rank_dispatch_physical_map: Optional[torch.Tensor] = None,
     ):
 
         _, num_physical_experts = physical_to_logical_map.shape
@@ -292,18 +353,22 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             ep_size=ep_size,
             logical_to_rank_dispatch_physical_map=(
-                compute_logical_to_rank_dispatch_physical_map(
-                    logical_to_all_physical_map=logical_to_all_physical_map,
-                    ep_size=ep_size,
-                    num_physical_experts=num_physical_experts,
-                    ep_rank=(
-                        moe_ep_rank
-                        if moe_ep_rank is not None
-                        else torch.distributed.get_rank() % ep_size
-                    ),
+                logical_to_rank_dispatch_physical_map
+                if logical_to_rank_dispatch_physical_map is not None
+                else (
+                    compute_logical_to_rank_dispatch_physical_map(
+                        logical_to_all_physical_map=logical_to_all_physical_map,
+                        ep_size=ep_size,
+                        num_physical_experts=num_physical_experts,
+                        ep_rank=(
+                            moe_ep_rank
+                            if moe_ep_rank is not None
+                            else torch.distributed.get_rank() % ep_size
+                        ),
+                    )
+                    if get_exec().moe.ep_dispatch_algorithm == "static"
+                    else None
                 )
-                if get_exec().moe.ep_dispatch_algorithm == "static"
-                else None
             ),
         )
 
@@ -615,11 +680,13 @@ def compute_logical_to_rank_dispatch_physical_map(
     num_physical_experts: int,
     ep_rank: int,
     seed: int = 42,
+    device: Optional[torch.device] = None,
 ):
 
     r = random.Random(seed)
 
-    device = logical_to_all_physical_map.device
+    if device is None:
+        device = logical_to_all_physical_map.device
     logical_to_all_physical_map = logical_to_all_physical_map.cpu()
 
     num_local_gpu_physical_experts = num_physical_experts // ep_size
