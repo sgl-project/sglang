@@ -2636,6 +2636,148 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertEqual(finish_reason["type"], "tool_calls")
 
+    def _tool_choice_response(self, choice, *, stream=False, parser=None, tools=True):
+        self.chat.tool_call_parser = parser
+        payload = '[{"name":"get_weather","parameters":{"location":"Tokyo"}}]'
+        if parser:
+            payload = (
+                '<tool_call>{"name":"get_weather",'
+                '"arguments":{"location":"Tokyo"}}</tool_call>'
+            )
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather?"}],
+            tools=(
+                [{"type": "function", "function": {"name": "get_weather"}}]
+                if tools
+                else None
+            ),
+            tool_choice=choice,
+            stream=stream,
+        )
+        if not stream:
+            result = _spec_result(0)
+            result["text"] = payload
+            response = self.chat._build_chat_response(request, [result], created=0)
+            choice_data = response.choices[0].model_dump()
+            choice_data["delta"] = choice_data.pop("message")
+            return [choice_data], payload
+
+        async def generate():
+            for end in (len(payload) // 2, len(payload)):
+                result = _spec_result(0)
+                result["text"] = payload[:end]
+                if end < len(payload):
+                    result["meta_info"]["finish_reason"] = None
+                yield result
+
+        self.tm.generate_request.return_value = generate()
+        chunks = self._parse_chunks(self._run_chat_stream(None, request))
+        self.assertFalse(any("error" in chunk for chunk in chunks))
+        return [choice for chunk in chunks for choice in chunk["choices"]], payload
+
+    def _assert_weather_tool_response(self, choices):
+        calls = [
+            call
+            for choice in choices
+            for call in (choice["delta"].get("tool_calls") or [])
+        ]
+        self.assertEqual(
+            [
+                call["function"]["name"]
+                for call in calls
+                if call["function"].get("name")
+            ],
+            ["get_weather"],
+        )
+        self.assertEqual({call["index"] for call in calls}, {0})
+        self.assertEqual(
+            json.loads("".join(call["function"]["arguments"] or "" for call in calls)),
+            {"location": "Tokyo"},
+        )
+        self.assertFalse(any(choice["delta"].get("content") for choice in choices))
+        self.assertEqual(choices[-1]["finish_reason"], "tool_calls")
+
+    def test_required_tool_choice_without_parser_non_streaming(self):
+        """Required JSON output must become tool calls instead of plain content."""
+        choices, _ = self._tool_choice_response("required")
+        self._assert_weather_tool_response(choices)
+
+    def test_required_tool_choice_without_parser_streaming(self):
+        """Required JSON fragments must become tool deltas and finish as tool_calls."""
+        choices, _ = self._tool_choice_response("required", stream=True)
+        self._assert_weather_tool_response(choices)
+
+    def test_named_tool_choice_without_parser(self):
+        named = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))
+        choices, _ = self._tool_choice_response(named)
+        self._assert_weather_tool_response(choices)
+
+    def test_tool_choice_without_parser_streaming_keeps_logprobs(self):
+        """The JSON fallback may consume deltas; their logprobs must still be sent once."""
+        self.chat.tool_call_parser = None
+        self.chat.reasoning_parser = None
+        payload = '[{"name":"get_weather","parameters":{"location":"Tokyo"}}]'
+        named = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))
+        for choice in ("required", named):
+            with self.subTest(choice=choice):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Weather?"}],
+                    tools=[{"type": "function", "function": {"name": "get_weather"}}],
+                    tool_choice=choice,
+                    stream=True,
+                    logprobs=True,
+                )
+
+                async def generate():
+                    for n, end in enumerate((len(payload) // 2, len(payload)), 1):
+                        result = _spec_result(0)
+                        result["text"] = payload[:end]
+                        result["meta_info"].update(
+                            finish_reason=None if n == 1 else {"type": "stop"},
+                            output_token_logprobs=[(-0.1, 1, "a"), (-0.2, 2, "b")][:n],
+                            output_top_logprobs=[],
+                            output_token_logprobs_length=n,
+                        )
+                        yield result
+
+                self.tm.generate_request.return_value = generate()
+                chunks = self._parse_chunks(self._run_chat_stream(None, request))
+                self.assertFalse(any("error" in chunk for chunk in chunks))
+                choices = [c for chunk in chunks for c in chunk["choices"]]
+                self._assert_weather_tool_response(choices)
+                self.assertEqual(
+                    [
+                        token["token"]
+                        for c in choices
+                        for token in (c.get("logprobs") or {}).get("content") or []
+                    ],
+                    ["a", "b"],
+                )
+
+    def test_tool_choice_with_native_parser_control(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                choices, _ = self._tool_choice_response(
+                    "auto", stream=stream, parser="hermes"
+                )
+                self._assert_weather_tool_response(choices)
+
+    def test_tool_choice_plain_content_controls(self):
+        for choice, tools in (("auto", True), ("none", True), ("required", False)):
+            for stream in (False, True):
+                with self.subTest(choice=choice, tools=tools, stream=stream):
+                    choices, payload = self._tool_choice_response(
+                        choice, stream=stream, tools=tools
+                    )
+                    self.assertEqual(
+                        "".join(c["delta"].get("content") or "" for c in choices),
+                        payload,
+                    )
+                    self.assertFalse(any(c["delta"].get("tool_calls") for c in choices))
+                    self.assertEqual(choices[-1]["finish_reason"], "stop")
+
     def test_iquest_release_tool_modes_through_streaming_serving(self):
         self.chat.tool_call_parser = "iquest_q1"
         self.chat.reasoning_parser = "iquest_q1"
