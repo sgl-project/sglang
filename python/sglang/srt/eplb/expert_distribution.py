@@ -206,7 +206,30 @@ class ExpertDistributionRecorder(ABC):
 
 
 class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
-    pass
+    """Recorder used when `expert_distribution_recorder_mode` is unset.
+
+    The endpoint-triggered actions are explicit no-ops with a warning, so
+    calling the expert-distribution endpoints without a recorder mode no
+    longer raises out of the scheduler request loop and terminates the
+    engine (https://github.com/sgl-project/sglang/issues/42222).
+    """
+
+    def _warn_disabled(self, endpoint: str):
+        logger.warning(
+            "Ignoring %s request: expert distribution recording is disabled "
+            "because ServerArgs.expert_distribution_recorder_mode is not set.",
+            endpoint,
+        )
+
+    def start_record(self):
+        self._warn_disabled("start_expert_distribution_record")
+
+    def stop_record(self):
+        self._warn_disabled("stop_expert_distribution_record")
+
+    def dump_record(self, output_mode: _OutputMode = "file"):
+        self._warn_disabled("dump_expert_distribution_record")
+        return None
 
 
 class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
