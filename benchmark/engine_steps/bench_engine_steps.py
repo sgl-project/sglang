@@ -14,8 +14,6 @@ records the server.
 
 Prefill profiling starts after every rank warms up in a separate request burst;
 its JSON control bounds are not the captured step range, which comes from the trace.
---prefill-completions saves raw measured completions before scoring, including
-partial completions on request failure. This diagnostic file is not a valid result.
 
   python bench_engine_steps.py prefill --base-url URL --dp 4 --tokens-per-step 8192
   python bench_engine_steps.py decode --base-url URL --dp 8 --batch-per-rank 64
@@ -66,10 +64,8 @@ def step_groups(times, size):
 
 
 def group_window(groups, lo, hi):
-    """(t0, t1, items, ms between group ends) of the groups that end between the lo
-    and hi fractions of all items."""
-    if not groups or not 0 <= lo < hi <= 1:
-        raise SystemExit("need step groups and 0 <= --lo < --hi <= 1")
+    """(t0, t1): the ends of the first and last groups that end between the lo and
+    hi fractions of all items."""
     total, cum, ends = sum(c for _, c in groups), 0, []
     for end, c in groups:
         cum += c
@@ -78,8 +74,7 @@ def group_window(groups, lo, hi):
     j = max((k for k, (_, c) in enumerate(ends) if c <= hi * total), default=-1)
     if j <= i:
         raise SystemExit(f"no whole step between the {lo} and {hi} fractions")
-    gaps = [(b[0] - a[0]) * 1000 for a, b in zip(ends[i:j], ends[i + 1 : j + 1])]
-    return ends[i][0], ends[j][0], ends[j][1] - ends[i][1], gaps
+    return ends[i][0], ends[j][0]
 
 
 def log_steps(lines, mode, t0, t1, size, tol=None):
@@ -142,6 +137,11 @@ def log_steps(lines, mode, t0, t1, size, tol=None):
     return check
 
 
+def steps_blurred(group_ms):
+    median = statistics.median(group_ms)
+    return any(not 0.6 * median <= ms <= 1.6 * median for ms in group_ms)
+
+
 def gpu_count(info, dp, explicit=None):
     """Attention DP partitions TP; ordinary DP replicates the TP/PP group."""
     replicas = info.get("dp_size", 1)
@@ -170,7 +170,7 @@ def check_cache(meta, new_tokens):
     return new
 
 
-def check_logs(check, result, size, dp, blurred):
+def check_logs(check, result, size, dp):
     """Every error voids the cross-check and fails the run."""
     per_rank = check["ms_per_step_per_rank"]
     errors = []
@@ -187,11 +187,6 @@ def check_logs(check, result, size, dp, blurred):
         errors.append(
             "engine lines miss part of the window on some rank; set SGLANG_LOG_MS=1 "
             "(and --enable-metrics for prefill) on the server"
-        )
-    if blurred:
-        errors.append(
-            "decode steps stray past 0.6-1.6x their median: streamed chunks blur the "
-            "step boundaries at this step length, so ms/step is unreliable"
         )
     if per_rank:
         check["ms_per_step"] = statistics.mean(per_rank.values())
@@ -467,41 +462,14 @@ async def prefill(args, tp, prompt):
     n_warmup = args.warmup_steps * per_step
     await batch(args, tp, prompt, n_warmup, params, [], "warmup", check_prefix=True)
     done = []
-    drained = False
-    try:
-        await batch(
-            args, tp, prompt, args.requests, params, done, "measured", check_prefix=True
-        )
-        drained = True
-    finally:
-        # Write only after all timed tasks are joined, never in the timed path.
-        # Preserve evidence before any scoring guard can reject the run.
-        if path := getattr(args, "prefill_completions", None):
-            with open(path, "w") as f:
-                json.dump(
-                    {
-                        "schema_version": 1,
-                        "phase": "measured_prefill",
-                        "requests_drained": drained,
-                        "validation": "not_evaluated",
-                        "columns": [
-                            "arrival_time_s",
-                            "scheduler_time_s",
-                            "new_tokens",
-                            "rank",
-                        ],
-                        "completions": done,
-                    },
-                    f,
-                )
-                f.write("\n")
+    await batch(
+        args, tp, prompt, args.requests, params, done, "measured", check_prefix=True
+    )
     stamp = "scheduler" if all(s for _, s, _, _ in done) else "arrival"
     times = [s if stamp == "scheduler" else t for t, s, _, _ in done]
     # The window comes from all completions; steps from each rank's own ends, since
     # one rank's ends can trail another's and split a step shared across ranks.
-    T0, T1, _, _ = group_window(
-        step_groups(times, per_step * args.dp), args.lo, args.hi
-    )
+    T0, T1 = group_window(step_groups(times, per_step * args.dp), args.lo, args.hi)
     spans, rank_steps, per_rank, group_ms = [], [], [], []
     for r in range(args.dp):
         mine = [(t, n) for t, (_, _, n, rr) in zip(times, done) if rr == r]
@@ -641,21 +609,12 @@ OPTIONS = [  # flag, type, default, help
     ("--hi", float, 0.9, "prefill: window end, as a fraction of completions"),
     ("--profile-steps", int, 0, "profile this many steps after the window"),
     ("--profile-dir", str, "/tmp/engine_steps_profile", "profile output directory"),
+    ("--profile-activities", str, None, "e.g. GPU (default: the server's)"),
     ("--timeout", float, 600, "seconds a stalled server gets before the run fails"),
     ("--seed", int, 0, "seed of the random ids"),
     ("--out", str, None, "write the JSON record here"),
-    (
-        "--prefill-completions",
-        str,
-        None,
-        "save raw prefill completions before validation",
-    ),
 ]
-WORKLOAD = [
-    flag[2:].replace("-", "_")
-    for flag, *_ in OPTIONS
-    if flag not in ("--out", "--prefill-completions")
-]
+WORKLOAD = [flag[2:].replace("-", "_") for flag, *_ in OPTIONS if flag != "--out"]
 
 
 def main():
@@ -669,6 +628,7 @@ def main():
     ap.add_argument("--server-log", nargs="+", default=[], help="logs to cross-check")
     ap.add_argument("--sample-gpu", action="store_true", help="local SM clock, power")
     ap.add_argument("--no-flush", action="store_true", help="keep the server's cache")
+    ap.add_argument("--profile-no-stack", action="store_true", help="skip stacks")
     if "--engine" in sys.argv:
         from sglang.srt.server_args import ServerArgs
 
@@ -701,6 +661,10 @@ def main():
     nc, B = args.new_tokens, args.tokens_per_step
     args.requests = args.requests or min(math.ceil(31 * B / nc), 512)
     args.profile = dict(output_dir=args.profile_dir, num_steps=args.profile_steps)
+    if args.profile_activities:
+        args.profile["activities"] = args.profile_activities.split(",")
+    if args.profile_no_stack:
+        args.profile["with_stack"] = False
     if args.engine:
         from sglang.srt.server_args import ServerArgs
 
@@ -791,16 +755,18 @@ def run_benchmark(args, tp):
             res[key + "_median"] = statistics.median(float(x) for x in col)
     lines = [line for path in args.server_log for line in open(path, errors="replace")]
     tol = min(res["group_ms"]) / 4000 if res["stamp"] == "scheduler" else None
-    median = statistics.median(res["group_ms"])
-    blurred = args.mode == "decode" and any(
-        not 0.6 * median <= ms <= 1.6 * median for ms in res["group_ms"]
-    )
     check = {}
     if args.server_log:
         # Prefill steps carry the engine's batch, not --tokens-per-step: match any size
         fixed = None if args.mode == "prefill" else size
         check = log_steps(lines, args.mode, *res["wall"], fixed, tol)
-        check = check_logs(check, res, fixed, args.dp, blurred)
+        check = check_logs(check, res, fixed, args.dp)
+    errors = check.get("errors", [])
+    if args.mode == "decode" and steps_blurred(res["group_ms"]):
+        errors = errors + [
+            "decode steps stray past 0.6-1.6x their median: streamed chunks blur the "
+            "step boundaries at this step length, so ms/step is unreliable"
+        ]
     record = dict(
         mode=args.mode,
         transport="engine" if args.engine else "http",
@@ -809,6 +775,7 @@ def run_benchmark(args, tp):
         workload={k: getattr(args, k) for k in WORKLOAD},
         result=res,
         cross_check=check,
+        errors=errors,
         server_info=info,
         **environment(),
     )
@@ -821,12 +788,12 @@ def run_benchmark(args, tp):
         print(
             f"engine log: {check['ms_per_step']:.2f} ms/step, {check['diff_pct']:+.2f}%"
         )
-    for error in check.get("errors", []):
+    for error in errors:
         print(f"ERROR: {error}")
     if args.out:
         with open(args.out, "w") as f:
             json.dump(record, f, indent=1, default=str)
-    if check.get("agree") is False:
+    if errors:
         raise SystemExit(1)
 
 

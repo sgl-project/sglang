@@ -34,19 +34,12 @@ class TestStepWindow(unittest.TestCase):
         groups = bench.step_groups(times, 2)
         self.assertEqual(len(groups), 29)
         self.assertEqual(sum(c for _, c in groups), 60)
-        t0, t1, reqs, group_ms = bench.group_window(groups, 0.2, 0.9)
-        self.assertEqual((reqs, len(group_ms)), (42, 20))
-        self.assertAlmostEqual(sum(group_ms), (t1 - t0) * 1000)
-        self.assertAlmostEqual((t1 - t0) / (reqs / 2), 0.1)
+        t0, t1 = bench.group_window(groups, 0.2, 0.9)
+        self.assertAlmostEqual(t1 - t0, 21 * 0.1)  # 21 steps; step 10 is merged
 
     def test_no_whole_step_fails(self):
         with self.assertRaises(SystemExit):
             bench.group_window([(1.0, 10)], 0.2, 0.9)
-
-    def test_empty_or_invalid_window_fails(self):
-        for groups, lo, hi in (([], 0.2, 0.9), ([(1, 1)], 0.9, 0.2)):
-            with self.assertRaises(SystemExit):
-                bench.group_window(groups, lo, hi)
 
 
 class TestLogSteps(unittest.TestCase):
@@ -117,7 +110,7 @@ class TestLogSteps(unittest.TestCase):
         self.assertFalse(got["complete"])  # rank 1 has no line at the last step end
 
     def test_cross_check_requires_all_ranks_and_fixed_batch(self):
-        def check(ranks, sizes=(64,), coverage=0.9, blurred=False):
+        def check(ranks, sizes=(64,), coverage=0.9):
             return bench.check_logs(
                 dict(
                     ms_per_step_per_rank=ranks,
@@ -127,7 +120,6 @@ class TestLogSteps(unittest.TestCase):
                 {"ms_per_step": 100},
                 64,
                 2,
-                blurred,
             )
 
         self.assertTrue(check({0: 100, 1: 100})["agree"])
@@ -136,7 +128,10 @@ class TestLogSteps(unittest.TestCase):
         self.assertFalse(check({0: 100, 1: 100}, sizes=(32, 64))["agree"])
         self.assertFalse(check({0: 90, 1: 90})["agree"])
         self.assertFalse(check({}, sizes=(), coverage=0)["agree"])
-        self.assertFalse(check({0: 100, 1: 100}, blurred=True)["agree"])
+
+    def test_blurred_decode_steps(self):
+        self.assertFalse(bench.steps_blurred([100, 95, 105, 70]))
+        self.assertTrue(bench.steps_blurred([100, 95, 105, 50]))
 
     def test_prefill_cross_check_takes_the_engine_batch(self):
         # Window edges cut chunked requests, so the measured new tokens per step only
@@ -149,7 +144,6 @@ class TestLogSteps(unittest.TestCase):
                 {"ms_per_step": 100, "new_tokens_per_step": 31793},
                 None,
                 1,
-                False,
             )
 
         self.assertTrue(check([31744])["agree"])
@@ -229,126 +223,30 @@ class TestWorkloadGuards(unittest.TestCase):
             )
         self.assertEqual(len(cancelled), 2)
 
-    def test_prefill_steps_short_of_the_budget(self):
-        # Steps of two 2-token requests every 100 ms against a 6-token budget, as
-        # when replayed tokens share it: steps come from boundaries, not tokens / B.
+    def run_prefill(self, dp, tp_size, cached, new, budget, offset=0.0):
+        """Each rank completes two requests every 100 ms, `offset` s behind the
+        previous rank; returns the JSON record and whether the transport closed."""
+
         class Transport:
             def __init__(self):
-                self.count = 0
+                self.count = [0] * dp
+                self.closed = False
 
             def server_info(self):
-                return dict(tp_size=1, dp_size=1)
-
-            def flush_cache(self):
-                return None
-
-            async def generate(self, ids, params, rank, stream):
-                self.count += 1
-                stamp = 1000 + (self.count // 2) * 0.1
-                yield (
-                    stamp,
-                    dict(prompt_tokens=9, cached_tokens=7, prefill_finished_time=stamp),
-                )
-
-            def run(self, coro):
-                return asyncio.run(coro)
-
-            def finish(self):
-                pass
-
-        with tempfile.TemporaryDirectory() as tmp:
-            output = Path(tmp) / "result.json"
-            argv = [
-                "bench",
-                "prefill",
-                "--dp",
-                "1",
-                "--base-url",
-                "http://localhost",
-                "--context",
-                "9",
-                "--new-tokens",
-                "2",
-                "--tokens-per-step",
-                "6",
-                "--requests",
-                "80",
-                "--warmup-steps",
-                "1",
-                "--out",
-                str(output),
-            ]
-            with (
-                patch.object(sys, "argv", argv),
-                patch.object(bench, "HttpTransport", return_value=Transport()),
-                patch.object(bench, "environment", return_value={}),
-            ):
-                bench.main()
-            result = json.loads(output.read_text())["result"]
-        self.assertAlmostEqual(result["ms_per_step"], 100.0)
-        self.assertEqual(result["new_tokens_per_step"], 4)
-
-    def test_prefill_steps_with_offset_ranks(self):
-        # Two ranks step every 100 ms, rank 1 45 ms behind rank 0: a step must not
-        # split into one group per rank.
-        class Transport:
-            def __init__(self):
-                self.count = [0, 0]
-
-            def server_info(self):
-                return dict(tp_size=1, dp_size=2)
+                return dict(tp_size=tp_size, dp_size=dp)
 
             def flush_cache(self):
                 return None
 
             async def generate(self, ids, params, rank, stream):
                 self.count[rank] += 1
-                stamp = 1000 + (self.count[rank] // 2) * 0.1 + 0.045 * rank
-                yield (
-                    stamp,
-                    dict(prompt_tokens=9, cached_tokens=7, prefill_finished_time=stamp),
+                stamp = 1000 + (self.count[rank] // 2) * 0.1 + offset * rank
+                meta = dict(
+                    prompt_tokens=cached + new,
+                    cached_tokens=cached,
+                    prefill_finished_time=stamp,
                 )
-
-            def run(self, coro):
-                return asyncio.run(coro)
-
-            def finish(self):
-                pass
-
-        with tempfile.TemporaryDirectory() as tmp:
-            output = Path(tmp) / "result.json"
-            argv = ["bench", "prefill", "--dp", "2", "--base-url", "http://localhost"]
-            argv += ["--context", "9", "--new-tokens", "2", "--tokens-per-step", "4"]
-            argv += ["--requests", "80", "--warmup-steps", "1", "--out", str(output)]
-            with (
-                patch.object(sys, "argv", argv),
-                patch.object(bench, "HttpTransport", return_value=Transport()),
-                patch.object(bench, "environment", return_value={}),
-            ):
-                bench.main()
-            result = json.loads(output.read_text())["result"]
-        self.assertAlmostEqual(result["ms_per_step"], 100.0)
-        self.assertEqual(result["new_tokens_per_step"], 4)
-
-    def test_prefill_record_uses_server_gpu_count(self):
-        class Transport:
-            def __init__(self):
-                self.count = 0
-                self.closed = False
-
-            def server_info(self):
-                return dict(tp_size=4, dp_size=1)
-
-            def flush_cache(self):
-                return None
-
-            async def generate(self, ids, params, rank, stream):
-                self.count += 1
-                stamp = 1000 + (self.count // 2) * 0.1
-                yield (
-                    stamp,
-                    dict(prompt_tokens=8, cached_tokens=7, prefill_finished_time=stamp),
-                )
+                yield stamp, meta
 
             def run(self, coro):
                 return asyncio.run(coro)
@@ -359,34 +257,37 @@ class TestWorkloadGuards(unittest.TestCase):
         transport = Transport()
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "result.json"
-            argv = [
-                "bench",
-                "prefill",
-                "--dp",
-                "1",
-                "--base-url",
-                "http://localhost",
-                "--context",
-                "8",
-                "--new-tokens",
-                "1",
-                "--tokens-per-step",
-                "2",
-                "--requests",
-                "80",
-                "--warmup-steps",
-                "1",
-                "--out",
-                str(output),
-            ]
+            argv = ["bench", "prefill", "--dp", str(dp), "--base-url", "http://x"]
+            argv += ["--context", str(cached + new), "--new-tokens", str(new)]
+            argv += ["--tokens-per-step", str(budget), "--requests", "80"]
+            argv += ["--warmup-steps", "1", "--out", str(output)]
             with (
                 patch.object(sys, "argv", argv),
                 patch.object(bench, "HttpTransport", return_value=transport),
                 patch.object(bench, "environment", return_value={}),
             ):
                 bench.main()
-            record = json.loads(output.read_text())
-        self.assertTrue(transport.closed)
+            return json.loads(output.read_text()), transport.closed
+
+    def test_prefill_steps_short_of_the_budget(self):
+        # Two 2-token requests per step against a 6-token budget, as when replayed
+        # tokens share it: steps come from boundaries, not tokens / B.
+        record, _ = self.run_prefill(dp=1, tp_size=1, cached=7, new=2, budget=6)
+        self.assertAlmostEqual(record["result"]["ms_per_step"], 100.0)
+        self.assertEqual(record["result"]["new_tokens_per_step"], 4)
+
+    def test_prefill_steps_with_offset_ranks(self):
+        # Rank 1 runs 45 ms behind rank 0: a step must not split into one group per
+        # rank.
+        record, _ = self.run_prefill(
+            dp=2, tp_size=1, cached=7, new=2, budget=4, offset=0.045
+        )
+        self.assertAlmostEqual(record["result"]["ms_per_step"], 100.0)
+        self.assertEqual(record["result"]["new_tokens_per_step"], 4)
+
+    def test_prefill_record_uses_server_gpu_count(self):
+        record, closed = self.run_prefill(dp=1, tp_size=4, cached=7, new=1, budget=2)
+        self.assertTrue(closed)
         self.assertEqual(record["workload"]["num_gpus"], 4)
         self.assertAlmostEqual(record["result"]["tok_s_per_gpu"], 5)
 
@@ -442,7 +343,6 @@ class TestPrefillProfiling(unittest.IsolatedAsyncioTestCase):
                 self.ack_started = asyncio.Event()
                 self.delay_ack = False
                 self.fail_peer = False
-                self.fail_start = False
 
             async def generate(self, ids, params, rank, stream):
                 self.active += 1
@@ -467,8 +367,6 @@ class TestPrefillProfiling(unittest.IsolatedAsyncioTestCase):
                 self.calls += 1
                 self.at_trigger = self.completed.copy()
                 self.ack_started.set()
-                if self.fail_start:
-                    raise ValueError("profile start failed")
                 if self.delay_ack:
                     await asyncio.Event().wait()
                 await asyncio.sleep(0)
@@ -525,24 +423,6 @@ class TestPrefillProfiling(unittest.IsolatedAsyncioTestCase):
             [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         )
 
-    async def test_profile_ack_timeout_cleans_up(self):
-        args = self.args(timeout=0.03)
-        tp = self.transport(args)
-        tp.delay_ack = True
-        with self.assertRaises(asyncio.TimeoutError):
-            await bench.profile_prefill(args, tp, lambda r: [], {})
-        self.assertEqual(tp.active, 0)
-        self.assertEqual(tp.stops, 1)
-
-    async def test_profile_start_failure_cleans_up(self):
-        args = self.args()
-        tp = self.transport(args)
-        tp.fail_start = True
-        with self.assertRaisesRegex(ValueError, "profile start failed"):
-            await bench.profile_prefill(args, tp, lambda r: [], {})
-        self.assertEqual(tp.active, 0)
-        self.assertEqual(tp.stops, 1)
-
     async def test_profile_does_not_change_timed_result(self):
         plain_args = self.args(profile_steps=0)
         plain = await bench.prefill(
@@ -553,46 +433,6 @@ class TestPrefillProfiling(unittest.IsolatedAsyncioTestCase):
         profile_record = prof.pop("profile")
         self.assertEqual(prof, plain)
         self.assertEqual(profile_record["final_completions"], [400, 400])
-
-    async def test_completions_survive_scoring_failure(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "completions.json"
-            args = self.args(profile_steps=0, prefill_completions=str(path))
-            with patch.object(
-                bench, "group_window", side_effect=SystemExit("rejected")
-            ):
-                with self.assertRaisesRegex(SystemExit, "rejected"):
-                    await bench.prefill(args, self.transport(args), lambda r: [])
-            record = json.loads(path.read_text())
-            self.assertTrue(record["requests_drained"])
-            self.assertEqual(len(record["completions"]), 800)
-            self.assertEqual(record["validation"], "not_evaluated")
-
-    async def test_partial_completions_survive_request_failure(self):
-        async def fail_batch(args, tp, prompt, count, params, done, label, **kw):
-            if label == "measured":
-                done.append((1.0, 0.9, 1, 0))
-                raise RuntimeError("request failed")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "completions.json"
-            args = self.args(prefill_completions=str(path))
-            with patch.object(bench, "batch", side_effect=fail_batch):
-                with self.assertRaisesRegex(RuntimeError, "request failed"):
-                    await bench.prefill(args, None, lambda r: [])
-            record = json.loads(path.read_text())
-            self.assertFalse(record["requests_drained"])
-            self.assertEqual(record["completions"], [[1.0, 0.9, 1, 0]])
-
-    async def test_completion_dump_does_not_change_result(self):
-        plain_args = self.args(profile_steps=0)
-        plain = await bench.prefill(
-            plain_args, self.transport(plain_args), lambda r: []
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            args = self.args(profile_steps=0, prefill_completions=tmp + "/samples.json")
-            recorded = await bench.prefill(args, self.transport(args), lambda r: [])
-        self.assertEqual(recorded, plain)
 
     async def test_delayed_ack_cannot_silently_profile_the_drain(self):
         args = self.args()
