@@ -1459,12 +1459,13 @@ class Scheduler(
             # 2: execute, make sure a reply is always sent
             items = self.get_next_batch_to_run()
             if not items:
+                release_wait_s = None
                 if (
                     release_cache_if_idle is not None
                     and not self.waiting_queue
                     and not self._inflight_finalizes
                 ):
-                    release_cache_if_idle()
+                    release_wait_s = release_cache_if_idle()
                 if self.waiting_queue and self._dynamic_batching_enabled():
                     oldest_ts = self.waiting_queue[0][2]
                     elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
@@ -1483,6 +1484,23 @@ class Scheduler(
                             self._poller.poll(timeout=1)
                     else:
                         time.sleep(0.001)
+                elif (
+                    not self.waiting_queue
+                    and self.receiver is not None
+                    and not self._is_multi_rank()
+                    and self.server_args.sleep_on_idle
+                ):
+                    # Wait instead of spinning a core. Multi rank replicas keep
+                    # spinning because their other ranks time their idle cache
+                    # release by this loop's iterations.
+                    with self._socket_lock:
+                        self._poller.poll(
+                            timeout=(
+                                1000
+                                if release_wait_s is None
+                                else min(release_wait_s * 1000.0, 1000)
+                            )
+                        )
                 continue
 
             if self.metrics is not None:
