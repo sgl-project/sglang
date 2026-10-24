@@ -469,24 +469,37 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_m3_effort_from_template_kwargs_is_normalized(self):
         """An effort sent in chat_template_kwargs or set by the server is normalized
-        like the top-level one instead of reaching the template as is."""
+        like the top-level one, and a server default never overrides thinking the
+        request turned off."""
         self.chat.is_minimax_m3 = True
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         user = [{"role": "user", "content": "Hi?"}]
+        enabled = {"thinking_mode": "enabled"}
+        # (request fields, server defaults, rendered effort, rendered thinking_mode):
+        # the request's own settings outrank the server defaults, which fill gaps.
         cases = (
-            ({"chat_template_kwargs": {"reasoning_effort": "none"}}, {}, None),
-            ({}, {"reasoning_effort": "none"}, None),
+            (
+                {"chat_template_kwargs": {"reasoning_effort": "none"}},
+                {},
+                None,
+                "disabled",
+            ),
+            ({}, {"reasoning_effort": "none"}, None, "disabled"),
+            ({"chat_template_kwargs": {"reasoning_effort": "high"}}, {}, "high", None),
+            ({"thinking": {"type": "disabled"}}, enabled, None, "disabled"),
+            ({"reasoning_effort": "none"}, enabled, None, "disabled"),
+            ({}, {**enabled, "reasoning_effort": "high"}, "high", "enabled"),
         )
-        for fields, server_defaults, rendered in cases:
+        for fields, server_defaults, effort, mode in cases:
             self.chat.default_chat_template_kwargs = server_defaults
             request = ChatCompletionRequest(model="x", messages=user, **fields)
             self.chat._convert_to_internal_request(request, self.fastapi_request)
             kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
             with self.subTest(fields=fields, server_defaults=server_defaults):
-                self.assertEqual(kwargs.get("reasoning_effort"), rendered)
-                self.assertEqual(kwargs["thinking_mode"], "disabled")
+                self.assertEqual(kwargs.get("reasoning_effort"), effort)
+                self.assertEqual(kwargs.get("thinking_mode"), mode)
         self.chat.default_chat_template_kwargs = {}
 
     def test_m3_tool_results_render_in_call_order(self):
