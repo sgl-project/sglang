@@ -1,9 +1,19 @@
+import logging
+
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.kernels.gdn_aiter_prefill import (
+    FUSED as AITER_GDN_PREFILL_FUSED,
+)
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_hip, is_npu, is_xpu
+
+logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
@@ -37,11 +47,73 @@ elif is_xpu():
     )
 
 
+_AITER_GDN_PREFILL = None
+_AITER_GDN_PREFILL_UNAVAILABLE = False
+
+
+def _aiter_gdn_prefill_requested() -> bool:
+    return envs.SGLANG_USE_AITER.get() and envs.SGLANG_AITER_GDN_PREFILL.get()
+
+
+def _aiter_gdn_prefill():
+    """AITER's chunked prefill, or None if it cannot be used.
+
+    Opt-in: SGLANG_USE_AITER plus SGLANG_AITER_GDN_PREFILL. It replaces the five
+    Triton FLA prefill kernels with either the opt_vk stages (fused FlyDSL
+    prepare, a tuned hidden-state kernel, the VK output kernel) or, with
+    SGLANG_AITER_GDN_PREFILL_H=fused, one FlyDSL kernel for the whole chunk loop.
+    """
+    global _AITER_GDN_PREFILL, _AITER_GDN_PREFILL_UNAVAILABLE
+    if _AITER_GDN_PREFILL is not None or _AITER_GDN_PREFILL_UNAVAILABLE:
+        return _AITER_GDN_PREFILL
+    if not _aiter_gdn_prefill_requested():
+        _AITER_GDN_PREFILL_UNAVAILABLE = True
+        return None
+    try:
+        from sglang.srt.layers.attention.linear.kernels.gdn_aiter_prefill import (
+            AiterGDNPrefill,
+        )
+
+        _AITER_GDN_PREFILL = AiterGDNPrefill(envs.SGLANG_AITER_GDN_PREFILL_H.get())
+    except ImportError as exc:
+        logger.info("aiter opt_vk GDN prefill unavailable (%s); keeping Triton", exc)
+        _AITER_GDN_PREFILL_UNAVAILABLE = True
+    return _AITER_GDN_PREFILL
+
+
+def _fill_track_state_from_h(
+    h: torch.Tensor,
+    track_state: torch.Tensor,
+    track_chunk_idx: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    """Copy each sequence's tracked chunk-start state out of the per-chunk ``h``.
+
+    ``h`` is [1, total_chunks, H, V, K] with each sequence's chunks contiguous;
+    rows with ``track_chunk_idx < 0`` receive an arbitrary chunk and are never
+    read. Index math stays on the device so the copy does not sync the stream.
+    """
+    seq_lens = query_start_loc[1:] - query_start_loc[:-1]
+    num_chunks = (seq_lens + 63) // 64
+    first_chunk = torch.cumsum(num_chunks, 0) - num_chunks
+    src = (first_chunk + track_chunk_idx.clamp(min=0)).clamp(max=h.shape[1] - 1)
+    track_state.copy_(h[0].index_select(0, src.long()))
+
+
 class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+
+    def __init__(self):
+        # The AITER fused prefill writes the fp32 track snapshot in-kernel; any
+        # batch it declines falls back to a kernel whose h fills the snapshot.
+        self.supports_track_state_snapshot = (
+            _is_hip
+            and _aiter_gdn_prefill_requested()
+            and envs.SGLANG_AITER_GDN_PREFILL_H.get() == AITER_GDN_PREFILL_FUSED
+        )
 
     def packed_decode(
         self,
@@ -178,7 +250,44 @@ class TritonGDNKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         inplace_update: bool = True,
+        seq_lens_cpu: list[int] | None = None,
+        track_state: torch.Tensor | None = None,
+        track_chunk_idx: torch.Tensor | None = None,
         **kwargs,
+    ) -> tuple:
+        o, last_state, h = self._extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            inplace_update=inplace_update,
+            seq_lens_cpu=seq_lens_cpu,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
+        )
+        if track_state is not None and h is not None:
+            _fill_track_state_from_h(h, track_state, track_chunk_idx, query_start_loc)
+        return o, last_state, h
+
+    def _extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        inplace_update: bool,
+        seq_lens_cpu: list[int] | None,
+        track_state: torch.Tensor | None,
+        track_chunk_idx: torch.Tensor | None,
     ) -> tuple:
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
@@ -199,6 +308,30 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # The external NPU kernel does not expose the optional write-back
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
+        elif (
+            _is_hip
+            and inplace_update
+            and seq_lens_cpu is not None
+            and len(seq_lens_cpu) == query_start_loc.numel() - 1
+            and ssm_states.is_contiguous()
+            and _aiter_gdn_prefill() is not None
+        ):
+            out = _aiter_gdn_prefill().extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                seq_lens_cpu=seq_lens_cpu,
+                track_state=track_state,
+                track_chunk_idx=track_chunk_idx,
+            )
+            if out is not None:
+                o, h = out
+                return o, None, h
 
         return chunk_gated_delta_rule(
             q=q,
