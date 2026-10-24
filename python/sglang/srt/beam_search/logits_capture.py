@@ -42,6 +42,25 @@ class BeamLogitsCapture(msgspec.Struct):
     tail_normalizer: Optional[torch.Tensor] = None
 
 
+def _copy_leader_rows(tensor: torch.Tensor, rows: List[int]) -> torch.Tensor:
+    import torch
+
+    if not rows:
+        return tensor[:0].clone()
+    start = rows[0]
+    if all(row == start + index for index, row in enumerate(rows)):
+        return tensor[start : start + len(rows)].clone(
+            memory_format=torch.contiguous_format
+        )
+    if tensor.device.type == "cuda":
+        indices = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(
+            tensor.device, non_blocking=True
+        )
+    else:
+        indices = torch.tensor(rows, dtype=torch.int64, device=tensor.device)
+    return tensor.index_select(0, indices)
+
+
 def capture_pre_sample_logits(
     batch: Optional[ScheduleBatch],
     forward_batch: ForwardBatch,
@@ -64,10 +83,12 @@ def capture_pre_sample_logits(
         leader_rows = [e.leader_idx for e in batch.beam_tail.entries]
         normalizer = logits_output.beam_normalizer
         logits_output.beam = BeamLogitsCapture(
-            leader_logits=logits[leader_rows].clone(),
+            leader_logits=_copy_leader_rows(logits, leader_rows),
             tail_logits=logits[n:],
             leader_normalizer=(
-                normalizer[leader_rows].clone() if normalizer is not None else None
+                _copy_leader_rows(normalizer, leader_rows)
+                if normalizer is not None
+                else None
             ),
             tail_normalizer=(
                 normalizer[n:].clone() if normalizer is not None else None
@@ -84,10 +105,14 @@ def capture_pre_sample_logits(
         if leader_rows:
             normalizer = logits_output.beam_normalizer
             logits_output.beam = BeamLogitsCapture(
-                leader_logits=logits_output.next_token_logits[leader_rows].clone(),
+                leader_logits=_copy_leader_rows(
+                    logits_output.next_token_logits, leader_rows
+                ),
                 leader_rows=leader_rows,
                 leader_normalizer=(
-                    normalizer[leader_rows].clone() if normalizer is not None else None
+                    _copy_leader_rows(normalizer, leader_rows)
+                    if normalizer is not None
+                    else None
                 ),
             )
             logits_output.beam_normalizer = None
