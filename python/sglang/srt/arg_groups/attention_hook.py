@@ -583,6 +583,7 @@ def handle_multi_item_scoring(server_args: Any):
 
 def handle_deterministic_inference(server_args: Any):
     from sglang.srt.server_args import (
+        MLA_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
         RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
     )
 
@@ -645,9 +646,9 @@ def handle_deterministic_inference(server_args: Any):
 
         attention_backend = resolved_view(server_args).attention_backend
         if is_deepseek_model:
-            if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
+            if attention_backend not in MLA_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
                 raise ValueError(
-                    f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with absorbed-MLA models. But you're using {attention_backend}."
+                    f"Currently only {MLA_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with absorbed-MLA models. But you're using {attention_backend}."
                 )
             if attention_backend == "fa4" and not get_platform().is_sm100_or_sm110:
                 raise ValueError(

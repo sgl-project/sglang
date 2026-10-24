@@ -246,7 +246,15 @@ add_deterministic_attention_backend_choices = (
     DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend
 )
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "triton"]
+MLA_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4", "triton"]
+
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = [
+    "ascend",
+    "flashinfer",
+    "fa3",
+    "fa4",
+    "triton",
+]
 add_radix_supported_deterministic_attention_backend_choices = (
     RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend
 )

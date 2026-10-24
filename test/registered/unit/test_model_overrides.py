@@ -1964,6 +1964,15 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 else:
                     self.assertEqual(_deterministic_rocm_rccl_check(view), {})
 
+    def test_deterministic_flashinfer_keeps_radix_cache(self):
+        sa = self._construct(
+            "LlamaForCausalLM",
+            "llama",
+            enable_deterministic_inference=True,
+            attention_backend="flashinfer",
+        )
+        self.assertFalse(self._resolved(sa, "disable_radix_cache"))
+
     def test_dllm_forces_flashinfer_with_cuda_graph(self):
         # CUDA path: cuda graph enabled by default -> dllm forces flashinfer.
         # A real dllm arch: the page pass now runs regardless of the radix

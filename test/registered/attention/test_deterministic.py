@@ -15,16 +15,18 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_xpu_ci,
 )
+from sglang.test.test_deterministic import BenchArgs, test_deterministic
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
 )
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+    DEFAULT_URL_FOR_TEST,
     is_in_amd_ci,
 )
 
-register_cuda_ci(est_time=285, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=385, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=278, suite="stage-b-test-1-gpu-small-amd")
 register_xpu_ci(est_time=207, suite="stage-b-test-1-gpu-xpu")
 
@@ -45,6 +47,25 @@ class TestFlashinferDeterministic(TestDeterministicBase):
             ]
         )
         return args
+
+
+@unittest.skipIf(_is_xpu, "CUDA runner only")
+@unittest.skipIf(is_in_amd_ci(), "Skip for AMD CI.")
+class TestFlashinferDeterministicRadixCache(TestDeterministicBase):
+    @classmethod
+    def get_server_args(cls):
+        return list(COMMON_SERVER_ARGS) + [
+            "--attention-backend",
+            "flashinfer",
+            "--disable-prefill-cuda-graph",
+        ]
+
+    def test_radix_cache(self):
+        args = BenchArgs()
+        args.host, args.port = self._extract_host_and_port(DEFAULT_URL_FOR_TEST)
+        args.test_mode = "radix_cache"
+        results = test_deterministic(args)
+        self.assertEqual(results, [1])
 
 
 @unittest.skipIf(_is_xpu, "CUDA runner only")
