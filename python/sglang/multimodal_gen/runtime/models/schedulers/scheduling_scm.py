@@ -86,6 +86,9 @@ class SCMScheduler(DiffusersSCMScheduler):
         generator: torch.Generator | list[torch.Generator] | None = None,
         return_dict: bool = True,
     ):
+        """One sCM step. ``pred_original_sample`` stays in the ``sigma_data``-scaled
+        TrigFlow space on every step; only the final ``prev_sample`` is divided by
+        ``sigma_data`` for VAE decoding."""
         if self.num_inference_steps is None:
             raise ValueError("Run `set_timesteps` before `step`")
         sigma_data = self.config.sigma_data
