@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.gemm.block_fp8_gemv import block_fp8_gemv, use_block_fp8_gemv
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     is_fp8_fnuz,
@@ -560,6 +561,14 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
+        self.use_block_fp8_gemv = (
+            _is_cuda
+            and get_platform().is_sm90
+            and envs.SGLANG_OPT_HOPPER_BLOCK_FP8_GEMV.get()
+            and not self.use_marlin
+            and not self.use_mxfp8
+            and self.weight_block_size == [128, 128]
+        )
 
     @staticmethod
     def validate_block_quant_shapes(
@@ -1395,6 +1404,15 @@ class Fp8LinearMethod(LinearMethodBase):
                     x.dtype,
                     True,  # is_vnni
                 )
+
+            if (
+                self.use_block_fp8_gemv
+                and isinstance(x, torch.Tensor)
+                and use_block_fp8_gemv(x, layer.weight, layer.weight_scale_inv)
+            ):
+                return block_fp8_gemv(
+                    x, layer.weight, layer.weight_scale_inv, bias
+                ).view(*x.shape[:-1], layer.weight.shape[0])
 
             cached_weight = getattr(layer, "_block_fp8_bf16_weight", None)
             extra_kwargs = (

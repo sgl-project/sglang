@@ -1150,6 +1150,9 @@ class Envs:
     # Cache BF16 expansions of Hopper group32 FP8 weights for larger GEMMs.
     # Disable to save the additional weight memory or allow online updates.
     SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
+    # Single-token decode on Hopper: 128x128 block-FP8 linears run a W8A16 GEMV
+    # instead of activation quant + the block GEMM.
+    SGLANG_OPT_HOPPER_BLOCK_FP8_GEMV = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
