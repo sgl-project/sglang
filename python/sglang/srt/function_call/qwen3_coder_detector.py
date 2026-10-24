@@ -37,8 +37,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
             r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
         )
         self.tool_call_parameter_regex = re.compile(
-            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+            r"<parameter=(.*?)(</parameter>|(?=<parameter=)|(?=</function>)|$)",
             re.DOTALL,
+        )
+        # Constrained decoding only locks the "</parameter" prefix, so a value may close
+        # with "</parameter1>" or a bare "</parameter"; drop once xgrammar#651 is fixed.
+        self.malformed_parameter_end_regex = re.compile(
+            r"</parameter(?!>)[^<>]*>?\s*", re.DOTALL
         )
 
         # Streaming State
@@ -90,6 +95,21 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     return {}
         logger.warning(f"Tool '{func_name}' is not defined in the tools list.")
         return {}
+
+    def _clean_param_value(self, raw_value: str, closed: bool) -> str:
+        # Only a value that no real </parameter> closed can end in a drifted
+        # marker; a properly closed value may itself end in e.g. "</parameters>".
+        if not closed:
+            idx = raw_value.rfind("</parameter")
+            if idx != -1 and self.malformed_parameter_end_regex.fullmatch(
+                raw_value, idx
+            ):
+                raw_value = raw_value[:idx].rstrip()
+        if raw_value.startswith("\n"):
+            raw_value = raw_value[1:]
+        if raw_value.endswith("\n"):
+            raw_value = raw_value[:-1]
+        return raw_value
 
     def _get_param_type(self, param_schema: Any) -> str:
         """Infer the parser conversion type from a JSON schema parameter."""
@@ -206,17 +226,16 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     param_config = self._get_arguments_config(func_name, tools)
                     parsed_params = {}
 
-                    for p_match in self.tool_call_parameter_regex.findall(params_str):
+                    for p_match, p_close in self.tool_call_parameter_regex.findall(
+                        params_str
+                    ):
                         if ">" not in p_match:
                             continue
                         p_idx = p_match.index(">")
                         p_name = p_match[:p_idx]
-                        p_val = p_match[p_idx + 1 :]
-                        # Remove prefixing and trailing \n
-                        if p_val.startswith("\n"):
-                            p_val = p_val[1:]
-                        if p_val.endswith("\n"):
-                            p_val = p_val[:-1]
+                        p_val = self._clean_param_value(
+                            p_match[p_idx + 1 :], closed=bool(p_close)
+                        )
 
                         parsed_params[p_name] = self._convert_param_value(
                             p_val, p_name, param_config, func_name
@@ -338,13 +357,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         param_name = current_slice[
                             len(self.parameter_prefix) : name_end
                         ]
-                        raw_value = rest_of_slice[:end_pos]
-
-                        # Cleanup value
-                        if raw_value.startswith("\n"):
-                            raw_value = raw_value[1:]
-                        if raw_value.endswith("\n"):
-                            raw_value = raw_value[:-1]
+                        raw_value = self._clean_param_value(
+                            rest_of_slice[:end_pos], closed=end_pos == cand_end_param
+                        )
 
                         # JSON Construction
                         if not self.json_started:
