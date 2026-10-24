@@ -91,6 +91,7 @@ impl ChatResponseProcessingStage {
                 "Tokenizer not cached in context - preparation stage may have been skipped",
             )
         })?;
+        let reasoning_started_in_prefill = ctx.state.reasoning_started_in_prefill;
 
         if is_streaming {
             // Streaming: Use StreamingProcessor and return SSE response
@@ -99,6 +100,7 @@ impl ChatResponseProcessingStage {
                 ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
                 dispatch,
                 tokenizer,
+                reasoning_started_in_prefill,
             );
 
             // Attach load guards to response body for proper RAII lifecycle
@@ -135,6 +137,7 @@ impl ChatResponseProcessingStage {
                 tokenizer,
                 stop_decoder,
                 request_logprobs,
+                reasoning_started_in_prefill,
             )
             .await?;
 

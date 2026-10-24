@@ -93,6 +93,9 @@ impl ChatPreparationStage {
             request.no_stop_trim,
         );
 
+        ctx.state.reasoning_started_in_prefill =
+            utils::reasoning_started_in_prefill(&processed_messages.text);
+
         // Store results in context
         ctx.state.preparation = Some(PreparationOutput {
             original_text: Some(processed_messages.text.clone()),
