@@ -40,6 +40,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
     TokenizerManager,
+    _distinct_parallel_bootstrap_rooms,
 )
 from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
@@ -51,6 +52,37 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
+
+
+def test_parallel_sampling_rooms_are_unique_and_keep_dp_placement():
+    seeds, children = _distinct_parallel_bootstrap_rooms(
+        [100, 101, 100, 101], batch_size=2, sample_count=2, dp_size=2
+    )
+    assert children == [100, 101, 102, 103]
+    assert seeds == [104, 105]
+    assert len(set(seeds + children)) == 6
+    assert all(room % 2 == index % 2 for index, room in enumerate(children))
+    assert seeds[0] % 2 == 0 and seeds[1] % 2 == 1
+
+
+def test_parallel_sampling_preserves_explicit_choice_rooms():
+    rooms = [100, 101, 200, 201]
+    seeds, children = _distinct_parallel_bootstrap_rooms(
+        rooms, batch_size=2, sample_count=2, dp_size=1
+    )
+    assert children == rooms
+    assert len(set(seeds + children)) == 6
+
+
+def test_parallel_sampling_normalizes_explicit_choice_rooms():
+    req = GenerateReqInput(
+        text=["first", "second"],
+        sampling_params={"n": 2},
+        bootstrap_room=[100, 101, 200, 201],
+    )
+    req.normalize_batch_and_arguments()
+    assert req.bootstrap_room == [100, 101, 200, 201]
+
 
 # ---------------------------------------------------------------------------
 # Per-request field defaults for BatchStrOutput construction.
@@ -1312,12 +1344,15 @@ class TestLoRARequestLifecycle(CustomTestCase):
             with self.subTest(status_code=status_code):
                 asyncio.run(drive(status_code, expected_exception))
 
-    async def _drive_parallel_request(self, fail_second_warmup=False):
+    async def _drive_parallel_request(
+        self, fail_second_warmup=False, bootstrap_room=None
+    ):
         tm = _make_tm_for_generate(self, enable_lora=True)
         obj = GenerateReqInput(
             text=["first", "second"],
             lora_path="adapter",
             sampling_params={"n": 2, "max_new_tokens": 4},
+            bootstrap_room=bootstrap_room,
         )
         tm._tokenize_one_request = AsyncMock(
             side_effect=lambda req: SimpleNamespace(
@@ -1338,9 +1373,11 @@ class TestLoRARequestLifecycle(CustomTestCase):
         tm._send_one_request = send
         generator = tm.generate_request(obj)
         response = asyncio.create_task(generator.__anext__())
+        rooms = []
         try:
             for i in range(2):
                 warmup = await asyncio.wait_for(sent.get(), timeout=1)
+                rooms.append(warmup.bootstrap_room)
                 self.assertEqual(warmup.lora_id, "adapter")
                 self.assertEqual(warmup.sampling_params.max_new_tokens, 0)
                 reason = None
@@ -1363,6 +1400,7 @@ class TestLoRARequestLifecycle(CustomTestCase):
                 self.assertEqual(tm.lora_registry._counters["adapter"].value(), 4)
                 for remaining in (3, 2, 1, 0):
                     sample = await asyncio.wait_for(sent.get(), timeout=1)
+                    rooms.append(sample.bootstrap_room)
                     await tm._handle_batch_output(_make_batch_str_output(sample.rid))
                     await asyncio.gather(*tm._lora_release_tasks)
                     self.assertEqual(
@@ -1373,6 +1411,7 @@ class TestLoRARequestLifecycle(CustomTestCase):
             await asyncio.gather(*tm._lora_release_tasks)
             self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
             self.assertFalse(tm.rid_to_state)
+            return rooms
         finally:
             response.cancel()
             await asyncio.gather(response, return_exceptions=True)
@@ -1381,6 +1420,11 @@ class TestLoRARequestLifecycle(CustomTestCase):
     def test_parallel_warmups_do_not_release_sample_references(self):
         """Prefix warmups must not let an adapter unload while samples use it."""
         asyncio.run(self._drive_parallel_request())
+
+    def test_parallel_sampling_dispatched_rooms_are_distinct(self):
+        rooms = asyncio.run(self._drive_parallel_request(bootstrap_room=100))
+        self.assertEqual(len(rooms), 6)
+        self.assertEqual(len(set(rooms)), 6)
 
     def test_second_parallel_warmup_failure_releases_all_references(self):
         """A failed warmup must return references even after earlier warmups finish."""

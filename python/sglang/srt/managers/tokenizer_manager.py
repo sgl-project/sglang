@@ -208,6 +208,39 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+_MAX_BOOTSTRAP_ROOM = (1 << 63) - 1
+
+
+def _distinct_parallel_bootstrap_rooms(
+    rooms: List[Optional[int]], batch_size: int, sample_count: int, dp_size: int
+) -> Tuple[List[Optional[int]], List[Optional[int]]]:
+    """Preserve normalized child rooms while giving the prefix seeds new rooms."""
+
+    if len(rooms) != batch_size * sample_count:
+        raise ValueError("parallel bootstrap room count does not match sample count")
+    step = max(dp_size, 1)
+    used: set[int] = set()
+
+    def reserve(room: Optional[int]) -> Optional[int]:
+        if room is None:
+            return None
+        room = int(room)
+        if room < 0 or room > _MAX_BOOTSTRAP_ROOM:
+            raise ValueError("bootstrap room must fit in a signed 63-bit integer")
+        residue = room % step
+        capacity = (_MAX_BOOTSTRAP_ROOM - residue) // step + 1
+        position = (room - residue) // step
+        for offset in range(len(used) + 1):
+            candidate = residue + ((position + offset) % capacity) * step
+            if candidate not in used:
+                used.add(candidate)
+                return candidate
+        raise ValueError("no unused bootstrap room remains for this DP rank")
+
+    child_rooms = [reserve(room) for room in rooms]
+    seed_rooms = [reserve(rooms[i]) for i in range(batch_size)]
+    return seed_rooms, child_rooms
+
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
     watermark = sampling_params.watermark
@@ -2141,6 +2174,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenized_objs = await asyncio.gather(
                 *(self._tokenize_one_request(obj) for obj in objs)
             )
+            seed_rooms, child_rooms = _distinct_parallel_bootstrap_rooms(
+                obj.bootstrap_room,
+                batch_size,
+                obj.parallel_sample_num,
+                self.server_args.dp_size,
+            )
+
+            def set_bootstrap_fields(tmp_obj, tokenized_obj, index, room):
+                for name in (
+                    "bootstrap_host",
+                    "bootstrap_port",
+                    "bootstrap_pair_key",
+                    "decode_tp_size",
+                ):
+                    value = getattr(obj, name)[index]
+                    setattr(tmp_obj, name, value)
+                    setattr(tokenized_obj, name, value)
+                tmp_obj.bootstrap_room = room
+                tokenized_obj.bootstrap_room = room
 
             # Cache the common prefix for parallel sampling
             for i in range(batch_size):
@@ -2150,6 +2202,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tmp_obj.lora_path = None
                 tmp_obj.lora_id = None
                 tokenized_obj = copy.copy(tokenized_objs[i])
+                set_bootstrap_fields(tmp_obj, tokenized_obj, i, seed_rooms[i])
                 # Ensure independent mm_items so wrap_shm_features won't mutate the original
                 if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                     tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
@@ -2177,9 +2230,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for sample_index in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
+                    expanded_index = i + sample_index * batch_size
+                    set_bootstrap_fields(
+                        tmp_obj,
+                        tokenized_obj,
+                        expanded_index,
+                        child_rooms[expanded_index],
+                    )
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
                     if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
                         tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
