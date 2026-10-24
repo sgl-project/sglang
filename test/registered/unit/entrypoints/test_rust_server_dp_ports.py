@@ -28,7 +28,7 @@ def _scheduler_for_typed_config():
             context_len=2048,
             vocab_size=1000,
             is_multimodal=False,
-            hf_config=SimpleNamespace(model_type=None),
+            hf_config=SimpleNamespace(model_type=None, architectures=None),
             get_default_sampling_params=lambda: {},
         ),
         get_init_info=MagicMock(
@@ -40,6 +40,7 @@ def _scheduler_for_typed_config():
             )
         ),
         page_size=16,
+        tree_cache=None,
         rust_server_tokenizer_path=lambda: "tokenizer",
         tokenizer=None,
         max_total_num_tokens=1024,

@@ -381,6 +381,11 @@ mod tests {
             reasoning_parser: Some("reasoner".into()),
             tool_call_parser: Some("tools".into()),
             disaggregation_mode: DisaggregationMode::Prefill,
+            model_config: ModelConfig {
+                model_type: Some("qwen3".into()),
+                architectures: Some(vec!["Qwen3ForCausalLM".into()]),
+                ..Default::default()
+            },
             ..Default::default()
         });
         let app = routes().with_state(state);
@@ -406,6 +411,12 @@ mod tests {
             assert_eq!(body["reasoning_parser"], "reasoner");
             assert_eq!(body["tool_call_parser"], "tools");
             assert_eq!(body["disaggregation_mode"], "prefill");
+            // Python's `/model_info` reports the HF identity under these keys.
+            assert_eq!(body["model_type"], "qwen3");
+            assert_eq!(
+                body["architectures"],
+                serde_json::json!(["Qwen3ForCausalLM"])
+            );
             assert!(body["preferred_sampling_params"].is_null());
         }
     }

@@ -58,12 +58,17 @@ pub(crate) struct CoreMetadata {
     reasoning_parser: Option<String>,
     tool_call_parser: Option<String>,
     disaggregation_mode: DisaggregationMode,
+    model_type: Option<String>,
+    architectures: Option<Vec<String>>,
     max_context_length: u64,
     max_total_num_tokens: u64,
+    num_reserved_tokens: u64,
     version: String,
     host: String,
     port: u16,
     incremental_streaming_output: bool,
+    allow_auto_truncate: bool,
+    skip_tokenizer_init: bool,
     deployment_info: crate::message::config::DeploymentInfo,
     launch_server_info: Arc<serde_json::Map<String, serde_json::Value>>,
 }
@@ -80,12 +85,17 @@ impl From<&ServerArgs> for CoreMetadata {
             reasoning_parser: args.reasoning_parser.clone(),
             tool_call_parser: args.tool_call_parser.clone(),
             disaggregation_mode: args.disaggregation_mode,
+            model_type: args.model_config.model_type.clone(),
+            architectures: args.model_config.architectures.clone(),
             max_context_length: args.model_config.context_len,
             max_total_num_tokens: args.max_total_num_tokens,
+            num_reserved_tokens: args.num_reserved_tokens,
             version: args.version.clone(),
             host: args.host.clone(),
             port: args.port,
             incremental_streaming_output: args.incremental_streaming_output,
+            allow_auto_truncate: args.allow_auto_truncate,
+            skip_tokenizer_init: args.skip_tokenizer_init,
             deployment_info: args.deployment_info.clone(),
             launch_server_info: args.launch_server_info.0.clone(),
         }
@@ -279,6 +289,8 @@ impl CoreHandle {
             reasoning_parser: metadata.reasoning_parser.clone(),
             tool_call_parser: metadata.tool_call_parser.clone(),
             disaggregation_mode: metadata.disaggregation_mode,
+            model_type: metadata.model_type.clone(),
+            architectures: metadata.architectures.clone(),
         }
     }
 
@@ -307,6 +319,7 @@ impl CoreHandle {
             tokenizer_path: metadata.tokenizer_path.clone(),
             max_context_length: metadata.max_context_length,
             max_total_num_tokens: metadata.max_total_num_tokens,
+            num_reserved_tokens: metadata.num_reserved_tokens,
             version: metadata.version.clone(),
             frontend: "rust",
             startup_time: internal_state.rust_server_startup_time.take(),
@@ -315,6 +328,8 @@ impl CoreHandle {
             port: metadata.port,
             incremental_streaming_output: metadata.incremental_streaming_output,
             disaggregation_mode: metadata.disaggregation_mode,
+            allow_auto_truncate: metadata.allow_auto_truncate,
+            skip_tokenizer_init: metadata.skip_tokenizer_init,
             deployment_info: metadata.deployment_info.clone(),
         })
     }

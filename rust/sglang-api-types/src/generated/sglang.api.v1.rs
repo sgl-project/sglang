@@ -876,6 +876,11 @@ pub struct GetModelInfoResponse {
     pub reasoning_parser: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "9")]
     pub tool_call_parser: ::core::option::Option<::prost::alloc::string::String>,
+    /// The HF config's `model_type` and `architectures`.
+    #[prost(string, optional, tag = "10")]
+    pub model_type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "11")]
+    pub architectures: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetServerInfoRequest {}
@@ -891,6 +896,10 @@ pub struct GetServerInfoResponse {
     pub max_context_length: u32,
     #[prost(uint64, optional, tag = "5")]
     pub max_total_num_tokens: ::core::option::Option<u64>,
+    /// Output-token slots each request reserves for speculative draft tokens;
+    /// the server counts them as input when checking a request against max_context_length.
+    #[prost(uint64, tag = "15")]
+    pub num_reserved_tokens: u64,
     #[prost(string, tag = "6")]
     pub version: ::prost::alloc::string::String,
     /// The allowlisted runtime metrics (last_gen_throughput, memory_usage,
@@ -908,6 +917,11 @@ pub struct GetServerInfoResponse {
     pub incremental_streaming_output: bool,
     #[prost(string, tag = "11")]
     pub disaggregation_mode: ::prost::alloc::string::String,
+    /// True: an over-long request is truncated to fit instead of rejected.
+    #[prost(bool, tag = "13")]
+    pub allow_auto_truncate: bool,
+    #[prost(bool, tag = "14")]
+    pub skip_tokenizer_init: bool,
     /// Distributed deployment metadata required by out-of-process orchestrators.
     #[prost(message, optional, tag = "12")]
     pub deployment_info: ::core::option::Option<DeploymentInfo>,

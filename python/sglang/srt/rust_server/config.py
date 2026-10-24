@@ -17,6 +17,8 @@ from sglang.srt.entrypoints.v1_loads import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -38,6 +40,7 @@ from sglang.version import __version__
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.rust_extensions._server import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -95,12 +98,12 @@ def _build_server_args(
         "hicache_ratio": get_memory().hicache_ratio,
         "hicache_size": get_memory().hicache_size,
         "hicache_write_policy": get_memory().hicache_write_policy,
+        "hicache_host_total_tokens": _hicache_host_total_tokens(scheduler.tree_cache),
         # Python's scheduler handshake only computes startup_time after all
         # components have initialized, but the Rust frontend must start earlier
         # to serve the disaggregation bootstrap registry. Read the already-
         # initialized KV publisher directly instead of calling get_init_info()
         # on a partially initialized scheduler.
-        "hicache_host_total_tokens": None,
         "kv_event_sources": scheduler.kv_events_publisher.local_kv_event_sources(
             scheduler.page_size * get_parallel().dcp_size
         ),
@@ -150,6 +153,7 @@ def _build_server_args(
             vocab_size=mc.vocab_size,
             is_multimodal=mc.is_multimodal,
             model_type=getattr(mc.hf_config, "model_type", None),
+            architectures=mc.hf_config.architectures,
             # Resolved default sampling params (generation_config.json when
             # `--sampling-defaults model`, {} otherwise). The rust server
             # consumes these for omitted temperature/top_p in chat
@@ -204,6 +208,20 @@ def _build_server_args(
             else None
         ),
     )
+
+
+def _hicache_host_total_tokens(tree_cache: BasePrefixCache) -> Optional[int]:
+    """The KV host tier's realized token capacity. The tree cache, host pools
+    included, is built before the Rust server launches."""
+    if not get_memory().enable_hierarchical_cache:
+        return None
+    if (
+        not isinstance(tree_cache, UnifiedRadixCache)
+        or tree_cache.host_pool_group is None
+    ):
+        return None
+    kv_entry = tree_cache.host_pool_group.entry_map.get(PoolName.KV)
+    return None if kv_entry is None else kv_entry.host_pool.logical_size
 
 
 def _launch_server_info(scheduler: Scheduler) -> str:

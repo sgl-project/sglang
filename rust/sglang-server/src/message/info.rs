@@ -21,6 +21,8 @@ pub(crate) struct ModelInfo {
     pub(crate) reasoning_parser: Option<String>,
     pub(crate) tool_call_parser: Option<String>,
     pub(crate) disaggregation_mode: DisaggregationMode,
+    pub(crate) model_type: Option<String>,
+    pub(crate) architectures: Option<Vec<String>>,
 }
 
 /// Public server metadata plus scheduler-owned runtime metrics.
@@ -35,6 +37,7 @@ pub(crate) struct ServerInfo {
     pub(crate) tokenizer_path: String,
     pub(crate) max_context_length: u64,
     pub(crate) max_total_num_tokens: u64,
+    pub(crate) num_reserved_tokens: u64,
     pub(crate) version: String,
     pub(crate) frontend: &'static str,
     /// The server's startup phase durations in seconds, Python's
@@ -46,6 +49,8 @@ pub(crate) struct ServerInfo {
     pub(crate) port: u16,
     pub(crate) incremental_streaming_output: bool,
     pub(crate) disaggregation_mode: DisaggregationMode,
+    pub(crate) allow_auto_truncate: bool,
+    pub(crate) skip_tokenizer_init: bool,
     pub(crate) deployment_info: DeploymentInfo,
 }
 
