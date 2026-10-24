@@ -1088,32 +1088,38 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 metadata.swa_mask[:bs, 0, :].copy_(mask)
                 metadata.swa_mask[bs:, :, :].fill_(True)
-        if self.dense_mla_dcp_target:
-            # Use the existing Host lengths for table bounds without a device readback.
-            _, block_tables = self._get_kv_lens_and_block_tables(
-                attention_kv_lens_cpu,
-                req_pool_indices[:bs],
-            )
-        elif self.needs_cpu_seq_lens:
-            block_tables = (
-                self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
-                // self.page_size
-            )
-        else:
+
+            if not self.dense_mla_dcp_target:
+                metadata.block_tables[:bs, :max_seq_pages].copy_(
+                    self.req_to_token[
+                        req_pool_indices[:bs], 0 : max_len : self.page_size
+                    ]
+                    // self.page_size
+                )
+                metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+        elif not self.dense_mla_dcp_target:
             total_pages = min(
                 metadata.block_tables.shape[1],
                 (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
             )
-            block_tables = (
+            metadata.block_tables[:bs, :total_pages].copy_(
                 self.req_to_token[
                     req_pool_indices[:bs],
                     0 : total_pages * self.page_size : self.page_size,
                 ]
                 // self.page_size
             )
-        num_pages = block_tables.shape[1]
-        metadata.block_tables[:bs, :num_pages].copy_(block_tables)
-        metadata.block_tables[:bs, num_pages:].fill_(0)
+            metadata.block_tables[:bs, total_pages:].fill_(0)
+
+        if self.dense_mla_dcp_target:
+            # Use the existing Host lengths for table bounds without a device readback.
+            _, block_tables = self._get_kv_lens_and_block_tables(
+                attention_kv_lens_cpu,
+                req_pool_indices[:bs],
+            )
+            num_pages = block_tables.shape[1]
+            metadata.block_tables[:bs, :num_pages].copy_(block_tables)
+            metadata.block_tables[:bs, num_pages:].fill_(0)
 
         if self.dsa_dcp_target:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
