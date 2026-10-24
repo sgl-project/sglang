@@ -351,6 +351,11 @@ class DiffusionTestCase:
     run_multi_lora_api_check: bool = False
     # Cached MiniMax goldens require its implicit-quality cache mode.
     pin_consistency_quality: bool = True
+    # GT-free checks against other requests to the same server, same seed: the
+    # output must match the request at this quality level ...
+    reference_quality: str | None = None
+    # ... and must change once the server's LoRA adapter is deactivated
+    run_lora_effect_check: bool = False
 
     def __post_init__(self) -> None:
         if self.perf_repeat_requests < 1:
@@ -441,6 +446,17 @@ class DiffusionTestCase:
                 f"{self.id}: run_multi_lora_api_check requires lora_path and second_lora_path"
             )
 
+        if self.run_lora_effect_check and not (has_startup_lora or has_dynamic_lora):
+            raise ValueError(
+                f"{self.id}: run_lora_effect_check requires lora_path or dynamic_lora_path"
+            )
+
+
+# per-key-frame bounds in 0-255 levels: lossless-tier drift is ~1 level, a
+# full-strength LoRA moves tens; the 4x gap keeps a dropped delta out of "match"
+OUTPUT_MATCH_MAX_MEAN_ABS_DIFF = 3.0
+OUTPUT_MATCH_MIN_PSNR = 30.0
+OUTPUT_CHANGE_MIN_MEAN_ABS_DIFF = 12.0
 
 _REALTIME_MODEL_COMMON_EXTRAS = {
     "seed": 42,
@@ -936,6 +952,17 @@ WAN_2_2_ANIMATE_2_14B_sampling_params = DiffusionSamplingParams(
         "clip_len": 37,
         "num_inference_steps": 8,
         "seed": 42,
+    },
+)
+
+# Distilled checkpoint: guidance is folded into the weights, so the request runs the
+# model's 10-step, guidance-1.0 recipe over the same inputs, canvas and clip length.
+WAN_2_2_ANIMATE_2_14B_DISTILLED_sampling_params = replace(
+    WAN_2_2_ANIMATE_2_14B_sampling_params,
+    extras={
+        **WAN_2_2_ANIMATE_2_14B_sampling_params.extras,
+        "num_inference_steps": 10,
+        "guidance_scale": 1.0,
     },
 )
 

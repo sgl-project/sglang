@@ -46,6 +46,12 @@ _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     (
+        "diffusion.fused_packed_swiglu_fp8_rowwise",
+        KernelBackend.TRITON,
+        "quantization.swiglu_fp8_rowwise_triton:fused_packed_swiglu_fp8_rowwise",
+        frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    ),
+    (
         "diffusion.residual_gate_fp32",
         KernelBackend.TRITON,
         "modulate.residual_gate_fp32:residual_gate_fp32",
@@ -274,6 +280,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.head_gate_mul",
+        KernelBackend.TRITON,
+        "modulate.head_gate_triton:head_gate_mul",
+        _CUDA,
+    ),
+    (
         "diffusion.fused_inplace_qknorm_rope",
         KernelBackend.JIT,
         "rope.qknorm_rope_jit:fused_inplace_qknorm_rope",
@@ -343,6 +355,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         "diffusion.rope_rotate_half",
         KernelBackend.TRITON,
         "rope.rope_rotate_half_bitexact:fused_rope_rotate_half_bitexact",
+        _CUDA,
+    ),
+    (
+        "diffusion.flux3_video_qknorm_rope",
+        KernelBackend.TRITON,
+        "rope.flux3_video_qknorm_rope_triton:flux3_video_qknorm_rope",
         _CUDA,
     ),
     (
@@ -612,6 +630,7 @@ for _op, _backend, _target, _caps in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
     "apply_matrix_rope": "rope.matrix_rope",
     "residual_gate_fp32": "modulate.residual_gate_fp32",
     "can_use_fp8_rowwise": "quantization.fp8_rowwise_triton",
@@ -623,8 +642,10 @@ _EXPORTS: dict[str, str] = {
     "can_use_flux2_gated_resnorm": "norm.flux2_gated_resnorm_jit",
     "flux2_gated_resnorm_raw": "norm.flux2_gated_resnorm_jit",
     "FLYDSL_NORM_MIN_ALIGNED_DIM": "norm.fused_residual_norm_flydsl",
+    "can_use_fused_scale_residual_norm_scale_shift_sycl": "norm.scale_residual_norm_scale_shift_sycl",
     "can_use_fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
     "flydsl_fused_residual_norm_scale_shift": "norm.fused_residual_norm_flydsl",
+    "fused_scale_residual_norm_scale_shift_sycl": "norm.scale_residual_norm_scale_shift_sycl",
     "fused_scale_residual_norm_scale_shift_triton": "norm.scale_residual_norm_scale_shift_triton",
     "flydsl_norm_scale_shift": "norm.fused_residual_norm_flydsl",
     "apply_group_norm_silu": "norm.group_norm_silu",
@@ -640,6 +661,10 @@ _EXPORTS: dict[str, str] = {
     "fused_layernorm_modulate_raw": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "fused_qk_head_layernorm": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "is_plain_layer_norm": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
+    "can_defer_xpu_gated_residual": "norm.layernorm_modulate_xpu_triton",
+    "can_use_xpu_layernorm_modulate": "norm.layernorm_modulate_xpu_triton",
+    "xpu_gated_resnorm": "norm.layernorm_modulate_xpu_triton",
+    "xpu_layernorm_modulate": "norm.layernorm_modulate_xpu_triton",
     "rmsnorm_scale": "norm.native_bf16_rmsnorm_triton",
     "rmsnorm_tanh_residual": "norm.native_bf16_rmsnorm_triton",
     "norm_infer": "norm.norm_triton",
@@ -695,6 +720,8 @@ _EXPORTS: dict[str, str] = {
     "indexed_gate_fp32_": "modulate.indexed_modulation_triton",
     "indexed_scale_shift_fp32_": "modulate.indexed_modulation_triton",
     "ltx2_ada_values9": "modulate.ltx2_ada_values_triton",
+    "can_use_head_gate_mul": "modulate.head_gate_triton",
+    "head_gate_mul": "modulate.head_gate_triton",
     "can_use_modulate_scale_shift_cuda": "modulate.modulate_scale_shift_jit",
     "modulate_scale_shift": "modulate.modulate_scale_shift_jit",
     "modulate_scale_shift_cuda": "modulate.modulate_scale_shift_jit",
@@ -727,6 +754,8 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_rope_rotate_half_fp32": "rope.rope_rotate_half_fp32",
     "fused_rope_rotate_half_fp32": "rope.rope_rotate_half_fp32",
     "fused_rope_rotate_half_bitexact": "rope.rope_rotate_half_bitexact",
+    "can_use_flux3_video_qknorm_rope": "rope.flux3_video_qknorm_rope_triton",
+    "flux3_video_qknorm_rope": "rope.flux3_video_qknorm_rope_triton",
     "fused_interleaved_rope_fp64": "rope.interleaved_rope_fp64_jit",
     "fused_inplace_helios_qk_rope": "rope.helios_qk_rope_jit",
     "apply_rotary_embedding": "rope.rotary_triton",
