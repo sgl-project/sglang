@@ -15,7 +15,7 @@ When using the diffusers backend, `--attention-backend` is passed through to dif
 `set_attention_backend` (e.g., `flash`, `_flash_3_hub`, `sage`, `xformers`, `native`).
 
 - **CUDA**: prefers FlashAttention (FA3/FA4) when supported; otherwise falls back to PyTorch SDPA. On SM100/B200, dense non-causal fp16/bf16 native attention prefers cuDNN SDPA and falls back to FA4 if cuDNN has no compatible kernel.
-- **ROCm**: uses FlashAttention when available; otherwise falls back to PyTorch SDPA.
+- **ROCm**: AITER is the default. gfx1250 can explicitly select Gluon FAv3 for compatible BF16/FP16 dense attention; unsupported dense Gluon contracts fall back to AITER, while shared masked-attention routing may use SDPA.
 - **Intel XPU**: uses XPU Flash Attention backend (fp16/bf16, head sizes 64/96/128/192/256); otherwise falls back to PyTorch SDPA.
 - **MUSA**: uses FlashAttention when available; also supports Sage Attention when installed; otherwise falls back to PyTorch SDPA.
 - **MPS**: always uses PyTorch SDPA.
@@ -103,6 +103,11 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`aiter`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`AITER`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Requires <code>aiter</code>.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`gluon_fa`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)", whiteSpace: "nowrap"}}>`GLUON_FA`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Dense gfx1250 Gluon/Triton FAv3. Supports non-causal BF16/FP16 MHA with head dimensions 64, 128, and 256 and rectangular Q/KV lengths. It selects stable pipeline/ping-pong kernels generally and a BF16/D128 persistent short-KV schedule when 257–512 K/V tokens fit in LDS and the resulting grid fills the device. Unsupported dtype, head, causal, dropout, or GQA contracts that reach this backend use AITER; shared masked-attention routing may use SDPA.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>aiter_sage</code></td>
@@ -782,6 +787,16 @@ Hybrid window attention constraints:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Requires <code>aiter</code>.</td>
     </tr>
 <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>gluon_fa</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>gfx1250 only. Uses the in-tree Gluon FAv3 kernel for BF16/FP16 non-causal MHA with head dimensions 64, 128, and 256. The backend falls back to AITER for unsupported dense contracts; shared masked-attention routing may use SDPA.</td>
+    </tr>
+<tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`sparse_video_gen_2_attn`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>No</td>
@@ -851,6 +866,123 @@ sglang generate \
   --prompt "..." \
   --attention-backend torch_sdpa
 ```
+
+### Gluon FlashAttention
+
+The `gluon_fa` backend selects a Gluon FlashAttention implementation for the GPU.
+Its current implementation is FA3 for gfx1250; this hardware restriction applies
+to the kernel implementation, not to Gluon itself.
+
+On AMD ROCm with a gfx1250 GPU, select `gluon_fa` explicitly for dense,
+non-causal BF16 or FP16 multi-head attention with head dimension 64, 128, or
+256. Q, K, and V must have matching batch and head counts in BSHD layout; query and K/V
+sequence lengths can differ. The optimized path requires zero dropout and
+a contiguous head dimension. Unsupported dense contracts use AITER, while
+shared masked-attention routing may use SDPA.
+
+You need a Triton build with Gluon `amd.cdna5` support, including the TDM
+`async_load_fused`, `update_tensor_descriptor`, and `prefetch` APIs used by
+the persistent kernel. The `gfx1250-rocm1000` stage in
+[`docker/rocm.Dockerfile`](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile)
+pins the validated Triton revision
+`76940ad348795521b3dc9f6c79acd7309ff924e3`. Check compiler compatibility
+before comparing performance across ROCm images.
+
+For example, select the backend for the public Wan2.2 T2V checkpoint on one
+GPU:
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --num-gpus 1 \
+  --prompt "A cat walking on a sunny beach, gentle waves." \
+  --attention-backend gluon_fa
+```
+
+Gluon accumulates scores, softmax state, and outputs in FP32. Dispatch depends on
+tensor geometry, layout, and device occupancy:
+
+- Head dimension 256 and small grids use the four-wave pipeline.
+- Other grids that fill the device use the eight-wave ping-pong kernel.
+- Contiguous BF16/D128 workloads with 257–512 K/V tokens can use persistent K/V
+  reuse when the resulting grid fills the device. Noncontiguous inputs use
+  ping-pong instead.
+- FP16 pipelines drain pending TDM loads before consuming K/V. Automatic FP16
+  pipeline selection uses the default scheduler; explicit scheduler overrides
+  retain the full waits.
+
+#### Numerical contract
+
+Let `a = softmax_scale * log2(e)`. All modes round probabilities to nearest,
+ties to even, before the probability/value matrix product (PV). The table
+distinguishes those rounded probabilities from the FP32 denominator.
+
+| Numerical mode | Prerequisites and bounds | Softmax and probability rounding | Graph replay |
+| --- | --- | --- | --- |
+| Online (`online`) | All supported BF16/FP16 head dimensions; also the final guarded fallback. | Subtract the running maximum before scaling. Rescale FP32 accumulators as the maximum changes. PV uses input-dtype probabilities; the denominator sums unrounded FP32 probabilities. | No data-dependent guard. |
+| Persistent (`persistent`) | Contiguous BF16/D128, 257–512 K/V tokens, and a valid persistent launch. | Subtract one maximum across all cached keys before scaling. PV uses BF16 probabilities; the denominator sums unrounded FP32 probabilities. | No data-dependent guard. |
+| Norm-bounded fixed shift (inside `guarded`) | Every Q/K row has squared L2 norm at most `(32/a) * (1 - 1e-4)`. Every V magnitude is zero or in `[2^-32, 2^64]`. | Use `exp2(score*a - 32)`, with exponent arguments in `[-64, 0]`. PV and the FP32 denominator use the same rounded BF16 probabilities. | Clear and recompute Q/K/V guard flags on every replay. |
+| Element-bounded fused exponent (inside `guarded`) | The norm route is unavailable, but every Q/K magnitude is at most `sqrt(1024/(128*a)) * (1 - 1e-5)`. | Use an online maximum and a fused scaled subtraction. PV uses BF16 probabilities; the denominator sums unrounded FP32 probabilities. | Recompute the guards on every replay; use online subtraction if this bound fails too. |
+
+Automatic `guarded` policy is limited to BF16/D128 ping-pong, both sequence
+lengths at least 65,536, K/V length below `2^31`, and the default scale
+`128**-0.5`. An explicit launch configuration uses the stable schedule without
+these automatic guards. Nonfinite Q/K values reject both bounded routes;
+nonfinite V values reject the norm route. Guard fallback does not sanitize
+nonfinite inputs or make overflowing FP32 dot products finite.
+
+The device flags `NORM_UNSAFE` and `FUSED_EXP_UNSAFE` describe independent
+failed checks. A passing norm check takes priority even if the element bound
+fails, as can happen with sparse rows. The two bounded algorithms share a JIT
+entry point; the online fallback has its own entry point to preserve register
+allocation.
+
+The `resolve_execution_policy` helper in
+`sglang.kernels.ops.attention.gluon.fa3.gfx1250.policy` reports the effective
+launch configuration, scale, and numerical mode after layout fallback.
+Supplying `num_cus` allows inspection with CPU or meta tensors. A reported
+`guarded` mode describes the available GPU routes; it does not read inputs or
+cache the route chosen for a particular tensor's values.
+
+#### Upstream validation
+
+The host policy and adapter checks are registered in the existing upstream
+`stage-a-test-1-gpu-small-amd` and `nightly-amd-1-gpu` suites. They can run on
+the existing AMD runners without compiling gfx1250 kernels.
+
+Numerical tests are registered in upstream's `nightly-amd-1-gpu-mi45x` suite,
+alongside the existing MI45x tests. The checked-in workflows currently do not
+consume that suite; the ROCm image workflow documents the missing MI450 runner
+pool. Recurring gfx1250 execution therefore remains an upstream CI
+infrastructure dependency. Host tests and API availability probes do not
+establish GPU compiler compatibility.
+
+Run the numerical suite on gfx1250 when changing these kernels or updating the
+supported Triton/ROCm image. It includes independent FP64 comparisons, guard
+boundaries, graph replay with mutated inputs, and repeated FP16 storage-offset
+regressions. Its CI entry point fails on the wrong architecture instead of
+reporting an entirely skipped run as success. From a source checkout in the
+supported ROCm environment:
+
+```bash
+python test/registered/amd/test_gluon_fa_policy.py
+python test/registered/amd/test_gluon_fa3_gfx1250.py
+```
+
+These tests do not require model weights or generation. On a shared development
+host, run them through the site's GPU lock wrapper.
+
+#### Compilation
+
+Sequence lengths and softmax scale are JIT compile-time constants. A new
+resolution, frame count, prompt length, or scale can trigger a separate
+compilation; repeated calls reuse cached binaries.
+
+For one Wan2.2-T2V-A14B request at 720×1280 with 193 frames, the latent token
+count is `49 × 45 × 80 = 176400`. Dense self-attention uses
+`B1/Sq176400/Sk176400/H40/D128`, and text cross-attention uses
+`B1/Sq176400/Sk512/H40/D128`. SGLang runs the conditional and unconditional
+CFG branches in separate calls, so CFG alone does not make these B2 shapes.
 
 ### Override one component
 
@@ -1008,5 +1140,7 @@ sglang generate \
 
 ### Notes for ROCm / MPS
 
-- ROCm: use `--attention-backend torch_sdpa` or `fa` depending on what is available in your environment. On gfx1151 / Strix Halo (wave32), do **not** use `aiter` — prefer `torch_sdpa` (image sets `SGLANG_USE_AITER=0`).
+- ROCm gfx1250: `aiter` remains the automatic default. Select `--attention-backend gluon_fa` explicitly for compatible dense BF16/FP16 attention with head dimension 64, 128, or 256.
+- Other ROCm GPUs: `aiter` is the automatic default.
+- ROCm gfx1151 / Strix Halo (wave32): do **not** use `aiter`; prefer `torch_sdpa` (the image sets `SGLANG_USE_AITER=0`).
 - MPS: the platform implementation always uses `torch_sdpa`.
