@@ -77,6 +77,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         store.is_mla_backend = True
         store.pp_rank = pp_rank
         store.pp_size = pp_size
+        store.dcp_size = 1
         store.config_prefix = "tag_my-model"
         store.should_split_heads = False
         store.enable_storage_metrics = False
@@ -478,7 +479,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         controller.get_attn_cp_rank_and_size = lambda: (0, 1)
         with (
             get_context().override_server_args(tp_size=2, pp_size=1),
-            get_parallel().override(tp_rank=0, pp_rank=0),
+            get_parallel().override(tp_rank=0, pp_rank=0, attn_dcp_rank=0),
         ):
             config = controller._generate_storage_config()
         self.assertTrue(config.is_mla_model)
