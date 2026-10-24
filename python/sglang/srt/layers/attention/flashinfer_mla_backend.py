@@ -40,6 +40,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -345,6 +346,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         seq_lens = forward_batch.seq_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
+        ragged_layout = forward_batch.ragged_verify_layout
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
@@ -386,7 +388,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     backend="auto",
                 )
                 self.prefill_cuda_graph_metadata[
-                    self._verify_graph_key(bs, spec_info)
+                    self._verify_graph_key(bs, ragged_layout)
                 ] = prefill_wrapper
                 self.forward_metadata = PrefillMetadata(prefill_wrapper, False)
             else:
@@ -402,6 +404,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
                 seq_lens_cpu=seq_lens_cpu,
                 in_capture=True,
+                ragged_verify_layout=ragged_layout,
             )
             if forward_mode.is_target_verify() and (
                 spec_info is None
@@ -419,6 +422,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
+                ragged_verify_layout=ragged_layout,
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -528,13 +532,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         }
 
     @staticmethod
-    def _verify_graph_key(bs: int, spec_info: Optional[SpecInput]):
+    def _verify_graph_key(bs: int, ragged_layout: Optional[RaggedVerifyLayout]):
         """bs for uniform graphs; token tier for ragged (tiers share slot
         counts but each graph must replay its own recorded plan buffers)."""
-        layout = spec_info.ragged_verify_layout if spec_info is not None else None
-        if layout is None:
+        if ragged_layout is None:
             return bs
-        return ("ragged", layout.graph_num_tokens)
+        return ("ragged", ragged_layout.graph_num_tokens)
 
     def _apply_cuda_graph_metadata(
         self,
@@ -547,6 +550,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         in_capture: bool = False,
+        *,
+        ragged_verify_layout: Optional[RaggedVerifyLayout],
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -593,6 +598,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             fast_verify_plan_kwargs = self._build_fast_verify_plan_kwargs(
                 bs=bs,
                 spec_info=spec_info,
+                ragged_verify_layout=ragged_verify_layout,
                 seq_lens_cpu=seq_lens_cpu,
                 in_capture=in_capture,
             )
@@ -605,7 +611,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=None,
                 prefill_wrapper_paged=self.prefill_cuda_graph_metadata[
-                    self._verify_graph_key(bs, spec_info)
+                    self._verify_graph_key(bs, ragged_verify_layout)
                 ],
                 use_ragged=False,
                 spec_info=spec_info,
@@ -635,6 +641,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         *,
         bs: int,
         spec_info: Optional[SpecInput],
+        ragged_verify_layout: Optional[RaggedVerifyLayout],
         seq_lens_cpu: Optional[torch.Tensor],
         in_capture: bool,
     ) -> Optional[dict]:
@@ -666,10 +673,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             return None
         if spec_info.spec_input_type != SpecInputType.DFLASH_VERIFY:
             return None
-        if (
-            spec_info.ragged_verify_layout is not None
-            or spec_info.custom_mask is not None
-        ):
+        if ragged_verify_layout is not None or spec_info.custom_mask is not None:
             return None
         if get_parallel().dcp_enabled:
             return None

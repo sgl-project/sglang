@@ -560,6 +560,7 @@ def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
         req_pool_indices=torch.arange(2, dtype=torch.int64),
         seq_lens=torch.ones(2, dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
+        ragged_verify_layout=None,
         spec_info=None,
         positions=torch.arange(2, dtype=torch.int64),
         out_cache_loc=torch.arange(2, dtype=torch.int64),
@@ -598,6 +599,7 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
         req_pool_indices=torch.arange(2, dtype=torch.int64),
         seq_lens=torch.ones(2, dtype=torch.int32),
         forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        ragged_verify_layout=None,
         spec_info=SimpleNamespace(
             num_tokens_per_req=4,
             num_accept_tokens=ExplodingAcceptTokens(),
@@ -664,7 +666,9 @@ def _assert_reads_only_current_pages(backend, v2p, bs=2):
         )
 
 
-def _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req):
+def _graph_batch(
+    seq_lens, forward_mode, spec_info, tokens_per_req, ragged_verify_layout=None
+):
     seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
     bs = seq_lens.numel()
     return SimpleNamespace(
@@ -674,6 +678,7 @@ def _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req):
         seq_lens_cpu=seq_lens.clone(),
         forward_mode=forward_mode,
         spec_info=spec_info,
+        ragged_verify_layout=ragged_verify_layout,
         positions=torch.arange(bs * tokens_per_req, dtype=torch.int64),
         # The window it writes; the reads under test do not depend on its ids.
         out_cache_loc=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
@@ -738,6 +743,7 @@ def _eager_batch(seq_lens, forward_mode, spec_info=None, tokens_per_req=1):
         seq_lens_cpu=seq_lens.clone(),
         forward_mode=forward_mode,
         spec_info=spec_info,
+        ragged_verify_layout=None,
         input_ids=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
         out_cache_loc=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
         extend_seq_lens=seq_lens,
@@ -786,7 +792,7 @@ def _bind_iteration_plan(translator, forward_batch, window=4):
     "forward_mode,spec_info,step_id,tokens_per_req",
     [
         (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
-        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(), 0, 4),
         (ForwardMode.DRAFT_EXTEND_V2, SimpleNamespace(num_tokens_per_req=4), 0, 4),
     ],
     ids=["draft_decode", "target_verify", "draft_extend"],
@@ -825,10 +831,16 @@ def test_unified_ragged_verify_reads_only_this_replays_pages(monkeypatch):
     backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
     backend.is_xqa_impl = False
     monkeypatch.setattr(backend, "_write_ragged_verify_graph_metadata", write_ragged)
-    spec_info = SimpleNamespace(ragged_verify_layout=object())
+    spec_info = SimpleNamespace()
 
     def batch(seq_lens):
-        return _graph_batch(seq_lens, ForwardMode.TARGET_VERIFY, spec_info, 8)
+        return _graph_batch(
+            seq_lens,
+            ForwardMode.TARGET_VERIFY,
+            spec_info,
+            8,
+            ragged_verify_layout=object(),
+        )
 
     # 123 + 7 crosses a page boundary that 123 plus the uniform draft width does not.
     _replay_and_check_every_read(
@@ -844,7 +856,7 @@ def test_unified_ragged_verify_reads_only_this_replays_pages(monkeypatch):
     "forward_mode,spec_info,step_id,tokens_per_req",
     [
         (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
-        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(), 0, 4),
     ],
     ids=["draft_decode", "target_verify"],
 )
@@ -934,6 +946,7 @@ def test_metadata_update_records_inside_cuda_graph():
         req_pool_indices=torch.arange(2, dtype=torch.int64, device=DEVICE),
         seq_lens=torch.tensor([3, 4], dtype=torch.int32, device=DEVICE),
         forward_mode=ForwardMode.DECODE,
+        ragged_verify_layout=None,
         spec_info=None,
         positions=torch.arange(2, dtype=torch.int64, device=DEVICE),
         out_cache_loc=torch.arange(2, dtype=torch.int64, device=DEVICE),
@@ -981,6 +994,7 @@ def test_graph_read_done_event_fences_slot_mutation():
         req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
         seq_lens=torch.tensor([4], dtype=torch.int32, device=DEVICE),
         forward_mode=ForwardMode.DECODE,
+        ragged_verify_layout=None,
         spec_info=None,
         positions=torch.tensor([0], dtype=torch.int64, device=DEVICE),
         out_cache_loc=torch.tensor([3], dtype=torch.int64, device=DEVICE),

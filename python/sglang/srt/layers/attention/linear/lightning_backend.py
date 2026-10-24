@@ -151,6 +151,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             ),
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            ragged_verify_layout=forward_batch.ragged_verify_layout,
         )
         self.forward_metadata = BailingLinearMetadata.prepare_decode(
             metadata.query_start_loc,

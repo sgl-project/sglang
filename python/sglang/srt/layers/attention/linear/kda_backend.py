@@ -1280,7 +1280,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
-        ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        ragged_layout = forward_batch.ragged_verify_layout
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,

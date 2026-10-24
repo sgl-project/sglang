@@ -82,6 +82,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
@@ -625,6 +626,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # Per-request target-verify geometry.
+    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # True for synthetic capture batches; init_new snapshots real request ranges.
@@ -957,6 +960,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
         extend_position_info=None,
         spec_mrope_positions: Optional[torch.Tensor] = None,
         kv_loc_plan: Optional[KVLocPlan] = None,
@@ -1109,6 +1113,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
+            ragged_verify_layout=ragged_verify_layout,
         )
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities,
@@ -2307,6 +2312,7 @@ def build_inner_fb_view(
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         spec_info=forward_batch.spec_info,
+        ragged_verify_layout=forward_batch.ragged_verify_layout,
     )
 
 
