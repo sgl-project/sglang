@@ -542,9 +542,10 @@ class TpModelWorker(BaseTpWorker):
 
     def get_worker_info(self):
         # The runner already reports logical DCP capacity.
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        shard_size = page_interleave_shard_size(allocator)
         kv_capacity = (
-            self.model_runner.effective_logical_max_total_num_tokens
-            * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
+            self.model_runner.effective_logical_max_total_num_tokens * shard_size
         )
         # Not an error: a deployment that never sends max-length requests may
         # want a small pool. Checked here because this is the final served value.
@@ -558,9 +559,13 @@ class TpModelWorker(BaseTpWorker):
                 kv_capacity,
                 self.model_config.context_len,
             )
+        # Admission rounds a prompt up to whole pages and reserves one more page
+        # per shard (PrefillAdder, init_req_max_new_tokens). Keep a page of
+        # headroom so the longest accepted (or auto-truncated) prompt still fits
+        # an empty pool; with page_size 1 this is the former kv_capacity - 1.
         max_req_len = min(
             self.model_config.context_len - 1,
-            kv_capacity - 1,
+            kv_capacity - allocator.page_size * shard_size,
         )
         max_req_input_len = max_req_len - 5
         if self.dllm_algorithm is not None:
