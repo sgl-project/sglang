@@ -170,21 +170,6 @@ pub(super) fn format_json_schema(
     })
 }
 
-/// `logit_bias` as Pydantic's `Dict[str, float]`, once its values are checked to be numbers.
-pub(super) fn float_logit_bias(
-    bias: &Option<Map<String, Value>>,
-) -> Result<HashMap<String, f64>, Unsupported> {
-    bias.iter()
-        .flat_map(|bias| bias.iter())
-        .map(|(key, value)| {
-            value
-                .as_f64()
-                .map(|value| (key.clone(), value))
-                .ok_or(Unsupported("invalid_request"))
-        })
-        .collect()
-}
-
 /// `model:adapter` selects a LoRA adapter over `lora_path`.
 pub(super) fn lora_path(
     model: &str,

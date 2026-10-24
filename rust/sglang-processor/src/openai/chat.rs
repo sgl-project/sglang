@@ -8,13 +8,14 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sglang_api_types::api::v1::{
     GenerateRequest, ImagesConfig, Int64List, SamplingParams, SamplingParamsOrList, TokenIds,
-    TokenIdsOrList, sampling_params_or_list, string_or_list, token_ids_or_list,
+    TokenIdsOrList, WatermarkRequestConfig, sampling_params_or_list, string_or_list,
+    token_ids_or_list,
 };
 
 use super::kimi_k3_tag::auto_tool_call_tag;
 use super::request::{
-    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, float_logit_bias,
-    format_json_schema, lora_path, one, usage_flags, yes,
+    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, format_json_schema,
+    lora_path, one, usage_flags, yes,
 };
 use super::wire::{
     Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
@@ -86,7 +87,7 @@ struct ChatRequest {
     model: String,
     #[serde(default)]
     frequency_penalty: f64,
-    logit_bias: Option<Map<String, Value>>,
+    logit_bias: Option<HashMap<String, f64>>,
     #[serde(default)]
     logprobs: bool,
     top_logprobs: Option<i64>,
@@ -113,7 +114,7 @@ struct ChatRequest {
     regex: Option<String>,
     ebnf: Option<String>,
     repetition_penalty: Option<f64>,
-    stop_token_ids: Option<Vec<i64>>,
+    stop_token_ids: Option<Int64List>,
     stop_regex: Option<OneOrList<String>>,
     #[serde(default)]
     no_stop_trim: bool,
@@ -132,7 +133,7 @@ struct ChatRequest {
     chat_template_kwargs: Option<Map<String, Value>>,
     custom_logit_processor: Option<OneOrList<Option<String>>>,
     custom_params: Option<Map<String, Value>>,
-    watermark: Option<Map<String, Value>>,
+    watermark: Option<WatermarkRequestConfig>,
     images_config: Option<ImagesConfig>,
     rid: Option<OneOrList<String>>,
     extra_key: Option<OneOrList<String>>,
@@ -615,13 +616,6 @@ fn validate(
     {
         return invalid;
     }
-    if request
-        .logit_bias
-        .as_ref()
-        .is_some_and(|b| !b.values().all(Value::is_number))
-    {
-        return invalid;
-    }
     let max_output = request
         .max_completion_tokens
         .filter(|&n| n != 0)
@@ -763,10 +757,7 @@ fn generate_body(
             .or(request.max_tokens),
         min_new_tokens: Some(request.min_tokens),
         stop: request.stop.clone().map(Into::into),
-        stop_token_ids: request
-            .stop_token_ids
-            .clone()
-            .map(|values| Int64List { items: values }),
+        stop_token_ids: request.stop_token_ids.clone(),
         stop_regex: request.stop_regex.clone().map(Into::into),
         top_p: Some(param(request.top_p, "top_p", 1.0)?),
         top_k: Some(top_k),
@@ -785,17 +776,13 @@ fn generate_body(
         no_stop_trim: Some(request.no_stop_trim),
         ignore_eos: Some(request.ignore_eos),
         skip_special_tokens: Some(request.skip_special_tokens),
-        logit_bias: float_logit_bias(&request.logit_bias)?,
+        logit_bias: request.logit_bias.clone().unwrap_or_default(),
         custom_params: request
             .custom_params
             .as_ref()
             .map(|v| serde_json::to_string(v).expect("JSON object")),
         sampling_seed: request.seed,
-        watermark: request
-            .watermark
-            .clone()
-            .map(|v| serde_json::from_value(Value::Object(v)).map_err(|_| Unsupported("watermark")))
-            .transpose()?,
+        watermark: request.watermark.clone(),
         spaces_between_special_tokens: Some(
             kwargs
                 .get("spaces_between_special_tokens")
