@@ -375,6 +375,17 @@ class DSparkReferenceLedger:
             )
         return replace(self, requests=tuple(rows.values()), pending=self.pending[1:])
 
+    def mark_inactive(self, rid):
+        """Record an explicit finish/retraction without dropping in-flight work."""
+        self.request_for(rid)
+        return replace(
+            self,
+            requests=tuple(
+                replace(row, active=False) if row.rid == rid else row
+                for row in self.requests
+            ),
+        )
+
     def forget(self, rid):
         _require(
             type(rid) is str and bool(rid), "reference retirement needs a request ID"

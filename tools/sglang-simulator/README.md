@@ -701,6 +701,39 @@ callback alone cannot reproduce that behavior. The ledger neither chooses that
 membership nor proves reference equivalence, qualified costs or serving accuracy.
 G's actual CPU lengths, allocations and native request objects remain unchanged.
 
+The opt-in `dspark_reference_adapter.DSparkReferenceAdapter` consumes those
+explicit events and defers request retirement. A source finish or retraction
+marks the request inactive; an already prepared or published result retains its
+ownership until processed. Later results for that retired request are explicitly
+skipped, and the adapter forgets its metadata only after all owners drain. This
+covers a finish that occurs while the next reference batch is already in flight.
+For a natural finish, process that finishing result before issuing retirement;
+retirement before processing represents an existing finish/retraction/abort.
+It does not equate G's finish callback with that source event: native prefill
+finish and retraction do not uniformly pass through the worker callback. An idle
+event must process the actual pending FIFO; reset requires an already drained
+ledger. No hook installs this adapter automatically.
+
+The same module's pure `prepare_reference_step` bridges a provisional typed step
+to a source-aware execution resolver. Callers explicitly provide page size,
+relay/backend policy, whether to process the previous result before forward,
+and any previously known skips. Preparation freezes allocation before optional
+previous-result processing. The resolver receives the existing group, runtime,
+native batch and buffer arguments plus an immutable `reference_view`. Only
+`execution_json` changes in the final step; ordered request facts, including
+worker-before output counts, remain the caller's facts. Buffer metadata remains
+authoritative. The original native batch is not rewritten.
+
+The returned `ReferenceStepTransaction.complete(result, current_ledger=...)`
+requires the owner's current ledger to be the original base object, publishes
+the exact final step's modeled result, then retires only the previously frozen
+FIFO head when appropriate. With no previous result, the current result remains
+pending. It accepts no new synchronization or skip decisions from current
+acceptance. Compute this candidate before external publication/session commit
+and install it only after those operations succeed; the pure helper does not
+perform or roll back external side effects. No source-qualified projector,
+source event driver or predictor factory activation is supplied by this bridge.
+
 Run repository checks before submitting:
 
 ```bash
