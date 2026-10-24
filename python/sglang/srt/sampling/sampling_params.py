@@ -237,9 +237,10 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}.")
         if not 0.0 <= self.min_p <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {self.min_p}.")
-        if self.top_k < 1 or self.top_k == -1:
+        if self.top_k != TOP_K_ALL and (self.top_k < 1 or self.top_k > vocab_size):
             raise ValueError(
-                f"top_k must be -1 (disable) or at least 1, got {self.top_k}."
+                f"top_k must be -1 (disable) or in [1, vocab_size({vocab_size})], "
+                f"got {self.top_k}."
             )
         if not -2.0 <= self.frequency_penalty <= 2.0:
             raise ValueError(

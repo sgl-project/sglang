@@ -211,6 +211,26 @@ class TestSamplingParamsVerify(CustomTestCase):
         with self.assertRaises(ValueError):
             sp.verify(self.VOCAB_SIZE)
 
+    def test_top_k_above_vocab_raises(self):
+        """Test that verify() rejects top_k greater than the vocabulary size."""
+        sp = self._make(top_k=self.VOCAB_SIZE + 1)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
+    def test_top_k_at_vocab_valid(self):
+        """Test that top_k equal to the vocabulary size is accepted."""
+        self._make(top_k=self.VOCAB_SIZE).verify(self.VOCAB_SIZE)
+
+    def test_top_k_all_valid(self):
+        """Test that the whole-vocabulary sentinel remains accepted."""
+        self._make(top_k=TOP_K_ALL).verify(self.VOCAB_SIZE)
+
+    def test_top_k_int32_overflow_raises(self):
+        """Test that verify() rejects top_k that would overflow int32."""
+        sp = self._make(top_k=2**31)
+        with self.assertRaises(ValueError):
+            sp.verify(self.VOCAB_SIZE)
+
     # --- frequency_penalty ---
     def test_frequency_penalty_below_minus_two_raises(self):
         """Test that verify() rejects frequency_penalty < -2.0."""
