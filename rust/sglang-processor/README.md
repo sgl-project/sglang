@@ -1,17 +1,19 @@
 # SGLang processor
 
 A thin wrapper over Dynamo's frontend crates (`dynamo-renderer`,
-`dynamo-tokenizers`, `dynamo-parsers`), shared by SGLang's Rust hosts.
+`dynamo-tokenizers`, `dynamo-parsers`, `dynamo-multimodal`), shared by SGLang's
+Rust hosts.
 
 **Rule.** Each feature calls Dynamo directly. SGLang code exists only where
 Dynamo differs from SGLang's Python serving behavior, or lacks a model; that
 code names the Python source it mirrors. Hosts own request types, sampling,
 validation, transport and runtime.
 
-Hosts use the re-exported `dynamo_protocols`, `dynamo_renderer` and
-`dynamo_tokenizers` so their Dynamo versions match the processor's.
+Hosts use the re-exported `dynamo_protocols`, `dynamo_renderer`,
+`dynamo_tokenizers` and `dynamo_multimodal` so their Dynamo versions match the
+processor's.
 
-The `render`, `tokenizer` and `parser` features (all default) gate each
+The `render`, `tokenizer`, `parser` and `mm` features (all default) gate each
 component and its Dynamo crate, so a host that only renders and tokenizes
 skips `dynamo-parsers`.
 
@@ -22,6 +24,8 @@ src/
   render/          chat request -> prompt
     models/        model-specific SGLang code
     legacy/        conversation.py templates
+  mm/              image bytes + prompt ids -> model inputs
+    models/        model-specific SGLang code
   parser/          engine output -> chat events
   openai/          OpenAI requests over /generate
 ```
@@ -122,6 +126,50 @@ SGLang's Python serving path rendered and tokenized, written by
 add a model, follow the
 [`processor-model-parity`](../../.claude/skills/processor-model-parity/SKILL.md)
 skill.
+
+## mm
+
+```rust
+select_mm_processor(&MmProcessorOptions) -> Result<MmProcessor, ProcessorError>
+MmProcessor::process(input_ids, images: &[&[u8]]) -> Result<MmOutput, ProcessorError>
+MmProcessor::capabilities() -> Capabilities
+```
+
+`select_mm_processor` (`selection.rs`) reads `config.json` from the model path
+and `preprocessor_config.json` (or `processor_config.json`) from the tokenizer
+path, as Python's `get_processor` does, resolves them with Dynamo's
+`spec_from_hf_configs`, applies the SGLang rules for the family, and builds
+Dynamo's family processor. An error means SGLang cannot serve the model's images
+bit-exactly, and the host should refuse to start.
+
+`process` (`mod.rs`) is Dynamo's pipeline in order: the content hash of the
+encoded bytes, `decode_rgb`, `process_item`, `layout`, `apply_layout` and
+`positions`. It returns the placeholder-expanded ids, one feature tensor and its
+named aux tensors per image, the inclusive item offsets, and the positions. It
+takes prompt ids, not text, and it fetches nothing: tokenizing, fetching and the
+prompt length ceiling stay with the host. Dynamo is built without its `parallel`
+and `fetch` features, so `process` spawns no threads
+(`tests/mm_single_thread.rs`).
+
+| Family | Models | SGLang code |
+|---|---|---|
+| Qwen-VL | Qwen2-VL, Qwen2.5-VL, Qwen3-VL (+MoE), Qwen3.5 (+MoE) | `models/qwen_vl.rs` |
+
+| Code | Mirrors | Hook |
+|---|---|---|
+| `mod.rs` | `utils/common.py::_load_image` | Decodes without an EXIF transpose, and with PIL's decompression-bomb limit. |
+| `models/qwen_vl.rs` | `utils/hf_transformers/processor.py`, `rust_server/multimodal.py` | `--image-processor-backend` picks the resampler; `--mm-process-config` may override only `image.min_pixels` and `image.max_pixels`. |
+
+To add a family, Dynamo implements its `process_item` and `ProcessorSpec` arm;
+SGLang adds `models/<family>.rs` and a match arm in `models/mod.rs` only where
+Python differs, and a parity fixture.
+
+**Parity.** Each `tests/fixtures/mm_parity/<model>.json` holds the checkpoint's
+config files and cases that SGLang's Python CPU path processed, written by
+`tests/scripts/generate_mm_parity.py`: PIL decode and the image processor's CPU
+kernels, under the recorded Pillow version. `tests/mm_parity.rs` checks the
+expanded ids, offsets, grids, M-RoPE positions and feature bytes of every case,
+over the images in `tests/fixtures/mm_parity/images/`.
 
 ## parser
 

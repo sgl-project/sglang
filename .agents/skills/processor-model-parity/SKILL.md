@@ -13,9 +13,12 @@ the implementation, and SGLang code exists only where the two differ.
 
 Scope: the request -> prompt -> token ids path, plus the checks that let hosts
 serve the model's OpenAI requests through `/generate` (see "OpenAI layer").
-Multimodal preprocessing is not covered here: `render_request` fails on media
+Chat rendering with media is not covered here: `render_request` fails on media
 content parts, so hosts send those chats to the engine. The fixture generator
 serves every checkpoint text-only, so a media case records that rejection.
+
+Image preprocessing (`src/mm/`) has its own skill:
+[`processor-mm-parity`](../processor-mm-parity/SKILL.md).
 
 ## Done means
 
