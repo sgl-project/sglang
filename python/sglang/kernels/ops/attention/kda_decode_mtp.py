@@ -168,6 +168,7 @@ def kda_decode_mtp_kernel(
     CACHE_RING: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
+    USE_PACKED_FMA: cutlass.Constexpr[bool],
 ):
     """KDA MTP decode — SMEM pre-compute + register-resident state.
 
@@ -699,17 +700,26 @@ def kda_decode_mtp_kernel(
                     shk_2 = 0.0
                     for jp in range(P2_VEC // 2):
                         _p = jp * 2
-                        r_state[_st + _p], r_state[_st + _p + 1] = (
-                            cute.arch.mul_packed_f32x2(
-                                (r_decay[_p], r_decay[_p + 1]),
-                                (r_state[_st + _p], r_state[_st + _p + 1]),
+                        # Packed f32x2 math is SM100+; SM90 takes the scalar pair.
+                        if cutlass.const_expr(USE_PACKED_FMA):
+                            r_state[_st + _p], r_state[_st + _p + 1] = (
+                                cute.arch.mul_packed_f32x2(
+                                    (r_decay[_p], r_decay[_p + 1]),
+                                    (r_state[_st + _p], r_state[_st + _p + 1]),
+                                )
                             )
-                        )
-                        shk_1, shk_2 = cute.arch.fma_packed_f32x2(
-                            src_a=(r_state[_st + _p], r_state[_st + _p + 1]),
-                            src_b=(r_k[_p], r_k[_p + 1]),
-                            src_c=(shk_1, shk_2),
-                        )
+                            shk_1, shk_2 = cute.arch.fma_packed_f32x2(
+                                src_a=(r_state[_st + _p], r_state[_st + _p + 1]),
+                                src_b=(r_k[_p], r_k[_p + 1]),
+                                src_c=(shk_1, shk_2),
+                            )
+                        else:
+                            r_state[_st + _p] = r_decay[_p] * r_state[_st + _p]
+                            r_state[_st + _p + 1] = (
+                                r_decay[_p + 1] * r_state[_st + _p + 1]
+                            )
+                            shk_1 = r_state[_st + _p] * r_k[_p] + shk_1
+                            shk_2 = r_state[_st + _p + 1] * r_k[_p + 1] + shk_2
                     shk = shk_1 + shk_2
                     for offset in [16, 8, 4, 2, 1]:
                         if cutlass.const_expr(offset < P2_LANES_K):
@@ -721,18 +731,26 @@ def kda_decode_mtp_kernel(
                     shq_2 = 0.0
                     for jp in range(P2_VEC // 2):
                         _p = jp * 2
-                        r_state[_st + _p], r_state[_st + _p + 1] = (
-                            cute.arch.fma_packed_f32x2(
-                                src_a=(vnb, vnb),
-                                src_b=(r_k[_p], r_k[_p + 1]),
-                                src_c=(r_state[_st + _p], r_state[_st + _p + 1]),
+                        if cutlass.const_expr(USE_PACKED_FMA):
+                            r_state[_st + _p], r_state[_st + _p + 1] = (
+                                cute.arch.fma_packed_f32x2(
+                                    src_a=(vnb, vnb),
+                                    src_b=(r_k[_p], r_k[_p + 1]),
+                                    src_c=(r_state[_st + _p], r_state[_st + _p + 1]),
+                                )
                             )
-                        )
-                        shq_1, shq_2 = cute.arch.fma_packed_f32x2(
-                            src_a=(r_state[_st + _p], r_state[_st + _p + 1]),
-                            src_b=(r_q[_p], r_q[_p + 1]),
-                            src_c=(shq_1, shq_2),
-                        )
+                            shq_1, shq_2 = cute.arch.fma_packed_f32x2(
+                                src_a=(r_state[_st + _p], r_state[_st + _p + 1]),
+                                src_b=(r_q[_p], r_q[_p + 1]),
+                                src_c=(shq_1, shq_2),
+                            )
+                        else:
+                            r_state[_st + _p] = vnb * r_k[_p] + r_state[_st + _p]
+                            r_state[_st + _p + 1] = (
+                                vnb * r_k[_p + 1] + r_state[_st + _p + 1]
+                            )
+                            shq_1 = r_state[_st + _p] * r_q[_p] + shq_1
+                            shq_2 = r_state[_st + _p + 1] * r_q[_p + 1] + shq_2
                     shq = shq_1 + shq_2
                     for offset in [16, 8, 4, 2, 1]:
                         if cutlass.const_expr(offset < P2_LANES_K):
@@ -823,6 +841,7 @@ def _run_kda_decode_mtp_dspark(
     CACHE_RING: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
+    USE_PACKED_FMA: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the fixed Kimi-K3/DSpARK bonus + NUM_SPEC-draft specialization."""
@@ -912,6 +931,7 @@ def _run_kda_decode_mtp_dspark(
         CACHE_RING,
         APPLY_ONORM,
         onorm_eps,
+        USE_PACKED_FMA,
     ).launch(
         grid=(H, N, 1),
         block=[BLOCK_THREADS, 1, 1],
@@ -1161,8 +1181,9 @@ def fused_kda_decode_mtp_dspark(
         onorm_weight if apply_onorm else dt_bias,
     )
     fits_32bit = tuple(_fits_32bit_stride(tensor) for tensor in args)
+    capability = torch.cuda.get_device_capability()
     key = (
-        torch.cuda.get_device_capability(),
+        capability,
         H,
         N,
         num_spec,
@@ -1193,6 +1214,7 @@ def fused_kda_decode_mtp_dspark(
             CACHE_RING=cache_ring,
             APPLY_ONORM=apply_onorm,
             onorm_eps=float(onorm_eps) if apply_onorm else 0.0,
+            USE_PACKED_FMA=capability[0] >= 10,
             stream=stream,
         )
         _DSPARK_COMPILED[key] = compiled

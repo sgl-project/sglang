@@ -1,8 +1,9 @@
 """KDA backend dispatch and ReplaySSM verify -> commit -> verify parity."""
 
+import importlib.util
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -23,13 +24,21 @@ from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=110, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 # One bf16 ulp: the fused and unfused kernels reduce K in different orders.
 _OUTPUT_TOL = dict(rtol=2**-7, atol=1e-7)
 # Fold and snapshot recurrence differ by ~1 fp32 ulp; a wrong-step commit
 # moves elements by >= 1e-3, so 1e-5 still catches it.
 _SNAPSHOT_ORACLE_TOL = dict(rtol=0, atol=1e-5)
+# Max error over max |reference|, the bar the CuTe ring parity tests use. A
+# dropped or misplaced FMA term in the recurrence moves it by O(1).
+_CUTE_MAX_REL_ERR = 2e-2
+
+
+def _max_rel_err(actual, expected):
+    actual, expected = actual.float(), expected.float()
+    return ((actual - expected).abs().max() / expected.abs().max()).item()
 
 
 class TestKDAFusedVerifyBackend(CustomTestCase):
@@ -104,7 +113,16 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         ]
         return layers, state, slots, batch, rounds
 
-    def _make_backend(self, template, slots, steps, *, fused, ring=True):
+    def _make_backend(
+        self,
+        template,
+        slots,
+        steps,
+        *,
+        fused,
+        ring=True,
+        verify_backend=LinearAttnKernelBackend.TRITON,
+    ):
         state = MambaPool.SpeculativeState(
             conv=[template.conv[0].clone()],
             temporal=template.temporal.clone(),
@@ -155,7 +173,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         backend.kernel_dispatcher = KDAKernelDispatcher(
             LinearAttnKernelBackend.TRITON,
             LinearAttnKernelBackend.TRITON,
-            LinearAttnKernelBackend.TRITON,
+            verify_backend,
         )
         backend._fused_chain_verify_fn = (
             Mock(wraps=fused_kda_conv_gating_verify) if fused else None
@@ -318,6 +336,53 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                 self.assertEqual(backend._fused_chain_verify_fn.call_count, 2)
                 for actual, expected in zip(out, ref):
                     torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
+
+    def test_nv_cutedsl_verify_matches_triton(self):
+        """nv_cutedsl verify runs the CuTe kernel and matches Triton verify.
+
+        A rejected capability gate falls back to Triton silently, so only the
+        dispatch count proves the CuTe kernel ran.
+        """
+        if importlib.util.find_spec("cutlass") is None:
+            self.skipTest("nvidia-cutlass-dsl is required")
+        if torch.cuda.get_device_capability()[0] not in (9, 10):
+            self.skipTest("the CuTe KDA verify kernel targets SM90 and SM100")
+        # 64 heads is GLM-5.3-Flash's KDA width at attention TP 1; H * N then
+        # exceeds the SM count, so the kernel takes its narrow block.
+        layers, initial, slots, batch, rounds = self._make_case(
+            batch_size=4, heads=64, v_heads=64, lower_bound=-5.0
+        )
+        for layer in layers:
+            layer.bias = None
+            layer.conv_weights = layer.conv_weights.float()
+        cute, _, cute_state = self._make_backend(
+            initial,
+            slots,
+            4,
+            fused=False,
+            ring=False,
+            verify_backend=LinearAttnKernelBackend.NV_CUTEDSL,
+        )
+        reference, _, ref_state = self._make_backend(
+            initial, slots, 4, fused=False, ring=False
+        )
+        with patch.object(
+            KDAAttnBackend,
+            "_run_dspark_cutedsl_mtp",
+            wraps=KDAAttnBackend._run_dspark_cutedsl_mtp,
+        ) as run_cute:
+            out_cute = self._verify(cute, layers, batch, rounds[0])
+        self.assertEqual(run_cute.call_count, len(layers))
+        out_ref = self._verify(reference, layers, batch, rounds[0])
+        for actual, expected in zip(out_cute, out_ref):
+            self.assertLess(
+                _max_rel_err(actual.reshape(expected.shape), expected),
+                _CUTE_MAX_REL_ERR,
+            )
+        self.assertLess(
+            _max_rel_err(cute_state.intermediate_ssm, ref_state.intermediate_ssm),
+            _CUTE_MAX_REL_ERR,
+        )
 
 
 if __name__ == "__main__":

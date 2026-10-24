@@ -17,11 +17,16 @@ logger = logging.getLogger(__name__)
 
 def apply_glm5_next_spec_backend_defaults(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
+    platform = get_platform()
 
     if (
         cfg.speculative_algorithm is None
         or cfg.linear_attn_verify_backend is not None
-        or not get_platform().is_sm100
+        or not (
+            platform.is_sm100
+            # SM90: measured end-to-end win with the ReplaySSM ring, mixed without it.
+            or (platform.is_sm90 and cfg.enable_linear_replayssm_spec)
+        )
     ):
         return
 

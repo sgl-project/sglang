@@ -1733,7 +1733,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if importlib.util.find_spec("cutlass") is None:
             return False
-        if torch.cuda.get_device_capability()[0] != 10:
+        if torch.cuda.get_device_capability()[0] not in (9, 10):
             return False
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
