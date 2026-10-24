@@ -2186,6 +2186,32 @@ def _mhc_combine_kernel(
 
 
 @triton.jit
+def _mhc_stream_mean_kernel(
+    x_ptr,
+    y_ptr,
+    H,
+    x_stride_m,
+    x_stride_k,
+    y_stride_m,
+    HC: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offs_h < H
+    x_row = x_ptr + pid_m.to(tl.int64) * x_stride_m + offs_h
+    # Streams are added in order onto a +0 fp32 accumulator, as torch.mean's
+    # reduction does (so an all -0 row averages to +0).
+    acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+    for k in tl.static_range(HC):
+        acc += tl.load(x_row + k * x_stride_k, mask=mask, other=0.0).to(tl.float32)
+    tl.store(
+        y_ptr + pid_m.to(tl.int64) * y_stride_m + offs_h, acc * (1.0 / HC), mask=mask
+    )
+
+
+@triton.jit
 def _hc_mix_stats_partial_kernel(
     x_ptr,
     w_ptr,
@@ -2718,6 +2744,7 @@ def mhc_combine(
     x_flat: torch.Tensor, pre: torch.Tensor, hc: int, out_dtype: torch.dtype
 ) -> torch.Tensor:
     """Fused y[m, h] = sum_k pre[m, k] * x_flat[m, k*H + h]."""
+    assert x_flat.stride(1) == 1
     m = x_flat.shape[0]
     h = x_flat.shape[1] // hc
     y = torch.empty((m, h), dtype=out_dtype, device=x_flat.device)
@@ -2730,6 +2757,37 @@ def mhc_combine(
         x_flat.stride(0),
         pre.stride(0),
         pre.stride(1),
+        y.stride(0),
+        HC=hc,
+        BLOCK_H=block_h,
+    )
+    return y
+
+
+def mhc_stream_mean(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """y[m, h] = x[m, :, h].mean(), bitwise equal to ``x.mean(dim=1)``, written
+    into ``out`` when given."""
+    m, hc, h = x.shape
+    # Bitwise equality with torch's CUDA mean holds for 4 streams (the mHC width)
+    # over whole 1024-element blocks; torch orders some other widths differently.
+    if (
+        _is_hip
+        or x.device.type != "cuda"
+        or hc != 4
+        or h % 1024
+        or x.stride(2) != 1
+        or (out is not None and (out.dtype != x.dtype or out.stride(1) != 1))
+    ):
+        y = x.mean(dim=1)
+        return y if out is None else out.copy_(y)
+    y = torch.empty((m, h), dtype=x.dtype, device=x.device) if out is None else out
+    block_h = 1024
+    _mhc_stream_mean_kernel[(m, triton.cdiv(h, block_h))](
+        x,
+        y,
+        h,
+        x.stride(0),
+        x.stride(1),
         y.stride(0),
         HC=hc,
         BLOCK_H=block_h,

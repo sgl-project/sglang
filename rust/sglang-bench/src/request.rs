@@ -869,6 +869,7 @@ mod tests {
             }),
             output_ids: Some(api::TokenIds { ids: vec![7, 8] }),
             index: None,
+            prompt_token_ids: None,
         };
         let data = serde_json::to_value(&frame).unwrap();
         assert_eq!(data["text"], "ab");
