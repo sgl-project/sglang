@@ -19,7 +19,10 @@ from pydantic import (
     model_validator,
 )
 
-from sglang.srt.entrypoints.openai.protocol import PDRoutingFields
+from sglang.srt.entrypoints.openai.protocol import (
+    PDRoutingFields,
+    _migrate_deprecated_dp_rank,
+)
 
 
 class AnthropicError(BaseModel):
@@ -379,6 +382,13 @@ class AnthropicMessagesRequest(PDRoutingFields):
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
+    # Deprecated: use routed_dp_rank (from PDRoutingFields) instead
+    data_parallel_rank: Optional[int] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
 
     @field_validator("model")
     @classmethod
