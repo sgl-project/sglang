@@ -211,6 +211,22 @@ def _load_fused_expert_tensor(
     return False
 
 
+def _refresh_indexer_x_projections(model: torch.nn.Module, is_nextn: bool) -> None:
+    """Rebuild every k-pool indexer's stacked x projection, whichever weights were
+    loaded: a partial update may touch only the indexer, with no kv_b_proj name.
+
+    A module function, not a mixin method: models such as Glm5NextForConditionalGeneration
+    call DeepseekV2WeightLoaderMixin.post_load_weights unbound, without the mixin."""
+    if is_nextn:
+        layers = [model.decoder]
+    else:
+        layers = [model.layers[i] for i in range(model.start_layer, model.end_layer)]
+    for layer in layers:
+        indexer = getattr(getattr(layer, "self_attn", None), "indexer", None)
+        if hasattr(indexer, "fuse_x_projections"):
+            indexer.fuse_x_projections()
+
+
 @dataclass(frozen=True)
 class NextNEnabledConfig:
     num_nextn_layers: int
@@ -599,6 +615,8 @@ class DeepseekV2WeightLoaderMixin:
             is_nextn: Whether processing NextN weights
             weight_names: Optional list of loaded weight names to determine which layers to process
         """
+        _refresh_indexer_x_projections(self.model, is_nextn)
+
         if is_nextn:
             layer_ids = [self.config.num_hidden_layers]
         else:
