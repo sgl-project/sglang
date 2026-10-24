@@ -63,6 +63,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_transformer,
     resolve_cache_dit_request_overrides,
 )
+from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -596,6 +597,18 @@ class DenoisingStage(PipelineStage):
             if batch.enable_teacache and hasattr(transformer, "reset_teacache_state"):
                 transformer.reset_teacache_state()
             if batch.enable_spectrum and hasattr(transformer, "reset_spectrum_state"):
+                transformer.reset_spectrum_state(batch.spectrum_params)
+
+    def _release_spectrum_history(self, batch: Req, *transformers) -> None:
+        """Free the Spectrum history (a feature copy per real step and CFG branch) of
+        DiTs that do not run again this request; no-op once released."""
+        if not batch.enable_spectrum:
+            return
+        for transformer in filter(None, transformers):
+            if isinstance(transformer, SpectrumMixin) and (
+                transformer.spectrum_forecaster is not None
+                or transformer.spectrum_forecaster_negative is not None
+            ):
                 transformer.reset_spectrum_state(batch.spectrum_params)
 
     def _maybe_override_attention_backend(
@@ -1937,6 +1950,8 @@ class DenoisingStage(PipelineStage):
             current_model = self.transformer_2
             current_guidance_scale = batch.guidance_scale_2
             current_phase = "transformer_2"
+            # Timesteps only decrease, so the high-noise expert is done for this request.
+            self._release_spectrum_history(batch, self.transformer)
 
         self._manage_dit_use_site(current_model, current_phase, batch)
 
@@ -2043,6 +2058,7 @@ class DenoisingStage(PipelineStage):
             guidance=ctx.guidance,
         )
         timesteps_cpu = self._run_denoising_loop(ctx, batch, server_args)
+        self._release_spectrum_history(batch, self.transformer, self.transformer_2)
 
         # collect rollout outputs before finalization gathers or replaces latents
         finalize_rollout_if_enabled(
