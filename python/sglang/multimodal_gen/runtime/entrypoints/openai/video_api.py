@@ -361,11 +361,15 @@ async def _save_first_input_image(
 
 
 async def _upload_and_cleanup_videos(paths: list[str]) -> list[str | None]:
-    return list(
-        await asyncio.gather(
-            *(cloud_storage.upload_and_cleanup(path) for path in paths)
-        )
+    results = await asyncio.gather(
+        *(cloud_storage.upload_and_cleanup(path) for path in paths),
+        return_exceptions=True,
     )
+    # join every upload before a cancellation or failure permits directory cleanup
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
 
 
 async def _dispatch_job_async(
