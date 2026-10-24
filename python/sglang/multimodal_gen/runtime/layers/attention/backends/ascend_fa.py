@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.platforms.npu import NPUPlatformEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -32,7 +33,7 @@ def resolve_mx_fa_scheme(quant_config) -> str | None:
     if type(quant_config).__name__ not in ("MXFP8Config", "ModelSlimConfig"):
         return None
 
-    if torch.npu.get_soc_version() < 260:
+    if current_platform.return_platform() == NPUPlatformEnum.ASCEND_950:
         logger.warning_once(
             "MXFP8 attention is disabled because MXFP8 quantization is only "
             "supported on Ascend 950 (A5) devices."
