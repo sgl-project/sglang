@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import os
@@ -193,6 +194,8 @@ class MegaMoeTunedForward:
             ):
                 continue
             value = getattr(self.backend.megakernel, item.name)
+            if isinstance(value, enum.Enum):
+                value = value.name
             if not isinstance(value, torch.Tensor):
                 config[item.name] = value
         # The enclosing flashinfer.autotune context validates runtime/compiler

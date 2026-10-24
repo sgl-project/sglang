@@ -3219,6 +3219,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_info = FlashInferMegaMoeQuantInfo(
                 mega=mega,
                 mega_forward=layer._flashinfer_megamoe_forward,
+                num_valid_tokens=layer._flashinfer_megamoe_num_valid_tokens,
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk
                 ),
