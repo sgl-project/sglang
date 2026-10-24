@@ -113,14 +113,17 @@ def _backfill_ltx2_audio_vae_latent_stats(
         loaded["latents_std"] = loaded[std_key]
 
 
-def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
+def _convert_conv3d_weights_to_channels_last_3d(
+    module: nn.Module, prefix: str = ""
+) -> int:
     """
-    Convert Conv3d weights to channels_last_3d (NDHWC) memory format.
+    Convert Conv3d weights whose module name starts with ``prefix`` to
+    channels_last_3d (NDHWC) memory format.
     Returns the number of Conv3d modules converted.
     """
     num_converted = 0
-    for m in module.modules():
-        if isinstance(m, nn.Conv3d):
+    for name, m in module.named_modules():
+        if isinstance(m, nn.Conv3d) and name.startswith(prefix):
             try:
                 m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
                 num_converted += 1
@@ -159,6 +162,19 @@ def _should_use_channels_last_3d(
     if isinstance(pipeline_config, LTX2PipelineConfig) and server_args.num_gpus == 1:
         return True
     return False
+
+
+def _channels_last_3d_prefix(server_args: ServerArgs | None) -> str:
+    """Module-name prefix of the Conv3d weights to convert to channels_last_3d."""
+    # multi-GPU Wan converts only its decoder: channels_last_3d convs round
+    # differently, and the encode output seeds I2V sampling
+    if (
+        server_args is not None
+        and server_args.num_gpus > 1
+        and isinstance(server_args.pipeline_config, WanT2V480PConfig)
+    ):
+        return "decoder."
+    return ""
 
 
 def _decode_dtype_store_path(
@@ -623,7 +639,9 @@ class VAELoader(WeightOverrideComponentLoader):
                 )
             vae = vae.to(device=target_device, dtype=vae_dtype)
             if _should_use_channels_last_3d(server_args, component_type):
-                n = _convert_conv3d_weights_to_channels_last_3d(vae)
+                n = _convert_conv3d_weights_to_channels_last_3d(
+                    vae, _channels_last_3d_prefix(server_args)
+                )
                 if n > 0:
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
@@ -686,7 +704,9 @@ class VAELoader(WeightOverrideComponentLoader):
             )
             _log_vae_checkpoint_adaptations(*adaptations)
             if _should_use_channels_last_3d(server_args, component_name):
-                n = _convert_conv3d_weights_to_channels_last_3d(vae)
+                n = _convert_conv3d_weights_to_channels_last_3d(
+                    vae, _channels_last_3d_prefix(server_args)
+                )
                 if n > 0:
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
@@ -746,7 +766,9 @@ class VAELoader(WeightOverrideComponentLoader):
                 logger.warning("VAE unexpected keys: %s", unexpected_keys)
 
         if _should_use_channels_last_3d(server_args, component_type):
-            n = _convert_conv3d_weights_to_channels_last_3d(vae)
+            n = _convert_conv3d_weights_to_channels_last_3d(
+                vae, _channels_last_3d_prefix(server_args)
+            )
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
 
