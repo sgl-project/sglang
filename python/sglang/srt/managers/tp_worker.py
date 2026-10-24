@@ -701,6 +701,16 @@ class TpModelWorker(BaseTpWorker):
                     else self.model_runner.kv_index_translator.own_plan(batch)
                 ),
             )
+            if (
+                batch is not None
+                and (observer := self.model_runner.forward_observer) is not None
+            ):
+                batch_result.forward_auxiliary_output = observer.after_forward(
+                    batch,
+                    forward_batch,
+                    logits_output,
+                    can_run_graph=can_run_cuda_graph,
+                )
 
             capture_pre_sample_logits(batch, forward_batch, logits_output)
 
