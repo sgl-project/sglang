@@ -204,7 +204,7 @@ class DecodeHiCacheTransferMixin:
 
         On success, ``dr.hicache_restore_lock`` and ``hicache_restored_kv_indices``
         are populated; the lock is held until commit/abort.
-        Trivial cases (all-on-device / no needed coverage) auto-flip to READY.
+        All-on-device rematches keep the lock and are gated by the caller.
         Failback paths flip to FAILED.
         """
         pm = dr.prefix_match
@@ -223,6 +223,10 @@ class DecodeHiCacheTransferMixin:
             cow_mamba=False,
             max_prefix_len=pm.decode_prefix_len,
         )
+        # A state-only (Mamba/SWA) load queues a DMA but loads no KV tokens.
+        controller = getattr(self.tree_cache, "cache_controller", None)
+        load_queue = controller.load_queue if controller is not None else ()
+        queued_ops = len(load_queue)
         loaded_len, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=rematch.best_match_node,
@@ -255,22 +259,51 @@ class DecodeHiCacheTransferMixin:
         )[pm.l1_prefix_len : pm.decode_prefix_len]
         dr.hicache_restore_lock = self.tree_cache.lock(restored_node)
 
-        if loaded_len == 0:
-            # Whole prefix already on device; no DMA needed.
-            dr.hicache_restore_status = HiCacheRestoreResult.READY
-            return False
-        return True
+        if len(load_queue) > queued_ops:
+            return True
+        # Whole prefix already on device and no DMA of its own; gated by the caller.
+        return loaded_len > 0
 
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
+        self._advance_hicache_local_restores(decode_reqs)
+        self._gate_reused_device_pages(decode_reqs)
+
+    def _gate_reused_device_pages(self, decode_reqs: List[DecodeRequest]) -> None:
+        """Hold reqs that reuse device prefix pages without a DMA of their own.
+
+        A load-back attaches its pages to the tree before its H2D copy runs, so
+        such a req waits once for the newest load-back submitted so far; loads
+        complete in submission order on one H2D stream.
+        """
+        load_index = None
+        for dr in decode_reqs:
+            if dr.hicache_restore_status != HiCacheRestoreResult.PENDING:
+                continue
+            pm = dr.prefix_match
+            if pm is None:
+                continue
+            if pm.needs_local_restore and (
+                dr.hicache_restore_lock is None or dr.hicache_load_consumer_index >= 0
+            ):
+                continue  # not rematched yet, or Phase A polls its own DMA
+            if dr.hicache_load_consumer_index < 0:
+                if load_index is None:
+                    load_index = self.tree_cache.latest_load_back_index()
+                dr.hicache_load_consumer_index = load_index
+            if self.tree_cache.is_load_back_event_done(dr.hicache_load_consumer_index):
+                dr.hicache_restore_status = HiCacheRestoreResult.READY
+
+    def _advance_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
         # Filter once: keep only PENDING reqs that still need restore work;
-        # trivially-done reqs (no prefix_match / nothing to restore) flip to READY.
+        # reqs reusing no device pages flip to READY, L1 hits are gated later.
         active: List[DecodeRequest] = []
         for dr in decode_reqs:
             if dr.hicache_restore_status != HiCacheRestoreResult.PENDING:
                 continue
             pm = dr.prefix_match
             if pm is None or not pm.needs_local_restore:
-                dr.hicache_restore_status = HiCacheRestoreResult.READY
+                if pm is None or pm.l1_prefix_len == 0:
+                    dr.hicache_restore_status = HiCacheRestoreResult.READY
                 continue
             active.append(dr)
 

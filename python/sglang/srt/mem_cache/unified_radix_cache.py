@@ -3716,6 +3716,12 @@ class UnifiedRadixCache(BasePrefixCache):
         ].finish_event
         return finish_event.query()
 
+    def latest_load_back_index(self) -> int:
+        """Counter slot of the newest submitted load-back still tracked, or -1."""
+        if self.cache_controller is None or not self.ongoing_load_back:
+            return -1
+        return self.cache_controller.layer_done_counter.producer_index
+
     def has_free_load_back_slot(self) -> bool:
         """Acks are reaped in lockstep, so every rank agrees on this."""
         cc = self.cache_controller
