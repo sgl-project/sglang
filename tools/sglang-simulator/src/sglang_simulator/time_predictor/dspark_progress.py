@@ -64,6 +64,7 @@ class EmpiricalDSparkProgress:
 
     def __init__(self, path, *, expected_sha256, runtime_profile_json):
         from infercast.sdk.native_sources import NATIVE_SOURCE_0522
+        from infercast.sdk.native_windows import MAX_NATIVE_WINDOW_BYTES
 
         path = Path(path)
         if (
@@ -144,9 +145,16 @@ class EmpiricalDSparkProgress:
             key = relative, ref["sha256"]
             if key not in native_cache:
                 p = path.parent / relative
-                if p.is_symlink() or not p.is_file() or p.stat().st_size > 64 * 1024**2:
+                if (
+                    p.is_symlink()
+                    or not p.is_file()
+                    or p.stat().st_size > MAX_NATIVE_WINDOW_BYTES
+                ):
                     _error("native progress evidence must be bounded regular bytes")
-                content = p.read_bytes()
+                with p.open("rb") as stream:
+                    content = stream.read(MAX_NATIVE_WINDOW_BYTES + 1)
+                if len(content) > MAX_NATIVE_WINDOW_BYTES:
+                    _error("native progress evidence must be bounded regular bytes")
                 if hashlib.sha256(content).hexdigest() != ref["sha256"]:
                     _error("native progress evidence digest differs")
                 native_cache[key] = _strict_json(content)

@@ -177,7 +177,9 @@ The progress artifact has `schema_version: 1`, definition
 `progress-observations-<sha256>.json` files. Each observation document contains
 `schema_version`, `source_pin`, `runtime_profile_sha256`, `participants`,
 `phase_policy`, `native`, `causal_history_evidence` and `observations`.
-Native/causal descriptors retain complete sibling JSON bytes. Each observation
+Native/causal descriptors retain complete sibling JSON bytes, bounded by the SDK's
+`MAX_NATIVE_WINDOW_BYTES` policy. Progress artifacts and observation documents
+retain their separate 64 MiB bounds. Each observation
 has `native_key`, `forward_ct`, `rid`, `trajectory_id`, `prefix_len`,
 `draft_history_tokens` (the source read window, at most 128), full
 `sampling_params`, `verify_width: 6` and `commit_len`. Native record identity is

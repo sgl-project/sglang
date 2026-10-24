@@ -83,7 +83,10 @@ def artifact(tmp_path, monkeypatch):
             "runtime_profile_sha256": pd,
             "source_pin": NATIVE_SOURCE_0522.name,
             "observations": rows,
-            "native": [{"path": proof_path.name, "sha256": proof_digest}],
+            "native": [
+                load.native_original
+                or {"path": proof_path.name, "sha256": proof_digest}
+            ],
             "causal_history_evidence": [
                 {"path": proof_path.name, "sha256": proof_digest}
             ],
@@ -110,7 +113,28 @@ def artifact(tmp_path, monkeypatch):
 
     load.batch_sizes = batch_sizes
     load.participants = participants
+    load.native_original = None
     return recipe, profile, train, validation, document, load
+
+
+@pytest.fixture
+def native_artifact(artifact, monkeypatch):
+    from sglang_simulator.time_predictor import dspark_progress
+
+    load = artifact[-1]
+    verify_context = dspark_progress._verify_native_progress_context
+    load.native_values = []
+
+    def read_originals(document, read):
+        # Exercise original-byte custody while the existing fixture continues
+        # to isolate progress mechanics from all-rank source admission.
+        load.native_values.extend(read(ref) for ref in document["native"])
+        return verify_context(document, read)
+
+    monkeypatch.setattr(
+        dspark_progress, "_verify_native_progress_context", read_originals
+    )
+    return artifact
 
 
 def before(recipe, profile):
@@ -119,6 +143,89 @@ def before(recipe, profile):
     return replace(
         s, groups=(replace(s.groups[0], requests=(r,)),), runtime_profile_json=profile
     )
+
+
+def test_native_original_over_64mib_preserves_custody_and_progress(
+    native_artifact, tmp_path
+):
+    from infercast.sdk.native_windows import MAX_NATIVE_WINDOW_BYTES
+
+    recipe, profile, _, _, _, load = native_artifact
+    window = {
+        "schema_version": 1,
+        "records": [],
+        "metadata": [],
+        "scope": "CPU structural original only; no timing or source admission",
+    }
+    size = 64 * 1024**2 + 1
+    assert size <= MAX_NATIVE_WINDOW_BYTES
+    prefix = raw(window) + b"\n"
+    original = prefix + b" " * (size - len(prefix))
+    path = tmp_path / "native-window.json"
+    path.write_bytes(original)
+    digest = hashlib.sha256(original).hexdigest()
+    load.native_original = {"path": path.name, "sha256": digest}
+
+    model = load()
+    assert load.native_values == [window, window]
+    assert model.conditional_commit_counts(before(recipe, profile)) == (
+        ("a", ((2, 1), (4, 1))),
+    )
+    assert path.stat().st_size == size
+    assert path.read_bytes() == original
+
+    # Equivalent JSON is still different original evidence if a byte changes.
+    with path.open("r+b") as stream:
+        stream.seek(-1, 2)
+        stream.write(b"\t")
+    model_path = tmp_path / "progress.json"
+    with pytest.raises(PredictorError, match="native progress evidence digest"):
+        EmpiricalDSparkProgress(
+            model_path,
+            expected_sha256=hashlib.sha256(model_path.read_bytes()).hexdigest(),
+            runtime_profile_json=profile,
+        )
+
+
+def test_native_original_above_sdk_bound_rejects_before_reading(
+    native_artifact, tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    from infercast.sdk.native_windows import MAX_NATIVE_WINDOW_BYTES
+
+    *_, load = native_artifact
+    path = tmp_path / "native-too-large.json"
+    with path.open("wb") as stream:
+        stream.write(b"{}")
+        stream.truncate(MAX_NATIVE_WINDOW_BYTES + 1)
+    assert path.stat().st_size == MAX_NATIVE_WINDOW_BYTES + 1
+    load.native_original = {"path": path.name, "sha256": "a" * 64}
+    original_open = Path.open
+
+    def no_oversize_read(self, *args, **kwargs):
+        if self == path:
+            pytest.fail("oversize native original was opened for reading")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", no_oversize_read)
+    with pytest.raises(PredictorError, match="bounded regular bytes"):
+        load()
+
+
+@pytest.mark.parametrize("kind", ["model", "observations"])
+def test_progress_json_bounds_remain_64mib(artifact, tmp_path, kind):
+    _, profile, _, _, document, load = artifact
+    load()
+    model_path = tmp_path / "progress.json"
+    digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    path = model_path if kind == "model" else tmp_path / document["training"][0]["path"]
+    with path.open("r+b") as stream:
+        stream.truncate(64 * 1024**2 + 1)
+    with pytest.raises(PredictorError, match="regular file|bounded regular originals"):
+        EmpiricalDSparkProgress(
+            model_path, expected_sha256=digest, runtime_profile_json=profile
+        )
 
 
 def test_training_distribution_excludes_validation_counts_and_reports_full_error(
