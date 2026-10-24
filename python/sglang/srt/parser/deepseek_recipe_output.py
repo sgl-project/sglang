@@ -232,14 +232,15 @@ def parse_output_text(
     thinking: Optional[bool] = None,
 ) -> RecipeOutputDelta:
     """`text` parsed as a whole output; the markers it spells count as the tokens
-    the model would have sampled. With `thinking` None, text that closes a thinking
-    block is reasoning up to `</think>`, with or without a leading `<think>`."""
+    the model would have sampled. With `thinking` None, text that opens with
+    `<think>` or closes a thinking block is reasoning up to `</think>`."""
     tokenizer = deepseek_recipe.hf_tokenizer
     output_ids = tokenizer.encode(text, add_special_tokens=False).ids
     if thinking is None:
-        if output_ids[:1] == [tokenizer.token_to_id(THINK_START_TOKEN)]:
+        thinking = output_ids[:1] == [tokenizer.token_to_id(THINK_START_TOKEN)]
+        if thinking:
             output_ids = output_ids[1:]
-        thinking = tokenizer.token_to_id(THINK_END_TOKEN) in output_ids
+        thinking = thinking or tokenizer.token_to_id(THINK_END_TOKEN) in output_ids
     parser = DeepSeekRecipeOutputParser(
         deepseek_recipe,
         thinking_stage=deepseek_recipe.parse_start(thinking=thinking),

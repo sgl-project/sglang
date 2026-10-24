@@ -1768,11 +1768,10 @@ async def separate_reasoning_request(
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
     if text_parser is not None:
         reasoning_text, normal_text = text_parser.separate_reasoning_text(obj.text)
-        blocks = [
-            {"type": kind, "text": text}
-            for kind, text in (("reasoning", reasoning_text), ("text", normal_text))
-            if text
-        ]
+        blocks = (
+            [{"type": "reasoning", "text": reasoning_text}] if reasoning_text else []
+        )
+        blocks.append({"type": "text", "text": normal_text})
     else:
         # 1) Initialize the parser based on the request body
         parser = ReasoningParser(

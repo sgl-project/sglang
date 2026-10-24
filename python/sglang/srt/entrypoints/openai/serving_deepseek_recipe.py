@@ -18,7 +18,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
-from sglang.srt.function_call.utils import called_tool_index, tool_indices
 from sglang.srt.parser.deepseek_recipe_output import (
     DeepSeekRecipeOutputParser,
     RecipeToolCall,
@@ -300,19 +299,21 @@ class DeepSeekRecipeChatEncodingAdapter:
     def parse_function_call_text(
         self, text: str, tools: list[Tool]
     ) -> tuple[str, list[ToolCallItem]]:
+        if not tools:
+            return text, []  # as the text parsers: nothing to call
         delta = parse_output_text(
             self.deepseek_recipe, text, parse_tool_calls=True, thinking=False
         )
-        indices = tool_indices(tools)
-        calls = []
-        for call in whole_tool_calls(delta):
-            tool_index = called_tool_index(call.name, indices)
-            if tool_index is not None:
-                calls.append(
-                    ToolCallItem(
-                        tool_index=tool_index, name=call.name, parameters=call.arguments
-                    )
-                )
+        # As in chat, a call to a tool outside `tools` is returned, at index -1.
+        indices = {tool.function.name: i for i, tool in enumerate(tools)}
+        calls = [
+            ToolCallItem(
+                tool_index=indices.get(call.name, -1),
+                name=call.name,
+                parameters=call.arguments,
+            )
+            for call in whole_tool_calls(delta)
+        ]
         return delta.content, calls
 
     def _new_output_parser(
