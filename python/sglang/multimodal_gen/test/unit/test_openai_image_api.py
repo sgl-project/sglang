@@ -42,7 +42,16 @@ def test_image_edits_declares_perf_dump_path_form_field():
     assert "perf_dump_path" in inspect.signature(edits).parameters
 
 
-def test_image_edits_forwards_cache_dit_form_fields(monkeypatch):
+@pytest.mark.parametrize("image_field", ["image", "image[]"])
+@pytest.mark.parametrize(
+    "enable_cache_dit,expected",
+    [(None, None), ("true", True), ("false", False)],
+    ids=["inherit", "enable", "disable"],
+)
+def test_image_edits_forwards_cache_dit_form_fields(
+    monkeypatch, image_field, enable_cache_dit, expected
+):
+    monkeypatch.setenv("SGLANG_CACHE_DIT_ENABLED", "true")
     monkeypatch.setattr(
         image_api,
         "get_global_server_args",
@@ -64,19 +73,28 @@ def test_image_edits_forwards_cache_dit_form_fields(monkeypatch):
     image = BytesIO()
     Image.new("RGB", (16, 16)).save(image, format="PNG")
     with TestClient(app) as client:
+        form_fields = {
+            "prompt": "p",
+            "cache_dit_params": '{"residual_diff_threshold":0.12}',
+        }
+        if enable_cache_dit is not None:
+            form_fields["enable_cache_dit"] = enable_cache_dit
+        upload = {image_field: ("reference.png", image.getvalue(), "image/png")}
         response = client.post(
             "/v1/images/edits",
-            data={
-                "prompt": "p",
-                "enable_cache_dit": "true",
-                "cache_dit_params": '{"residual_diff_threshold":0.12}',
-            },
-            files={"image": ("reference.png", image.getvalue(), "image/png")},
+            data=form_fields,
+            files=upload,
         )
         assert response.status_code == 400
         assert response.json()["detail"] == "captured before inference"
-        assert captured["enable_cache_dit"] is True
+        assert captured["enable_cache_dit"] is expected
         assert captured["cache_dit_params"] == {"residual_diff_threshold": 0.12}
+        response = client.post(
+            "/v1/images/edits",
+            data={"prompt": "p", "enable_cache_dit": "invalid"},
+            files=upload,
+        )
+        assert response.status_code == 422
         response = client.post(
             "/v1/images/edits",
             data={"cache_dit_params": "not json"},

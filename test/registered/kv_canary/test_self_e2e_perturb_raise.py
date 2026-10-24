@@ -25,10 +25,10 @@ class TestPerturbRaiseMha(CanaryE2EBase):
     def test_real_kv_used_perturbation_raises_in_raise_mode(self) -> None:
         """Verify raise mode surfaces real KV perturbation as a logged violation."""
         try:
+            # Use the default budget: first prefill may compile cold attention kernels.
             self.send_parallel_requests(
                 n=4,
                 assert_all_success=False,
-                timeout=30.0,
             )
         except Exception:
             pass

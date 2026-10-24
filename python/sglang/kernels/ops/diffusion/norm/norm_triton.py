@@ -22,14 +22,16 @@ def triton_autotune_configs():
     # Return configs with a valid warp count for the current device
     # Maximum threads per block is architecture-dependent in theory, but in reality all are 1024
     max_threads_per_block = 1024
-    # Default to warp size 32 if not defined by device
-    warp_size = getattr(
-        torch.get_device_module().get_device_properties(
-            torch.get_device_module().current_device()
-        ),
-        "warp_size",
-        32,
-    )
+    # This runs at import time, including on hosts without an accelerator.
+    # Default to warp size 32 when device properties are unavailable.
+    warp_size = 32
+    device_module = torch.get_device_module()
+    if device_module.is_available() and hasattr(device_module, "get_device_properties"):
+        warp_size = getattr(
+            device_module.get_device_properties(device_module.current_device()),
+            "warp_size",
+            32,
+        )
     if warp_size is None:
         warp_size = 32
     # Autotune for warp counts which are powers of 2 and do not exceed thread per block limit

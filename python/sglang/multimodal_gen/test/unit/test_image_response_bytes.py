@@ -4,6 +4,7 @@ import asyncio
 import base64
 import copy
 import os
+from contextlib import nullcontext
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -21,6 +22,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.runtime.disaggregation import scheduler_mixin
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import unpack_tensors
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
@@ -202,6 +204,64 @@ def test_dynamic_batch_split_keeps_each_requests_image_bytes():
     )
 
     assert [output.output_image_bytes for output in outputs] == [[b"a"], [b"b"]]
+
+
+@pytest.mark.parametrize("num_outputs", [1, 2], ids=["single", "sequential"])
+def test_glm_denoiser_returns_pixels_for_image_bytes_requests(
+    monkeypatch, tmp_path, num_outputs
+):
+    req = _image_req(tmp_path, save_output=True, return_image_bytes=True)
+    req.num_outputs_per_prompt = num_outputs
+    req.prior_token_id = torch.arange(num_outputs).reshape(num_outputs, 1)
+    worker = object.__new__(GPUWorker)
+    worker.is_output_rank = True
+
+    def forward(reqs):
+        (output_req,) = reqs
+        pixels = output_req.prior_token_id.float().reshape(-1, 1, 1, 1)
+        output_batch = OutputBatch(output=pixels.expand(-1, 3, 8, 8))
+        worker._materialize_output_transport(
+            output_batch,
+            output_req,
+            lambda batch: worker._save_output_paths(output_req, batch),
+        )
+        return output_batch
+
+    monkeypatch.setattr(worker, "execute_forward", forward)
+    monkeypatch.setattr(
+        worker,
+        "execute_forward_sequentially",
+        lambda reqs: (forward([output_req]) for output_req in reqs),
+    )
+    sent = []
+    monkeypatch.setattr(
+        scheduler_mixin,
+        "send_tensors",
+        lambda socket, tensors, scalars: sent.append((tensors, scalars)),
+    )
+    scheduler = SimpleNamespace(
+        worker=worker,
+        server_args=SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                supports_sequential_multi_output_inference=lambda: True
+            )
+        ),
+        _disagg_trace_dispatch=lambda req: nullcontext(),
+        _pool_result_push=None,
+        _disagg_metrics=None,
+    )
+
+    scheduler_mixin.SchedulerDisaggMixin._execute_glm_distributed_denoiser_request(
+        scheduler, req, "image-request"
+    )
+
+    ((tensors, scalars),) = sent
+    expected = torch.arange(num_outputs).float().reshape(-1, 1, 1, 1)
+    torch.testing.assert_close(tensors["output"], expected.expand(-1, 3, 8, 8))
+    assert scalars["request_id"] == "image-request"
+    assert "error" not in scalars
+    assert req.return_image_bytes is True
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("sequential", [False, True])

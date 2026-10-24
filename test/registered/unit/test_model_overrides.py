@@ -216,6 +216,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "enable_symm_mem",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
+                    "aux_hidden_state_capture",
                     "watermark_context_window",
                     "watermark_default_enabled",
                     "watermark_enforce_all",

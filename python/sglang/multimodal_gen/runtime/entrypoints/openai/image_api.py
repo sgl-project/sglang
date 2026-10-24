@@ -459,6 +459,10 @@ async def edits(
     profile_all_stages: Optional[bool] = Form(False),
     num_frames: int = Form(1),
 ):
+    # Omitted API fields inherit the server default, unlike unchecked HTML checkboxes.
+    if "enable_cache_dit" not in await raw_request.form():
+        enable_cache_dit = None
+
     request_id = generate_request_id()
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)

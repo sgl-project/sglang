@@ -132,7 +132,10 @@ jobs:
 
       - name: Resolve runner_config
         id: rc
-        run: python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+        run: |
+          # The selected dependency installer has not run yet.
+          python3 -m pip install PyYAML
+          python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
 
       - name: Export rdma_devices to job env
         run: echo "SGLANG_CI_RDMA_ALL_DEVICES=${{ steps.rc.outputs.rdma_devices || '' }}" >> "$GITHUB_ENV"
