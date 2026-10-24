@@ -82,6 +82,127 @@ def _runtime_json(raw):
         ) from error
 
 
+def _native_source_policy(database, profile_id, capture_profile):
+    """Resolve existing retained slice metadata; the SDK validates its policy."""
+    from infercast._serialization import canonical_json_bytes
+    from infercast.sdk.native_segment_module import OP, NativeSegmentQuery
+    from infercast.sdk.native_segment_projection import NativeSegmentSourcePolicy
+    from infercast.sdk.native_segments import BOUNDARY
+    from infercast.sdk.native_windows import MAX_NATIVE_WINDOW_BYTES
+    from infercast.sdk.perf_database.dsv41_dspark import decode_dspark_artifact
+    from infercast.sdk.perf_database.dsv41_native_segment import artifact_descriptor
+    from infercast.sdk.perf_database.slice_manifest import read_verified_slice_artifact
+
+    root = database.slice_ref.slice_dir
+
+    def read(path, digest):
+        return read_verified_slice_artifact(
+            root, path, expected_sha256=digest, max_bytes=MAX_NATIVE_WINDOW_BYTES
+        )
+
+    def document(ref):
+        return decode_dspark_artifact(read(*artifact_descriptor(ref)))
+
+    inventory = decode_dspark_artifact(
+        read_verified_slice_artifact(
+            root, "_meta/kernel_identity.json", max_bytes=MAX_NATIVE_WINDOW_BYTES
+        )
+    )
+    _require(
+        type(inventory.get("schema_version")) is int
+        and inventory["schema_version"] == 1
+        and isinstance(inventory.get("identities"), list),
+        "native regions require retained kernel identities",
+        code="invalid_execution_profile",
+    )
+    profiles, measurements = {}, {}
+    for entry in inventory["identities"]:
+        if not isinstance(entry, dict):
+            raise TypeError("native kernel identity must be an object")
+        if entry.get("op") != OP or entry.get("config_token") != profile_id:
+            continue
+        _require(
+            type(entry.get("shape_key")) is str,
+            "native region identity requires its canonical source shape",
+            code="invalid_execution_profile",
+        )
+        query = NativeSegmentQuery.from_shape(
+            decode_dspark_artifact(entry["shape_key"].encode("utf-8"))
+        )
+        shape = query.to_shape()
+        extra = entry.get("extra", {})
+        _require(
+            query.execution_profile_id == profile_id
+            and entry["shape_key"] == canonical_json_bytes(shape).decode()
+            and entry.get("kernel_source") == "sglang"
+            and entry.get("exec_mode") == shape["kernel_impl"]
+            and entry.get("kernel_name") == BOUNDARY
+            and isinstance(extra, dict)
+            and {"execution_profile", "measurement_manifest"} <= extra.keys(),
+            "native region source/profile identity differs",
+            code="invalid_execution_profile",
+        )
+        ref, measurement = extra["execution_profile"], extra["measurement_manifest"]
+        profiles[artifact_descriptor(ref)] = ref
+        measurements[artifact_descriptor(measurement)] = measurement
+    _require(
+        len(profiles) == 1 and next(iter(profiles))[1] == profile_id,
+        "native region profile is missing or ambiguous in the finalized slice",
+        code="data_unavailable",
+    )
+    profile_ref = next(iter(profiles.values()))
+    profile = document(profile_ref)
+    source = document(profile["source"])
+    captures, startup = {}, {}
+    for ref in source["evidence"]:
+        value = document(ref)
+        # Select original record kinds, including malformed candidates for the
+        # SDK's strict rejection. Roles never come from artifact filenames.
+        if any(
+            k in value for k in ("graph_keys", "runner_class", "captured_req_width")
+        ):
+            captures[artifact_descriptor(ref)] = ref
+        if "recorded_after_successful_init" in value:
+            startup[artifact_descriptor(ref)] = ref
+    windows, proposal = {}, {}
+    for ref in measurements.values():
+        value = document(ref)
+        _require(
+            type(value.get("schema_version")) is int
+            and value["schema_version"] == 1
+            and value.get("execution_profile_id") == profile_id,
+            "native source measurement belongs to another profile",
+            code="invalid_execution_profile",
+        )
+        for name, target in (("native", windows), ("proposal_paths", proposal)):
+            refs = value.get(name)
+            _require(
+                isinstance(refs, list)
+                and bool(refs)
+                and (name != "proposal_paths" or len(refs) == 2),
+                "native source metadata omits original " + name,
+                code="data_unavailable",
+            )
+            identities = [artifact_descriptor(original) for original in refs]
+            _require(
+                len(set(identities)) == len(identities),
+                "native source metadata repeats original " + name,
+                code="invalid_execution_profile",
+            )
+            for original in refs:
+                target[artifact_descriptor(original)] = original
+    return NativeSegmentSourcePolicy(
+        profile_ref,
+        read,
+        stack_meta=database.stack_meta,
+        capture_profile=capture_profile,
+        capture_descriptors=tuple(captures[k] for k in sorted(captures)),
+        startup_descriptors=tuple(startup[k] for k in sorted(startup)),
+        window_descriptors=tuple(windows[k] for k in sorted(windows)),
+        proposal_descriptors=tuple(proposal[k] for k in sorted(proposal)),
+    )
+
+
 def _canonical_config(value):
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -438,6 +559,8 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         runtime_profile=None,
         progress_artifact=None,
         proposal_profile_id=None,
+        native_segment_profile_id=None,
+        native_capture_profile=None,
         output_token_id=1,
         model_config_root=None,
         **kwargs,
@@ -503,6 +626,20 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             or type(proposal_profile_id) is str
             and re.fullmatch("[0-9a-f]{64}", proposal_profile_id) is not None,
             "proposal_profile_id must be a full lowercase digest",
+        )
+        _require(
+            native_segment_profile_id is None
+            or type(native_segment_profile_id) is str
+            and re.fullmatch("[0-9a-f]{64}", native_segment_profile_id) is not None,
+            "native_segment_profile_id must be a full lowercase digest",
+        )
+        _require(
+            (native_segment_profile_id is None) == (native_capture_profile is None),
+            "native_segment_profile_id and native_capture_profile must be selected together",
+        )
+        _require(
+            native_segment_profile_id is None or proposal_profile_id is None,
+            "native regions and legacy proposal profiles select conflicting cost grains",
         )
         _require(
             type(output_token_id) is int
@@ -585,6 +722,50 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         )
         from sglang_simulator.time_predictor.dspark_umd import UMDDSparkCostModel
 
+        native_policy, capture_identity = None, None
+        if native_segment_profile_id is not None:
+            try:
+                from infercast.sdk.decode_forward import DecodeExecutionProfile
+                from infercast.sdk.perf_database.dsv41_dspark import (
+                    decode_dspark_artifact,
+                )
+
+                capture_path, capture_bytes, capture_digest = _asset(
+                    native_capture_profile, "native_capture_profile"
+                )
+                capture_profile = DecodeExecutionProfile.from_dict(
+                    decode_dspark_artifact(capture_bytes)
+                )
+                native_policy = _native_source_policy(
+                    database, native_segment_profile_id, capture_profile
+                )
+                _require(
+                    runtime_text == native_policy.runtime_profile_json,
+                    "configured runtime differs from the verified native physical source",
+                    code="incompatible_runtime",
+                )
+                capture_identity = {
+                    "path": str(capture_path),
+                    "sha256": capture_digest,
+                    "profile_id": capture_profile.profile_id,
+                }
+            except PredictorError:
+                raise
+            except ImportError as error:
+                raise PredictorError(
+                    "provider_initialization_failed",
+                    "native projection SDK is unavailable",
+                ) from error
+            except (
+                OSError,
+                KeyError,
+                ValueError,
+                TypeError,
+                NotImplementedError,
+            ) as error:
+                raise PredictorError(
+                    "data_unavailable", f"native source policy is unavailable: {error}"
+                ) from error
         progress = EmpiricalDSparkProgress(
             progress_path,
             expected_sha256=progress_digest,
@@ -595,7 +776,11 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             "progress originals require the same modeled TP2/DP1/PP1 topology",
             code="unsupported_topology",
         )
-        costs = UMDDSparkCostModel(database, proposal_profile_id=proposal_profile_id)
+        costs = UMDDSparkCostModel(
+            database,
+            proposal_profile_id=proposal_profile_id,
+            native_source_policy=native_policy,
+        )
         self.dspark_runtime = DSparkNativeRuntime(
             session=DSparkSession(costs, progress),
             topology=DSparkTopology(2, 1, 1),
@@ -618,6 +803,8 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             },
             "progress_model_ref": progress.model_ref,
             "proposal_profile_id": proposal_profile_id,
+            "native_segment_profile_id": native_segment_profile_id,
+            "native_capture_profile": capture_identity,
             "slice": {
                 "path": str(database.slice_ref.slice_dir),
                 "stack_path": str(stack_path),
@@ -653,13 +840,21 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             "infercast_dspark": {
                 **copy.deepcopy(self._identity),
                 "phase_preparers": coverage,
-                "source_resolution": "proposal_capture_only",
-                "unresolved_source_facts": [
-                    "target_graph_key",
-                    "target_graph_padding",
-                    "target_epilogue_folding",
-                    "target_monokernel_source_state_ledger",
-                ],
+                "source_resolution": (
+                    "sdk_native_segment_projection"
+                    if self._identity["native_segment_profile_id"] is not None
+                    else "proposal_capture_only"
+                ),
+                "unresolved_source_facts": (
+                    ["source_ordered_reference_driver_inputs"]
+                    if self._identity["native_segment_profile_id"] is not None
+                    else [
+                        "target_graph_key",
+                        "target_graph_padding",
+                        "target_epilogue_folding",
+                        "target_monokernel_source_state_ledger",
+                    ]
+                ),
                 "complete_worker_costs": False,
                 "timing_qualified": False,
                 "accuracy_admitted": False,

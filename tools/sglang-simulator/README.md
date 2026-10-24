@@ -130,20 +130,23 @@ configuration, and requires full model and installed-provider commits plus
 hash-pinned runtime and progress assets. It opens the selected FIDB database and
 records the stack digest; this does not certify its manifest or complete table
 coverage. Asset paths resolve from the configuration directory. The
-factory currently prepares only the existing proposal module; complete prefill
-and decode phases remain explicit data gaps. Constructing it does not establish
-a complete runnable cost model, source resolver or accuracy admission.
+legacy `proposal_profile_id` selection prepares only the existing proposal
+module. The explicit native-region selection below prepares all four prefill
+and five decode regions through the SDK. Constructing either selection does
+not establish measured coverage, a reference event driver or accuracy admission.
 
 The before-work resolver receives the original native CPU batch and authoritative
 proposal-buffer capacity/device state before costs are queried. The optional
 `capture_simulator_source_facts` helper freezes ordered original-input lengths,
 budgets, request-state flags and CPU mirrors. These remain simulator observations;
 they do not establish the reference path's mirror availability, target graph bound
-or separate verify-plan argument. A source-owned SDK projector is still required.
-Native-region phase graphs must bind the exact region, ordered work, full sampling,
+or separate verify-plan argument. With a verified native policy, the resolver
+passes the source driver's separate `reference_view` and matching ordered request
+metadata to SDK `project_native_segment_query`. It retains the returned canonical
+module variant unchanged. Native-region phase graphs bind the exact region, ordered work, full sampling,
 buffer/history, execution profile and actual runtime identity, including a complete
-phase attestation for native proposal. The adapter supplies no such attestation.
-The legacy proposal selector rejects a conflicting preparer instead of replacing it.
+phase attestation for native proposal, through SDK `prepare_native_dspark_phase`.
+Native and legacy proposal selectors reject conflicting cost grains.
 
 For a HuggingFace snapshot whose `config.json` links into the cache's blob
 directory, set `model_config_root` to the explicit containing checkpoint/cache
@@ -168,6 +171,33 @@ the simulation configuration directory.
   "output_token_id": 1
 }
 ```
+
+For the native-region path, replace `proposal_profile_id` with both fields:
+
+```json
+{
+  "native_segment_profile_id": "<existing native region profile SHA-256>",
+  "native_capture_profile": {
+    "path": "decode-capture-profile.json",
+    "sha256": "<file SHA-256>"
+  }
+}
+```
+
+The capture artifact is the existing SDK `DecodeExecutionProfile.to_dict()`
+document, parsed with its strict serializer. Native-region metadata does not
+retain this document, so it must be supplied explicitly; capture buckets alone
+cannot reconstruct its compatibility fields. The selected slice's existing
+kernel identities provide profile/measurement references. Their retained source
+inventory supplies startup/capture originals, and measurement references supply
+native windows/proposal paths. The SDK validates all roles, actual captures,
+source policy and process correspondence. Conflicting epochs reject rather
+than selecting the latest receipt. Runtime bytes must exactly match the policy's
+canonical physical-source document and the independently bound progress artifact.
+
+This first native projection domain is TP2/ADP1/PP1, B1-B8. Its seven logical
+preparers select nine mode-specific regions; costs still use the ordinary UMD
+executor and finalized silicon PerfDB. Missing rows remain data gaps.
 
 This is the predictor object inside the ordinary simulation configuration;
 replace digest/commit placeholders with verified values. Configure the modeled
@@ -206,6 +236,8 @@ the description must declare `extra.complete_dspark_worker_phase` equal to its
 phase. This is a coverage contract for reviewed implementation, not a user
 override: it cannot remove `unmodeled_target_call_units` or introduce constant
 latencies. Complete worker queries require every phase before querying progress.
+An explicit native source policy installs its own complete phase preparers and
+rejects additional custom preparers.
 
 ## Requirements
 
@@ -739,8 +771,34 @@ FIFO head when appropriate. With no previous result, the current result remains
 pending. It accepts no new synchronization or skip decisions from current
 acceptance. Compute this candidate before external publication/session commit
 and install it only after those operations succeed; the pure helper does not
-perform or roll back external side effects. No source-qualified projector,
-source event driver or predictor factory activation is supplied by this bridge.
+perform or roll back external side effects. The native factory's existing cost
+model can now serve as this resolver:
+
+```python
+transaction = prepare_reference_step(
+    reference_ledger,
+    unresolved_step,
+    page_size=256,
+    future_indices_ready=source_future_indices_ready,
+    needs_cpu_seq_lens=source_needs_cpu_seq_lens,
+    process_previous_before=source_sync_previous,
+    skipped_previous_ids=source_skipped_previous_ids,
+    execution_resolver=predictor.dspark_runtime.session.cost_model.execution_for,
+    native_batch=source_worker_before_batch,
+    buffer_capacity=before_capacity,
+    buffer_device_matches=before_device_matches,
+)
+prediction = predictor.dspark_runtime.session.predict(transaction.step)
+```
+
+The driver must supply reference-order request membership, abort/embed/multimodal
+flags, relay/backend policy and causal history before current progress. Request
+IDs, budgets and complete normalized sampling must match the step. The SDK gets
+reference CPU vectors, including known absence, separately from synchronous
+simulator mirrors. EXTEND's SDK decode-only arguments are None; the outer step
+still retains its real persistent buffer state. Unknown inputs reject explicitly.
+The ordinary runtime callback supplies no reference event driver and therefore
+cannot activate this path by itself. No scheduler or cost lookup is duplicated.
 
 Run repository checks before submitting:
 

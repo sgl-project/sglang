@@ -12,15 +12,44 @@ from sglang_simulator.time_predictor.base import PredictorError
 class UMDDSparkCostModel:
     """Evaluate source-owned prepared graphs; no alternate latency table.
 
-    Existing proposal preparation is wired directly. Other complete boundaries
-    must be supplied by their owning UMD family implementation. Missing phases
-    remain gaps, including target-call gaps omitted by the 44-leaf composition.
+    An explicit SDK native source policy enables its complete region graphs.
+    The legacy proposal selector remains a separate incomplete cost grain.
+    Registration alone supplies neither measured costs nor source event order.
     """
 
-    def __init__(self, database, *, proposal_profile_id=None, phase_preparers=None):
+    def __init__(
+        self,
+        database,
+        *,
+        proposal_profile_id=None,
+        phase_preparers=None,
+        native_source_policy=None,
+    ):
         self.database = database
         self.proposal_profile_id = proposal_profile_id
         self.preparers = dict(phase_preparers or {})
+        self.native_source_policy = native_source_policy
+        if native_source_policy is not None:
+            from infercast.sdk.native_segment_projection import (
+                NativeSegmentSourcePolicy,
+            )
+
+            if (
+                type(native_source_policy) is not NativeSegmentSourcePolicy
+                or proposal_profile_id is not None
+                or self.preparers
+            ):
+                raise PredictorError(
+                    "invalid_execution_profile",
+                    "native regions require one verified SDK policy and one cost grain",
+                )
+            from sglang_simulator.time_predictor.dspark_native_regions import _REGIONS
+
+            self.preparers = {
+                phase: self._prepare_native
+                for phases in _REGIONS.values()
+                for phase in phases
+            }
         if proposal_profile_id is not None:
             if "proposal" in self.preparers:
                 raise PredictorError(
@@ -38,15 +67,28 @@ class UMDDSparkCostModel:
         native_batch=None,
         buffer_capacity=None,
         buffer_device_matches=None,
+        reference_view=None,
     ):
-        """Resolve draft capture from retained SDK profile metadata, not outputs.
+        """Resolve SDK work from explicit before-work inputs.
 
-        This resolves the existing source-bound proposal domain only. Target
-        and prefill execution decisions remain owned by their UMD preparation.
-        Native batch and buffer inputs are transported separately for the
-        prospective SDK projector; this legacy path does not reinterpret them
-        as reference graph or verify-plan facts.
+        A native policy requires the source driver's frozen reference CPU view
+        and matching request metadata. The legacy proposal path resolves only
+        its own capture and does not reinterpret reference planning inputs.
         """
+        if self.native_source_policy is not None:
+            return self._native_execution(
+                group=group,
+                runtime_profile_json=runtime_profile_json,
+                native_batch=native_batch,
+                buffer_capacity=buffer_capacity,
+                buffer_device_matches=buffer_device_matches,
+                reference_view=reference_view,
+            )
+        if reference_view is not None:
+            raise PredictorError(
+                "data_unavailable",
+                "reference CPU inputs require the complete native SDK source policy",
+            )
         from infercast.sdk.perf_database.slice_manifest import (
             read_verified_slice_artifact,
         )
@@ -100,6 +142,139 @@ class UMDDSparkCostModel:
                 "DSPark draft capture has no matching source profile",
             )
         return {"draft_capture_key": key, "draft_graph_eligible": True}
+
+    def _native_execution(
+        self,
+        *,
+        group,
+        runtime_profile_json,
+        native_batch,
+        buffer_capacity,
+        buffer_device_matches,
+        reference_view,
+    ):
+        from sglang_simulator.simulation.sglang.dspark_reference import ReferenceCPUView
+        from sglang_simulator.simulation.sglang.dspark_runtime import (
+            capture_simulator_source_facts,
+            sampling_snapshot,
+        )
+        from sglang_simulator.time_predictor.dspark_native_regions import _REGIONS
+
+        if type(reference_view) is not ReferenceCPUView:
+            raise PredictorError(
+                "data_unavailable",
+                "native projection requires the source driver's before-work reference CPU view",
+                missing_source_facts=["reference_view"],
+            )
+        if native_batch is None:
+            raise PredictorError(
+                "data_unavailable",
+                "native projection requires the matching before-work request metadata",
+                missing_source_facts=["native_batch"],
+            )
+        facts = capture_simulator_source_facts(native_batch)
+        decode = group.forward_mode == "TARGET_VERIFY"
+        mode = "DECODE" if decode else "EXTEND"
+        if (
+            group.attention_dp_rank != 0
+            or group.forward_mode not in _REGIONS
+            or facts.forward_mode != mode
+            or tuple((r.rid, r.max_new_tokens) for r in facts.requests)
+            != tuple((r.rid, r.max_new_tokens) for r in group.requests)
+            or tuple(sampling_snapshot(r.sampling_params) for r in native_batch.reqs)
+            != tuple(r.sampling_params_json for r in group.requests)
+        ):
+            raise PredictorError(
+                "data_unavailable",
+                "native projection request order, mode or complete sampling differs from the reference step",
+            )
+        from infercast.sdk.extend_forward import ExtendRequestShape
+        from infercast.sdk.native_segment_projection import project_native_segment_query
+
+        try:
+            query = project_native_segment_query(
+                execution_profile_id=self.native_source_policy.execution_profile_id,
+                segment_kind=next(iter(_REGIONS[group.forward_mode].values())),
+                source_policy=self.native_source_policy,
+                runtime_profile_json=runtime_profile_json,
+                forward_mode=mode,
+                request_work=tuple(
+                    ExtendRequestShape(
+                        prefix_len=r.target_prefix_len, extend_len=r.extend_len
+                    )
+                    for r in group.requests
+                ),
+                normalized_sampling=tuple(
+                    json.loads(r.sampling_params_json) for r in group.requests
+                ),
+                request_metadata=tuple(
+                    (
+                        r.origin_input_len,
+                        r.to_finish_present,
+                        r.input_embeds_present,
+                        r.multimodal_inputs_present,
+                    )
+                    for r in facts.requests
+                ),
+                seq_lens_cpu=reference_view.seq_lens_cpu,
+                nxt_kv_lens_cpu=reference_view.nxt_kv_lens_cpu,
+                draft_history_tokens=tuple(
+                    r.bounded_draft_history_tokens(128) for r in group.requests
+                )
+                if decode
+                else None,
+                buffer_capacity=buffer_capacity if decode else None,
+                buffer_device_matches=buffer_device_matches if decode else None,
+            )
+        except (KeyError, ValueError, TypeError) as error:
+            raise PredictorError(
+                "data_unavailable",
+                "native SDK projection lacks compatible causal inputs",
+                reason=str(error),
+            ) from error
+        return {
+            "native_segment_profile_id": query.execution_profile_id,
+            "native_segment_module_variant": query.module_variant,
+        }
+
+    def _prepare_native(self, *, step, phase):
+        from sglang_simulator.time_predictor.dspark_native_regions import _REGIONS
+
+        try:
+            from infercast.sdk.models.umd.templates.deepseek_v41_segments import (
+                prepare_native_dspark_phase,
+            )
+            from infercast.sdk.native_segment_module import NativeSegmentQuery
+
+            if (
+                step.topology.tp_size,
+                step.topology.attention_dp_size,
+                step.topology.pp_size,
+            ) != (2, 1, 1) or len(step.groups) != 1:
+                raise ValueError("native region profile requires TP2/ADP1/PP1")
+            group = step.groups[0]
+            execution = json.loads(group.execution_json)
+            if (
+                execution["native_segment_profile_id"]
+                != self.native_source_policy.execution_profile_id
+                or step.runtime_profile_json
+                != self.native_source_policy.runtime_profile_json
+            ):
+                raise ValueError(
+                    "native region policy/runtime changed after projection"
+                )
+            query = NativeSegmentQuery(
+                execution["native_segment_profile_id"],
+                _REGIONS[group.forward_mode][phase],
+                execution["native_segment_module_variant"],
+            )
+            return prepare_native_dspark_phase(
+                query=query, phase=phase, runtime_profile_json=step.runtime_profile_json
+            )
+        except (KeyError, ValueError, TypeError) as error:
+            raise PredictorError(
+                "data_unavailable", "native SDK phase projection is unavailable"
+            ) from error
 
     def _prepare_proposal(self, *, step, phase):
         from infercast.sdk.dspark_proposal import project_dspark_proposal_work

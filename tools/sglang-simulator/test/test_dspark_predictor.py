@@ -287,6 +287,32 @@ def factory(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "change,message",
+    [
+        ({"native_segment_profile_id": "e" * 64}, "selected together"),
+        (
+            {"native_capture_profile": {"path": "capture.json", "sha256": "f" * 64}},
+            "selected together",
+        ),
+        ({"native_segment_profile_id": "short"}, "lowercase digest"),
+        (
+            {
+                "native_segment_profile_id": "e" * 64,
+                "native_capture_profile": {"path": "capture.json", "sha256": "f" * 64},
+            },
+            "conflicting cost grains",
+        ),
+    ],
+)
+def test_native_selector_requires_existing_capture_profile_and_excludes_legacy_grain(
+    factory, change, message
+):
+    with pytest.raises(PredictorError, match=message):
+        factory.build(**change)
+    assert factory.calls["progress"] == []
+
+
 def test_factory_assembles_real_runtime_and_exposes_incomplete_costs(factory):
     from sglang_simulator.time_predictor.dspark_umd import UMDDSparkCostModel
 

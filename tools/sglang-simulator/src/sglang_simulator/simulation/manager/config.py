@@ -297,6 +297,8 @@ class ConfigManager:
                 "runtime_profile",
                 "progress_artifact",
                 "proposal_profile_id",
+                "native_segment_profile_id",
+                "native_capture_profile",
                 "output_token_id",
             }
             unknown_fields = sorted(predictor_config.keys() - supported_fields)
@@ -323,7 +325,11 @@ class ConfigManager:
                 # Preserve the requested root's link identity. The factory
                 # resolves and checks it across native model binding.
                 options["model_config_root"] = str(root.absolute())
-            for key in ("runtime_profile", "progress_artifact"):
+            for key in (
+                "runtime_profile",
+                "progress_artifact",
+                "native_capture_profile",
+            ):
                 ref = options.get(key)
                 if isinstance(ref, dict) and type(ref.get("path")) is str:
                     options[key] = {

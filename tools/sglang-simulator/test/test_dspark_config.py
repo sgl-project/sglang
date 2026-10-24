@@ -90,6 +90,25 @@ def test_malformed_asset_is_passed_to_predictor_validator_not_repaired(factory):
     assert calls == [result]
 
 
+def test_native_segment_selector_and_existing_capture_profile_resolve_from_config(
+    factory,
+):
+    _, raw, folder = factory
+    raw["predictor"].pop("proposal_profile_id")
+    raw["predictor"].update(
+        native_segment_profile_id="e" * 64,
+        native_capture_profile={"path": "capture.json", "sha256": "f" * 64},
+    )
+    original = copy.deepcopy(raw)
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert result.native_segment_profile_id == "e" * 64
+    assert result.native_capture_profile == {
+        "path": str((folder / "capture.json").resolve()),
+        "sha256": "f" * 64,
+    }
+    assert raw == original
+
+
 @pytest.mark.parametrize("invalid", [123, "", " "])
 def test_model_config_root_is_optional_and_malformed_values_are_not_repaired(
     factory, invalid
