@@ -110,10 +110,8 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.layers.cp.base import (
-    from_cp_sharded,
-    is_cp_sharded_padded,
-)
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
@@ -607,6 +605,9 @@ class Scheduler(
         self.swa_tokens_per_layer = result.swa_tokens_per_layer
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.logical_page_size = self.page_size
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
         self.kv_shard_widening = page_interleave_shard_size(
             self.token_to_kv_pool_allocator
         )
@@ -2469,16 +2470,14 @@ class Scheduler(
         )
 
     def init_invariant_checker(self) -> None:
-        global_page_size = self.page_size
         global_tokens = self.max_total_num_tokens * self.kv_shard_widening
         if is_cp_sharded_padded():
-            global_page_size = from_cp_sharded(global_page_size)
             global_tokens = from_cp_sharded(global_tokens)
         self.invariant_checker = SchedulerInvariantChecker(
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_ssm=self.is_hybrid_ssm,
             disaggregation_mode=self.disaggregation_mode,
-            page_size=global_page_size,
+            page_size=self.logical_page_size,
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
             max_total_num_tokens=global_tokens,
@@ -2672,15 +2671,14 @@ class Scheduler(
         )
         if is_cp_sharded_padded():
             token_capacity = from_cp_sharded(token_capacity)
-            # The allocator rounds to physical pages. Reserve the extra group
-            # padding and headroom here, in the scheduler's global token budget.
-            group_size = from_cp_sharded(self.page_size)
-            token_capacity -= (
-                (-input_len) % group_size
-                - (-input_len) % self.page_size
-                + group_size
-                - self.page_size
-            )
+            # (-input_len) % size is padding to the next multiple of size.
+            # Replace physical-page padding and decode headroom with a CP group.
+            group_size = self.logical_page_size
+            group_padding = (-input_len) % group_size
+            page_padding = (-input_len) % self.page_size
+            extra_padding = group_padding - page_padding
+            extra_headroom = group_size - self.page_size
+            token_capacity -= extra_padding + extra_headroom
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,

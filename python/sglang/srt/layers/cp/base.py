@@ -29,10 +29,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
 
-import torch
-
 from sglang.srt.arg_groups.choices import add_cp_kv_layout_choices
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -356,67 +354,6 @@ def is_cp_sharded_padded() -> bool:
     return strategy is not None and strategy.cp_kv_sharded
 
 
-def get_cp_sharded_padded(value):
-    """Convert a global KV count to local storage for sharded CP storage."""
-    strategy = get_cp_strategy()
-    return value // strategy.cp_size
-
-
-def from_cp_sharded(value):
-    """Convert a local KV count back to global for sharded CP storage."""
-    strategy = get_cp_strategy()
-    return value * strategy.cp_size
-
-
-def get_cp_sharded_padded_cache_indices(value):
-    """Recover complete reserved local pages from actual cache-group rows."""
-    strategy = get_cp_strategy()
-    c = strategy.cp_size
-    p = get_schedule().page_size
-    # The interval starts at a group boundary; its last group may be partial.
-    representatives = value[:: c * p]
-    pages = (
-        get_cp_sharded_padded_cache_transfer_indices(representatives.to(torch.int64))
-        // p
-    )
-    local = pages[:, None] * p + torch.arange(p, device=value.device)
-    return torch.where(
-        representatives[:, None] > 0,
-        local.to(value.dtype),
-        representatives[:, None],
-    ).reshape(-1)
-
-
-def from_cp_sharded_expanded_indices(value):
-    """Expand complete local pages into every CP column in cache-row order."""
-    strategy = get_cp_strategy()
-    c = strategy.cp_size
-    p = get_schedule().page_size
-    pages = value[::p] // p
-    columns = torch.arange(c, device=value.device)
-    offsets = torch.arange(p, device=value.device)
-    return (
-        ((pages[:, None, None] - 1) * c + 1 + columns[None, :, None]) * p
-        + offsets[None, None, :]
-    ).reshape(-1)
-
-
-def _ceil_group_count(value, group_size):
-    """Count complete groups needed to cover a token endpoint."""
-    return (value + group_size - 1) // group_size
-
-
-def get_cp_sharded_padded_allocation_tokens(value, *, prefix_tokens):
-    """Convert raw request tokens to fresh KV capacity for sharded CP storage."""
-    strategy = get_cp_strategy()
-    page_size = get_schedule().page_size
-    group_size = strategy.cp_size * page_size
-    return (
-        _ceil_group_count(prefix_tokens + value, group_size) * group_size
-        - _ceil_group_count(prefix_tokens, group_size) * group_size
-    )
-
-
 def get_cp_strategy_kind() -> ContextParallelStrategyKind:
     strategy = get_cp_strategy()
     if strategy is None:
@@ -434,13 +371,3 @@ def is_zigzag() -> bool:
 
 def is_interleave() -> bool:
     return get_cp_strategy_kind() == ContextParallelStrategyKind.INTERLEAVE
-
-
-def get_cp_sharded_padded_cache_transfer_indices(value):
-    """Project cache rows to local rows, preserving shape, dtype and sentinels."""
-    strategy = get_cp_strategy()
-    c = strategy.cp_size
-    p = get_schedule().page_size
-    shifted = value.to(torch.int64) + (c - 1) * p
-    local = (shifted // (c * p)) * p + shifted % p
-    return torch.where(value > 0, local.to(value.dtype), value)

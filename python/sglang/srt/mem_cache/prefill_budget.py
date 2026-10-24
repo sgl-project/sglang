@@ -21,44 +21,14 @@ realizes the selected reservation before a host transfer pins device rows.
 
 from typing import Optional
 
-from sglang.srt.layers.cp.base import (
-    _ceil_group_count,
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import (
     from_cp_sharded,
     get_cp_sharded_padded_allocation_tokens,
-    get_cp_strategy,
-    is_cp_sharded_padded,
+    get_cp_sharded_padded_available_tokens,
+    get_cp_sharded_padded_chunk_tokens,
 )
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
-from sglang.srt.runtime_context import get_schedule
-
-
-def get_cp_sharded_padded_chunk_tokens(value, *, prefix_tokens):
-    """Align a chunk to complete fresh groups, retaining its reserved prefix tail."""
-    strategy = get_cp_strategy()
-    page_size = get_schedule().page_size
-    group_size = strategy.cp_size * page_size
-    tail = _ceil_group_count(prefix_tokens, group_size) * group_size - prefix_tokens
-    groups = max(0, int((value - tail) // group_size))
-    return min(max(value, 0), tail + groups * group_size)
-
-
-def get_cp_sharded_padded_available_tokens(value, *, reserved_tokens=0):
-    """Adapt free capacity before the existing chunk headroom subtraction.
-
-    The resource group is C times the strategy's physical token page size.
-    Without a prefix, allow at most one partial group's tail. A request-aware
-    geometry entry bounds that allowance by the actual reserved tail.
-    """
-    strategy = get_cp_strategy()
-    if value < 0:
-        return value
-    group_size = strategy.cp_size * get_schedule().page_size
-    return (
-        reserved_tokens
-        + max(0, (value - reserved_tokens) // group_size) * group_size
-        + group_size
-        - 1
-    )
 
 
 def estimate_swa_kv_tokens(
@@ -108,7 +78,7 @@ class PrefillBudget:
         # Logical token alignment width: one allocator page, or a full CP group.
         self.page_size = allocator.page_size
         if is_cp_sharded_padded():
-            self.page_size = from_cp_sharded(self.page_size)
+            self.page_size *= get_cp_strategy().cp_size
         self.total_offset = num_mixed_decode_tokens
         self.current_offset = num_mixed_decode_tokens
         self.swa_offset = 0

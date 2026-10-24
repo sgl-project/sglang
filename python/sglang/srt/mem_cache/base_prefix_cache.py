@@ -18,10 +18,8 @@ from typing import (
 
 import torch
 
-from sglang.srt.layers.cp.base import (
-    from_cp_sharded,
-    is_cp_sharded_padded,
-)
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -62,6 +60,7 @@ class PrefixCacheTrait(Protocol):
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
+    logical_page_size: int
     disable: bool
 
 
@@ -501,9 +500,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
         # Adjacent pieces whose seam falls inside one (DCP-widened) page would
         # free that page twice; the allocator rejects that, so merge them first.
-        global_page_size = allocator.page_size
-        if is_cp_sharded_padded():
-            global_page_size = from_cp_sharded(global_page_size)
+        global_page_size = self.logical_page_size
         free_kv_row_segments(
             allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],

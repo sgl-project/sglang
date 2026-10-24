@@ -12,11 +12,11 @@ from sglang.kernels.ops.memory.common import (
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.environ import envs
-from sglang.srt.layers.cp.base import (
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import (
     from_cp_sharded,
     get_cp_sharded_padded,
     get_cp_sharded_padded_cache_indices,
-    is_cp_sharded_padded,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -473,11 +473,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
 def _release_overallocated_kv_indices(
     req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
 ) -> None:
-    allocator = tree_cache.token_to_kv_pool_allocator
     # Logical token alignment width: one allocator page, or a full CP group.
-    page_size = allocator.page_size
-    if is_cp_sharded_padded():
-        page_size = from_cp_sharded(page_size)
+    page_size = tree_cache.logical_page_size
     spec_algo = get_spec().speculative_algorithm
 
     # strip_thinking_cache intentionally reports output tokens as overallocated

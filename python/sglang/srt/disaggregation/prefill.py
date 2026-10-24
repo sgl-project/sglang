@@ -66,10 +66,8 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.cp.base import (
-    get_cp_sharded_padded_cache_transfer_indices,
-    is_cp_sharded_padded,
-)
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indices
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
     FINISH_LENGTH,

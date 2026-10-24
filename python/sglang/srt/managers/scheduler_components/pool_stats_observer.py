@@ -10,10 +10,8 @@ from typing import (
     Tuple,
 )
 
-from sglang.srt.layers.cp.base import (
-    from_cp_sharded,
-    is_cp_sharded_padded,
-)
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils.common import ceil_align

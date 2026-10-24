@@ -24,6 +24,7 @@ class TestUnifiedRadixLockRefScenarios(unittest.TestCase):
         cache.disable = False
         cache.req_to_token_pool = MagicMock()
         cache.token_to_kv_pool_allocator = SimpleNamespace(page_size=1)
+        cache.logical_page_size = 1
         cache.req_to_token_pool.req_to_token = torch.arange(8).reshape(1, 8)
         cache.free_kv_row = MagicMock()
         cache.dec_lock_ref = MagicMock()

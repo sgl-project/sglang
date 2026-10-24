@@ -17,12 +17,13 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
 )
-from sglang.srt.layers.cp.base import (
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import (
     _ceil_group_count,
     from_cp_sharded_expanded_indices,
+    get_cp_sharded_padded_allocation_lengths,
+    get_cp_sharded_padded_allocation_size,
     get_cp_sharded_padded_cache_transfer_indices,
-    get_cp_strategy,
-    is_cp_sharded_padded,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
@@ -58,26 +59,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _EMPTY_PREFIX = torch.empty((0,), dtype=torch.int64)
-
-
-def get_cp_sharded_padded_allocation_lengths(value):
-    """Convert request endpoints to reserved local capacity for allocation."""
-    strategy = get_cp_strategy()
-    page_size = get_schedule().page_size
-    group_size = strategy.cp_size * page_size
-    return _ceil_group_count(value, group_size) * page_size
-
-
-def get_cp_sharded_padded_allocation_size(value, *, prefix_lens, extend_lens):
-    """Count fresh local rows from the existing CPU request endpoints."""
-    strategy = get_cp_strategy()
-    page_size = get_schedule().page_size
-    seq_lens = prefix_lens + extend_lens
-    group_size = strategy.cp_size * page_size
-    pages = _ceil_group_count(seq_lens, group_size) - _ceil_group_count(
-        prefix_lens, group_size
-    )
-    return int(pages.sum()) * page_size
 
 
 def write_cache_indices(
@@ -502,10 +483,8 @@ def alloc_for_extend(
             alloc_seq_lens_cpu = get_cp_sharded_padded_allocation_lengths(
                 alloc_seq_lens_cpu
             )
-            alloc_extend_num_tokens = get_cp_sharded_padded_allocation_size(
-                alloc_extend_num_tokens,
-                prefix_lens=prefix_lens_cpu,
-                extend_lens=extend_lens_cpu,
+            alloc_extend_num_tokens = int(
+                (alloc_seq_lens_cpu - alloc_prefix_lens_cpu).sum()
             )
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,

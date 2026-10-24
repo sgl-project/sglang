@@ -32,11 +32,13 @@ from sglang.srt.layers.attention.local_attention import (
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
-    get_cp_sharded_padded_cache_transfer_indices,
     get_cp_strategy,
     is_cp_sharded_padded,
 )
-from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.cp.utils import (
+    get_cp_sharded_padded_cache_transfer_indices,
+    is_cp_active,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view

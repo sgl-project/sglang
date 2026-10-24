@@ -3,10 +3,9 @@ from __future__ import annotations
 import logging
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.cp.base import (
-    from_cp_sharded,
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_allocation_tokens,
-    is_cp_sharded_padded,
 )
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.runtime_context import (
@@ -609,6 +608,9 @@ class PrefillAdder:
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.logical_page_size = self.page_size
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
@@ -709,10 +711,8 @@ class PrefillAdder:
         self.per_req_token_overhead = (
             kv_shard_size * self.kv_shard_granule
             if self.kv_shard_granule
-            else self.page_size
+            else self.logical_page_size
         )
-        if not self.kv_shard_granule and is_cp_sharded_padded():
-            self.per_req_token_overhead = from_cp_sharded(self.per_req_token_overhead)
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
@@ -885,12 +885,10 @@ class PrefillAdder:
         compute_charge = (
             raw_extend_input_len if self.exact_chunk_fill else rounded_extend_input_len
         ) + replay_len
-        global_page_size = self.page_size
         if is_cp_sharded_padded():
             extend_input_len = get_cp_sharded_padded_allocation_tokens(
                 raw_extend_input_len, prefix_tokens=prefix_len
             )
-            global_page_size = from_cp_sharded(global_page_size)
         else:
             extend_input_len = rounded_extend_input_len
 
@@ -902,7 +900,7 @@ class PrefillAdder:
                 mamba_gap_reserve
                 + request_slot_reserve
                 + self.per_req_token_overhead
-                - global_page_size
+                - self.logical_page_size
             ),
             chunk_limit=self.rem_chunk_tokens,
             is_chunked_continuation=is_chunked_continuation,
