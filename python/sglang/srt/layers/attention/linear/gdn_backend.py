@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
+from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import is_pin_memory_available, rank0_log
 
@@ -245,6 +246,22 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
             "FlashInfer GDN prefill is not supported with "
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
+        )
+
+
+def _validate_gdn_target_verify_layout(model_runner: ModelRunner) -> None:
+    """Compact verify packs per-request verify lengths into one token list,
+    but GDN target verify views a dense [batch, draft tokens] window from the
+    conv on. Cap-accept verifies the dense window and only trims acceptance."""
+    if model_runner.is_draft_worker:
+        return
+    if not model_runner.spec_algorithm.supports_ragged_verify():
+        return
+    if ragged_verify_compact_enabled():
+        raise ValueError(
+            "SGLANG_RAGGED_VERIFY_MODE=compact is not supported on GDN models: "
+            "GDN target verify views a dense [batch, draft tokens] window. Use "
+            "SGLANG_RAGGED_VERIFY_MODE=static or cap-accept."
         )
 
 
@@ -521,6 +538,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
+        _validate_gdn_target_verify_layout(model_runner)
         super().__init__(model_runner)
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
