@@ -1,20 +1,7 @@
-"""Ascend Ops MoE token dispatcher.
+"""Ascend Ops MoE communication dispatcher.
 
-Communication only: the expert-order regrouping and the local weighted
-unpermute live in the runner's ``ascend_ops -> ascend`` permute hooks
-(``moe_runner/ascend.py``), via the shared entry points in
-``hardware_backend/npu/moe/routing.py``.
-
-Paths (``--ascend-ops-config``):
-
-* prefill ``allgather``: TP all-gather; every rank computes its local
-  experts over the full batch.
-* prefill ``alltoallv``: token all-to-all over the TP group; the source-side
-  routing pass produces the wire layout.
-* decode ``low_latency``: MC2 distribute ops
-  (``npu_moe_distribute_dispatch_v2`` / ``npu_moe_distribute_combine_v2``)
-  around the expert GEMMs.
-* decode ``fused_op``: single fused kernel (not implemented yet).
+Expert regrouping is handled by the Ascend runner hooks. This module owns the
+AllGather, AllToAllV, and MC2 communication paths.
 """
 
 from __future__ import annotations
@@ -54,10 +41,7 @@ from sglang.srt.utils import is_npu
 if is_npu():
     import torch_npu
 
-# Quant mode per consumer op.  The routing op's modes are shared with every
-# other Ascend MoE path (see routing.py); the MC2 distribute ops define
-# their own enum (``npu_moe_distribute_dispatch_setup``: 0 unquant, 2
-# per-token int8, 4 MX), so the same dtype maps to a different number.
+# Routing and MC2 use different quant-mode enums.
 _MC2_QUANT_MODE = {
     DispatcherOutputDtype.BF16: 0,
     DispatcherOutputDtype.INT8: 2,
@@ -69,9 +53,7 @@ _QUANT_MODES = {
     "mc2": _MC2_QUANT_MODE,
 }
 
-# ``y_dtype`` of the MC2 ops is an ATen ``ScalarType`` value (op schema:
-# ``int?``), not a ``torch.dtype``, and torch exposes no public dtype -> value
-# conversion, so the enum is spelled out here.
+# MC2 expects an ATen ScalarType integer for ``y_dtype``.
 _TORCH_DTYPE_TO_ATEN = {
     torch.int8: 1,
     torch.int32: 3,
@@ -85,27 +67,7 @@ _TORCH_DTYPE_TO_ATEN = {
 
 
 class AscendOpsDispatchOutput(NamedTuple):
-    """What the Ascend Ops dispatcher hands to the MoE runner.
-
-    Field meaning by ``exec_mode``:
-
-    - ``"mc2"`` (decode): ``hidden_states`` / ``hidden_states_scale`` are the
-      MC2 dispatch output (already grouped per expert), ``topk_weights`` /
-      ``topk_ids`` the (possibly padded) originals the MC2 combine needs.
-    - ``"alltoallv"`` (prefill): ``hidden_states`` is the raw a2a payload in
-      wire order, ``hidden_states_scale`` its scale, ``recv_counts`` the
-      per-source/per-expert receive counts the pre-permute derives the local
-      route ids from.
-    - ``"allgather"`` (prefill): ``hidden_states`` / ``hidden_states_scale``
-      are the gathered payload (bf16, or MXFP8 pre-quantized with its scale)
-      and ``topk_ids`` / ``topk_weights`` the gathered router output; the
-      local-expert filter and the regrouping run in the pre-permute.
-
-    ``quant_mode`` is the routing quant mode (see
-    ``hardware_backend/npu/moe/routing.py``); the MC2 path leaves it at -1.
-    ``forward_state`` carries communication metadata through the runner to
-    the matching combine call and is scoped to one forward.
-    """
+    """Dispatcher output shared by the three Ascend execution paths."""
 
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
@@ -136,11 +98,7 @@ class AscendOpsCombineInput(NamedTuple):
 
 @dataclass
 class _MC2State:
-    """Per-forward state the MC2 combine needs from the matching dispatch.
-
-    The padded top-k ids and weights travel with this state so combine does not
-    depend on dispatcher-global forward state.
-    """
+    """Per-forward metadata required by MC2 combine."""
 
     num_tokens: int
     assist_info_for_combine: torch.Tensor
@@ -179,12 +137,7 @@ AscendOpsForwardState = _MC2State | _AllGatherState | _AllToAllState
 
 
 class AscendOpsDispatcher(BaseDispatcher):
-    """Select one of the Ascend Ops dispatch/combine execution paths.
-
-    The methods below form the integration boundary for the NPU operators.
-    Keeping path selection here makes the runner independent of whether a
-    batch is prefill or decode and keeps the output contract stable.
-    """
+    """Select and execute an Ascend dispatch/combine path."""
 
     def __init__(
         self,
@@ -193,7 +146,6 @@ class AscendOpsDispatcher(BaseDispatcher):
     ) -> None:
         super().__init__()
         self.ascend_ops_config = ascend_ops_config or AscendOpsConfig()
-        # Prefill communication is scoped to TP; decode routing is scoped to EP.
         parallel = get_parallel()
         self.tp_group = parallel.tp_group.device_group
         self.attn_tp_size = parallel.attn_tp_size
@@ -257,12 +209,10 @@ class AscendOpsDispatcher(BaseDispatcher):
             return self._combine_mc2(combine_input.hidden_states, state)
         raise TypeError(f"unknown Ascend Ops forward state: {type(state)!r}")
 
-    # Decode (MC2 low latency) -------------------------------------------------
+    # Decode (MC2 low latency)
 
     def _dispatch_low_latency(self, hidden_states, topk_weights, topk_ids):
         num_tokens = hidden_states.shape[0]
-        # Without DP attention every EP rank steps with the same BS, so no
-        # padding is needed (0). Set it when ranks can disagree.
         pad_bs = envs.SGLANG_ASCEND_OPS_DECODE_PAD_BS.get()
         if pad_bs and num_tokens > pad_bs:
             raise ValueError(
@@ -286,11 +236,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         padded_bs: int,
         dtype_mode: str,
     ) -> AscendOpsDispatchOutput:
-        """Run ``npu_moe_distribute_dispatch_v2`` for one batch.
-
-        ``padded_bs`` is the BS every rank in the EP group uses for this call;
-        the trailing rows are dropped after combine via ``x_active_mask``.
-        """
+        """Dispatch one decode batch through MC2."""
         num_tokens = hidden_states.shape[0]
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.float()
@@ -302,8 +248,6 @@ class AscendOpsDispatcher(BaseDispatcher):
                 hidden_states, topk_ids, topk_weights, num_tokens, padded_bs
             )
 
-        # Every quantised mode defaults the payload to int8 unless ``y_dtype`` is
-        # given, which is invalid next to the e8m0 block scale MX emits.
         mxfp8_args = (
             {"y_dtype": _TORCH_DTYPE_TO_ATEN[torch.float8_e4m3fn]}
             if quant_mode == _MC2_QUANT_MODE[DispatcherOutputDtype.MXFP8]
@@ -328,7 +272,6 @@ class AscendOpsDispatcher(BaseDispatcher):
             x_active_mask=x_active_mask,
             quant_mode=quant_mode,
             global_bs=0,
-            # Per-expert counts, matching ``group_list_type=1`` of the runner.
             expert_token_nums_type=1,
             comm_alg=self.ascend_ops_config.ll_dispatch_alg,
             **mxfp8_args,
@@ -340,15 +283,11 @@ class AscendOpsDispatcher(BaseDispatcher):
                     "MC2 MXFP8 decode requires hidden_size to be a multiple "
                     f"of 64, got {hidden_states.shape[1]}"
                 )
-            # The op returns a flat ``(A, h // 32)`` e8m0 scale; the runner's
-            # MX kernels take the pair-split ``(A, h // 64, 2)`` form.
+            # Convert the flat e8m0 scale to the runner's pair-split layout.
             dynamic_scales = dynamic_scales.reshape(
                 dynamic_scales.shape[0], hidden_states.shape[1] // 64, 2
             )
 
-        # Only meaningful when top-k weights were handed to dispatch, which we
-        # never do. Some torch_npu builds return an empty (0,) tensor here, but
-        # A3 returns an uninitialised ``(a,)`` one, so never forward it.
         expand_scales = None
 
         state = _MC2State(
@@ -362,8 +301,6 @@ class AscendOpsDispatcher(BaseDispatcher):
         )
         return AscendOpsDispatchOutput(
             hidden_states=expand_x,
-            # The op returns an empty scale tensor in the unquantised case;
-            # the runner expects None there.
             hidden_states_scale=(
                 dynamic_scales
                 if quant_mode != _MC2_QUANT_MODE[DispatcherOutputDtype.BF16]
@@ -385,14 +322,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         num_tokens: int,
         padded_bs: int,
     ):
-        """Copy the batch into buffers reused across steps.
-
-        ``padded_bs`` differs from ``num_tokens`` whenever EP ranks disagree on
-        the batch size (DP attention), so the buffers are allocated once per
-        shape and afterwards only the rows that changed are touched: the active
-        prefix is overwritten, and the tail is cleared only when the previous
-        call filled more rows than this one.
-        """
+        """Copy a possibly shorter batch into reusable padded buffers."""
         key = (padded_bs, hidden_states.shape[1], topk_ids.shape[1])
         bufs = self._pad_buffers.get(key)
         if bufs is None:
@@ -409,7 +339,6 @@ class AscendOpsDispatcher(BaseDispatcher):
         padded_ids[:num_tokens] = topk_ids
         padded_weights[:num_tokens] = topk_weights
 
-        # Inactive rows must be the trailing ones and must stay zeroed.
         mask[:num_tokens] = True
         if filled > num_tokens:
             padded_x[num_tokens:filled] = 0
@@ -430,7 +359,6 @@ class AscendOpsDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, state: _MC2State
     ) -> torch.Tensor:
         """Run ``npu_moe_distribute_combine_v2`` for the batch dispatched last."""
-        # The combine op applies the top-k weights itself.
         combined = torch_npu.npu_moe_distribute_combine_v2(
             hidden_states,
             state.topk_ids,
@@ -471,13 +399,7 @@ class AscendOpsDispatcher(BaseDispatcher):
     def _resolve_dispatch_dtype(
         self, dtype_mode: Optional[str] = None
     ) -> DispatcherOutputDtype:
-        """Resolve the dispatch wire dtype.
-
-        ``dtype_mode`` (e.g. ``"low_latency"``) first consults the
-        mode-specific ``<mode>_dispatcher_output_dtype`` key before falling
-        back to the shared ``dispatcher_output_dtype``; ``None`` reads only
-        the shared key.
-        """
+        """Resolve a mode-specific dtype, falling back to the shared dtype."""
         quant_config = self.quant_config or {}
         raw = None
         if dtype_mode is not None:
@@ -498,7 +420,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             self._ep_comm_name = name
         return self._ep_comm_name
 
-    # Prefill allgather --------------------------------------------------------
+    # Prefill: AllGather
 
     def _dispatch_allgather(self, hidden_states, topk_weights, topk_ids, group):
         """Gather the full batch on every TP rank."""
@@ -509,8 +431,6 @@ class AscendOpsDispatcher(BaseDispatcher):
                 "NPU AllGather supports BF16, INT8 and MXFP8 routing"
             )
         world_size = dist.get_world_size(group)
-        # The MoE boundary already splits each DP shard across attention TP.
-        # Mirror tensor_split using CPU counts, including scheduler padding.
         sizes = get_dp_global_num_tokens()
         if sizes is None:
             raise RuntimeError("NPU AllGather requires scheduler DP token counts")
@@ -551,7 +471,6 @@ class AscendOpsDispatcher(BaseDispatcher):
 
         scales = None
         if quant_mode == MXFP8_QUANT_MODE:
-            # Quantize local rows once, then gather MXFP8 payload and scales.
             if hidden_states.shape[0] > 0:
                 hidden_states, scales = torch_npu.npu_dynamic_mx_quant(
                     hidden_states, dst_type=torch.float8_e4m3fn
@@ -585,10 +504,9 @@ class AscendOpsDispatcher(BaseDispatcher):
     def _combine_allgather(
         self, contributions: torch.Tensor, state: _AllGatherState
     ) -> torch.Tensor:
-        """ReduceScatter the per-rank contributions back to the local shard."""
+        """ReduceScatter contributions back to the local shard."""
         sizes = state.row_sizes
         group = state.group
-        # Equal-sized chunks already have the layout required by ReduceScatter.
         max_rows = max(sizes)
         if min(sizes) == max_rows:
             padded = contributions
@@ -605,7 +523,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         output = output[: sizes[dist.get_rank(group)]].to(state.input_dtype)
         return output
 
-    # Prefill alltoallv --------------------------------------------------------
+    # Prefill: AllToAllV
 
     def _alltoall_counts(
         self, topk_ids: torch.Tensor, group
@@ -670,7 +588,7 @@ class AscendOpsDispatcher(BaseDispatcher):
         return output
 
     def _dispatch_alltoallv(self, hidden_states, topk_weights, topk_ids, group):
-        """Send each token to the rank owning its expert."""
+        """Send each token to its expert-owning rank."""
         topk_ids = topk_ids.to(torch.int32)
         input_splits, output_splits, recv_counts = self._alltoall_counts(
             topk_ids, group
@@ -718,12 +636,7 @@ class AscendOpsDispatcher(BaseDispatcher):
     def _combine_alltoallv(
         self, local_output: torch.Tensor, state: _AllToAllState
     ) -> torch.Tensor:
-        """Reverse the a2a and apply the router weights at the source.
-
-        ``local_output`` arrives from the runner's post-permute already mapped
-        back to wire order (the post-permute undoes the local expert
-        regrouping with ``local_expanded_row_idx``).
-        """
+        """Reverse AllToAllV and apply source-side router weights."""
         source_order = self._alltoall_single(
             local_output,
             state.input_splits,
