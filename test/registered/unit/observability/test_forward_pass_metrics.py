@@ -40,6 +40,7 @@ from sglang.srt.observability.forward_pass_metrics import (
 )
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
+    QueueCount,
     SchedulerMetricsCollector,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
@@ -318,6 +319,7 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "kv_events_publisher"):
         scheduler.kv_events_publisher = types.SimpleNamespace(
             init_kv_events=lambda *a, **kw: None,
+            emit_kv_metrics=Mock(),
         )
     if not hasattr(scheduler, "tp_workers"):
         scheduler.tp_workers = []
@@ -917,6 +919,74 @@ class TestIdleMetrics(CustomTestCase):
                 stats.fwd_occupancy
             ),
         )
+
+    def test_idle_publishes_refreshed_kv_metrics(self):
+        self.reporter.current_scheduler_metrics_enabled = True
+        self.scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(queue=[])
+        self.scheduler.disagg_prefill_inflight_queue = []
+        self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(queue=[])
+        self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
+            queue=[], num_pending_deferred_releases=lambda: 0
+        )
+        published = []
+        self.scheduler.kv_events_publisher.emit_kv_metrics.side_effect = lambda: (
+            published.append(
+                (
+                    self.reporter.stats.token_usage,
+                    self.reporter.stats.num_running_reqs.total,
+                    self.reporter.stats.num_queue_reqs.total,
+                )
+            )
+        )
+        for mode in DisaggregationMode:
+            for token_usage in (0.0, 0.25):
+                with self.subTest(mode=mode, token_usage=token_usage):
+                    self.scheduler.disaggregation_mode = mode
+                    self.reporter.stats.token_usage = 0.82
+                    self.reporter.stats.num_running_reqs = QueueCount(total=1)
+                    self.reporter.stats.num_queue_reqs = QueueCount(total=1)
+                    self.scheduler.pool_stats_observer.get_pool_stats = lambda: (
+                        types.SimpleNamespace(
+                            update_scheduler_stats=lambda stats: setattr(
+                                stats, "token_usage", token_usage
+                            )
+                        )
+                    )
+                    with patch(
+                        "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                        return_value=101.0,
+                    ):
+                        self.reporter._maybe_log_idle_metrics()
+                    self.assertEqual(published, [(token_usage, 0, 0)])
+                    published.clear()
+
+    def test_idle_kv_metrics_preserve_rate_limit_and_metrics_gate(self):
+        self.reporter.current_scheduler_metrics_enabled = True
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                False,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                return_value=101.0,
+            ),
+        ):
+            self.reporter._maybe_log_idle_metrics()
+        self.scheduler.kv_events_publisher.emit_kv_metrics.assert_not_called()
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+            return_value=131.0,
+        ):
+            self.reporter._maybe_log_idle_metrics()
+        self.scheduler.kv_events_publisher.emit_kv_metrics.assert_called_once_with()
+
+        self.scheduler.kv_events_publisher.emit_kv_metrics.reset_mock()
+        self.reporter.current_scheduler_metrics_enabled = False
+        self.reporter.stats.num_running_reqs = QueueCount(total=1)
+        self.reporter._maybe_log_idle_metrics()
+        self.scheduler.kv_events_publisher.emit_kv_metrics.assert_not_called()
 
     def test_host_receive_metrics_survive_queue_drain(self):
         registry = prometheus_client.CollectorRegistry()

@@ -1508,3 +1508,4 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(priority_enabled)
         self.metrics_collector.log_stats(self.stats)
+        self.scheduler.kv_events_publisher.emit_kv_metrics()
