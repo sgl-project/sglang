@@ -7,9 +7,12 @@ device has to come from what the worker was handed.
 """
 
 import unittest
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import torch
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.runtime_context import publish, reset_context
@@ -29,6 +32,22 @@ class _Processor:
 class _StubProcessor(BaseMultimodalProcessor):
     async def process_mm_data_async(self, *args, **kwargs):
         raise NotImplementedError
+
+
+class _DeviceTensor(torch.Tensor):
+    """A CPU tensor that reports a CUDA device, standing in for pool memory."""
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
+
+    @property
+    def device(self):
+        return torch.device("cuda", 0)
+
+    def cpu(self):
+        return self.as_subclass(torch.Tensor).clone()
+
+    def to(self, device):
+        return self.cpu()
 
 
 def _make(**fields):
@@ -127,6 +146,18 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
         processor.precompute_hash_before_cpu_transfer = precompute_hash
         return processor
 
+    def _with_hf_processor(self, hf_processor):
+        processor = self._processor()
+        processor._processor = hf_processor
+        processor._tokenizer = hf_processor.tokenizer
+        processor._tokenizer_auto_adds_specials = False
+        processor.disable_fast_image_processor = False
+        processor.image_config = {}
+        processor.video_config = {}
+        processor.audio_config = {}
+        processor.FEATURE_NAMES = ["pixel_values"]
+        return processor
+
     def test_pool_is_limited_to_immediate_cpu_transport(self):
         cases = (
             (self._processor(), "cuda:0", True),
@@ -155,6 +186,9 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
             def to(self, device):
                 events.append(("copy", device))
 
+            def cpu(self):
+                events.append(("copy", "cpu"))
+
         feature = Feature()
 
         class Processor:
@@ -166,15 +200,7 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
                 return {"pixel_values": feature}
 
         events = []
-        processor = self._processor()
-        processor._processor = Processor()
-        processor._tokenizer = processor._processor.tokenizer
-        processor._tokenizer_auto_adds_specials = False
-        processor.disable_fast_image_processor = False
-        processor.image_config = {}
-        processor.video_config = {}
-        processor.audio_config = {}
-        processor.FEATURE_NAMES = ["pixel_values"]
+        processor = self._with_hf_processor(Processor())
 
         class PoolContext:
             def __enter__(self):
@@ -208,6 +234,79 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
             events,
             ["enter", ("call", "cuda:0"), ("copy", "cpu"), "exit"],
         )
+
+    def test_no_device_output_is_live_when_the_pool_is_released(self):
+        # Scaled down Gemma4 and Mllama outputs with the layouts transformers
+        # 5.12.1 builds on the device. pixel_values is the feature control.
+        cases = {
+            "gemma4": {
+                "pixel_values": torch.ones(1, 4, 6),
+                "image_position_ids": torch.tensor(
+                    [[[0, 0], [0, 1], [1, 0], [-1, -1]]]
+                ),
+            },
+            "mllama": {
+                "pixel_values": torch.ones(1, 1, 4, 3, 2, 2),
+                "aspect_ratio_ids": torch.tensor([[6]]),
+                "aspect_ratio_mask": torch.tensor([[[1, 1, 1, 0]]]),
+            },
+        }
+        for name, outputs in cases.items():
+            with self.subTest(processor=name):
+                refs = []
+                live_at_exit = []
+
+                class ImageProcessor:
+                    pass
+
+                class Processor:
+                    image_processor = ImageProcessor()
+                    tokenizer = SimpleNamespace(bos_token=None)
+
+                    def __call__(self, **kwargs):
+                        result = {
+                            key: value.clone().as_subclass(_DeviceTensor)
+                            for key, value in outputs.items()
+                        }
+                        refs.extend(weakref.ref(value) for value in result.values())
+                        result["input_ids"] = torch.tensor([[1, 2, 3]])
+                        return result
+
+                class PoolContext:
+                    def __enter__(self):
+                        return None
+
+                    def __exit__(self, *args):
+                        live_at_exit.extend(ref() is not None for ref in refs)
+
+                processor = self._with_hf_processor(Processor())
+                with (
+                    patch.multiple(
+                        BASE,
+                        _is_cpu=False,
+                        _is_xpu=False,
+                        _is_npu=False,
+                        platforms=SimpleNamespace(
+                            current_platform=SimpleNamespace(
+                                is_cuda_alike=lambda: True,
+                                device_type="cuda",
+                            )
+                        ),
+                    ),
+                    patch(f"{BASE}.BaseImageProcessor", ImageProcessor),
+                    patch(f"{BASE}.torch.cuda.device", return_value=nullcontext()),
+                    patch(f"{BASE}.torch.cuda.MemPool", return_value="pool"),
+                    patch(
+                        f"{BASE}.torch.cuda.use_mem_pool", return_value=PoolContext()
+                    ),
+                ):
+                    result = processor.process_mm_data("test", images=["image"])
+
+                self.assertEqual(live_at_exit, [False] * len(outputs))
+                for key, expected in outputs.items():
+                    self.assertIs(type(result[key]), torch.Tensor)
+                    self.assertTrue(torch.equal(result[key], expected))
+                self.assertEqual(result["input_ids"].tolist(), [[1, 2, 3]])
 
 
 if __name__ == "__main__":
