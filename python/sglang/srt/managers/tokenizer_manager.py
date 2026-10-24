@@ -1940,7 +1940,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Schedule at most one LoRA release per state, returning the new task if any."""
         if state.lora_released:
             return None
-        if not (self.enable_lora and state.obj.lora_path):
+        # Only a successful acquire sets lora_id; rejected requests hold no reference.
+        if not (self.enable_lora and state.obj.lora_path and state.obj.lora_id):
             return None
         state.lora_released = True
         task = asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
