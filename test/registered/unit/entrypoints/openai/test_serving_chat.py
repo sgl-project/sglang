@@ -646,12 +646,14 @@ class ServingChatTestCase(CustomTestCase):
 
             self.basic_req.return_sampling_mask = True
             self.basic_req.sampling_logprobs_mode = "support"
+            self.basic_req.return_indexer_topk = True
             self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
             self.assertTrue(adapted.return_sampling_mask)
             self.assertEqual(adapted.sampling_logprobs_mode, "support")
+            self.assertTrue(adapted.return_indexer_topk)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
 
@@ -1169,6 +1171,18 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertEqual(adapted.top_logprobs_num, 2)
                 self.assertEqual(adapted.return_flat_raw_output_top_logprobs, flat)
                 self.assertEqual(adapted.return_flat_raw_top_logprobs_b64, b64)
+
+    def test_validate_request_rejects_indexer_topk_without_meta_info(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_indexer_topk=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_indexer_topk requires return_meta_info=true.",
+        )
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
