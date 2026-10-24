@@ -33,8 +33,10 @@ impl TemplateArgs {
             .as_object()
             .cloned()
             .unwrap_or_default();
+        // `pop("reasoning_effort", None)`: a null keeps the request's effort.
         let effort = own
             .remove("reasoning_effort")
+            .filter(|effort| !effort.is_null())
             .or_else(|| requested_effort(body).cloned());
         kwargs.extend(own);
         if let Some(effort) = effort {
@@ -199,6 +201,15 @@ mod tests {
         let body = json!({"model": "m", "messages": messages, "reasoning_effort": "high"});
         let defaults = HashMap::from([("reasoning_effort".into(), json!("low"))]);
         assert_eq!(render(&formatter, body, &defaults).0, "low|True|True");
+
+        // A null kwargs effort is no effort, so the request's still applies.
+        let body = json!({
+            "model": "m",
+            "messages": messages,
+            "reasoning_effort": "high",
+            "chat_template_kwargs": {"reasoning_effort": null}
+        });
+        assert_eq!(render(&formatter, body, &none).0, "high|True|True");
     }
 
     /// `reasoning_effort` sets both thinking toggles beneath the request's own
