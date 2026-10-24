@@ -869,7 +869,10 @@ jobs:
       # Split unit files across the four existing containers to stay within
       # the step timeout without repeating image pulls and dependency installs.
       # Run after failed server tests too, so a regression cannot hide them.
-      # Skips the CUDA-only ltx2_vae_channels_last memory-format assertion.
+      # Skips the CUDA-only ltx2_vae_channels_last memory-format assertion, and
+      # survives_real_pytest_runner: its 9 cases each re-import sglang 7 times,
+      # ~20 min on mi300, which pushes its shard to ~25 of the 30 min. Both
+      # still run in the CUDA diffusion unit lane.
       - name: Run diffusion unit tests
         if: success() || failure()
         timeout-minutes: 30
@@ -881,7 +884,7 @@ jobs:
               --suite unit \
               --partition-id ${{ matrix.part }} \
               --total-partitions 4 \
-              -k "not ltx2_vae_channels_last" \
+              -k "not ltx2_vae_channels_last and not survives_real_pytest_runner" \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
       - name: Upload diffusion failure artifacts
