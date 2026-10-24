@@ -35,17 +35,31 @@ class BatchedTopKStatisticsMixin:
         )
         self._route_offsets = [0] * self._data.shape[0]
         self._batch_collected = False
+        self._has_batched_routes = False
+        self._routes_dirty = False
 
     def on_graph_capture_forward_start(self):
         # Warmups bypass ModelRunner's normal recorder reset. Only Python
         # branch state changes here; runtime reset clears the shared buffers.
         self._route_offsets = [0] * len(self._route_offsets)
 
+    def get_graph_capture_state(self):
+        return any(self._route_offsets)
+
+    def on_graph_replay_forward_start(self, has_batched_routes):
+        # Replay bypasses on_select_experts. Restore the state recorded for
+        # this graph, including when it follows an eager overflow-only pass.
+        self._has_batched_routes |= has_batched_routes
+        self._routes_dirty |= has_batched_routes
+
     def reset(self):
         super().reset()
-        self._batched_routes.fill_(-1)
+        if self._routes_dirty:
+            self._batched_routes.fill_(-1)
+            self._routes_dirty = False
         self._route_offsets = [0] * self._data.shape[0]
         self._batch_collected = False
+        self._has_batched_routes = False
 
     def on_select_experts(self, layer_idx, topk_ids):
         count = topk_ids.numel()
@@ -57,9 +71,12 @@ class BatchedTopKStatisticsMixin:
             return super().on_select_experts(layer_idx, topk_ids)
         self._batched_routes[layer_idx, start:end].copy_(topk_ids.flatten())
         self._route_offsets[layer_idx] = end
+        if count:
+            self._has_batched_routes = True
+            self._routes_dirty = True
 
     def collect(self):
-        if not self._batch_collected:
+        if self._has_batched_routes and not self._batch_collected:
             ids = self._batched_routes
             mask = (ids >= 0) & (ids < self._data.shape[1])
             self._data.scatter_add_(1, ids.masked_fill(~mask, 0).long(), mask.int())

@@ -172,11 +172,20 @@ def main():
         for initial, layouts in (
             (
                 list(range(8)),
-                [[7, 0, 4, 3, 2, 5, 6, 1], [4, 5, 6, 7, 0, 1, 2, 3], list(range(8))],
+                [
+                    list(range(8)),
+                    [7, 0, 4, 3, 2, 5, 6, 1],
+                    [4, 5, 6, 7, 0, 1, 2, 3],
+                    list(range(8)),
+                ],
             ),
             (
                 [0, 0, 1, 1, 2, 2, 3, 3],
                 [
+                    [0, 0, 1, 1, 2, 2, 3, 3],
+                    # Rank 0's destinations stay unchanged, but it must send
+                    # expert 0 to rank 1. Local-only skip checks lose this send.
+                    [0, 0, 1, 1, 0, 2, 3, 3],
                     [2, 0, 2, 1, 3, 1, 0, 3],
                     [3, 3, 2, 2, 1, 1, 0, 0],
                     [0, 0, 1, 1, 2, 2, 3, 3],

@@ -162,6 +162,12 @@ class ExpertDistributionRecorder(ABC):
     def on_graph_capture_forward_start(self):
         pass
 
+    def get_graph_capture_state(self):
+        return {}
+
+    def on_graph_replay_forward_start(self, state):
+        pass
+
     @contextmanager
     def with_current_layer(self, layer_idx):
         yield
@@ -255,6 +261,23 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             prepare = getattr(gatherer, "on_graph_capture_forward_start", None)
             if prepare is not None:
                 prepare()
+
+    def get_graph_capture_state(self):
+        if self._disable_all:
+            return {}
+        return {
+            key: gatherer.get_graph_capture_state()
+            for key, gatherer in self._single_pass_gatherers.items()
+            if hasattr(gatherer, "get_graph_capture_state")
+        }
+
+    def on_graph_replay_forward_start(self, state):
+        if self._disable_all:
+            return
+        for key, has_batched_routes in state.items():
+            self._single_pass_gatherers[key].on_graph_replay_forward_start(
+                has_batched_routes
+            )
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
