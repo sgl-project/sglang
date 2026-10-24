@@ -9,9 +9,7 @@ from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
 
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
-from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-    NPUW8A8Int8DynamicLinearMethod,
-)
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -21,13 +19,40 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cpu, is_cuda
 
 __all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
+
+
+def _requantize_int8_with_max_scale(
+    weight: torch.Tensor, weight_scale: torch.Tensor, logical_widths: list[int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    max_w_scale = weight_scale.max()
+    requantized_weight = weight.clone()
+
+    unfused_module_in_checkpoint = (
+        weight_scale[-1] > torch.finfo(torch.float8_e4m3fn).min
+    )
+    if unfused_module_in_checkpoint:
+        int8_info = torch.iinfo(torch.int8)
+        start = 0
+        for idx, logical_width in enumerate(logical_widths):
+            end = start + logical_width
+            weight_dq = weight[start:end, :].float() * weight_scale[idx]
+            requantized_weight[start:end, :] = torch.clamp(
+                torch.round(weight_dq / max_w_scale),
+                int8_info.min,
+                int8_info.max,
+            ).to(torch.int8)
+            start = end
+
+    max_w_scale_channelwise = max_w_scale.expand(weight.size(0)).clone()
+    return requantized_weight, max_w_scale_channelwise
 
 
 class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
@@ -99,6 +124,34 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         return 80
 
     def process_weights_after_loading(self, layer) -> None:
+        if _is_cpu:
+            if self.is_static_input_scheme or not self.input_symmetric:
+                raise NotImplementedError(
+                    "CPU compressed-tensors W8A8 INT8 only supports dynamic symmetric activation quantization."
+                )
+
+            if self.strategy == QuantizationStrategy.TENSOR:
+                weight, max_w_scale = _requantize_int8_with_max_scale(
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    logical_widths=layer.logical_widths,
+                )
+                layer.weight = Parameter(weight, requires_grad=False)
+                layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
+            elif self.strategy == QuantizationStrategy.CHANNEL:
+                layer.weight = Parameter(layer.weight.data, requires_grad=False)
+                layer.weight_scale = Parameter(
+                    layer.weight_scale.data, requires_grad=False
+                )
+            else:
+                raise ValueError(f"Unknown quantization strategy {self.strategy}")
+
+            _amx_process_weight_after_loading(layer, ["weight"])
+            layer.input_scale = None
+            layer.input_zero_point = None
+            layer.azp_adj = None
+            return
+
         # If per tensor, when we have a fused module (e.g. QKV) with per
         # tensor scales (thus N scales being passed to the kernel),
         # requantize so we can always run per channel
@@ -171,6 +224,20 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ) -> torch.Tensor:
         # TODO: add cutlass_scaled_mm_azp support
+        if _is_cpu:
+            if not layer.use_intel_amx_backend:
+                raise NotImplementedError(
+                    "CPU compressed-tensors W8A8 INT8 requires AMX-packed weights."
+                )
+            return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                bias,
+                x.dtype,
+                True,
+            )
+
         x_q, x_scale = per_token_quant_int8(x)
 
         return int8_scaled_mm(
@@ -189,6 +256,10 @@ class NPUCompressedTensorsW8A8Int8(CompressedTensorsW8A8Int8):
             raise NotImplementedError(
                 "Static compressed-tensors scheme is not yet supported on NPU."
             )
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            NPUW8A8Int8DynamicLinearMethod,
+        )
+
         self.kernel = NPUW8A8Int8DynamicLinearMethod()
 
     @classmethod
