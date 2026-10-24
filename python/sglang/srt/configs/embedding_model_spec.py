@@ -117,6 +117,7 @@ class EmbeddingModelSpec:
 
 
 _EMBEDDING_ARCHITECTURES = {
+    "BertForMaskedLM": ("bert", EmbeddingExecution.ENCODER_ONLY, PoolingStrategy.CLS),
     "BertModel": ("bert", EmbeddingExecution.ENCODER_ONLY, PoolingStrategy.CLS),
     "CLIPModel": ("clip", EmbeddingExecution.MULTIMODAL, PoolingStrategy.LAST),
     "Contriever": (
@@ -133,6 +134,11 @@ _EMBEDDING_ARCHITECTURES = {
         "mistral_embedding",
         EmbeddingExecution.DECODER_POOLING,
         PoolingStrategy.LAST,
+    ),
+    "XLMRobertaForMaskedLM": (
+        "xlm_roberta",
+        EmbeddingExecution.ENCODER_ONLY,
+        PoolingStrategy.CLS,
     ),
     "XLMRobertaModel": (
         "xlm_roberta",
