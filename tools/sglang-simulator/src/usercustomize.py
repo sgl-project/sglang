@@ -39,5 +39,12 @@ def apply_cpu_simulation_compat() -> None:
 
     sgl_kernel_hook.install_load_utils_stub()
 
+    # Native DSPark validates accelerator devices before constructing its worker.
+    # The simulator has an explicit CPU worker/result bridge, with its own narrow
+    # argument checks; keep the native GPU path and device identity unchanged.
+    from sglang_simulator.simulation.sglang.dspark_args import install_cpu_dspark_args
+
+    install_cpu_dspark_args()
+
 
 apply_cpu_simulation_compat()

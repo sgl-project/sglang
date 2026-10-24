@@ -584,6 +584,16 @@ establish available GPU hardware. The check exercises real native result types,
 CPU request-table buffers and the public allocation seam with protocol fixture
 costs; it does not validate measured latency or a full Simulator run.
 
+CPU DSPark argument compatibility is installed only with both explicit bootstrap
+flags above. It preserves `device=cpu` and delegates non-CPU calls to the native
+handler. The initial path requires physical single-rank execution, overlap and
+physical graphs disabled, static draft Q5 / target Q6, an explicit draft path
+and full draft revision commit, and positive explicit `max_running_requests`.
+Target TP topology remains part of the cost/runtime profile. Unsupported ragged,
+adaptive, coordinated and constrained paths fail before simulator declarations.
+This removes native accelerator-only argument rejection; complete cost/progress
+assets and predictor launch wiring remain necessary for a full run.
+
 Run repository checks before submitting:
 
 ```bash
