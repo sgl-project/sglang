@@ -429,7 +429,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         components: dict[ComponentType, TreeComponent],
     ):
         self.page_size = params.page_size
-        self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
+        # KV-only PD trees also own shifted draft KV. Include the next token
+        # in the key so a prefix branch cannot reuse the wrong draft boundary.
+        # Ordinary Mamba checkpoint trees retain their existing token keys.
+        self.is_eagle = params.is_eagle and (
+            ComponentType.MAMBA not in components or params.mamba_state_from_prefill
+        )
         self.enable_hicache = False
         self.is_host_memory_buffer_only = False
         self.enable_storage = False
