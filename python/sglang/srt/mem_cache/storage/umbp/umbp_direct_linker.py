@@ -853,7 +853,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             for start in range(0, self.num_layers, self.layer_group)
         ]
 
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
+    def offload(
+        self, transfers: list[PoolTransfer], session_id: str | None = None
+    ) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
