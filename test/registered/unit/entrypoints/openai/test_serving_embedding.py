@@ -67,6 +67,7 @@ class _MockTokenizerManager:
     def __init__(self):
         self.model_config = Mock()
         self.model_config.is_multimodal = False
+        self.model_config.vocab_size = 30522
         self.server_args = Mock()
         self.server_args.enable_cache_report = False
         self.model_path = "test-model"
@@ -150,6 +151,29 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             model="test-model",
             input=[1, 2, 3, 4, 5],
             encoding_format="float",
+        )
+
+    def test_token_id_upper_bound(self):
+        for token_id in (30522, 30528):
+            with self.subTest(token_id=token_id):
+                request = EmbeddingRequest(
+                    model="test-model", input=[101, token_id, 102]
+                )
+                self.assertIn(
+                    "vocabulary size", self.serving_embedding._validate_request(request)
+                )
+        request = EmbeddingRequest(model="test-model", input=[101, 30521, 102])
+        self.assertIsNone(self.serving_embedding._validate_request(request))
+        request = EmbeddingRequest(
+            model="test-model",
+            input=[101, 30528, 102],
+            embed_override_token_id=30528,
+            embed_overrides=[[[0.0] * 384]],
+        )
+        self.assertIsNone(self.serving_embedding._validate_request(request))
+        request.input = [101, 30529, 102]
+        self.assertIn(
+            "vocabulary size", self.serving_embedding._validate_request(request)
         )
 
     def test_convert_single_string_request(self):
