@@ -502,7 +502,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         """Copy individual tokens; the page path below would copy whole pages."""
         if not self._has_transfer_indices(host_indices, device_indices):
             return
-        # A C4 token is not one contiguous byte range in the paged row:
+        # Token-granular DSV4 C4 copy needs this helper because a token is
+        # not one contiguous byte range in the paged row:
         # [value0..value63][scale0..scale63].
         if self.page_aligned_only:
             raise self._unaligned_transfer_error(host_indices, device_indices)
@@ -524,6 +525,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         ):
             self.backup_tokens_from_device_all_layer(host_indices, device_indices)
             return
+        # Whole C4 pages can use the normal HiCache page-row copy below.
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
         if io_backend == "kernel" and self.layout == "layer_first":

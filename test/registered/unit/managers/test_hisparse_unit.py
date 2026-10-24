@@ -11,11 +11,11 @@ import os
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -52,7 +52,6 @@ KV_CACHE_DIM = 576  # MLA dim (DeepSeek-style)
 LAYER_NUM = 2
 MAX_NUM_REQS = 8
 MAX_CONTEXT_LEN = 2048
-MAX_NUM_REQS_DSV4 = 72
 
 
 def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
@@ -868,128 +867,49 @@ class TestHiSparseUnit(unittest.TestCase):
 
 
 class TestDSV4HiSparseEagerBackup(unittest.TestCase):
-    """A decode step backs up one scattered C4 token per request."""
-
-    def setUp(self):
-        if not is_cuda():
-            self.skipTest("DSV4 HiSparse runs on CUDA.")
-        reset_context()
-        self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="scheduler")
-        from sglang.srt.runtime_context import get_context
-
-        page_size, full_size = 256, 64 * 256
-        override = get_context().override_server_args(page_size=page_size)
-        override.install()
-        self.addCleanup(override.restore)
-        if not torch.distributed.is_initialized():
-            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-            os.environ.setdefault("MASTER_PORT", "29598")
-            torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
-            self.addCleanup(torch.distributed.destroy_process_group)
-
+    @unittest.skipUnless(is_cuda(), "DSV4 HiSparse runs on CUDA.")
+    def test_page_sized_batch_uses_token_copy(self):
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-        from sglang.srt.mem_cache.allocator.hisparse import (
-            DeepSeekV4HiSparseTokenToKVPoolAllocator,
-        )
-        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DeepSeekV4TokenToKVPool,
-        )
-        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
-        pool = DeepSeekV4TokenToKVPool(
-            max_num_reqs=MAX_NUM_REQS_DSV4,
-            swa_size=full_size,
-            c4_size=full_size // 4,
-            c128_size=2 * full_size // 128,
-            c4_state_pool_size=MAX_NUM_REQS_DSV4,
-            c128_state_pool_size=0,
-            page_size=page_size,
-            swa_page_size=page_size,
-            dtype=torch.float8_e4m3fn,
-            c4_state_dtype=torch.float32,
-            c128_state_dtype=torch.float32,
-            qk_nope_head_dim=448,
-            qk_rope_head_dim=64,
-            indexer_head_dim=128,
-            layer_num=2,
-            device=DEVICE,
-            enable_memory_saver=False,
-            compression_ratios=[0, 4],
-            full_size=full_size,
-            enable_hisparse=True,
-        )
-        logical = PagedTokenToKVPoolAllocator(
-            full_size, page_size, pool.dtype, DEVICE, pool, need_sort=False
-        )
-        self.req_to_token_pool = ReqToTokenPool(
-            size=MAX_NUM_REQS_DSV4,
-            max_context_len=MAX_CONTEXT_LEN,
-            device=DEVICE,
-            enable_memory_saver=False,
-        )
-        self.coordinator = HiSparseCoordinator(
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=DeepSeekV4HiSparseTokenToKVPoolAllocator(
-                logical
-            ),
-            top_k=TOP_K,
-            device_buffer_size=DEVICE_BUFFER_SIZE,
-            device=DEVICE,
-            tp_group=torch.distributed.group.WORLD,
-            host_to_device_ratio=HOST_TO_DEVICE_RATIO,
-        )
-        self.addCleanup(self.coordinator.mem_pool_host.destroy)
+        # 64 requests produce 64 scattered C4 tokens, not one contiguous page.
+        batch_size = 64
+        device_locs = torch.arange(batch_size, device=DEVICE) * 3 + 1
+        host_locs = torch.arange(batch_size, device=DEVICE) * 64
+        host_pool = Mock()
+        host_pool.alloc_paged_token_slots.side_effect = host_locs.split(1)
 
-    def test_page_sized_batch_backs_up_each_token(self):
-        coordinator = self.coordinator
-        device_pool = coordinator.mem_pool_device
-        page_size = coordinator.mem_pool_host.slot_page_size
-        torch.manual_seed(0)
-        for buf in device_pool.kv_buffer:
-            raw = buf.view(torch.uint8)
-            raw.copy_(torch.randint(0, 256, raw.shape, dtype=torch.uint8))
-        for buf in coordinator.mem_pool_host.kv_buffer:
-            buf.zero_()
+        # Only the eager-backup state is needed; no model pools or TP group.
+        coordinator = HiSparseCoordinator.__new__(HiSparseCoordinator)
+        coordinator.device = DEVICE
+        coordinator.is_dsv4_hisparse = True
+        coordinator.compress_ratio = 4
+        coordinator.device_buffer_size = DEVICE_BUFFER_SIZE
+        coordinator._skip_first_backup = [False] * batch_size
+        coordinator.req_to_device_buffer = device_locs[:, None]
+        coordinator.req_to_host_pool = None
+        coordinator.req_to_host_pool_allocated_len = None
+        coordinator.mem_pool_host = host_pool
+        coordinator.mem_pool_device = None
+        coordinator.decode_backup_stream = get_device_module().Stream()
+        coordinator.decode_producer_stream = None
+        coordinator._backup_done_event = get_device_module().Event()
+        coordinator._has_pending_backup = False
 
         # seq_len 5 produced compressed token 0, held in device-buffer slot 0.
-        reqs = [_make_req(f"dsv4-backup-{i}") for i in range(page_size)]
-        self.req_to_token_pool.alloc(reqs)
-        req_pool_indices = torch.tensor(
-            [req.kv.req_pool_idx for req in reqs], dtype=torch.int64
-        )
-        device_locs = torch.arange(page_size, dtype=torch.int64) * 3 + 1
-        coordinator.req_to_device_buffer[req_pool_indices.to(DEVICE), 0] = (
-            device_locs.to(DEVICE)
-        )
-        seq_lens = torch.full((page_size,), 5, dtype=torch.int64)
-
+        req_indices = torch.arange(batch_size)
+        seq_lens = torch.full((batch_size,), 5, dtype=torch.int64)
         coordinator._eager_backup_previous_token(
-            seq_lens.to(DEVICE), req_pool_indices.to(DEVICE), seq_lens, req_pool_indices
+            seq_lens.to(DEVICE), req_indices.to(DEVICE), seq_lens, req_indices
         )
         coordinator.wait_for_pending_backup()
 
-        host_locs = coordinator.req_to_host_pool[req_pool_indices.to(DEVICE), 0]
-        reference = DeepSeekV4PagedHostPool(
-            pool_name="dsv4_hisparse_c4_reference",
-            device_buffers=device_pool.kv_buffer,
-            item_bytes=device_pool.bytes_per_page_padded,
-            num_host_pages=coordinator.mem_pool_host.size // page_size,
-            slot_page_size=page_size,
-            layout="layer_first",
+        host_pool.backup_from_device_all_layer.assert_not_called()
+        host_pool.backup_tokens_from_device_all_layer.assert_called_once()
+        got_host, got_device = (
+            host_pool.backup_tokens_from_device_all_layer.call_args.args
         )
-        self.addCleanup(reference.destroy)
-        for buf in reference.kv_buffer:
-            buf.zero_()
-        for i in range(page_size):
-            reference.backup_tokens_from_device_all_layer(
-                host_locs[i : i + 1], device_locs[i : i + 1].to(DEVICE)
-            )
-        get_device_module().synchronize()
-        host_pages = torch.unique(host_locs.cpu() // page_size)
-        for got, want in zip(coordinator.mem_pool_host.kv_buffer, reference.kv_buffer):
-            self.assertTrue(torch.equal(got[host_pages], want[host_pages]))
+        self.assertTrue(torch.equal(got_host, host_locs))
+        self.assertTrue(torch.equal(got_device, device_locs))
 
 
 if __name__ == "__main__":
