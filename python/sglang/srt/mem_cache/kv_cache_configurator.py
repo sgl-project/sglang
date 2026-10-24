@@ -216,6 +216,27 @@ def mm_runtime_reservation_gb(
     return reserved_mb / 1024
 
 
+def symm_mem_runtime_reservation_gb(*, enable_symm_mem: bool) -> float:
+    """Symmetric-memory pool allocated after the KV pool is sized.
+
+    ``prealloc_symmetric_memory_pool`` runs in ``finalize_cuda_graph_capture``,
+    after the KV budget is already committed. Leave that prealloc out of the
+    KV budget so it does not have to fit in ``--mem-fraction-static`` leftover
+    slack. See issue #44106.
+    """
+    if not enable_symm_mem:
+        return 0.0
+    prealloc_gb = envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()
+    if prealloc_gb <= 0:
+        return 0.0
+    logger.info(
+        "Reserving %.2f GB of the KV budget for the post-sizing symmetric-"
+        "memory prealloc (SGLANG_SYMM_MEM_PREALLOC_GB_SIZE).",
+        float(prealloc_gb),
+    )
+    return float(prealloc_gb)
+
+
 # base ratio of mamba pool size to max_running_requests. Under
 # SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK the decode-time skip frees one resident slot
 # per running request, so the base drops by 1 (overlap 5->4, lazy 4->3). no_buffer
@@ -2976,7 +2997,12 @@ class KVCacheConfigurator:
             is_multimodal=self.model_config.is_multimodal,
             mm_feature_transport=get_mm().mm_feature_transport,
         )
-        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        symm_reservation_gb = symm_mem_runtime_reservation_gb(
+            enable_symm_mem=get_exec().comm.enable_symm_mem,
+        )
+        rest_memory = (
+            available_gpu_memory - slack_gb - mm_reservation_gb - symm_reservation_gb
+        )
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
