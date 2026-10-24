@@ -27,6 +27,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.environ import envs
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -53,7 +54,8 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+# leave more time for post data processing
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = envs.SGLANG_UNBALANCED_LOAD_TIMEOUT_S.get()
 
 
 def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
