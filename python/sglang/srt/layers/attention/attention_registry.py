@@ -411,7 +411,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         from sglang.srt.utils import (
             is_blackwell,
             is_npu,
-            is_xpu,
         )
 
         if not is_npu():
@@ -424,10 +423,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 flashinfer_gdn_prefill_default,
             )
 
-            if is_xpu():
-                from sglang.srt.hardware_backend.xpu.attention.xpu_gdn_backend import (
-                    XpuGDNAttnBackend as GDNAttnBackend,
-                )
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
                 AscendGDNAttnBackend as GDNAttnBackend,
