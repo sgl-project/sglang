@@ -305,6 +305,9 @@ class KVIndexTranslator:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         width: int,
+        positions_out: Optional[torch.Tensor] = None,
+        anchor_src: Optional[torch.Tensor] = None,
+        anchor_out: Optional[torch.Tensor] = None,
     ) -> KVLocPlan:
         """Gather one fixed-width speculative window, translating at its producer.
 
@@ -342,6 +345,9 @@ class KVIndexTranslator:
             full_out=writes.get(IdSpaceKind.FULL),
             swa_out=writes.get(IdSpaceKind.SLIDING_WINDOW),
             page_size=self.page_size,
+            positions_out=positions_out,
+            anchor_src=anchor_src,
+            anchor_out=anchor_out,
         )
         return self.plan(
             req_pool_indices=req_pool_indices,
