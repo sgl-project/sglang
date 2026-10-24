@@ -414,7 +414,7 @@ def _test_one_model(
         )
         today_exp_dir = today_dump_dir / EXP_NAME
         _assert_decode_captured(today_exp_dir, tp_size=model_setup.tp_size)
-        _assert_fused_tp_layout(today_exp_dir, tp_size=model_setup.tp_size)
+        _assert_deferred_tp_layout(today_exp_dir, tp_size=model_setup.tp_size)
 
         has_baseline = baseline_exp_dir.exists() and any(baseline_exp_dir.glob("*.pt"))
 
@@ -689,7 +689,7 @@ _ATTN_INPUT_RE = re.compile(
 )
 
 
-def _assert_fused_tp_layout(dump_dir: Path, *, tp_size: int) -> None:
+def _assert_deferred_tp_layout(dump_dir: Path, *, tp_size: int) -> None:
     reference_by_bundle: dict[str, Any] = {}
     ranks_by_bundle: dict[str, set[int]] = {}
     names_by_bundle: dict[str, str] = {}
@@ -741,13 +741,13 @@ def _assert_fused_tp_layout(dump_dir: Path, *, tp_size: int) -> None:
     if not non_initial_layer_inputs:
         raise AssertionError("no non-initial transformer layer input dumps found")
     if not attn_inputs:
-        raise AssertionError("no post-fusion attention input dumps found")
+        raise AssertionError("no post-reduction attention input dumps found")
     replicated_layer_inputs = [
         bundle for bundle in non_initial_layer_inputs if bundle not in partial_bundles
     ]
     if replicated_layer_inputs:
         raise AssertionError(
-            "flashinfer allreduce fusion did not produce TP-partial layer inputs; "
+            "expected TP-partial layer inputs at the deferred-allreduce boundary; "
             f"replicated tensors={replicated_layer_inputs}"
         )
     partial_attn_inputs = [
@@ -755,7 +755,7 @@ def _assert_fused_tp_layout(dump_dir: Path, *, tp_size: int) -> None:
     ]
     if partial_attn_inputs:
         raise AssertionError(
-            "post-fusion attention inputs were not replicated; "
+            "post-reduction attention inputs were not replicated; "
             f"TP-partial tensors={partial_attn_inputs}"
         )
 
