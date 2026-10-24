@@ -11,7 +11,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
 
 class MluDeviceMixin(DeviceMixin):
@@ -66,6 +66,14 @@ class MluDeviceMixin(DeviceMixin):
 
 class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
     """In-tree Cambricon MLU SRT platform."""
+
+    capabilities = PlatformCapabilities(
+        supports_triton=True,
+        graph_capture=False,
+        piecewise_graph=False,
+        hicache_device_kernels=False,
+        supports_pynccl=False,
+    )
 
     def get_dispatch_key_name(self) -> str:
         return "mlu"
