@@ -276,7 +276,9 @@ mod tests {
 
     use sglang_processor::dynamo_tokenizers::Tokenizer;
 
-    use super::super::test_utils::{answering_app_state_with_item, body_json, chunk, post_json};
+    use super::super::test_utils::{
+        answering_app_state_with_item, body_json, checkpoint_formatter, chunk, post_json,
+    };
     use super::*;
     use crate::message::response::ResponseItem;
 
@@ -359,6 +361,34 @@ mod tests {
         assert!(
             value["message"].as_str().unwrap().contains("boom"),
             "{value}"
+        );
+    }
+
+    /// A template without a detected reasoning toggle reasons by the parser's
+    /// default: Qwen3's thinks unless `enable_thinking` is false.
+    #[tokio::test]
+    async fn undetected_template_reasons_by_the_parser_default() {
+        let template = "{% for m in messages %}{{ m.content }}{% endfor %}<think>\n";
+        let formatter = checkpoint_formatter(&json!({}), template);
+        let args = ServerArgs {
+            served_model_name: "model".into(),
+            reasoning_parser: Some("qwen3".into()),
+            ..Default::default()
+        };
+        let state =
+            answering_app_state_with_item(Arc::new(args), formatter, Some(tokenizer()), |rid| {
+                chunk(rid, "work</think>answer", true)
+            });
+        let app = super::super::routes().with_state(state);
+        let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
+        let value = body_json(post_json(app, "/v1/chat/completions", body).await).await;
+        let message = &value["choices"][0]["message"];
+        assert_eq!(
+            (
+                message["reasoning_content"].as_str(),
+                message["content"].as_str()
+            ),
+            (Some("work"), Some("answer"))
         );
     }
 
