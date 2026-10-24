@@ -1530,8 +1530,11 @@ class Req(ReqDllmMixin):
     @property
     def output_ids_through_stop(self) -> array[int]:
         """Get the output ids through the stop condition. Stop position is included."""
+        max_new_tokens = self.sampling_params.max_new_tokens
         if self.finished_len is not None:
-            return self.output_ids[: self.finished_len]
+            return self.output_ids[: min(self.finished_len, max_new_tokens)]
+        if len(self.output_ids) > max_new_tokens:
+            return self.output_ids[:max_new_tokens]
         return self.output_ids
 
     @property
@@ -2033,6 +2036,13 @@ class Req(ReqDllmMixin):
         if self.to_finish:
             self.finished_reason = self.to_finish
             self.to_finish = None
+            if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+                self.finished_len = self.sampling_params.max_new_tokens
+            elif (
+                self.finished_len is not None
+                and self.finished_len > self.sampling_params.max_new_tokens
+            ):
+                self.finished_len = self.sampling_params.max_new_tokens
             return
 
         new_accepted_tokens = self.output_ids[-new_accepted_len:]

@@ -429,7 +429,13 @@ class _GenerationStreamAccumulator:
             assert not req.finished_output
             req.finished_output = True
             if req.finished_len is None:
-                req.finished_len = len(req.output_ids)
+                req.finished_len = min(
+                    len(req.output_ids), req.sampling_params.max_new_tokens
+                )
+            else:
+                req.finished_len = min(
+                    req.finished_len, req.sampling_params.max_new_tokens
+                )
             should_output = True
         else:
             if req.stream:
