@@ -667,6 +667,9 @@ class Envs:
     # tokens, so a prefill batch runs exactly chunked_prefill_size and the dense
     # GEMMs get an aligned M. gfx95 only; see PrefillAdder.exact_chunk_fill.
     SGLANG_EXACT_CHUNK_FILL = EnvBool(True)
+    # Hybrid Mamba models with the extra buffer: end a prefill chunk at the
+    # cached Mamba fork so both the fork and the tail states reach the cache.
+    SGLANG_SPLIT_PREFILL_AT_MAMBA_FORK = EnvBool(False)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
