@@ -257,10 +257,6 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
-        configure_media_url_security(
-            get_mm().allowed_media_domains,
-            get_mm().media_url_max_file_size_mb,
-        )
         configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
             configured_mm_feature_transport
@@ -277,6 +273,13 @@ class BaseMultimodalProcessor(ABC):
             mm_process_config=get_mm().mm_process_config,
             mm_processor_worker_num=get_mm().mm_processor_worker_num,
             mm_io_worker_num=get_mm().mm_io_worker_num,
+            allowed_media_domains=get_mm().allowed_media_domains,
+            media_url_max_file_size_mb=get_mm().media_url_max_file_size_mb,
+        )
+
+        configure_media_url_security(
+            processor_config.allowed_media_domains,
+            processor_config.media_url_max_file_size_mb,
         )
 
         self.image_processor_backend = processor_config.image_processor_backend
