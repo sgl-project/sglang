@@ -275,10 +275,26 @@ def _qwen3_5_stage_facts(
     )
 
 
+# Single-launch fused QK-GemmaRMSNorm + partial-RoPE + gate-deinterleave kernel,
+# the same Triton kernel the CUDA path uses. It replaces the aiter/HIP 2-kernel
+# prepare (fused_qk_gemma_rmsnorm_with_gate + rotary_emb). It is plain Triton and
+# handles mrope + partial rotary + the Gemma norm, so it is not gfx-specific.
+# Import it defensively on aiter: a ROCm Triton that cannot import it leaves the
+# name None, and _prepare_qkv_gate falls back to the 2-kernel path with no
+# regression. (aiter's fused_qk_norm_rope_gate_fp8_quant is NOT a fit: it takes
+# 1-D positions only -> no mrope, and always emits an FP8 prefill suffix.)
+fused_qk_gemma_rmsnorm_rope_gate = None
 if _is_cuda:
     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
         fused_qk_gemma_rmsnorm_rope_gate,
     )
+elif _use_aiter:
+    try:
+        from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+            fused_qk_gemma_rmsnorm_rope_gate,
+        )
+    except Exception:
+        pass
 
 if _is_cpu:
     _fused_sigmoid_mul_cpu = torch.ops.sgl_kernel.fused_sigmoid_mul_cpu
@@ -1462,6 +1478,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_cuda_fused(self, positions, hidden_states):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
+        # The aiter fused AR+RMSNorm(+quant) path hands down a (bf16, fp8, scale)
+        # tuple; unpack it to the side qkv_proj consumes, exactly as
+        # forward_prepare_native / forward_prepare_fused_gate do. No-op on CUDA
+        # (where _use_aiter is False), required on HIP where this path is now
+        # reached with fused AR enabled.
+        if _use_aiter and isinstance(hidden_states, tuple):
+            hidden_states = _select_fused_ar_input_for_linear(
+                hidden_states, self.qkv_proj
+            )
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -1595,6 +1620,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         if _is_cuda and self.attn_output_gate:
+            return self.forward_prepare_cuda_fused(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        if (
+            _use_aiter
+            and self.attn_output_gate
+            and fused_qk_gemma_rmsnorm_rope_gate is not None
+        ):
+            # One fused Triton kernel (norm + partial RoPE + gate) in place of
+            # fused_qk_gemma_rmsnorm_with_gate + rotary_emb. Enabled on any aiter
+            # HIP GPU; the import leaves the name None where it is unsupported.
             return self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
