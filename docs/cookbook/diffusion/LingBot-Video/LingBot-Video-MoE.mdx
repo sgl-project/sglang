@@ -1,13 +1,13 @@
 ---
 title: LingBot Video MoE
-description: Serve the native LingBot Video MoE 30B-A3B text-to-video model with SGLang Diffusion.
+description: Serve LingBot Video MoE 30B-A3B for text-to-video, image-to-video, and text-to-image with SGLang Diffusion.
 metatags:
-    description: "Run robbyant/lingbot-video-moe-30b-a3b text-to-video generation with SGLang Diffusion."
+    description: "Run robbyant/lingbot-video-moe-30b-a3b text-to-video, image-to-video, text-to-image, and refiner generation with SGLang Diffusion."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["video", "text-to-video", "mixture-of-experts", "30B-A3B"]} />
+<DiffusionModelTags tags={["video", "text-to-video", "image-to-video", "text-to-image", "mixture-of-experts", "30B-A3B"]} />
 
 import { Deployment } from '/src/snippets/_deployment.jsx';
 import { config } from '/src/snippets/configs/LingBot/lingbot-video.jsx';
@@ -25,29 +25,19 @@ Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installa
 ## 2. Model capabilities
 
 [LingBot Video MoE 30B-A3B](https://huggingface.co/robbyant/lingbot-video-moe-30b-a3b)
-is a text-to-video mixture-of-experts model served through a native SGLang
-Diffusion pipeline. Its main advantage is the MoE economics: 30B total
-parameters with 3B active per token, so a plain `sglang serve` invocation
-covers the released 480×480, 81-frame profile without parallelism flags.
+is a mixture-of-experts video diffusion model with 30B total parameters and 3B
+active per token. One set of weights covers text-to-video, image-to-video, and
+text-to-image, and an optional refiner pass re-denoises the clip at 1088x1920
+with a second set of DiT weights. Qwen3-VL is the text encoder, so in
+image-to-video the condition frame and the caption are encoded together.
 
-Prompting is the distinctive part of this checkpoint: it expects a structured
-JSON caption rather than an unexpanded natural-language prompt, passed as the
-request's `prompt` string. A compact 17-frame, 12-step smoke-test profile is
-available for quick validation next to the released 40-step profile.
+Choose it when you can supply structured JSON captions or run the released
+prompt rewriter: a raw natural-language prompt is out of distribution and
+degrades the output quietly rather than failing. Image conditioning does not
+support sequence parallelism, and the refiner roughly doubles both the weights
+on disk and the peak memory.
 
-The public checkpoint served by the pipeline:
-
-| Model ID | Task | Default output |
-| --- | --- | --- |
-| `robbyant/lingbot-video-moe-30b-a3b` | Text to video | 480x480, 81 frames at 16 FPS |
-
-The checkpoint expects a structured JSON caption rather than an unexpanded
-natural-language prompt. The JSON is passed as the request's `prompt` string;
-it is not an `extra_params` object.
-
-## 3. Serve LingBot Video MoE
-
-Start the server with the Hugging Face model ID:
+## 3. Deployment
 
 ```bash Command
 sglang serve \
@@ -55,11 +45,208 @@ sglang serve \
   --port 30010
 ```
 
-## 4. Generate a video
+One GPU is enough to bring the model up. `--performance-mode` decides where the DiT lives:
 
-The following request uses the compact 17-frame, 12-step smoke-test profile.
-Use the model defaults of 81 frames and 40 steps for the released generation
-profile.
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+    <col style={{width: "33.3%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Mode</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>DiT</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Text encoder, VAE</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`auto` (default)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>offloaded to CPU between uses</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>layer by layer</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`speed`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>resident, needs room for all 30B parameters</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>resident</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`memory`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>streamed layer by layer</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>layer by layer</td>
+    </tr>
+  </tbody>
+</table>
+
+`memory` keeps the least memory in use and is the mode to reach for when a whole DiT does not fit; it streams each block from CPU as the loop reaches it.
+
+Across multiple GPUs, sequence parallelism splits the joint video and text sequence:
+
+```bash Command
+sglang serve \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --port 30010 \
+  --num-gpus 4 \
+  --ulysses-degree 4
+```
+
+Sequence parallelism splits the sequence, not the weights, so every rank still holds all 30B parameters. When that does not fit, either shard the weights across ranks with `--use-fsdp-inference true` or stream them from CPU with `--performance-mode memory`; otherwise the DiT runs out of memory as it is placed on device.
+
+`--tp-size`, `--ulysses-degree`, `--ring-degree`, and CFG parallel can be combined, and their degrees multiply out to `--num-gpus`. Left unset they are chosen for you: on two or more GPUs CFG parallel takes a degree of 2 and sequence parallelism gets the rest, so 8 GPUs run CFG parallel with `--ulysses-degree 4`. Pinning the full width to sequence parallelism, as the example above does, turns CFG parallel off. Pinning only part of it does not: `--num-gpus 8 --ulysses-degree 4` on its own is refused at startup, because the remaining factor of 2 is unaccounted for. Add `--enable-cfg-parallel` to claim it.
+
+Image conditioning does not support sequence parallelism, see 5.2, and `num_attention_heads` divided by `--tp-size` must stay divisible by `--ulysses-degree`; the server refuses the configuration at startup otherwise. The full list of supported optimizations is in the [compatibility matrix](/docs/sglang-diffusion/compatibility_matrix).
+
+`torch.compile` is not enabled by default for this model, including under `--performance-mode speed`. Benchmark it on your own hardware before enabling it: whether it pays off depends on the GPU.
+
+## 4. Prompt format
+
+The model is trained on structured JSON captions. A raw natural-language prompt is out of distribution and produces degraded output rather than an error, so pass a JSON object. The generation examples below read this caption from `fox.json`:
+
+```bash Command
+cat > fox.json <<'EOF'
+{
+  "comprehensive_description": {
+    "scene_content_description": "A red fox trots across fresh snow in a pine forest at sunrise, its coat bright against the white ground.",
+    "camera_movement_description": "The camera stays stationary at eye level in a medium shot."
+  },
+  "camera_info": {
+    "color": "Warm",
+    "frame_size": "Medium",
+    "shot_type_angle": "Eye level",
+    "lens_size": "Medium",
+    "composition": "Center",
+    "lighting": "Soft light",
+    "lighting_type": "Daylight"
+  },
+  "world_knowledge": [],
+  "prominent_elements": [
+    {
+      "name": "red fox",
+      "description": "A fox with a dense orange-red coat and a white-tipped tail.",
+      "actions": [
+        { "timestamp": "[0.0s - 1.5s]", "action": "trots from the left toward the center" },
+        { "timestamp": "[1.5s - 3.0s]", "action": "pauses to sniff the air, then continues" }
+      ],
+      "location": "center of the frame",
+      "relative_size": "dominant"
+    }
+  ]
+}
+EOF
+```
+
+`comprehensive_description` and `camera_info` are objects, not strings, and each entry in `prominent_elements` carries timestamped actions. A caption with the right keys but flatter values is still out of distribution. The rewriter below emits this shape, so use it rather than writing the JSON by hand.
+
+### 4.1 Prompt rewriter
+
+Rather than writing the JSON by hand, use the rewriter the model was released with. It runs in two turns: expand the free-text prompt into a detailed caption on the base VLM, then map that caption to JSON with the rewriter LoRA enabled. The weights are `Qwen/Qwen3.6-27B` plus `robbyant/lingbot-video-rewriter-lora`, a second model rather than part of the checkpoint.
+
+The rewriter has no CLI flags, so configure it in a config file:
+
+```bash Command
+cat > /tmp/lingbot_rewriter.json <<'EOF'
+{
+  "model_path": "robbyant/lingbot-video-moe-30b-a3b",
+  "prompt": "A red fox trots across fresh snow in a pine forest.",
+  "num_frames": 81,
+  "rewriter_model_path": "Qwen/Qwen3.6-27B",
+  "rewriter_adapter_path": "<path to lingbot-video-rewriter-lora>"
+}
+EOF
+
+sglang generate --config /tmp/lingbot_rewriter.json --save-output
+```
+
+This loads the VLM in the diffusion process and switches the adapter between turns, which is what the reference implementation does. It holds roughly 54 GB in bf16 on top of the DiT and has no offload path. `rewriter_device_map` defaults to `"auto"`, which spreads it over every visible GPU; to keep it off the DiT GPUs, point it at GPUs of its own or use the served option below. An under-provisioned VLM degrades quietly rather than failing.
+
+To serve the rewriter separately instead, launch it on its own port, for example `--port 30001`, set `rewriter_url` to it, and name a model per turn:
+
+```json Example
+{
+  "rewriter_url": "http://127.0.0.1:30001",
+  "rewriter_expand_model": "Qwen/Qwen3.6-27B",
+  "rewriter_map_model": "lingbot-rewriter"
+}
+```
+
+The mapping turn needs the adapter applied. `--lora-paths` does not accept this adapter: `Qwen/Qwen3.6-27B` is a `qwen3_5`-architecture checkpoint whose attention projections SGLang loads fused, while the adapter targets them unfused through a regex. So serve a checkpoint with the adapter already merged in, as its own endpoint via `rewriter_map_url` when one server cannot hold both.
+
+Prompts that already start with `{` are passed through untouched. If the mapping turn returns nothing parseable the request fails rather than falling back to the free-text prompt, which the DiT would render as a broken video. Setting `rewriter_model_path` without `rewriter_adapter_path` is rejected at startup, since the mapping turn would otherwise silently run base weights. Leaving both `rewriter_url` and `rewriter_model_path` unset, the default, skips the stage.
+
+Set `"rewriter_auto_negative": true` to also prune the negative prompt per request, which requires one of the two backends above. The shipped negative is deliberately over-complete and self-contradictory, so terms this caption legitimately wants push the sample away from the request. The rewriter deletes those terms and keeps the rest verbatim; a few, such as `underexposed` for a night scene and `motion blur` for a long exposure, are also deleted by rule afterwards because the model tends to leave them in. Because a merged request carries one negative prompt for several captions, enabling this turns dynamic batching off for the server.
+
+## 5. Generation
+
+### 5.1 Text-to-video
+
+```bash Command
+sglang generate \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --prompt "$(cat fox.json)" \
+  --num-frames 81 \
+  --save-output \
+  --output-path outputs
+```
+
+Request constraints:
+
+- `num_frames` must be `1` or `4n+1`; examples include 17 and 81.
+- Width and height must both be multiples of 16.
+- SGLang's request defaults are 480x480, `guidance_scale=6.0`, `flow_shift=3.0`,
+  `num_inference_steps=40`, and `fps=16`. The upstream reference scripts use
+  `guidance_scale=3` and `fps=24` instead; the checkpoint itself does not ship
+  either value, so match whichever reference you are comparing against.
+- Keep the prompt as serialized JSON. Raw free text is outside the
+  checkpoint's expected caption format.
+
+### 5.2 Image-to-video
+
+Pass a condition image; the first frame is pinned to it for the whole denoising loop. Describe in the caption the motion that should follow the condition frame.
+
+```bash Command
+sglang generate \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --prompt "$(cat fox.json)" \
+  --image-path fox.png \
+  --num-frames 81 \
+  --save-output \
+  --output-path outputs
+```
+
+Image conditioning does not support sequence parallelism yet. Serve with `--sp-degree 1` for image-to-video requests, or shard with `--tp-size 8` as in 6.1; the server raises an error rather than generating a corrupted clip.
+
+### 5.3 Text-to-image
+
+`--num-frames 1` produces a still image. The request keeps its own negative prompt, which drops the motion and temporal-stability terms that only apply to video, and frame-count alignment is disabled so a single frame is not rounded up into a short clip. A still-image caption can leave the timestamped actions out.
+
+```bash Command
+sglang generate \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --prompt "$(cat fox.json)" \
+  --num-frames 1 \
+  --save-output \
+  --output-path outputs
+```
+
+### 5.4 Refiner second pass
+
+The refiner decodes the base clip, resizes it to the refiner resolution, re-encodes it, and denoises again from `t_thresh` down using the DiT weights in the checkpoint's `refiner` subfolder. Opt in with:
+
+```bash Command
+sglang serve \
+  --model-path robbyant/lingbot-video-moe-30b-a3b \
+  --port 30010 \
+  --pipeline-class-name LingBotVideoRefinerPipeline
+```
+
+This loads a second set of DiT weights, so the checkpoint on disk and the peak memory both roughly double. Defaults for the second pass are 1088x1920, guidance scale 3.0, flow shift 3.0, and `t_thresh` 0.85. The step count is 8: `refiner_num_inference_steps` lays out a grid from which only the sigmas at or below `t_thresh` are kept, 6 at these defaults, and `refiner_sigma_tail_steps` appends 2 more at the low end. The refiner is trained on video and rejects single-frame requests; serve the base pipeline for text-to-image.
+
+The second pass resizes the decoded clip to 1088x1920 without cropping, so the refiner pipeline defaults the base pass to 480x832 and rejects a base geometry whose aspect ratio is more than 5% off 1088x1920.
+
+### 5.5 HTTP request
+
+The following request uses the compact 17-frame, 12-step smoke-test profile against the server from section 3. Use the model defaults of 81 frames and 40 steps for the released generation profile.
 
 ```python Python
 import json
@@ -148,11 +335,121 @@ video.raise_for_status()
 Path("lingbot_video_moe.mp4").write_bytes(video.content)
 ```
 
-## 5. Request constraints
+## 6. Benchmark
 
-- `num_frames` must be `1` or `4n+1`; examples include 17 and 81.
-- Width and height must both be multiples of 16.
-- The native defaults are `guidance_scale=6.0`, `flow_shift=3.0`,
-  `num_inference_steps=40`, and `fps=16`.
-- Keep the prompt as serialized JSON. Raw free text is outside the
-  checkpoint's expected caption format.
+Test environment:
+
+- Hardware: NVIDIA H100 80GB, 8 GPUs
+- Model: `robbyant/lingbot-video-moe-30b-a3b`
+- Reference: the upstream `lingbot-video` diffusers implementation, diffusers 0.39.0
+- Workload: 480x832, 121 frames, 40 steps, guidance scale 3.0, flow shift 3.0, seed 42, structured JSON caption
+- Quality tier: the reference numerics, selected with `--quality exact`; the default `lossless` tier enables fused fast paths and was not measured here
+
+Both stacks ran the same caption, resolution, frame count, schedule, and seed, and both computed the two CFG branches sequentially.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+    <col style={{width: "20.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Stack</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Parallelism</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Denoise</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Per step</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>End to end</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>upstream diffusers</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FSDP 8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>409 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>10.23 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>469 s</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`--ulysses-degree 8`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>73 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.83 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>175 s</td>
+    </tr>
+  </tbody>
+</table>
+
+SGLang denoises 5.6x faster and completes the request 2.7x faster. End to end covers text encoding, denoising, and VAE decode, so it closes less than denoise alone: both stacks decode the same 121 frames.
+
+The two rows shard differently, so for a weights-only comparison against upstream FSDP, SGLang `--tp-size 8` denoises the same workload in 139 s, 3.48 s per step, still 2.9x faster.
+
+Output matches the reference in subject, composition, and motion without being bit-identical: PSNR 20.7 dB and SSIM 0.82 on the luma plane. Switching only the sharding layout within SGLang moves the result by the same margin, so the difference is the bf16 reduction-order floor across 40 steps.
+
+Other tasks, same hardware, schedule, and quality tier:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Task</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Parallelism</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Denoise</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Decode</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Text-to-image, 1 frame</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`--ulysses-degree 8`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>31.8 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>0.2 s</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Image-to-video, 121 frames</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`--tp-size 8`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>134 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4.7 s</td>
+    </tr>
+    <tr style={{borderBottom: "1px solid rgba(255,255,255,0.08)"}}>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Refiner, both passes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`--ulysses-degree 8` + FSDP</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>57 s + 100 s</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>7.5 s</td>
+    </tr>
+  </tbody>
+</table>
+
+Tensor parallelism is the slower layout because the MoE experts are replicated on every rank rather than sharded: `--tp-size 8` splits the attention projections, but each rank still runs all 128 experts. Prefer sequence parallelism, and use tensor parallelism for image-to-video, where sequence parallelism is unavailable.
+
+### 6.1 Recommended configuration
+
+On 8 GPUs:
+
+- Text-to-video and text-to-image: `--ulysses-degree 8`.
+- Image-to-video: `--tp-size 8`. Sequence parallelism is rejected for image conditioning, so tensor parallelism is the way to shard.
+- Refiner: `--ulysses-degree 8 --use-fsdp-inference true`. Sequence parallelism replicates both sets of DiT weights on every GPU; FSDP shards them, which is what keeps the second pass inside memory at 1088x1920. The refiner tiles the VAE for its own decode and re-encode regardless of `--vae-tiling`.
+- Refiner image-to-video: `--tp-size 8 --use-fsdp-inference true`, since image conditioning rejects sequence parallelism.
+
+Each of these pins the full GPU count to one layout, which turns off the CFG parallel that would otherwise be picked by default, see section 3. The rows above were measured that way, with both guidance branches computed sequentially. Splitting the branches across GPU groups instead halves the sequence-parallel group size; whether that wins depends on interconnect bandwidth, so benchmark both on your own topology.
+
+`--enable-cache-dit` works on this model and stacks with CFG parallel. It skips steps whose output is close enough to the previous one, so it helps more at 40 steps than at 8, where a single skip is already an eighth of the trajectory.
+
+## 7. Notes
+
+- The refiner conditions on zeros rather than on the negative prompt, and reseeds instead of continuing the base pass random stream.
+- Text-only requests batch normally. Image requests are kept out of batches by the scheduler.
+- Latents stay fp32 through the denoising loop while the DiT bulk runs in bf16; the norms, router, and timestep embedder are pinned to fp32.
+
+## 8. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="video" />
