@@ -29,6 +29,7 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
     """MSA-v1 Q8KV4 attention with a K-only sparse index."""
 
     needs_cpu_seq_lens: bool = False
+    skips_prefill_metadata_on_idle_dp_rank: bool = True
 
     def __init__(self, runner):
         self.kv_pool = runner.token_to_kv_pool

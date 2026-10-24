@@ -1294,7 +1294,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         elif not self.use_captured_attn_metadata:
             # An idle DP rank retains the padded graph shape for collective
             # participation, but has no real sparse queries or KV writes.
-            if getattr(forward_batch, "global_num_token_non_padded_cpu", None) != 0:
+            if not (
+                attn_backend.skips_prefill_metadata_on_idle_dp_rank
+                and getattr(forward_batch, "global_num_token_non_padded_cpu", None) == 0
+            ):
                 attn_backend.init_forward_metadata(forward_batch)
                 build_snapshot = True
         else:
