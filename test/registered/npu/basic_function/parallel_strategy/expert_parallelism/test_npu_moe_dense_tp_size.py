@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
-from sglang.test.ascend.test_ascend_utils import DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH
+from sglang.test.ascend.e2e.test_npu_performance_utils import MOONLIGHT_16B_A3B_MODEL_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -15,7 +15,11 @@ from sglang.test.test_utils import (
 
 register_npu_ci(est_time=400, suite="base-b-test-2-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
-
+register_npu_ci(
+    est_time=7200,
+    suite="nightly-acc-4-npu-a5",
+    nightly=True,
+)
 
 class TestAscendMoeDenseTPSize(CustomTestCase):
     """Testcase: Verify that the model accuracy remains uncompromised when the parameter --moe-dense-tp-size is configured to 1.
@@ -26,7 +30,7 @@ class TestAscendMoeDenseTPSize(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH
+        cls.model = MOONLIGHT_16B_A3B_MODEL_PATH
         cls.process = popen_launch_server(
             cls.model,
             DEFAULT_URL_FOR_TEST,

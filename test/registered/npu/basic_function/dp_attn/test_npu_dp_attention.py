@@ -30,7 +30,11 @@ register_npu_ci(
     suite="base-b-test-4-npu-a3",
 )
 register_npu_ci(est_time=2400, suite="nightly-4-npu-a3", nightly=True)
-
+register_npu_ci(
+    est_time=7200,
+    suite="nightly-acc-4-npu-a5",
+    nightly=True,
+)
 
 class TestDPAttentionDP2TP2(
     CustomTestCase,
