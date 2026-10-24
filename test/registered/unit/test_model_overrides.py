@@ -1802,6 +1802,42 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(self._leaf("attention_backend"), deterministic_fills[0])
 
+    def test_deterministic_inference_disables_hybrid_swa_memory(self):
+        """With the radix cache on, deterministic mode must not reuse cached prefixes
+        through the hybrid SWA pool, whose reusable length follows eviction state."""
+
+        def disabled(arch, config_extra=None, **kwargs):
+            sa = self._construct(
+                arch, "llama", config_extra, attention_backend="triton", **kwargs
+            )
+            return resolution_result(sa, "disable_hybrid_swa_memory")
+
+        self.assertTrue(
+            disabled("GptOssForCausalLM", enable_deterministic_inference=True)
+        )
+        self.assertFalse(
+            disabled(
+                "GptOssForCausalLM",
+                enable_deterministic_inference=True,
+                disable_radix_cache=True,
+            )
+        )
+        self.assertFalse(disabled("GptOssForCausalLM"))
+        self.assertFalse(
+            disabled("LlamaForCausalLM", enable_deterministic_inference=True)
+        )
+        # A hybrid SWA model outside the verified list keeps its pool (Laguna does not start without it).
+        self.assertFalse(
+            disabled(
+                "LagunaForCausalLM",
+                enable_deterministic_inference=True,
+                config_extra={
+                    "layer_types": ["sliding_attention", "full_attention"],
+                    "sliding_window": 64,
+                },
+            )
+        )
+
     def test_deterministic_incompatible_backend_raises(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,

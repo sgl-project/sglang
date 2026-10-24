@@ -41,6 +41,13 @@ from sglang.srt.utils.common import (
 
 logger = logging.getLogger(__name__)
 
+# Hybrid sliding-window (SWA) models that turn off the hybrid SWA memory pool in
+# deterministic mode with the radix cache. A model is listed only when tests show
+# both that the pool breaks its determinism and that it runs correctly without the
+# pool. Other hybrid SWA models keep the pool: Gemma 4 and Laguna, for example,
+# fail to start without it.
+_DETERMINISTIC_NO_SWA_POOL_ARCHS = frozenset({"GptOssForCausalLM", "MellumForCausalLM"})
+
 
 # Largest GQA group DISPATCH_DECODE instantiates in sgl-kernel-xpu flash_attention.cpp.
 XPU_DECODE_MAX_Q_GROUP_SIZE = 16
@@ -619,6 +626,7 @@ def handle_deterministic_inference(server_args: Any):
 
         run_post_process_pass(server_args, _deterministic_sampling_backend)
         is_deepseek_model = False
+        disable_swa_pool = False
         if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
             try:
                 hf_config = model_config_of(server_args).hf_config
@@ -633,6 +641,10 @@ def handle_deterministic_inference(server_args: Any):
                     "Glm4MoeLiteForCausalLM",
                     "Glm5NextForConditionalGeneration",
                 ]
+                disable_swa_pool = any(
+                    arch in _DETERMINISTIC_NO_SWA_POOL_ARCHS
+                    for arch in hf_config.architectures
+                )
             except Exception:
                 pass
 
@@ -662,6 +674,23 @@ def handle_deterministic_inference(server_args: Any):
             )
             logger.warning(
                 f"Currently radix cache is not compatible with {attention_backend} attention backend for deterministic inference. It will be supported in the future."
+            )
+
+        # A cached prefix can be reused only as far as its sliding-window KV is still in
+        # the SWA pool, so how a prompt is prefilled would depend on what earlier requests
+        # evicted.
+        if (
+            disable_swa_pool
+            and not cfg.disable_radix_cache
+            and not cfg.disable_hybrid_swa_memory
+        ):
+            logger.warning(
+                "Disable the hybrid SWA memory pool because deterministic inference is enabled with the radix cache."
+            )
+            declare_resolution(
+                server_args,
+                "_handle_deterministic_inference",
+                disable_hybrid_swa_memory=True,
             )
 
         # Check TP size
