@@ -5,6 +5,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    get_schedule,
 )
 
 """
@@ -42,6 +43,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
+    cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -347,6 +349,14 @@ class FlashInferAttnBackend(AttentionBackend):
         # FIXME: remove dllm workarounds from flashinfer
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
+
+        # Same gate as the Triton backend: bidirectional extend attention needs
+        # the whole prompt in one forward, which chunked prefill and the CUDA
+        # graph modes that split or pad a prefill do not guarantee.
+        self.allow_bidirectional_attention_in_extend = (
+            cuda_graph_fully_disabled()
+            or check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+        ) and get_schedule().chunked_prefill_size == -1
 
         self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
         self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
@@ -1353,6 +1363,32 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def _extend_is_causal(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> bool:
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            return False
+        if layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL:
+            # A DLLM extend is one complete, fixed-width canvas, so it stays
+            # bidirectional even when the generic gate is off.
+            return not (
+                self.allow_bidirectional_attention_in_extend
+                or forward_batch.forward_mode.is_dllm_extend()
+            )
+        return True
+
+    def _extend_window_left(self, layer: RadixAttention, causal: bool) -> int:
+        multi_item_params = self.forward_metadata.multi_item_params
+        if multi_item_params and multi_item_params.is_enabled():
+            # Multi-item scoring masks per item; a sliding window could cut
+            # across item boundaries.
+            return -1
+        if not causal and layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL:
+            # FlashInfer has no right window, so a bidirectional sliding-window
+            # layer attends over the whole sequence, as in the Triton backend.
+            return -1
+        return layer.sliding_window_size
+
     @debug_kernel_api
     def forward_extend(
         self,
@@ -1366,6 +1402,8 @@ class FlashInferAttnBackend(AttentionBackend):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
+        causal = self._extend_is_causal(layer, forward_batch)
+        window_left = self._extend_window_left(layer, causal)
 
         logits_soft_cap = layer.logit_cap
 
@@ -1409,29 +1447,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     *self._kv_write_scales(layer),
                 )
 
-            causal = (
-                not layer.is_cross_attention
-                and layer.attn_type != AttentionType.ENCODER_ONLY
-            )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 kv_cache,
                 causal=causal,
                 sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=(
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                ),
+                window_left=window_left,
                 logits_soft_cap=logits_soft_cap,
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                 k_scale=layer.k_scale_float,
@@ -1448,12 +1469,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 k = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
                 v = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
-            causal = True
-            if (
-                layer.is_cross_attention
-                or layer.attn_type == AttentionType.ENCODER_ONLY
-            ):
-                causal = False
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
@@ -1471,21 +1486,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             else:
-                swa_window_left = (
-                    layer.sliding_window_size
-                    if not (
-                        self.forward_metadata.multi_item_params
-                        and self.forward_metadata.multi_item_params.is_enabled()
-                    )
-                    else -1
-                )
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
-                    window_left=swa_window_left,
+                    window_left=window_left,
                     logits_soft_cap=logits_soft_cap,
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
@@ -1493,7 +1500,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     kv_cache,
                     causal=False,
                     sm_scale=layer.scaling,
-                    window_left=swa_window_left,
+                    window_left=window_left,
                     logits_soft_cap=logits_soft_cap,
                     # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                     k_scale=layer.k_scale_float,
