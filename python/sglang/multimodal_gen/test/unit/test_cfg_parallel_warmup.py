@@ -14,13 +14,17 @@ All tests are CPU-only; no model loading, no distributed init.
 """
 
 import json
+import shlex
 import unittest
 from collections import deque
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
+import sglang.multimodal_gen.test.server.test_server_common as server_test_common
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
     Flux3ImageSamplingParams,
@@ -1396,3 +1400,68 @@ class TestCfgParallelServesOneBranch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize("env_shape", [False, True])
+@pytest.mark.parametrize("assignment", [False, True])
+@pytest.mark.parametrize("explicit_shape", [False, True])
+def test_server_fixture_calibrates_case_shape_with_quality_defaults(
+    assignment, explicit_shape, env_shape, monkeypatch
+):
+    original = next(case for case in TWO_GPU_CASES if case.id == "wan2_2_t2v_a14b_2gpu")
+    supplied = {"quality": "exact"}
+    if explicit_shape:
+        supplied["num_frames"] = 9
+    raw = json.dumps(supplied)
+    option = (
+        f"--warmup-sampling-params={shlex.quote(raw)}"
+        if assignment
+        else f"--warmup-sampling-params {shlex.quote(raw)}"
+    )
+    case = replace(
+        original,
+        server_args=replace(
+            original.server_args,
+            extras=[
+                arg
+                for arg in original.server_args.extras
+                if not arg.startswith("--warmup-sampling-params")
+            ]
+            + [option],
+        ),
+    )
+    if env_shape:
+        monkeypatch.setenv(
+            "SGLANG_TEST_SERVE_ARGS", "--warmup-sampling-params='{\"num_frames\":7}'"
+        )
+    else:
+        monkeypatch.delenv("SGLANG_TEST_SERVE_ARGS", raising=False)
+    monkeypatch.setattr(server_test_common, "get_dynamic_server_port", lambda: 19000)
+    with patch.object(server_test_common, "ServerManager") as manager:
+        fixture = server_test_common.diffusion_server.__wrapped__(case)
+        try:
+            next(fixture)
+        finally:
+            fixture.close()
+        tokens = shlex.split(manager.call_args.kwargs["extra_args"])
+    assert (
+        sum(token.split("=", 1)[0] == "--warmup-sampling-params" for token in tokens)
+        == 1
+    )
+    resolved = json.loads(
+        _get_extra_arg_value([shlex.join(tokens)], "--warmup-sampling-params")
+    )
+    if explicit_shape:
+        assert resolved == supplied
+    elif env_shape:
+        assert resolved == {"num_frames": 7, "quality": "exact"}
+    else:
+        assert (
+            resolved == server_test_common._case_warmup_sampling_params(case) | supplied
+        )
+        assert resolved["num_frames"] == (
+            case.sampling_params.num_frames
+            if case.sampling_params.num_frames is not None
+            else case.sampling_params.seconds
+            * (case.sampling_params.fps or server_test_common.DEFAULT_FPS)
+        )

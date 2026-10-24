@@ -160,13 +160,6 @@ def _case_warmup_sampling_params(case: DiffusionTestCase) -> dict[str, Any]:
     return overrides
 
 
-def _has_server_option(extra_args: str, case_extras: list[str], option: str) -> bool:
-    tokens = shlex.split(extra_args)
-    for extra in case_extras:
-        tokens.extend(shlex.split(extra))
-    return option in tokens or any(token.startswith(f"{option}=") for token in tokens)
-
-
 def _key_frame_distances(
     case_id: str, label: str, frames: list[np.ndarray], reference: list[np.ndarray]
 ) -> tuple[list[float], list[float]]:
@@ -207,17 +200,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
     extra_args = f"--model-type diffusion {extra_args}".strip()
 
-    has_explicit_warmup_workload = _has_server_option(
-        extra_args, server_args.extras, "--warmup-sampling-params"
-    )
-    if not has_explicit_warmup_workload and supports_auto_residency_for_server_args(
-        server_args
-    ):
-        warmup_sampling_params = _case_warmup_sampling_params(case)
-        if warmup_sampling_params:
-            encoded = json.dumps(warmup_sampling_params, separators=(",", ":"))
-            extra_args += f" --warmup-sampling-params {shlex.quote(encoded)}"
-
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
     if server_args.tp_size is not None:
@@ -253,6 +235,32 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     for arg in server_args.extras:
         extra_args += f" {arg}"
+
+    if supports_auto_residency_for_server_args(server_args):
+        warmup_params = _case_warmup_sampling_params(case)
+        if warmup_params:
+            tokens = shlex.split(extra_args)
+            option = "--warmup-sampling-params"
+            remaining = []
+            existing = {}
+            index = 0
+            while index < len(tokens):
+                token = tokens[index]
+                name, separator, value = token.partition("=")
+                if name == option:
+                    if not separator:
+                        index += 1
+                        value = tokens[index]
+                    existing.update(json.loads(value))
+                else:
+                    remaining.append(token)
+                index += 1
+            # quality is also injected by the shared testcase defaults;
+            # it must not suppress the actual request's calibration shape
+            if set(existing) <= {"quality"}:
+                existing = warmup_params | existing
+            remaining.extend([option, json.dumps(existing, separators=(",", ":"))])
+            extra_args = shlex.join(remaining)
 
     # Build custom environment variables
     env_vars = {}
