@@ -46,6 +46,8 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_neo_ch
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 import (
     Qwen3Attention,
     Qwen3MLP,
+    Qwen3Model,
+    Qwen3RotaryEmbedding,
     _flash_or_sdpa,
     _sdpa_attn_func,
     create_block_causal_mask,
@@ -373,6 +375,155 @@ def test_sensenova_u1_fused_dense_mlp_matches_original(monkeypatch):
         mlp.gate_proj.weight.untyped_storage().data_ptr()
         == mlp.up_proj.weight.untyped_storage().data_ptr()
     )
+    # Sleep mode moves parameters and buffers only; a cached packed tensor
+    # would keep the device copy alive.
+    assert not any(isinstance(value, torch.Tensor) for value in vars(mlp).values())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@torch.no_grad()
+def test_sensenova_u1_cuda_fused_mlp_keeps_eager_rounding():
+    """The fused CUDA activation must round like eager silu(gate) * up.
+
+    Plain silu_and_mul keeps the product in fp32 and changes the output bits.
+    """
+    config = SimpleNamespace(hidden_size=256, intermediate_size=512, hidden_act="silu")
+    with torch.random.fork_rng(devices=[0]):
+        torch.manual_seed(41)
+        mlp = Qwen3MLP(config).eval().to("cuda", torch.bfloat16)
+        hidden_states = torch.randn(2, 64, 256, device="cuda", dtype=torch.bfloat16)
+
+    actual = mlp(hidden_states)
+
+    gate, up = F.linear(hidden_states, mlp._packed_gate_up_weight()).chunk(2, dim=-1)
+    expected = mlp.down_proj(F.silu(gate) * up)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "device,dtype",
+    [
+        ("cpu", torch.float32),
+        pytest.param(
+            "cuda",
+            torch.bfloat16,
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="needs CUDA"
+            ),
+        ),
+    ],
+)
+@torch.no_grad()
+def test_sensenova_u1_gen_qkv_bshd_matches_bhsd(device, dtype):
+    """Generation q/k/v built in [B, S, H, D] must equal the [B, H, S, D] build.
+
+    128 tokens with 128-dim heads put the t/h/w RoPE on the fused CUDA kernel.
+    """
+    config = NEOLLMConfig(
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=128,
+        max_position_embeddings=256,
+    )
+    config._attn_implementation = "eager"
+    with torch.random.fork_rng():
+        torch.manual_seed(43)
+        attention = Qwen3Attention(config, layer_idx=0).eval().to(device, dtype)
+    generator = torch.Generator().manual_seed(47)
+    hidden_states = torch.randn(2, 128, 256, generator=generator).to(device, dtype)
+    indexes = torch.randint(0, 256, (2, 3, 128), generator=generator).to(device)
+
+    bshd = attention._build_qkv_gen(hidden_states, indexes, bshd=True)
+    bhsd = attention._build_qkv_gen(hidden_states, indexes, bshd=False)
+
+    for actual, expected in zip(bshd, bhsd):
+        assert torch.equal(actual, expected.transpose(1, 2))
+
+
+@torch.no_grad()
+def test_sensenova_u1_shared_rope_tables_match_per_layer(monkeypatch):
+    """RoPE tables built once per forward must equal the tables each layer builds.
+
+    Covers prefill, single-token decode (which rebuilds indexes inside the forward)
+    and denoise. Denoise feeds bf16 embeddings to fp32 weights, so the layer input is
+    fp32 while the shared tables are bf16 and must be rebuilt.
+    """
+    config = NEOLLMConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=128,
+        vocab_size=97,
+    )
+    config._attn_implementation = "eager"
+    with torch.random.fork_rng():
+        torch.manual_seed(53)
+        model = Qwen3Model(config).eval()
+    helper = SimpleNamespace(device=torch.device("cpu"))
+
+    def run():
+        generator = torch.Generator().manual_seed(59)
+        input_ids = torch.randint(0, 97, (1, 6), generator=generator)
+        positions = torch.arange(6)[None]
+        indexes = torch.stack(
+            [positions, torch.zeros_like(positions), torch.zeros_like(positions)], dim=1
+        )
+        cache = DynamicCache(config=config)
+        prefill = model(
+            input_ids=input_ids,
+            indexes=indexes,
+            attention_mask={"full_attention": create_block_causal_mask(positions)},
+            past_key_values=cache,
+            use_cache=True,
+        ).last_hidden_state
+        decode = model(
+            input_ids=input_ids[:, :1], past_key_values=cache, use_cache=True
+        ).last_hidden_state
+        prepare_flash_kv_cache(
+            cache, current_len=4, batch_size=1, prefix_lengths=torch.tensor([7])
+        )
+        image_embeds = torch.randn(1, 4, 64, generator=generator).bfloat16()
+        denoise = model(
+            inputs_embeds=image_embeds,
+            image_gen_indicators=torch.ones(1, 4, dtype=torch.bool),
+            indexes=NEOChatModel._build_t2i_image_indexes(
+                helper, 2, 2, torch.tensor([7]), torch.device("cpu")
+            ),
+            attention_mask={"full_attention": None},
+            past_key_values=cache,
+            update_cache=False,
+        ).last_hidden_state
+        return prefill, decode, denoise
+
+    table_builds = 0
+    rotary_forward = Qwen3RotaryEmbedding.forward
+
+    def counting_rotary_forward(self, x, position_ids):
+        nonlocal table_builds
+        table_builds += 1
+        return rotary_forward(self, x, position_ids)
+
+    monkeypatch.setattr(Qwen3RotaryEmbedding, "forward", counting_rotary_forward)
+    shared = run()
+    # Three axes per forward; denoise also rebuilds in each of the 2 layers.
+    assert table_builds == 3 + 3 + 3 * (1 + 2)
+
+    build = Qwen3Attention.build_rope_tables
+    monkeypatch.setattr(
+        Qwen3Attention,
+        "build_rope_tables",
+        lambda self, hidden_states, indexes, shared=None: build(
+            self, hidden_states, indexes
+        ),
+    )
+    for actual, expected in zip(shared, run()):
+        assert torch.equal(actual, expected)
 
 
 def test_sensenova_u1_batched_gqa_matches_unpadded_singletons():

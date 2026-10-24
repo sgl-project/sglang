@@ -344,45 +344,66 @@ class Qwen3MLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._npu_gate_up_weight = None
 
-    def _pack_npu_gate_up_weights(self) -> torch.Tensor:
-        reference = self.gate_proj.weight
-        packed = self._npu_gate_up_weight
-        if (
-            packed is not None
-            and packed.device == reference.device
-            and packed.dtype == reference.dtype
-            and packed.untyped_storage().data_ptr()
-            == reference.untyped_storage().data_ptr()
-        ):
-            return packed
-
+    def pack_gate_up_weight(self) -> None:
+        # gate and up become the two halves of one buffer; state_dict is unchanged.
         with torch.no_grad():
-            packed = torch.cat(
-                [self.gate_proj.weight, self.up_proj.weight], dim=0
-            ).contiguous()
+            packed = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
             self.gate_proj.weight.set_(packed[: self.intermediate_size])
             self.up_proj.weight.set_(packed[self.intermediate_size :])
-        self._npu_gate_up_weight = packed
-        return packed
+
+    def _packed_gate_up_weight(self) -> torch.Tensor:
+        gate, up = self.gate_proj.weight, self.up_proj.weight
+        if not (
+            gate.untyped_storage().data_ptr() == up.untyped_storage().data_ptr()
+            and gate.storage_offset() == 0
+            and up.storage_offset() == gate.numel()
+        ):
+            # Wake-up or a weight update rebound the weights. The freed halves
+            # cannot hold the next MLP's packed buffer, so return them now.
+            self.pack_gate_up_weight()
+            if gate.device.type != "cpu":
+                torch.get_device_module(gate.device).empty_cache()
+        # A view, not a cached tensor: moving the two parameters frees the buffer.
+        return gate.as_strided(
+            (2 * self.intermediate_size, self.hidden_size), (self.hidden_size, 1)
+        )
+
+    def _can_fuse_gate_up(self, x: torch.Tensor) -> bool:
+        return (
+            not self.training
+            and not torch.is_grad_enabled()
+            and x.dtype == torch.bfloat16
+            and self.gate_proj.weight.dtype == x.dtype
+            and self.config.hidden_act == "silu"
+        )
 
     def _use_npu_fused_mlp(self, x: torch.Tensor) -> bool:
-        if (
-            x.device.type != "npu"
-            or self.training
-            or torch.is_grad_enabled()
-            or x.dtype != torch.bfloat16
-            or self.gate_proj.weight.dtype != x.dtype
-            or self.config.hidden_act != "silu"
-        ):
+        if x.device.type != "npu" or not self._can_fuse_gate_up(x):
             return False
         return hasattr(torch.ops.npu, "npu_swiglu")
 
+    def _use_cuda_fused_mlp(self, x: torch.Tensor) -> bool:
+        return (
+            x.device.type == "cuda"
+            and self._can_fuse_gate_up(x)
+            and self.intermediate_size % 16 == 0
+            and not torch.compiler.is_compiling()
+        )
+
     def forward(self, x):
         if self._use_npu_fused_mlp(x):
-            gate_up = F.linear(x, self._pack_npu_gate_up_weights())
+            gate_up = F.linear(x, self._packed_gate_up_weight())
             return self.down_proj(torch.ops.npu.npu_swiglu(gate_up))
+        if self._use_cuda_fused_mlp(x):
+            from sglang.kernels.ops.activation.activation import (
+                silu_and_mul_with_activation_rounding,
+            )
+
+            # The kernel rounds the activation to bf16 before the multiply and
+            # rounds the product once, matching the eager silu-then-mul chain.
+            gate_up = F.linear(x, self._packed_gate_up_weight())
+            return self.down_proj(silu_and_mul_with_activation_rounding(gate_up))
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
@@ -414,39 +435,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    if (
-        q.is_cuda
-        and q.dtype is torch.bfloat16
-        and k.dtype is torch.bfloat16
-        and cos.dtype is torch.bfloat16
-        and sin.dtype is torch.bfloat16
-        and q.device == k.device == cos.device == sin.device
-        and not torch.is_grad_enabled()
-        and not torch.compiler.is_compiling()
-        and unsqueeze_dim == 1
-        and q.ndim == k.ndim == 4
-        and q.numel() > 0
-        and k.numel() > 0
-        and q.shape[2] >= 128
-        and q.shape[0] == k.shape[0]
-        and q.shape[2:] == k.shape[2:]
-        and q.shape[-1] in (32, 64)
-        and cos.shape == sin.shape == (q.shape[0], q.shape[2], q.shape[3])
-    ):
-        from sglang.kernels.ops.diffusion.rope.rope_rotate_half_bitexact import (
-            fused_rope_rotate_half_bitexact,
-        )
-
-        # The kernel rounds both products to bf16 before adding, matching
-        # the eager chain. Spatial axes are slices of the normalized HW
-        # heads; materialize those slices in the kernel's BSHD layout.
-        cos_rows = cos.reshape(-1, cos.shape[-1]).contiguous()
-        sin_rows = sin.reshape(-1, sin.shape[-1]).contiguous()
-        q_embed = fused_rope_rotate_half_bitexact(
-            q.transpose(1, 2).contiguous(), cos_rows, sin_rows
-        )
-        k_embed = fused_rope_rotate_half_bitexact(
-            k.transpose(1, 2).contiguous(), cos_rows, sin_rows
+    if unsqueeze_dim == 1 and _use_fused_rope(q, k, cos, sin, seq_dim=2):
+        q_embed, k_embed = _fused_rope_bshd(
+            q.transpose(1, 2), k.transpose(1, 2), cos, sin
         )
         return q_embed.transpose(1, 2), k_embed.transpose(1, 2)
 
@@ -455,6 +446,52 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
+
+
+def apply_rotary_pos_emb_bshd(q, k, cos, sin):
+    # Bit-identical to apply_rotary_pos_emb on the [B, H, S, D] transpose.
+    if _use_fused_rope(q, k, cos, sin, seq_dim=1):
+        return _fused_rope_bshd(q, k, cos, sin)
+    return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=2)
+
+
+def _use_fused_rope(q, k, cos, sin, *, seq_dim: int) -> bool:
+    # seq_dim is 1 for [B, S, H, D] q/k and 2 for [B, H, S, D].
+    return (
+        q.is_cuda
+        and q.dtype is torch.bfloat16
+        and k.dtype is torch.bfloat16
+        and cos.dtype is torch.bfloat16
+        and sin.dtype is torch.bfloat16
+        and q.device == k.device == cos.device == sin.device
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and q.ndim == k.ndim == 4
+        and q.numel() > 0
+        and k.numel() > 0
+        and q.shape[seq_dim] >= 128
+        and q.shape[0] == k.shape[0]
+        and q.shape[seq_dim] == k.shape[seq_dim]
+        and q.shape[3] == k.shape[3]
+        and q.shape[-1] in (32, 64)
+        and cos.shape == sin.shape == (q.shape[0], q.shape[seq_dim], q.shape[3])
+    )
+
+
+def _fused_rope_bshd(q, k, cos, sin):
+    from sglang.kernels.ops.diffusion.rope.rope_rotate_half_bitexact import (
+        fused_rope_rotate_half_bitexact,
+    )
+
+    # The kernel rounds both products to bf16 before adding, matching
+    # the eager chain. Spatial axes are slices of the normalized HW
+    # heads; materialize those slices in the kernel's BSHD layout.
+    cos_rows = cos.reshape(-1, cos.shape[-1]).contiguous()
+    sin_rows = sin.reshape(-1, sin.shape[-1]).contiguous()
+    return (
+        fused_rope_rotate_half_bitexact(q.contiguous(), cos_rows, sin_rows),
+        fused_rope_rotate_half_bitexact(k.contiguous(), cos_rows, sin_rows),
+    )
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -592,6 +629,14 @@ class Qwen3RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
+# One (cos, sin) pair per RoPE axis: temporal, height, width.
+RopeTables = tuple[
+    tuple[torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor],
+]
+
+
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -699,6 +744,23 @@ class Qwen3Attention(nn.Module):
         hw_config.max_position_embeddings = config.max_position_embeddings_hw
         self.rotary_emb_hw = Qwen3RotaryEmbedding(config=hw_config)
 
+    def build_rope_tables(
+        self,
+        hidden_states: torch.Tensor,
+        indexes: torch.LongTensor,
+        shared: Optional[RopeTables] = None,
+    ) -> RopeTables:
+        # Every layer builds the same tables from the same positions, so
+        # Qwen3Model.forward builds them once; they are cast to the activation
+        # dtype, so rebuild if this layer's input differs.
+        if shared is not None and shared[0][0].dtype == hidden_states.dtype:
+            return shared
+        return (
+            self.rotary_emb(hidden_states, position_ids_from_indexes(indexes, 0)),
+            self.rotary_emb_hw(hidden_states, position_ids_from_indexes(indexes, 1)),
+            self.rotary_emb_hw(hidden_states, position_ids_from_indexes(indexes, 2)),
+        )
+
     def forward_und(
         self,
         hidden_states: torch.Tensor,
@@ -706,6 +768,7 @@ class Qwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        rope_tables: Optional[RopeTables] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert self.config._attn_implementation == "eager"
@@ -726,22 +789,14 @@ class Qwen3Attention(nn.Module):
 
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        cos_t, sin_t = self.rotary_emb(
-            hidden_states, position_ids_from_indexes(indexes, 0)
+        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self.build_rope_tables(
+            hidden_states, indexes, shared=rope_tables
         )
         query_states_t, key_states_t = apply_rotary_pos_emb(
             query_states_t, key_states_t, cos_t, sin_t
         )
-
-        cos_h, sin_h = self.rotary_emb_hw(
-            hidden_states, position_ids_from_indexes(indexes, 1)
-        )
         query_states_h, key_states_h = apply_rotary_pos_emb(
             query_states_h, key_states_h, cos_h, sin_h
-        )
-
-        cos_w, sin_w = self.rotary_emb_hw(
-            hidden_states, position_ids_from_indexes(indexes, 2)
         )
         query_states_w, key_states_w = apply_rotary_pos_emb(
             query_states_w, key_states_w, cos_w, sin_w
@@ -869,6 +924,53 @@ class Qwen3Attention(nn.Module):
     #     attn_output = self.o_proj_mot_gen(attn_output)
     #     return attn_output, attn_weights
 
+    def _build_qkv_gen(
+        self,
+        hidden_states: torch.Tensor,
+        indexes: Optional[torch.LongTensor],
+        bshd: bool,
+        rope_tables: Optional[RopeTables] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Returns [B, S, H, D] when bshd, else [B, H, S, D]; the values are identical.
+        hidden_shape = (*hidden_states.shape[:-1], -1, self.head_dim)
+
+        query_states = self.q_proj_mot_gen(hidden_states).view(hidden_shape)
+        query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
+        query_states_t = self.q_norm_mot_gen(query_states_t)
+        query_states_hw = self.q_norm_hw_mot_gen(query_states_hw)
+
+        key_states = self.k_proj_mot_gen(hidden_states).view(hidden_shape)
+        key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
+        key_states_t = self.k_norm_mot_gen(key_states_t)
+        key_states_hw = self.k_norm_hw_mot_gen(key_states_hw)
+
+        value_states = self.v_proj_mot_gen(hidden_states).view(hidden_shape)
+
+        if not bshd:
+            query_states_t = query_states_t.transpose(1, 2)
+            query_states_hw = query_states_hw.transpose(1, 2)
+            key_states_t = key_states_t.transpose(1, 2)
+            key_states_hw = key_states_hw.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+
+        # The h/w split is on head_dim, so it commutes with the transpose above.
+        query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
+        key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
+
+        rope = apply_rotary_pos_emb_bshd if bshd else apply_rotary_pos_emb
+        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = self.build_rope_tables(
+            hidden_states, indexes, shared=rope_tables
+        )
+        query_states_t, key_states_t = rope(query_states_t, key_states_t, cos_t, sin_t)
+        query_states_h, key_states_h = rope(query_states_h, key_states_h, cos_h, sin_h)
+        query_states_w, key_states_w = rope(query_states_w, key_states_w, cos_w, sin_w)
+
+        query_states = torch.cat(
+            [query_states_t, query_states_h, query_states_w], dim=-1
+        )
+        key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
+        return query_states, key_states, value_states
+
     def forward_gen(
         self,
         hidden_states: torch.Tensor,
@@ -876,64 +978,10 @@ class Qwen3Attention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        rope_tables: Optional[RopeTables] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-
-        # -----------------------------
-        # Build q / k / v for current tokens
-        # Internal layout before flash:
-        #   q/k/v: [B, H, S, D]
-        # Flash layout:
-        #   q/k/v: [B, S, H, D]
-        # -----------------------------
-        query_states = self.q_proj_mot_gen(hidden_states).view(hidden_shape)
-        query_states_t, query_states_hw = query_states.chunk(2, dim=-1)
-        query_states_t = self.q_norm_mot_gen(query_states_t).transpose(
-            1, 2
-        )  # [B,H,S,D/2]
-        query_states_hw = self.q_norm_hw_mot_gen(query_states_hw).transpose(1, 2)
-        query_states_h, query_states_w = query_states_hw.chunk(2, dim=-1)
-
-        key_states = self.k_proj_mot_gen(hidden_states).view(hidden_shape)
-        key_states_t, key_states_hw = key_states.chunk(2, dim=-1)
-        key_states_t = self.k_norm_mot_gen(key_states_t).transpose(1, 2)  # [B,H,S,D/2]
-        key_states_hw = self.k_norm_hw_mot_gen(key_states_hw).transpose(1, 2)
-        key_states_h, key_states_w = key_states_hw.chunk(2, dim=-1)
-
-        value_states = (
-            self.v_proj_mot_gen(hidden_states).view(hidden_shape).transpose(1, 2)
-        )  # [B,H,S,D]
-
-        # RoPE
-        cos_t, sin_t = self.rotary_emb(
-            hidden_states, position_ids_from_indexes(indexes, 0)
-        )
-        query_states_t, key_states_t = apply_rotary_pos_emb(
-            query_states_t, key_states_t, cos_t, sin_t
-        )
-
-        cos_h, sin_h = self.rotary_emb_hw(
-            hidden_states, position_ids_from_indexes(indexes, 1)
-        )
-        query_states_h, key_states_h = apply_rotary_pos_emb(
-            query_states_h, key_states_h, cos_h, sin_h
-        )
-
-        cos_w, sin_w = self.rotary_emb_hw(
-            hidden_states, position_ids_from_indexes(indexes, 2)
-        )
-        query_states_w, key_states_w = apply_rotary_pos_emb(
-            query_states_w, key_states_w, cos_w, sin_w
-        )
-
-        # concat along head_dim
-        # query/key current layout: [B, H, S, D]
-        query_states = torch.cat(
-            [query_states_t, query_states_h, query_states_w], dim=-1
-        )
-        key_states = torch.cat([key_states_t, key_states_h, key_states_w], dim=-1)
 
         update_cache = kwargs.get("update_cache", True)
 
@@ -949,21 +997,34 @@ class Qwen3Attention(nn.Module):
             and attention_mask.ndim == 4
             and (attention_mask.shape[-2] == 1 or attention_mask.dtype == torch.bool)
         )
-        if attention_mask is None or key_padding_mask:
+        flash_path = attention_mask is None or key_padding_mask
+        layer = (
+            past_key_values.layers[self.layer_idx]
+            if past_key_values is not None and not update_cache
+            else None
+        )
+        use_bnsd_cache = (
+            layer is not None
+            and getattr(layer, "flash_cache_layout", None) == "BNSD"
+            and getattr(layer, "flash_k_cache", None) is not None
+            and getattr(layer, "flash_v_cache", None) is not None
+        )
+        # BSHD is flash's own layout. The eager fallback, the NPU BNSD cache
+        # and ``Cache.update`` all read [B, H, S, D], so those keep it.
+        bshd = (
+            flash_path
+            and not use_bnsd_cache
+            and not (update_cache and past_key_values is not None)
+        )
+
+        query_states, key_states, value_states = self._build_qkv_gen(
+            hidden_states, indexes, bshd=bshd, rope_tables=rope_tables
+        )
+
+        if flash_path:
             actual_seq_lengths_kv = None
             kv_padding_size = None
             input_layout = "BSND"
-            layer = (
-                past_key_values.layers[self.layer_idx]
-                if past_key_values is not None and not update_cache
-                else None
-            )
-            use_bnsd_cache = (
-                layer is not None
-                and getattr(layer, "flash_cache_layout", None) == "BNSD"
-                and getattr(layer, "flash_k_cache", None) is not None
-                and getattr(layer, "flash_v_cache", None) is not None
-            )
 
             if use_bnsd_cache:
                 q = query_states
@@ -983,9 +1044,12 @@ class Qwen3Attention(nn.Module):
                 kv_padding_size = layer.flash_kv_padding_size
                 input_layout = "BNSD"
             else:
-                q = query_states.transpose(1, 2).contiguous()
-                k_cur = key_states.transpose(1, 2).contiguous()
-                v_cur = value_states.transpose(1, 2).contiguous()
+                if bshd:
+                    q, k_cur, v_cur = query_states, key_states, value_states
+                else:
+                    q = query_states.transpose(1, 2).contiguous()
+                    k_cur = key_states.transpose(1, 2).contiguous()
+                    v_cur = value_states.transpose(1, 2).contiguous()
 
                 if past_key_values is not None:
                     if update_cache:
@@ -1427,7 +1491,15 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        layers = self.layers[: self.config.num_hidden_layers]
+        # Built after indexes is final; a layer whose input dtype differs from
+        # the embeddings' rebuilds its own (see build_rope_tables).
+        rope_tables = (
+            layers[0].self_attn.build_rope_tables(hidden_states, indexes)
+            if len(layers) > 0
+            else None
+        )
+        for decoder_layer in layers:
             hidden_states = decoder_layer(
                 hidden_states,
                 image_gen_indicators=image_gen_indicators,
@@ -1439,6 +1511,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 cache_position=cache_position,
+                rope_tables=rope_tables,
                 **kwargs,
             )
         if not exist_image_gen_tokens:
