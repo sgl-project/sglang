@@ -4,16 +4,7 @@ import contextlib
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import (
-    TYPE_CHECKING,
-    Callable,
-    Iterator,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Sequence, Union
 
 import msgspec
 import torch
@@ -34,12 +25,9 @@ logger = logging.getLogger(__name__)
 
 _SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
 _RECOVER_COHORT_KEY_PREFIX = "elastic_ep/recover_cohort"
-
 # Last inactive-rank set reported by is_scaling(), which polls: re-log only on change.
 _fault_reported_ranks: tuple = ()
-
-# Bound on warming_up without serving. Covers the prefill-shape DeepGEMM JIT a fresh rank
-# compiles on its first forward: tens of seconds, worse on a shared DG_JIT_CACHE_DIR.
+# Max warming_up without a forward; covers a fresh rank's first-forward DeepGEMM JIT.
 _WARMUP_SETTLE_TIMEOUT_S = 60.0
 
 
@@ -114,19 +102,8 @@ def update_dp_attention_for_elastic_ep(
 def register_recover_cohort(
     rank_offset: int, effective_ep_size: int, tp_size: int = 1
 ) -> None:
-    """Announce the cohort width a recover joiner sized its expert map for.
-
-    One key per slot the joiner covers, not one at its offset.
-    ``required_recover_width`` plans for a set of slots and wants a key for each, so a
-    ``tp_size > 1`` joiner that announced only its offset left every slot above it
-    silent: the width never resolved,
-    the tokenizer retried for two minutes holding the scale lock, and the grow then
-    staged through a width no joiner was waiting at.
-
-    Its own key space, not the scale cohort's: survivors ask ``get_scale_cohort``
-    whether an append grow has a cohort waiting, and a recover joiner parked at an
-    offset equal to the current width would answer that for an unrelated grow.
-    """
+    """Announce a recover joiner's expert-map width, one key per covered slot. Not the
+    scale cohort's keys: an offset equal to the width would answer get_scale_cohort."""
     store = get_global_tcp_store()
     if store is None:
         raise RuntimeError("Elastic EP recover-mode join requires the global TCPStore.")
@@ -134,25 +111,17 @@ def register_recover_cohort(
         store.set(f"{_RECOVER_COHORT_KEY_PREFIX}/{slot}", str(effective_ep_size))
 
 
-def clear_recover_cohort(rank_offset: int, tp_size: int = 1) -> None:
+def clear_recover_cohort(rank_offset: int) -> None:
     """Drop a stale announce so a later grow cannot be planned off a dead joiner."""
     store = get_global_tcp_store()
-    if store is None:
-        return
-    for slot in range(rank_offset, rank_offset + tp_size):
-        key = f"{_RECOVER_COHORT_KEY_PREFIX}/{slot}"
-        if store.check([key]):
-            store.delete_key(key)
+    key = f"{_RECOVER_COHORT_KEY_PREFIX}/{rank_offset}"
+    if store is not None and store.check([key]):
+        store.delete_key(key)
 
 
 def required_recover_width(recover_slots: List[int]) -> Optional[int]:
-    """The narrowest cohort width that fits every joiner waiting on these slots.
-
-    None until all of them have announced, and deliberately no guess in the meantime:
-    going direct kills a joiner wider than the target at the cohort barrier, while
-    assuming the launch width asks a narrower one to fill slots it has no ranks for.
-    Reads the store once and never sleeps, because the caller is the scheduler loop.
-    """
+    """Narrowest width fitting every joiner on these slots, None until all announced
+    (a guess misfits a wider or narrower joiner). Never sleeps (scheduler loop)."""
     store = get_global_tcp_store()
     if store is None:
         return None
@@ -179,7 +148,6 @@ class ElasticEPState:
     pending_recover_ranks: List[int] = field(default_factory=list)
     # True once mask flips are committed; blocks reset() from clobbering Mooncake state.
     mask_dirty: bool = False
-    # Deadline for the post-grow warmup window; see _WARMUP_SETTLE_TIMEOUT_S.
     warmup_deadline: Optional[float] = None
 
     def is_active_equal_last(self) -> bool:
@@ -205,9 +173,8 @@ class ElasticEPState:
     def _set_active_bits(self, global_ranks: List[int], value: int) -> None:
         if self.active_ranks is None:
             return
-        numel = self.active_ranks.numel()
         for g in global_ranks:
-            if 0 <= g < numel:
+            if 0 <= g < self.active_ranks.numel():
                 self.active_ranks[g] = value
         self.snapshot_active_to_last()
         self.sync_active_to_cpu()
@@ -320,8 +287,7 @@ class ElasticEPStateManager:
             return False
         if inst.pending_ep_size is not None:
             return False
-        # Bounds and feasibility are the caller's to reject: it can answer the client
-        # with a reason, and its bound is never looser than ours.
+        # The caller checks bounds and feasibility, so it can tell the client why.
         inst.pending_recover_ranks = list(recover_ranks)
         inst.pending_ep_size = n
         inst.scale_phase = "waiting_for_cohort"
@@ -362,15 +328,10 @@ class ElasticEPStateManager:
     @classmethod
     def is_shrink_pending(cls) -> bool:
         inst = cls._instance
-        return (
-            inst is not None
-            and inst.pending_ep_size is not None
-            and inst.pending_ep_size < inst.effective_ep_size
-        )
+        return cls.is_scale_pending() and inst.pending_ep_size < inst.effective_ep_size
 
     @classmethod
     def is_scale_pending(cls) -> bool:
-        """Any resize in flight, grow or shrink. The width is moving either way."""
         inst = cls._instance
         return inst is not None and inst.pending_ep_size is not None
 
@@ -379,14 +340,13 @@ class ElasticEPStateManager:
         inst = cls._instance
         if inst is None or inst.pending_ep_size is None:
             return
-        was_shrink = cls.is_shrink_pending()
-        inst.effective_ep_size = inst.pending_ep_size
-        inst.pending_ep_size = None
-        inst.has_scaled = True
-        if was_shrink:
+        if inst.pending_ep_size < inst.effective_ep_size:
             inst.scale_phase = "serving_shrunk"
         else:
             cls.mark_warming_up()
+        inst.effective_ep_size = inst.pending_ep_size
+        inst.pending_ep_size = None
+        inst.has_scaled = True
         inst.last_error = None
         inst.pending_since = None
         inst.pending_recover_ranks = []
@@ -401,11 +361,8 @@ class ElasticEPStateManager:
 
     @classmethod
     def settle_warmup(cls, *, served: bool) -> None:
-        """Leave warming_up once the cohort has served, or when the window expires.
-
-        A joiner cannot warm itself: the rest is prefill-shape JIT that compiles only
-        when a kernel runs, which in EP needs the a2a. One forward at the new width
-        therefore proves it warm; the deadline covers an idle cohort."""
+        """Leave warming_up after one forward at the new width (the remaining JIT needs
+        the a2a, so a joiner cannot warm itself), or at the deadline if idle."""
         inst = cls._instance
         if inst is None or inst.scale_phase != "warming_up":
             return
@@ -428,18 +385,10 @@ class ElasticEPStateManager:
         if not inst.mask_dirty:
             inst.reset()
         elif inst.active_ranks_cpu is not None:
-            # Trust the flip over the uncommitted width: barrier targets read
-            # effective_ep_size, so leaving it pre-shrink waits on departed ranks.
-            #
-            # The contiguous prefix, not the popcount: every width here addresses ranks
-            # as [0, width), so a mask with a hole would make the count name a
-            # different set than the mask does, and later barriers would size
-            # themselves for participants that are not the live ones.
-            mask = inst.active_ranks_cpu
-            active_count = int(mask.sum().item())
-            prefix = 0
-            while prefix < mask.shape[0] and int(mask[prefix]):
-                prefix += 1
+            # Barrier targets read the width: size it to the mask's contiguous prefix.
+            bits = inst.active_ranks_cpu.tolist()
+            active_count = sum(bits)
+            prefix = next((i for i, a in enumerate(bits) if not a), len(bits))
             if prefix != active_count:
                 logger.error(
                     "[Elastic EP] active mask is not a contiguous prefix after a failed "
@@ -447,13 +396,9 @@ class ElasticEPStateManager:
                     "active ranks above it stay unreachable until a recover repairs them.",
                     prefix,
                     active_count,
-                    mask.tolist(),
+                    bits,
                 )
-            # Narrowing only. mask_dirty is set by activate_ranks too, so a failed grow
-            # arrives here with a mask wider than the width, and adopting it would widen
-            # effective_ep_size onto slots the DPC never activated -- and the tokenizer
-            # sizes its control fan-out from this. A grow that failed keeps serving at
-            # the width it already had; the unjoined slots are recovered, not adopted.
+            # Narrow only: widening after a failed grow fans out to unactivated slots.
             if 0 < prefix < inst.effective_ep_size:
                 inst.effective_ep_size = prefix
             elif prefix > inst.effective_ep_size:
@@ -533,50 +478,38 @@ class ElasticEPStateManager:
         NixlEPBuffer.poll_rank_faults()
 
     @classmethod
-    def get_inactive_ranks(cls) -> Tuple[int, ...]:
-        """Ranks inside the current width whose mask bit is clear.
-
-        Non-empty only after a fault: a committed scale leaves the width and the mask
-        agreeing. Barrier targets are sized from the width, so these are exactly the
-        participants a later rendezvous would wait on and never get.
-        """
+    def get_inactive_ranks(cls) -> tuple[int, ...]:
+        """Ranks in [0, effective_ep_size) whose mask bit is clear."""
         inst = cls._instance
         if inst is None or inst.active_ranks_cpu is None:
             return ()
-        return tuple(
-            i
-            for i in range(inst.effective_ep_size)
-            if not int(inst.active_ranks_cpu[i])
-        )
+        mask = inst.active_ranks_cpu
+        return tuple(i for i in range(inst.effective_ep_size) if not int(mask[i]))
 
     @classmethod
     def is_scaling(cls) -> bool:
-        """Whether a scale or recovery is pending (CPU snapshot: rank polling reads it too)."""
+        """Return whether a scale or recovery operation is pending.
+
+        The CPU snapshot is authoritative because rank polling uses it too.
+        """
         inst = cls._instance
         if inst is None or inst.active_ranks_cpu is None:
             return False
-        if inst.pending_ep_size is not None:
+        # warming_up: a grown cohort is slow until the joiner warms (see settle_warmup).
+        if inst.pending_ep_size is not None or inst.scale_phase == "warming_up":
             return True
-        # Committed, but a grown cohort cannot serve at full speed until the joiner has
-        # warmed; settle_warmup() closes this on the first forward or at the deadline.
-        if inst.scale_phase == "warming_up":
-            return True
-        active_count = int(inst.active_ranks_cpu[: inst.effective_ep_size].sum().item())
-        if active_count == inst.effective_ep_size:
-            return False
-        # No scale is pending, so the short mask is a post-scale rank fault. Recovery
-        # is a separate path, so this does not clear on its own and a caller polling
-        # this endpoint would otherwise wait on a state nothing is driving. Name the
-        # ranks once rather than leave it to be inferred from a poll that never ends.
-        global _fault_reported_ranks
         missing = cls.get_inactive_ranks()
+        if not missing:
+            return False
+        # Only a recover clears this, so a poller would wait forever: name the ranks.
+        global _fault_reported_ranks
         if missing != _fault_reported_ranks:
             _fault_reported_ranks = missing
             logger.warning(
                 "[Elastic EP] %d of %d ranks are inactive with no scale pending: %s. "
                 "This is a post-scale fault, not a scale in progress; is_scaling() "
                 "stays true until those ranks are recovered.",
-                inst.effective_ep_size - active_count,
+                len(missing),
                 inst.effective_ep_size,
                 list(missing),
             )
@@ -584,7 +517,10 @@ class ElasticEPStateManager:
 
 
 def elastic_expanded_world_enabled() -> bool:
-    """Whether execution uses post-launch ranks: launch-time TP groups exclude them."""
+    """Return whether execution uses ranks admitted after server launch.
+
+    Launch-time TP groups exclude ranks admitted during scale-up.
+    """
     inst = ElasticEPStateManager.instance()
     if inst is None:
         return False
@@ -601,43 +537,27 @@ def _refresh_ep_members() -> None:
         buffer.update_ep_member()
 
 
-# Shared across all three store barriers (NIXL retire, WORLD retire, scale_ready).
 _BARRIER_STORE_POLL_S = 0.05
 _BARRIER_EPOCH_CATCH_UP_S = 5.0
 _RETIRE_BARRIER_TIMEOUT_S = 300.0
 _BARRIER_RECHECK_S = 0.2
-
-# The store stands in for dist.barrier(WORLD): Mooncake's bitmap lags our active_ranks
-# flip while it digests retirees' link events.
+# Store, not dist.barrier(WORLD): Mooncake's bitmap lags our active_ranks flip.
+# ns -> (arrival counter key, cycle counter key, ready key format, log prefix)
 _BARRIER_NS: dict[str, tuple[str, str, str, str]] = {
-    # ns: (arrival counter key, cycle counter key, ready key format, log prefix)
-    "nixl": (
-        "sglang_nixl_retire_arrival_counter",
-        "sglang_nixl_retire_cycle_counter",
-        "sglang_nixl_retire_barrier_e{}_posted",
-        "[Elastic EP][retire]",
-    ),
-    "world": (
-        "sglang_retire_barrier_arrival_counter",
-        "sglang_retire_barrier_cycle_counter",
-        "sglang_retire_barrier_e{}_posted",
-        "[Elastic EP][retire_barrier]",
-    ),
-    "scale_ready": (
-        "sglang_scale_ready_arrival_counter",
-        "sglang_scale_ready_cycle_counter",
-        "sglang_scale_ready_e{}_posted",
-        "[Elastic EP][scale_ready]",
-    ),
-    "nixl_wired": (
-        "sglang_nixl_wired_arrival_counter",
-        "sglang_nixl_wired_cycle_counter",
-        "sglang_nixl_wired_e{}_posted",
-        "[Elastic EP][nixl_wired]",
-    ),
+    ns: (
+        f"sglang_{stem}_arrival_counter",
+        f"sglang_{stem}_cycle_counter",
+        f"sglang_{ready}_e{{}}_posted",
+        f"[Elastic EP][{tag}]",
+    )
+    for ns, stem, ready, tag in (
+        ("nixl", "nixl_retire", "nixl_retire_barrier", "retire"),
+        ("world", "retire_barrier", "retire_barrier", "retire_barrier"),
+        ("scale_ready", "scale_ready", "scale_ready", "scale_ready"),
+        ("nixl_wired", "nixl_wired", "nixl_wired", "nixl_wired"),
+    )
 }
 _last_local_cycle_id: dict[str, int] = {ns: 0 for ns in _BARRIER_NS}
-
 _EXPERT_MAP_INBOX_KEY = "sglang_expert_map_to_r{}"
 
 
@@ -652,13 +572,9 @@ def clear_expert_map_inbox(group_rank: int) -> None:
 def share_expert_map_via_store(
     tensor: torch.Tensor, *, is_src: bool, cohort_ranks: Sequence[int], group_rank: int
 ) -> bool:
-    """Hand the expert map to the cohort over the store, one inbox per reader. False = no
-    store, caller falls back to the collective. Not a broadcast: Mooncake drives one through
-    putTaskCuda, which syncs the stream from inside the collective. An inbox, not a shared
-    round, since a round keyed on participant count desyncs when the width changes.
-
-    Addressed by rank id, not by position: a reader waits on the inbox named for its own
-    rank, and after a fault the live ids are no longer 0..n-1."""
+    """Hand the expert map over the store, one inbox per reader rank id (sparse after a
+    fault); False = no store. Not a broadcast (Mooncake's putTaskCuda syncs the stream)
+    nor a round keyed on participant count (desyncs when the width changes)."""
     store = _store_or_none("[Elastic EP][expert map]")
     if store is None or len(cohort_ranks) <= 1:
         return False
@@ -689,34 +605,26 @@ def sync_random_seed_via_store(is_source: bool) -> None:
     store = _store_or_none("[Elastic EP] random_seed sync:")
     if store is None:
         return
-
     if is_source:
         try:
-            # get_device(), not server_args: the raw field is None until the device
-            # namespace resolves it, so int() raised and no key was ever written.
+            # get_device(): server_args.random_seed is None until the device sets it.
             store.set(key, str(int(get_device().random_seed)))
         except Exception as exc:
             logger.warning("[Elastic EP] random_seed source write failed (%s)", exc)
         return
-
     try:
         store.wait([key], datetime.timedelta(seconds=30))
         set_random_seed(_store_int(store, key))
     except Exception as exc:
         logger.warning(
-            "[Elastic EP] random_seed sync failed (%s); keeping boot-time value",
-            exc,
+            "[Elastic EP] random_seed sync failed (%s); keeping boot-time value", exc
         )
 
 
-def _assert_shrink_runtime_supported() -> None:
-    """The invariants the FSM itself needs, re-checked at shrink-request time.
-
-    A no-op for a deployment that opted into scaling: parallel_hook asserts each of
-    these at launch, but only when ``--max-ep-size > tp_size``. The point is the
-    fault-tolerance deployment that never sets it, whose shrink would otherwise be
-    accepted while skipping every one of them.
-    """
+def assert_shrink_supported() -> None:
+    """Fail a shrink this deployment cannot serve. Checked per request, not at init, so
+    fault-tolerance-only deployments boot; parallel_hook asserts these only when
+    --max-ep-size > tp_size."""
     from sglang.srt.runtime_context import get_disagg, get_serving
 
     parallel = get_parallel()
@@ -742,52 +650,27 @@ def _assert_shrink_runtime_supported() -> None:
             f"handed work (got {parallel.load_balance_method})",
         ),
         (
-            # attn_dp_enabled, not enable_dp_attention: the latter is the deprecated
-            # spelling, and parallel_hook consumes it into attn_dp_size and leaves it
-            # False, so reading it rejects every deployment that passed it.
+            # Not enable_dp_attention: parallel_hook consumes it and leaves it False.
             parallel.attn_dp_enabled,
             "--attn-dp-size > 1: the shrink retires EP ranks as DP slots",
+        ),
+        (
+            # Not dp_size vs tp_size: at runtime tp_size is per-worker attention TP.
+            parallel.attn_tp_size == 1,
+            "attn_tp_size == 1 (got "
+            f"attn_tp_size={parallel.attn_tp_size}): the shrink reports retired EP "
+            "ranks as DP slots. Retiring whole logical replicas is not implemented yet",
+        ),
+        (
+            # The launch hook's "scalable" predicate.
+            parallel.max_ep_size is not None,
+            "--max-ep-size. Without it this deployment "
+            "was launched as fault-tolerance only, and the launch checks were relaxed "
+            "on the understanding that it never retires a rank",
         ),
     ):
         if not ok:
             raise RuntimeError(f"Elastic EP scale-down requires {requirement}.")
-
-
-def assert_shrink_supported() -> None:
-    """Fail a shrink request this deployment cannot serve.
-
-    Checked here rather than at init: a fault-tolerance-only deployment never retires a
-    rank, so requiring this at startup would stop an existing one from booting on a
-    mooncake that is perfectly adequate for what it does. A planned shrink without it
-    reads as a link fault (~10s/peer)."""
-    _assert_shrink_runtime_supported()
-    parallel = get_parallel()
-    # The shrink reports retirees as DP slots: ElasticScaleUpdateReq.slot_offset /
-    # slot_count, retired_ranks / safe_to_terminate_ranks and remove_elastic_workers
-    # all index workers by EP rank. That identity holds only while one DP slot is one
-    # EP rank. Once DP moves to logical-replica units (attn_tp_size > 1, #33728) a
-    # shrink has to retire whole replicas and those ranges need converting, so refuse
-    # here rather than deactivate the wrong workers.
-    # attn_tp_size, not dp_size vs tp_size: at runtime tp_size is the per-worker
-    # attention TP width, so comparing the two rejects working shapes. One rank per
-    # attention DP group is what makes an EP rank a DP slot.
-    if parallel.attn_tp_size != 1:
-        raise RuntimeError(
-            "Elastic EP scale-down requires attn_tp_size == 1 (got "
-            f"attn_tp_size={parallel.attn_tp_size}): the shrink reports retired EP "
-            "ranks as DP slots. Retiring whole logical replicas is not implemented yet."
-        )
-    # The same predicate the launch hook calls scalable, so the two halves agree.
-    # Without it the hook relaxes three checks on the grounds that the deployment never
-    # retires a rank: --enable-symm-mem and SGLANG_SYNC_TOKEN_IDS_ACROSS_TP tolerated
-    # with a warning, and the shm broadcaster kept. Admitting a shrink anyway runs it
-    # on the path this PR's own launch-time error calls bypassing active_ranks.
-    if parallel.max_ep_size is None:
-        raise RuntimeError(
-            "Elastic EP scale-down requires --max-ep-size. Without it this deployment "
-            "was launched as fault-tolerance only, and the launch checks were relaxed "
-            "on the understanding that it never retires a rank."
-        )
     if get_exec().moe.elastic_ep_backend != "mooncake":
         return
     try:
@@ -799,35 +682,24 @@ def assert_shrink_supported() -> None:
         ) from exc
 
 
-def live_cohort_ranks() -> Tuple[int, ...]:
-    """The live ranks themselves, for anything that addresses a peer rather than counts
-    them.
-
-    A shrink retires the top slots, so there the live ranks are 0..n-1 and the count
-    doubles as the id range. A fault clears any bit, so after one the two part ways: at
-    width 6 with rank 4 down the count is 5 while the ids are 0,1,2,3,5. Addressing
-    ``range(count)`` there writes to the rank that just died and skips a live one."""
+def live_cohort_ranks() -> tuple[int, ...]:
+    """Live rank ids: a fault can clear any mask bit, not just the top slots."""
     inst = ElasticEPStateManager.instance()
     if inst is None or inst.active_ranks_cpu is None or not inst.effective_ep_size:
         if torch.distributed.is_initialized():
             return tuple(range(torch.distributed.get_world_size()))
         return (0,)
-    return tuple(
-        i for i in range(inst.effective_ep_size) if int(inst.active_ranks_cpu[i])
-    )
+    mask = inst.active_ranks_cpu
+    return tuple(i for i in range(inst.effective_ep_size) if int(mask[i]))
 
 
 def live_cohort_size() -> int:
-    """Live rank count, for scoping collectives that WORLD would run past retirees.
-
-    ``effective_ep_size`` follows the commit, so this is the post-scale width once a
-    shrink lands; WORLD still counts the ranks that have since called sys.exit()."""
+    """Live rank count; WORLD still counts retirees that have exited."""
     return len(live_cohort_ranks())
 
 
 def seed_barrier_epochs() -> None:
-    """Adopt the cohort's cycle ids; call on a joiner once admitted. A follower takes the
-    first id above its last, and a process new to a namespace has no floor, so it would
+    """Adopt the cohort's cycle ids on an admitted joiner, which with no floor would
     accept a closed round and cross alone. ``add(key, 0)`` reads without minting."""
     store = _store_or_none("[Elastic EP][barrier seed]")
     if store is None:
@@ -840,7 +712,7 @@ def seed_barrier_epochs() -> None:
 
 
 class _BarrierSkip:
-    """No barrier needed. Distinct from None (post failed), which must not flip masks."""
+    """No barrier needed; unlike None (post failed), which must not flip masks."""
 
 
 BARRIER_SKIP = _BarrierSkip()
@@ -852,7 +724,6 @@ def _store_int(store, key: str) -> int:
 
 
 def _store_or_none(what: Optional[str] = None):
-    """Global TCPStore or None. ``what`` = warning prefix."""
     store = get_global_tcp_store()
     if store is None and what:
         logger.warning("%s no TCPStore", what)
@@ -860,12 +731,11 @@ def _store_or_none(what: Optional[str] = None):
 
 
 def _barrier_target_from_effective_ep() -> int:
-    """Retire barrier target = pre-shrink effective_ep_size (chained shrinks 4->3->2)."""
+    """Retire barrier target: the pre-shrink effective_ep_size (chained 4->3->2)."""
     return ElasticEPStateManager.instance().effective_ep_size
 
 
 def _post_retire_barrier(ns: str) -> _BarrierHandle:
-    """Post a retire barrier in ``ns``. None = post failed, caller must retry."""
     rank = torch.distributed.get_rank()
     store = _store_or_none(f"{_BARRIER_NS[ns][3]} rank={rank}")
     if store is None:
@@ -876,8 +746,8 @@ def _post_retire_barrier(ns: str) -> _BarrierHandle:
 
 @dataclass
 class _StoreBarrier:
-    """One in-flight store barrier. The epoch is elected, not computed: arrival 1 mints
-    the next cycle id and later arrivals read it, so chained scales cannot share a key."""
+    """One in-flight store barrier. Its epoch is elected: arrival 1 mints the next cycle
+    id and later arrivals read it, so chained scales cannot share a key."""
 
     ns: str
     rank: int
@@ -897,8 +767,8 @@ class _StoreBarrier:
     def post(
         cls, store, rank: int, ns: str, target: int, *, rewind_on_fail: bool = False
     ) -> Optional[_StoreBarrier]:
-        """Elect an epoch, then announce this rank on its ready key. ``rewind_on_fail``
-        frees the leader's epoch on a failed announce (a sync driver must not reuse one)."""
+        """Elect an epoch, then announce on its ready key. ``rewind_on_fail`` frees a
+        leader's epoch on a failed announce (a sync driver must not reuse one)."""
         epoch, arrival = cls._elect_epoch(store, rank, ns)
         if epoch is None:
             return None
@@ -923,16 +793,14 @@ class _StoreBarrier:
         return cls(ns, rank, epoch, target, ready_key, arrival, time.monotonic())
 
     def check(self, store, secs: float) -> tuple[bool, int]:
-        """Poll ready key to target or ``secs`` -> (reached, count); secs=0 probes once."""
+        """Poll until target or ``secs`` (0 = one probe); returns (reached, count)."""
         deadline = time.monotonic() + secs
         seen = 0
         while True:
-            try:
+            with contextlib.suppress(Exception):
                 seen = _store_int(store, self.ready_key)
                 if seen >= self.world_size:
                     return True, seen
-            except Exception:
-                pass
             if time.monotonic() >= deadline:
                 return False, seen
             time.sleep(_BARRIER_STORE_POLL_S)
@@ -1005,21 +873,17 @@ def retire_barrier_check(
     keep_serving: bool = False,
 ) -> bool:
     """Non-blocking probe: True when every cohort rank posted. TimeoutError at 300s.
-    ``block_s`` waits in place rather than across ticks, for a caller that must not
-    re-enter an event loop whose peers may have left the collectives it posts.
-    ``keep_serving`` drops the catch-up window, for the one caller whose peers are all
-    still serving: waiting in place there stalls decode for the whole window."""
+    ``block_s`` waits in place, for a caller that must not re-enter the event loop.
+    ``keep_serving`` skips the catch-up window, which would stall a serving cohort."""
     if isinstance(state, _BarrierSkip):
         return True
     if state is None:
         return False  # post failed: fail closed so the FSM re-posts
-
     store = _store_or_none()
     seen = "no store"
     if store is not None:
         now = time.monotonic()
-        # Catch up on the same-tick fold, then poll without blocking. Sleeping 200ms per
-        # re-tick is free when idle but costs a draining rank 7x decode.
+        # One catch-up window, then non-blocking polls: sleeping per tick slows decode.
         if block_s is not None:
             window = block_s
         elif state.first_check and not keep_serving:
@@ -1046,14 +910,12 @@ def retire_barrier_check(
 
 def retire_barrier_consume(state: _BarrierHandle) -> None:
     """Finalize the barrier; only the leader resets ARRIVAL_KEY."""
-    if state is None or isinstance(state, _BarrierSkip):
-        return
-    state.consume()
+    if isinstance(state, _StoreBarrier):
+        state.consume()
 
 
 def _pre_nixl_retire(retiree_global_ranks: List[int]) -> None:
-    """Survivor-side NIXL peer disconnect before the retire barrier. Survivor-only: the
-    FSM routes a retiree to on_retiree_quiesce instead."""
+    """Survivor-only NIXL peer disconnect before the retire barrier."""
     from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
 
     if NixlEPBuffer._state().buffer is None or not torch.distributed.is_initialized():
@@ -1062,10 +924,8 @@ def _pre_nixl_retire(retiree_global_ranks: List[int]) -> None:
 
 
 def nixl_retire_barrier_post() -> _BarrierHandle:
-    """Post async NIXL retire barrier over the global TCPStore (elected-leader epoch).
-    BARRIER_SKIP = nothing to synchronize; None = post failed, caller must retry."""
-    # Keyed off the backend, not off this rank's buffer, which is lazy on first dispatch:
-    # skipping is a cohort decision, and one rank opting out crosses without arriving.
+    """The NIXL retire barrier; same handle contract as ``retire_barrier_post``."""
+    # Keyed off the backend, not the lazily built buffer: skipping must be cohort-wide.
     if (
         not torch.distributed.is_initialized()
         or get_exec().moe.moe_a2a_backend != "nixl"
@@ -1126,13 +986,8 @@ def _is_mooncake_inactive_transient(exc: BaseException) -> bool:
 
 
 def mooncake_all_reduce_strict(tensor, *, op, group) -> None:
-    """One all_reduce, no retry.
-
-    A single rank must not retry a collective its peers already completed: the retry
-    waits on members that moved on and they on it, deadlocking the cohort silently.
-    ``mooncake_world_settle_probe`` converges the bitmap before the hot path, so a
-    transient here means it did not; failing loudly is by design.
-    """
+    """One all_reduce, no retry: a rank retrying a collective its peers completed
+    deadlocks the cohort, and ``mooncake_world_settle_probe`` already converged."""
     try:
         torch.distributed.all_reduce(tensor, op=op, group=group)
     except RuntimeError as exc:
@@ -1145,25 +1000,15 @@ def mooncake_all_reduce_strict(tensor, *, op, group) -> None:
         ) from exc
 
 
-# Bounded well under --watchdog-timeout, so a view that never settles still fails loudly
-# instead of parking the cohort until the watchdog fires.
+# Well under --watchdog-timeout, so a view that never settles fails loudly before it.
 _GATHER_SETTLE_BUDGET_S = 20.0
 _GATHER_SETTLE_POLL_S = 0.05
 
 
 def mooncake_all_gather_settling(output, input_, *, group, gather) -> None:
-    """One mlp_sync gather, retried only while Mooncake refuses it as inactive.
-
-    The opposite call from ``mooncake_all_reduce_strict``, for a reason that does not
-    reach here. That one runs after ``mooncake_world_settle_probe`` converged the bitmap,
-    so a refusal means convergence failed and waiting cannot help. A bare fault has no
-    probe ahead of it: the coordinator drops the peer on its own schedule and the first
-    gather after it can land while the membership change is still being digested. The
-    refusal is a precondition check raised before the collective is posted, so no peer
-    can have completed a gather this rank never sent, and waiting only makes it arrive
-    late rather than not at all. ``gather`` is the all-gather to post, with
-    ``all_gather_single``'s signature.
-    """
+    """One mlp_sync gather, retried only while Mooncake refuses it as inactive (a bare
+    fault has no settle probe). Safe: the refusal precedes posting, so no peer completed
+    a gather this rank never sent. ``gather`` has ``all_gather_single``'s signature."""
     deadline = time.monotonic() + _GATHER_SETTLE_BUDGET_S
     waited_from = None
     while True:
@@ -1194,50 +1039,34 @@ def mooncake_all_gather_settling(output, input_, *, group, gather) -> None:
             time.sleep(_GATHER_SETTLE_POLL_S)
 
 
-# Sleep before round i, in seconds; sums to ~15s. Every rank must run the same
-# number of rounds, so no wall-clock bound: two ranks reading a deadline from
-# either side would leave one voting alone.
+# Sleep before round i (~15s total). No wall-clock bound: every rank must run the same
+# number of rounds; ranks reading a deadline either side would leave one voting alone.
 _SETTLE_BACKOFF_S = (0.0, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 2.0, 2.0, 2.0, 2.0, 2.0)
 
 
-def mooncake_world_settle_probe(
-    *, cohort_size: int, vote_timeout_s: float = 30.0
-) -> None:
-    """Converge Mooncake's bitmap off the hot path, in lockstep across the cohort.
-
-    The retry decision is voted over the store (see ``_SETTLE_BACKOFF_S``), so ranks
-    whose own attempt succeeded re-attempt with the rest; the probe tensor is a
-    throwaway. Warn-only on give-up: aborting strands ``effective_ep_size``, and a
-    cohort that truly cannot converge fails loudly on the next hot-path tick.
-    """
+def mooncake_world_settle_probe(*, cohort_size: int) -> None:
+    """Converge Mooncake's bitmap off the hot path; retries are store-voted, so ranks
+    that succeeded re-attempt with the rest. Warn-only: aborting strands the width, and
+    a cohort that cannot converge fails loudly on the next hot-path tick."""
     if not torch.distributed.is_initialized():
         return
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     last = None
-    for attempt, backoff_s in enumerate(_SETTLE_BACKOFF_S):
+    for backoff_s in _SETTLE_BACKOFF_S:
         if backoff_s:
             time.sleep(backoff_s)
         probe = torch.zeros(1, dtype=torch.int64, device=device)
         ok = True
         try:
-            torch.distributed.all_reduce(
-                probe,
-                op=torch.distributed.ReduceOp.SUM,
-                group=None,  # WORLD
-            )
+            torch.distributed.all_reduce(probe, op=torch.distributed.ReduceOp.SUM)
         except RuntimeError as exc:
             if not _is_mooncake_inactive_transient(exc):
                 raise
             ok, last = False, exc
-
-        # A vote timeout means a peer stopped voting, which we cannot fix by
-        # voting harder; treat it as non-convergence and let the hot path speak.
+        # A vote timeout means a peer stopped voting: treat it as non-convergence.
         try:
             if cohort_vote_via_store(
-                ok,
-                cohort_size,
-                tag="mooncake_settle",
-                timeout_s=vote_timeout_s,
+                ok, cohort_size, tag="mooncake_settle", timeout_s=30.0
             ):
                 return
         except RuntimeError as exc:
@@ -1252,25 +1081,20 @@ def mooncake_world_settle_probe(
 
 
 def scale_ready_barrier_via_store(target_size: int, *, timeout_s: float = 60.0) -> None:
-    """Post-scale WORLD sync via TCPStore, Mooncake-free. ``target_size`` = live ranks."""
+    """Mooncake-free post-scale WORLD sync over the store; target_size = live ranks."""
     if not torch.distributed.is_initialized():
         return
-
     rank = torch.distributed.get_rank()
     store = _store_or_none(f"[Elastic EP][scale_ready] rank={rank}")
     if store is None:
         return
-
     state = _StoreBarrier.post(store, rank, "scale_ready", target_size)
     if state is None:
-        # Fail closed, as the retire barriers do: a rank that skips this barrier runs
-        # on past it while its peers are still counting, which is the desync the
-        # barrier exists to prevent.
+        # Fail closed: a rank skipping this runs on while its peers are still counting.
         raise RuntimeError(
             f"[Elastic EP][scale_ready] rank={rank} failed to arm the barrier "
             f"(target={target_size})"
         )
-
     reached, count = state.check(store, timeout_s)
     # Consume before raising: a timed-out leader still owes ARRIVAL, else a 2nd leader.
     state.consume()
@@ -1282,31 +1106,15 @@ def scale_ready_barrier_via_store(target_size: int, *, timeout_s: float = 60.0) 
 
 
 def nixl_wired_barrier_via_store(cohort_size: int, *, timeout_s: float = 30.0) -> None:
-    """Hold a rank that has just wired itself to a width until its peers have too.
-
-    ``connect_ranks`` is not a rendezvous. A rank returns from it once its own side is
-    set up, so the first one out posts a dispatch at the new width to peers still
-    inside theirs, and times out once per expert per peer. At server start rank 0 came
-    out of connect in 1.010s against 1.24s for ranks 1 to 3, and was the only rank to
-    report: 22 timeouts against each of the three. A grow skews wider still, because
-    the joiner has several GiB of transport buffers to register before it even begins
-    connecting, and it lands in the post-scale graph capture, where the timeout is
-    captured along with everything else.
-
-    Warn-only, unlike the scale barriers, which raise. This runs inside a forward and
-    under decode graph capture, where raising is fatal, and giving up here only leaves
-    the skew that was there before. The wait is bounded well under the scale barriers'
-    minute for the same reason: the leg being waited on is the joiner registering its
-    buffers, measured at about 3s, so a wait that reaches the deadline is one that was
-    never going to be met.
-    """
+    """Hold a rank that has just wired itself to a width until its peers have too, as
+    ``connect_ranks`` is no rendezvous. Warn-only and short: this runs inside a forward
+    and under graph capture, where raising is fatal."""
     if cohort_size <= 1 or not torch.distributed.is_initialized():
         return
     rank = torch.distributed.get_rank()
     store = _store_or_none(f"[Elastic EP][nixl_wired] rank={rank}")
     if store is None:
         return
-
     state = _StoreBarrier.post(store, rank, "nixl_wired", cohort_size)
     if state is None:
         logger.warning(
@@ -1316,10 +1124,8 @@ def nixl_wired_barrier_via_store(cohort_size: int, *, timeout_s: float = 30.0) -
             cohort_size,
         )
         return
-
     reached, count = state.check(store, timeout_s)
-    # Consume before returning: a timed-out leader still owes ARRIVAL, else a
-    # second leader.
+    # Consume before returning: a timed-out leader still owes ARRIVAL.
     state.consume()
     if not reached:
         logger.warning(
@@ -1337,11 +1143,7 @@ _HEARTBEAT_KEY = "sglang_elastic_heartbeat_r{}"
 
 
 def beat_heartbeat() -> None:
-    """Publish one liveness tick for this rank.
-
-    ``add`` creates the key at the increment when it is absent, so there is nothing to
-    seed and a read never blocks on a rank that has not started.
-    """
+    """Publish one liveness tick for this rank."""
     if not torch.distributed.is_initialized():
         return
     store = _store_or_none()
@@ -1364,8 +1166,7 @@ def read_heartbeats(ranks: Sequence[int]) -> dict:
     ticks = {}
     for rank in ranks:
         try:
-            # add(key, 0) reads and creates at zero, so an absent rank reads as zero
-            # instead of blocking the way get does.
+            # add(key, 0), not get: an absent key reads as zero instead of blocking.
             ticks[rank] = int(store.add(_HEARTBEAT_KEY.format(rank), 0))
         except Exception:
             logger.debug(
@@ -1377,23 +1178,20 @@ def read_heartbeats(ranks: Sequence[int]) -> dict:
 def cohort_vote_via_store(
     ok: bool, cohort_size: int, *, tag: str, timeout_s: float = 60.0
 ) -> bool:
-    """Unanimous go/no-go over the TCPStore. Not a device all_reduce(MIN): a departed
-    slot reduces in as a zero, so the fastest rank reads a "no" nobody voted while the
-    rest block forever. Keyed per width, else consecutive shrinks split a round."""
+    """Unanimous go/no-go over the store; a device all_reduce(MIN) would read a departed
+    slot as a "no". Keyed per width, else consecutive shrinks split a round."""
     if cohort_size <= 1:
         return ok
     store = _store_or_none(f"[Elastic EP][vote] {tag}")
     if store is None:
         return ok
-
     ns = f"sglang_cohort_vote_{tag}_n{cohort_size}"
     seq_key, cast_key = f"{ns}_seq", f"{ns}_cast"
     rnd = (int(store.add(seq_key, 1)) - 1) // cohort_size
     yes_key = f"{ns}_r{rnd}_yes"
-    # Tally before announcing, or the last arrival reads a tally a peer has yet to add to.
+    # Tally before announcing, else the last arrival may read a tally missing a peer.
     store.add(yes_key, 1 if ok else 0)
     store.add(cast_key, 1)
-
     target = (rnd + 1) * cohort_size
     deadline = time.monotonic() + timeout_s
     while (cast := _store_int(store, cast_key)) < target:
@@ -1424,22 +1222,13 @@ def _wait_for_peer_state(backend, ranks: List[int], *, budget_s: float = 60.0) -
 
 
 def _recover_parallel_groups(global_ranks: List[int]) -> bool:
-    """Readmit ``global_ranks`` to every live parallel group's Mooncake PGs.
-
-    Bare-fault recovery only. A departure is announced in all of these groups via
-    ``_mooncake_membership_targets``, and Mooncake sizes each group's collectives from
-    its own per-group bitmap, so any group left unrecovered mis-sizes the first
-    collective posted over it. ``mlp_sync`` runs over ``tp_group``, which makes that the
-    first one to hit.
-    """
+    """Readmit ``global_ranks`` to every live parallel group's Mooncake PGs (bare fault
+    only): Mooncake sizes each group's collectives from its own bitmap."""
     from mooncake.pg import recover_ranks
 
     world_backend = torch.distributed.group.WORLD
     for group in _iter_live_parallel_groups():
-        # _WORLD is in the same registry, and _try_recover_world already took its PGs.
-        # The width skip matches the rejoining side, which has nothing to join in a
-        # group of one. Readmitting where it does not join is the mismatch this whole
-        # function exists to avoid.
+        # _try_recover_world took _WORLD's PGs; the joiner joins no group of one.
         if group is parallel_state._WORLD or group.world_size <= 1:
             continue
         local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
@@ -1460,10 +1249,8 @@ def _recover_parallel_groups(global_ranks: List[int]) -> bool:
     return True
 
 
-def _try_recover_world(
-    global_ranks: List[int], *, include_subgroups: bool = False
-) -> bool:
-    """Recover WORLD-scope Mooncake peers. include_subgroups also recovers _WORLD sub-PGs
+def _try_recover_world(global_ranks: List[int], include_subgroups: bool) -> bool:
+    """Recover WORLD-scope Mooncake peers, plus _WORLD sub-PGs if include_subgroups
     (recover-mode only; scale-up-v1 must pass False to avoid sub-PG ID mismatch)."""
     from mooncake.pg import get_peer_state, recover_ranks
 
@@ -1473,32 +1260,44 @@ def _try_recover_world(
 
     recover_ranks(world_backend, global_ranks)
     logger.debug("[Elastic EP][recover] WORLD recover_ranks(%s) done", global_ranks)
-
-    if not include_subgroups:
-        return True
-
-    _WORLD_RECOVER_WAIT_TIMEOUT_S = 60.0
     world_group = parallel_state._WORLD
-    if world_group is not None:
-        for pg in (world_group.device_group, world_group.cpu_group):
-            if pg is None or pg is world_backend:
-                continue
-            # Do not gate on get_peer_state: the joiner blocks in join_group (deadlock).
-            deadline = time.monotonic() + _WORLD_RECOVER_WAIT_TIMEOUT_S
-            while True:
-                try:
-                    recover_ranks(pg, global_ranks)
-                    break
-                except Exception as exc:
-                    if time.monotonic() > deadline:
-                        logger.warning(
-                            "[Elastic EP][recover] admit %s to sub-PG failed: %s",
-                            global_ranks,
-                            exc,
-                        )
-                        return False
-                    time.sleep(_PEER_STATE_POLL_INTERVAL_SEC)
+    if not include_subgroups or world_group is None:
+        return True
+    for pg in (world_group.device_group, world_group.cpu_group):
+        if pg is None or pg is world_backend:
+            continue
+        # Do not gate on get_peer_state: the joiner blocks in join_group (deadlock).
+        deadline = time.monotonic() + 60.0
+        while True:
+            try:
+                recover_ranks(pg, global_ranks)
+                break
+            except Exception as exc:
+                if time.monotonic() > deadline:
+                    logger.warning(
+                        "[Elastic EP][recover] admit %s to sub-PG failed: %s",
+                        global_ranks,
+                        exc,
+                    )
+                    return False
+                time.sleep(_PEER_STATE_POLL_INTERVAL_SEC)
     return True
+
+
+def try_admit_scale_ranks(global_ranks: List[int]) -> bool:
+    """Admit append-only ranks into the expandable WORLD group."""
+    return _activate(global_ranks, include_subgroups=False)
+
+
+def try_recover_ranks(global_ranks: List[int]) -> bool:
+    """Recover ranks in WORLD + sub-PGs. Scale regrow into a retired slot."""
+    return _activate(global_ranks, include_subgroups=True)
+
+
+def try_recover_faulted_ranks(global_ranks: List[int]) -> bool:
+    """Bare-fault recovery: WORLD, its sub-PGs, and every live parallel group. Not for
+    scale joiners: ``joinGroup`` admits only an isolated or inactive rank."""
+    return _activate(global_ranks, include_subgroups=True, include_parallel_groups=True)
 
 
 def _activate(
@@ -1509,9 +1308,8 @@ def _activate(
 ) -> bool:
     if not _try_recover_world(global_ranks, include_subgroups=include_subgroups):
         return False
-    # Ahead of the flip and _refresh_ep_members below: the Mooncake buffer refresh
-    # all-gathers a cohort-wide list into the moe_ep group, which Mooncake still sizes
-    # from its own bitmap until recover_ranks lands there.
+    # Before _refresh_ep_members: its all-gather into moe_ep is sized from that group's
+    # Mooncake bitmap, which only recover_ranks there updates.
     if include_parallel_groups and not _recover_parallel_groups(global_ranks):
         return False
     inst = ElasticEPStateManager.instance()
@@ -1519,33 +1317,12 @@ def _activate(
         inst.activate_ranks(global_ranks)
     for group in _iter_live_parallel_groups():
         _flip_active_rank_mask(global_ranks, 1, group)
-        # Only where a rank came back: rebuilding elsewhere drops a live queue's shm
-        # segment and adds an untimed blocking collective to the scale path.
+        # Only where a rank came back: a rebuild drops a live queue's shm and blocks.
         if _map_global_to_group_local_ranks(group.ranks, global_ranks):
             _maybe_create_message_queue(group)
     _flip_active_rank_mask(global_ranks, 1)
     _refresh_ep_members()
     return True
-
-
-def try_admit_scale_ranks(global_ranks: List[int]) -> bool:
-    """Scale-up-v1 append (no sub-PG join)."""
-    return _activate(global_ranks, include_subgroups=False)
-
-
-def try_recover_ranks(global_ranks: List[int]) -> bool:
-    """Recover ranks in WORLD + sub-PGs. Scale regrow into a retired slot."""
-    return _activate(global_ranks, include_subgroups=True)
-
-
-def try_recover_faulted_ranks(global_ranks: List[int]) -> bool:
-    """Bare-fault recovery: WORLD, its sub-PGs, and every live parallel group.
-
-    Wider than the scale regrow above, to match how wide the departure was. A scale
-    joiner must not come through here: it is inactive rather than faulted, and
-    ``joinGroup`` admits only an isolated or inactive rank.
-    """
-    return _activate(global_ranks, include_subgroups=True, include_parallel_groups=True)
 
 
 def _join_world_group(
@@ -1560,26 +1337,23 @@ def _join_world_group(
     world_group = parallel_state._WORLD
     if world_group is not None:
         for pg in (world_group.device_group, world_group.cpu_group):
-            if pg is None or pg is world_backend:
-                continue
-            join_group(pg)
+            if pg is not None and pg is not world_backend:
+                join_group(pg)
     if not include_parallel_groups:
         return
-    # Exactly the groups a survivor readmits us to in _recover_parallel_groups. A rank
-    # has to join the same set its peers readmit, or the next collective mis-sizes.
+    # Must match _recover_parallel_groups' readmits, or the next collective mis-sizes.
     for group in _iter_live_parallel_groups():
         if group is world_group or group.world_size <= 1:
             continue
         for pg in (group.device_group, group.cpu_group):
-            if pg is None or pg is world_backend:
-                continue
-            join_group(pg)
+            if pg is not None and pg is not world_backend:
+                join_group(pg)
         _maybe_create_message_queue(group)
 
 
 def join_scale_process_group() -> None:
-    """Scale-up-v1 append join (no sub-PG join)."""
-    _join_world_group(include_subgroups=False)
+    """Join the expandable WORLD group for an append-only scale operation."""
+    _join_world_group()
     _refresh_ep_members()
 
 
@@ -1617,33 +1391,16 @@ def get_healthy_expert_location_src_rank(
 
 def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
     elastic_ep_state = ElasticEPStateManager.instance()
-    if elastic_ep_state is None:
+    # Not mid-resize: is_active_equal_last's sync can hang on a departing/arriving peer.
+    if elastic_ep_state is None or ElasticEPStateManager.is_scale_pending():
         return False
-    # Not while the width is moving. is_active_equal_last compares two device tensors,
-    # so it forces a stream sync at the tail of every forward, and mid resize that sync
-    # can land on a collective that a departing or arriving peer will never post. What
-    # the cohort sees then is a scheduler watchdog timeout, not a slow tick. Until
-    # commit the mask is the scale path's to maintain and a fault rebalance on top of it
-    # would be fighting the finalize anyway. The comparison resumes on the first forward
-    # after commit, so a real fault is deferred by one resize rather than missed.
-    if ElasticEPStateManager.is_scale_pending():
-        return False
-    # Poll here rather than from inside the combine. This runs once per forward on the
-    # host, after the model returns, so it is reached on a replayed decode graph too --
-    # a counter stepped inside the combine is not, because the replay never runs the
-    # python around it. It rate limits itself on wall clock, so every rank looks at the
-    # same evidence at the same time however much of the routing each one carries.
+    # Polled on the host, not inside the combine, so replayed decode graphs reach it.
     ElasticEPStateManager.poll_faults()
     if elastic_ep_state.is_active_equal_last():
         return False
     elastic_ep_state.snapshot_active_to_last()
     elastic_ep_state.sync_active_to_cpu()
-    # Snapshot first, then stand down: a rank whose own bit the cohort cleared is not in
-    # the cohort any more, so every rendezvous below is addressed to the ranks that are.
-    # It waits to be recovered instead. Taking part would be a peer the others never
-    # expect, and the expert map it blocks on is one nobody sends. Reachable because the
-    # combine timeout that clears a bit is a liveness guess: a rank that merely stalled
-    # for a forward is still running to see the verdict land on itself.
+    # Snapshot, then stand down if a stall cleared our own bit: the rendezvous skips us.
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() not in live_cohort_ranks():
             logger.warning(
@@ -1662,8 +1419,7 @@ def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
 
 
 def _flip_active_rank_mask(global_ranks: List[int], value: int, group=None) -> None:
-    """Flip mask bits for ``global_ranks``. ``group=None`` targets the WORLD backend,
-    which carries no CPU mirror of the mask."""
+    """``group=None`` targets the WORLD backend, which has no CPU mirror of the mask."""
     if group is None:
         ranks = parallel_state.get_world_backend_ranks()
         active = parallel_state.get_world_backend_active_ranks()
@@ -1699,18 +1455,16 @@ def _mooncake_membership_targets(global_ranks: List[int]) -> List[tuple]:
     return targets
 
 
-# 60s, not 15s: a retiree that drained a request up to the barrier still holds queued GPU
-# work and RDMA slots, so it departs later than the idle case 15s was sized on.
+# 60s: a retiree that drained up to the barrier still holds GPU work and RDMA slots.
 def await_retirees_departed(global_ranks: List[int], *, budget_s: float = 60.0) -> None:
     """Hold the first post-flip device collective until Mooncake drops the retirees: our
     flip is local, so one posted first still expects them and the spin-wait kernel pegs
-    the GPU. Must be ``get_peer_state``; ``get_active_ranks`` reads back our own flip."""
+    the GPU. Must be get_peer_state: get_active_ranks reads back our own flip."""
     if not global_ranks or not torch.distributed.is_initialized():
         return
     targets = _mooncake_membership_targets(global_ranks)
     if not targets:
         return
-
     from mooncake.pg import get_peer_state
 
     deadline = time.monotonic() + budget_s
@@ -1725,8 +1479,7 @@ def await_retirees_departed(global_ranks: List[int], *, budget_s: float = 60.0) 
                 )
                 break
             if time.monotonic() >= deadline:
-                # Raise rather than post anyway: posting is the pegged GPU this exists to
-                # prevent, and a failed scale reconciles the width and keeps serving.
+                # Raise, not post: posting pegs the GPU; a failed scale keeps serving.
                 raise RuntimeError(
                     f"[Elastic EP][retire] {label} still holds {local} after "
                     f"{budget_s:.1f}s; refusing to post a collective it still expects"
@@ -1735,17 +1488,14 @@ def await_retirees_departed(global_ranks: List[int], *, budget_s: float = 60.0) 
 
 
 def _mooncake_deactivate_self() -> None:
-    """Announce our own departure, mirroring ``recover_ranks`` on grow: the flip alone
-    never reaches the coordinator, so a shrink reads as a link fault (~10s p2p timeout)
-    and ``joinGroup`` needs the slot inactive. Self-only, on the way out only."""
+    """Announce our own departure, as recover_ranks does on grow: unannounced, a shrink
+    reads as a link fault, and joinGroup needs the slot inactive. Self-only, on exit."""
     from mooncake.pg import deactivate_ranks
 
     if not torch.distributed.is_initialized():
         return
-
-    for label, pg, local in _mooncake_membership_targets(
-        [torch.distributed.get_rank()]
-    ):
+    rank = torch.distributed.get_rank()
+    for label, pg, local in _mooncake_membership_targets([rank]):
         try:
             # A Rejected proposal means a peer already carried the same deactivation.
             deactivate_ranks(pg, local)
@@ -1761,20 +1511,17 @@ def try_retire_ranks(global_ranks: List[int]) -> None:
     inst = ElasticEPStateManager.instance()
     if inst is not None:
         inst.deactivate_ranks(global_ranks)
-
     for group in _iter_live_parallel_groups():
         _flip_active_rank_mask(global_ranks, 0, group)
     _flip_active_rank_mask(global_ranks, 0)
     _refresh_ep_members()
 
 
-# Departure from DRAIN, not arrival: the barrier proves every rank reached it, not
-# that each acted, and folding one poll early blocks on peers still in the serving
-# loop's mlp_sync. Riding that mlp_sync is what makes every rank read it at once.
+# Departure is read off the mlp_sync gather, not the barrier: arrival proves a rank
+# reached DRAIN, not that it acted, and every rank reads the gather at once.
 _departure_announced_at: Optional[float] = None
 _departure_cleared = False
-# Backstop, not a schedule: expiry means the gather is not carrying the flag (degenerate
-# dp size, say), where a staggered exit beats a hang.
+# Backstop for a gather not carrying the flag, where a staggered exit beats a hang.
 _DEPARTURE_ALIGN_BUDGET_S = 30.0
 
 
@@ -1786,7 +1533,7 @@ def departure_announce() -> None:
 
 
 def departure_pending() -> bool:
-    """One element of the mlp_sync gather: True while this rank still holds the cohort."""
+    """Our mlp_sync gather element: True while this rank still holds the cohort."""
     return _departure_announced_at is None
 
 
@@ -1818,10 +1565,9 @@ def departure_reset() -> None:
 
 
 def retire_barrier_post() -> _BarrierHandle:
-    """Post the WORLD retire barrier over the store. BARRIER_SKIP = nothing to
-    synchronize; None = post failed, caller must retry. Not a collective: Mooncake orders
-    collective issue behind the previous one's completion, so a barrier outstanding across
-    ticks stalls the next mlp_sync and ranks not yet in DRAIN never arrive."""
+    """Post the WORLD retire barrier. BARRIER_SKIP = nothing to sync; None = post
+    failed, caller must retry. Over the store, not a collective: Mooncake issues each
+    behind the previous one's completion; one pending across ticks stalls mlp_sync."""
     if not torch.distributed.is_initialized():
         return BARRIER_SKIP
     return _post_retire_barrier("world")
@@ -1838,11 +1584,9 @@ def retiree_local_cleanup() -> None:
 
 
 def _destroy_local_process_groups() -> None:
-    """Tear down our backends here, not at interpreter exit: Mooncake's destructors would
-    run against an unloading CUDA driver, and an error escaping one takes down every
-    survivor via std::terminate. Subgroups first, WORLD last, failures never block."""
-    world = torch.distributed.group.WORLD
-    seen = {id(world)}
+    """Tear down our backends now, not at exit, where Mooncake's destructors would hit
+    an unloading CUDA driver and std::terminate all survivors. Subgroups first."""
+    seen = {id(torch.distributed.group.WORLD)}
     groups = []
     for group in _iter_live_parallel_groups():
         for pg in (group.device_group, group.cpu_group):

@@ -1367,9 +1367,8 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    # A recover joiner is excluded alongside a scale joiner: it also runs with one DP
-    # rank of its own and must keep the primary's dp_attention settings. Same breadth
-    # as attn_dp_enabled_of, which the dp_lm_head validation below reads.
+    # Joiners run one DP rank of their own but keep the primary's dp_attention settings;
+    # same breadth as attn_dp_enabled_of, which the dp_lm_head validation below reads.
     if num_dp_ranks_of(view) == 1 and not ep_joiner_of(view):
         return {"enable_dp_lm_head": False}
     return {}

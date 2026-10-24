@@ -1419,10 +1419,7 @@ class Envs:
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
-    # Same escape hatch for the mooncake dispatcher, which otherwise always sends fp8
-    # and so cannot feed a deep_gemm runner holding BF16 weights. Needed to exercise
-    # the scale-down lanes over mooncake a2a against an unquantized model; fp8
-    # deployments keep the old behaviour.
+    # Unset, mooncake sends fp8, which cannot feed a deep_gemm runner on BF16 weights.
     SGLANG_MOONCAKE_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)

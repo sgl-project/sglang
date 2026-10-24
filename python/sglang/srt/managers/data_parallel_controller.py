@@ -105,11 +105,7 @@ class WorkerPortHandshake:
 
 
 class DPRoutingUnavailable(RuntimeError):
-    """No DP worker can take this request.
-
-    Its own type so the event loop can absorb exactly this and nothing else. Every
-    other failure in a dispatch is a bug, and swallowing those hides them.
-    """
+    """No DP worker can take this request; the only failure the event loop absorbs."""
 
 
 class LoadBalanceMethod(Enum):
@@ -193,9 +189,7 @@ class DataParallelController:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
-            # The only path back. Everything else here pushes down to the schedulers,
-            # so a request this process cannot route has nowhere to be reported and
-            # the client is left waiting on a rid nothing will ever complete.
+            # Lets an unroutable request be aborted back to its client.
             self.send_to_tokenizer = get_zmq_socket(
                 self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
@@ -255,9 +249,7 @@ class DataParallelController:
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
         self._active_count_cache: int = self.launch_dp_size
-        # Slots that are draining for a shrink. Still active for control delivery --
-        # they need the scale request itself -- but excluded from request routing, so
-        # their drain can reach idle instead of being fed until the commit.
+        # Slots draining for a shrink: still sent control messages, but not requests.
         self._draining_slots: set[int] = set()
 
         if get_parallel().attn_dp_enabled:
@@ -368,28 +360,13 @@ class DataParallelController:
         self._refresh_active_workers()
 
     def _dispatch_elastic_scale_request(self, obj: ScaleElasticEPReqInput) -> None:
-        """Forward the scale request, then stop routing new work to the retiring slots.
-
-        Forwarded first, because the retirees have to receive this message to begin
-        draining at all. Once they have it they must not be fed any more requests, or
-        their drain never reaches idle; that is also what lets the tokenizer hold back
-        only the requests pinned to those slots instead of pausing the whole server."""
+        """Forward so retirees start draining, then stop routing new work to them."""
         self.send_control_message(obj)
         if obj.new_ep_size < self._active_count_cache:
             # Retirees are the contiguous tail of the active list.
             self._draining_slots = {
                 slot for slot in self._active_workers if slot >= obj.new_ep_size
             }
-
-    def _clear_elastic_draining(self, msg: ElasticDrainClearReq) -> None:
-        """Route to the retiring slots again: the shrink was rejected or it failed.
-
-        Nothing else clears this on those paths. A rejection produces no scale update,
-        and a failure is dropped by the tokenizer before dispatch, so without this the
-        pickers skip the tail for the rest of the deployment's life while
-        /is_scaling_elastic_ep still reports it idle at full width.
-        """
-        self._draining_slots = set()
 
     def _dispatch_elastic_scale_update(self, msg: ElasticScaleUpdateReq) -> None:
         # Terminal either way: the slots are gone, or the shrink failed and they stay.
@@ -479,7 +456,7 @@ class DataParallelController:
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self._dispatch_elastic_scale_update),
-                (ElasticDrainClearReq, self._clear_elastic_draining),
+                (ElasticDrainClearReq, lambda _: self._draining_slots.clear()),
                 (ScaleElasticEPReqInput, self._dispatch_elastic_scale_request),
             ]
         )
@@ -796,9 +773,8 @@ class DataParallelController:
                         server_args, dp_rank, worker_ports
                     )
                     if get_exec().moe.is_ep_joiner:
-                        # PortArgs derives joiner ports from the joiner's own --port,
-                        # and a joiner runs no tokenizer, so outputs, a bare recovery
-                        # at offset 0 included, return through the primary's.
+                        # Joiners run no tokenizer; ports derive from their own --port.
+                        # Outputs (offset-0 recovery included) go via the primary's.
                         primary_addr = NetworkAddress.parse(
                             get_parallel().dist_init_addr
                         )
@@ -974,12 +950,7 @@ class DataParallelController:
         sock_send(self.workers[self._redirect_if_draining(target_worker)], req)
 
     def _redirect_if_draining(self, slot: int) -> int:
-        """Move a request off a draining slot.
-
-        The budget and bootstrap-room pickers choose from the full worker set, so they
-        can land on a slot that is retiring. Redirecting is round-robin over what is
-        left rather than a re-run of the picker: the point is only to not feed a rank
-        that is trying to reach idle."""
+        """Move a pick from the full worker set off a draining slot, round-robin."""
         if slot not in self._draining_slots:
             return slot
         routable = self._routable_workers()
@@ -992,12 +963,7 @@ class DataParallelController:
         return chosen
 
     def _abort_undispatchable(self, recv_req, message: str) -> None:
-        """Fail the request back to the tokenizer instead of dropping it.
-
-        Dropped, its rid_to_state entry is never completed and the client waits
-        forever, so a router holding a stale routed_dp_rank sees hangs where it should
-        see failures. An abort completes the rid and the client fails fast.
-        """
+        """Fail the request back to the tokenizer; dropped, its client waits forever."""
         rid = getattr(recv_req, "rid", None)
         if not rid or self.send_to_tokenizer is None:
             return
@@ -1017,11 +983,7 @@ class DataParallelController:
                 try:
                     self._request_dispatcher(recv_req)
                 except DPRoutingUnavailable as exc:
-                    # Per-request, not fatal: routing rejects a request pinned to a
-                    # slot that has retired, and letting that escape here would take
-                    # the controller down and with it every other DP worker. Only this
-                    # one, though. Every other failure in a dispatch is a bug, and on
-                    # main it took the controller down rather than going unnoticed.
+                    # Per-request, e.g. a retired-slot pin; other errors still raise.
                     logger.warning("[DPC] %s (%s)", exc, type(recv_req).__name__)
                     self._abort_undispatchable(recv_req, str(exc))
 

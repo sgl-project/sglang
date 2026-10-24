@@ -241,10 +241,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def adopt_single_pass_gatherers(self, previous: ExpertDistributionRecorder):
         """Take over ``previous``'s gatherers, which a kept decode graph writes.
-
-        Shrink only: their buffers keep the wider width and collect reads the live
-        width out of them. A grow recaptures, and needs gatherers at its own width.
-        """
+        Shrink only: a grow recaptures and needs gatherers at its own width."""
         if not isinstance(previous, _ExpertDistributionRecorderReal):
             return
         kept = previous._single_pass_gatherers

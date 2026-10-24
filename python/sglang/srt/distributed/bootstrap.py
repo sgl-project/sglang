@@ -204,13 +204,11 @@ def measure_pre_model_load_memory(*, device: str, is_draft_worker: bool) -> floa
     # Draft workers reuse the target pool config and may exist on only one PP
     # stage; including them in this WORLD reduction would deadlock on absent
     # peers.
-    solo_join = get_exec().moe.is_ep_offset_joiner  # Solo boot: no WORLD peers yet.
+    solo = get_exec().moe.is_ep_offset_joiner  # Solo boot: no WORLD peers yet.
     pre_model_load_memory = get_available_gpu_memory(
         device,
         get_device().gpu_id,
-        distributed=(
-            not solo_join and get_world_group().world_size > 1 and not is_draft_worker
-        ),
+        distributed=get_world_group().world_size > 1 and not (is_draft_worker or solo),
         cpu_group=get_world_group().cpu_group,
     )
     local_gpu_memory = get_available_gpu_memory(device, get_device().gpu_id)

@@ -956,12 +956,10 @@ class ExecMoe(msgspec.Struct):
     ] = "self_exit"
     elastic_ep_reuse_cuda_graph: A[
         bool,
-        (
-            "Keep the decode CUDA graphs across an elastic EP scale-down instead of "
-            "recapturing them. NIXL a2a only. The dispatch keeps the width it was "
-            "captured at, and the transport masks the retired ranks. A scale-up "
-            "still recaptures."
-        ),
+        "Keep the decode CUDA graphs across an elastic EP scale-down instead of "
+        "recapturing them. NIXL a2a only. The dispatch keeps the width it was "
+        "captured at, and the transport masks the retired ranks. A scale-up "
+        "still recaptures.",
     ] = False
     disable_flashinfer_cutlass_moe_fp4_allgather: A[
         bool, "Disables quantize before all-gather for flashinfer cutlass moe."

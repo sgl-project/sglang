@@ -757,13 +757,11 @@ def build_decode_registry(
 
         def _global_num_tokens_post_fill(buf, fb, ctx):
             # Only the gathered (DP) path writes a value; otherwise left as init.
-            if not require_gathered_buffer:
-                return
-            # Retired slots must read as ranks contributing nothing, or the stale rows
-            # in their region count as real tokens. Retirees are the contiguous tail.
-            live = min(get_parallel().num_dp_ranks, buf.shape[0])
-            buf[:live].fill_(ctx.padded_num_tokens)
-            buf[live:].zero_()
+            if require_gathered_buffer:
+                # Retired slots (the contiguous tail) must contribute no tokens.
+                live = min(get_parallel().num_dp_ranks, buf.shape[0])
+                buf[:live].fill_(ctx.padded_num_tokens)
+                buf[live:].zero_()
 
         _dp_capacity = dp_capacity_for(num_dp_ranks)
         _global_shape = (
