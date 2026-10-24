@@ -845,9 +845,6 @@ class ToolChoice(BaseModel):
 ReasoningEffortTier = Literal[
     "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"
 ]
-# The typed /v1/responses stream events validate against OpenAI's narrower
-# ``Reasoning.effort``; echoing a tier outside this set kills the stream.
-ECHOABLE_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
 # Chat Completions and /v1/tokenize additionally accept a fine-grained float in
 # [0.0, 0.99] as an sglang extension (not part of the OpenAI schema, so the
 # /v1/responses surface deliberately keeps the string tiers only). Single-sourced
@@ -2079,10 +2076,9 @@ class ResponsesRequest(PDRoutingFields):
                 max_tokens = min(max_tokens, default_max_tokens)
         else:
             max_tokens = default_max_tokens
-
-        # Headroom for BOS/EOS the engine appends on top of prompt+budget.
-        if max_tokens is not None:
-            max_tokens -= 2
+            # Headroom for BOS/EOS the engine appends on top of prompt+budget.
+            if max_tokens is not None:
+                max_tokens -= 2
 
         temperature = self.temperature
         if temperature is None:
@@ -2311,12 +2307,7 @@ class ResponsesResponse(BaseModel):
             max_output_tokens=request.max_output_tokens,
             previous_response_id=request.previous_response_id,  # TODO(v): ensure this is propagated if retrieved from store
             reasoning={
-                "effort": (
-                    request.reasoning.effort
-                    if request.reasoning
-                    and request.reasoning.effort in ECHOABLE_REASONING_EFFORTS
-                    else None
-                ),
+                "effort": request.reasoning.effort if request.reasoning else None,
                 "summary": None,  # unused
             },
             store=request.store,
