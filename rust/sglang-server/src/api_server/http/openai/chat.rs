@@ -14,18 +14,18 @@ use axum::{
     },
     routing::post,
 };
-use dynamo_parsers::tool_calling::jail::Annotated;
-use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
-use dynamo_protocols::types::{
+use futures::StreamExt;
+use serde::Deserialize;
+use serde_json::Value;
+use sglang_processor::dynamo_parsers::tool_calling::jail::Annotated;
+use sglang_processor::dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
+use sglang_processor::dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
     FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
     TopLogprobs,
 };
-use futures::StreamExt;
-use serde::Deserialize;
-use serde_json::Value;
 use sglang_processor::{
     ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning,
     tool_call_stream,
@@ -913,9 +913,9 @@ mod tests {
     use crate::message::config::DefaultSamplingParams;
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
-    use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
     use sglang_processor::ReasoningOptions;
+    use sglang_processor::dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
 
     fn request() -> CreateChatCompletionRequest {
         serde_json::from_value(serde_json::json!({

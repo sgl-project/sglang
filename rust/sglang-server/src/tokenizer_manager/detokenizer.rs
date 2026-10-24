@@ -45,7 +45,7 @@ pub trait StreamDecoder: Send {
 
 /// Real decoder wrapping a dynamo-tokenizers `DecodeStream`.
 struct DynamoDecoder {
-    stream: dynamo_tokenizers::DecodeStream,
+    stream: sglang_processor::dynamo_tokenizers::DecodeStream,
 }
 
 impl StreamDecoder for DynamoDecoder {
@@ -76,7 +76,7 @@ impl StreamDecoder for DynamoDecoder {
 /// on each `Register`.
 #[derive(Clone)]
 pub enum DetokenizerBackend {
-    Dynamo(dynamo_tokenizers::Tokenizer),
+    Dynamo(sglang_processor::dynamo_tokenizers::Tokenizer),
     /// No decoding at all — the shard emits each chunk's raw output token ids as
     /// `output_ids` (no `DecodeStream`, no accumulation). Used for
     /// `skip_tokenizer_init` and when no tokenizer is configured.

@@ -39,13 +39,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Safe POD slice casts (feature buffers viewed as bytes for the shm copy).
 bytemuck = "1"
 core_affinity = "0.8"
-# Same version as sglang-processor's, which loads the tokenizer; bump together.
-dynamo-tokenizers = "3.1.0"
-# Keep the HTTP adapter on Dynamo's public OpenAI types and parsers.
-# `dynamo-llm` stays excluded because it pulls the full runtime just to reuse
-# small service helpers.
-dynamo-parsers = "=9.2.8"
-dynamo-protocols = "7.0.0"
 sglang-processor = { path = "../sglang-processor" }
 minijinja = "2.24"
 flume = "0.12.0"

@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use dynamo_tokenizers::EncodeSegment;
+use sglang_processor::dynamo_tokenizers::EncodeSegment;
 
 use crate::message::request::{RenderedChat, Request, RequestKind, TokenizeInput};
 use crate::message::response::ResponseItem;
@@ -58,7 +58,7 @@ pub fn load_tokenizer(
     tokenizer_path: Option<&str>,
     revision: Option<&str>,
     skip_tokenizer_init: bool,
-) -> Result<Option<dynamo_tokenizers::Tokenizer>, String> {
+) -> Result<Option<sglang_processor::dynamo_tokenizers::Tokenizer>, String> {
     if skip_tokenizer_init {
         tracing::info!("skip_tokenizer_init: token ids in and out; no tokenizer/detokenizer");
         return Ok(None);
@@ -68,13 +68,17 @@ pub fn load_tokenizer(
 
 /// Real tokenizer over an already-loaded dynamo `Tokenizer` (Arc inside).
 pub struct DynamoTokenizer {
-    inner: dynamo_tokenizers::Tokenizer,
+    inner: sglang_processor::dynamo_tokenizers::Tokenizer,
     bos: Option<i64>,
 }
 
 impl DynamoTokenizer {
     /// `bos_token` comes from `tokenizer_config.json`, as Python's does.
-    pub fn new(inner: dynamo_tokenizers::Tokenizer, path: &str, revision: Option<&str>) -> Self {
+    pub fn new(
+        inner: sglang_processor::dynamo_tokenizers::Tokenizer,
+        path: &str,
+        revision: Option<&str>,
+    ) -> Self {
         let bos = sglang_processor::resolve_model_file(path, revision, "tokenizer_config.json")
             .and_then(|file| std::fs::read_to_string(file).ok())
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
