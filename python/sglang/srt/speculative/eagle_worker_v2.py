@@ -233,6 +233,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+        # The draft model builds its own embed_tokens/lm_head while loading and
+        # only hands them over to the target's tensors in init_lm_head(). Do it
+        # here, before the scheduler profiles free memory for the target KV
+        # pool: otherwise the duplicate draft tensors are still resident when
+        # the pool is sized and the KV cache is permanently undersized.
+        self._embed_and_head_shared = False
+        self._share_embed_and_head()
+
+    def _share_embed_and_head(self):
+        if self._embed_and_head_shared:
+            return
+        self.init_token_map()
+        self.init_lm_head()
+        self._embed_and_head_shared = True
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -247,8 +262,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+        self._share_embed_and_head()
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
