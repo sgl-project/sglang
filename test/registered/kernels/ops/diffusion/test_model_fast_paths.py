@@ -1264,7 +1264,7 @@ def test_wan_vae_conv_epilogue_wiring_is_bit_exact() -> None:
     wan_vae_cuda_opt._install_norm_silu(
         dec,
         gate,
-        residual_block_cls=wanvae.WanResidualBlock,
+        residual_block_cls=(wanvae.WanResidualBlock,),
         rms_norm_cls=WanRMS_norm,
         label="test",
     )
@@ -1342,7 +1342,7 @@ def test_wan_vae_decoder_install_wires_resample_gate() -> None:
     n_norm = wan_vae_cuda_opt._install_norm_silu(
         dec,
         gate,
-        residual_block_cls=wanvae.WanResidualBlock,
+        residual_block_cls=(wanvae.WanResidualBlock,),
         rms_norm_cls=WanRMS_norm,
         label="test",
     )
@@ -1471,7 +1471,7 @@ def test_qwen_vae_decoder_install_is_gated_and_close() -> None:
     n_norm = wan_vae_cuda_opt._install_norm_silu(
         dec,
         gate,
-        residual_block_cls=qwen_vae.QwenImageResidualBlock,
+        residual_block_cls=(qwen_vae.QwenImageResidualBlock,),
         rms_norm_cls=qwen_vae.QwenImageRMS_norm,
         label="test",
     )
