@@ -341,7 +341,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         )
         self._tool_call_completed = False  # Reset tool call completion status
         self._sent_empty_object = False  # Reset empty object sent status
-        self._buffer_arguments = None
+        self._buffer_arguments = True
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
@@ -568,7 +568,6 @@ class Glm47MoeDetector(BaseFormatDetector):
             logger.warning("Empty function name detected, skipping tool call")
             return None
 
-        # Send tool name
         self.current_tool_name_sent = True
         self._streamed_raw_length = 0
         self._reset_streaming_state()
@@ -577,7 +576,11 @@ class Glm47MoeDetector(BaseFormatDetector):
         self.prev_tool_call_arr[self.current_tool_id] = {
             "name": func_name,
             "arguments": {},
+            "complete": False,
         }
+
+        if self._buffer_arguments:
+            return None
 
         return ToolCallItem(
             tool_index=self.current_tool_id,
@@ -600,12 +603,6 @@ class Glm47MoeDetector(BaseFormatDetector):
         """
         current_raw_length = len(func_args_raw)
 
-        if self._buffer_arguments is None:
-            self._buffer_arguments = any(
-                tool.function.name == func_name
-                and _needs_argument_context(tool.function.parameters)
-                for tool in tools
-            )
         if self._buffer_arguments:
             return None
 
@@ -663,11 +660,14 @@ class Glm47MoeDetector(BaseFormatDetector):
             serialized = json.dumps(arguments, ensure_ascii=False)
             calls.append(
                 ToolCallItem(
-                    tool_index=self.current_tool_id, name=None, parameters=serialized
+                    tool_index=self.current_tool_id,
+                    name=func_name,
+                    parameters=serialized,
                 )
             )
             self._last_arguments += serialized
             self.streamed_args_for_tool[self.current_tool_id] += serialized
+            self.prev_tool_call_arr[self.current_tool_id]["arguments"] = arguments
             self._sent_empty_object = True
 
         # Handle no-arg function or need to close braces
@@ -708,6 +708,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                 logger.debug(f"Failed to parse arguments: {e}", exc_info=True)
 
         self._buffer = current_text[match_end_pos:]
+        self.prev_tool_call_arr[self.current_tool_id]["complete"] = True
 
         # Reset state for next tool call
         self._tool_call_completed = True
@@ -804,7 +805,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
             # Ensure tracking arrays are large enough (keeping existing logic)
             while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
+                self.prev_tool_call_arr.append({"complete": False})
             while len(self.streamed_args_for_tool) <= self.current_tool_id:
                 self.streamed_args_for_tool.append("")
 

@@ -2397,6 +2397,82 @@ class ServingChatTestCase(CustomTestCase):
         # Should return None since no completion is needed
         self.assertIsNone(result, "Should return None when no completion is needed")
 
+    def test_unstreamed_tool_args_ignores_incomplete_buffered_call(self):
+        mock_parser = Mock()
+        mock_detector = Mock()
+        mock_detector.prev_tool_call_arr = [
+            {"name": "get_weather", "arguments": {}, "complete": False}
+        ]
+        mock_detector.streamed_args_for_tool = [""]
+        mock_parser.detector = mock_detector
+
+        content = {"meta_info": {"id": "chatcmpl-test123"}}
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        )
+
+        result = self.chat._check_for_unstreamed_tool_args(
+            parser=mock_parser,
+            content=content,
+            request=request,
+            index=0,
+        )
+
+        self.assertIsNone(result)
+
+    def test_glm47_truncated_buffered_call_emits_no_tool_chunk(self):
+        self.chat.tool_call_parser = "glm47"
+        request = ChatCompletionRequest(
+            model="test",
+            messages=[{"role": "user", "content": "What's the weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+            stream=True,
+        )
+        parser_dict = {}
+        has_tool_calls = {}
+
+        async def collect_chunks():
+            return [
+                chunk
+                async for chunk in self.chat._process_tool_call_stream(
+                    index=0,
+                    delta=(
+                        "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Bei"
+                    ),
+                    parser_dict=parser_dict,
+                    content={"meta_info": {"id": "chatcmpl-test123"}},
+                    request=request,
+                    has_tool_calls=has_tool_calls,
+                    flush=True,
+                )
+            ]
+
+        chunks = get_or_create_event_loop().run_until_complete(collect_chunks())
+
+        self.assertEqual(chunks, [])
+        self.assertEqual(has_tool_calls, {})
+        self.assertIsNone(
+            self.chat._check_for_unstreamed_tool_args(
+                parser=parser_dict[0],
+                content={"meta_info": {"id": "chatcmpl-test123"}},
+                request=request,
+                index=0,
+            )
+        )
+
     def test_unstreamed_tool_args_raw_string_no_completion_needed(self):
         """Test raw JSON string arguments are not JSON-encoded again at finish."""
 
