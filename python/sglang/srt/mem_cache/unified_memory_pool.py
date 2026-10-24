@@ -913,6 +913,25 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             self._page_bytes,
         )
 
+    def _mha_buffer_info(self):
+        from msgspec.structs import replace
+
+        from sglang.srt.mem_cache.device_pool_info import PageEnvelopeBufferInfo
+
+        info = super()._mha_buffer_info()
+        if self._unified_buffer.anchor_bytes(self._sub_pool_name) != 0:
+            return info
+        return replace(
+            info,
+            page_envelope=PageEnvelopeBufferInfo(
+                allocation=self._unified_buffer._raw,
+                registration_bytes=self._unified_buffer.active_allocation_bytes,
+                pages=self.get_page_envelope_buffer(),
+                page_size=self.page_size,
+                grow_direction=self.grow_direction,
+            ),
+        )
+
     def get_contiguous_buf_infos(self):
         """Register the raw buffer as physical page envelopes for PD transfer.
 

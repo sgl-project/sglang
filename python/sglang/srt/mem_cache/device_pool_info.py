@@ -93,6 +93,41 @@ class KVScaleBuffers(msgspec.Struct, frozen=True, kw_only=True):
     layout: KVScaleLayout
 
 
+class PageEnvelopeBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
+    """Native shared allocation and one sub-pool's complete-page view.
+
+    Capture after final backing; reserved virtual bytes are not registrable.
+    """
+
+    allocation: torch.Tensor
+    registration_bytes: int
+    pages: torch.Tensor
+    page_size: int
+    grow_direction: str
+
+    def validate(self) -> None:
+        if (
+            self.allocation.dtype != torch.uint8
+            or self.allocation.ndim != 1
+            or not self.allocation.is_contiguous()
+            or not 0 < self.registration_bytes <= self.allocation.nbytes
+        ):
+            raise ValueError("Page-envelope allocation requires a backed uint8 region")
+        if (
+            self.pages.dtype != torch.uint8
+            or self.pages.ndim != 2
+            or not self.pages.is_contiguous()
+            or self.pages.device != self.allocation.device
+            or self.pages.data_ptr() != self.allocation.data_ptr()
+            or self.pages.nbytes > self.registration_bytes
+            or self.page_size <= 0
+            or self.pages.shape[1] <= 0
+            or self.pages.shape[1] % self.page_size
+            or self.grow_direction not in {"up", "down"}
+        ):
+            raise ValueError("Invalid zero-anchored page-envelope view or geometry")
+
+
 class MHABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     """Physical MHA input for host construction; no capacity or allocation policy.
 
@@ -109,6 +144,7 @@ class MHABufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     dtype: torch.dtype
     device: torch.device
     scales: KVScaleBuffers | None = None
+    page_envelope: PageEnvelopeBufferInfo | None = None
     # Resolve current contiguous backing at transfer time for relocatable pools.
     transfer_buffers: Callable[[], tuple[torch.Tensor, torch.Tensor]] | None = None
 
