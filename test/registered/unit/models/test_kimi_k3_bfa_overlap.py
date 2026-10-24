@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
+    KimiK3LinearForCausalLM,
     KimiK3MLAAttention,
     _get_k3_dense_weight,
 )
@@ -144,6 +145,67 @@ class TestKimiK3BfaOverlap(CustomTestCase):
                     graph.replay()
                     torch.cuda.synchronize()
                     self.assertTrue(torch.equal(captured, expected))
+
+    def test_mla_weight_reload_preserves_captured_projections(self):
+        def values(shape):
+            return (
+                torch.arange(torch.Size(shape).numel(), device="cuda")
+                .reshape(shape)
+                .to(torch.bfloat16)
+                / 512
+            )
+
+        attn = SimpleNamespace(
+            kv_b_proj=SimpleNamespace(weight=values((24, 16))),
+            qk_nope_head_dim=4,
+            v_head_dim=8,
+            w_kc=None,
+            w_vc=None,
+        )
+        owner = SimpleNamespace(
+            config=SimpleNamespace(full_attention_layer_ids=[0]),
+            model=SimpleNamespace(
+                layers=[
+                    SimpleNamespace(self_attn=attn, use_attn_residuals=False, mlp=None)
+                ]
+            ),
+        )
+        post_load = KimiK3LinearForCausalLM.post_load_weights
+        post_load(owner)
+        # Keep captured storage alive even if a reload incorrectly replaces it.
+        captured_weights = (attn.w_kc, attn.w_vc)
+        query, latent = values((2, 3, 4)), values((2, 3, 16))
+
+        def project():
+            return torch.bmm(query, attn.w_kc), torch.bmm(latent, attn.w_vc)
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            project()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = project()
+        graph.replay()
+        initial = [output.clone() for output in captured]
+
+        for reload in range(2):
+            attn.kv_b_proj.weight.add_(0.125)
+            post_load(owner)
+            expected = project()
+            graph.replay()
+            torch.cuda.synchronize()
+            for index, name in enumerate(("w_kc", "w_vc")):
+                with self.subTest(reload=reload, weight=name):
+                    self.assertFalse(torch.equal(expected[index], initial[index]))
+                    torch.testing.assert_close(
+                        captured[index], expected[index], rtol=0, atol=0
+                    )
+                    self.assertEqual(
+                        getattr(attn, name).data_ptr(),
+                        captured_weights[index].data_ptr(),
+                    )
 
     def test_block_fp8_weight_is_dequantized_for_tiny_gemm(self):
         module = SimpleNamespace(
