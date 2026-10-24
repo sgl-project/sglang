@@ -47,6 +47,7 @@ def install_simulator_hooks() -> None:
             scheduler.C_SglangPrefillAdderHook,
             scheduler.C_SchedulerRequestReceiver,
             dspark_worker.C_DSparkWorkerHook,
+            dspark_worker.C_DSparkDraftInputHook,
             model_runner.C_ModelRunnerHook,
             model_runner.C_KVCacheConfiguratorHook,
             hicache_storage.C_StorageBackendFactory,

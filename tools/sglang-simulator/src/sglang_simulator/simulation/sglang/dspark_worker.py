@@ -26,6 +26,28 @@ def _runtime():
     return runtime
 
 
+class C_DSparkDraftInputHook(BaseHook):
+    HOOK_CLASS_NAME = "DFlashDraftInputV2"
+    HOOK_MODULE_NAME = "sglang.srt.speculative.dflash_info_v2"
+    REQUIRED = False
+
+    @classmethod
+    def hook(cls, target):
+        original_prepare = target.prepare_for_decode
+
+        def prepare(self, batch):
+            from sglang_simulator.simulation.sglang.dspark_runtime import (
+                INPUT_ATTRIBUTE,
+                prepare_cpu_decode,
+            )
+
+            if getattr(self, INPUT_ATTRIBUTE, None) is not None:
+                return prepare_cpu_decode(self, batch)
+            return original_prepare(self, batch)
+
+        target.prepare_for_decode = prepare
+
+
 class C_DSparkWorkerHook(BaseHook):
     HOOK_CLASS_NAME = "DSparkWorkerV2"
     HOOK_MODULE_NAME = "sglang.srt.speculative.dspark_components.dspark_worker_v2"

@@ -170,11 +170,14 @@ def test_unknown_draft_gap_cannot_be_bridged_by_commit():
     assert run.history_for("a") == CommittedHistory(512, 0, 400)
 
 
-def test_prefill_requires_its_own_injection_adapter():
+def test_prefill_progress_is_native_bonus_and_injected_work_not_spec_acceptance():
     before = step()
     before = replace(before, groups=(replace(before.groups[0], forward_mode="EXTEND"),))
-    with pytest.raises(PredictorError, match="injection adapter"):
-        session(before).execute(before)
+    run = session(before)
+    result = run.execute(before)
+    assert result.progress.committed_tokens == (("a", 1),)
+    assert run.progress_model.calls == 0
+    assert run.history_for("a") == CommittedHistory(518, 0, 518)
 
 
 def test_native_dspark_hook_routes_to_explicit_runtime_and_retains_result(monkeypatch):

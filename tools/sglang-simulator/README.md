@@ -23,8 +23,8 @@ support.
 
 ### DSPark integration boundary
 
-The DSPark adapter currently provides CPU protocols and worker/scheduler hooks;
-it does not yet qualify a V4.1 serving run. Existing ordinary-forward predictors
+The DSPark adapter provides CPU protocols, a native runtime and worker/scheduler
+hooks; it does not yet qualify a V4.1 serving run. Existing ordinary-forward predictors
 and launch validation keep their current support bounds.
 
 `simulation.sglang.dspark` separates immutable before-work (`DSparkStep`),
@@ -63,10 +63,73 @@ acceptance. The scheduler consumes the attached staged timing once, accounts for
 predictor wall time, and preserves coordinated idle time. It does not issue an
 ordinary one-token DECODE query for that speculative step.
 
-Full prefill/injection, verified progress artifacts, runtime construction,
-multi-DP scheduling and full worker cost coverage remain required before launch
-validation can admit a complete V4.1 AgentX run. CPU fixture results are protocol
-checks and must not be reported as actual Simulator accuracy or hardware data.
+`DSparkNativeRuntime` reads native CPU chunk/prefix/committed-length mirrors and
+all fields from the SDK-owned normalized sampling inventory. Prefill logically
+injects only the executed range: a target cache hit supplies no missing draft KV.
+Intermediate chunks emit no token. Decode obtains independently modeled progress,
+builds native `GenerationBatchResult`/`DFlashDraftInputV2`, publishes new lengths,
+then commits the causal ledger. Result/publication failures leave that ledger
+unchanged. The marked next input uses SGLang's page-aligned reservation sizing,
+public allocator and request-table writes on CPU; unmarked DFlash inputs keep
+their native path. Synthetic token content follows the ordinary simulator
+contract and does not determine progress.
+
+The complete causal KV range stays explicit. Proposal reads project a bounded
+128-token window from that range; two successive commits can extend the range
+to 130/132 while the source query still reads 128. Unknown gaps and 127-token
+history fail. Persistent proposal-buffer capacity is tracked from successful
+calls, including the initial allocation gap, and is not reset by a KV-only flush.
+
+`time_predictor.dspark_umd.UMDDSparkCostModel` evaluates prepared source-owned
+graphs through InferCast's existing composition executor. Its built-in proposal
+preparation and capture resolution use verified FIDB profile assets. Additional
+phase preparers must cover their complete worker boundary; a target composition
+with uncovered call spans cannot become a complete target cost. Missing phases
+fail before progress is sampled. The default runtime execution resolver uses
+this same cost adapter rather than a second graph/cost planner.
+
+`time_predictor.dspark_progress.EmpiricalDSparkProgress` reads a hash-pinned
+artifact and sibling observation/native/causal-evidence files. It verifies raw
+native frames with the shared SDK participant join, checks full recipes and
+leader commit labels, and retains peers' native null request records. The model
+fits conditional count distributions from training trajectories only, keyed by
+explicit prefix/history bins and the full recipe digest. Distinct heldout
+trajectories provide visible mean/distribution errors. Native observation IDs
+and trajectories cannot overlap splits; unsupported recipes/layouts/conditions
+have no fallback. Deterministic sampling reads only before-work and clips to
+the remaining output budget. Neither loading nor heldout support is an accuracy
+admission; causal-history evidence still requires its separate source review.
+
+Actual multi-DP scheduling/heterogeneous coordination, complete measured worker
+costs (including allocation), independently reviewed progress data and predictor
+launch wiring remain required for a complete V4.1 AgentX run. The native runtime
+supports homogeneous TP2/TP4 ADP1; ADP2 fails until actual peer partitions and
+publication exist. CPU fixtures and native-type checks must not be reported as
+actual Simulator accuracy or hardware performance data.
+
+The progress artifact has `schema_version: 1`, definition
+`dspark_recipe_prefix_history_empirical_commit_v1`, `source_pin`,
+`runtime_profile_sha256`, `seed`, `prefix_edges`, `history_edges`, `training` and
+`validation`. Each split lists `{path, sha256}` descriptors for sibling
+`progress-observations-<sha256>.json` files. Each observation document contains
+`schema_version`, `source_pin`, `runtime_profile_sha256`, `participants`,
+`phase_policy`, `native`, `causal_history_evidence` and `observations`.
+Native/causal descriptors retain complete sibling JSON bytes. Each observation
+has `native_key`, `forward_ct`, `rid`, `trajectory_id`, `prefix_len`,
+`draft_history_tokens` (the source read window, at most 128), full
+`sampling_params`, `verify_width: 6` and `commit_len`. Native record identity is
+recomputed independently of the authored label; request IDs and trajectories
+cannot cross training/validation splits. An observation's declared causal
+history still requires separate source-lineage review. No field sets an
+automatic timing or accuracy admission.
+
+For additional UMD boundaries, pass source-owned `phase_preparers` to
+`UMDDSparkCostModel`. Each returns `(ModelDescription, point, graph_phase)` using
+the existing family graph and operation registry. Besides the built-in proposal,
+the description must declare `extra.complete_dspark_worker_phase` equal to its
+phase. This is a coverage contract for reviewed implementation, not a user
+override: it cannot remove `unmodeled_target_call_units` or introduce constant
+latencies. Complete worker queries require every phase before querying progress.
 
 ## Requirements
 

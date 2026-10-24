@@ -25,7 +25,12 @@ _DECODE_PHASES = (
     "accept_commit_publication",
     "worker_tail",
 )
-_PREFILL_PHASES = ("target_prefill", "draft_kv_inject")
+_PREFILL_PHASES = (
+    "worker_preamble",
+    "target_prefill",
+    "draft_kv_inject",
+    "worker_tail",
+)
 
 
 def _fail(message, **details):
@@ -85,6 +90,7 @@ class DSparkRequest:
     output_tokens_before: int
     max_new_tokens: int
     sampling_params_json: str
+    emits_output: bool = True
 
     def __post_init__(self):
         if type(self.rid) is not str or not self.rid:
@@ -105,6 +111,8 @@ class DSparkRequest:
         ):
             _fail("DSPark request has inconsistent before-state")
         recipe = _canonical_object(self.sampling_params_json, "sampling_params_json")
+        if type(self.emits_output) is not bool:
+            _fail("emits_output must reflect the native chunk completion flag")
         if (
             type(recipe.get("max_new_tokens")) is not int
             or recipe["max_new_tokens"] != self.max_new_tokens
@@ -119,6 +127,15 @@ class DSparkRequest:
     def draft_history_tokens(self):
         # Available history is a causal range, not a target-prefix proxy.
         return self.draft_valid_to - self.draft_valid_from
+
+    def bounded_draft_history_tokens(self, window_size):
+        """Project a source read window from a contiguous causal KV range."""
+        _integer(window_size, 1, "draft history window")
+        if self.draft_valid_to != self.target_prefix_len:
+            raise PredictorError(
+                "data_unavailable", "draft read window has an unknown trailing KV gap"
+            )
+        return min(window_size, self.draft_history_tokens)
 
 
 @dataclass(frozen=True)
@@ -259,7 +276,11 @@ class DSparkProgress:
         ):
             _fail("DSPark progress must match ordered requests and model identity")
         for request, (_, count) in zip(step.requests, self.committed_tokens):
-            _integer(count, 1, "committed output count")
+            _integer(
+                count, 0 if not request.emits_output else 1, "committed output count"
+            )
+            if not request.emits_output and count != 0:
+                _fail("an intermediate prefill chunk cannot emit output")
             if count > min(request.extend_len, request.remaining_output_tokens):
                 _fail(
                     "DSPark progress exceeds executed work or remaining output budget"
@@ -359,27 +380,49 @@ class DSparkSession:
     def forget(self, rid):
         self._history.pop(rid, None)
 
-    def execute(
+    def predict(
         self, step: DSparkStep, *, local_attention_dp_rank=0
     ) -> DSparkStepResult:
         if type(step) is not DSparkStep or step.forward_id <= self._last_forward_id:
             _fail("DSPark step must advance the run's forward sequence")
-        if any(
-            group.forward_mode not in {"TARGET_VERIFY", "IDLE"} for group in step.groups
-        ):
+        modes = {group.forward_mode for group in step.groups} - {"IDLE"}
+        if modes not in ({"TARGET_VERIFY"}, {"EXTEND"}):
             raise PredictorError(
                 "unsupported_forward_mode",
-                "prefill needs its source-specific injection adapter",
+                "heterogeneous steps need their source coordination adapter",
             )
+        prefill = modes == {"EXTEND"}
         for request in step.requests:
             expected = CommittedHistory(
                 request.target_prefix_len,
                 request.draft_valid_from,
                 request.draft_valid_to,
             )
-            if self.history_for(request.rid) != expected:
+            if prefill:
+                known = self._history.get(request.rid)
+                if known is None or known.draft_valid_from > request.target_prefix_len:
+                    prior = CommittedHistory(
+                        request.target_prefix_len,
+                        request.target_prefix_len,
+                        request.target_prefix_len,
+                    )
+                else:
+                    prior = CommittedHistory(
+                        request.target_prefix_len,
+                        known.draft_valid_from,
+                        min(known.draft_valid_to, request.target_prefix_len),
+                    )
+            else:
+                prior = self.history_for(request.rid)
+            if prior != expected:
                 _fail(
                     "DSPark before-work differs from committed causal history",
+                    rid=request.rid,
+                )
+            if not prefill and request.draft_valid_to != request.target_prefix_len:
+                raise PredictorError(
+                    "data_unavailable",
+                    "DSPark commit cannot bridge an unknown draft KV gap",
                     rid=request.rid,
                 )
         # A missing cost must fail before generating progress or mutating history.
@@ -388,7 +431,15 @@ class DSparkSession:
         if type(timing) is not DSparkStepTiming:
             _fail("cost adapter must return typed complete DSPark timing")
         timing.validate_for(step)
-        progress = self.progress_model.predict_progress(step)
+        progress = (
+            DSparkProgress(
+                step.forward_id,
+                tuple((r.rid, int(r.emits_output)) for r in step.requests),
+                "native_prefill_bonus_v1",
+            )
+            if prefill
+            else self.progress_model.predict_progress(step)
+        )
         if type(progress) is not DSparkProgress:
             _fail("progress model must return typed DSPark progress")
         result = DSparkStepResult(
@@ -398,21 +449,54 @@ class DSparkSession:
             local_attention_dp_rank,
             time.perf_counter() - started,
         )
+        return result
+
+    def commit(self, result: DSparkStepResult):
+        step = result.step
+        if step.forward_id <= self._last_forward_id:
+            _fail("DSPark result was already committed")
+        # Recheck before-state so an outstanding result cannot overwrite a
+        # different successful step. predict() does not advance any run state.
+        for group in step.groups:
+            for request in group.requests:
+                if group.forward_mode == "TARGET_VERIFY" and self.history_for(
+                    request.rid
+                ) != CommittedHistory(
+                    request.target_prefix_len,
+                    request.draft_valid_from,
+                    request.draft_valid_to,
+                ):
+                    _fail("stale DSPark result differs from committed history")
         updated = dict(self._history)
-        for request, (_, count) in zip(step.requests, progress.committed_tokens):
-            if request.draft_valid_to != request.target_prefix_len:
+        modes = {group.forward_mode for group in step.groups}
+        prefill = "EXTEND" in modes
+        for request, (_, count) in zip(step.requests, result.progress.committed_tokens):
+            if not prefill and request.draft_valid_to != request.target_prefix_len:
                 raise PredictorError(
                     "data_unavailable",
                     "DSPark commit cannot bridge an unknown draft KV gap",
                     rid=request.rid,
                 )
-            new_prefix = request.target_prefix_len + count
-            updated[request.rid] = CommittedHistory(
-                new_prefix, request.draft_valid_from, new_prefix
+            new_prefix = request.target_prefix_len + (
+                request.extend_len if prefill else count
             )
+            lower = (
+                request.draft_valid_from
+                if request.draft_valid_to == request.target_prefix_len
+                else request.target_prefix_len
+            )
+            updated[request.rid] = CommittedHistory(new_prefix, lower, new_prefix)
         self._history = updated
         self._last_forward_id = step.forward_id
+
+    def execute(self, step: DSparkStep, *, local_attention_dp_rank=0):
+        result = self.predict(step, local_attention_dp_rank=local_attention_dp_rank)
+        self.commit(result)
         return result
+
+    def clear(self):
+        self._history.clear()
+        # Preserve the forward sequence across a native cache reset.
 
 
 def dspark_result_from_native(result):
