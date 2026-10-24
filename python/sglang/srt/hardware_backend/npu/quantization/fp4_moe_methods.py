@@ -11,7 +11,7 @@ import torch
 
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8MXFP4MoEMethod,
-    prepare_w4a8_mxfp_weight,
+    process_npu_fp4_expert_weights,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import set_weight_attrs
@@ -156,18 +156,13 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
             )
 
         nz_format = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ
-        layer.w13_weight.data, w13_scale = prepare_w4a8_mxfp_weight(
-            layer.w13_weight.data.view(torch.uint8),
-            layer.w13_weight_scale_inv.data,
-            npu_format=nz_format,
+        process_npu_fp4_expert_weights(layer, npu_format=nz_format)
+        layer.w13_weight_scale_inv = torch.nn.Parameter(
+            layer.w13_weight_scale_inv.data, requires_grad=False
         )
-        layer.w2_weight.data, w2_scale = prepare_w4a8_mxfp_weight(
-            layer.w2_weight.data.view(torch.uint8),
-            layer.w2_weight_scale_inv.data,
-            npu_format=nz_format,
+        layer.w2_weight_scale_inv = torch.nn.Parameter(
+            layer.w2_weight_scale_inv.data, requires_grad=False
         )
-        layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale, requires_grad=False)
-        layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale, requires_grad=False)
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config(

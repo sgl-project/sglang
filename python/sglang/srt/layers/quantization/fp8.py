@@ -2255,7 +2255,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if self.is_fp4_expert:
                 if _is_npu:
-                    self._process_npu_fp4_expert_weights(layer)
+                    from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                        process_npu_fp4_expert_weights,
+                    )
+
+                    process_npu_fp4_expert_weights(layer)
                     return
 
                 if get_moe_runner_backend().is_marlin():
@@ -3089,53 +3093,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a2_scale=layer.w2_input_scale,
             block_shape=self.weight_block_size,
         )
-
-    def _process_npu_fp4_expert_weights(self, layer: torch.nn.Module) -> None:
-        """Convert HF MXFP4 experts to the NPU W4A8 kernel layout.
-
-        HF stores packed FP4 weights as int8 and block scales as float32; the
-        NPU kernel expects the weight in FRACTAL_NZ (transposed) and the scale
-        as e8m0 (uint8) reshaped to [E, K//64, N, 2].
-        """
-        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
-            _get_float4_e2m1fn_x2_dtype,
-        )
-        from sglang.srt.hardware_backend.npu.utils import npu_format_cast
-
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-        if fp4_dtype is None:
-            raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
-
-        for prefix in ("w13", "w2"):
-            weight = getattr(layer, f"{prefix}_weight")
-            weight.data = npu_format_cast(
-                weight.data.view(torch.uint8),
-                customize_dtype=torch.float8_e4m3fn,
-                input_dtype=fp4_dtype,
-            ).transpose(-1, -2)
-
-            # Two e8m0 storage conventions in the fp32 scales: (a) the value
-            # IS the e8m0 byte (int in 0..255, MiMo-V2.5-Pro); (b) the value
-            # is 2^(e-127) -> recover e from the exponent field. Never
-            # re-encode with round(log2)+127: it re-biases the exponent.
-            scale_inv = getattr(layer, f"{prefix}_weight_scale_inv")
-            scale = scale_inv.data.to(torch.float32)
-            s_flat = scale.detach().float().flatten()
-            is_int_like = bool(
-                torch.all(s_flat >= 0)
-                and torch.all(s_flat <= 255)
-                and torch.allclose(s_flat, s_flat.round())
-            )
-            if is_int_like:
-                e8m0 = scale.to(torch.uint8)
-            else:
-                e8m0 = (scale.view(torch.int32) >> 23 & 0xFF).to(torch.uint8)
-            scale_inv.data = e8m0.reshape(
-                scale.shape[0],
-                scale.shape[1],
-                scale.shape[2] // 2,
-                2,
-            ).transpose(1, 2)
 
     def apply(
         self,

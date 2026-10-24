@@ -29,6 +29,7 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import deepep
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.test.test_utils import CustomTestCase
 
 
 def _make_fp4_method(**kwargs):
@@ -141,7 +142,7 @@ class TestReshapeMxfp4ScaleForNpu(unittest.TestCase):
             )
 
 
-class TestPrepareW4A8MxfpWeight(unittest.TestCase):
+class TestPrepareW4A8MxfpWeight(CustomTestCase):
     def test_uses_shared_weight_and_scale_layout(self):
         # A wrong transpose or scale packing makes both ModelSlim W4A8 and
         # DeepSeek-V4 W4A8 read different blocks from the same checkpoint.
@@ -748,7 +749,7 @@ class TestRunnerDelegation(unittest.TestCase):
         moe_runner.assert_called_once()
 
 
-class TestProcessWeightsAfterLoadingZeroScale(unittest.TestCase):
+class TestProcessWeightsAfterLoadingZeroScale(CustomTestCase):
     @staticmethod
     def _method():
         return _make_fp4_method(prefix="test")
@@ -783,27 +784,62 @@ class TestProcessWeightsAfterLoadingZeroScale(unittest.TestCase):
     def test_keeps_low_latency_dispatch_in_mxfp8(self):
         layer = SimpleNamespace(
             w13_weight=torch.nn.Parameter(
-                torch.ones(1, 2, 32, dtype=torch.uint8), requires_grad=False
+                torch.arange(64, dtype=torch.uint8).view(1, 2, 32), requires_grad=False
             ),
             w13_weight_scale_inv=torch.nn.Parameter(
-                torch.ones(1, 2, 1, dtype=torch.uint8), requires_grad=False
+                torch.tensor([[[125, 126], [127, 128]]], dtype=torch.uint8),
+                requires_grad=False,
             ),
             w2_weight=torch.nn.Parameter(
-                torch.ones(1, 32, 1, dtype=torch.uint8), requires_grad=False
+                torch.full((1, 64, 32), 255, dtype=torch.uint8), requires_grad=False
             ),
             w2_weight_scale_inv=torch.nn.Parameter(
-                torch.ones(1, 32, 1, dtype=torch.uint8), requires_grad=False
+                torch.full((1, 64, 2), 127, dtype=torch.uint8), requires_grad=False
             ),
             dispatcher=MagicMock(),
         )
-        prepared_weight = torch.ones(1, 32, 2, dtype=torch.uint8)
-        prepared_scale = torch.ones(1, 1, 2, 2, dtype=torch.uint8)
+        original_scales = (layer.w13_weight_scale_inv, layer.w2_weight_scale_inv)
+
+        def format_cast(weight, acl_format, **kwargs):
+            self.assertEqual(acl_format, 29)  # ACL_FORMAT_FRACTAL_NZ
+            self.assertEqual(weight.dtype, torch.uint8)
+            self.assertIsNotNone(kwargs["input_dtype"])
+            return weight
 
         with patch(
-            "sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods.prepare_w4a8_mxfp_weight",
-            return_value=(prepared_weight, prepared_scale),
+            "sglang.srt.hardware_backend.npu.quantization.moe_methods.npu_format_cast",
+            side_effect=format_cast,
         ):
             self._method().process_weights_after_loading(layer)
+
+        self.assertTrue(
+            torch.equal(
+                layer.w13_weight,
+                torch.arange(64, dtype=torch.uint8).view(1, 2, 32).transpose(1, 2),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                layer.w2_weight, torch.full((1, 32, 64), 255, dtype=torch.uint8)
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                layer.w13_weight_scale_inv,
+                torch.tensor([[[[125, 126], [127, 128]]]], dtype=torch.uint8),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                layer.w2_weight_scale_inv,
+                torch.full((1, 1, 64, 2), 127, dtype=torch.uint8),
+            )
+        )
+        for original, processed in zip(
+            original_scales, (layer.w13_weight_scale_inv, layer.w2_weight_scale_inv)
+        ):
+            self.assertIsNot(original, processed)
+            self.assertFalse(processed.requires_grad)
 
         layer.dispatcher.set_quant_config.assert_called_once_with(
             {
