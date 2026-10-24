@@ -11,6 +11,7 @@ maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 from fastapi import HTTPException  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from jinja2 import Environment  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 
 from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessage,
@@ -384,6 +385,23 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(anthropic_response.usage.input_tokens, 6)
         self.assertEqual(anthropic_response.usage.output_tokens, 2)
         self.assertEqual(anthropic_response.usage.cache_read_input_tokens, 4)
+
+    def test_unsupported_nested_tool_result_blocks_are_rejected(self):
+        for block in (
+            {"type": "thinking", "thinking": "discarded"},
+            {"type": "redacted_thinking", "data": "discarded"},
+            {"type": "tool_use", "id": "nested", "name": "f", "input": {}},
+            {"type": "tool_result", "tool_use_id": "nested", "content": "discarded"},
+        ):
+            with (
+                self.subTest(block=block),
+                self.assertRaisesRegex(
+                    ValidationError, "Unsupported tool_result.content"
+                ),
+            ):
+                self._tool_result_request(
+                    [{"type": "text", "text": "Keep this"}, block]
+                )
 
     def test_tool_result_search_result_content_is_flattened(self):
         request = AnthropicMessagesRequest.model_validate(

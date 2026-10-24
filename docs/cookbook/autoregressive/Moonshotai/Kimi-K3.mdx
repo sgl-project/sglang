@@ -478,3 +478,13 @@ Decisions the preset already makes:
 <Note>
 No preset has a full serving round on final weights; the constants derive from measured single- and dual-node rounds plus a 64-GPU sweep. Validate throughput and accuracy on your workload before committing a fleet.
 </Note>
+
+
+## Nested Messages tool results
+
+For the Anthropic-compatible Messages API, `tool_result.content` accepts a string
+or a list of `text`, `image`, `tool_reference` and `search_result` blocks.
+Unsupported nested blocks are rejected during request validation instead of
+being removed while the rest of the tool result is processed. This restriction
+applies only inside tool results; assistant thinking and tool-use history keep
+their existing top-level formats.
