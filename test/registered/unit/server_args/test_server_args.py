@@ -1678,6 +1678,37 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         self.assertEqual(resolved_view(args).page_size, 128)
 
 
+class TestTorchNativeAttentionBackendSpeculativeRejected(CustomTestCase):
+    """Reject speculative decoding before torch_native reaches verification."""
+
+    def _args(self, *, speculative_algorithm):
+        args = ServerArgs(model_path="dummy")
+        args.attention_backend = "torch_native"
+        args.speculative_algorithm = speculative_algorithm
+        args._model_config = SimpleNamespace(
+            attention_arch=AttentionArch.MHA,
+            is_encoder_decoder=False,
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        )
+        args.cuda_graph_config = CudaGraphConfig()
+        return args
+
+    def test_torch_native_rejects_speculative_decoding(self):
+        args = self._args(speculative_algorithm="NGRAM")
+        with self.assertRaisesRegex(AssertionError, "torch_native attention backend"):
+            handle_attention_backend_compatibility(args)
+
+    def test_torch_native_allows_non_speculative(self):
+        args = self._args(speculative_algorithm=None)
+        handle_attention_backend_compatibility(args)
+
+        from sglang.srt.arg_groups.overrides import resolved_view
+
+        self.assertEqual(
+            resolved_view(args).cuda_graph_config.decode.backend, Backend.DISABLED
+        )
+
+
 class TestContextParallelServerArgs(CustomTestCase):
     def setUp(self):
         self.parser = server_args_module.argparse.ArgumentParser()

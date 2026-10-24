@@ -139,6 +139,10 @@ def handle_attention_backend_compatibility(server_args: Any):
                 cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
             ),
         )
+        assert cfg.speculative_algorithm is None, (
+            "Speculative decoding is currently not supported with the "
+            "torch_native attention backend"
+        )
 
     if attention_backend == "flex_attention":
         logger.warning(
