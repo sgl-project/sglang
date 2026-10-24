@@ -24,6 +24,7 @@ use crate::api_server::core::{CoreCall, CoreEvent, CoreHandle};
 use crate::message::config::ServerArgs;
 use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::tokenizer_manager::wiring::TmEvent;
+
 /// The formatter a checkpoint with `config` and Jinja `template` selects.
 pub(super) fn checkpoint_formatter(
     config: &serde_json::Value,

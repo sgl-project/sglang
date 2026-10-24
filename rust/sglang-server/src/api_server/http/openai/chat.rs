@@ -898,12 +898,17 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_utils::{chat_submitted, chunk};
+    use std::sync::Arc;
+
+    use super::super::ChatFormatter;
+    use super::super::test_utils::{
+        answering_app_state_with, body_json, chat_submitted, chunk, post_json,
+    };
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
         merge_template_stops, unary_chat,
     };
-    use crate::message::config::DefaultSamplingParams;
+    use crate::message::config::{DefaultSamplingParams, ServerArgs};
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
     use futures::StreamExt;
@@ -1024,7 +1029,7 @@ mod tests {
     fn formatter_without_stops_leaves_request_stops_alone() {
         let mut req = request();
         req.stop = Some(Stop::String("x".into()));
-        merge_template_stops(&mut req, &super::super::ChatFormatter::KimiK3);
+        merge_template_stops(&mut req, &ChatFormatter::KimiK3);
         assert_eq!(req.stop, Some(Stop::String("x".into())));
     }
 
@@ -1102,67 +1107,52 @@ mod tests {
         assert_eq!(value["usage"]["completion_tokens"], 2);
     }
 
+    /// The first choice's message for `body`, against a core answering `text`.
+    async fn chat_message(
+        reasoning_parser: &str,
+        formatter: ChatFormatter,
+        text: &'static str,
+        body: serde_json::Value,
+    ) -> serde_json::Value {
+        let args = ServerArgs {
+            served_model_name: "model".into(),
+            reasoning_parser: Some(reasoning_parser.into()),
+            ..Default::default()
+        };
+        let state = answering_app_state_with(Arc::new(args), formatter, None, text);
+        let app = super::routes().with_state(state);
+        let response = post_json(app, "/v1/chat/completions", body).await;
+        body_json(response).await["choices"][0]["message"].clone()
+    }
+
     /// A continuation that already closed its think block generates content.
     #[tokio::test]
     async fn continuation_after_think_end_is_content() {
-        let args = crate::message::config::ServerArgs {
-            served_model_name: "model".into(),
-            reasoning_parser: Some("deepseek-v4".into()),
-            ..Default::default()
-        };
-        let state = super::super::test_utils::answering_app_state_with(
-            std::sync::Arc::new(args),
-            super::super::ChatFormatter::DeepSeekV41,
-            None,
-            " 391.",
-        );
-        let response = super::super::test_utils::post_json(
-            super::routes().with_state(state),
-            "/v1/chat/completions",
-            serde_json::json!({
-                "model": "model",
-                "messages": [
-                    {"role": "user", "content": "What is 17*23?"},
-                    {"role": "assistant", "content": "17*23</think>The answer is"}
-                ],
-                "continue_final_message": true,
-                "chat_template_kwargs": {"thinking": true}
-            }),
-        )
-        .await;
-        let value = super::super::test_utils::body_json(response).await;
-        assert_eq!(value["choices"][0]["message"]["content"], " 391.");
-        assert!(value["choices"][0]["message"]["reasoning_content"].is_null());
+        let body = serde_json::json!({
+            "model": "model",
+            "messages": [
+                {"role": "user", "content": "What is 17*23?"},
+                {"role": "assistant", "content": "17*23</think>The answer is"}
+            ],
+            "continue_final_message": true,
+            "chat_template_kwargs": {"thinking": true}
+        });
+        let message = chat_message("deepseek-v4", ChatFormatter::DeepSeekV41, " 391.", body).await;
+        assert_eq!(message["content"], " 391.");
+        assert!(message["reasoning_content"].is_null());
     }
 
     /// Kimi K3 with thinking off generates content, though its detector defaults to reasoning.
     #[tokio::test]
     async fn kimi_k3_thinking_off_is_content() {
-        let args = crate::message::config::ServerArgs {
-            served_model_name: "model".into(),
-            reasoning_parser: Some("kimi_k3".into()),
-            ..Default::default()
-        };
-        let state = super::super::test_utils::answering_app_state_with(
-            std::sync::Arc::new(args),
-            super::super::ChatFormatter::KimiK3,
-            None,
-            "Hello!",
-        );
         let messages = serde_json::json!([{"role": "user", "content": "Hi"}]);
         for body in [
             serde_json::json!({"model": "model", "messages": messages, "chat_template_kwargs": {"thinking": false}}),
             serde_json::json!({"model": "model", "messages": messages, "reasoning_effort": "none"}),
         ] {
-            let response = super::super::test_utils::post_json(
-                super::routes().with_state(state.clone()),
-                "/v1/chat/completions",
-                body,
-            )
-            .await;
-            let value = super::super::test_utils::body_json(response).await;
-            assert_eq!(value["choices"][0]["message"]["content"], "Hello!");
-            assert!(value["choices"][0]["message"]["reasoning_content"].is_null());
+            let message = chat_message("kimi_k3", ChatFormatter::KimiK3, "Hello!", body).await;
+            assert_eq!(message["content"], "Hello!");
+            assert!(message["reasoning_content"].is_null());
         }
     }
 

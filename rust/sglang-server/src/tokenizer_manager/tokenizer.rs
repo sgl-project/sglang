@@ -22,11 +22,8 @@ use crate::runtime::Runnable;
 use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::{error::Error, fsm::Event};
 
-/// Load the tokenizer the encode pool uses; its [`DynamoTokenizer::tokenizer`]
-/// handle is shared by the detok shards. `None` under `skip_tokenizer_init`,
-/// else required (missing/failed load → `Err`). `tokenizer_path` is a
-/// tokenizer file, a model dir, or an HF Hub repo id (resolved from the local
-/// cache — no network).
+/// Load the tokenizer shared by the encode pool and (its handle) the detok shards;
+/// `tokenizer_path` may be an HF Hub repo id, read from the local cache only.
 pub fn load_tokenizer(
     tokenizer_path: Option<&str>,
     revision: Option<&str>,
@@ -117,9 +114,7 @@ impl Runnable for TokenizerWorker {
                 }
                 let encoded = match g.chat_prompt.take() {
                     Some(chat) => widen(chat.encode(&*self.tokenizer)),
-                    // Match Python sglang: reject an empty prompt as a 400
-                    // (`Validation`), not the misleading 500 a tokenize error
-                    // would give.
+                    // As Python, an empty prompt is a 400, not a tokenize error's 500.
                     None => match g.text.as_deref().unwrap_or("") {
                         "" => Err(Error::Validation("prompt cannot be empty".into())),
                         text => widen(self.tokenizer.encode(text, true)),
@@ -265,9 +260,8 @@ mod tests {
         }
     }
 
-    /// Plain text keeps the tokenizer's specials; a rendered chat encodes
-    /// without them — Python's `add_special_tokens=False` at the
-    /// chat-template encode site — and its continuation loses its BOS.
+    /// Plain text keeps the tokenizer's specials; a rendered chat encodes without
+    /// them (Python's `add_special_tokens=False`), and its continuation loses its BOS.
     #[test]
     fn rendered_prompts_encode_without_specials() {
         let run = |chat_prompt: Option<Box<RenderedChat>>| {
