@@ -56,7 +56,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 pub(super) struct ChatRequest {
     #[serde(flatten)]
     pub(super) request: CreateChatCompletionRequest,
-    pub(super) chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// The renderer reads it off the raw body; typed here so a malformed one
+    /// is a 400, as Python's request model makes it.
+    #[allow(dead_code)]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
     #[serde(flatten)]
     routing: PDRoutingFields,
 }
@@ -81,12 +84,9 @@ async fn chat_completions(
     body: Result<Json<ChatBody>, JsonRejection>,
 ) -> Response {
     let ChatBody {
-        request:
-            ChatRequest {
-                request,
-                chat_template_kwargs,
-                routing,
-            },
+        request: ChatRequest {
+            request, routing, ..
+        },
         raw,
     } = match body {
         Ok(Json(body)) => body,
@@ -179,11 +179,10 @@ async fn chat_completions(
         &raw,
         &state.server_args.default_chat_template_kwargs,
     );
-    let (request, rendered) =
-        match prepare_chat_request(&state, raw, request, chat_template_kwargs.as_ref()).await {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
-        };
+    let (request, rendered) = match prepare_chat_request(&state, raw, request).await {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
 
     let mut sampling = match chat_sampling(
         &request,
@@ -315,7 +314,6 @@ pub(super) async fn prepare_chat_request(
     state: &AppState,
     body: Value,
     mut request: CreateChatCompletionRequest,
-    kwargs: Option<&ChatTemplateKwargs>,
 ) -> Result<(CreateChatCompletionRequest, RenderedChat), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
@@ -333,7 +331,6 @@ pub(super) async fn prepare_chat_request(
         &formatter,
         body,
         &request,
-        kwargs,
         &state.server_args.default_chat_template_kwargs,
     )
     .map_err(|error| {
