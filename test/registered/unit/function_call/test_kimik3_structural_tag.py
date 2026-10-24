@@ -442,6 +442,92 @@ def test_strict_schema_preserves_additional_properties_default():
     )
 
 
+def _annotate_tool(additional_properties):
+    return Tool(
+        type="function",
+        function=Function(
+            name="annotate",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    # Patterned so the string value cannot swallow a following
+                    # argument tag; the test then only exercises key matching.
+                    "label": {"type": "string", "pattern": "[a-z]+"},
+                    "score": {"type": "integer"},
+                },
+                "required": ["label"],
+                "additionalProperties": additional_properties,
+            },
+        ),
+    )
+
+
+@pytest.mark.parametrize("additional_properties", [True, {"type": "string"}])
+def test_strict_additional_properties_do_not_relax_declared_keys(
+    additional_properties,
+):
+    """The additionalProperties branch matched any key, so a declared property
+    could reappear there under the looser schema: ``score`` declared as an
+    integer was accepted as a string and ``label`` could be repeated. JSON
+    Schema applies additionalProperties only to undeclared keys (#38587)."""
+    grammar = _grammar([_annotate_tool(additional_properties)], tool_choice="required")
+    label = _argument("label", "string", "sample")
+
+    assert _accepts(
+        grammar,
+        _tools_section(_call("annotate", 1, label, _argument("note", "string", "x"))),
+    )
+    assert _accepts(
+        grammar,
+        _tools_section(_call("annotate", 1, label, _argument("score", "number", "3"))),
+    )
+    assert not _accepts(
+        grammar,
+        _tools_section(
+            _call("annotate", 1, label, _argument("score", "string", "high"))
+        ),
+    )
+    assert not _accepts(
+        grammar,
+        _tools_section(
+            _call("annotate", 1, label, _argument("label", "string", "again"))
+        ),
+    )
+
+
+def test_dynamic_keys_exclude_only_the_exact_declared_names():
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="lookup",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "data": {"type": "integer"},
+                    "database": {"type": "string"},
+                },
+                "required": [],
+                "additionalProperties": True,
+            },
+        ),
+    )
+    grammar = _grammar([tool], tool_choice="required")
+
+    for key in ("dat", "datab", "databases", "data_x", "d", "x"):
+        assert _accepts(
+            grammar, _tools_section(_call("lookup", 1, _argument(key, "string", "v")))
+        ), key
+    assert not _accepts(
+        grammar, _tools_section(_call("lookup", 1, _argument("data", "string", "v")))
+    )
+    assert not _accepts(
+        grammar,
+        _tools_section(_call("lookup", 1, _argument("database", "number", "1"))),
+    )
+
+
 def test_dynamic_argument_key_compiles_without_xgrammar_unicode_warning(capfd):
     tool = Tool(
         type="function",
