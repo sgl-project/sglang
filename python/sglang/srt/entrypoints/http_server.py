@@ -510,6 +510,10 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 
     app.add_middleware(RequestDecompressionMiddleware)
 
+from sglang.srt.entrypoints.guard_integration import attach_guard
+
+attach_guard(app)
+
 # Registered at import so that tokenizer workers, which re-import this module, get it too.
 add_http_request_metrics_middleware(app)
 

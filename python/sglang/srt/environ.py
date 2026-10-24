@@ -344,6 +344,31 @@ class Envs:
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
+    # ===================================================================
+    # Optional fastapi-guard security middleware
+    # (sglang/srt/entrypoints/guard_integration.py)
+    # ===================================================================
+    # Opt-in request screening for deployments exposing the bare server:
+    # IP block/allow lists, rate limiting with auto-ban, user-agent
+    # blocking, penetration detection. Default off; the disabled path
+    # imports nothing. Install with pip install "sglang[guard]".
+    SGLANG_GUARD_ENABLED = EnvBool(False)
+    SGLANG_GUARD_RATE_LIMIT = EnvInt(100)
+    SGLANG_GUARD_RATE_LIMIT_WINDOW = EnvInt(60)
+    SGLANG_GUARD_AUTO_BAN_THRESHOLD = EnvInt(10)
+    SGLANG_GUARD_AUTO_BAN_DURATION = EnvInt(300)
+    SGLANG_GUARD_PASSIVE_MODE = EnvBool(False)
+    SGLANG_GUARD_BLOCKED_IPS = EnvStr("")
+    SGLANG_GUARD_ALLOWED_IPS = EnvStr("")
+    SGLANG_GUARD_BLOCKED_USER_AGENTS = EnvStr("")
+    SGLANG_GUARD_TRUSTED_PROXIES = EnvStr("")
+    SGLANG_GUARD_TRUSTED_PROXY_DEPTH = EnvInt(1)
+    SGLANG_GUARD_EXCLUDED_PATHS = EnvStr("")
+    SGLANG_GUARD_BLOCKED_COUNTRIES = EnvStr("")
+    SGLANG_GUARD_ALLOWED_COUNTRIES = EnvStr("")
+    SGLANG_GUARD_BLOCK_CLOUD_PROVIDERS = EnvStr("")
+    SGLANG_GUARD_REDIS_URL = EnvStr("")
+    SGLANG_GUARD_IPINFO_TOKEN = EnvStr("")
 
     # ===================================================================
     # Logging
