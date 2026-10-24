@@ -722,6 +722,7 @@ def test_sensenova_u1_scheduler_normalizes_single_output_seed_lists():
 def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
     scheduler = object.__new__(Scheduler)
     scheduler.server_args = SimpleNamespace(pipeline_config=SenseNovaU1PipelineConfig())
+    scheduler.worker = SimpleNamespace(is_output_rank=True)
     requests = [
         _make_sensenova_u1_scheduler_request(
             "request-0",

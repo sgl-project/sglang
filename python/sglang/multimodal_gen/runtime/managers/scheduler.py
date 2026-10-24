@@ -1125,7 +1125,11 @@ class Scheduler(
         output_items = self._count_first_dim(output_batch.output)
         output_path_items = self._count_first_dim(output_batch.output_file_paths)
 
-        if output_items is None and output_path_items is None:
+        if (
+            self.worker.is_output_rank
+            and output_items is None
+            and output_path_items is None
+        ):
             logger.warning(
                 "Batched output has neither tensor outputs nor output_file_paths; cannot split safely."
             )

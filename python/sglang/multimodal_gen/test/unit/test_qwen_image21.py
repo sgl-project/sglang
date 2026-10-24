@@ -652,6 +652,7 @@ def test_dynamic_batching_preserves_output_order_and_seeds(outputs):
     scheduler = object.__new__(Scheduler)
     config = QwenImage21PipelineConfig()
     scheduler.server_args = SimpleNamespace(pipeline_config=config)
+    scheduler.worker = SimpleNamespace(is_output_rank=True)
     scheduler._batch_admission = SimpleNamespace(enabled=True)
     assert scheduler._dynamic_batching_enabled()
     requests = []
@@ -670,6 +671,22 @@ def test_dynamic_batching_preserves_output_order_and_seeds(outputs):
     torch.testing.assert_close(split[1].output, result[outputs:])
     requests[1].image_path = "reference.png"
     assert scheduler._try_merge_generation_reqs(requests) is None
+
+
+def test_dynamic_batch_split_succeeds_on_non_output_rank():
+    """A non-output TP/SP rank holds no output tensors or file paths after a
+    successful batched forward; splitting must not report a failure there."""
+    scheduler = object.__new__(Scheduler)
+    scheduler.worker = SimpleNamespace(is_output_rank=False)
+    requests = [
+        Req(
+            request_id=f"request-{i}",
+            sampling_params=QwenImage21SamplingParams(prompt="p", seed=i),
+        )
+        for i in range(2)
+    ]
+    split = scheduler._split_batched_output(OutputBatch(), requests)
+    assert split is not None and len(split) == 2
 
 
 @pytest.mark.parametrize("channels", [3, 4])
