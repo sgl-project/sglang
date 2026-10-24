@@ -68,12 +68,9 @@ def fused_mxfp8_rows(rows: int) -> bool:
     return rows <= FUSED_MXFP8_PRODUCER_MAX_ROWS
 
 
-def empty_deepgemm_mxfp8_pair(
-    rows: int, cols: int, device
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Empty fp8 rows and DeepGEMM-packed UE8M0 scales for a producer to fill."""
-    data = torch.empty((rows, cols), device=device, dtype=torch.float8_e4m3fn)
-    scales = create_per_token_group_quant_fp8_output_scale(
+def empty_deepgemm_mxfp8_scales(rows: int, cols: int, device) -> torch.Tensor:
+    """Empty DeepGEMM-packed UE8M0 scales for ``rows`` x ``cols`` fp8 data."""
+    return create_per_token_group_quant_fp8_output_scale(
         (rows, cols),
         device,
         32,
@@ -81,7 +78,14 @@ def empty_deepgemm_mxfp8_pair(
         scale_tma_aligned=True,
         scale_ue8m0=True,
     )
-    return data, scales
+
+
+def empty_deepgemm_mxfp8_pair(
+    rows: int, cols: int, device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Empty fp8 rows and DeepGEMM-packed UE8M0 scales for a producer to fill."""
+    data = torch.empty((rows, cols), device=device, dtype=torch.float8_e4m3fn)
+    return data, empty_deepgemm_mxfp8_scales(rows, cols, device)
 
 
 def fused_mhc_tp_ok(tp_size: int) -> bool:
