@@ -1369,10 +1369,7 @@ class SchedulerBatchResultProcessor:
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.finalize_release_on_finish(req)
         else:
-            if (
-                get_memory().enable_hisparse
-                and self.hisparse_coordinator is not None
-            ):
+            if get_memory().enable_hisparse and self.hisparse_coordinator is not None:
                 self.hisparse_coordinator.request_finished(req)
             self._prepare_kv_cache_release(req)
             release_kv_cache(req, self.tree_cache, checkpoint=False)

@@ -110,8 +110,12 @@ def _qsa_fused_kv_prepare(
             nvoff = input_row.to(tl.int64)[:, None] * NV_STRIDE + head * D + d[None, :]
             dev = (dslot > 0)[:, None] & valid[:, None]
             host = (dslot <= 0)[:, None] & valid[:, None]
-            k_dev = tl.load(K + dslot[:, None] * H * D + head * D + d[None, :], dev, 0.0)
-            v_dev = tl.load(V + dslot[:, None] * H * D + head * D + d[None, :], dev, 0.0)
+            k_dev = tl.load(
+                K + dslot[:, None] * H * D + head * D + d[None, :], dev, 0.0
+            )
+            v_dev = tl.load(
+                V + dslot[:, None] * H * D + head * D + d[None, :], dev, 0.0
+            )
             k_host = tl.load(HK + koff, host, 0.0)
             v_host = tl.load(HV + koff, host, 0.0)
             k_new = tl.load(NK + nkoff, valid[:, None], 0.0)

@@ -3327,6 +3327,6 @@ def _qsa_hisparse_resident_tokens() -> int | None:
     value = int(raw)
     if value < 0:
         raise ValueError(
-            "SGLANG_QSA_HISPARSE_RESIDENT_TOKENS must be >= 0, got " f"{value}"
+            f"SGLANG_QSA_HISPARSE_RESIDENT_TOKENS must be >= 0, got {value}"
         )
     return value

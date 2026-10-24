@@ -333,11 +333,15 @@ class QSATokenToKVPool(HybridLinearKVPool):
         return k_size + qsa_k_size, v_size
 
 
-
 @triton.jit
 def _qsa_host_kv_scatter_kernel(
-    k_ptr, v_ptr, hk_ptr, hv_ptr,
-    dk_ptr, dv_ptr, idx_ptr,
+    k_ptr,
+    v_ptr,
+    hk_ptr,
+    hv_ptr,
+    dk_ptr,
+    dv_ptr,
+    idx_ptr,
     n_rows,
     row_dim: tl.constexpr,
     RESIDENT: tl.constexpr,
@@ -457,8 +461,8 @@ class HiSparseQSATokenToKVPool(QSATokenToKVPool):
         if not self.host_key_buffer_pool:
             return 0
         per_row = self.host_key_buffer_pool[0][0].numel() * 2
-        return self.hisparse_resident_tokens * per_row * 2 * len(
-            self.host_key_buffer_pool
+        return (
+            self.hisparse_resident_tokens * per_row * 2 * len(self.host_key_buffer_pool)
         )
 
     def register_mapping(self, mapping) -> None:
@@ -478,9 +482,7 @@ class HiSparseQSATokenToKVPool(QSATokenToKVPool):
         return self.host_value_buffer_pool[self._transfer_full_attention_id(layer_id)]
 
     # ---- write path (write-through) -----------------------------------------
-    def set_kv_buffer(
-        self, layer, loc_info, cache_k, cache_v, *args, **kwargs
-    ) -> None:
+    def set_kv_buffer(self, layer, loc_info, cache_k, cache_v, *args, **kwargs) -> None:
         if args or kwargs:
             raise NotImplementedError(
                 "HiSparseQSATokenToKVPool.set_kv_buffer does not take scales"
@@ -491,9 +493,7 @@ class HiSparseQSATokenToKVPool(QSATokenToKVPool):
         )
 
         if write_loc_is_physical(loc_info):
-            raise NotImplementedError(
-                "HiSparse QSA writes must carry logical slot ids"
-            )
+            raise NotImplementedError("HiSparse QSA writes must carry logical slot ids")
         loc, _, full_loc = unwrap_write_loc(loc_info)
         logical = loc if full_loc is None else full_loc
         layer_id = self._transfer_full_attention_id(layer.layer_id)
