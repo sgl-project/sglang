@@ -4,7 +4,6 @@ import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
@@ -23,6 +22,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
+    LogitsProcessorOutput,
     should_apply_lm_head_quant_method,
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -451,6 +452,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
         self._is_domino = draft_config.is_domino
+        if get_parallel().attn_dp_enabled and not _is_npu:
+            if self._is_domino or self.lilicorr is not None:
+                raise ValueError(
+                    "DFLASH with dp attention supports plain DFlash and DFlash2 "
+                    "drafts; Domino and LiLiCorr heads are not supported."
+                )
         self.domino_candidate_pool_size = int(
             get_spec().speculative_domino_candidate_pool_size
         )
@@ -689,6 +696,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
+        target_dp_enabled = get_parallel().attn_dp_enabled
         with (
             draft_pp_context(),
             draft_tp_context(self.draft_parallel_layout),
@@ -707,10 +715,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "device graph capture.",
                     type(current_platform).__name__,
                 )
-            if get_parallel().attn_dp_enabled and capture_decode_cuda_graph:
-                # Idle DP ranks skip the draft step, so they cannot join a
-                # shared graph capture/replay; keep the draft eager under dp
-                # attention.
+            if target_dp_enabled and capture_decode_cuda_graph:
+                # Keep the eager-draft policy for idle/unequal DP batches.
+                # The narrowed draft scope hides the target's DP flag.
                 capture_decode_cuda_graph = False
                 if self._target_tp_rank == 0:
                     logger.warning(
@@ -741,6 +748,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+            if target_dp_enabled and not _is_npu and self.selector is not None:
+                self._warm_eager_selector()
+
+    def _warm_eager_selector(self) -> None:
+        # Build selector kernels before serving rather than under the watchdog.
+        hidden = torch.zeros(
+            (int(self.block_size), int(self.draft_model.config.hidden_size)),
+            dtype=self.draft_model_runner.dtype,
+            device=self.device,
+        )
+        self._propose_selector_block(
+            draft_logits_output=LogitsProcessorOutput(
+                next_token_logits=None, hidden_states=hidden
+            ),
+            bs=1,
+            lm_head=unwrap_lora_layer(self._target_worker.model_runner.model.lm_head),
+            anchor_token_ids=torch.zeros((1,), dtype=torch.int64, device=self.device),
+            sampling_info=None,
+        )
 
     def _prewarm_batch_size(self, block_size: int) -> int:
         """Largest batch the non-greedy verify path can see in one step."""
@@ -1352,37 +1378,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
     def _cache_full_embed_weight(self) -> None:
-        """Cache the full target embedding replicated on GPU during init.
-
-        Under dp attention, idle DP ranks skip the draft step, so the attn-TP
-        all_reduce inside VocabParallelEmbedding gets mismatched calls. Gather
-        the full embedding once during init and keep it replicated, making
-        the draft block-id lookup a collective-free on-device F.embedding.
-        """
         if not get_parallel().attn_dp_enabled:
             return
-
-        tp_group = get_parallel().tp_group
-        tp_size = int(tp_group.world_size)
-        if tp_size <= 1:
-            return
-
-        target_model = self._target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
-        local_w = embed_module.weight.data
-        shard = getattr(embed_module, "shard_indices", None)
-        num_org = int(shard.num_org_elements) if shard else local_w.shape[0]
-        vocab_size = int(self._target_worker.model_runner.model_config.vocab_size)
-
-        shard_t = local_w[:num_org].contiguous()
-        parts = [torch.empty_like(shard_t) for _ in range(tp_size)]
-        dist.all_gather(parts, shard_t, group=tp_group.device_group)
-        self._full_embed_gpu = torch.cat(parts, dim=0)[:vocab_size]
-        if get_parallel().tp_rank == 0:
-            logger.info(
-                "DFLASH cached full embed on GPU for dp attention: shape=%s",
-                list(self._full_embed_gpu.shape),
+        embedding = unwrap_lora_layer(
+            _resolve_dflash_embedding_module(
+                self.draft_model, self._target_worker.model_runner.model
             )
+        )
+        # Reconstruct on the table's own group before DP ranks can go idle.
+        self._full_embed_gpu = gather_draft_embedding(embedding)
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -2441,7 +2445,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
                 idle_verify_forward_batch, _ = idle_verify_input.prepare_for_verify(
-                    batch, self._target_worker
+                    batch, self._target_worker, defer_metadata_init=True
                 )
                 # Force eager: the active ranks run eager verify when any DP
                 # rank is idle (see the idle-guard below); a graph-replaying
@@ -2452,7 +2456,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
                     is_verify=True,
-                    skip_attn_backend_init=True,
+                    skip_attn_backend_init=True if _is_npu else None,
                 )
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
@@ -2566,8 +2570,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
         if self._full_embed_gpu is not None:
-            # Replicated lookup avoids the mismatched attn-TP all_reduce
-            # inside VocabParallelEmbedding under dp attention.
+            # A borrowed embedding may use target-wide collectives, while
+            # other DP replicas are idle or looking up different token IDs.
             noise_embedding = torch.nn.functional.embedding(
                 block_ids, self._full_embed_gpu
             )
@@ -2843,7 +2847,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
+            batch,
+            self.target_worker,
+            defer_metadata_init=get_parallel().attn_dp_enabled,
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
@@ -2869,7 +2875,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True if not _is_npu else None,
+            skip_attn_backend_init=(
+                None if _is_npu or get_parallel().attn_dp_enabled else True
+            ),
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
