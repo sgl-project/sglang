@@ -2882,7 +2882,6 @@ class AscendAttnBackend(AttentionBackend):
 
             # DCP verify uses rank-local tables/lengths; ordinary MLA uses full KV.
             # Graph mode binds the corresponding Host list instead of a CPU tensor.
-            block_table = self.forward_metadata.block_tables
             kv_lens_cpu = (
                 self.forward_metadata.dcp_seq_lens_cpu_int
                 if dense_mla_dcp_verify and not self.graph_mode
@@ -2907,7 +2906,7 @@ class AscendAttnBackend(AttentionBackend):
                     layer,
                     batch_size=batch_size,
                     query_len=query_len,
-                    block_table=block_table[:batch_size],
+                    block_table=self.forward_metadata.block_tables[:batch_size],
                     actual_seq_lengths=[query_len] * batch_size,
                     actual_seq_lengths_kv=actual_seq_lengths_kv[:batch_size],
                     attn_mask=self.forward_metadata.dcp_mtp_attn_mask[:batch_size],
@@ -2932,8 +2931,10 @@ class AscendAttnBackend(AttentionBackend):
             # block_table.shape[0] == len(actual_seq_lengths); slice to match.
             if not self.graph_mode:
                 actual_bs = len(actual_seq_lengths)
-                block_table = block_table[:actual_bs]
+                block_table = self.forward_metadata.block_tables[:actual_bs]
                 actual_seq_lengths_kv = actual_seq_lengths_kv[:actual_bs]
+            else:
+                block_table = self.forward_metadata.block_tables
 
             if (
                 self.q_head_num_padding is not None
