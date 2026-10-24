@@ -20,7 +20,10 @@ from sglang_simulator.simulation.sglang import (
 # A spawned worker imports this module while unpickling its target. ModelConfig
 # can import GPU kernels while later arguments are still being unpickled, before
 # the target wrapper executes, so the loader stub must already be present here.
+# Model modules also resolve sgl_kernel CPU op names at import time, so the op
+# stand-ins must already be present here too.
 sgl_kernel_hook.install_load_utils_stub()
+sgl_kernel_hook.install_cpu_op_standins()
 
 _HOOKS_INSTALLED = False
 
@@ -34,6 +37,7 @@ def install_simulator_hooks() -> None:
     # The package __init__ loads GPU ops before a child-module import hook can
     # run reliably under spawn. Seed the loader module before importing SGLang.
     sgl_kernel_hook.install_load_utils_stub()
+    sgl_kernel_hook.install_cpu_op_standins()
 
     sglang_simulator_hook.install_class_hooks(
         [
