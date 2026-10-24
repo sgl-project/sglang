@@ -12,12 +12,16 @@ export const DeepSeekR1BasicDeployment = () => {
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
         { id: 'xeon', label: 'XEON', default: false },
+        { id: 'ascend-a3', label: 'Ascend A3', default: false },
       ],
     },
     quantization: {
       name: 'quantization',
       title: 'Quantization',
       getDynamicItems: (values) => {
+        if (values.hardware === 'ascend-a3') {
+          return [{ id: 'w4a8', label: 'W4A8', subtitle: 'ModelSlim', default: true }];
+        }
         const isXeon = values.hardware === 'xeon';
         const fp4Disabled = values.hardware === 'h100' || values.hardware === 'mi300x' || isXeon;
         return [
@@ -41,9 +45,29 @@ export const DeepSeekR1BasicDeployment = () => {
         ];
       },
     },
+    deployshape: {
+      name: 'deployshape',
+      title: 'A3 deployment',
+      condition: (values) => values.hardware === 'ascend-a3',
+      items: [
+        { id: 'colocated', label: '1×A3 · PD co-located', default: true },
+        { id: 'pd2node', label: '2×A3 · PD disaggregated', default: false },
+      ],
+    },
+    ascendRole: {
+      name: 'ascendRole',
+      title: 'PD role',
+      condition: (values) => values.hardware === 'ascend-a3' && values.deployshape === 'pd2node',
+      items: [
+        { id: 'prefill', label: 'Prefill', default: true },
+        { id: 'decode', label: 'Decode', default: false },
+        { id: 'router', label: 'Router', default: false },
+      ],
+    },
     strategy: {
       name: 'strategy',
       title: 'Deployment Strategy',
+      condition: (values) => values.hardware !== 'ascend-a3',
       type: 'checkbox',
       items: [
         { id: 'tp', label: 'TP', subtitle: 'Tensor Parallel', default: true, required: true },
@@ -55,6 +79,7 @@ export const DeepSeekR1BasicDeployment = () => {
     thinking: {
       name: 'thinking',
       title: 'Reasoning Parser',
+      condition: (values) => values.hardware !== 'ascend-a3',
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
         { id: 'enabled', label: 'Enabled', default: false },
@@ -63,6 +88,7 @@ export const DeepSeekR1BasicDeployment = () => {
     toolcall: {
       name: 'toolcall',
       title: 'Tool Call Parser',
+      condition: (values) => values.hardware !== 'ascend-a3',
       items: [
         { id: 'disabled', label: 'Disabled', default: true },
         { id: 'enabled', label: 'Enabled', default: false },
@@ -93,7 +119,212 @@ export const DeepSeekR1BasicDeployment = () => {
     return initialState;
   };
 
+  // Measured A3 recipes; see the Cookbook for results and validation limits.
+  const ascendA3ReferenceFlags = {
+  "prefill": [
+    "--model-path \"$MODEL_PATH\"",
+    "--disaggregation-mode prefill",
+    "--host \"<prefill-ip>\"",
+    "--port 30000",
+    "--disaggregation-bootstrap-port 8998",
+    "--node-rank 0",
+    "--nnodes 1",
+    "--tp-size 16",
+    "--mem-fraction-static 0.8",
+    "--quantization modelslim",
+    "--max-running-requests 32",
+    "--context-length 8192",
+    "--disable-radix-cache",
+    "--chunked-prefill-size 20480",
+    "--max-prefill-tokens 20480",
+    "--moe-a2a-backend deepep",
+    "--deepep-mode normal",
+    "--speculative-algorithm NEXTN",
+    "--speculative-num-steps 1",
+    "--speculative-eagle-topk 1",
+    "--speculative-num-draft-tokens 2",
+    "--attn-dp-size 8",
+    "--disable-shared-experts-fusion",
+    "--dtype bfloat16",
+    "--reasoning-parser deepseek-r1",
+    "--tool-call-parser deepseekv3",
+    "--max-total-tokens 80000",
+    "--disaggregation-transfer-backend ascend",
+    "--trust-remote-code",
+    "--attention-backend ascend",
+    "--device npu"
+  ],
+  "decode": [
+    "--model-path \"$MODEL_PATH\"",
+    "--disaggregation-mode decode",
+    "--host \"<decode-ip>\"",
+    "--port 30000",
+    "--nnodes 1",
+    "--tp-size 16",
+    "--attn-dp-size 16",
+    "--mem-fraction-static 0.9",
+    "--max-running-requests 416",
+    "--quantization modelslim",
+    "--moe-a2a-backend deepep",
+    "--deepep-mode low_latency",
+    "--enable-dp-lm-head",
+    "--cuda-graph-bs-decode 2 4 6 8 10 12 14 16 18 20 22 24 26",
+    "--watchdog-timeout 9000",
+    "--context-length 8192",
+    "--speculative-algorithm NEXTN",
+    "--speculative-num-steps 2",
+    "--speculative-eagle-topk 1",
+    "--speculative-num-draft-tokens 3",
+    "--disable-shared-experts-fusion",
+    "--dtype bfloat16",
+    "--tokenizer-worker-num 4",
+    "--load-balance-method round_robin",
+    "--reasoning-parser deepseek-r1",
+    "--tool-call-parser deepseekv3",
+    "--max-total-tokens 145792",
+    "--disaggregation-transfer-backend ascend",
+    "--trust-remote-code",
+    "--attention-backend ascend",
+    "--device npu"
+  ],
+  "colocated": [
+    "--model-path \"$MODEL_PATH\"",
+    "--host 127.0.0.1",
+    "--port 30000",
+    "--tp-size 16",
+    "--trust-remote-code",
+    "--attention-backend ascend",
+    "--device npu",
+    "--quantization modelslim",
+    "--watchdog-timeout 9000",
+    "--cuda-graph-bs-decode 4 8 12 14",
+    "--mem-fraction-static 0.9",
+    "--max-running-requests 224",
+    "--context-length 8188",
+    "--disable-radix-cache",
+    "--chunked-prefill-size 65536",
+    "--max-prefill-tokens 3000",
+    "--moe-a2a-backend deepep",
+    "--deepep-mode auto",
+    "--attn-dp-size 16",
+    "--enable-dp-lm-head",
+    "--speculative-algorithm NEXTN",
+    "--speculative-num-steps 3",
+    "--speculative-eagle-topk 1",
+    "--speculative-num-draft-tokens 4",
+    "--dtype bfloat16",
+    "--reasoning-parser deepseek-r1",
+    "--tool-call-parser deepseekv3",
+    "--max-total-tokens 100000"
+  ]
+};
+  const ascendA3Environment = {
+  "colocated": {
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "SGLANG_NPU_USE_MLAPO": "1",
+    "SGLANG_USE_FIA_NZ": "1",
+    "STREAMS_PER_DEVICE": "32",
+    "DEEPEP_HCCL_BUFFSIZE": "2000",
+    "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "1024",
+    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "10",
+    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "72",
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "200",
+    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1"
+  },
+  "prefill": {
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "SGLANG_NPU_USE_MLAPO": "1",
+    "SGLANG_USE_FIA_NZ": "1",
+    "STREAMS_PER_DEVICE": "32",
+    "ENABLE_MOE_NZ": "1",
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "DEEPEP_HCCL_BUFFSIZE": "4000",
+    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
+    "TASK_QUEUE_ENABLE": "2",
+    "ASCEND_MF_TRANSFER_PROTOCOL": "sdma"
+  },
+  "decode": {
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "SGLANG_NPU_USE_MLAPO": "1",
+    "SGLANG_USE_FIA_NZ": "1",
+    "STREAMS_PER_DEVICE": "32",
+    "ENABLE_MOE_NZ": "1",
+    "DEEPEP_HCCL_BUFFSIZE": "800",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "78",
+    "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+    "TASK_QUEUE_ENABLE": "1",
+    "ASCEND_MF_TRANSFER_PROTOCOL": "sdma"
+  }
+};
+
+  // Pack words onto lines of at most `width` characters; a word is never split.
+  const packWords = (words, first, rest, width, tail) => {
+    const out = [];
+    let line = first;
+    let empty = true;
+    words.forEach((word) => {
+      const candidate = empty ? line + word : `${line} ${word}`;
+      if (!empty && candidate.length + tail.length > width) {
+        out.push(line + tail);
+        line = rest + word;
+      } else {
+        line = candidate;
+      }
+      empty = false;
+    });
+    out.push(line);
+    return out;
+  };
+
+  const generateAscendA3Command = (values) => {
+    if (values.quantization !== 'w4a8') {
+      return '# Select ModelSlim W4A8 for Ascend A3.';
+    }
+    if (!['colocated', 'pd2node'].includes(values.deployshape)) {
+      return '# Select one A3 deployment scenario.';
+    }
+    const role = values.deployshape === 'colocated' ? 'colocated' : values.ascendRole;
+    if (!['colocated', 'prefill', 'decode', 'router'].includes(role)) {
+      return '# Select Prefill, Decode, or Router.';
+    }
+    const lines = ['# Ascend A3 ModelSlim W4A8: replace the <...> placeholders and the model path.'];
+    if (role === 'router') {
+      lines.push(
+        ...packWords(
+          ['--pd-disaggregation', '--policy cache_aware', '--prefill "http://<prefill-ip>:30000" 8998',
+            '--decode "http://<decode-ip>:30000"', '--host 127.0.0.1', '--port 6688'],
+          'python -m sglang_router.launch_router ', '  ', 80, ' \\',
+        ),
+      );
+      return lines.join('\n');
+    }
+    lines.push(
+      'MODEL_PATH="/path/to/DeepSeek-R1-0528-w4a8"',
+      'export HCCL_SOCKET_IFNAME=<network-interface> GLOO_SOCKET_IFNAME=<network-interface>',
+    );
+    if (role !== 'colocated') {
+      lines.push(
+        'export ASCEND_MF_STORE_URL="tcp://<prefill-ip>:24670"',
+        'export MF_CONFIG_STORE_URL="tcp://<prefill-ip>:24670"',
+      );
+    }
+    lines.push(
+      'source /usr/local/Ascend/ascend-toolkit/set_env.sh',
+      'source /usr/local/Ascend/nnal/atb/set_env.sh',
+      'unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ASCEND_LAUNCH_BLOCKING',
+      ...packWords(
+        Object.entries(ascendA3Environment[role]).map(([key, value]) => `${key}=${value}`),
+        'export ', 'export ', 80, '',
+      ),
+      ...packWords(ascendA3ReferenceFlags[role], 'python3 -m sglang.launch_server ', '  ', 80, ' \\'),
+    );
+    return lines.join('\n');
+  };
+
   const generateCommand = (values) => {
+    if (values.hardware === 'ascend-a3') return generateAscendA3Command(values);
     const { hardware, quantization, strategy, thinking, toolcall } = values;
     const strategyValues = Array.isArray(strategy) ? strategy : [];
 
@@ -175,6 +406,42 @@ export const DeepSeekR1BasicDeployment = () => {
     return command;
   };
 
+  const getUpdatedValues = (prev, optionName, value) => {
+    const next = { ...prev, [optionName]: value };
+    if (optionName === 'hardware') {
+      const quantizationItems = resolveItems(options.quantization, next);
+      const current = quantizationItems.find((item) => item.id === next.quantization);
+      if (!current || current.disabled) {
+        const fallback =
+          quantizationItems.find((item) => item.default && !item.disabled) ||
+          quantizationItems.find((item) => !item.disabled);
+        if (fallback) {
+          next.quantization = fallback.id;
+        }
+      }
+    }
+    if (optionName === 'hardware') {
+      if (next.hardware === 'xeon') {
+        next.quantization = 'int8';
+      } else if (next.quantization === 'int8') {
+        next.quantization = 'fp8';
+      }
+    }
+    const strategyItems = options.strategy.items || [];
+    const currentStrategy = Array.isArray(next.strategy) ? next.strategy : [];
+    next.strategy = currentStrategy.filter((id) => {
+      const item = strategyItems.find((s) => s.id === id);
+      if (!item) {
+        return false;
+      }
+      if (typeof item.disabledWhen === 'function' && item.disabledWhen(next)) {
+        return false;
+      }
+      return true;
+    });
+    return next;
+  };
+
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
 
@@ -197,41 +464,7 @@ export const DeepSeekR1BasicDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => {
-      const next = { ...prev, [optionName]: value };
-      if (optionName === 'hardware') {
-        const quantizationItems = resolveItems(options.quantization, next);
-        const current = quantizationItems.find((item) => item.id === next.quantization);
-        if (!current || current.disabled) {
-          const fallback =
-            quantizationItems.find((item) => item.default && !item.disabled) ||
-            quantizationItems.find((item) => !item.disabled);
-          if (fallback) {
-            next.quantization = fallback.id;
-          }
-        }
-      }
-      if (optionName === 'hardware') {
-        if (next.hardware === 'xeon') {
-          next.quantization = 'int8';
-        } else if (next.quantization === 'int8') {
-          next.quantization = 'fp8';
-        }
-      }
-      const strategyItems = options.strategy.items || [];
-      const currentStrategy = Array.isArray(next.strategy) ? next.strategy : [];
-      next.strategy = currentStrategy.filter((id) => {
-        const item = strategyItems.find((s) => s.id === id);
-        if (!item) {
-          return false;
-        }
-        if (typeof item.disabledWhen === 'function' && item.disabledWhen(next)) {
-          return false;
-        }
-        return true;
-      });
-      return next;
-    });
+    setValues((prev) => getUpdatedValues(prev, optionName, value));
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -418,7 +651,7 @@ export const DeepSeekR1BasicDeployment = () => {
                     >
                       <input
                         type="radio"
-                        name={option.name}
+                        name={`deepseek-r1-basic-${option.name}`}
                         value={item.id}
                         checked={isChecked}
                         disabled={isDisabled}
