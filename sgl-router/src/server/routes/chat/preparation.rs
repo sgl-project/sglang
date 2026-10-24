@@ -20,7 +20,7 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{json, Number, Value};
 use sglang_processor::openai::{
-    lower_chat, lower_completion, OpenAiHeaders, OpenAiSettings, Responder,
+    lower_chat, lower_completion, GenerateRequest, OpenAiHeaders, OpenAiSettings, Responder,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -180,7 +180,13 @@ impl PreparedRequest {
             .collect();
         let with_defaults = append_fields(&body, &defaults).unwrap_or_else(|| body.clone());
         let lowered = if lower {
-            lower_openai(ctx, path, &model, headers, &with_defaults)
+            lower_openai(ctx, path, &model, headers, &with_defaults).and_then(
+                |(generate, responder)| {
+                    let generate =
+                        serde_json::to_value(generate).map_err(|_| "generate_serialization")?;
+                    Ok((generate, responder))
+                },
+            )
         } else {
             Err("native_grpc")
         };
@@ -626,7 +632,7 @@ fn lower_openai(
     model: &ModelId,
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<(Value, Responder), &'static str> {
+) -> Result<(GenerateRequest, Responder), &'static str> {
     let settings = model_openai_settings(ctx, model).ok_or("engine_settings_unknown")?;
     let headers = OpenAiHeaders {
         // The router owns DP ranks; a client's header is never forwarded.
@@ -640,31 +646,29 @@ fn lower_openai(
             .any(|name| header_str(headers, name) == Some("1")),
     };
     let tokenizer = ctx.tokenizers.openai();
-    let (body, responder) = if path == COMPLETIONS_PATH {
-        lower_completion(body, &headers, &settings, tokenizer)
+    if path == COMPLETIONS_PATH {
+        return lower_completion(body, &headers, &settings, tokenizer)
             .map(|(body, responder)| (body, Responder::Completion(Box::new(responder))))
-    } else {
-        // Only renderers verified against SGLang render every chat.
-        if forwarding_scope(ctx, model) != ForwardingScope::AllText {
-            return Err("chat_rendering_unverified");
-        }
-        let engine_kwargs = settings
-            .default_chat_template_kwargs
-            .clone()
-            .unwrap_or_default();
-        if engine_kwargs.into_iter().collect::<HashMap<_, _>>()
-            != ctx.config.model.default_chat_template_kwargs
-        {
-            return Err("default_chat_template_kwargs_differ");
-        }
-        let render = |request: &Value| ctx.tokenizers.encode_chat(&model.0, request);
-        let chat_model = ctx.tokenizers.chat_model();
-        lower_chat(body, &headers, &settings, chat_model, render, tokenizer)
-            .map(|(body, responder)| (body, Responder::Chat(Box::new(responder))))
+            .map_err(|unsupported| unsupported.0);
     }
-    .map_err(|unsupported| unsupported.0)?;
-    let body = serde_json::to_value(body).map_err(|_| "generate_serialization")?;
-    Ok((body, responder))
+    // Only renderers verified against SGLang render every chat.
+    if forwarding_scope(ctx, model) != ForwardingScope::AllText {
+        return Err("chat_rendering_unverified");
+    }
+    let engine_kwargs = settings
+        .default_chat_template_kwargs
+        .clone()
+        .unwrap_or_default();
+    if engine_kwargs.into_iter().collect::<HashMap<_, _>>()
+        != ctx.config.model.default_chat_template_kwargs
+    {
+        return Err("default_chat_template_kwargs_differ");
+    }
+    let render = |request: &Value| ctx.tokenizers.encode_chat(&model.0, request);
+    let chat_model = ctx.tokenizers.chat_model();
+    lower_chat(body, &headers, &settings, chat_model, render, tokenizer)
+        .map(|(body, responder)| (body, Responder::Chat(Box::new(responder))))
+        .map_err(|unsupported| unsupported.0)
 }
 
 /// The OpenAI settings every worker of `model` reports; `None` if any is unread or they differ.
