@@ -225,6 +225,72 @@ class TestMlaGluonDecodeShapes(CustomTestCase):
             )
         self.assertIsNone(out)
 
+    def test_kv_len_hint_is_forwarded(self):
+        layer = _layer()
+        captured = {}
+
+        def fake_kernel(*args, **kwargs):
+            captured["hint"] = kwargs.get("kv_len_hint")
+
+        with mock.patch(_GLUON_FN, return_value=fake_kernel):
+            mod.mla_gluon_decode(
+                q=torch.zeros(4, 12, 576, dtype=torch.bfloat16),
+                k_buffer=torch.zeros(64, 576, dtype=torch.bfloat16),
+                layer=layer,
+                kv_indices=torch.zeros(64, dtype=torch.int32),
+                kv_indptr=torch.zeros(5, dtype=torch.int32),
+                sm_scale=layer.scaling,
+                min_kv_seq_len=128,
+                kv_len_hint=131072,
+            )
+        self.assertEqual(captured["hint"], 131072)
+
+    def test_kv_len_hint_skipped_on_older_aiter(self):
+        layer = _layer()
+        captured = {}
+
+        def fake_kernel(
+            q_nope,
+            q_pe,
+            kv_c,
+            o,
+            kv_indices,
+            kv_indptr,
+            sm_scale,
+            k_pe=None,
+            kv_pe_offset=0,
+            use_2d_view=False,
+            kv_scale=1.0,
+            min_kv_seq_len=1,
+            return_lse=False,
+        ):
+            captured["called"] = True
+
+        with mock.patch(_GLUON_FN, return_value=fake_kernel):
+            mod.mla_gluon_decode(
+                q=torch.zeros(4, 12, 576, dtype=torch.bfloat16),
+                k_buffer=torch.zeros(64, 576, dtype=torch.bfloat16),
+                layer=layer,
+                kv_indices=torch.zeros(64, dtype=torch.int32),
+                kv_indptr=torch.zeros(5, dtype=torch.int32),
+                sm_scale=layer.scaling,
+                min_kv_seq_len=128,
+                kv_len_hint=131072,
+            )
+        self.assertTrue(captured["called"])
+
+    def test_kv_len_hint_is_static_capacity(self):
+        self.assertEqual(mod.mla_gluon_kv_len_hint(1_048_576), 1_048_576)
+        self.assertEqual(
+            mod.mla_gluon_kv_len_hint(
+                1_048_576, local_shard=True, dcp_world_size=8
+            ),
+            131_072,
+        )
+        self.assertEqual(
+            mod.mla_gluon_kv_len_hint(10, local_shard=True, dcp_world_size=8), 2
+        )
+
 
 class TestForwardMlaDecodeDispatch(CustomTestCase):
     """_forward_mla_decode picks Gluon or the zero-pad ASM path, never both."""
