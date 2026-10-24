@@ -7,18 +7,27 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
-from transformers import LlamaConfig, Qwen3_5Config
+from transformers import (
+    Cohere2Config,
+    Gemma2Config,
+    Gemma3TextConfig,
+    LlamaConfig,
+    Qwen3_5Config,
+)
 
 from sglang.srt.arg_groups.overrides import model_config_of
 from sglang.srt.configs.model_config import (
     ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
+    is_hybrid_swa_model,
+    is_layer_types_hybrid_swa_model,
     is_multimodal_model,
     load_decision_config,
     register_model_config_factory,
     resolve_spec_hidden_size,
 )
+from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -50,6 +59,61 @@ class TestHybridLayerIds(CustomTestCase):
                     get_hybrid_layer_ids([architecture], config),
                     ([0, 2], [1, 3]),
                 )
+
+    def test_layer_types_mix_makes_a_model_hybrid_swa(self):
+        exaone4_32b = SimpleNamespace(
+            num_hidden_layers=8,
+            sliding_window=4096,
+            sliding_window_pattern="LLLG",
+            layer_types=(["sliding_attention"] * 3 + ["full_attention"]) * 2,
+        )
+        olmo3 = Olmo3Config(num_hidden_layers=8, sliding_window=4096)
+        # The full-attention layers each model's own code builds.
+        cases = {
+            "Gemma2ForCausalLM": (Gemma2Config(num_hidden_layers=6), [1, 3, 5]),
+            "Gemma3ForCausalLM": (Gemma3TextConfig(num_hidden_layers=12), [5, 11]),
+            "Cohere2ForCausalLM": (Cohere2Config(num_hidden_layers=8), [3, 7]),
+            "Exaone4ForCausalLM": (exaone4_32b, [3, 7]),
+            olmo3.architectures[0]: (olmo3, [3, 7]),
+        }
+        for architecture, (config, full) in cases.items():
+            with self.subTest(architecture=architecture):
+                self.assertTrue(is_hybrid_swa_model([architecture], config))
+                self.assertTrue(is_layer_types_hybrid_swa_model([architecture], config))
+                swa = [i for i in range(config.num_hidden_layers) if i not in full]
+                self.assertEqual(
+                    get_hybrid_layer_ids([architecture], config), (swa, full)
+                )
+
+    def test_layer_types_without_a_sliding_full_mix_are_not_hybrid_swa(self):
+        cases = {
+            "no window": (None, ["sliding_attention", "full_attention"]),
+            "all full": (4096, ["full_attention"] * 2),
+            "all sliding": (4096, ["sliding_attention"] * 2),
+            "other kinds": (4096, ["sliding_attention", "linear_attention"]),
+            "fewer than the layers": (4096, ["sliding_attention"]),
+        }
+        for name, (sliding_window, layer_types) in cases.items():
+            with self.subTest(name):
+                config = SimpleNamespace(
+                    num_hidden_layers=2,
+                    sliding_window=sliding_window,
+                    layer_types=layer_types,
+                )
+                self.assertFalse(is_hybrid_swa_model(["LlamaForCausalLM"], config))
+                self.assertEqual(
+                    get_hybrid_layer_ids(["LlamaForCausalLM"], config), (None, None)
+                )
+
+    def test_listed_architectures_keep_their_own_rule(self):
+        config = SimpleNamespace(
+            num_hidden_layers=2,
+            sliding_window=4096,
+            layer_types=["sliding_attention", "full_attention"],
+        )
+        self.assertTrue(is_hybrid_swa_model(["Gemma4ForCausalLM"], config))
+        self.assertFalse(is_layer_types_hybrid_swa_model(["Gemma4ForCausalLM"], config))
+        self.assertTrue(is_layer_types_hybrid_swa_model(["Gemma3ForCausalLM"], config))
 
 
 class TestEmbeddingGemmaConfig(CustomTestCase):

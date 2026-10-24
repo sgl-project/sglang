@@ -1321,6 +1321,33 @@ def _attention_backend_platform_fallbacks(view: Any) -> dict:
 
 
 @register_post_process
+def _hybrid_swa_memory_backend_disable(view: Any) -> dict:
+    if view.disable_hybrid_swa_memory:
+        return {}
+    from sglang.srt.configs.model_config import is_layer_types_hybrid_swa_model
+
+    model_config = model_config_of(view)
+    architectures = model_config.hf_config.architectures
+    if not is_layer_types_hybrid_swa_model(architectures, model_config.hf_text_config):
+        return {}
+    # aiter: with the SWA pool it serves these models through unified_attention,
+    # which loses a passkey 32K tokens back on Gemma 3 that triton retrieves;
+    # drop it here once unified_attention retrieves it too.
+    # wave, flex_attention: they never translate full-pool slots into SWA ones.
+    backends = [
+        backend
+        for backend in attention_backends_of(view)
+        if backend in ("aiter", "wave", "flex_attention")
+    ]
+    if not backends:
+        return {}
+    logger.warning(
+        f"Disable hybrid SWA memory for {architectures[0]} on the {backends[0]} attention backend."
+    )
+    return {"disable_hybrid_swa_memory": True}
+
+
+@register_post_process
 def _intel_xpu_page_constraint(view: Any) -> dict:
     prefill_backend, decode_backend = attention_backends_of(view)
     if "intel_xpu" in (prefill_backend, decode_backend):

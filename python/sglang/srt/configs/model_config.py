@@ -1191,6 +1191,12 @@ class ModelConfig:
             is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
             and not self.disable_hybrid_swa_memory
         )
+        self.is_layer_types_hybrid_swa = (
+            self.is_hybrid_swa
+            and is_layer_types_hybrid_swa_model(
+                self.hf_config.architectures, self.hf_text_config
+            )
+        )
         # Whole-model split, read-only; per-runner slices live on ModelLayerInfo.
         self.swa_attention_layer_ids: Optional[List[int]] = None
         self.full_attention_layer_ids: Optional[List[int]] = None
@@ -2619,7 +2625,50 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     return base_scaling * mscale * mscale
 
 
+def mixed_sliding_layer_types(
+    hf_text_config: Optional[PretrainedConfig],
+) -> Optional[List[str]]:
+    """Per-layer kinds of a config that mixes sliding-window and full attention.
+
+    None unless `sliding_window` is set and the first `num_hidden_layers` entries
+    of `layer_types` are all "sliding_attention" or "full_attention", both present.
+    """
+    if hf_text_config is None or not getattr(hf_text_config, "sliding_window", None):
+        return None
+    num_layers = getattr(hf_text_config, "num_hidden_layers", None)
+    layer_types = getattr(hf_text_config, "layer_types", None)
+    if num_layers is None or not layer_types or len(layer_types) < num_layers:
+        return None
+    layer_types = list(layer_types[:num_layers])
+    if set(layer_types) != {"sliding_attention", "full_attention"}:
+        return None
+    return layer_types
+
+
 def is_hybrid_swa_model(
+    model_architectures: List[str],
+    hf_text_config: Optional[PretrainedConfig] = None,
+):
+    return _is_listed_hybrid_swa_model(model_architectures, hf_text_config) or (
+        mixed_sliding_layer_types(hf_text_config) is not None
+    )
+
+
+def is_layer_types_hybrid_swa_model(
+    model_architectures: List[str],
+    hf_text_config: Optional[PretrainedConfig],
+) -> bool:
+    """Hybrid SWA only because `layer_types` mixes sliding and full layers.
+
+    Such a split comes from the HF config alone, so ModelRunner checks it against
+    the attention layers the model builds.
+    """
+    return not _is_listed_hybrid_swa_model(model_architectures, hf_text_config) and (
+        mixed_sliding_layer_types(hf_text_config) is not None
+    )
+
+
+def _is_listed_hybrid_swa_model(
     model_architectures: List[str],
     hf_text_config: Optional[PretrainedConfig] = None,
 ):
@@ -2784,6 +2833,13 @@ def get_hybrid_layer_ids(
         ]
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
+        ]
+    elif (layer_types := mixed_sliding_layer_types(hf_text_config)) is not None:
+        swa_attention_layer_ids = [
+            i for i, kind in enumerate(layer_types) if kind == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, kind in enumerate(layer_types) if kind == "full_attention"
         ]
     else:
         swa_attention_layer_ids = None
