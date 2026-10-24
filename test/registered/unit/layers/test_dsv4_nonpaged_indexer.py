@@ -564,10 +564,13 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         token_to_kv_pool = MagicMock()
         token_to_kv_pool.get_index_k_scale_buffer.return_value = (k_u8, scale_u8)
         c4_indexer = SimpleNamespace(layer_id=17)
-        expected = MagicMock(name="logits")
-        deep_gemm = SimpleNamespace(fp8_mqa_logits=MagicMock(return_value=expected))
+        expected = torch.zeros((query_rows, 128), dtype=torch.float32)
+        deep_gemm = SimpleNamespace(fp8_fp4_mqa_logits=MagicMock(return_value=expected))
 
-        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+        with (
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+            patch(f"{_INDEXER}.dsv4_fp8_index_cache_is_ue8m0", return_value=False),
+        ):
             kv = C4IndexerBackendMixin._gather_nonpaged_index_k(
                 c4_indexer=c4_indexer,
                 token_to_kv_pool=token_to_kv_pool,
@@ -589,7 +592,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             seq_len_sum=65,
             max_seq_len=65,
         )
-        call = deep_gemm.fp8_mqa_logits.call_args
+        call = deep_gemm.fp8_fp4_mqa_logits.call_args
         torch.testing.assert_close(call.args[0], q_indexer[:query_rows])
         torch.testing.assert_close(call.args[1][0], k_u8.view(FP8_DTYPE))
         torch.testing.assert_close(
@@ -598,7 +601,8 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         torch.testing.assert_close(call.args[2], weights[:query_rows])
         torch.testing.assert_close(call.args[3], plan.ks)
         torch.testing.assert_close(call.args[4], plan.ke)
-        self.assertEqual(call.kwargs, {"clean_logits": False, "max_seqlen_k": 128})
+        self.assertEqual(call.args[5], 128)
+        self.assertEqual(call.kwargs, {})
 
 
 class TestMqaLogitsBudgetArithmetic(CustomTestCase):
@@ -1162,7 +1166,9 @@ class TestCandidateIndexerGating(CustomTestCase):
         )
 
         def sm100(value):
-            return patch.object(v41_indexer, "is_sm100_or_newer", lambda: value)
+            return patch.object(
+                v41_indexer, "has_deep_gemm_index_logits", lambda: value
+            )
 
         def make(topk_blocks, block_size):
             # The prefill choice reads the real DeepGEMM build and is cached.

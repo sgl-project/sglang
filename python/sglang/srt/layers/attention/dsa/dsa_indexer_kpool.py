@@ -9,6 +9,13 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+    fp8_paged_mqa_logits,
+    mx_kv_scale,
+    mx_q_and_weights,
+    to_fp32_logits,
+    uses_mx_mqa_logits,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
     BaseIndexerMetadata,
@@ -21,6 +28,7 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     dsa_use_prefill_cp,
+    resolve_paged_mqa_logits_metadata_fn,
 )
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_MAX_BYTES_ROCM,
@@ -96,6 +104,9 @@ def _mqa_logits_row_chunks(
     # get_is_capture_mode(), but its eager breaks run here and need the budget.
     if capture_mode.is_capture_mode or torch.cuda.is_current_stream_capturing():
         return (slice(0, num_rows),)
+    if uses_mx_mqa_logits(device):
+        # BF16 logits plus their FP32 copy for top-k
+        num_cols = num_cols * 3 // 2
     device_index = device.index
     assert device_index is not None, "q_fp8 must be on an indexed CUDA device"
     # The logits kernel (DeepGEMM, or AITER on ROCm) allocates them outside every
@@ -189,6 +200,11 @@ class IndexerKPool(MultiPlatformOp):
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
+        self.mx_mqa_logits = uses_mx_mqa_logits(get_device().device)
+        # Other paged backends read the FP32 scales, which are repacked per call
+        self.ue8m0_index_cache = (
+            self.mx_mqa_logits and self.paged_mqa_logits_backend.is_deepgemm()
+        )
 
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.index_kpool, self.head_dim, dtype=torch.float32)
@@ -241,6 +257,7 @@ class IndexerKPool(MultiPlatformOp):
             )
         self.block_size = block_size
         self.scale_fmt = scale_fmt
+        self.round_index_scale = scale_fmt is not None or self.mx_mqa_logits
         self.softmax_scale = self.head_dim**-0.5
 
     @torch.compile(dynamic=True)
@@ -327,7 +344,8 @@ class IndexerKPool(MultiPlatformOp):
             ape=self.index_kpool_compress_ape,
             loc=write_locs.contiguous(),
             write_mask=write_mask.contiguous() if write_mask is not None else None,
-            round_scale=self.scale_fmt is not None,
+            round_scale=self.round_index_scale,
+            ue8m0_scale=self.ue8m0_index_cache,
             return_compressed=return_compressed,
             write_cache=write_cache,
         )
@@ -372,7 +390,8 @@ class IndexerKPool(MultiPlatformOp):
             positions=positions[:batch],
             seq_lens=metadata.get_seqlens_int32()[:batch],
             out_cache_loc=forward_batch.out_cache_loc[:batch],
-            round_scale=self.scale_fmt is not None,
+            round_scale=self.round_index_scale,
+            ue8m0_scale=self.ue8m0_index_cache,
         )
 
     def _compress_write_extend(
@@ -484,7 +503,8 @@ class IndexerKPool(MultiPlatformOp):
                     tail_logical_base=writes.tail_logical_base,
                     ape=self.index_kpool_compress_ape,
                     loc=writes.write_loc,
-                    round_scale=self.scale_fmt is not None,
+                    round_scale=self.round_index_scale,
+                    ue8m0_scale=self.ue8m0_index_cache,
                 )
 
             if not tails.is_empty:
@@ -836,7 +856,7 @@ class IndexerKPool(MultiPlatformOp):
                 ).contiguous()
             pool_schedule_metadata = plan.pool_schedule_metadata
             if pool_schedule_metadata is None and build_schedule_metadata:
-                pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                pool_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                     pool_context_lens.clamp(min=1), blocksize, self.sm_count
                 )
             return (
@@ -876,7 +896,7 @@ class IndexerKPool(MultiPlatformOp):
 
         pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
         if pool_schedule_metadata is None and build_schedule_metadata:
-            pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+            pool_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                 pool_context_lens.clamp(min=1), blocksize, self.sm_count
             )
 
@@ -913,7 +933,51 @@ class IndexerKPool(MultiPlatformOp):
         return None, None, None
 
     @staticmethod
+    def _aiter_mqa_logits(
+        q_fp8: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        starts: torch.Tensor,
+        ends: torch.Tensor,
+    ) -> torch.Tensor:
+        from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+        # above 2 GiB of fp32 logits the kernel miscompiles and abort()s the
+        # process (ROCm/aiter#5114); rows are independent, so block the queries
+        num_q, num_k = q_fp8.shape[0], k_fp8.shape[0]
+        rows_per_call = mqa_logits_rows_per_chunk(
+            num_rows=num_q,
+            # aiter pads each output row to 256 columns
+            row_bytes=mqa_logits_row_bytes(num_k),
+            budget_bytes=MQA_LOGITS_MAX_BYTES_ROCM,
+        )
+        if rows_per_call is None:
+            return fp8_mqa_logits(
+                q_fp8,
+                k_fp8,
+                k_scale,
+                weights,
+                starts,
+                ends,
+                clean_logits=True,
+            )
+        logits = torch.empty((num_q, num_k), dtype=torch.float32, device=q_fp8.device)
+        for i in range(0, num_q, rows_per_call):
+            rows = slice(i, i + rows_per_call)
+            logits[rows] = fp8_mqa_logits(
+                q_fp8[rows],
+                k_fp8,
+                k_scale,
+                weights[rows],
+                starts[rows],
+                ends[rows],
+                clean_logits=True,
+            )
+        return logits
+
     def _fp8_mqa_logits(
+        self,
         q_fp8: torch.Tensor,
         k_fp8: torch.Tensor,
         k_scale: torch.Tensor,
@@ -921,49 +985,47 @@ class IndexerKPool(MultiPlatformOp):
         starts: torch.Tensor,
         ends: torch.Tensor,
         *,
-        clean_logits: bool,
+        max_seqlen_k: int,
     ) -> torch.Tensor:
-        """Ragged MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm."""
+        """Ragged FP32 MQA logits: DeepGEMM on CUDA, AITER's Triton kernel on ROCm.
+
+        DeepGEMM's are compressed (column ``j`` of row ``i`` is key ``starts[i] + j``),
+        AITER's span every key with ``-inf`` outside ``[starts, ends)``."""
         if is_hip():
-            from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-
-            # above 2 GiB of fp32 logits the kernel miscompiles and abort()s the
-            # process (ROCm/aiter#5114); rows are independent, so block the queries
-            num_q, num_k = q_fp8.shape[0], k_fp8.shape[0]
-            rows_per_call = mqa_logits_rows_per_chunk(
-                num_rows=num_q,
-                # aiter pads each output row to 256 columns
-                row_bytes=mqa_logits_row_bytes(num_k),
-                budget_bytes=MQA_LOGITS_MAX_BYTES_ROCM,
+            return self._aiter_mqa_logits(q_fp8, k_fp8, k_scale, weights, starts, ends)
+        if self.mx_mqa_logits:
+            q, weights = mx_q_and_weights(q_fp8, weights)
+            k_scale = mx_kv_scale(
+                k_scale.view(torch.int32) if self.ue8m0_index_cache else k_scale
             )
-            if rows_per_call is None:
-                return fp8_mqa_logits(
-                    q_fp8,
-                    k_fp8,
-                    k_scale,
-                    weights,
-                    starts,
-                    ends,
-                    clean_logits=clean_logits,
-                )
-            logits = torch.empty(
-                (num_q, num_k), dtype=torch.float32, device=q_fp8.device
-            )
-            for i in range(0, num_q, rows_per_call):
-                rows = slice(i, i + rows_per_call)
-                logits[rows] = fp8_mqa_logits(
-                    q_fp8[rows],
-                    k_fp8,
-                    k_scale,
-                    weights[rows],
-                    starts[rows],
-                    ends[rows],
-                    clean_logits=clean_logits,
-                )
-            return logits
+        else:
+            q = q_fp8
+        logits = deep_gemm.fp8_fp4_mqa_logits(
+            q, (k_fp8, k_scale), weights, starts, ends, max_seqlen_k
+        )
+        # ponytail: FP32 copy for the FP32-only top-k kernels; read BF16 there to drop it
+        return to_fp32_logits(logits)
 
-        return deep_gemm.fp8_mqa_logits(
-            q_fp8, (k_fp8, k_scale), weights, starts, ends, clean_logits=clean_logits
+    def _deep_gemm_paged_mqa_logits(
+        self,
+        q_fp8: torch.Tensor,
+        kv_cache: torch.Tensor,
+        weights: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        schedule_metadata: torch.Tensor,
+        max_seq_len: int,
+    ) -> torch.Tensor:
+        """FP32 logits ``[rows, max_seq_len]`` of ``q_fp8`` ``[rows, heads, dim]``,
+        garbage past each row's context length."""
+        return fp8_paged_mqa_logits(
+            q_fp8.unsqueeze(1),
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            schedule_metadata,
+            max_seq_len,
         )
 
     @staticmethod
@@ -1076,15 +1138,14 @@ class IndexerKPool(MultiPlatformOp):
                 clean_logits=False,
             )
         else:
-            logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8.unsqueeze(1),
+            logits = self._deep_gemm_paged_mqa_logits(
+                q_fp8,
                 kv_cache_fp8,
                 weights,
                 pool_context_lens,
                 pool_block_tables,
                 pool_schedule_metadata,
                 pool_max_seq_len,
-                clean_logits=False,
             )
 
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
@@ -1107,6 +1168,7 @@ class IndexerKPool(MultiPlatformOp):
         kv_fp8: Optional[Tuple[torch.Tensor, torch.Tensor]],
         logits_starts: Optional[torch.Tensor],
         logits_ends: torch.Tensor,
+        max_seqlen_k: int,
         pool_lens: torch.Tensor,
         seq_lens: Optional[torch.Tensor],
         page_table: Optional[torch.Tensor],
@@ -1138,7 +1200,7 @@ class IndexerKPool(MultiPlatformOp):
                     weights=weights[rows].contiguous(),
                     starts=logits_starts[rows],
                     ends=logits_ends[rows],
-                    clean_logits=True,
+                    max_seqlen_k=max_seqlen_k,
                 )
             topk_chunk = self._topk_from_kpool_logits(
                 logits=logits,
@@ -1152,7 +1214,9 @@ class IndexerKPool(MultiPlatformOp):
                     else _slice_rows(tensor=page_table, rows=rows)
                 ),
                 topk_offsets=_slice_rows(tensor=topk_offsets, rows=rows),
-                row_starts=_slice_rows(tensor=topk_row_starts, rows=rows),
+                row_starts=(
+                    _slice_rows(tensor=topk_row_starts, rows=rows) if is_hip() else None
+                ),
                 out_rows=out_rows if single_chunk else None,
                 page_table_row_index=_slice_rows(
                     tensor=page_table_row_index, rows=rows
@@ -1242,6 +1306,7 @@ class IndexerKPool(MultiPlatformOp):
             kv_fp8=kv_fp8,
             logits_starts=ks_per_q,
             logits_ends=ke_per_q,
+            max_seqlen_k=total_k_rows,
             pool_lens=pool_lens,
             seq_lens=seq_lens_expanded,
             page_table=page_table_all,
@@ -1488,6 +1553,7 @@ class IndexerKPool(MultiPlatformOp):
                 kv_fp8=local_kv_fp8,
                 logits_starts=row_starts,
                 logits_ends=local_pool_lens,
+                max_seqlen_k=pool_seq_len,
                 pool_lens=local_pool_lens,
                 seq_lens=local_seqlens,
                 page_table=page_table_local,
@@ -1635,7 +1701,8 @@ class IndexerKPool(MultiPlatformOp):
                 write_loc=plan.write_loc,
                 out_cache_loc=forward_batch.out_cache_loc,
                 num_draft_tokens=num_draft_tokens,
-                round_scale=self.scale_fmt is not None,
+                round_scale=self.round_index_scale,
+                ue8m0_scale=self.ue8m0_index_cache,
                 effective_n_per_batch=plan.effective_n_per_batch,
             )
 

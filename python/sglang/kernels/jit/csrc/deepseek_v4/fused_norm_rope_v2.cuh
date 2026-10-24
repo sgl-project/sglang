@@ -65,9 +65,16 @@ enum class ForwardMode : bool {
 // ----------------------------------------------------------------------------
 // Indexer variant: kHeadDim = 128, 1 token per *warp* (8 tokens per block).
 // Each warp's 32 lanes cover the full 128-elem head_dim (kVecSize = 4 each).
-// Cache layout: 132 bytes/token (128 fp8 nope + 4 fp32 scale).
+// Cache layout: 132 bytes/token (128 fp8 nope + 4 scale bytes in one of the
+// deepseek_v4::fp8::kIndexKScale* formats, kScaleFmt).
 // ----------------------------------------------------------------------------
-template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL, int32_t kPreshuffleSize = 0>
+template <
+    typename DType,
+    ForwardMode kMode,
+    int32_t kPageBits,
+    bool kUsePDL,
+    int32_t kPreshuffleSize = 0,
+    int kScaleFmt = deepseek_v4::fp8::kIndexKScaleFP32>
 INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
@@ -205,8 +212,9 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
       local_max = math::max(local_max, math::abs(data[i]));
     }
     const auto abs_max = warp::reduce_max(local_max);
-    const auto scale = fmaxf(1e-4f, abs_max) / kFP8E4M3Max;
-    const auto inv_scale = 1.0f / scale;
+    uint32_t stored_scale;
+    const auto inv_scale =
+        deepseek_v4::fp8::quant_index_k_scale<kScaleFmt>(fmaxf(1e-4f, abs_max) / kFP8E4M3Max, stored_scale);
     const int64_t page = out_loc >> kPageBits;
     const int64_t offset = out_loc & ((1 << kPageBits) - 1);
     const auto page_ptr = params.kvcache + page * kPageBytes;
@@ -229,8 +237,8 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
     } else {
       result.store(value_ptr, lane_id);
     }
-    // The single fp32 scale is identical across all lanes -- write from any lane.
-    if (lane_id == 0) reinterpret_cast<float*>(scale_ptr)[0] = scale;
+    // The single scale is identical across all lanes -- write from any lane.
+    if (lane_id == 0) reinterpret_cast<uint32_t*>(scale_ptr)[0] = stored_scale;
   }
 }
 
@@ -580,7 +588,8 @@ template <
     int32_t kPreshuffleSize,
     bool kBf16Store,
     deepseek_v4::KVLayout kLayout,
-    bool kUsePDL>
+    bool kUsePDL,
+    int kIndexerScaleFmt = deepseek_v4::fp8::kIndexKScaleFP32>
 struct FusedNormRopeKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr bool kIsIndexer = (kHeadDim == 128);
@@ -600,7 +609,7 @@ struct FusedNormRopeKernel {
   template <ForwardMode kMode>
   static constexpr auto select_kernel() {
     if constexpr (kIsIndexer) {
-      return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize>;
+      return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize, kIndexerScaleFmt>;
     } else {
       return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kBf16Store, kLayout, kUsePDL>;
     }

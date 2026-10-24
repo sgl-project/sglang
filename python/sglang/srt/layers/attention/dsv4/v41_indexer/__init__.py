@@ -32,6 +32,7 @@ __all__ = [
     "FullTopKIndexer",
     "PrefillCandidates",
     "PrefillInputs",
+    "has_deep_gemm_index_logits",
     "has_dense_fp4_indexer",
     "is_sm100_or_newer",
     "make_candidate_indexer",
@@ -47,6 +48,12 @@ def is_sm100_or_newer() -> bool:
 
 
 @functools.cache
+def has_deep_gemm_index_logits() -> bool:
+    # DeepGEMM's MQA logits kernels are SM100-only; SM120 takes the Triton indexer.
+    return is_cuda() and torch.cuda.get_device_capability()[0] == 10
+
+
+@functools.cache
 def has_dense_fp4_indexer() -> bool:
     if not torch.cuda.is_available() or torch.version.cuda is None:
         return False
@@ -59,7 +66,7 @@ def has_dense_fp4_indexer() -> bool:
 
 @functools.cache
 def _use_deep_gemm_prefill() -> bool:
-    return is_sm100_or_newer() and has_dense_fp4_indexer()
+    return has_deep_gemm_index_logits() and has_dense_fp4_indexer()
 
 
 def make_full_topk_indexer(
@@ -71,7 +78,7 @@ def make_full_topk_indexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100_or_newer(),
+        use_deep_gemm_decode=has_deep_gemm_index_logits(),
     )
 
 
@@ -96,7 +103,7 @@ def make_candidate_indexer(
         use_deep_gemm_prefill=use_deep_gemm_prefill,
     )
     # Without candidate blocks no layer is a candidate source or consumer.
-    if not is_sm100_or_newer() or candidate_topk_blocks <= 0:
+    if not has_deep_gemm_index_logits() or candidate_topk_blocks <= 0:
         return dense_blocks, dense_blocks
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (

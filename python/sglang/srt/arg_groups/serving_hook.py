@@ -466,11 +466,12 @@ def handle_environment_variables(server_args: Any):
                 "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                 "All operations will run eagerly through the graph capture/replay path."
             )
+    # On CUDA the FP4 indexer runs DeepGEMM's MQA logits, which are SM100-only
     if cfg.enable_deepseek_v4_fp4_indexer and not (
-        get_platform().is_sm100 or get_platform().is_sm120 or is_gfx95_supported()
+        get_platform().is_sm100 or is_gfx95_supported()
     ):
         raise ValueError(
-            "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
+            "--enable-deepseek-v4-fp4-indexer requires SM100 or gfx95 GPUs "
             "with FP4 indexer support."
         )
     # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can

@@ -8,6 +8,7 @@ from typing import Any, Iterator, List, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.deep_gemm_mqa_logits import uses_mx_mqa_logits
 from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_budget_bytes,
     mqa_logits_needs_budget_check,
@@ -209,9 +210,13 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
+            # SM100 DeepGEMM schedules varlen rows in its own format, which the
+            # JIT builder does not produce
+            mx = uses_mx_mqa_logits(self.compressed_seq_lens.device)
             use_jit_indexer = (
                 not self.force_deep_gemm_metadata
                 and self.rows_per_request == 1
+                and not (mx and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get())
                 and (
                     envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
                     or self.compressed_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
@@ -222,7 +227,9 @@ class PagedIndexerMetadata:
                     get_paged_mqa_logits_metadata,
                 )
             else:
-                from deep_gemm import get_paged_mqa_logits_metadata
+                from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+                    get_paged_mqa_logits_metadata,
+                )
 
             compressed_seq_lens = self.compressed_seq_lens.to(torch.int32)
             if compressed_seq_lens.dim() == 1:
@@ -236,7 +243,10 @@ class PagedIndexerMetadata:
             self.mqa_logits_budget_bytes = self._mqa_logits_budget(num_rows=num_rows)
             self.rows_per_chunk = plan_indexer_row_chunks(
                 num_rows=num_rows,
-                num_cols=self.max_compressed_seq_len,
+                # SM100 also holds DeepGEMM's BF16 logits while they widen to FP32
+                num_cols=self.max_compressed_seq_len * 3 // 2
+                if mx
+                else self.max_compressed_seq_len,
                 budget_bytes=self.mqa_logits_budget_bytes,
                 sm120_row_cap=_SM120_INDEXER_M_CHUNK if _IS_SM120 else None,
             )

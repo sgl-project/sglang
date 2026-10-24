@@ -925,6 +925,7 @@ def kpool_softmax_rotate_write_cache(
     loc: torch.Tensor,
     write_mask: torch.Tensor | None = None,
     round_scale: bool = False,
+    ue8m0_scale: bool = False,
     return_compressed: bool = False,
     write_cache: bool = True,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
@@ -1001,7 +1002,8 @@ def kpool_softmax_rotate_write_cache(
         POOL_SIZE=slot_k.shape[1],
         HEAD_DIM=slot_k.shape[2],
         S_OFFSET_NBYTES_IN_PAGE=pool.index_page_size * pool.index_head_dim,
-        ROUND_SCALE=round_scale,
+        ROUND_SCALE=round_scale or ue8m0_scale,
+        UE8M0_SCALE=ue8m0_scale,
         HAS_WRITE_MASK=has_write_mask,
         RETURN_COMPRESSED=return_compressed,
         WRITE_CACHE=write_cache,
@@ -1026,6 +1028,7 @@ def kpool_decode_update_and_maybe_write_cache(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
     round_scale: bool = False,
+    ue8m0_scale: bool = False,
 ) -> None:
     assert tail_k.ndim == 3
     assert tail_score.shape == tail_k.shape
@@ -1097,7 +1100,8 @@ def kpool_decode_update_and_maybe_write_cache(
         HEAD_DIM=tail_k.shape[2],
         BLOCK_TABLE_COLS=block_tables.shape[1],
         S_OFFSET_NBYTES_IN_PAGE=pool.index_page_size * pool.index_head_dim,
-        ROUND_SCALE=round_scale,
+        ROUND_SCALE=round_scale or ue8m0_scale,
+        UE8M0_SCALE=ue8m0_scale,
         BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
         INDEX_PAGE_SIZE=pool.index_page_size,
     )
@@ -1148,6 +1152,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
+    UE8M0_SCALE: tl.constexpr,
     HAS_WRITE_MASK: tl.constexpr,
     RETURN_COMPRESSED: tl.constexpr,
     WRITE_CACHE: tl.constexpr,
@@ -1237,14 +1242,16 @@ def _kpool_softmax_rotate_write_cache_kernel(
         )
 
         tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
-        tl.store(buf_fp32_ptr + out_s_offset, scale, mask=do_write)
+        tl.store(
+            buf_fp32_ptr + out_s_offset, _cache_scale(scale, UE8M0_SCALE), mask=do_write
+        )
     if RETURN_COMPRESSED:
         tl.store(
             compressed_k_ptr + row * HEAD_DIM + offs,
             quantized,
             mask=offs < HEAD_DIM,
         )
-        tl.store(compressed_scale_ptr + row, scale)
+        tl.store(compressed_scale_ptr + row, _cache_scale(scale, UE8M0_SCALE))
 
 
 @triton.jit
@@ -1280,6 +1287,7 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
+    UE8M0_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     INDEX_PAGE_SIZE: tl.constexpr,
 ):
@@ -1406,7 +1414,7 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
         )
 
         tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
-        tl.store(buf_fp32_ptr + out_s_offset, scale)
+        tl.store(buf_fp32_ptr + out_s_offset, _cache_scale(scale, UE8M0_SCALE))
 
     tail_k_offset = req * tail_k_stride_0 + phys_slot * tail_k_stride_1 + offs
     tail_score_offset = (
@@ -1415,6 +1423,15 @@ def _kpool_decode_update_and_maybe_write_cache_kernel(
     update_mask = dim_mask & pos_valid
     tl.store(tail_k_ptr + tail_k_offset, key, mask=update_mask)
     tl.store(tail_score_ptr + tail_score_offset, score_current, mask=update_mask)
+
+
+@triton.jit
+def _cache_scale(scale, UE8M0_SCALE: tl.constexpr):
+    # Packed UE8M0 (MXFP8, one byte per 32 channels) is what DeepGEMM's SM100 MQA logits read
+    if UE8M0_SCALE:
+        exponent = (scale.to(tl.uint32, bitcast=True) >> 23) & 0xFF
+        return (exponent * 0x01010101).to(tl.float32, bitcast=True)
+    return scale
 
 
 @triton.jit
@@ -1459,6 +1476,7 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
+    UE8M0_SCALE: tl.constexpr,
     HAS_WRITE_MASK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     INDEX_PAGE_SIZE: tl.constexpr,
@@ -1520,7 +1538,7 @@ def _kpool_assemble_softmax_rotate_write_cache_kernel(
     )
 
     tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=mask)
-    tl.store(buf_fp32_ptr + out_s_offset, scale)
+    tl.store(buf_fp32_ptr + out_s_offset, _cache_scale(scale, UE8M0_SCALE))
 
 
 def kpool_assemble_softmax_rotate_write_cache(
@@ -1538,6 +1556,7 @@ def kpool_assemble_softmax_rotate_write_cache(
     loc: torch.Tensor,
     write_mask: torch.Tensor | None = None,
     round_scale: bool = False,
+    ue8m0_scale: bool = False,
 ) -> None:
     kpool = pool.index_kpool
     n_pools = req_pool_idx.shape[0]
@@ -1583,7 +1602,8 @@ def kpool_assemble_softmax_rotate_write_cache(
         TAIL_SIZE=tail_k.shape[1],
         HEAD_DIM=INDEX_HEAD_DIM,
         S_OFFSET_NBYTES_IN_PAGE=index_page_size * INDEX_HEAD_DIM,
-        ROUND_SCALE=round_scale,
+        ROUND_SCALE=round_scale or ue8m0_scale,
+        UE8M0_SCALE=ue8m0_scale,
         HAS_WRITE_MASK=has_write_mask,
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
         INDEX_PAGE_SIZE=index_page_size,
@@ -1828,6 +1848,7 @@ def _kpool_write_tail_and_maybe_compress_kernel(
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
     ROUND_SCALE: tl.constexpr,
+    UE8M0_SCALE: tl.constexpr,
     HAS_EFFECTIVE_N: tl.constexpr,
     MAX_CLOSED_POOLS: tl.constexpr,
 ):
@@ -1905,7 +1926,7 @@ def _kpool_write_tail_and_maybe_compress_kernel(
                 + loc_token_offset_in_page
             )
             tl.store(buf_fp8_ptr + out_k_offsets, quantized, mask=dim_mask)
-            tl.store(buf_fp32_ptr + out_s_offset, scale)
+            tl.store(buf_fp32_ptr + out_s_offset, _cache_scale(scale, UE8M0_SCALE))
 
 
 def kpool_write_tail_and_maybe_compress(
@@ -1923,6 +1944,7 @@ def kpool_write_tail_and_maybe_compress(
     out_cache_loc: torch.Tensor,
     num_draft_tokens: int,
     round_scale: bool,
+    ue8m0_scale: bool = False,
     effective_n_per_batch: Optional[torch.Tensor] = None,
 ) -> None:
     assert num_draft_tokens > 0
@@ -1989,7 +2011,8 @@ def kpool_write_tail_and_maybe_compress(
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         PRESHUFFLE_TILE=_preshuffle_tile(),
         S_OFFSET_NBYTES_IN_PAGE=index_page_size * pool.index_head_dim,
-        ROUND_SCALE=round_scale,
+        ROUND_SCALE=round_scale or ue8m0_scale,
+        UE8M0_SCALE=ue8m0_scale,
         HAS_EFFECTIVE_N=effective_n_per_batch is not None,
         MAX_CLOSED_POOLS=max_closed_pools,
     )

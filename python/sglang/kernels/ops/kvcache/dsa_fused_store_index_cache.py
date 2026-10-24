@@ -27,15 +27,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def index_k_scale_fmt(round_scale: bool, ue8m0_scale: bool) -> int:
+    """The ``kScaleFmt`` template argument (``kIndexKScale*`` in fp8_utils.cuh):
+    FP32, FP32 rounded up to a power of two, or that power of two as packed UE8M0.
+    ``ue8m0_scale`` implies ``round_scale``."""
+    return 2 if ue8m0_scale else int(round_scale)
+
+
 @cache_once
 def _jit_dsa_fused_store_module(
-    key_dtype: torch.dtype, indices_dtype: torch.dtype, page_size: int
+    key_dtype: torch.dtype,
+    indices_dtype: torch.dtype,
+    page_size: int,
+    scale_fmt: int = 0,
 ) -> Module:
     """
     Build a JIT module that exposes:
       module.fused_store_index_k_cache(input_bf16, index_k_with_scale_u8, loc_i64)
     """
-    args = make_cpp_args(key_dtype, indices_dtype, page_size, is_arch_support_pdl())
+    args = make_cpp_args(
+        key_dtype,
+        indices_dtype,
+        page_size,
+        is_arch_support_pdl(),
+        scale_fmt,
+    )
     return load_jit(
         "fused_store_index_k_cache",
         *args,
@@ -71,9 +87,13 @@ def fused_store_index_k_cache(
     index_k_with_scale: torch.Tensor,
     out_cache_loc: torch.Tensor,
     page_size: int = 64,
+    round_scale: bool = False,
+    ue8m0_scale: bool = False,
 ) -> None:
     """
-    Fused: quantize bf16 key (N,128) -> fp8 + fp32 scale and write into DSATokenToKVPool.index_k_with_scale_buffer.
+    Fused: quantize bf16 key (N,128) -> fp8 + per-token scale and write into DSATokenToKVPool.index_k_with_scale_buffer.
+    The scale is FP32, rounded to a power of two with ``round_scale``, or packed
+    UE8M0 (MXFP8, implies ``round_scale``) with ``ue8m0_scale``.
 
     key:            (num_tokens, 128) bf16 (or reshapeable to it)
     index_k_with_scale:  (num_pages, 64*(128+4)) uint8
@@ -101,5 +121,10 @@ def fused_store_index_k_cache(
     if not index_k_with_scale.is_contiguous():
         index_k_with_scale = index_k_with_scale.contiguous()
 
-    module = _jit_dsa_fused_store_module(key.dtype, out_cache_loc.dtype, page_size)
+    module = _jit_dsa_fused_store_module(
+        key.dtype,
+        out_cache_loc.dtype,
+        page_size,
+        index_k_scale_fmt(round_scale, ue8m0_scale),
+    )
     module.fused_store_index_k_cache(key, index_k_with_scale, out_cache_loc)

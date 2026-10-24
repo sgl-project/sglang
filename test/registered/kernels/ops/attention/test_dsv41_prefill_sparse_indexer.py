@@ -26,8 +26,9 @@ TOPK_BLOCKS, BLOCK, TOPK = 2048, 8, 512
 PAGE = 128  # index-K pool page size under DeepGEMM's paged sparse logits
 CASES = [(256, 40000), (64, 3000)]  # (query rows, context): above and below 2048 blocks
 
-# The sparse kernel scores with bf16 weights and accumulation, the dense one in
-# fp32; picks a few bf16 ulps from the selection floor can go either way.
+# Both kernels score with bf16 weights; the sparse one also accumulates in bf16,
+# so picks a few bf16 ulps from the selection floor can go either way. The dense
+# scores are bf16 too, so equal-score ties at the floor are common.
 MIN_OVERLAP = 0.95
 FLOOR_TOLERANCE = 2**-5
 # A tail table is a different DeepGEMM row set: its row pairing moves boundary
@@ -36,7 +37,7 @@ MIN_TAIL_OVERLAP = 0.98
 
 
 class Case(NamedTuple):
-    dense: torch.Tensor  # fp32 [rows, width] scores of every row against its context
+    dense: torch.Tensor  # [rows, width] scores of every row against its context
     lens: torch.Tensor  # [rows] int32 causal lengths
     data: DeepGEMMPrefillData
     kv: tuple  # the flattened index K (int8 [n, 64], int32 [n])
@@ -47,12 +48,11 @@ class Case(NamedTuple):
 def make_case(rows, ctx, seed) -> Case:
     """One request: `rows` query tokens whose causal lengths end at `ctx`, its
     index K in the pool page layout [pages, PAGE * 64 payload | PAGE * 4 scale]."""
-    from deep_gemm import fp8_fp4_mqa_logits
-
     from sglang.kernels.ops.attention.dsv4.index_logits import (
         index_logits_dtype,
         index_weights_dtype,
     )
+    from sglang.srt.layers.attention.deep_gemm_mqa_logits import fp8_mqa_logits
 
     torch.manual_seed(seed)
     dev = "cuda"
@@ -78,14 +78,13 @@ def make_case(rows, ctx, seed) -> Case:
     width = (ctx + 7) // 8 * 8
     starts = torch.zeros(rows, device=dev, dtype=torch.int32)
     # Score in the dtypes the indexer uses on this GPU, so the reference matches.
-    dense = fp8_fp4_mqa_logits(
+    dense = fp8_mqa_logits(
         (q_fp4, q_sf),
         (k_fp4[:width], k_sf[:width]),
         weights.to(index_weights_dtype()),
         starts,
         lens,
-        False,
-        width,
+        max_seqlen_k=width,
         logits_dtype=index_logits_dtype(),
     ).float()
     data = DeepGEMMPrefillData(
@@ -338,7 +337,15 @@ class TestPrefillSparseIndexer(CustomTestCase):
                 self.assertFalse(got[0, :nb].any(), "an empty row keeps no block")
                 _, own_dense = publish_dense(case)
                 for r in range(rows):
-                    self.assertEqual(picks(own, r), picks(own_dense, r), r)
+                    a, b = picks(own, r), picks(own_dense, r)
+                    self.assertEqual(len(a), len(b), r)
+                    self.assertTrue(
+                        torch.equal(
+                            case.dense[r, list(a)].sort().values,
+                            case.dense[r, list(b)].sort().values,
+                        ),
+                        r,
+                    )
 
     @torch.inference_mode()
     def test_select_prefill_matches_the_dense_implementation(self):

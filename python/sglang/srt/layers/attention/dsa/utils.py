@@ -379,9 +379,11 @@ def resolve_paged_mqa_logits_metadata_fn():
         from sglang.kernels.ops.attention.dsv4 import get_paged_mqa_logits_metadata
 
         return get_paged_mqa_logits_metadata
-    import deep_gemm
+    from sglang.srt.layers.attention.deep_gemm_mqa_logits import (
+        get_paged_mqa_logits_metadata,
+    )
 
-    return deep_gemm.get_paged_mqa_logits_metadata
+    return get_paged_mqa_logits_metadata
 
 
 def _fp8_paged_mqa_logits_torch(
@@ -457,9 +459,9 @@ def _fp8_paged_mqa_logits_torch(
 def resolve_fp8_paged_mqa_logits_fn():
     if _use_torch_mqa_logits():
         return _fp8_paged_mqa_logits_torch
-    import deep_gemm
+    from sglang.srt.layers.attention.deep_gemm_mqa_logits import fp8_paged_mqa_logits
 
-    return deep_gemm.fp8_paged_mqa_logits
+    return fp8_paged_mqa_logits
 
 
 def _fp8_mqa_logits_torch(
@@ -499,6 +501,6 @@ def _fp8_mqa_logits_torch(
 def resolve_fp8_mqa_logits_fn():
     if _use_torch_mqa_logits():
         return _fp8_mqa_logits_torch
-    import deep_gemm
+    from sglang.srt.layers.attention.deep_gemm_mqa_logits import fp8_mqa_logits
 
-    return deep_gemm.fp8_mqa_logits
+    return fp8_mqa_logits

@@ -16,7 +16,10 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     refresh_kpool_topk_v2_plan,
     update_kpool_write_plan_cuda_graph,
 )
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    resolve_paged_mqa_logits_metadata_fn,
+)
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
@@ -568,7 +571,7 @@ def _compute_pool_schedule_metadata(
     deep_gemm = _get_deep_gemm()
     if deep_gemm is None:
         return None
-    return deep_gemm.get_paged_mqa_logits_metadata(
+    return resolve_paged_mqa_logits_metadata_fn()(
         pool_seqlens.contiguous().view(-1, 1).clamp(min=1),
         index_page_size,
         deep_gemm.get_num_sms(),
