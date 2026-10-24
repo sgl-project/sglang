@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-import weakref
 from functools import lru_cache
 from typing import Any
 
@@ -66,7 +65,10 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     PatchEmbed,
     TimestepEmbedder,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    DENOISING_LOOP_STATE,
+    get_forward_context,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -1189,6 +1191,10 @@ class WanTransformerBlock_VSA(nn.Module):
         return hidden_states
 
 
+# DENOISING_LOOP_STATE entry of the text K/V (WanTransformer3DModel._text_kvs)
+_TEXT_KV_STATE = "wan_text_kv"
+
+
 class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
@@ -1279,20 +1285,18 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self.layer_names = ["blocks"]
-        # id(prompt embeds) -> (weakref to the request, that tensor, every block's
-        # cross-attention K/V)
-        self._text_kv_cache: dict[int, tuple] = {}
 
     def _text_kvs(
         self, source: torch.Tensor, context: torch.Tensor
     ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
         """Every block's cross-attention (K, V) of ``context``, the embedding of ``source``.
 
-        The denoising stage hands the same prompt tensor to every step of a request's
-        loop, so the K/V are projected once per (request, prompt tensor); holding the
-        tensor keeps its id from being reused while cached, and a new request (whose
-        LoRA or weights may differ) projects again. Off when the projections could
-        differ step to step (LoRA wrappers, offloaded weights) or would be captured.
+        The denoising stage hands the same prompt tensor to every step of a loop, so the
+        K/V are projected once per (model, prompt tensor) and kept in the request's
+        DENOISING_LOOP_STATE, which the stage drops when the loop ends; the module holds
+        none of them. Holding the tensor keeps its id from being reused while cached.
+        Off when the projections could differ step to step (LoRA wrappers, offloaded
+        weights) or would be captured.
         """
         req = get_forward_context().forward_batch
         if (
@@ -1310,14 +1314,26 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
         ):
             return None
-        entry = self._text_kv_cache.get(id(source))
-        if entry is not None and entry[0]() is req and entry[1] is source:
-            return entry[2]
+        # (id(model), id(prompt tensor)) -> (that tensor, every block's K/V)
+        cached = req.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault(
+            _TEXT_KV_STATE, {}
+        )
+        key = (id(self), id(source))
+        entry = cached.pop(key, None)
+        if (
+            entry is not None
+            and entry[0] is source
+            and entry[1][0][0].device == context.device
+        ):
+            cached[key] = entry
+            return entry[1]
+        # the other expert is done with its K/V; keep this model's other CFG branch
+        mine = [k for k in cached if k[0] == id(self)]
+        for stale in [k for k in cached if k[0] != id(self)] + mine[:-1]:
+            del cached[stale]
+        del entry
         kvs = [block.attn2.project_context_kv(context) for block in self.blocks]
-        # one entry per CFG branch is enough
-        if len(self._text_kv_cache) >= 2:
-            self._text_kv_cache.pop(next(iter(self._text_kv_cache)))
-        self._text_kv_cache[id(source)] = (weakref.ref(req), source, kvs)
+        cached[key] = (source, kvs)
         return kvs
 
     def _plain_blocks(self) -> bool:
