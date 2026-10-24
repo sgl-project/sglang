@@ -45,9 +45,11 @@ from sglang.srt.distributed.parallel_state import inplace_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
+    can_use_dp_reduce_scatter,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
+    get_dp_global_num_tokens,
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
@@ -1222,18 +1224,26 @@ class EngramEmbedding(nn.Module):
         if rows == 0:
             return self._empty(indices)
         values = self._owned_rows(ids_global).view(rows, -1)
+        uniform_rows = _uniform_sum_len_scatter_rows(forward_batch, self.tp_size, rows)
         local = torch.empty(
-            (indices.shape[0], values.shape[1]),
+            (
+                uniform_rows if uniform_rows is not None else indices.shape[0],
+                values.shape[1],
+            ),
             dtype=values.dtype,
             device=values.device,
         )
         padding = forward_batch.dp_padding_mode
         if (
-            padding is not None
-            and padding.is_max_len()
-            and self.tp_size == get_parallel().attn_dp_size
-            and rows == self.tp_size * local.shape[0]
-        ) or is_dp_gatherv_active():
+            (
+                padding is not None
+                and padding.is_max_len()
+                and self.tp_size == get_parallel().attn_dp_size
+                and rows == self.tp_size * local.shape[0]
+            )
+            or is_dp_gatherv_active()
+            or uniform_rows is not None
+        ):
             if _is_hip and values.is_cuda:
                 dp_reduce_scatter_tensor(
                     local.view(torch.int32), values.view(torch.int32)
@@ -1242,7 +1252,52 @@ class EngramEmbedding(nn.Module):
                 dp_reduce_scatter_tensor(local, values)
         else:
             dp_scatter(local, self._reduce_owned_rows(values), forward_batch)
+        if uniform_rows is not None:
+            # Validate the producer contract after the shared collective, never
+            # branch into different collectives on a rank-local shape mismatch.
+            assert indices.shape[0] == uniform_rows, (indices.shape, uniform_rows)
         return local.view(*indices.shape, self.dim)
+
+
+def _uniform_sum_len_scatter_rows(
+    forward_batch: ForwardBatch, tp_size: int, rows: int
+) -> Optional[int]:
+    """Select a fixed-size collective using only rank-common metadata.
+
+    The padded CPU counts and graph vote come from DP synchronization. Never
+    use a rank-local tensor shape or forward mode to select this collective.
+    Capture batches use MAX_LEN; graph-eligible forwards retain their old path.
+    """
+    parallel = get_parallel()
+    padding = forward_batch.dp_padding_mode
+    counts = forward_batch.global_num_tokens_padded_cpu
+    if (
+        not is_cuda()
+        or is_dp_gatherv_active()
+        or envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        or padding is None
+        or not padding.is_sum_len()
+        or not forward_batch.is_extend_in_batch
+        or forward_batch.can_run_dp_prefill_cuda_graph
+        or tp_size <= 1
+        or tp_size != parallel.tp_size
+        or tp_size != parallel.attn_dp_size
+        or parallel.attn_tp_size != 1
+        or parallel.attn_cp_size != 1
+        or not can_use_dp_reduce_scatter()
+        or counts is None
+        or len(counts) != tp_size
+        or counts != get_dp_global_num_tokens()
+    ):
+        return None
+    local_rows = counts[0]
+    if (
+        local_rows <= 0
+        or any(count != local_rows for count in counts)
+        or rows != sum(counts)
+    ):
+        return None
+    return local_rows
 
 
 def engram_gate(
