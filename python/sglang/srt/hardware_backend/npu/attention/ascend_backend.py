@@ -1174,17 +1174,16 @@ class AscendAttnBackend(AttentionBackend):
                 metadata.dcp_block_tables[:bs, dcp_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
 
-        effective_seq_lens = seq_lens[:bs]
         if forward_mode.is_target_verify():
-            effective_seq_lens = effective_seq_lens + self.speculative_num_draft_tokens
+            seq_lens = seq_lens + self.speculative_num_draft_tokens
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            effective_seq_lens = effective_seq_lens + self.speculative_step_offset_npu
+            seq_lens = seq_lens + self.speculative_step_offset_npu
 
         if self.dense_mla_dcp_target:
             # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
             if in_capture:
                 local_seq_lens = get_dcp_lens(
-                    effective_seq_lens,
+                    seq_lens[:bs],
                     self.dcp_size,
                     self.dcp_rank,
                     interleave_size=self.page_size,
@@ -1193,7 +1192,7 @@ class AscendAttnBackend(AttentionBackend):
             if forward_mode.is_target_verify():
                 query_len = self.speculative_num_draft_tokens
                 local_query_lens = get_dcp_chain_spec_lens(
-                    effective_seq_lens,
+                    seq_lens[:bs],
                     query_len,
                     self.dcp_size,
                     self.dcp_rank,
@@ -1218,10 +1217,10 @@ class AscendAttnBackend(AttentionBackend):
                 if seq_lens_cpu is not None:
                     kv_lens = seq_lens_cpu[:bs]
                 else:
-                    kv_lens = effective_seq_lens
+                    kv_lens = seq_lens[:bs]
                 metadata.seq_lens_cpu_list = kv_lens.cpu().int().tolist()
         if not self.dense_mla_dcp_target:
-            metadata.seq_lens[:bs].copy_(effective_seq_lens)
+            metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
         self.forward_metadata = metadata
 
