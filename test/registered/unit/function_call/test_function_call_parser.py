@@ -4854,6 +4854,43 @@ function call<|role_sep|>
         self.assertEqual(params["content"]["likes"], ["short", "clear"])
         self.assertEqual(params["content"]["dislikes"], ["emojis", "verbose"])
 
+    def test_streaming_braces_and_escaped_quotes_in_strings(self):
+        """Test incremental brace scanning when string values contain braces/quotes."""
+        expected_content = 'value with } and {"nested": "}still_string"} inside'
+        payload = json.dumps(
+            {
+                "name": "manage_user_memory",
+                "arguments": {
+                    "action": "create",
+                    "id": "prefs",
+                    "content": expected_content,
+                },
+            },
+            ensure_ascii=False,
+        )
+        chunks = [
+            "<|function_call|>",
+            *[payload[i : i + 4] for i in range(0, len(payload), 4)],
+            "</s>",
+        ]
+        tool_calls_by_index = {}
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    tc = tool_calls_by_index.setdefault(
+                        call.tool_index, {"name": "", "parameters": ""}
+                    )
+                    if call.name:
+                        tc["name"] = call.name
+                    if call.parameters:
+                        tc["parameters"] += call.parameters
+
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "manage_user_memory")
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params["content"], expected_content)
+
     def test_streaming_with_eos_token(self):
         """Test streaming with EOS token at the end."""
         chunks = [
@@ -5675,6 +5712,19 @@ class TestGemma4Detector(unittest.TestCase):
         params1 = json.loads(tool_calls_by_index[1]["parameters"])
         self.assertEqual(params0["location"], "Paris")
         self.assertEqual(params1["timezone"], "UTC")
+
+    def test_streaming_braces_inside_string_and_split_delims(self):
+        """Test incremental brace matching when strings contain '}' and split '<|\"|>'."""
+        full_text = (
+            '<|tool_call>call:get_weather{location:<|"|>Paris {France} }<|"|>,'
+            'unit:<|"|>celsius<|"|>}<tool_call|>'
+        )
+        chunks = [full_text[i : i + 2] for i in range(0, len(full_text), 2)]
+        _, tool_calls = self._collect_streaming(chunks)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        params = json.loads(tool_calls[0]["parameters"])
+        self.assertEqual(params, {"location": "Paris {France} }", "unit": "celsius"})
 
 
 class TestGetSchemaProperties(unittest.TestCase):
