@@ -134,6 +134,17 @@ factory currently prepares only the existing proposal module; complete prefill
 and decode phases remain explicit data gaps. Constructing it does not establish
 a complete runnable cost model, source resolver or accuracy admission.
 
+The before-work resolver receives the original native CPU batch and authoritative
+proposal-buffer capacity/device state before costs are queried. The optional
+`capture_simulator_source_facts` helper freezes ordered original-input lengths,
+budgets, request-state flags and CPU mirrors. These remain simulator observations;
+they do not establish the reference path's mirror availability, target graph bound
+or separate verify-plan argument. A source-owned SDK projector is still required.
+Native-region phase graphs must bind the exact region, ordered work, full sampling,
+buffer/history, execution profile and actual runtime identity, including a complete
+phase attestation for native proposal. The adapter supplies no such attestation.
+The legacy proposal selector rejects a conflicting preparer instead of replacing it.
+
 For a HuggingFace snapshot whose `config.json` links into the cache's blob
 directory, set `model_config_root` to the explicit containing checkpoint/cache
 root. Both the requested checkpoint and resolved config must remain inside it.

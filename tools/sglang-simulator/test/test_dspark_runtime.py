@@ -373,6 +373,216 @@ def test_proposal_buffer_capacity_is_causal_run_state_not_resolver_output(runtim
     assert runtime._draft_buffer_capacity == 1
 
 
+def test_resolver_receives_original_batch_and_before_state_before_cost(runtime):
+    import json
+
+    native_batch = batch()
+
+    def resolve(
+        *,
+        group,
+        runtime_profile_json,
+        native_batch,
+        buffer_capacity,
+        buffer_device_matches,
+    ):
+        assert native_batch is original
+        assert runtime_profile_json == runtime.runtime_profile_json
+        assert group.requests[0].target_prefix_len == 0
+        assert group.requests[0].draft_history_tokens == 0
+        assert buffer_capacity == 0 and buffer_device_matches is False
+        assert (
+            runtime.session.cost_model.calls
+            == runtime.session.progress_model.calls
+            == 0
+        )
+        assert runtime._forward_id == 0
+        return {"draft_buffer_capacity": 9000, "draft_buffer_device_matches": True}
+
+    original = native_batch
+    runtime.execution_resolver = resolve
+    # This legacy batch deliberately lacks all optional source-fact attributes.
+    result = forward(runtime, native_batch)
+    execution = json.loads(
+        getattr(result, STEP_ATTRIBUTE).step.groups[0].execution_json
+    )
+    assert execution["draft_buffer_capacity"] == 0
+    assert execution["draft_buffer_device_matches"] is False
+
+
+def test_resolver_buffer_growth_and_failed_cost_keep_transactional_state(runtime):
+    import json
+
+    seen = []
+
+    def resolve(**kwargs):
+        seen.append(kwargs)
+        return {"draft_buffer_capacity": 9000, "draft_buffer_device_matches": False}
+
+    runtime.execution_resolver = resolve
+    forward(runtime, batch())
+    second_prefill = batch()
+    second_prefill.reqs[0].rid = "b"
+    forward(runtime, second_prefill)
+    forward(runtime, batch("DECODE", prefix=512))
+    assert seen[-1]["buffer_capacity"] == 0
+    assert seen[-1]["buffer_device_matches"] is False
+    assert runtime._draft_buffer_capacity == 1
+
+    larger = batch("DECODE", prefix=514)
+    second = batch("DECODE", prefix=512).reqs[0]
+    second.rid = "b"
+    larger.reqs.append(second)
+    larger.seq_lens_cpu = larger.seq_lens = [514, 512]
+    before_history = tuple(runtime.session.history_for(rid) for rid in ("a", "b"))
+    before_id = runtime._forward_id
+    progress_calls = runtime.session.progress_model.calls
+    predict = runtime.session.cost_model.predict_step
+
+    def fail(_step):
+        raise PredictorError("data_unavailable", "missing larger-batch cost")
+
+    runtime.session.cost_model.predict_step = fail
+    published = []
+    with pytest.raises(PredictorError, match="missing larger-batch cost"):
+        forward(runtime, larger, published.append)
+    assert seen[-1]["native_batch"] is larger
+    assert seen[-1]["buffer_capacity"] == 1
+    assert seen[-1]["buffer_device_matches"] is True
+    assert [req.target_prefix_len for req in seen[-1]["group"].requests] == [514, 512]
+    assert (
+        tuple(runtime.session.history_for(rid) for rid in ("a", "b")) == before_history
+    )
+    assert runtime._forward_id == before_id and runtime._draft_buffer_capacity == 1
+    assert runtime.session.progress_model.calls == progress_calls and published == []
+
+    runtime.session.cost_model.predict_step = predict
+    result = forward(runtime, larger)
+    execution = json.loads(
+        getattr(result, STEP_ATTRIBUTE).step.groups[0].execution_json
+    )
+    assert execution["draft_buffer_capacity"] == 1
+    assert execution["draft_buffer_device_matches"] is True
+    assert runtime._draft_buffer_capacity == 2
+    runtime.capture(batch("DECODE", prefix=516))
+    assert seen[-1]["buffer_capacity"] == 2
+    assert seen[-1]["buffer_device_matches"] is True
+
+
+def source_fact_batch():
+    from array import array
+
+    native_batch = batch("DECODE", prefix=512)
+    req = native_batch.reqs[0]
+    req.origin_input_ids = array("q", [100, 101])
+    req.sampling_params = NS(max_new_tokens=100)
+    req.to_finish = req.input_embeds = req.multimodal_inputs = None
+    native_batch.spec_info = NS(nxt_kv_lens_cpu=[768])
+    return native_batch
+
+
+def test_optional_simulator_source_facts_freeze_order_without_mutating_native_state():
+    from dataclasses import FrozenInstanceError
+
+    native_batch = source_fact_batch()
+    second = source_fact_batch().reqs[0]
+    second.rid = "b"
+    second.origin_input_ids = [10, 11, 12]
+    second.sampling_params.max_new_tokens = 200
+    second.to_finish = object()
+    second.input_embeds = object()
+    second.multimodal_inputs = object()
+    native_batch.reqs.append(second)
+    native_batch.seq_lens_cpu = [512, 128]
+    native_batch.spec_info.nxt_kv_lens_cpu = [768, 256]
+
+    facts = adapter.capture_simulator_source_facts(native_batch)
+    assert facts.observation_scope == "simulator_cpu_before_worker_v1"
+    assert facts.forward_mode == "DECODE" and facts.draft_input_present is True
+    assert [(r.rid, r.origin_input_len, r.max_new_tokens) for r in facts.requests] == [
+        ("a", 2, 100),
+        ("b", 3, 200),
+    ]
+    assert facts.requests[0].to_finish_present is False
+    assert facts.requests[1].to_finish_present is True
+    assert facts.requests[1].input_embeds_present is True
+    assert facts.requests[1].multimodal_inputs_present is True
+    assert facts.seq_lens_cpu == (512, 128) and facts.nxt_kv_lens_cpu == (768, 256)
+    assert native_batch.reqs[0].origin_input_ids.tolist() == [100, 101]
+    assert native_batch.seq_lens_cpu == [512, 128]
+    assert native_batch.spec_info.nxt_kv_lens_cpu == [768, 256]
+
+    native_batch.reqs[0].origin_input_ids.append(102)
+    native_batch.reqs[1].sampling_params.max_new_tokens = 1
+    native_batch.reqs.reverse()
+    native_batch.seq_lens_cpu[0] = 900
+    native_batch.spec_info.nxt_kv_lens_cpu[0] = 1024
+    assert facts.requests[0].rid == "a" and facts.requests[0].origin_input_len == 2
+    assert facts.requests[1].max_new_tokens == 200
+    assert facts.seq_lens_cpu == (512, 128) and facts.nxt_kv_lens_cpu == (768, 256)
+    with pytest.raises(FrozenInstanceError):
+        facts.requests[0].origin_input_len = 9
+    with pytest.raises(FrozenInstanceError):
+        facts.seq_lens_cpu = (900, 128)
+
+
+def test_optional_source_facts_preserve_known_absent_mirrors_and_draft_input():
+    native_batch = source_fact_batch()
+    native_batch.seq_lens_cpu = None
+    native_batch.spec_info.nxt_kv_lens_cpu = None
+    facts = adapter.capture_simulator_source_facts(native_batch)
+    assert facts.seq_lens_cpu is None and facts.nxt_kv_lens_cpu is None
+    assert facts.draft_input_present is True
+    native_batch.spec_info = None
+    facts = adapter.capture_simulator_source_facts(native_batch)
+    assert facts.draft_input_present is False and facts.nxt_kv_lens_cpu is None
+
+
+@pytest.mark.parametrize(
+    "owner,name",
+    [
+        ("batch", "seq_lens_cpu"),
+        ("batch", "spec_info"),
+        ("draft_input", "nxt_kv_lens_cpu"),
+        ("request", "origin_input_ids"),
+        ("request", "to_finish"),
+        ("request", "input_embeds"),
+        ("request", "multimodal_inputs"),
+        ("sampling", "max_new_tokens"),
+    ],
+)
+def test_optional_source_facts_reject_unknown_fields(owner, name):
+    native_batch = source_fact_batch()
+    owners = {
+        "batch": native_batch,
+        "draft_input": native_batch.spec_info,
+        "request": native_batch.reqs[0],
+        "sampling": native_batch.reqs[0].sampling_params,
+    }
+    delattr(owners[owner], name)
+    with pytest.raises(PredictorError, match="missing a native field"):
+        adapter.capture_simulator_source_facts(native_batch)
+
+
+@pytest.mark.parametrize("name", ["seq_lens_cpu", "nxt_kv_lens_cpu"])
+def test_optional_source_facts_reject_non_cpu_mirrors_without_reading_them(name):
+    class DeviceVector:
+        device = NS(type="cuda")
+        ndim = 1
+
+        def __len__(self):
+            raise AssertionError("non-CPU mirror was inspected")
+
+        def __iter__(self):
+            raise AssertionError("non-CPU mirror was read")
+
+    native_batch = source_fact_batch()
+    owner = native_batch if name == "seq_lens_cpu" else native_batch.spec_info
+    setattr(owner, name, DeviceVector())
+    with pytest.raises(PredictorError, match="CPU vector"):
+        adapter.capture_simulator_source_facts(native_batch)
+
+
 def test_umd_draft_capture_comes_from_verified_profile_metadata(monkeypatch):
     import json
     from dataclasses import replace

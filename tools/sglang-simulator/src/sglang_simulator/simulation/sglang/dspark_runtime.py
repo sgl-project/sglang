@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import replace
+from array import array
+from dataclasses import dataclass, field, replace
 
 from sglang_simulator.simulation.sglang.dspark import (
     STEP_ATTRIBUTE,
@@ -47,6 +48,110 @@ def cpu_vector(values, size, name):
     return tuple(cpu_int(value, name) for value in values)
 
 
+@dataclass(frozen=True)
+class DSparkSimulatorRequestFacts:
+    rid: str
+    origin_input_len: int
+    max_new_tokens: int
+    to_finish_present: bool
+    input_embeds_present: bool
+    multimodal_inputs_present: bool
+
+
+@dataclass(frozen=True)
+class DSparkSimulatorSourceFacts:
+    """CPU simulator observations, not reference mirror policy or query inputs."""
+
+    forward_mode: str
+    requests: tuple[DSparkSimulatorRequestFacts, ...]
+    seq_lens_cpu: tuple[int, ...] | None
+    draft_input_present: bool
+    nxt_kv_lens_cpu: tuple[int, ...] | None
+    observation_scope: str = field(default="simulator_cpu_before_worker_v1", init=False)
+
+
+def capture_simulator_source_facts(native_batch):
+    """Optionally freeze actual CPU facts for a future source-owned projector.
+
+    Callers must explicitly opt in. Missing fields are unknown, whereas a present
+    None mirror or draft input records known absence. These are simulator facts
+    after CPU preparation, which may have overwritten earlier host mirrors; no
+    reference execution's mirror availability or graph/planner bound is inferred.
+    Token contents and non-CPU tensors are never copied or inspected.
+    """
+
+    def required(obj, name):
+        try:
+            return getattr(obj, name)
+        except AttributeError as error:
+            raise PredictorError(
+                "invalid_batch",
+                "simulator source facts are missing a native field",
+                field=name,
+            ) from error
+
+    if str(required(native_batch, "device")) != "cpu":
+        raise PredictorError(
+            "invalid_batch", "simulator source facts require a CPU batch"
+        )
+    mode = required(required(native_batch, "forward_mode"), "name")
+    requests = required(native_batch, "reqs")
+    if (
+        mode not in {"EXTEND", "DECODE"}
+        or not isinstance(requests, (list, tuple))
+        or not requests
+    ):
+        raise PredictorError(
+            "invalid_batch",
+            "simulator source facts require ordered prefill/decode requests",
+        )
+    facts = []
+    for req in requests:
+        rid = required(req, "rid")
+        original = required(req, "origin_input_ids")
+        if (
+            type(rid) is not str
+            or not rid
+            or not isinstance(original, (array, list, tuple))
+        ):
+            raise PredictorError(
+                "invalid_batch",
+                "simulator source facts require original CPU request metadata",
+            )
+        facts.append(
+            DSparkSimulatorRequestFacts(
+                rid=rid,
+                origin_input_len=len(original),
+                max_new_tokens=cpu_int(
+                    required(required(req, "sampling_params"), "max_new_tokens"),
+                    "max_new_tokens",
+                ),
+                to_finish_present=required(req, "to_finish") is not None,
+                input_embeds_present=required(req, "input_embeds") is not None,
+                multimodal_inputs_present=required(req, "multimodal_inputs")
+                is not None,
+            )
+        )
+    if len({req.rid for req in facts}) != len(facts):
+        raise PredictorError(
+            "invalid_batch", "simulator source facts repeat a request ID"
+        )
+    seq = required(native_batch, "seq_lens_cpu")
+    draft_input = required(native_batch, "spec_info")
+    nxt = None if draft_input is None else required(draft_input, "nxt_kv_lens_cpu")
+    return DSparkSimulatorSourceFacts(
+        forward_mode=mode,
+        requests=tuple(facts),
+        seq_lens_cpu=None
+        if seq is None
+        else cpu_vector(seq, len(facts), "seq_lens_cpu"),
+        draft_input_present=draft_input is not None,
+        nxt_kv_lens_cpu=None
+        if nxt is None
+        else cpu_vector(nxt, len(facts), "nxt_kv_lens_cpu"),
+    )
+
+
 def sampling_snapshot(params):
     # The SDK owns the source-pinned field inventory; do not maintain a second
     # simulator sampling schema or discard normalized defaults.
@@ -82,6 +187,7 @@ def prepare_cpu_decode(draft_input, batch):
     uses ReqToTokenPool.write for the same table update.
     """
     import torch
+
     from sglang.srt.mem_cache.allocation import (
         alloc_paged_token_slots_extend,
         alloc_token_slots,
@@ -179,6 +285,7 @@ class NativeDSparkResults:
 
     def build(self, *, batch, prediction):
         import torch
+
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.managers.utils import GenerationBatchResult
         from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -369,14 +476,20 @@ class DSparkNativeRuntime:
             )
         internal_mode = "EXTEND" if mode == "EXTEND" else "TARGET_VERIFY"
         group = DSparkGroup(0, internal_mode, tuple(work), '{"selection":"pending"}')
+        buffer_capacity = self._draft_buffer_capacity
+        buffer_device_matches = buffer_capacity > 0
         execution = self.execution_resolver(
-            group=group, runtime_profile_json=self.runtime_profile_json
+            group=group,
+            runtime_profile_json=self.runtime_profile_json,
+            native_batch=batch,
+            buffer_capacity=buffer_capacity,
+            buffer_device_matches=buffer_device_matches,
         )
         execution = dict(execution)
         # Persistent proposal-buffer state is causal run state. A resolver may
         # not label the first allocation as a warm no-allocation proposal.
-        execution["draft_buffer_capacity"] = self._draft_buffer_capacity
-        execution["draft_buffer_device_matches"] = self._draft_buffer_capacity > 0
+        execution["draft_buffer_capacity"] = buffer_capacity
+        execution["draft_buffer_device_matches"] = buffer_device_matches
         group = replace(group, execution_json=canonical(execution))
         return DSparkStep(
             self._forward_id, self.topology, (group,), self.runtime_profile_json

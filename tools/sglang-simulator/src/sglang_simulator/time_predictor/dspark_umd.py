@@ -22,14 +22,30 @@ class UMDDSparkCostModel:
         self.proposal_profile_id = proposal_profile_id
         self.preparers = dict(phase_preparers or {})
         if proposal_profile_id is not None:
+            if "proposal" in self.preparers:
+                raise PredictorError(
+                    "invalid_execution_profile",
+                    "DSPark proposal preparers select conflicting cost grains",
+                )
             self.preparers["proposal"] = self._prepare_proposal
         self._proposal_profile = None
 
-    def execution_for(self, *, group, runtime_profile_json):
+    def execution_for(
+        self,
+        *,
+        group,
+        runtime_profile_json,
+        native_batch=None,
+        buffer_capacity=None,
+        buffer_device_matches=None,
+    ):
         """Resolve draft capture from retained SDK profile metadata, not outputs.
 
         This resolves the existing source-bound proposal domain only. Target
         and prefill execution decisions remain owned by their UMD preparation.
+        Native batch and buffer inputs are transported separately for the
+        prospective SDK projector; this legacy path does not reinterpret them
+        as reference graph or verify-plan facts.
         """
         from infercast.sdk.perf_database.slice_manifest import (
             read_verified_slice_artifact,
@@ -135,6 +151,7 @@ class UMDDSparkCostModel:
     def query_phase(self, phase, step):
         from infercast.sdk.models.umd.description import bind_runtime_point
         from infercast.sdk.models.umd.executor import evaluate_phase_composition
+        from infercast.sdk.perf_database.database import PerfDataNotAvailableError
 
         if phase not in self.preparers:
             raise PredictorError(
@@ -146,10 +163,20 @@ class UMDDSparkCostModel:
             raise PredictorError(
                 "invalid_execution_profile", "DSPark cost needs its UMD prepared graph"
             )
-        if (
-            phase != "proposal"
-            and description.extra.get("complete_dspark_worker_phase") != phase
-        ):
+        from sglang_simulator.time_predictor.dspark_native_regions import (
+            validate_native_region_phase,
+        )
+
+        native_region = validate_native_region_phase(
+            description=description,
+            point=point,
+            graph_phase=graph_phase,
+            phase=phase,
+            step=step,
+        )
+        if (phase != "proposal" or native_region) and description.extra.get(
+            "complete_dspark_worker_phase"
+        ) != phase:
             raise PredictorError(
                 "data_unavailable",
                 "UMD graph does not cover the complete requested DSPark phase",
@@ -166,14 +193,19 @@ class UMDDSparkCostModel:
             raise PredictorError(
                 "data_unavailable", "DSPark costs require measured UMD operations"
             )
-        result = evaluate_phase_composition(
-            self.database,
-            nodes,
-            getattr(graph, graph_phase + "_composition"),
-            phase=graph_phase,
-            env=bind_runtime_point(description, point),
-            layer_repeat=graph.layer_repeat,
-        )
+        try:
+            result = evaluate_phase_composition(
+                self.database,
+                nodes,
+                getattr(graph, graph_phase + "_composition"),
+                phase=graph_phase,
+                env=bind_runtime_point(description, point),
+                layer_repeat=graph.layer_repeat,
+            )
+        except PerfDataNotAvailableError as error:
+            raise PredictorError(
+                "data_unavailable", f"missing qualified DSPark cost for phase: {phase}"
+            ) from error
         if result.source != "silicon":
             raise PredictorError(
                 "data_unavailable", "DSPark requires measured silicon cost provenance"
