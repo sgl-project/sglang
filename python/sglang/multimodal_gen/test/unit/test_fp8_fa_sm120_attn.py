@@ -206,6 +206,18 @@ def test_block_scaled_mma_is_bit_equal():
         assert torch.equal(lse.view(torch.int32), scaled_lse.view(torch.int32))
 
 
+def test_kernel_package_imports_under_meta_device():
+    """The backend must import while a DiT is constructed under torch.device("meta")."""
+    import importlib
+
+    from sglang.kernels.ops.attention.fp8_fa_sm120 import fused_prep
+
+    expected = fused_prep.INVERSE_FP8_MAX
+    with torch.device("meta"):
+        importlib.reload(fused_prep)
+    assert fused_prep.INVERSE_FP8_MAX == expected
+
+
 def test_causal_falls_back_to_cudnn():
     ours, reference = _make_impls(causal=True)
     q, k, v = _fused_qkv_views(1024)
