@@ -105,6 +105,16 @@ class TestAdapterRegistry(CustomTestCase):
                     )
                 )
 
+    def test_no_tokenizer_builds_no_adapter(self):
+        """--skip-tokenizer-init servers start, with no chat prompts to encode."""
+        from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
+
+        for spec in ("dsv4", "dsv41"):
+            with self.subTest(spec=spec):
+                self.assertIsNone(
+                    registry.build_chat_encoding_adapter(self._context(spec))
+                )
+
     def test_tool_dumps_render_as_the_client_sent_them(self):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters as registry
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest

@@ -139,21 +139,28 @@ def _build_inkling(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
     )
 
 
-def _build_deepseek_recipe(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
+def _build_deepseek_recipe(
+    ctx: ChatEncodingAdapterContext,
+) -> Optional[ChatEncodingAdapter]:
+    if ctx.tokenizer is None:
+        return None  # --skip-tokenizer-init: the server encodes no chat prompts.
     from sglang.srt.entrypoints.openai.serving_deepseek_recipe import (
         DeepSeekRecipeChatEncodingAdapter,
     )
 
     return DeepSeekRecipeChatEncodingAdapter(
         chat_encoding_spec=ctx.chat_encoding_spec,
-        tokenizer=ctx.require("tokenizer"),
+        tokenizer=ctx.tokenizer,
         default_chat_template_kwargs=ctx.default_chat_template_kwargs,
     )
 
 
 _BUILDERS: dict[
     str,
-    dict[EncodingBackend, Callable[[ChatEncodingAdapterContext], ChatEncodingAdapter]],
+    dict[
+        EncodingBackend,
+        Callable[[ChatEncodingAdapterContext], Optional[ChatEncodingAdapter]],
+    ],
 ] = {
     "inkling": {"builtin": _build_inkling},
     "dsv4": {"builtin": _build_deepseek_recipe},
