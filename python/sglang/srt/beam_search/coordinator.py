@@ -55,6 +55,7 @@ from sglang.srt.beam_search.fork import (
 )
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
 from sglang.srt.beam_search.trie_constraint import BeamTrieConstraint
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import (
@@ -72,6 +73,7 @@ from sglang.srt.runtime_context import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.beam_search.selection_cuda_graph import TrieSelectionGraphCache
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -113,6 +115,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     trie_constraint: Optional[BeamTrieConstraint] = None
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
+    _trie_selection_graph_cache: Optional[TrieSelectionGraphCache] = None
 
     def __post_init__(self) -> None:
         config = self.model_config.beam_trie_config
@@ -392,7 +395,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             f"admission gate (get_num_allocatable_reqs) must reserve them."
         )
         device = self.req_to_token_pool.device
-        member_rows = torch.tensor(rows, dtype=torch.int64, device=device)
+        member_rows_cpu = torch.tensor(
+            rows, dtype=torch.int64, pin_memory=torch.device(device).type == "cuda"
+        )
+        member_rows = member_rows_cpu.to(device, non_blocking=True)
         alias_members_prompt_kv(
             self.req_to_token_pool.req_to_token,
             member_rows,
@@ -400,10 +406,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group.prompt_len,
         )
         group.member_rows = member_rows
-        group.member_rows_cpu = torch.tensor(rows, dtype=torch.int64)
+        group.member_rows_cpu = member_rows_cpu
         leader_row = torch.tensor(
-            [leader.kv.req_pool_idx], dtype=torch.int64, device=device
-        )
+            [leader.kv.req_pool_idx],
+            dtype=torch.int64,
+            pin_memory=torch.device(device).type == "cuda",
+        ).to(device, non_blocking=True)
         group.all_rows = torch.cat([leader_row, member_rows])
 
     def select_and_relay_decode(
@@ -419,21 +427,34 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group = entry.group
             if group.retired or group.state != BeamGroupState.DECODING:
                 continue
-            top_logprobs, top_tokens = self._group_topk_logprobs(
-                group,
-                [
-                    capture.leader_logits[gi : gi + 1],
-                    capture.tail_logits[entry.start : entry.end],
-                ],
-                self._capture_normalizers(
-                    capture,
-                    leader_slice=slice(gi, gi + 1),
-                    tail_slice=slice(entry.start, entry.end),
-                ),
+            pieces = [
+                capture.leader_logits[gi : gi + 1],
+                capture.tail_logits[entry.start : entry.end],
+            ]
+            normalizers = self._capture_normalizers(
+                capture,
+                leader_slice=slice(gi, gi + 1),
+                tail_slice=slice(entry.start, entry.end),
             )
-            next_tokens, parent_idx = self._select_group(
-                group, top_logprobs, top_tokens, batch.forward_iter
-            )
+            selected = None
+            if envs.SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH.get():
+                from sglang.srt.beam_search.selection_cuda_graph import (
+                    TrieSelectionGraphCache,
+                )
+
+                if self._trie_selection_graph_cache is None:
+                    self._trie_selection_graph_cache = TrieSelectionGraphCache()
+                selected = self._trie_selection_graph_cache.select(
+                    self, group, pieces, normalizers, batch.forward_iter
+                )
+            if selected is None:
+                top_logprobs, top_tokens = self._group_topk_logprobs(
+                    group, pieces, normalizers
+                )
+                selected = self._select_group(
+                    group, top_logprobs, top_tokens, batch.forward_iter
+                )
+            next_tokens, parent_idx = selected
             self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
 
     def commit_decode(self, batch: ScheduleBatch) -> set:
