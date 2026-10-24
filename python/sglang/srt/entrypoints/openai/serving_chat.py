@@ -492,6 +492,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 reasoning_parser=self.reasoning_parser,
                 tool_call_parser=self.tool_call_parser,
                 chat_hooks=chat_encoding_adapters.ChatOutputHooks(
+                    thinking_requested=self._thinking_requested,
                     tool_call_parsing_active=self._tool_call_parsing_active,
                     history_tool_calls_count=self._get_history_tool_calls_cnt,
                     tool_call_id=self._process_tool_call_id,
@@ -1554,11 +1555,10 @@ class OpenAIServingChat(OpenAIServingBase):
         template_content_format = self.template_manager.jinja_template_content_format
 
         # Try custom encoding first (override in subclass for custom renderers)
-        thinking_requested = (request.chat_template_kwargs or {}).get(
-            "thinking", envs.SGLANG_DEFAULT_THINKING.get()
-        )
         thinking_mode = (
-            ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
+            ThinkingMode.THINKING
+            if self._thinking_requested(request)
+            else ThinkingMode.CHAT
         )
         messages = [msg.model_dump() for msg in request.messages]
         strict_tool_call_arguments = (
@@ -2962,6 +2962,11 @@ class OpenAIServingChat(OpenAIServingBase):
         chat_template_kwargs = dict(request.chat_template_kwargs or {})
         chat_template_kwargs[toggle_param] = enabled
         request.chat_template_kwargs = chat_template_kwargs
+
+    def _thinking_requested(self, request: ChatCompletionRequest) -> bool:
+        return (request.chat_template_kwargs or {}).get(
+            "thinking", envs.SGLANG_DEFAULT_THINKING.get()
+        )
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Determine whether reasoning mode should be enabled for this request.
