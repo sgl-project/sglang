@@ -194,7 +194,14 @@ class SGLDiffusionExecutor(torch.nn.Module):
             return bool((timestep < 1.0).item())
         return bool(timestep < 1.0)
 
-    def set_lora(self, lora_nickname=None, lora_path=None, strength=None, target=None):
+    def set_lora(
+        self,
+        lora_nickname=None,
+        lora_path=None,
+        strength=None,
+        target=None,
+        merge_mode=None,
+    ):
         """Set LoRA adapter using SGLang Diffusion API."""
         desired = {
             "lora_nickname": lora_nickname,
@@ -202,13 +209,10 @@ class SGLDiffusionExecutor(torch.nn.Module):
             "strength": strength,
             "target": target,
         }
+        if merge_mode is not None:
+            desired["merge_mode"] = merge_mode
         if lora_nickname and len(lora_nickname) > 0:
-            self.generator.set_lora(
-                lora_nickname=lora_nickname,
-                lora_path=lora_path,
-                strength=strength,
-                target=target,
-            )
+            self.generator.set_lora(**desired)
 
         self._lora_input = desired
 

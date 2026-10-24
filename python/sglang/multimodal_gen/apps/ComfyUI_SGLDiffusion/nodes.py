@@ -106,6 +106,15 @@ class SGLDLoraLoader:
                     {"default": "all"},
                 ),
             },
+            "optional": {
+                "merge_mode": (
+                    ["dynamic", "merge"],
+                    {
+                        "default": "dynamic",
+                        "tooltip": "Dynamic keeps base weights unchanged; merge folds LoRA into weights. Use the same mode for all LoRAs chained on one MODEL.",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("MODEL",)
@@ -114,15 +123,23 @@ class SGLDLoraLoader:
     CATEGORY = "SGLDiffusion"
 
     def load_lora(
-        self, model, lora_name, strength_model=1.0, nickname="", target="all"
+        self,
+        model,
+        lora_name,
+        strength_model=1.0,
+        nickname="",
+        target="all",
+        merge_mode="dynamic",
     ):
         """Load LoRA adapter using SGLang Diffusion API."""
+        if merge_mode not in ("dynamic", "merge"):
+            raise ValueError(f"Unsupported LoRA merge mode: {merge_mode}")
         lora_path = folder_paths.get_full_path("loras", lora_name)
         assert model is not None
         bi = model.clone()
         nickname = nickname if nickname != "" else str("lora" + str(uuid.uuid4()))
         # set lora in the model
-        bi.patches[nickname] = (lora_path, strength_model, target)
+        bi.patches[nickname] = (lora_path, strength_model, target, merge_mode)
 
         # prepare input for the SGLang Diffusion API
         lora_input = {
@@ -130,8 +147,14 @@ class SGLDLoraLoader:
             "lora_path": [],
             "strength": [],
             "target": [],
+            "merge_mode": merge_mode,
         }
         for nickname, lora_info in bi.patches.items():
+            mode = lora_info[3] if len(lora_info) > 3 else "dynamic"
+            if mode != merge_mode:
+                raise ValueError(
+                    "Chained SGLDLoraLoader nodes must use the same merge_mode"
+                )
             lora_input["lora_nickname"].append(nickname)
             lora_input["lora_path"].append(lora_info[0])
             lora_input["strength"].append(lora_info[1])
