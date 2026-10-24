@@ -119,6 +119,24 @@ def handle_attention_backend_compatibility(server_args: Any):
     # Split-backend override + default fill.
     run_post_process_pass(server_args, _attention_backend_default)
 
+    # FlashInfer has no FP32 attention kernels: torch.float32 is missing from
+    # flashinfer's filename_safe_dtype_map, so a model running in FP32 crashes
+    # mid-startup during CUDA-graph capture with a bare `KeyError:
+    # torch.float32` that kills the whole engine process group. Fail fast with
+    # an actionable message instead of letting that KeyError escape.
+    if resolving_view(server_args).dtype in ("float", "float32"):
+        prefill_backend, decode_backend = attention_backends_of(
+            resolved_view(server_args)
+        )
+        if "flashinfer" in (prefill_backend, decode_backend):
+            raise ValueError(
+                "attention backend 'flashinfer' does not support dtype='float32': "
+                "FlashInfer has no FP32 attention kernels, so the engine would "
+                "crash during CUDA-graph capture with `KeyError: torch.float32`. "
+                "Use --dtype bfloat16 or float16, or select an FP32-capable "
+                "backend such as --attention-backend torch_native or triton."
+            )
+
     # Torch native and flex attention backends
     attention_backend = resolved_view(server_args).attention_backend
     if attention_backend == "torch_native":
