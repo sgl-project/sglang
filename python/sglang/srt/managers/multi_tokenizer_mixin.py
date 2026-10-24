@@ -30,6 +30,7 @@ import threading
 import zlib
 from functools import lru_cache
 from multiprocessing import shared_memory
+from time import perf_counter
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import msgspec
@@ -736,9 +737,39 @@ class MultiDetokenizerRouter:
     ``rid`` is hashed instead.
     """
 
-    def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
+    def __init__(
+        self,
+        ipc_name_list: List[str],
+        port_args: PortArgs,
+        *,
+        enable_metrics: bool = False,
+    ):
         self.ipc_name_list = ipc_name_list
         self.num_workers = len(ipc_name_list)
+        self.processing_seconds = None
+        if enable_metrics:
+            # Import after the launcher configures PROMETHEUS_MULTIPROC_DIR.
+            from prometheus_client import Histogram
+
+            self.processing_seconds = Histogram(
+                "sglang:detokenizer_router_processing_seconds",
+                "Time spent routing one received scheduler message, including sends.",
+                buckets=(
+                    0.00001,
+                    0.00005,
+                    0.0001,
+                    0.0005,
+                    0.001,
+                    0.005,
+                    0.01,
+                    0.05,
+                    0.1,
+                    0.5,
+                    1.0,
+                    5.0,
+                    10.0,
+                ),
+            )
         self.socket_mapping = SocketMapping()
         context = zmq.Context(2)
         self.recv_from_scheduler = get_zmq_socket(
@@ -777,37 +808,46 @@ class MultiDetokenizerRouter:
     def event_loop(self):
         while True:
             recv_obj = sock_recv(self.recv_from_scheduler)
+            if self.processing_seconds is None:
+                self._route_output(recv_obj)
+            else:
+                # Exclude receive wait/deserialization; include routing and
+                # any blocking sends, even when a send raises an exception.
+                start = perf_counter()
+                try:
+                    self._route_output(recv_obj)
+                finally:
+                    self.processing_seconds.observe(perf_counter() - start)
 
-            # Control messages must reach every detokenizer process.
-            if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):
+    def _route_output(self, recv_obj: Any) -> None:
+        # Control messages must reach every detokenizer process.
+        if isinstance(recv_obj, (FreezeGCReq, ConfigureLoggingReq)):
+            for ipc in self.ipc_name_list:
+                self._send(ipc, recv_obj)
+            return
+
+        # Single request: route like the batch items of the same rid.
+        if isinstance(recv_obj, BaseReq):
+            assert recv_obj.http_worker_ipc is not None or recv_obj.rid is not None, (
+                f"Single req {type(recv_obj).__name__} has no routing key"
+            )
+            self._send(self._pick_for(recv_obj.http_worker_ipc, recv_obj.rid), recv_obj)
+            return
+
+        # Batch request.
+        if isinstance(recv_obj, BaseBatchReq):
+            # Idle/no-op batch (rids=[]): broadcast to all detokenizers
+            if not recv_obj.rids:
                 for ipc in self.ipc_name_list:
                     self._send(ipc, recv_obj)
-                continue
+                return
 
-            # Single request: route like the batch items of the same rid.
-            if isinstance(recv_obj, BaseReq):
-                assert (
-                    recv_obj.http_worker_ipc is not None or recv_obj.rid is not None
-                ), f"Single req {type(recv_obj).__name__} has no routing key"
-                self._send(
-                    self._pick_for(recv_obj.http_worker_ipc, recv_obj.rid), recv_obj
-                )
-                continue
+            self._send_batch(recv_obj)
+            return
 
-            # Batch request.
-            if isinstance(recv_obj, BaseBatchReq):
-                # Idle/no-op batch (rids=[]): broadcast to all detokenizers
-                if not recv_obj.rids:
-                    for ipc in self.ipc_name_list:
-                        self._send(ipc, recv_obj)
-                    continue
-
-                self._send_batch(recv_obj)
-                continue
-
-            raise ValueError(
-                f"MultiDetokenizerRouter got unsupported type {type(recv_obj)}"
-            )
+        raise ValueError(
+            f"MultiDetokenizerRouter got unsupported type {type(recv_obj)}"
+        )
 
 
 def run_multi_detokenizer_router_process(
@@ -826,7 +866,9 @@ def run_multi_detokenizer_router_process(
     try:
         if enable_metrics:
             start_cpu_monitor_thread("detokenizer_router")
-        router = MultiDetokenizerRouter(ipc_name_list, port_args)
+        router = MultiDetokenizerRouter(
+            ipc_name_list, port_args, enable_metrics=enable_metrics
+        )
         router.event_loop()
     except Exception:
         traceback = get_exception_traceback()

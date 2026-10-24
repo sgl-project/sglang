@@ -1,11 +1,13 @@
 import pickle
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import DEFAULT, MagicMock, patch
 
 import numpy as np
 import torch
+from prometheus_client import CollectorRegistry, Histogram
 
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.utils.weight_versions import WeightVersionSpan
@@ -20,6 +22,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers import multi_tokenizer_mixin
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    BaseBatchReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -171,6 +174,7 @@ def _make_router() -> MultiDetokenizerRouter:
     router = MultiDetokenizerRouter.__new__(MultiDetokenizerRouter)
     router.ipc_name_list = ["detok-a", "detok-b"]
     router.num_workers = 2
+    router.processing_seconds = None
     router._pick = lambda key: {
         "worker-a": "detok-a",
         "worker-b": "detok-b",
@@ -179,6 +183,102 @@ def _make_router() -> MultiDetokenizerRouter:
 
 
 class TestMultiTokenizerMixin(CustomTestCase):
+    def _metric_router(self, enabled, registry):
+        with (
+            patch.object(multi_tokenizer_mixin.zmq, "Context"),
+            patch.object(multi_tokenizer_mixin, "get_zmq_socket"),
+            patch.object(multi_tokenizer_mixin, "SocketMapping"),
+            patch("prometheus_client.Histogram", partial(Histogram, registry=registry)),
+        ):
+            return MultiDetokenizerRouter(
+                ["detok-a", "detok-b"],
+                SimpleNamespace(detokenizer_ipc_name="scheduler"),
+                enable_metrics=enabled,
+            )
+
+    def test_router_processing_metric_excludes_receive_wait(self):
+        registry = CollectorRegistry()
+        router = self._metric_router(True, registry)
+        router._pick = lambda key: "detok-b" if key == "worker-b" else "detok-a"
+        clock = [0.0]
+        messages = [
+            ConfigureLoggingReq(log_level="debug"),
+            AbortReq(rid="rid-0"),
+            _make_batch_token_id_output(),
+            BaseBatchReq(rids=[], http_worker_ipcs=[]),
+        ]
+        messages[2].http_worker_ipcs = ["worker-a", "worker-b"]
+        incoming = iter(messages)
+        sent = []
+
+        def receive(_):
+            clock[0] += 100.0  # Idle time must not enter the histogram.
+            try:
+                return next(incoming)
+            except StopIteration:
+                raise EOFError("end of input")
+
+        def send(target, obj):
+            clock[0] += 0.125
+            sent.append((target, obj))
+
+        router._send = send
+        with (
+            patch.object(multi_tokenizer_mixin, "sock_recv", side_effect=receive),
+            patch.object(
+                multi_tokenizer_mixin, "perf_counter", side_effect=lambda: clock[0]
+            ),
+            self.assertRaisesRegex(EOFError, "end of input"),
+        ):
+            router.event_loop()
+
+        name = "sglang:detokenizer_router_processing_seconds"
+        self.assertEqual(registry.get_sample_value(name + "_count"), 4)
+        self.assertEqual(registry.get_sample_value(name + "_sum"), len(sent) * 0.125)
+        self.assertEqual(len(sent), 7)
+
+    def test_router_processing_metric_records_failed_send(self):
+        registry = CollectorRegistry()
+        router = self._metric_router(True, registry)
+        router._send = mock.Mock(side_effect=RuntimeError("send failed"))
+        with (
+            patch.object(
+                multi_tokenizer_mixin, "sock_recv", return_value=AbortReq(rid="r")
+            ),
+            patch.object(
+                multi_tokenizer_mixin, "perf_counter", side_effect=[1.0, 1.25]
+            ),
+            self.assertRaisesRegex(RuntimeError, "send failed"),
+        ):
+            router.event_loop()
+
+        name = "sglang:detokenizer_router_processing_seconds"
+        self.assertEqual(registry.get_sample_value(name + "_count"), 1)
+        self.assertEqual(registry.get_sample_value(name + "_sum"), 0.25)
+
+    def test_router_processing_metric_disabled_avoids_clock_and_samples(self):
+        registry = CollectorRegistry()
+        router = self._metric_router(False, registry)
+        sent = []
+        router._send = lambda target, obj: sent.append(obj.rid)
+        with (
+            patch.object(
+                multi_tokenizer_mixin,
+                "sock_recv",
+                side_effect=[AbortReq(rid="r"), EOFError("end of input")],
+            ),
+            patch.object(
+                multi_tokenizer_mixin,
+                "perf_counter",
+                side_effect=AssertionError("disabled timer"),
+            ),
+            self.assertRaisesRegex(EOFError, "end of input"),
+        ):
+            router.event_loop()
+
+        self.assertEqual(sent, ["r"])
+        self.assertEqual(list(registry.collect()), [])
+
     def test_each_tokenizer_worker_freezes_locally(self):
         threshold = [700, 10, 1000]
         server_args = mock.Mock(gc_threshold=threshold)
@@ -237,6 +337,9 @@ class TestMultiTokenizerMixin(CustomTestCase):
 
                 self.assertEqual(
                     mocks["start_cpu_monitor_thread"].call_count, 1 if enabled else 0
+                )
+                mocks["MultiDetokenizerRouter"].assert_called_once_with(
+                    [], None, enable_metrics=enabled
                 )
 
     def test_batch_str_output_preserves_cached_tokens_details(self):
