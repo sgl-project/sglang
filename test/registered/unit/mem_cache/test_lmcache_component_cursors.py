@@ -126,5 +126,43 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
     assert flow.mamba_value is None
 
 
+def test_check_hicache_events_drains_pending_stores_fifo_with_deque(cache_class):
+    from collections import deque
+
+    cache = cache_class.__new__(cache_class)
+    cache._external_flows = {}
+    op1 = SimpleNamespace(request_id="req1")
+    op2 = SimpleNamespace(request_id="req1")
+    op3 = SimpleNamespace(request_id="req2")
+    cache._pending_stores = deque(
+        [
+            SimpleNamespace(operation=op1, node_id=10, lock_params="lock1"),
+            SimpleNamespace(operation=op2, node_id=20, lock_params="lock2"),
+            SimpleNamespace(operation=op3, node_id=30, lock_params="lock3"),
+        ]
+    )
+    cache._pending_store_counts = {"req1": 2, "req2": 1}
+    cache._session_finish_requested = set()
+    completed_ops = []
+    cache.lmcache_connector = SimpleNamespace(
+        ready_prefix_count=lambda ops: 2 if len(ops) == 3 else 0,
+        complete_store=lambda op: completed_ops.append(op),
+    )
+    unlocked = []
+    cache.dec_lock_ref = lambda node_id, lock_params: unlocked.append(
+        (node_id, lock_params)
+    )
+    cache._finish_session_if_store_idle = mock.Mock()
+
+    cache.check_hicache_events()
+
+    assert completed_ops == [op1, op2]
+    assert unlocked == [(10, "lock1"), (20, "lock2")]
+    assert len(cache._pending_stores) == 1
+    assert cache._pending_stores[0].operation is op3
+    assert "req1" not in cache._pending_store_counts
+    assert cache._pending_store_counts["req2"] == 1
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

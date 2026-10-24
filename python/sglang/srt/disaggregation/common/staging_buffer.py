@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import List, Optional, Tuple
+from collections import deque
+from typing import Deque, List, Optional, Tuple
 
 import torch
 import triton
@@ -281,7 +282,7 @@ class StagingAllocator:
         self.head = 0
         self.round = 0
         self.allocations: dict = {}  # alloc_id -> (offset, size, round)
-        self.alloc_order: List[int] = []
+        self.alloc_order: Deque[int] = deque()
         self.next_alloc_id = 0
         self.watermark_round = 0
         self.watermark_tail = 0
@@ -326,7 +327,7 @@ class StagingAllocator:
             self.allocations.pop(alloc_id)
 
             while self.alloc_order and self.alloc_order[0] not in self.allocations:
-                self.alloc_order.pop(0)
+                self.alloc_order.popleft()
 
             if not self.allocations:
                 # An empty ring makes the entire prior round reusable. Start a
