@@ -115,6 +115,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
+    _release_mm_inputs = Scheduler._release_mm_inputs
 
     def __init__(
         self,

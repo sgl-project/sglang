@@ -336,6 +336,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
             ps=SimpleNamespace(tp_rank=0),
             req_to_metadata_buffer_idx_allocator=MagicMock(),
             output_streamer=MagicMock(),
+            _release_mm_inputs=MagicMock(),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             enable_hicache_storage=False,
         )
@@ -360,6 +361,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         cache.finish.assert_called_once_with(
             req.cache_request_handle, CacheRequestOutcome.ABORT
         )
+        scheduler._release_mm_inputs.assert_called_once_with(req)
         self.assertFalse(req.pending_bootstrap)
 
     def test_write_through_pending_chunk_does_not_publish(self):
