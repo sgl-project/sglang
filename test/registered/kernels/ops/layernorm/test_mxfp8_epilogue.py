@@ -1,5 +1,7 @@
 """MXFP8 epilogues stay bitwise identical to FlashInfer's standalone quantizer."""
 
+import os
+import subprocess
 import sys
 
 import flashinfer
@@ -90,6 +92,47 @@ def test_combine_norm_mxfp8_split_invariant(m: int, monkeypatch):
         for ref, a, b in zip(expected, eager, replayed):
             assert torch.equal(a.view(torch.uint8), ref.view(torch.uint8)), parts
             assert torch.equal(b.view(torch.uint8), ref.view(torch.uint8)), parts
+
+
+_PADDING_REPLAY = """
+import torch
+from sglang.kernels.ops.layernorm import hc_combine_norm as mod
+
+alloc = mod._alloc
+
+
+def poisoned_alloc(m, k, device):
+    q, s = alloc(m, k, device)
+    return q, s.fill_(0xFF)
+
+
+mod._alloc = poisoned_alloc
+for m in (1, 49, 127):
+    g = torch.Generator().manual_seed(m)
+    x = torch.randn((m, 4 * 5120), dtype=torch.bfloat16, generator=g)
+    pre = torch.randn((m, 4), dtype=torch.bfloat16, generator=g)
+    w = torch.randn((5120,), dtype=torch.bfloat16, generator=g)
+    for parts in (1, 2, 4):
+        mod._parts_for = lambda m, k, p=parts: p
+        sf = mod.hc_combine_norm_mxfp8(x, pre, w, 1e-6)[2]
+        # A live scale byte is never 0xFF and, for these inputs, never 0.
+        assert not (sf == 0xFF).any(), f"m={m} parts={parts}: scale bytes unwritten"
+        live = int(sf.count_nonzero())
+        assert live == m * 160, f"m={m} parts={parts}: {m * 160 - live} live bytes zeroed"
+"""
+
+
+# Padding programs zero every padding scale byte and no live one. On the GPU a
+# live row stores its scales last and hides an overwrite; Triton's interpreter
+# runs the programs in grid order, live rows first, so an overwrite shows.
+def test_combine_norm_mxfp8_padding_disjoint_from_live_rows():
+    replay = subprocess.run(
+        [sys.executable, "-c", _PADDING_REPLAY],
+        env={**os.environ, "TRITON_INTERPRET": "1"},
+        capture_output=True,
+        text=True,
+    )
+    assert replay.returncode == 0, replay.stderr[-3000:]
 
 
 def check(x, w, got):
