@@ -595,11 +595,13 @@ class DiffGenerator:
                 f"Expected {request_count} outputs, got {output_count} from scheduler"
             )
 
-    def _send_to_scheduler_and_wait_for_response(self, batch: list[Req]) -> OutputBatch:
+    def _send_to_scheduler_and_wait_for_response(
+        self, batch: list[Req], timeout_ms: int | None = None
+    ) -> OutputBatch:
         """
         Sends a request to the scheduler and waits for a response.
         """
-        return sync_scheduler_client.forward(batch)
+        return sync_scheduler_client.forward(batch, timeout_ms=timeout_ms)
 
     # LoRA
     def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):

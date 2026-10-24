@@ -60,6 +60,16 @@ class ResumeMemoryOccupationReqInput:
     pass
 
 
+@dataclass
+class ReleaseAllocatorCacheReqInput:
+    """Free the allocator's cached blocks (no weights move) and report the bytes
+    of module weights the worker keeps resident on its GPU."""
+
+    # Intentionally just `pass`: no fields, the type alone routes the request
+    # to Scheduler._handle_release_allocator_cache.
+    pass
+
+
 class RolloutRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = None

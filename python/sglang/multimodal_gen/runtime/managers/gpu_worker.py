@@ -1675,6 +1675,15 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
 
+    def release_allocator_cache(self) -> dict:
+        """Return cached allocator blocks to the device; weights stay put."""
+        if _device_initialized():
+            _device_module().empty_cache()
+        return {
+            "success": True,
+            "resident_bytes": self._get_memory_occupation().resident_bytes(),
+        }
+
     def release_memory_occupation(self) -> dict:
         return self._get_memory_occupation().release_memory_occupation()
 

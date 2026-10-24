@@ -26,6 +26,10 @@ from .preflight import check_model_options, check_sgld_options
 logger = logging.getLogger(__name__)
 
 
+# Worker memory RPCs (release/sleep/wake) must not block ComfyUI forever.
+_MEMORY_RPC_TIMEOUT_MS = 30_000
+
+
 class _HeaderTensor:
     """Shape-only stand-in so detect_unet_config does not load 66GB weights."""
 
@@ -143,6 +147,24 @@ def native_model_type(model_dir: str) -> str:
     return _NATIVE_MODEL_TYPES[class_name]
 
 
+def _native_model_size_bytes(model_dir: str) -> int:
+    """Return the on-disk weight size used for ComfyUI VRAM accounting.
+
+    Only the DiT (``transformer/``) is loaded by the worker; text encoders and
+    the VAE in sibling directories are not, so they are not counted.
+    """
+    weight_suffixes = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf")
+    transformer_dir = os.path.join(model_dir, "transformer")
+    if os.path.isdir(transformer_dir):
+        model_dir = transformer_dir
+    return sum(
+        os.path.getsize(os.path.join(root, name))
+        for root, _, names in os.walk(model_dir)
+        for name in names
+        if name.lower().endswith(weight_suffixes)
+    )
+
+
 def _h3_unet_config_from_native(model_dir: str) -> dict:
     """ComfyUI MiniMaxH3 unet_config built from a native transformer/config.json."""
     with open(os.path.join(model_dir, "transformer", "config.json")) as f:
@@ -251,6 +273,9 @@ class SGLDiffusionGenerator:
         self.model_type = None
         self.last_options = None
         self._patcher = None
+        self.worker_asleep = False
+        self.shares_comfy_gpu = True
+        self.resident_bytes = 0
 
         # Native pipelines, run under comfyui_mode as a DiT-only forward service.
         self.pipeline_class_dict = {}
@@ -400,6 +425,7 @@ class SGLDiffusionGenerator:
     def ensure_executor(self, executor) -> None:
         """Rebuild the worker if this cached executor no longer owns it."""
         if self._owns_live(executor):
+            self.wake_worker()
             return
         reload = executor._sgld_reload
         if not reload:
@@ -418,6 +444,89 @@ class SGLDiffusionGenerator:
         # The new worker's session cache starts empty, so conditioning the
         # old worker already had cannot be restored; resend it.
         executor.begin_sampler_run()
+
+    def _memory_occupation_request(self, req_name: str) -> dict:
+        from sglang.multimodal_gen.runtime.entrypoints.post_training import io_struct
+
+        # Bounded wait: this runs in sampler-wrapper finally blocks, so an
+        # unresponsive worker must surface as an error, not hang ComfyUI.
+        out = self.generator._send_to_scheduler_and_wait_for_response(
+            [getattr(io_struct, req_name)()], timeout_ms=_MEMORY_RPC_TIMEOUT_MS
+        )
+        if out.error:
+            raise RuntimeError(out.error)
+        payload = out.output or {}
+        if not payload.get("success", True):
+            raise RuntimeError(payload.get("message", "memory occupation failed"))
+        return payload
+
+    @staticmethod
+    def _worker_shares_comfy_gpu(sgld_options: dict) -> bool:
+        """True when the worker's GPUs include the one ComfyUI runs on.
+
+        Only then does the worker's memory compete with ComfyUI's own models;
+        on a different GPU, freeing it would help nothing and cost a reload.
+        """
+        import torch
+        from comfy import model_management
+
+        device = model_management.get_torch_device()
+        if getattr(device, "type", None) != "cuda":
+            return False
+        index = device.index
+        if index is None:
+            index = torch.cuda.current_device()
+        base = int(sgld_options.get("base_gpu_id") or 0)
+        count = int(sgld_options.get("num_gpus") or 1)
+        return base <= index < base + count
+
+    def release_worker_cache(self) -> None:
+        """Hand the worker's cached allocator blocks back to the device.
+
+        No weights move, so this is cheap enough to run after every sampler
+        run; it lets VAE decode use the memory the DiT's activations held.
+        """
+        if (
+            not self.shares_comfy_gpu
+            or self.worker_asleep
+            or self.generator is None
+            or not self._is_live()
+        ):
+            return
+        try:
+            payload = self._memory_occupation_request("ReleaseAllocatorCacheReqInput")
+        except Exception:
+            logger.warning(
+                "Could not release SGLD worker allocator cache", exc_info=True
+            )
+            return
+        self.resident_bytes = int(payload.get("resident_bytes") or 0)
+
+    def sleep_worker(self, token=None) -> None:
+        """Move the worker's weights off the GPU (best effort, failures are logged).
+
+        ``token`` is the patcher's worker_token, so a patcher for a replaced
+        worker cannot put the new one to sleep.
+        """
+        if token is not None and token is not self.generator:
+            return
+        if not self.shares_comfy_gpu:
+            return
+        if self.worker_asleep or self.generator is None or not self._is_live():
+            return
+        try:
+            self._memory_occupation_request("ReleaseMemoryOccupationReqInput")
+        except Exception:
+            logger.warning("Could not release SGLD worker GPU memory", exc_info=True)
+            return
+        self.worker_asleep = True
+
+    def wake_worker(self) -> None:
+        """Bring a sleeping worker's weights back to the GPU."""
+        if not self.worker_asleep:
+            return
+        self._memory_occupation_request("ResumeMemoryOccupationReqInput")
+        self.worker_asleep = False
 
     def kill_generator(self):
         """Force-stop workers this owner started. Do not scan the process table."""
@@ -452,6 +561,8 @@ class SGLDiffusionGenerator:
         self.executor = None
         self.model_type = None
         self._patcher = None
+        self.worker_asleep = False
+        self.resident_bytes = 0
 
     def get_comfyui_model(self, model_path: str, model_options: dict = None):
         """Get ComfyUI model from model path."""
@@ -473,7 +584,12 @@ class SGLDiffusionGenerator:
             )
             model_config.set_inference_dtype(torch.bfloat16, None)
             model_config.unet_config["disable_unet_model_creation"] = True
-            return model_config.get_model({}), model_config, "minimax_h3"
+            return (
+                model_config.get_model({}),
+                model_config,
+                "minimax_h3",
+                _native_model_size_bytes(model_path),
+            )
 
         sd = _load_state_dict_for_detection(model_path)
         diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
@@ -525,7 +641,8 @@ class SGLDiffusionGenerator:
         model_config.custom_operations = model_options.get("custom_operations", None)
         model_config.unet_config["disable_unet_model_creation"] = True
         comfyui_model = model_config.get_model({})
-        return comfyui_model, model_config, model_type
+        model_size_bytes = parameters * unet_dtype.itemsize
+        return comfyui_model, model_config, model_type, model_size_bytes
 
     def load_model(
         self, model_path: str, model_options: dict = None, sgld_options: dict = None
@@ -592,9 +709,17 @@ class SGLDiffusionGenerator:
             _apply_cache_mode(self.executor, plugin)
             return self._patcher
 
-        comfyui_model, model_config, model_type = self.get_comfyui_model(
-            detect_path, model_options
+        comfyui_model, model_config, model_type, model_size_bytes = (
+            self.get_comfyui_model(detect_path, model_options)
         )
+        if _looks_like_gguf(model_path):
+            # detection sizes unpacked shapes; size the quantized file instead
+            try:
+                model_size_bytes = os.path.getsize(
+                    sgld_options["transformer_weights_path"]
+                )
+            except OSError:
+                pass
         if model_type is None or model_type not in self.pipeline_class_dict:
             raise ValueError(f"Unsupported model type: {model_type}")
         if set_model_type is not None and set_model_type in self.pipeline_class_dict:
@@ -632,6 +757,9 @@ class SGLDiffusionGenerator:
             )
         self.model_type = model_type
 
+        self.shares_comfy_gpu = self._worker_shares_comfy_gpu(sgld_options)
+        self.resident_bytes = 0
+
         executor_class = self.executor_class_dict[model_type]
         self.executor = executor_class(
             self.generator, worker_model_path, comfyui_model, model_config
@@ -639,6 +767,7 @@ class SGLDiffusionGenerator:
         _apply_cache_mode(self.executor, plugin)
         self.executor._sgld_reload = reload_kwargs
         self.executor._ensure_runtime = self.ensure_executor
+        self.executor._release_cache = self.release_worker_cache
         comfyui_model.diffusion_model = self.executor
 
         from comfy import model_management
@@ -650,7 +779,13 @@ class SGLDiffusionGenerator:
         offload_device = model_management.unet_offload_device()
 
         self._patcher = SGLDModelPatcher(
-            comfyui_model, load_device, offload_device, model_type=model_type
+            comfyui_model,
+            load_device,
+            offload_device,
+            size=model_size_bytes,
+            model_type=model_type,
+            worker=self,
+            worker_token=self.generator,
         )
         self._patcher.add_wrapper_with_key(
             WrappersMP.SAMPLER_SAMPLE,

@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
+    ReleaseAllocatorCacheReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
@@ -192,6 +193,7 @@ class Scheduler(
                 self._handle_update_weights_from_tensor_checker
             ),
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
+            ReleaseAllocatorCacheReqInput: self._handle_release_allocator_cache,
             ReleaseMemoryOccupationReqInput: self._handle_release_memory_occupation,
             ResumeMemoryOccupationReqInput: self._handle_resume_memory_occupation,
         }
@@ -1600,6 +1602,9 @@ class Scheduler(
             self.receiver.close()
         self._cleanup_disagg()
         self.context.destroy(linger=0)
+
+    def _handle_release_allocator_cache(self, _reqs: List[Any]) -> OutputBatch:
+        return OutputBatch(output=self.worker.release_allocator_cache())
 
     def _handle_release_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
         logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")
