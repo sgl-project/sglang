@@ -73,6 +73,8 @@ pub struct OpenAiSettings {
     pub return_input_ids: bool,
     pub return_output_ids: bool,
     pub sampling_defaults: Option<String>,
+    /// `--served-model-name`, which a `model:adapter` request may contain.
+    pub served_model_name: Option<String>,
     pub stream_response_default_include_usage: bool,
     pub tokenizer_metrics_custom_labels_header: Option<String>,
     pub tokenizer_metrics_allowed_custom_labels: Option<Vec<String>>,

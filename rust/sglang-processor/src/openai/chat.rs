@@ -13,8 +13,8 @@ use super::request::{
     format_json_schema, lora_path, one, usage_flags, yes,
 };
 use super::wire::{
-    Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
-    stream_error_event, unary_reply,
+    Payload, Reply, StreamState, http_status_name, logprobs_length, malformed_output_reply,
+    meta_u64, now, stream_error_event, unary_reply,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 use crate::py::python_json;
@@ -840,7 +840,11 @@ fn generate_body(
         "stream": request.stream,
         "return_text_in_logprobs": true,
         "modalities": [],
-        "lora_path": lora_path(&request.model, &request.lora_path),
+        "lora_path": lora_path(
+            &request.model,
+            &request.lora_path,
+            settings.served_model_name.as_deref(),
+        ),
         "bootstrap_host": request.bootstrap_host,
         "bootstrap_port": request.bootstrap_port,
         "bootstrap_room": request.bootstrap_room,
@@ -1003,7 +1007,7 @@ impl ChatResponder {
         let mut logprobs = None;
         if self.logprobs {
             let prev = self.stream.logprob_counts.get(&index).copied().unwrap_or(0);
-            let total = meta_u64(meta, "output_token_logprobs_length") as usize;
+            let total = logprobs_length(meta, prev, self.settings.incremental_streaming_output);
             if prev < total {
                 let incremental = self.settings.incremental_streaming_output;
                 let slice = |key: &str| -> Value {
