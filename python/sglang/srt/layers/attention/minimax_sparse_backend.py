@@ -28,7 +28,12 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
-from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_sm90_supported,
+)
 
 if is_npu():
     from sglang.kernels.ops.attention.minimax_sparse.common.index import (
@@ -249,6 +254,25 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
 
         self._msa_dec_meta = None
+        native_q8kv8_requested = (
+            not self.is_npu and envs.SGLANG_ENABLE_MINIMAX_SGL_NATIVE_Q8KV8_STEP3.get()
+        )
+        self.use_sgl_native_q8kv8 = (
+            native_q8kv8_requested
+            and is_sm90_supported()
+            and not self.fp8_attn_gemm
+            and self.kv_pool.main_pool.dtype == torch.float8_e4m3fn
+            and self._loc_mapping is None
+            and self.block_size_k == 128
+            and self.kv_pool.page_size == self.block_size_k
+        )
+        if native_q8kv8_requested and not self.use_sgl_native_q8kv8:
+            logger.warning(
+                "[MiniMaxSparse] SGL native Q8KV8 requested but unsupported "
+                "(requires SM90, FP8 E4M3 main KV, no HiSparse remapping, "
+                "and page_size=block_size_k=128); "
+                "falling back to the existing sparse provider."
+            )
         if self.use_msa:
             self.num_q_heads = (
                 runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -348,7 +372,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
-            f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"main_attn={'sgl_native_q8kv8' if self.use_sgl_native_q8kv8 else ('MSA' if self.use_msa else 'triton')}, "
             f"index_topk_freq={self.index_topk_freq}, "
             f"msa_decode={self._use_msa_decode}, "
             f"msa_owns_decode={self._msa_owns_decode}, "
@@ -1579,10 +1603,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 )
         else:
             # fp8 attention GEMMs: quantize q/idx_q AFTER the KV store (which reads
-            # the bf16 k/v) and the DP trim.
+            # the bf16 k/v) and the DP trim. HiSparse remapping is not supported by
+            # the native Q8KV8 kernel, so preserve BF16 Q for the fallback provider.
+            use_sgl_native_q8kv8 = (
+                self.use_sgl_native_q8kv8 and self._loc_mapping is None
+            )
             if self.fp8_attn_gemm:
                 q = _quant_q_fp8(q, layer.q_scale_float)
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+            elif use_sgl_native_q8kv8:
+                q = _quant_q_fp8(q, layer.q_scale_float)
 
             # GPU (CUDA/ROCm) sparse path; imported here so NPU never touches it.
             from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
@@ -1630,6 +1660,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 score_type=self.score_type,
                 disable_index_value=disable_value,
                 use_msa=self.use_msa,
+                use_sgl_native_q8kv8=use_sgl_native_q8kv8,
                 seqlens_cpu=forward_batch.extend_seq_lens_cpu,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 cu_seqblocks_q=cu_seqblocks_q,
