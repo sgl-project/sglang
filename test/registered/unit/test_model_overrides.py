@@ -1958,6 +1958,39 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             (self._publish(sa), self._leaf("attention_backend"))[1], "triton"
         )
 
+    def test_default_attention_backend_skips_flashinfer_for_unsupported_head_dims(
+        self,
+    ):
+        """The default is not FlashInfer when its FA2 prefill cannot run the head
+        dim (flashinfer-ai/flashinfer#4299); an explicit choice is kept."""
+        fa2_platform = override_platform(
+            is_cuda=True,
+            is_hopper_with_cuda_12_3=False,
+            is_sm100=False,
+            is_hip=False,
+            has_flashinfer=True,
+        )
+        with fa2_platform:
+            for head_dim, expected in (
+                (128, "flashinfer"),
+                (96, "triton"),
+                (32, "triton"),
+            ):
+                with self.subTest(head_dim=head_dim):
+                    sa = self._construct(
+                        "LlamaForCausalLM",
+                        "llama",
+                        config_extra={"head_dim": head_dim, "v_head_dim": head_dim},
+                    )
+                    self.assertEqual(self._resolved(sa, "attention_backend"), expected)
+            sa = self._construct(
+                "LlamaForCausalLM",
+                "llama",
+                config_extra={"head_dim": 96, "v_head_dim": 96},
+                attention_backend="flashinfer",
+            )
+            self.assertEqual(self._resolved(sa, "attention_backend"), "flashinfer")
+
     def test_compatibility_passes_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
