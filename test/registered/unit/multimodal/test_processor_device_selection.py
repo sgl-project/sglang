@@ -6,12 +6,26 @@ each drive their own GPU, which no process-global value can express — the
 device has to come from what the worker was handed.
 """
 
+import asyncio
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+from transformers import BaseImageProcessor, PreTrainedTokenizerFast
+
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
+from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
+    TokenSpaceProcessStrategy,
+)
+from sglang.srt.multimodal.token_space_mm_process.processor import (
+    TokenSpaceProcessor,
+)
+from sglang.srt.multimodal.token_space_mm_process.sglang import (
+    TokenSpaceSGLangProcessor,
+)
 from sglang.srt.multimodal.transport.feature_transport import (
     MultimodalFeatureTransport,
 )
@@ -48,6 +62,12 @@ def _make(**fields):
     processor = _StubProcessor.__new__(_StubProcessor)
     processor.server_args = server_args
     return processor
+
+
+def _make_wrapper(**fields):
+    wrapper = TokenSpaceSGLangProcessor.__new__(TokenSpaceSGLangProcessor)
+    wrapper._server_args = _make(**fields).server_args
+    return wrapper
 
 
 class TestFastImageProcessorDevice(CustomTestCase):
@@ -118,6 +138,83 @@ class TestFastImageProcessorDevice(CustomTestCase):
                     ),
                     expected,
                 )
+
+
+class _PinnedVideoStrategy(TokenSpaceProcessStrategy):
+    processor_class_attributes = {"video_preprocessing_device": "cpu"}
+
+
+class TestTokenSpaceDevices(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def test_wrapper_fills_the_image_device_unless_pil_decodes(self):
+        for use_pil, expected in ((False, "cuda:3"), (True, None)):
+            wrapper = _make_wrapper(base_gpu_id=3)
+            wrapper._core = SimpleNamespace(
+                _processor=SimpleNamespace(
+                    image_processor=object.__new__(BaseImageProcessor)
+                )
+            )
+            wrapper._disable_fast_image_processor = use_pil
+            platforms = SimpleNamespace(
+                current_platform=SimpleNamespace(
+                    is_cuda_alike=lambda: True, device_type="cuda"
+                )
+            )
+            with (
+                self.subTest(use_pil=use_pil),
+                patch.multiple(
+                    PLACEMENT,
+                    platforms=platforms,
+                    _is_cpu=False,
+                    _is_xpu=False,
+                    _is_npu=False,
+                ),
+            ):
+                self.assertEqual(wrapper._serving_image_processor_device(), expected)
+
+    def test_strategy_video_device_overrides_every_media_device(self):
+        # As in process_mm_data: a video request runs all its media on that device.
+        processor = TokenSpaceProcessor.for_strategy(_PinnedVideoStrategy)(
+            None,
+            PreTrainedTokenizerFast(tokenizer_object=_empty_tokenizer()),
+            processor_config=MultimodalProcessorConfig(mm_processor_worker_num=1),
+        )
+        self.addCleanup(processor.shutdown)
+        seen = {}
+
+        async def capture(function, **kwargs):
+            seen[kwargs["modality"]] = kwargs["request_options"]
+            raise _Stop
+
+        loaded = ([object()], [object()], [])
+        with (
+            patch.object(
+                processor, "_load_media_lists", AsyncMock(return_value=loaded)
+            ),
+            patch.object(processor, "_run_mm_processor", capture),
+            self.assertRaises(_Stop),
+        ):
+            asyncio.run(
+                processor.process(
+                    ["image"], ["video"], input_ids=[1], image_device="cuda:5"
+                )
+            )
+        for modality in (Modality.IMAGE, Modality.VIDEO):
+            self.assertEqual(seen[modality]["image_device"], "cpu")
+            self.assertEqual(seen[modality]["video_device"], "cpu")
+
+
+class _Stop(Exception):
+    pass
+
+
+def _empty_tokenizer():
+    from tokenizers import Tokenizer, models
+
+    return Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
 
 
 class TestFastImageProcessorMemoryPool(CustomTestCase):
