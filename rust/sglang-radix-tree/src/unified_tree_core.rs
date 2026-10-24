@@ -195,6 +195,8 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub swa_evicted_seqlen: usize,
     /// The Full-KV-derived boundary whose SWA window this insert should materialize.
     pub swa_branching_seqlen: Option<usize>,
+    /// The insert ends at the last full page of a running request's prompt.
+    pub swa_prompt_tail: bool,
     /// The donated mamba slot for the insert target leaf; None on non-mamba trees.
     pub mamba_value: Option<Tensor>,
     /// The inserting request already inserted [0, here); only the nodes past it
@@ -298,6 +300,7 @@ pub(crate) struct InsertWalkState<K: ChildKeyType> {
     pub(crate) prev_prefix_len: usize,
     swa_evicted_seqlen: usize,
     swa_branching_seqlen: Option<usize>,
+    swa_prompt_tail: bool,
     mamba_value: Option<Tensor>,
     inserted_len: usize,
     priority: i64,
@@ -518,6 +521,10 @@ pub struct ComponentState {
     pub(crate) evict_device_pending_num_tokens: usize,
     /// Token budget for the current eviction walk.
     pub(crate) evict_device_request_cnt: usize,
+    /// Whether the SWA walk still passes over branch tails.
+    pub(crate) evict_device_spares_tails: bool,
+    /// Whether the SWA walk passed over a branch tail it may have to reclaim.
+    pub(crate) evict_device_spared_tail: bool,
 }
 
 /// Tree-construction parameters: the tree-consumed slice of the cache's init params.
@@ -841,6 +848,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         );
         state.is_evict_device_ongoing = true;
         state.evict_device_request_cnt = request_cnt;
+        state.evict_device_spares_tails = true;
+        state.evict_device_spared_tail = false;
         state.evict_device_cursor = None;
         state.evict_device_pending_node = None;
         state.evict_device_pending_num_tokens = 0;
@@ -1843,6 +1852,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             prev_prefix_len: params.prev_prefix_len,
             swa_evicted_seqlen: params.swa_evicted_seqlen,
             swa_branching_seqlen: params.swa_branching_seqlen,
+            swa_prompt_tail: params.swa_prompt_tail,
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
             inserted_len: params.inserted_len,
             priority: params.priority,
@@ -2009,6 +2019,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             prev_prefix_len: state.prev_prefix_len,
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
+            swa_prompt_tail: state.swa_prompt_tail,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
             inserted_len: state.inserted_len,
             priority: state.priority,
@@ -2065,6 +2076,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             prev_prefix_len: state.prev_prefix_len,
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
+            swa_prompt_tail: state.swa_prompt_tail,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
             inserted_len: state.inserted_len,
             priority: state.priority,
@@ -2201,6 +2213,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             prev_prefix_len: state.prev_prefix_len,
             swa_evicted_seqlen: state.swa_evicted_seqlen,
             swa_branching_seqlen: state.swa_branching_seqlen,
+            swa_prompt_tail: state.swa_prompt_tail,
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
             inserted_len: state.inserted_len,
             priority: state.priority,

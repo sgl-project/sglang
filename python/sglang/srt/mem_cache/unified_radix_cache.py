@@ -1225,6 +1225,19 @@ class UnifiedRadixCache(BasePrefixCache):
         radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
+        prompt_key = RadixKey(
+            req.origin_input_ids,
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        # Any checkpoint that ends at the prompt's last full page marks its window;
+        # when the last chunk is under a page, the chunk before it ends there too.
+        insert_params.swa_prompt_tail = (
+            envs.SGLANG_OPT_SWA_PROTECT_PROMPT_TAIL.get()
+            and not is_finished
+            and page_aligned_len == len(prompt_key)
+        )
 
         insert_params.key = radix_key
         insert_params.value = values
@@ -1250,12 +1263,6 @@ class UnifiedRadixCache(BasePrefixCache):
         # Split the leaf at the prompt boundary so eviction can drop the output
         # KV without the prompt. prev_prefix_len keeps the overlapping indices
         # from being freed as duplicates.
-        prompt_key = RadixKey(
-            req.origin_input_ids,
-            req.extra_key,
-            is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
-        ).page_aligned(self.page_size)
         if (
             len(self._components_tuple) == 1
             and self._components_tuple[0].component_type == BASE_COMPONENT_TYPE
