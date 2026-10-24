@@ -59,14 +59,49 @@ pub struct MmProcessOutput {
     pub result: MmEncodedEntry,
 }
 
+/// Client/server class of a media preparation failure, mirroring Python's
+/// loader contract: `ValueError` is a 400, any other exception a 500.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MediaError {
+    /// Bad input from the client (400).
+    #[error("{0}")]
+    Client(String),
+    /// A fault on the server side, e.g. a media backend that is down (500).
+    #[error("{0}")]
+    Server(String),
+}
+
 /// Multimodal processor shared by built-in and external implementations.
 /// Implementations run on the fixed Rust worker pool and must not retain
 /// request-scoped Python objects. `input_ids` arrive tokenized (the FSM runs
 /// `Tokenizing` before `Encoding` for a text prompt), so a processor never
 /// tokenizes: it expands placeholders in ids. `mm` is the request's media,
 /// owned.
+///
+/// The media hooks run earlier, during admission on the API runtime, before
+/// any media is fetched or the request reaches the worker pool.
 pub trait MmProcessor: Send + Sync {
     fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String>;
+
+    /// Reject a request's media before any of it is fetched, e.g. a modality
+    /// the served model cannot encode. `Err` is a client error (400). Runs on
+    /// an async worker, so it must not block.
+    fn check_media(&self, _mm: &MmData) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Fetch one I/O-backed source, charging its bytes to `budget`; runs on
+    /// the API runtime's blocking pool. `Ok(None)` leaves the source to the
+    /// built-in fetcher (`http(s)://`, `file://` and absolute paths), which
+    /// rejects every other URI scheme.
+    fn fetch_media(
+        &self,
+        _source: &str,
+        _modality: MmModality,
+        _budget: &crate::MediaByteBudget,
+    ) -> Result<Option<bytes::Bytes>, MediaError> {
+        Ok(None)
+    }
 
     /// Finish item layout after caller hash overrides, before feature publication.
     fn finalize(&self, _entry: &mut MmEncodedEntry) -> Result<(), String> {

@@ -3353,7 +3353,7 @@
                 "Cosmos3LatentPreparationStage": 0.14,
                 "Cosmos3TimestepPreparationStage": 0.56,
                 "Cosmos3DenoisingStage": 202.12,
-                "Cosmos3DecodingStage": 47.82,
+                "Cosmos3DecodingStage": 211.21,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
@@ -3362,7 +3362,7 @@
                 "2": 85.06,
                 "3": 58.08
             },
-            "expected_e2e_ms": 369.27,
+            "expected_e2e_ms": 476.39,
             "expected_avg_denoise_ms": 73.47,
             "expected_median_denoise_ms": 73.29,
             "estimated_full_test_time_s": 50
