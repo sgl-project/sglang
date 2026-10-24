@@ -264,7 +264,6 @@ class HybridCacheController(BaseHiCacheController):
                 prefetch_threshold=prefetch_threshold,
                 model_name=model_name,
                 storage_backend_extra_config=storage_backend_extra_config,
-                host_pools=getattr(mem_pool_host, "entries", None),
             )
 
     def _start_storage_threads(self):
@@ -297,17 +296,12 @@ class HybridCacheController(BaseHiCacheController):
         """Only opt in backends whose FULL object is the complete shared page."""
         return storage_backend is None or storage_backend == "mori"
 
-    # The per-pool v2 burst runs after super() returns; on_host_pools_registered()
-    # fires at its end, so the base class leaves the firing to us.
-    _registers_host_pools_after_super_attach = True
-
     def attach_storage_backend(
         self,
         storage_backend: str,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
-        host_pools: Optional[list[PoolEntry]] = None,
     ):
         if isinstance(
             self.storage_host_pool, UnifiedPageEnvelopeHostPool
@@ -340,14 +334,15 @@ class HybridCacheController(BaseHiCacheController):
                 storage_backend_extra_config=storage_backend_extra_config,
             )
         except Exception:
-            if self.pp_prefetch_command_group is not None:
+            # A failed rollback may leave the PP worker alive. Its command group
+            # must survive with the retained backend until detach can stop it.
+            if (
+                self.storage_backend is None
+                and self.pp_prefetch_command_group is not None
+            ):
                 torch.distributed.destroy_process_group(self.pp_prefetch_command_group)
                 self.pp_prefetch_command_group = None
             raise
-
-        for entry in host_pools or []:
-            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
-        self.storage_backend.on_host_pools_registered()
 
     def detach_storage_backend(self):
         super().detach_storage_backend()
@@ -361,11 +356,22 @@ class HybridCacheController(BaseHiCacheController):
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
-        self.mem_pool_host.add_entry(entry)
-        if not entry.is_primary_index_anchor:
-            self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
-        if self.enable_storage and self.storage_backend is not None:
+        self.mem_pool_host.check_entry(entry)
+        if self.enable_storage:
+            from sglang.srt.mem_cache.storage import StorageBackendFactory
+
+            pools = self._storage_host_pools()
+            pools[entry.name] = entry.host_pool
+            StorageBackendFactory.validate_backend(
+                self.storage_backend_type,
+                self.storage_config,
+                pools,
+                backend_class=type(self.storage_backend),
+            )
+            # Native registration goes first so a failure publishes nothing.
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+        self.mem_pool_host.add_entry(entry)
+        self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
 
     @staticmethod
     def parse_storage_backend_extra_config(

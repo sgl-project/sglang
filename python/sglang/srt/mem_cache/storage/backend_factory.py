@@ -5,7 +5,16 @@ import importlib
 import logging
 from typing import TYPE_CHECKING, Any, Dict
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    DCP_CAP_DRAFT_MLA_SHARDED,
+    DCP_CAP_EXACT_RESTORABLE_PREFIX_PAGES,
+    DCP_CAP_LOGICAL_PAGE_INDICES,
+    DCP_CAP_MAMBA_TP_SHARDED,
+    DCP_CAP_MLA_SHARDED,
+    HiCacheStorage,
+    HiCacheStorageConfig,
+    PoolName,
+)
 
 if TYPE_CHECKING:
     pass
@@ -63,11 +72,88 @@ class StorageBackendFactory:
         }
 
     @classmethod
+    def validate_backend(
+        cls, backend_name, storage_config, host_pools, backend_class=None
+    ):
+        """Check the pool set against the backend before any native client I/O.
+
+        ``backend_class`` is the dynamic backend's class; registered backends
+        are validated by name alone. Also runs when a hybrid controller
+        registers a sidecar after startup.
+        """
+        if storage_config.dcp_size > 1:
+            cls._validate_dcp_host_pools(backend_name, storage_config, host_pools)
+        if backend_name == "dynamic":
+            cls._validate_dynamic_backend(backend_class, storage_config, host_pools)
+
+    @staticmethod
+    def _validate_dcp_host_pools(backend_name, storage_config, host_pools):
+        if backend_name not in ("file", "mooncake", "dynamic"):
+            raise NotImplementedError("Backend does not support DCP storage.")
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+        from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+        anchor = host_pools.get(PoolName.KV)
+        if anchor is None:
+            raise NotImplementedError("DCP storage requires a KV anchor.")
+        mla_pools = {PoolName.KV}
+        if backend_name == "dynamic":
+            mla_pools.add(PoolName.DRAFT)
+        for name, pool in host_pools.items():
+            if name == PoolName.MAMBA:
+                if not isinstance(pool, MambaPoolHost):
+                    raise NotImplementedError("Unsupported DCP storage sidecar.")
+                continue
+            if name not in mla_pools:
+                raise NotImplementedError("Unsupported DCP storage sidecar.")
+            if not isinstance(pool, MLATokenToKVPoolHost) or pool.kv_buffer is None:
+                raise NotImplementedError(
+                    "DCP storage requires materialized MLA pools."
+                )
+            if pool.layout not in ("layer_first", "page_first", "page_first_direct"):
+                raise NotImplementedError(
+                    "DCP storage requires generic MLA page layout."
+                )
+            # Materialized MLA host pools reject separate FP4 scales while
+            # capturing MLABufferInfo; they no longer retain a device_pool.
+            if backend_name == "dynamic" and (
+                pool.dcp_size != storage_config.dcp_size
+                or pool.dcp_rank != storage_config.dcp_rank
+                or pool.logical_page_size != storage_config.logical_page_size
+                or pool.page_size * storage_config.dcp_size != pool.logical_page_size
+                or pool.layout != anchor.layout
+            ):
+                raise NotImplementedError(
+                    "DCP storage pool geometry or layout mismatch."
+                )
+
+    @staticmethod
+    def _validate_dynamic_backend(backend_class, storage_config, host_pools):
+        dcp = storage_config.dcp_size > 1
+        if dcp:
+            required = {DCP_CAP_MLA_SHARDED, DCP_CAP_LOGICAL_PAGE_INDICES}
+            if PoolName.MAMBA in host_pools:
+                required.update(
+                    (DCP_CAP_MAMBA_TP_SHARDED, DCP_CAP_EXACT_RESTORABLE_PREFIX_PAGES)
+                )
+            if PoolName.DRAFT in host_pools:
+                required.add(DCP_CAP_DRAFT_MLA_SHARDED)
+            missing = required - backend_class.dcp_storage_capabilities
+            if missing:
+                raise NotImplementedError(
+                    f"Dynamic backend lacks DCP storage capabilities: {sorted(missing)}"
+                )
+        # Legacy plugins that declare nothing keep their DCP1 path untouched.
+        if dcp or backend_class.dcp_storage_capabilities:
+            backend_class.validate_dcp_config(storage_config, host_pools)
+
+    @classmethod
     def create_backend(
         cls,
         backend_name: str,
         storage_config: HiCacheStorageConfig,
         mem_pool_host: Any,
+        storage_host_pools=None,
         **kwargs,
     ) -> HiCacheStorage:
         """Create a storage backend instance.
@@ -75,6 +161,8 @@ class StorageBackendFactory:
             backend_name: Name of the backend to create
             storage_config: Storage configuration
             mem_pool_host: Memory pool host object
+            storage_host_pools: PoolName -> host pool map validated against the
+                backend; defaults to ``{PoolName.KV: mem_pool_host}``
             **kwargs: Additional arguments passed to external backends
         Returns:
             Initialized storage backend instance
@@ -83,6 +171,18 @@ class StorageBackendFactory:
             ImportError: If backend module cannot be imported
             Exception: If backend initialization fails
         """
+        if storage_host_pools is None:
+            storage_host_pools = {PoolName.KV: mem_pool_host}
+        if backend_name == "dynamic":
+            if storage_config.extra_config is None:
+                raise ValueError("Dynamic storage backend requires extra_config.")
+            return cls._create_dynamic_backend(
+                storage_config.extra_config,
+                storage_config,
+                storage_host_pools,
+                **kwargs,
+            )
+        cls.validate_backend(backend_name, storage_config, storage_host_pools)
         # First check if backend is already registered
         if backend_name in cls._registry:
             registry_entry = cls._registry[backend_name]
@@ -93,13 +193,6 @@ class StorageBackendFactory:
             )
             return cls._create_builtin_backend(
                 backend_name, backend_class, storage_config, mem_pool_host
-            )
-
-        # Try to dynamically load backend from extra_config
-        if backend_name == "dynamic" and storage_config.extra_config is not None:
-            backend_config = storage_config.extra_config
-            return cls._create_dynamic_backend(
-                backend_config, storage_config, mem_pool_host, **kwargs
             )
 
         # Backend not found
@@ -115,7 +208,7 @@ class StorageBackendFactory:
         cls,
         backend_config: Dict[str, Any],
         storage_config: HiCacheStorageConfig,
-        mem_pool_host: Any,
+        storage_host_pools: Dict[PoolName, Any],
         **kwargs,
     ) -> HiCacheStorage:
         """Create a backend dynamically from configuration."""
@@ -141,7 +234,13 @@ class StorageBackendFactory:
                 f"({module_path}.{class_name})"
             )
 
-            # Create the backend instance with storage_config
+            # Validation precedes __init__: plugins may open native clients there.
+            cls.validate_backend(
+                "dynamic",
+                storage_config,
+                storage_host_pools,
+                backend_class=backend_class,
+            )
             return backend_class(storage_config, kwargs)
         except Exception as e:
             logger.error(

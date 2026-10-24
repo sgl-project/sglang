@@ -5461,8 +5461,9 @@ class Scheduler(
             logger.exception("Detach HiCache storage backend failed with exception.")
             return DetachHiCacheStorageReqOutput(success=False, message=str(e))
 
-        if ok or (not self.enable_hicache_storage):
-            # Treat "already disabled / nothing to do" as success for idempotence.
+        if ok:
+            # A retained backend whose close failed reports ok=False even when
+            # storage is already disabled, so the caller can retry.
             self.enable_hicache_storage = False
             get_context().override(
                 "scheduler.detach_hicache",

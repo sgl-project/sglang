@@ -227,6 +227,57 @@ python3 -m sglang.launch_server \
   - `class_name`: Your HiCache implementation class name
   - `interface_v1`: 0 (disable) or 1 (enable) to control usage of batch_get_v1 and batch_set_v1 methods
 
+### Dynamic backends with DCP
+
+Dynamic loading does not automatically make a backend compatible with Decode
+Context Parallelism (DCP). For MLA KV storage with DCP, your `HiCacheStorage`
+subclass must declare the capabilities it implements in the class attribute
+`dcp_storage_capabilities`, using the `DCP_CAP_*` constants from
+`sglang.srt.mem_cache.hicache_storage`, and may override the class method
+`validate_dcp_config(storage_config, host_pools)` for backend-specific limits.
+
+| Host pools present | Required capability names |
+| --- | --- |
+| MLA KV anchor | `mla_sharded`, `logical_page_indices` |
+| Mamba/KDA state | Also `mamba_tp_sharded`, `exact_restorable_prefix_pages` |
+| MLA draft KV | Also `draft_mla_sharded` |
+
+The factory reads these declarations from the backend class. Setting names in
+`--hicache-storage-backend-extra-config` cannot enable unsupported capabilities.
+Legacy dynamic backends with no declared capabilities retain their DCP1 path.
+For an opted-in backend, validation also runs at DCP1.
+
+`host_pools` maps `PoolName` to materialized host pools. Validation runs before
+the backend constructor, so reject unsupported configurations before opening a
+native client or registering memory. The factory checks MLA pool types, generic
+MLA layouts, DCP rank/size, and logical-to-physical page geometry. Your validation
+method must check any additional restrictions of your implementation. When a
+sidecar is added later, validation sees the proposed complete pool set before
+the sidecar is registered or published.
+
+Your implementation must keep DCP KV shards and TP-sharded state distinct in
+storage and translate logical page indices to each rank's physical rows. For
+hybrid caches, report the actual sparse checkpoint boundaries through
+`PoolTransferResult.restorable_prefix_pages`. The controller intersects those
+boundaries across ranks; a single longest-prefix count cannot describe missing
+checkpoints between two valid ones.
+
+### Pool registration and cleanup
+
+Each attach registers the anchor with `register_mem_pool_host`, then all initial
+host-pool group entries with `register_mem_host_pool_v2`. The controller calls
+`on_host_pools_registered()` once after that registration burst and before
+starting storage workers. Later sidecars use `register_mem_host_pool_v2` without
+calling the finalizer again. A registration or finalizer exception fails attach
+and starts rollback.
+
+If your backend owns native memory registrations, set the class attribute
+`requires_explicit_memory_cleanup = True` and implement a retryable `close()`.
+The controller stops workers before closing the backend. If close fails, it
+retains the backend and rejects a new attach until a later detach completes
+cleanup. See [runtime attach/detach](/docs/advanced_features/hicache_storage_runtime_attach_detach#cleanup-failures)
+for failures that require a model-process restart.
+
 
 ## Community and Support
 
