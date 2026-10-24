@@ -280,7 +280,7 @@ def _run_mega_routed(
     hidden_size = moe.config.hidden_size
 
     routing = None
-    if should_use_mega_gate(moe, hidden_states):
+    if should_use_mega_gate(moe, hidden_states, forward_batch):
         import deep_gemm
 
         # Only the fp8xfp4 pre-dispatch can skip its top-k copy (kCopyTopk).
@@ -290,7 +290,9 @@ def _run_mega_routed(
             else None
         )
         with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-            routing = run_mega_gate(moe, hidden_states, input_ids_global, buf)
+            routing = run_mega_gate(
+                moe, hidden_states, input_ids_global, buf, forward_batch
+            )
 
     if routing is not None:
         topk_ids = routing.topk_ids

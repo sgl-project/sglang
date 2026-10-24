@@ -1,3 +1,7 @@
+#pragma once
+
+#include "vecdotq.cuh"
+
 // copied from
 // https://github.com/vllm-project/vllm/blob/4492e3a55428e161ca8db381edc28263e5da4c8d/csrc/quantization/gguf/moe_vec.cuh
 // copied and adapted from

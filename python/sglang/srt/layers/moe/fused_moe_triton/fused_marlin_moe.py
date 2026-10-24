@@ -275,11 +275,14 @@ def fused_marlin_moe(
         from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_single_token(
-            topk_ids, block_size_m
+            topk_ids, block_size_m, return_inactive_prefix_count=True
         )
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, global_num_experts
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            return_inactive_prefix_count=expert_map is None,
         )
 
     if workspace is None:
@@ -339,6 +342,8 @@ def fused_marlin_moe(
         top_k=topk,
         mul_topk_weights=False,
         is_ep=expert_map is not None,
+        expert_ids_are_sorted=expert_map is None,
+        has_inactive_prefix_count=expert_map is None,
         b_q_type=scalar_type1,
         size_m=M,
         size_n=gemm1_n,
@@ -380,9 +385,7 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    # Gate-up is dead after activation, so its storage can hold the down output.
-    # Skipped down routes must start at zero before the top-k reduction.
-    intermediate_cache3.zero_()
+    # Gate-up is dead; the down GEMM defines inactive rows in the shared output.
     intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
         intermediate_cache3,
@@ -401,7 +404,10 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=1,
         mul_topk_weights=True,
+        zero_inactive_output=True,
         is_ep=expert_map is not None,
+        expert_ids_are_sorted=expert_map is None,
+        has_inactive_prefix_count=expert_map is None,
         b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
