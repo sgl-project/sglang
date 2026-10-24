@@ -58,7 +58,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
     ) -> None:
-        self._decode_runner = None
+        self._decode_runner = cuda_graph_runner
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
@@ -92,9 +92,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     @property
     def cache_loc_dtype(self):
         return torch.int32
-
-    def bind_decode_runner(self, runner):
-        self._decode_runner = runner
 
     def _decode_update_attr_name(self):
         runner = self._decode_runner
@@ -289,6 +286,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 is_encoder_decoder=runner.is_encoder_decoder,
             )
             runner._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
+        # Preserve the legacy NPU pre-planned replay key.
+        runner._replay_graph_key = runner._make_graph_key(runner.bs)
         return True
 
     @contextmanager
