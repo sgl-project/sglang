@@ -38,6 +38,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
@@ -63,6 +64,54 @@ class TestCompletionRequest(unittest.TestCase):
 
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model")  # missing prompt
+
+
+class TestThinkingAliases(CustomTestCase):
+    def _request(self, **kwargs):
+        return ChatCompletionRequest(
+            messages=[{"role": "user", "content": "Hi"}], **kwargs
+        )
+
+    def test_explicit_alias_overrides_reasoning_effort_for_both_consumers(self):
+        for alias in ("thinking", "enable_thinking"):
+            for effort, override in (("high", False), ("none", True), (None, False)):
+                with self.subTest(alias=alias, effort=effort, override=override):
+                    source = {alias: override, "unrelated": "preserved"}
+                    request = self._request(
+                        reasoning_effort=effort, chat_template_kwargs=source
+                    )
+                    self.assertIs(request.chat_template_kwargs["thinking"], override)
+                    self.assertIs(
+                        request.chat_template_kwargs["enable_thinking"], override
+                    )
+                    self.assertEqual(
+                        request.chat_template_kwargs["unrelated"], "preserved"
+                    )
+                    self.assertEqual(
+                        source, {alias: override, "unrelated": "preserved"}
+                    )
+
+    def test_conflicting_or_non_boolean_aliases_are_rejected(self):
+        for kwargs in (
+            {"thinking": True, "enable_thinking": False},
+            {"thinking": "false"},
+            {"enable_thinking": 0},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValidationError):
+                self._request(chat_template_kwargs=kwargs)
+
+    def test_implicit_toggles_and_unrelated_kwargs_keep_existing_behavior(self):
+        for effort, expected in (("none", False), ("high", True)):
+            request = self._request(reasoning_effort=effort)
+            self.assertEqual(
+                request.chat_template_kwargs,
+                {"thinking": expected, "enable_thinking": expected},
+            )
+        self.assertIsNone(self._request().chat_template_kwargs)
+        self.assertEqual(
+            self._request(chat_template_kwargs={"other": 1}).chat_template_kwargs,
+            {"other": 1},
+        )
 
 
 class TestChatCompletionRequest(unittest.TestCase):

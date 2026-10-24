@@ -1096,10 +1096,30 @@ class ChatCompletionRequest(PDRoutingFields):
         if effort is not None:
             thinking = effort != "none"
 
-        if thinking is not None:
+        if thinking is not None or any(
+            key in (values.get("chat_template_kwargs") or {})
+            for key in ("thinking", "enable_thinking")
+        ):
             ctk = values.get("chat_template_kwargs")
             if not isinstance(ctk, dict):
                 ctk = {}
+            else:
+                ctk = dict(ctk)
+            explicit_toggles = [
+                ctk[key] for key in ("thinking", "enable_thinking") if key in ctk
+            ]
+            if any(not isinstance(toggle, bool) for toggle in explicit_toggles):
+                raise ValueError(
+                    "chat_template_kwargs thinking toggles must be boolean"
+                )
+            if len(set(explicit_toggles)) > 1:
+                raise ValueError(
+                    "chat_template_kwargs.thinking conflicts with enable_thinking"
+                )
+            if explicit_toggles:
+                # Both consumers must see the same explicit override, including
+                # when a caller only supplies the alias used by one template.
+                thinking = explicit_toggles[0]
             # different models check different keys:
             # - "thinking" for deepseek-v3, kimi_k2
             # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1

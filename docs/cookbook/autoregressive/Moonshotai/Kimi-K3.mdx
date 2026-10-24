@@ -478,3 +478,12 @@ Decisions the preset already makes:
 <Note>
 No preset has a full serving round on final weights; the constants derive from measured single- and dual-node rounds plus a 64-GPU sweep. Validate throughput and accuracy on your workload before committing a fleet.
 </Note>
+
+
+## Override thinking explicitly
+
+`chat_template_kwargs.thinking` and `chat_template_kwargs.enable_thinking` are
+aliases for an explicit boolean thinking override. Either one takes precedence
+over `reasoning_effort`, and the server forwards the same value under both names
+so prompt templates and reasoning parsers agree. Conflicting aliases or
+non-boolean values are rejected.
