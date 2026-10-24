@@ -791,6 +791,11 @@ class Envs:
     # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
     # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
+    # Gated background transfers (distributed/device_communicators/
+    # gated_transfer.py): force open a transfer gate whose pause has been held
+    # this long, logging an error. A pause that never resumes means work the
+    # resume depends on is stuck behind a parked chunk. 0 disables it.
+    SGLANG_GATED_TRANSFER_WATCHDOG_MS = EnvInt(1000)
 
     # ===================================================================
     # Tool calling and native web search

@@ -949,6 +949,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Synchronize sampled token ids across tensor-parallel ranks.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_GATED_TRANSFER_WATCHDOG_MS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Gated background transfers: force open a transfer gate whose pause has been held this many milliseconds, and log an error. A pause that never resumes means work the resume depends on is stuck behind a parked chunk (a hardware queue shared with it, a lazy module load or a device sync inside a pause); the transfer then overlaps the foreground op instead of hanging it. <code>0</code> disables the watchdog.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1000</code></td>
+    </tr>
   </tbody>
 </table>
 
