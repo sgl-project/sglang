@@ -57,6 +57,7 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
     prepare_kv_shard_forward,
 )
+from sglang.srt.layers.attention.merge_state import lse_base2_to_natural
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
@@ -1079,7 +1080,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         q_scale = k_scale = v_scale = 1.0
         if self.data_type == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
-        return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
             value=v,
@@ -1100,6 +1101,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             out=out_buffer,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         )
+        return lse_base2_to_natural(result)
 
     def _set_kv_and_concat_q_fused(
         self,

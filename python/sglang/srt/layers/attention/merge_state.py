@@ -46,3 +46,15 @@ def merge_state(
         return merge_state_triton(
             prefix_output, prefix_lse, suffix_output, suffix_lse, output, output_lse
         )
+
+
+# FlashInfer / TRT-LLM attention kernels return log-sum-exp in base 2, while
+# merge_state (merge_state_v2, FA3/FA4) uses natural log. Convert exactly once.
+_LN2 = 0.6931471805599453
+
+
+def lse_base2_to_natural(out):
+    if not isinstance(out, tuple):  # LSE not requested
+        return out
+    o, lse = out
+    return o, lse * _LN2
