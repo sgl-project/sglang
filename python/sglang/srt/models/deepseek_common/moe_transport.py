@@ -11,7 +11,6 @@ from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
     attn_tp_all_gather_into_tensor,
-    dp_gather_partial,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_reduce_scatterv_async,
@@ -292,17 +291,33 @@ def _tbo_gather_moe_input(moe, local, batch, sub, do_shared_local):
         local.dtype,
         local.device,
     )
+    parallel = get_parallel()
+    local_shard = (
+        local
+        if parallel.attn_tp_size == 1
+        else local.tensor_split(parallel.attn_tp_size)[
+            parallel.attn_tp_rank
+        ].contiguous()
+    )
+    tp_sizes = batch._tbo_tp_sizes
+    assert local_shard.shape[0] == tp_sizes[parallel.tp_group.rank_in_group]
     comm = get_dp_tbo_comm_stream()
     compute = torch.cuda.current_stream()
     with torch.cuda.stream(comm):
         comm.wait_stream(compute)
-        dp_gather_partial(global_hidden, local, batch)
+        if parallel.attn_tp_size == 1:
+            # Preserve the optional FP8 wire format of the existing DP gather.
+            dp_gather_replicate(global_hidden, local, batch)
+        else:
+            parallel.tp_group.all_gatherv(
+                local_shard, sizes=tp_sizes, output=global_hidden
+            )
         event = _tbo_event(("gather", sub))
         event.record(comm)
-    return global_hidden, event, shared_local
+    return global_hidden, event, shared_local, local_shard
 
 
-def _tbo_combine_moe_output(output, sub):
+def _tbo_combine_moe_output(output, batch, sub):
     local = get_tbo_persistent_buffer(
         ("lo", sub),
         get_local_dp_buffer_len(),
@@ -311,7 +326,7 @@ def _tbo_combine_moe_output(output, sub):
         output.device,
     )
     event = dp_reduce_scatterv_async(
-        local, output, get_dp_global_num_tokens(), event_key=("combine", sub)
+        local, output, batch._tbo_tp_sizes, event_key=("combine", sub)
     )
     return local, event
 
@@ -360,7 +375,9 @@ class OverlappedMoeTransport(ComputeTransport):
         self.moe, self.input, self.batch = moe, hidden_states, batch
         self.ep = not get_moe_a2a_backend().is_none()
         self.sub = subbatch_index
-        self.do_shared_local = not self.ep and shared_expert_runs_locally(moe)
+        self.do_shared_local = (
+            not self.ep and moe.shared_experts is not None and moe._shared_expert_tp1
+        )
         self.shared_local = None
         self.gather_event = self.combine_event = None
         self.gather_keepalive = self.combine_keepalive = None
@@ -382,12 +399,14 @@ class OverlappedMoeTransport(ComputeTransport):
         if self.ep or self.gather_event is not None or self.global_hidden is not None:
             raise RuntimeError("TBO gather cannot be issued twice")
         local = self.input
-        self.global_hidden, self.gather_event, self.shared_local = (
-            _tbo_gather_moe_input(
-                self.moe, local, self.batch, self.sub, self.do_shared_local
-            )
+        (
+            self.global_hidden,
+            self.gather_event,
+            self.shared_local,
+            self.gather_keepalive,
+        ) = _tbo_gather_moe_input(
+            self.moe, local, self.batch, self.sub, self.do_shared_local
         )
-        self.gather_keepalive = local
         self.input = None
 
     def wait_gather(self):
@@ -400,7 +419,9 @@ class OverlappedMoeTransport(ComputeTransport):
     def issue_combine(self, output):
         if self.ep or self.combine_event is not None or self.combined:
             raise RuntimeError("TBO combine cannot be issued twice")
-        self.local_out, self.combine_event = _tbo_combine_moe_output(output, self.sub)
+        self.local_out, self.combine_event = _tbo_combine_moe_output(
+            output, self.batch, self.sub
+        )
         self.combine_keepalive = output
         self.global_hidden = None
 
