@@ -39,7 +39,7 @@ HICACHE_SIZE_GB = 10
 class TestUnifiedKimiLinearDcpHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Kimi Linear + DCP4 + HiCache L2 + UnifiedRadixCache."""
 
-    kl_threshold = 0.01
+    kl_threshold = 0.005
     gsm8k_threshold = 0.85
     prefill_cache_assert = staticmethod(
         make_mamba_prefill_assert(chunk_size=WIDENED_PAGE)
