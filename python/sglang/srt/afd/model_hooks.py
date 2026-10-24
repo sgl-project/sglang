@@ -21,6 +21,11 @@ def afd_execution_mode() -> AFDExecutionMode:
     return execution_mode_from_server_args(get_server_args())
 
 
+def afd_m2n_enabled() -> bool:
+    config = getattr(get_server_args(), "afd_config", None)
+    return bool(getattr(config, "experimental_m2n", False))
+
+
 def afd_a_router_enabled(*, model_family: str | None = None) -> bool:
     args = get_server_args()
     config = getattr(args, "afd_config", None)

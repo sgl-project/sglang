@@ -26,7 +26,11 @@ from transformers import PretrainedConfig
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.afd.config import AFDExecutionMode
-from sglang.srt.afd.model_hooks import afd_execution_mode, afd_model_forward
+from sglang.srt.afd.model_hooks import (
+    afd_execution_mode,
+    afd_m2n_enabled,
+    afd_model_forward,
+)
 from sglang.srt.afd.model_proxy import AFDProxyAttention, AFDProxyMLP
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
@@ -1359,6 +1363,10 @@ def make_glm_dsa_attention_mlp(*, config, layer_id, quant_config, prefix=""):
         raise RuntimeError("AFD_GLM_ROUTING_QUANTIZATION_UNSUPPORTED")
     if config.hidden_act != "silu" or layer_id < getattr(config, "num_hash_layers", 0):
         raise RuntimeError("AFD_GLM_ROUTING_EXPERT_LAYOUT_UNSUPPORTED")
+    if afd_m2n_enabled() and DeepseekV2DecoderLayer._is_layer_sparse(
+        config, layer_id, False
+    ):
+        return Glm5AFDRouterShared(config, layer_id, quant_config, prefix)
     return AFDProxyMLP()
 
 
@@ -1392,7 +1400,10 @@ class GlmMoeDsaAFDDecoderLayer(DeepseekV2DecoderLayer):
             if mode == AFDExecutionMode.FFN and layer.mlp.num_fused_shared_experts:
                 raise RuntimeError("AFD_GLM_ROUTING_FUSED_SHARED_UNSUPPORTED")
         if mode == AFDExecutionMode.ATTENTION:
-            layer.mlp = AFDProxyMLP()
+            if not (afd_m2n_enabled() and layer.is_layer_sparse):
+                layer.mlp = AFDProxyMLP()
+            elif not isinstance(layer.mlp, Glm5AFDRouterShared):
+                raise RuntimeError("AFD_M2N_GLM5_ROUTER_SHARED_NOT_PROJECTED")
         elif mode == AFDExecutionMode.FFN:
             layer.attn_boundary.plan.qkv_latent_func = None
             layer.self_attn = AFDProxyAttention()
@@ -1561,7 +1572,16 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         if mode != AFDExecutionMode.OFF and is_nextn:
             raise RuntimeError("AFD_GLM_DSA_MTP_UNSUPPORTED")
         if mode == AFDExecutionMode.ATTENTION:
-            weights = ((name, value) for name, value in weights if ".mlp." not in name)
+            keep_m2n = afd_m2n_enabled()
+            weights = (
+                (name, value)
+                for name, value in weights
+                if ".mlp." not in name
+                or (
+                    keep_m2n
+                    and (".mlp.gate." in name or ".mlp.shared_experts." in name)
+                )
+            )
         elif mode == AFDExecutionMode.FFN:
             weights = (
                 (name, value) for name, value in weights if ".self_attn." not in name

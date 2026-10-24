@@ -12,6 +12,8 @@ import msgspec
 # Balanced fixed-capacity decode rows, before Graph padding.
 DIRECT_STAGE_ROWS = (16, 20, 24, 32, 36, 40, 48)
 DIRECT_BALANCED_LANE_ROWS = tuple(((rows, rows),) * 8 for rows in DIRECT_STAGE_ROWS)
+M2N_STAGE_ROWS = DIRECT_STAGE_ROWS
+M2N_FFN_LANES = (2, 4, 8)
 
 
 class AFDError(RuntimeError):
@@ -513,6 +515,7 @@ class AFDStepDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     # Global batch mode, independent of graph eligibility (IDLE is decode).
     is_extend_in_batch: bool = False
     uses_direct: bool = False
+    uses_m2n: bool = False
     close_usage: dict[str, Any] | None = None
     # Wire field retained; this base runtime only admits one decode token/request.
     tokens_per_request: int = 1
@@ -531,10 +534,12 @@ class AFDStepDescriptor(msgspec.Struct, frozen=True, kw_only=True):
             type(self.is_extend_in_batch) is not bool
             or type(self.graph_eligible) is not bool
             or type(self.uses_direct) is not bool
+            or type(self.uses_m2n) is not bool
         ):
             raise AFDError("AFD_STEP_DESCRIPTOR_MODE_INVALID")
-        if self.uses_direct and (
-            self.is_extend_in_batch
+        if (self.uses_direct or self.uses_m2n) and (
+            (self.uses_direct and self.uses_m2n)
+            or self.is_extend_in_batch
             or self.kind not in ("STEP", "CAPTURE")
             or not self.lane_stage_rows
             or any(
@@ -543,7 +548,8 @@ class AFDStepDescriptor(msgspec.Struct, frozen=True, kw_only=True):
             )
             or not any(any(rows) for rows in self.lane_stage_rows)
         ):
-            raise AFDError("AFD_DIRECT_STEP_UNSUPPORTED")
+            backend = "DIRECT" if self.uses_direct else "M2N"
+            raise AFDError(f"AFD_{backend}_STEP_UNSUPPORTED")
         if self.is_extend_in_batch and self.graph_eligible:
             raise AFDError(
                 "AFD_STEP_DESCRIPTOR_MODE_MISMATCH", "extend cannot be graphed"

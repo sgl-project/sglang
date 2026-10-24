@@ -92,6 +92,7 @@ def routing(monkeypatch):
         use_intel_amx_backend=lambda _: False,
         _use_mnnvl_cutedsl_fusion=lambda: False,
         afd_a_router_enabled=lambda: False,
+        afd_m2n_enabled=lambda: False,
         _is_cuda=True,
         _is_musa=False,
         _is_xpu=False,

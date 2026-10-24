@@ -14,7 +14,7 @@ from .contracts import (
     AFDShapeFactory,
     AFDStepDescriptor,
 )
-from .ffn_backend import direct_step_reason, select_direct_step
+from .ffn_backend import direct_step_reason, select_direct_step, select_m2n_step
 from .layer_executor import execute_layer_operations
 from .model_adapters.base import stage_forward_context
 
@@ -168,6 +168,7 @@ class AFDAttentionPipeline:
             and not is_extend_in_batch
             and all(all(stage_rows) for stage_rows in lane_rows)
         )
+        uses_m2n = select_m2n_step(self._config, lane_rows, is_extend_in_batch)
         backend = self._connector.transport.ffn_backend
         reason = direct_step_reason(
             self._config, lane_rows, is_extend_in_batch, backend=backend
@@ -177,14 +178,14 @@ class AFDAttentionPipeline:
             reason = getattr(
                 self._connector.transport, "direct_selection_reason", reason
             )
-        if backend is not None and not uses_direct:
+        if backend is not None and not (uses_direct or uses_m2n):
             eligible = False
         if reason != self._last_backend_selection:
             self._last_backend_selection = reason
             logger.info(
                 "AFD_FFN_SELECTION step_id=%d backend=%s reason=%s lane_rows=%r",
                 self._step_id,
-                "nccl_direct" if uses_direct else "fixed",
+                "m2n" if uses_m2n else "nccl_direct" if uses_direct else "fixed",
                 reason,
                 lane_rows,
             )
@@ -220,6 +221,7 @@ class AFDAttentionPipeline:
             graph_eligible=eligible,
             is_extend_in_batch=is_extend_in_batch,
             uses_direct=uses_direct,
+            uses_m2n=uses_m2n,
         )
         if uses_direct:
             backend.prepare_step(shape=shape)
@@ -280,7 +282,7 @@ class AFDAttentionPipeline:
                 recv_buffers=recv_buffers,
                 bucket_rows=shape.bucket_rows,
                 participates=participates,
-                uses_backend=uses_direct,
+                uses_backend=uses_direct or uses_m2n,
             )
         finally:
             end_reason = self._connector.graph_strategy.end_step()
@@ -594,7 +596,7 @@ class AFDFFNPipeline:
                 stages=stages,
                 recv_buffers=recv_buffers,
                 participates=participates,
-                uses_backend=descriptor.uses_direct,
+                uses_backend=descriptor.uses_direct or descriptor.uses_m2n,
             )
         finally:
             end_reason = self._connector.graph_strategy.end_step()
@@ -734,9 +736,20 @@ class AFDFFNPipeline:
         if (
             self._connector.transport.ffn_backend is not None
             and not descriptor.uses_direct
+            and not descriptor.uses_m2n
             and descriptor.graph_eligible
         ):
             raise AFDError("AFD_DIRECT_FALLBACK_MUST_BE_EAGER")
+        if descriptor.uses_m2n != select_m2n_step(
+            self._config, descriptor.lane_stage_rows, descriptor.is_extend_in_batch
+        ):
+            raise AFDError("AFD_M2N_STEP_MODE_MISMATCH")
+        if (
+            self._config.experimental_m2n
+            and not descriptor.uses_m2n
+            and descriptor.graph_eligible
+        ):
+            raise AFDError("AFD_M2N_FALLBACK_GRAPH_UNSUPPORTED")
         expected = (
             descriptor.kind in ("STEP", "CAPTURE")
             and len(descriptor.lane_stage_rows) == self._config.attention_lane_count

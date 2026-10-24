@@ -113,12 +113,35 @@ def negotiate_direct_capabilities(descriptors):
     }
 
 
+def select_m2n_step(config: Any, lane_rows: tuple, is_extend: bool) -> bool:
+    return bool(
+        config.experimental_m2n
+        and not is_extend
+        and lane_rows == ((config.experimental_m2n_stage_rows,) * 2,) * 8
+    )
+
+
 def validate_ffn_backend(*, config, adapter, model_family, dtype, capture_sizes):
     """Advertise local capability, including the native expert placement on F.
 
     Policy and graph capacities may differ between roles. The startup exchange
     resolves one capability/capture plan, and the STEP descriptor decides use.
     """
+    if config.experimental_m2n:
+        from .m2n import m2n_model_spec
+
+        spec = m2n_model_spec(adapter)
+        if (
+            model_family not in ("qwen3_moe", "glm_moe_dsa")
+            or str(dtype) != "torch.bfloat16"
+            or capture_sizes != (config.experimental_m2n_stage_rows,)
+            or (spec["identity"] == "glm5" and config.lanes != 8)
+        ):
+            raise AFDError(
+                "AFD_M2N_SCOPE_UNSUPPORTED",
+                "requires an admitted model/topology and its exact capture stage width",
+            )
+
     capability = {
         "mode": config.direct_mode,
         "available": False,
@@ -191,7 +214,13 @@ def build_ffn_backend(
     *, transport, adapter, config, device
 ) -> FFNExecutionBackend | None:
     """Select once; import optional implementations only when explicitly enabled."""
-    if getattr(transport, "direct_enabled", config.experimental_direct is True):
+    if config.experimental_m2n:
+        from .m2n import AFDM2NDataPlane
+
+        transport.ffn_backend = AFDM2NDataPlane(
+            transport=transport, adapter=adapter, config=config, device=device
+        )
+    elif getattr(transport, "direct_enabled", config.experimental_direct is True):
         from .expert_exchange import AFDDirectExchange
 
         # Register partial ownership so constructor failure still aborts every

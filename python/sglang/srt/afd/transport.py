@@ -36,6 +36,7 @@ def _shared_step(descriptor: AFDStepDescriptor) -> tuple[Any, ...]:
         descriptor.is_extend_in_batch,
         descriptor.tokens_per_request,
         descriptor.uses_direct,
+        descriptor.uses_m2n,
     )
 
 
@@ -562,6 +563,7 @@ class AFDPairedP2PTransport:
                 num_layers=received[0].num_layers,
                 is_extend_in_batch=received[0].is_extend_in_batch,
                 uses_direct=received[0].uses_direct,
+                uses_m2n=received[0].uses_m2n,
                 tokens_per_request=received[0].tokens_per_request,
                 graph_eligible=all(item.graph_eligible for item in received),
                 # The leader lane's, because only one can be carried and the

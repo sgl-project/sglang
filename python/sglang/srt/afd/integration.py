@@ -100,6 +100,11 @@ def _model_descriptor(
             eager_capacity=config.experimental_direct_stage_rows,
             abi="native-nccl-rows-v3",
         )
+    if config.experimental_m2n:
+        family = "glm5" if profile.model_family == "glm_moe_dsa" else "qwen"
+        runtime_contract["experimental_data_plane"] = (
+            f"{family}8a{config.lanes}f-m2n-s2-width{config.experimental_m2n_stage_rows}-r1"
+        )
     descriptor = {
         "role": role.value,
         "execution_mode": role.value,

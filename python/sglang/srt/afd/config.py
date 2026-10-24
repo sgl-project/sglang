@@ -7,7 +7,7 @@ from typing import Any
 
 import msgspec
 
-from .contracts import AFDError, AFDRole
+from .contracts import M2N_FFN_LANES, M2N_STAGE_ROWS, AFDError, AFDRole
 
 
 class AFDExecutionMode(str, Enum):
@@ -59,6 +59,8 @@ class AFDConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields
     """The sole AFD feature config; all retained allocation is bounded here."""
 
     stages: int = 2
+    experimental_m2n: bool = False
+    experimental_m2n_stage_rows: int = 16
     experimental_direct_transport: str = "nccl"
     # None is the capability-based default. An explicit legacy false still
     # selects the fixed F path, including when the new selector is omitted.
@@ -135,6 +137,21 @@ class AFDConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields
             or self.experimental_direct_stage_rows < 1
         ):
             raise AFDError("AFD_DIRECT_CAPACITY_INVALID")
+        if self.experimental_m2n and self.direct_mode == "direct":
+            raise AFDError("AFD_DIRECT_SCOPE_UNSUPPORTED")
+        if type(self.experimental_m2n) is not bool:
+            raise AFDError("AFD_M2N_CONFIG_INVALID")
+        if (
+            type(self.experimental_m2n_stage_rows) is not int
+            or self.experimental_m2n_stage_rows not in M2N_STAGE_ROWS
+        ):
+            raise AFDError("AFD_M2N_STAGE_ROWS_UNSUPPORTED", str(M2N_STAGE_ROWS))
+        if self.experimental_m2n and (
+            self.lanes not in M2N_FFN_LANES
+            or self.attention_lane_count != 8
+            or self.stages != 2
+        ):
+            raise AFDError("AFD_M2N_TOPOLOGY_UNSUPPORTED", "requires 8A{2,4,8}F/S2")
         if self.stages != 2:
             raise AFDError(
                 "AFD_GRAPH_STAGE_COUNT_UNSUPPORTED",
