@@ -7,6 +7,7 @@ and a realtime session always lands on the same replica it started on.
 import itertools
 
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    AutoResidencyReq,
     SetLoraReq,
     ShutdownReq,
 )
@@ -14,6 +15,8 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import (
     _CONTROL_REQ_TYPES,
+    _is_warmup_batch,
+    _merge_auto_residency_results,
     _merge_fanout_results,
     _select_replica,
 )
@@ -45,10 +48,18 @@ def test_session_requests_stick_to_one_replica():
 
 
 def test_control_reqs_are_recognized():
+    assert isinstance(AutoResidencyReq(), _CONTROL_REQ_TYPES)
     assert isinstance(SetLoraReq(lora_nickname="x", lora_path="y"), _CONTROL_REQ_TYPES)
     assert isinstance(ShutdownReq(), _CONTROL_REQ_TYPES)
     assert not isinstance([_req()], _CONTROL_REQ_TYPES)
     assert not isinstance(_req(), _CONTROL_REQ_TYPES)
+
+
+def test_warmup_reqs_are_fanned_out_to_every_replica():
+    assert _is_warmup_batch(_req(is_warmup=True))
+    assert _is_warmup_batch([_req(is_warmup=True), _req(is_warmup=True)])
+    assert not _is_warmup_batch(_req())
+    assert not _is_warmup_batch([])
 
 
 def test_fanout_merge_surfaces_the_failing_replica():
@@ -56,6 +67,32 @@ def test_fanout_merge_surfaces_the_failing_replica():
     bad = OutputBatch(error="replica 1 exploded")
     assert _merge_fanout_results([ok, bad]) is bad
     assert _merge_fanout_results([ok, OutputBatch(output=None)]) is ok
+
+
+def test_auto_residency_fanout_rewarms_when_any_replica_adjusts():
+    skipped = OutputBatch(output={"status": "skipped"})
+    adjusted = OutputBatch(output={"status": "adjusted"})
+    assert _merge_auto_residency_results([skipped, adjusted]) is adjusted
+
+
+def test_auto_residency_fanout_tolerates_a_locally_rolled_back_replica():
+    restored = OutputBatch(
+        output={"status": "rolled_back"}, error="original placement restored"
+    )
+    adjusted = OutputBatch(output={"status": "adjusted"})
+    assert _merge_auto_residency_results([restored, adjusted]) is adjusted
+
+
+def test_auto_residency_fanout_never_hides_failed_rollback():
+    failed = OutputBatch(output={"status": "rollback_failed"}, error="restart required")
+    adjusted = OutputBatch(output={"status": "adjusted"})
+    assert _merge_auto_residency_results([adjusted, failed]) is failed
+
+
+def test_auto_residency_fanout_reports_successful_rollback():
+    skipped = OutputBatch(output={"status": "skipped"})
+    restored = OutputBatch(output={"status": "rolled_back"})
+    assert _merge_auto_residency_results([skipped, restored]) is restored
 
 
 def test_scheduler_endpoints_one_per_replica():

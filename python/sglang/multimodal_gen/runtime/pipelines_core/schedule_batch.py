@@ -362,6 +362,34 @@ class Req:
         req.set_as_warmup(warmup_steps)
         return req
 
+    def record_stage_iterations(
+        self,
+        measured_iterations: int,
+        target_iterations: int | None = None,
+    ) -> None:
+        """Record a stage loop against its full default-request work.
+
+        Most stages declare the count as a formula of the step count
+        (``PipelineStage.default_workload_iterations``) and never call this.
+        It is for loops whose length is only known inside them (chunked or
+        block-wise schedules); ``target_iterations`` defaults to scaling the
+        measured count from the probe's steps to the default workload's.
+        """
+        if not self.is_warmup or self.metrics is None:
+            return
+        measured = max(1, int(measured_iterations))
+        if target_iterations is None:
+            measured_request_steps = max(1, int(self.num_inference_steps))
+            target_request_steps = int(
+                self.extra.get(
+                    "warmup_target_num_inference_steps", measured_request_steps
+                )
+            )
+            target_iterations = (
+                measured * max(1, target_request_steps) + measured_request_steps - 1
+            ) // measured_request_steps
+        self.metrics.record_stage_iterations(measured, target_iterations)
+
     def validate(self):
         """Initialize dependent fields after dataclass initialization."""
         if getattr(self.sampling_params, "data_type", None) == DataType.ACTION:

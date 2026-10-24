@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
 )
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    AutoResidencyReq,
     GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -180,6 +181,7 @@ class Scheduler(
         self._running = True
 
         self.request_handlers = {
+            AutoResidencyReq: self._handle_auto_residency,
             SetLoraReq: self._handle_set_lora,
             MergeLoraWeightsReq: self._handle_merge_lora,
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
@@ -256,6 +258,14 @@ class Scheduler(
         return OutputBatch(
             output=stats or {"role": "monolithic", "message": "not in disagg mode"}
         )
+
+    def _handle_auto_residency(self, reqs: List[Any]) -> OutputBatch:
+        req = reqs[0]
+        if not isinstance(self.worker, GPUWorker):
+            return OutputBatch(error="auto residency requires a GPU worker")
+        if req.action == "rollback":
+            return self.worker.rollback_auto_residency()
+        return self.worker.apply_auto_residency(validate_only=req.action == "validate")
 
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status

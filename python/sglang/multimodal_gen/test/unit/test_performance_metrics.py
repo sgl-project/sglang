@@ -8,11 +8,27 @@ import torch
 import sglang.multimodal_gen.runtime.managers.gpu_worker as gpu_worker_module
 import sglang.multimodal_gen.runtime.managers.memory_managers.component_manager as component_manager_module
 import sglang.multimodal_gen.runtime.utils.perf_logger as perf_logger_module
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     _deserialize_request_metrics,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+    GIB_BYTES,
+    DefaultWorkload,
+    WarmupMemoryRecord,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    WarmupPhasePeak,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+    LayerwiseUsageTracker,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
@@ -265,9 +281,10 @@ def test_worker_records_replica_load_and_runtime_peaks():
 def test_server_warmup_preserves_peak_after_managed_stage_timeline():
     worker = GPUWorker.__new__(GPUWorker)
     worker._auto_residency_warmup_records = []
+    worker.pipeline = SimpleNamespace(stages=[])
     residency_manager = Mock()
     residency_manager.take_warmup_phase_peaks.return_value = {
-        "0:denoise:use:transformer": 8
+        "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
     }
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 9
@@ -281,8 +298,10 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
         ),
     ):
         worker._record_server_warmup_memory(
-            workload=(128, 96, 9),
+            req=SimpleNamespace(metrics=None),
+            workload=(128, 96, 9, 1),
             baseline_allocated_bytes=3,
+            baseline_reserved_bytes=3,
             succeeded=True,
         )
 
@@ -294,9 +313,10 @@ def test_server_warmup_preserves_peak_after_managed_stage_timeline():
 def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory():
     worker = GPUWorker.__new__(GPUWorker)
     worker._auto_residency_warmup_records = []
+    worker.pipeline = SimpleNamespace(stages=[])
     residency_manager = Mock()
     residency_manager.take_warmup_phase_peaks.return_value = {
-        "0:denoise:use:transformer": 8
+        "0:denoise:use:transformer": WarmupPhasePeak(("transformer",), 8)
     }
     device_module = Mock()
     device_module.max_memory_allocated.return_value = 8
@@ -310,13 +330,151 @@ def test_server_warmup_does_not_treat_allocator_cache_as_untracked_live_memory()
         ),
     ):
         worker._record_server_warmup_memory(
-            workload=(64, 64, 1),
+            req=SimpleNamespace(metrics=None),
+            workload=(64, 64, 1, 1),
             baseline_allocated_bytes=3,
+            baseline_reserved_bytes=12,
             succeeded=True,
         )
 
     record = worker._auto_residency_warmup_records[0]
     assert record.peak_allocated_bytes == 8
+
+
+def test_loaded_prequantized_checkpoint_can_use_auto_residency():
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.rank = 0
+    worker.is_output_rank = True
+    worker._auto_residency_budget_correction_bytes = 0
+    worker._auto_residency_reference_request_duration_ns = None
+    worker._auto_residency_reference_stage_duration_ns = {}
+    worker._auto_residency_reference_component_stages = {}
+    quantized_module = torch.nn.Module()
+    quantized_module.register_parameter(
+        "weight",
+        torch.nn.Parameter(torch.ones(1, dtype=torch.int8), requires_grad=False),
+    )
+    worker.pipeline = SimpleNamespace(
+        modules={"transformer": quantized_module},
+        stages=[],
+        _stage_name_mapping={},
+        component_residency_strategies={},
+    )
+    host_pin_budget = HostPinBudget(available_bytes=0, reserve_bytes=0)
+    worker.server_args = SimpleNamespace(
+        num_gpus=1,
+        nnodes=1,
+        node_rank=0,
+        residency_mode=lambda _name: "resident",
+        configured_residency_mode=lambda _name: "resident",
+        explicit_residency_mode=lambda _name: None,
+        component_residency_requirement=lambda _name: None,
+        auto_residency_mode=lambda _name: None,
+        ltx2_two_stage_device_mode=None,
+        layerwise_tuning_for=lambda _name, *, dit_group: (0.0, 0.0, "leading"),
+        is_layerwise_residency_policy_explicit=lambda _name, *, dit_group: False,
+        pin_cpu_memory=True,
+        host_pin_budget=lambda: host_pin_budget,
+        component_quantizations=(),
+        quantization=None,
+        direct_gpu_weight_loading=False,
+        nunchaku_config=None,
+    )
+    device_module = Mock()
+    device_module.mem_get_info.return_value = (100, 100)
+    device_module.memory_reserved.return_value = 0
+    device_module.memory_allocated.return_value = 1
+
+    with patch.object(torch, "get_device_module", return_value=device_module):
+        report = worker._build_auto_residency_report(
+            workload=DefaultWorkload(
+                width=64,
+                height=64,
+                num_frames=1,
+                num_inference_steps=1,
+            ),
+            records=[
+                WarmupMemoryRecord(
+                    width=64,
+                    height=64,
+                    num_frames=1,
+                    baseline_allocated_bytes=1,
+                    peak_allocated_bytes=2,
+                    succeeded=True,
+                )
+            ],
+        )
+
+    assert report.skip_reason is None
+
+
+def test_auto_residency_budget_respects_test_device_memory_cap(monkeypatch):
+    worker = GPUWorker.__new__(GPUWorker)
+    worker.rank = 0
+    worker.is_output_rank = True
+    worker._auto_residency_reference_request_duration_ns = None
+    worker._auto_residency_reference_stage_duration_ns = {}
+    worker._auto_residency_reference_component_stages = {}
+    worker.pipeline = SimpleNamespace(
+        modules={"transformer": torch.nn.Linear(1, 1)},
+        stages=[],
+        _stage_name_mapping={},
+        component_residency_strategies={},
+    )
+    host_pin_budget = HostPinBudget(available_bytes=0, reserve_bytes=0)
+    worker.server_args = SimpleNamespace(
+        num_gpus=1,
+        nnodes=1,
+        node_rank=0,
+        residency_mode=lambda _name: "resident",
+        configured_residency_mode=lambda _name: "resident",
+        explicit_residency_mode=lambda _name: None,
+        component_residency_requirement=lambda _name: None,
+        auto_residency_mode=lambda _name: None,
+        ltx2_two_stage_device_mode=None,
+        layerwise_tuning_for=lambda _name, *, dit_group: (0.0, 0.0, "leading"),
+        is_layerwise_residency_policy_explicit=lambda _name, *, dit_group: False,
+        pin_cpu_memory=True,
+        host_pin_budget=lambda: host_pin_budget,
+        component_quantizations=(),
+        quantization=None,
+        direct_gpu_weight_loading=False,
+        nunchaku_config=None,
+    )
+    device_module = Mock()
+    device_module.mem_get_info.return_value = (100 * GIB_BYTES, 140 * GIB_BYTES)
+    device_module.memory_reserved.return_value = 2 * GIB_BYTES
+    device_module.memory_allocated.return_value = 60 * GIB_BYTES
+    monkeypatch.setattr(
+        gpu_worker_module.envs,
+        "SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB",
+        80,
+    )
+
+    with patch.object(torch, "get_device_module", return_value=device_module):
+        report = worker._build_auto_residency_report(
+            workload=DefaultWorkload(
+                width=64,
+                height=64,
+                num_frames=1,
+                num_inference_steps=1,
+            ),
+            records=[
+                WarmupMemoryRecord(
+                    width=64,
+                    height=64,
+                    num_frames=1,
+                    baseline_allocated_bytes=1,
+                    peak_allocated_bytes=60 * GIB_BYTES,
+                    peak_reserved_bytes=62 * GIB_BYTES,
+                    succeeded=True,
+                )
+            ],
+        )
+
+    assert report.budget_bytes == 80 * GIB_BYTES
+    assert report.planning_headroom_correction_bytes == 2 * GIB_BYTES
+    assert report.device_transition_allocated_bytes == 60 * GIB_BYTES
 
 
 def test_baseline_config_loads_per_scenario_peak_vram(tmp_path):
@@ -617,6 +775,64 @@ def test_worker_keeps_the_pool_when_no_probe_ran(monkeypatch):
     assert calls == []
 
 
+def test_server_warmup_normalizes_profile_stage_names_for_residency_timing():
+    worker = GPUWorker.__new__(GPUWorker)
+    worker._auto_residency_warmup_records = []
+    stage = Mock()
+    stage._active_profile_stage_name.return_value = "RefinerStage"
+    stage._component_stage_name.return_value = "refiner"
+    worker.pipeline = SimpleNamespace(stages=[stage])
+    residency_manager = Mock()
+    residency_manager.take_warmup_phase_peaks.return_value = {
+        "0:refiner:use:transformer_2": WarmupPhasePeak(
+            ("transformer_2",),
+            8,
+            used_components=("transformer_2",),
+        )
+    }
+    residency_manager.current_device_components.return_value = ("transformer_2",)
+    device_module = Mock()
+    device_module.max_memory_allocated.return_value = 8
+    device_module.max_memory_reserved.return_value = 8
+    req = SimpleNamespace(
+        metrics=SimpleNamespace(
+            total_duration_ms=12.0,
+            stages={"RefinerStage": 10.0},
+            steps=[],
+            steps_by_stage={},
+            stage_iterations={},
+        )
+    )
+
+    with (
+        patch.object(torch, "get_device_module", return_value=device_module),
+        patch.object(
+            gpu_worker_module,
+            "peek_global_component_residency_manager",
+            return_value=residency_manager,
+        ),
+    ):
+        worker._record_server_warmup_memory(
+            req=req,
+            workload=(64, 64, 1, 1),
+            baseline_allocated_bytes=3,
+            baseline_reserved_bytes=3,
+            succeeded=True,
+        )
+
+    record = worker._auto_residency_warmup_records[0]
+    assert record.stage_duration_ms == {"refiner": 10.0}
+    _, stage_duration_ns, component_stages = (
+        gpu_worker_module.estimate_default_workload_timing(
+            records=[record],
+            target_units=record.workload_units(),
+            target_num_inference_steps=1,
+        )
+    )
+    assert stage_duration_ns == {"refiner": 10_000_000}
+    assert component_stages == {"transformer_2": ("refiner",)}
+
+
 def _timing_validator(timing_tolerance: float | None) -> PerformanceValidator:
     return PerformanceValidator(
         scenario=ScenarioConfig(
@@ -699,3 +915,90 @@ def test_log_request_summary_records_requested_tag(monkeypatch, tmp_path):
     )
 
     assert "custom_tag" in (tmp_path / "performance.log").read_text()
+
+
+@pytest.mark.parametrize("is_warmup", [True, False])
+@pytest.mark.parametrize("explicit_iterations", [True, False])
+def test_real_stage_metrics_reach_warmup_record(
+    is_warmup, explicit_iterations, monkeypatch
+):
+    class TinyTransformer(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+        layer_names = ["blocks"]
+
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+
+    req = Req(
+        sampling_params=SamplingParams(num_inference_steps=2),
+        is_warmup=is_warmup,
+        perf_dump_path="metrics",
+        extra={"warmup_target_num_inference_steps": 8},
+    )
+    metrics = req.metrics
+    model = TinyTransformer()
+    stage = DenoisingStage.__new__(DenoisingStage)
+    stage.server_args = SimpleNamespace(
+        enable_layerwise_nvtx_marker=False, comfyui_mode=False
+    )
+    stage.set_registered_stage_name("denoise")
+    stage.set_profile_stage_name("custom_denoise")
+    monkeypatch.setattr(
+        stage, "verify_input", PipelineStage.verify_input.__get__(stage)
+    )
+    monkeypatch.setattr(
+        stage, "verify_output", PipelineStage.verify_output.__get__(stage)
+    )
+
+    def forward(batch, args):
+        for _ in range(2):
+            model.blocks[0](torch.ones(1, 2))
+            batch.metrics.record_step(0.001)
+        if explicit_iterations:
+            batch.record_stage_iterations(2, 8)
+        return batch
+
+    monkeypatch.setattr(stage, "forward", forward)
+    tracker = LayerwiseUsageTracker(
+        {"transformer": model}, stage_name_provider=lambda: metrics.active_stage_name
+    )
+    try:
+        assert stage(req, stage.server_args) is req
+    finally:
+        uses, uses_by_stage = tracker.finish_with_stages()
+    assert metrics.active_stage_name is None
+    assert metrics.steps == [1.0, 1.0]
+    assert metrics.denoising_stages == {"custom_denoise"}
+    assert uses == {"transformer": {"blocks": (2,)}}
+    assert not model.blocks[0]._forward_pre_hooks
+    if not is_warmup:
+        assert metrics.steps_by_stage == {}
+        assert metrics.stage_iterations == {}
+        assert uses_by_stage == {}
+        return
+
+    assert metrics.steps_by_stage == {"denoise": [1.0, 1.0]}
+    assert metrics.stage_iterations == {"denoise": (2, 8)}
+    assert uses_by_stage == {"denoise": {"transformer": {"blocks": (2,)}}}
+    worker = GPUWorker.__new__(GPUWorker)
+    worker._auto_residency_warmup_records = []
+    worker.pipeline = SimpleNamespace(stages=[stage])
+    device = SimpleNamespace(
+        max_memory_allocated=lambda: 8, max_memory_reserved=lambda: 9
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device)
+    worker._record_server_warmup_memory(
+        req=req,
+        workload=(64, 64, 1, 2),
+        baseline_allocated_bytes=3,
+        baseline_reserved_bytes=3,
+        succeeded=True,
+        layerwise_layer_uses=uses,
+        layerwise_layer_uses_by_stage=uses_by_stage,
+    )
+    (record,) = worker._auto_residency_warmup_records
+    assert record.succeeded
+    assert record.stage_iterations == {"denoise": (2, 8)}
+    assert record.step_duration_ms_by_stage == {"denoise": (1.0, 1.0)}
+    assert record.stage_duration_ms.keys() == {"denoise"}
+    assert record.layerwise_layer_uses_by_stage == uses_by_stage

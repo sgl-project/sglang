@@ -115,6 +115,146 @@ def auto_residency_skip_reason(server_args: ServerArgs) -> str | None:
     return None
 
 
+def _auto_residency_status(response: OutputBatch) -> str | None:
+    if isinstance(response.output, dict):
+        return response.output.get("status")
+    return None
+
+
+async def maybe_apply_auto_residency(
+    server_args: ServerArgs,
+    forward: Callable[[Req], Awaitable[OutputBatch]],
+) -> None:
+    """Adjust implicit component residency after warmup, then re-warm.
+
+    Runs between the synthetic warmup and the ready signal, so the residency
+    is frozen before ``/health`` turns 200. If an adjustment or its calibration
+    fails, the workers roll back that round and retain the last calibrated
+    placement; only a failed rollback raises and aborts startup.
+    """
+    from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+        AutoResidencyReq,
+    )
+    from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+        PLACEMENT_STATUS_ADJUSTED,
+        PLACEMENT_STATUS_ROLLBACK_FAILED,
+        PLACEMENT_STATUS_ROLLED_BACK,
+        PLACEMENT_STATUS_VALIDATED,
+    )
+
+    skip_reason = auto_residency_skip_reason(server_args)
+    if skip_reason is not None:
+        # Whoever asked for auto needs to hear why it did nothing; on any other
+        # server this is just a note about a mode they did not pick.
+        log = logger.info if server_args.performance_mode == "auto" else logger.debug
+        log("Auto residency: skipped (%s)", skip_reason)
+        return
+
+    logger.info(
+        "Server warmup complete; adjusting component residency for the "
+        "default workload (--performance-mode auto)."
+    )
+    # Same fail-open contract as the warmup itself: implicit warmups must
+    # never abort startup, explicit --warmup-resolutions ones must succeed.
+    fail_open = server_args.warmup_resolutions is None
+
+    async def rollback_and_rewarm(error: Exception) -> None:
+        logger.warning(
+            "Post-adjustment calibration failed (%s); rolling back auto residency",
+            error,
+        )
+        rollback = await forward(AutoResidencyReq(action="rollback"))
+        if (
+            rollback.error is not None
+            or _auto_residency_status(rollback) != PLACEMENT_STATUS_ROLLED_BACK
+        ):
+            raise RuntimeError(
+                f"auto residency rollback failed: {rollback.error}"
+            ) from error
+        # Restore warm caches for the previous calibrated placement before
+        # turning ready. Once placement was mutated, failure to revalidate the
+        # restored state is unsafe to ignore.
+        await run_async_client_warmup(
+            server_args, forward, fail_open=False, rewarm=True
+        )
+
+    try:
+        response = await forward(AutoResidencyReq(action="apply"))
+    except Exception as e:
+        if not fail_open:
+            raise
+        logger.warning(
+            "Auto residency apply request failed; continuing on the original "
+            "strategy: %s",
+            e,
+        )
+        return
+    status = _auto_residency_status(response)
+    recovering_from_oom = bool(
+        isinstance(response.output, dict) and response.output.get("recovering_from_oom")
+    )
+    if status == PLACEMENT_STATUS_ROLLBACK_FAILED:
+        raise RuntimeError(f"auto residency rollback failed: {response.error}")
+    if response.error is not None:
+        if status == PLACEMENT_STATUS_ROLLED_BACK:
+            await run_async_client_warmup(
+                server_args, forward, fail_open=False, rewarm=True
+            )
+        logger.warning(
+            "Auto residency adjustment not applied; continuing on the original "
+            "strategy: %s",
+            response.error,
+        )
+        return
+    if status != PLACEMENT_STATUS_ADJUSTED:
+        if recovering_from_oom:
+            raise RuntimeError(
+                "default workload exceeds the VRAM budget and auto residency "
+                "found no feasible placement"
+            )
+        return
+
+    short_validation = bool(
+        isinstance(response.output, dict) and response.output.get("short_validation")
+    )
+    # This pass physically realizes the selected placement and measures phases
+    # that overlap under it. Resident-only changes need one full-shape step for
+    # memory safety; other changes retain the longer regression timing sample.
+    try:
+        validation_options = {"step_limit": 1} if short_validation else {}
+        await run_async_client_warmup(
+            server_args,
+            forward,
+            fail_open=False,
+            rewarm=True,
+            **validation_options,
+        )
+    except Exception as e:
+        await rollback_and_rewarm(e)
+        return
+
+    try:
+        validation = await forward(AutoResidencyReq(action="validate"))
+    except Exception as e:
+        await rollback_and_rewarm(e)
+        return
+    validation_status = _auto_residency_status(validation)
+    if validation_status == PLACEMENT_STATUS_ROLLBACK_FAILED:
+        raise RuntimeError(f"auto residency rollback failed: {validation.error}")
+    if validation_status == PLACEMENT_STATUS_ROLLED_BACK:
+        await run_async_client_warmup(
+            server_args, forward, fail_open=False, rewarm=True
+        )
+        return
+    if validation.error is not None or validation_status != PLACEMENT_STATUS_VALIDATED:
+        await rollback_and_rewarm(
+            RuntimeError(
+                validation.error
+                or "post-adjustment calibration returned no validation result"
+            )
+        )
+
+
 # Enough to clear a probe that overshot the card, few enough that a failure
 # which is not about probe size gives up quickly instead of walking the
 # workload down to nothing.
@@ -220,6 +360,7 @@ async def run_async_client_warmup(
     step_limit: int | None = None,
 ) -> None:
     try:
+        auto_residency_handles_oom = auto_residency_skip_reason(server_args) is None
         warmup_input_path = None
         if should_include_warmup_image(server_args, server_based_warmup=True):
             warmup_input_path = prepare_warmup_image_path(server_args)
@@ -233,6 +374,12 @@ async def run_async_client_warmup(
             response = await forward(req)
             for _ in range(MAX_WARMUP_DEGRADE_ATTEMPTS):
                 if response.error is None or not _is_out_of_memory(response.error):
+                    break
+                # The residency planner needs the first failed target-shape
+                # measurement. Retrying smaller requests cannot fix a weight-
+                # dominated OOM and can retain failed-forward allocations that
+                # contaminate the phase model used by the planner.
+                if auto_residency_handles_oom:
                     break
                 lighter = _degrade_after_oom(server_args, req)
                 if lighter is None:
