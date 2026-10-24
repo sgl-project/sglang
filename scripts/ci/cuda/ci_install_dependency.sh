@@ -27,6 +27,58 @@ mark_step_done() {
 }
 
 # ---------------------------------------------------------------------------
+# Shared-host isolation
+# ---------------------------------------------------------------------------
+# SGLANG_CI_SHARED_HOST=true marks a container shared by several runners (one
+# per GPU) instead of one container per runner.
+is_shared_host() {
+    case "$(printf '%s' "${SGLANG_CI_SHARED_HOST:-}" | tr '[:upper:]' '[:lower:]')" in
+        1 | true | yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Serializes host-wide installs (apt, system pip, /usr/local, /opt/gdrcopy)
+# across runners sharing one host; uncontended on a single-tenant runner.
+# Same path as scripts/ci/utils/{ensure_zstd,install_rust_protoc}.sh.
+HOST_LOCK=/tmp/sglang-ci-host.lock
+with_host_lock() {
+    local lock_fd
+    # Read-only: the file may have been created by root via sudo flock.
+    [ -e "${HOST_LOCK}" ] || : >"${HOST_LOCK}"
+    exec {lock_fd}<"${HOST_LOCK}"
+    flock --timeout 1800 "${lock_fd}"
+    "$@"
+    flock --unlock "${lock_fd}"
+    exec {lock_fd}>&-
+}
+
+isolate_shared_host_runner() {
+    if ! is_shared_host; then
+        return
+    fi
+    SHARED_HOST_RUNNER_ROOT="/opt/sglang-ci-runners/${RUNNER_NAME:?SGLANG_CI_SHARED_HOST requires RUNNER_NAME}"
+    # Toolchains are per-container on per-runner hosts, so give each runner its own.
+    # Caches (uv, HF, JIT) stay shared: per-GPU containers already share ~/.cache.
+    export CARGO_HOME="${SHARED_HOST_RUNNER_ROOT}/cargo"
+    export RUSTUP_HOME="${SHARED_HOST_RUNNER_ROOT}/rustup"
+    export UV_PYTHON_INSTALL_DIR="${SHARED_HOST_RUNNER_ROOT}/uv-python"
+    export UV_PYTHON_BIN_DIR="${SHARED_HOST_RUNNER_ROOT}/uv-python-bin"
+    mkdir -p "${CARGO_HOME}" "${RUSTUP_HOME}" "${UV_PYTHON_INSTALL_DIR}" "${UV_PYTHON_BIN_DIR}"
+    if [ -n "${GITHUB_ENV:-}" ]; then
+        # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
+        mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
+        printf '%s\n' \
+            "CARGO_HOME=${CARGO_HOME}" \
+            "RUSTUP_HOME=${RUSTUP_HOME}" \
+            "UV_PYTHON_INSTALL_DIR=${UV_PYTHON_INSTALL_DIR}" \
+            "UV_PYTHON_BIN_DIR=${UV_PYTHON_BIN_DIR}" >> "$GITHUB_ENV" || true
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+# ---------------------------------------------------------------------------
 # Functions
 # ---------------------------------------------------------------------------
 
@@ -56,7 +108,7 @@ configure_environment() {
     echo "USE_VENV=${USE_VENV}"
 
     # A stale uv only knows the managed Python builds released before it.
-    python3 -m pip install --upgrade pip uv
+    with_host_lock python3 -m pip install --upgrade pip uv
     # Put that uv ahead of any older copy on PATH (runner image, standalone installer).
     UV_BIN_DIR="$(dirname "$(python3 -c 'import uv; print(uv.find_uv_bin())')")"
     export PATH="${UV_BIN_DIR}:${PATH}"
@@ -87,6 +139,10 @@ configure_environment() {
     else
         # Kept across jobs so installs stay incremental and path-keyed JIT caches hit.
         UV_VENV="/opt/sglang-ci-py${CI_PYTHON_VER}"
+        # Runners sharing one host must not share this venv; concurrent installs corrupt it.
+        if is_shared_host; then
+            UV_VENV="${SHARED_HOST_RUNNER_ROOT}/venv-py${CI_PYTHON_VER}"
+        fi
         # A cancelled install leaves dist-info that later installs treat as satisfied;
         # rebuild unless the last install ran to completion.
         UV_VENV_COMPLETE_MARKER="$UV_VENV/.install-complete"
@@ -947,13 +1003,14 @@ if os.environ["SGLANG_CI_OPTIONAL_DEPS"] != "diffusion":
 # ---------------------------------------------------------------------------
 
 main() {
+    isolate_shared_host_runner
     configure_environment "$@"
     detect_host
     kill_existing_processes
     cleanup_stale_shm
-    repair_stale_nvidia_dkms
-    install_apt_packages
-    install_gdrcopy
+    with_host_lock repair_stale_nvidia_dkms
+    with_host_lock install_apt_packages
+    with_host_lock install_gdrcopy
     clean_site_packages
     require_prebuilt_rust_exts
     setup_pip_toolchain

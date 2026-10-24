@@ -8,6 +8,8 @@ Pid-stamped names (see _creator_pid) are unlinked once their creator is dead;
 pid-less families (_ORPHAN_PREFIXES) are unlinked unconditionally, safe only
 because the sweep runs at CI job start right after killall.py. CI-only
 (SGLANG_IS_IN_CI): both rules assume a single-tenant runner container.
+On a host shared by several runners (SGLANG_CI_SHARED_HOST), the pid-less rule
+is skipped, since those segments may belong to another runner's live job.
 """
 
 import logging
@@ -85,12 +87,18 @@ def _is_in_ci() -> bool:
     return os.environ.get("SGLANG_IS_IN_CI", "false").lower() in ("true", "1")
 
 
+def _is_shared_host() -> bool:
+    # Set in the runner env when several CI runners share one container.
+    return os.environ.get("SGLANG_CI_SHARED_HOST", "false").lower() in ("true", "1")
+
+
 def _cleanup_stale_shm_impl() -> None:
     if not _is_in_ci():
         return
     if not _SHM_DIR.is_dir():
         return
 
+    shared_host = _is_shared_host()
     removed = 0
     freed_bytes = 0
     try:
@@ -106,7 +114,7 @@ def _cleanup_stale_shm_impl() -> None:
             # segment. Keep that bias when changing this check.
             if pid == os.getpid() or _pid_alive(pid):
                 continue
-        elif not entry.name.startswith(_ORPHAN_PREFIXES):
+        elif shared_host or not entry.name.startswith(_ORPHAN_PREFIXES):
             continue
         try:
             size = entry.stat().st_size
