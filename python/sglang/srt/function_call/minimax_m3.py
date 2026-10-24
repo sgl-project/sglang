@@ -284,7 +284,9 @@ class MinimaxM3Detector(BaseFormatDetector):
                 self.PARAM_START_PREFIX.startswith(head)
             ):
                 return False
-            rest = head
+            # Spacing before a nested tag is markup; a string value keeps it.
+            if head.startswith(self.PARAM_START_PREFIX):
+                rest = head
 
         self._buffer = rest
         self._current_param_name = tag
