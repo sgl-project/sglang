@@ -19,8 +19,12 @@ from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
+from sglang.srt.layers.cp.utils import get_cp_strategy, is_cp_active
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
@@ -42,6 +46,57 @@ def _use_dsa_dcp_partial_attention(forward_batch: "ForwardBatch") -> bool:
 
 
 # region MHA
+def _prepend_cp_prefix_latent(
+    m: "DeepseekV2AttentionMLA",
+    extend_latent: torch.Tensor,
+    prefix_lens,
+    forward_batch: "ForwardBatch",
+) -> torch.Tensor:
+    """Fetch each sequence's prefix latent from the pool and stack it ahead of
+    the all-gathered extend latent, producing per-sequence [prefix; extend]
+    blocks. Extend lengths are taken from the CP metadata's split_list so the
+    block layout stays aligned with the backend's cumulative starts (both
+    include any chunked-prefill padding)."""
+    ckv_cache, k_rope_cache = get_token_to_kv_pool().get_kv_buffer(m.layer_id)
+    # The NPU MLA pool stores paged buffers (pages, page_size, 1, dim);
+    # flatten to token rows so pool token ids index directly.
+    ckv_rows = ckv_cache.view(-1, m.kv_lora_rank)
+    k_rope_rows = k_rope_cache.view(-1, m.qk_rope_head_dim)
+    req_to_token = get_req_to_token_pool().req_to_token
+    loc_list = [
+        req_to_token[forward_batch.req_pool_indices[i], : int(plen)]
+        for i, plen in enumerate(prefix_lens)
+        if int(plen) > 0
+    ]
+    prefix_loc = torch.cat(loc_list, dim=0).to(torch.int64)
+    prefix_latent = torch.cat(
+        [ckv_rows[prefix_loc], k_rope_rows[prefix_loc]], dim=-1
+    )
+
+    meta = forward_batch.attn_cp_metadata
+    if meta is not None and meta.split_list:
+        seg_num = len(meta.split_list) // meta.bs
+        extend_lens = [
+            sum(meta.split_list[i * seg_num : (i + 1) * seg_num])
+            for i in range(meta.bs)
+        ]
+    else:
+        extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+
+    pieces = []
+    p_off = 0
+    e_off = 0
+    for plen, elen in zip(prefix_lens, extend_lens):
+        plen = int(plen)
+        elen = int(elen)
+        if plen > 0:
+            pieces.append(prefix_latent[p_off : p_off + plen])
+            p_off += plen
+        pieces.append(extend_latent[e_off : e_off + elen])
+        e_off += elen
+    return torch.cat(pieces, dim=0)
+
+
 def forward_mha_prepare_npu(
     m: "DeepseekV2AttentionMLA",
     positions: torch.Tensor,
@@ -125,10 +180,46 @@ def forward_mha_prepare_npu(
         k_pe = latent_cache[:, :, m.kv_lora_rank :]
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
-        # this is for model kimi-vl-a3B-instruct
-        get_token_to_kv_pool().set_kv_buffer(
-            m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-        )
+        if is_cp_active(forward_batch):
+            # All-gather the rank-local latent shard across CP ranks back into
+            # original sequence order, materialize the full-sequence latent in
+            # the pool, and expand K/V for the whole sequence so the backend's
+            # two-segment CP attention can consume it (q stays rank-local).
+            strategy = get_cp_strategy()
+            latent_shard = torch.cat(
+                [
+                    kv_a.reshape(-1, m.kv_lora_rank),
+                    k_pe.reshape(-1, m.qk_rope_head_dim),
+                ],
+                dim=-1,
+            ).contiguous()
+            latent_full = strategy.gather_kv_cache(latent_shard, forward_batch)
+            kv_a, k_pe = latent_full.split(
+                [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
+            )
+            get_token_to_kv_pool().set_kv_buffer(
+                m, forward_batch.out_cache_loc, kv_a, k_pe
+            )
+            # Radix-cache hit: stack each sequence's prefix latent (already in
+            # the pool; every CP rank writes the full extend sequence, so the
+            # prefix rows are locally complete) ahead of its all-gathered
+            # extend latent. The backend's two-segment CP attention addresses
+            # these [prefix; extend] blocks through cumulative starts.
+            prefix_lens = forward_batch.extend_prefix_lens_cpu
+            if prefix_lens and sum(prefix_lens) > 0:
+                latent_full = _prepend_cp_prefix_latent(
+                    m, latent_full, prefix_lens, forward_batch
+                )
+                kv_a, k_pe = latent_full.split(
+                    [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
+                )
+            # _concat_and_cast_mha_k expands k_pe over heads ([T, 1, rope]).
+            k_pe = k_pe.reshape(-1, 1, m.qk_rope_head_dim)
+        else:
+            # this is for model kimi-vl-a3B-instruct
+            get_token_to_kv_pool().set_kv_buffer(
+                m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+            )
 
     q[..., m.qk_nope_head_dim :] = q_pe
 

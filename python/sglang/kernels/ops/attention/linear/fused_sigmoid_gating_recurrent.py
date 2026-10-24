@@ -17,6 +17,9 @@ _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
 _is_sm90 = is_sm90_supported()
 _is_sm103 = is_cuda() and get_device_sm() == 103
+# The PTX precision branch below emits NVIDIA inline asm; NPU backends
+# (Triton-Ascend) cannot parse or execute it and take the generic path.
+_is_nvidia = is_cuda() and not is_hip()
 
 
 def _select_recurrent_launch_config(
@@ -198,6 +201,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     SPLIT_N_HV_GRID: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
     MATCH_CUTEDSL_DECODE: tl.constexpr = False,
+    IS_NVIDIA: tl.constexpr = _is_nvidia,
     ROUND_STATE_TO_BF16: tl.constexpr = False,
 ):
     """
@@ -465,7 +469,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Update hidden state: h += k[:, None] * v[None, :]
         if MATCH_CUTEDSL_DECODE:
             b_h = tl.fma(b_k[:, None], b_v[None, :], b_h)
-        elif IS_KDA and V == 128 and BV == 4:
+        elif IS_NVIDIA and ((IS_KDA and V == 128) and BV == 4):
             # The narrow KDA tile keeps the separate FP32 multiply/add rounding.
             b_h = tl.inline_asm_elementwise(
                 "add.rn.f32 $0, $1, $2;",
