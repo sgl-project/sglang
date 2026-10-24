@@ -190,6 +190,31 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
 def choose_daemon_transport_backend(
     state_tensors: Mapping[str, Tuple[torch.Tensor, bool]],
 ) -> WeightCacheTransportBackend:
+    from sglang.srt.utils.common import is_npu
+
+    if is_npu():
+        # torch_npu must be imported before the first ForkingPickler dump of an
+        # NPU tensor so its reducer is registered; otherwise the tensor falls
+        # back to a CPU copy instead of zero-copy IPC. Probe once and warn (rather
+        # than error) if zero-copy is unavailable, so weight caching still works
+        # by copying the weights through the CPU.
+        import torch.multiprocessing.reductions as _reductions
+        import torch_npu  # noqa: F401
+
+        first = next(iter(state_tensors.values()), None)
+        if first is not None:
+            rebuild_fn, _ = _reductions.reduce_tensor(first[0].data)
+            if getattr(rebuild_fn, "__name__", None) != "rebuild_npu_tensor":
+                logger.warning(
+                    "NPU weight-cache zero-copy IPC is unavailable: tensor "
+                    "reduced to %r instead of torch_npu's rebuild_npu_tensor; "
+                    "falling back to a CPU copy. Zero-copy requires Ascend HDK "
+                    ">= 25.3.RC1 and CANN >= 8.3.RC1, and is unsupported on "
+                    "Ascend 950DT.",
+                    rebuild_fn,
+                )
+        logger.info("[weight_cache] Using transport backend: %s", TORCH_IPC_BACKEND)
+        return TorchIpcTransportBackend()
     if VmmFdTransportBackend.can_export_state(state_tensors):
         logger.info("[weight_cache] Using transport backend: %s", VMM_FD_BACKEND)
         return VmmFdTransportBackend()
