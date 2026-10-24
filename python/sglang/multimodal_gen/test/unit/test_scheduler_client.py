@@ -16,9 +16,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.scheduler_client import (
     AsyncSchedulerClient,
     SchedulerClient,
+    async_scheduler_client,
     run_zeromq_broker,
 )
 from sglang.multimodal_gen.runtime.server_args import MAX_SCHEDULER_RPC_TIMEOUT_S
+from sglang.srt.utils.network import get_free_port
 
 
 @pytest.mark.parametrize(
@@ -212,23 +214,114 @@ def test_async_scheduler_client_closes_socket_when_cancelled():
     asyncio.run(run_test())
 
 
-def test_broker_closes_socket_and_context_when_cancelled(monkeypatch):
+def test_worker_failure_aborts_concurrent_requests_without_rpc_deadline():
+    async def run_test():
+        context = zmq.asyncio.Context()
+        endpoint = f"inproc://scheduler-{uuid.uuid4().hex}"
+        server = context.socket(zmq.ROUTER)
+        server.bind(endpoint)
+        client = AsyncSchedulerClient()
+        client.context = context
+        client.server_args = SimpleNamespace(scheduler_rpc_timeout=None)
+        tasks = [
+            asyncio.create_task(client._forward_one(endpoint, i, None))
+            for i in range(3)
+        ]
+        try:
+            # All requests reached the worker; none has received a reply.
+            for _ in tasks:
+                await asyncio.wait_for(server.recv_multipart(), timeout=5)
+            client.mark_failed("Scheduler worker exited; restart the server.")
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), timeout=5
+            )
+            assert all(isinstance(result, RuntimeError) for result in results)
+            assert all("restart the server" in str(result) for result in results)
+            with pytest.raises(RuntimeError, match="restart the server"):
+                await client._forward_one(endpoint, "new request", None)
+            assert not client._pending_requests
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            server.close(linger=0)
+            context.destroy(linger=0)
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("failure", [None, "bind", "recv", "send"])
+def test_broker_closes_socket_and_context(monkeypatch, failure):
     async def run_test():
         socket = MagicMock()
         socket.recv = AsyncMock(side_effect=asyncio.Event().wait)
         context = MagicMock()
         context.socket.return_value = socket
         monkeypatch.setattr(zmq.asyncio, "Context", lambda: context)
+        if failure == "bind":
+            socket.bind.side_effect = zmq.ZMQError(zmq.EADDRINUSE)
+        elif failure == "recv":
+            # bound the old retry loop so a regression fails instead of hanging CI
+            socket.recv.side_effect = [
+                zmq.ZMQError(zmq.ENOTSOCK),
+                asyncio.CancelledError(),
+            ]
+        elif failure == "send":
+            socket.recv.side_effect = [
+                pickle.dumps("request"),
+                asyncio.CancelledError(),
+            ]
+            socket.send = AsyncMock(side_effect=zmq.ZMQError(zmq.ENOTSOCK))
+            monkeypatch.setattr(
+                async_scheduler_client, "forward", AsyncMock(return_value={"ok": True})
+            )
 
         task = asyncio.create_task(
             run_zeromq_broker(SimpleNamespace(broker_port=12345))
         )
         await asyncio.sleep(0)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        if failure is None:
+            task.cancel()
+        with pytest.raises(zmq.ZMQError if failure else asyncio.CancelledError):
             await task
 
         socket.close.assert_called_once_with(linger=0)
         context.destroy.assert_called_once_with(linger=0)
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("failure", ["decode", "forward", "encode"])
+def test_broker_serves_next_request_after_job_error(monkeypatch, failure):
+    async def run_test():
+        async def forward(request):
+            if request == "bad":
+                if failure == "forward":
+                    raise ValueError("rejected job")
+                return lambda: None  # cannot serialize a reply
+            return {"request": request}
+
+        monkeypatch.setattr(async_scheduler_client, "forward", forward)
+        port = get_free_port()
+        context = zmq.asyncio.Context()
+        socket = context.socket(zmq.REQ)
+        socket.connect(f"tcp://127.0.0.1:{port}")
+        broker = asyncio.create_task(
+            run_zeromq_broker(SimpleNamespace(broker_port=port))
+        )
+        try:
+            payload = b"invalid pickle" if failure == "decode" else pickle.dumps("bad")
+            await socket.send(payload)
+            error = pickle.loads(await asyncio.wait_for(socket.recv(), 5))
+            assert error["status"] == "error" and error["message"]
+            await socket.send(pickle.dumps("next"))
+            reply = pickle.loads(await asyncio.wait_for(socket.recv(), 5))
+            assert reply == {"request": "next"}
+            assert not broker.done()
+        finally:
+            broker.cancel()
+            await asyncio.gather(broker, return_exceptions=True)
+            socket.close(linger=0)
+            context.destroy(linger=0)
 
     asyncio.run(run_test())

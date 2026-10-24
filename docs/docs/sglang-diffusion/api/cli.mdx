@@ -473,13 +473,33 @@ SGLang Diffusion separates process liveness from inference readiness:
 | Endpoint | Success condition | Recommended use |
 | --- | --- | --- |
 | `GET /liveness` | The HTTP server is accepting requests. It remains `200` during server warmup. | Kubernetes liveness probe |
-| `GET /health` | The server is ready for normal inference traffic. It returns `503` while server-based synthetic warmup is running and `200` after it completes. | Startup and readiness probes |
+| `GET /health` | Server-based synthetic warmup has completed, tracked local workers are alive, and the local broker and any disaggregation routing loop are running. Returns `503` otherwise. | Startup and readiness probes |
 | `GET /health_generate` | Compatibility alias for `/health`. It does not currently issue a generation request in SGLang Diffusion. | Existing integrations only |
 
-`/health` gates only server-based warmup. With `--warmup-mode off` or
-`--warmup-mode request`, it returns `200` once the HTTP server starts; those modes
+With `--warmup-mode off` or `--warmup-mode request`, `/health` returns `200`
+once the HTTP server starts, provided its local backend is running; those modes
 do not promise that compilation or other first-request work has completed. If
 server-based warmup fails, the server terminates instead of reporting ready.
+
+For standard serving (including `--webui`) and locally launched disaggregated
+pools, losing any tracked worker makes `/health` return `503`; `/liveness`
+continues to report HTTP availability. The same applies when the local offline
+broker or disaggregation routing loop exits, even if its process is still alive.
+The broker replies to malformed jobs and inference errors without stopping;
+an unrecoverable socket receive or send error stops it and makes the server unready.
+A local monitor checks these components once per
+second, fails outstanding scheduler requests, and rejects new POST requests with
+`503`, even without an RPC timeout. Completed job status and content remain
+readable until the server stops. Remove the instance from routing and restart
+the whole server; workers and in-flight jobs are not automatically recovered.
+
+An allocator OOM during a multi-rank forward terminates the affected worker:
+other ranks may still be inside collectives, so continuing the next request is
+unsafe. Single-GPU replicas, including independent DP replicas, retain normal
+request-level OOM handling. The monitor does not detect arbitrary hangs, unusable
+CUDA contexts, or workers on other machines. A standalone disaggregation router
+does not own remote worker processes and cannot validate their health through this
+check; it only validates its own routing loop and broker.
 
 Do not use `/health` as a liveness probe: a long server warmup can legitimately
 keep it at `503` for several minutes.

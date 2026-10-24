@@ -260,6 +260,10 @@ def _probe_workload_units(req: Req) -> int:
     )
 
 
+class _FatalDistributedForward(SystemExit):
+    """Escape request-level recovery when ranks can no longer run in lockstep."""
+
+
 class GPUWorker(GPUWorkerPostTrainingMixin):
     """
     A worker that executes the model on a single GPU.
@@ -795,6 +799,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                     deferred=False,
                 )
         except Exception as e:
+            if (
+                forward_failed
+                and isinstance(e, _oom_exceptions())
+                and get_replica_group().world_size > 1
+            ):
+                # Other ranks may still be inside this forward's collectives.
+                # Returning a request error would enter the next dispatch on
+                # only this rank, permanently desynchronizing the replica.
+                measure_server_warmup = False
+                raise _FatalDistributedForward(
+                    "Multi-rank forward ran out of memory; restart the server."
+                ) from e
             if propagate_forward_errors and forward_failed:
                 if isinstance(e, StopIteration):
                     raise RuntimeError(
@@ -1760,6 +1776,13 @@ def run_scheduler_process(
             }
         )
         scheduler.event_loop()
+    except _FatalDistributedForward:
+        logger.exception(
+            "Worker %d cannot safely continue after a multi-rank OOM", rank
+        )
+        # CUDA/NCCL teardown can wait forever on a peer's outstanding collective.
+        # Exit at the process boundary; the HTTP worker monitor rejects new work.
+        os._exit(1)
     except _oom_exceptions() as _e:
         logger.warning(OOM_MSG)
         raise

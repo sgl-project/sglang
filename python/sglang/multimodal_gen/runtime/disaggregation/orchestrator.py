@@ -344,6 +344,10 @@ class DiffusionServer:
     def dispatcher(self) -> PoolDispatcher:
         return self._dispatcher
 
+    @property
+    def is_alive(self) -> bool:
+        return self._running and self._thread is not None and self._thread.is_alive()
+
     def start(self) -> None:
         if self._running:
             return
