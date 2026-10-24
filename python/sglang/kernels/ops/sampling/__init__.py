@@ -59,6 +59,8 @@ def softmax(
 
 __all__ = ["cake_softmax", "softmax"]
 
+# Cake (FlashInfer) backends: metadata-only registrations + explicit entry points.
+from sglang.kernels.ops.sampling import cake as _cake  # noqa: E402, F401
 
 # Migrated from srt/layers/utils/hash.py (RFC #29630, Phase 2.5).
 register_kernel(
