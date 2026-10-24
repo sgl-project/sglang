@@ -792,6 +792,9 @@ class HiCacheController:
         # storage thread remains alive before clearing shared state.
         self._stop_storage_threads()
 
+        if self.enable_storage:
+            self.storage_backend.release_all_lookup_claims()
+
         self.write_queue.clear()
         self.load_queue.clear()
         self.ack_write_queue.clear()
@@ -1303,6 +1306,12 @@ class HiCacheController:
                         operation=operation,
                     )
                 )
+
+    def enqueue_prefetch_transfer(self, operation: PrefetchOperation) -> None:
+        self.prefetch_buffer.put(operation)
+
+    def release_unqueued_prefetch_claims(self, operation: PrefetchOperation) -> None:
+        """Backends without lookup claims have nothing to release on a drop."""
 
     def prefetch_rate_limited(self) -> bool:
         """

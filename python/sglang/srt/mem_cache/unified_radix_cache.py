@@ -2771,6 +2771,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.buffer_pipeline.pop_prefix_ctx(request)
             self.buffer_pipeline.release_anchor_lock(request)
         cc = self.cache_controller
+        if hasattr(cc, "release_unqueued_prefetch_claims"):
+            cc.release_unqueued_prefetch_claims(info.operation)
         cc.append_host_mem_release(host_indices=host_indices, extra_pools=extra_pools)
         cc.prefetch_tokens_occupied = max(
             0,
@@ -2999,6 +3001,8 @@ class UnifiedRadixCache(BasePrefixCache):
             info = self.ongoing_prefetch.get(request)
             hit_tokens = operation.storage_hit_count
             if info is None:
+                if hasattr(cc, "release_unqueued_prefetch_claims"):
+                    cc.release_unqueued_prefetch_claims(operation)
                 return True  # aborted/cleaned; nothing to retry
             if operation.is_terminated():
                 self.revoke_pending_prefetch(request)
@@ -3098,7 +3102,7 @@ class UnifiedRadixCache(BasePrefixCache):
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]
             operation.host_indices = host_indices
             self.ongoing_prefetch[request] = info._replace(host_indices=host_indices)
-            cc.prefetch_buffer.put(operation)
+            cc.enqueue_prefetch_transfer(operation)
             return True
 
         def _drain_and_alloc_storage_hit():
@@ -3115,6 +3119,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
                 if info is None:
+                    if hasattr(cc, "release_unqueued_prefetch_claims"):
+                        cc.release_unqueued_prefetch_claims(operation)
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
                     continue

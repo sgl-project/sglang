@@ -198,6 +198,27 @@ class HiCacheStorage(ABC):
     # including after a failed batch, to preserve their collective sequence.
     prefetch_batch_pages = STORAGE_BATCH_SIZE
 
+    # An opt-in backend may return advisory trailing-state hits from a router
+    # hint. The controller must physically confirm each rank-agreed boundary
+    # before admission and retain the resulting claim until storage delivery.
+    requires_lookup_confirmation = False
+
+    def confirm_lookup(
+        self,
+        keys: List[str],
+        pool_transfers: List[PoolTransfer],
+        hit_pages: int,
+        extra_info: HiCacheStorageExtraInfo,
+        scope: str,
+    ) -> bool:
+        return True
+
+    def release_lookup(self, scope: str) -> None:
+        """Release a prefetch's confirmation claims after terminal delivery/drop."""
+
+    def release_all_lookup_claims(self) -> None:
+        """Release claims left by queued prefetches after threads stop."""
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host

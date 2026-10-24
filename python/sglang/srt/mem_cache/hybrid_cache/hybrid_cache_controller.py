@@ -191,6 +191,10 @@ class PrefetchOperation(StorageOperation):
             kv_hints=kv_hints,
             storage_key_to_event_hash=storage_key_to_event_hash,
         )
+        # A request can be re-matched while an older prefetch is still draining.
+        # Keep KVCR lookup claims scoped to this operation, not just its RID.
+        self.storage_lookup_scope = f"{self.request_id}:{self.id}"
+        self.storage_transfer_enqueued = False
         self.pool_transfers_done = not bool(pool_transfers)
         # The hit query's verdict per pool, as the chain prefix length (in
         # pages) up to which the pool is present; rank-reduced with the
@@ -1382,7 +1386,7 @@ class HybridCacheController(BaseHiCacheController):
                     operation.mark_terminate()
                 if operation.pool_transfers:
                     self._resolve_sidecar_kv_derived_pool_transfers(operation)
-                self.prefetch_buffer.put(operation)
+                self.enqueue_prefetch_transfer(operation)
             except Exception:
                 logger.exception("PP HiCache ticket processing failed.")
                 # Query/allocation failures already follow the agreed ACK path.
@@ -1423,7 +1427,7 @@ class HybridCacheController(BaseHiCacheController):
         )
         operation.all_hash_values = hash_value
 
-        if operation.assume_stored:
+        if operation.assume_stored and not self._needs_lookup_confirmation(operation):
             # A prior hit on a suffix of this span proved it stored, and writes
             # are prefix-covered, so re-querying only adds a round trip. Nothing
             # is verified now, so no pool gets a verdict to learn from.
@@ -1467,6 +1471,45 @@ class HybridCacheController(BaseHiCacheController):
             kv_hit_pages * self.page_size,
         )
 
+    def _needs_lookup_confirmation(self, operation: PrefetchOperation) -> bool:
+        return bool(
+            self.storage_backend.requires_lookup_confirmation
+            and any(
+                transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+                for transfer in operation.pool_transfers or ()
+            )
+        )
+
+    def _release_lookup_claims(self, operation: PrefetchOperation) -> None:
+        if self._needs_lookup_confirmation(operation):
+            self.storage_backend.release_lookup(operation.storage_lookup_scope)
+
+    def _clamp_confirmed_trailing_hits(
+        self, operation: PrefetchOperation, pages: int
+    ) -> None:
+        # Advisory FETCHABLE is not evidence of a source checkpoint. Buffer
+        # mode must not retain an optimistic trailing-pool existence belief
+        # after physical confirmation rejected a longer boundary.
+        for transfer in operation.pool_transfers or ():
+            if transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES:
+                continue
+            prior = operation.query_pool_hit_pages.get(transfer.name)
+            if prior is not None:
+                operation.query_pool_hit_pages[transfer.name] = min(prior, pages)
+
+    def release_unqueued_prefetch_claims(self, operation: PrefetchOperation) -> None:
+        if not operation.storage_transfer_enqueued:
+            self._release_lookup_claims(operation)
+
+    def enqueue_prefetch_transfer(self, operation: PrefetchOperation) -> None:
+        operation.storage_transfer_enqueued = True
+        try:
+            self.prefetch_buffer.put(operation)
+        except Exception:
+            operation.storage_transfer_enqueued = False
+            self._release_lookup_claims(operation)
+            raise
+
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
         """Reduce pool verdicts, then intersect explicit legal resume boundaries.
 
@@ -1478,10 +1521,16 @@ class HybridCacheController(BaseHiCacheController):
         local = operation.query_pool_hit_pages
         boundaries = operation.pool_storage_result.restorable_prefix_pages
         explicit = boundaries is not None
+        local_needs_confirmation = self._needs_lookup_confirmation(operation)
         packed = torch.tensor(
             [storage_hit_count]
             + [local.get(pool, _NO_POOL_VERDICT) for pool in pools]
-            + [int(explicit), int(not explicit)],
+            + [
+                int(explicit),
+                int(not explicit),
+                int(local_needs_confirmation),
+                int(not local_needs_confirmation),
+            ],
             dtype=torch.int,
         )
         self._all_reduce(
@@ -1495,15 +1544,30 @@ class HybridCacheController(BaseHiCacheController):
             for pool, pages in zip(pools, reduced[1 : 1 + len(pools)], strict=True)
             if pages != _NO_POOL_VERDICT
         }
-        if reduced[-1]:
-            return int(reduced[0])
-        if not reduced[-2]:
+        if not reduced[-2] and not reduced[-1]:
+            # A rank disagreement about trailing-pool requirements must not
+            # let one rank accept an unconfirmed cache boundary.
+            self._release_lookup_claims(operation)
             operation.pool_storage_result.restorable_prefix_pages = []
+            return 0
+        needs_confirmation = bool(reduced[-2])
+        if reduced[-3]:
+            if needs_confirmation:
+                self._release_lookup_claims(operation)
+                operation.pool_storage_result.restorable_prefix_pages = []
+                return 0
+            return int(reduced[0])
+        if not reduced[-4]:
+            operation.pool_storage_result.restorable_prefix_pages = []
+            if needs_confirmation:
+                self._release_lookup_claims(operation)
             return 0
         valid = set(boundaries)
         pages = len(operation.all_hash_values)
         if not pages:
             operation.pool_storage_result.restorable_prefix_pages = []
+            if needs_confirmation:
+                self._release_lookup_claims(operation)
             return 0
         mask = torch.tensor([int(page in valid) for page in range(1, pages + 1)])
         self._all_reduce(
@@ -1511,8 +1575,56 @@ class HybridCacheController(BaseHiCacheController):
             torch.distributed.ReduceOp.MIN,
             self.prefetch_hits_sync_groups,
         )
-        common = [page for page, present in enumerate(mask.tolist(), 1) if present]
+        common = [
+            page
+            for page, present in enumerate(mask.tolist(), 1)
+            if present and page * self.page_size <= reduced[0]
+        ]
         operation.pool_storage_result.restorable_prefix_pages = common
+        if needs_confirmation:
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=(
+                    operation.prefix_keys.copy() if operation.prefix_keys else None
+                ),
+                extra_info=storage_operation_extra_info(operation),
+            )
+            for page in reversed(common):
+                try:
+                    local_ok = self.storage_backend.confirm_lookup(
+                        operation.all_hash_values,
+                        operation.pool_transfers,
+                        page,
+                        extra_info,
+                        operation.storage_lookup_scope,
+                    )
+                    local_error = False
+                except Exception:
+                    logger.exception(
+                        "HiCache source checkpoint confirmation failed for %s",
+                        operation.request_id,
+                    )
+                    local_ok, local_error = False, True
+                accepted = torch.tensor(
+                    [
+                        int(local_ok and not operation.is_terminated()),
+                        int(not local_error),
+                    ]
+                )
+                self._all_reduce(
+                    accepted,
+                    torch.distributed.ReduceOp.MIN,
+                    self.prefetch_hits_sync_groups,
+                )
+                if not accepted[1].item():
+                    break
+                if accepted[0].item():
+                    operation.pool_storage_result.restorable_prefix_pages = [page]
+                    self._clamp_confirmed_trailing_hits(operation, page)
+                    return page * self.page_size
+            self._release_lookup_claims(operation)
+            operation.pool_storage_result.restorable_prefix_pages = []
+            self._clamp_confirmed_trailing_hits(operation, 0)
+            return 0
         return max(common, default=0) * self.page_size
 
     def _move_pool_indices(
@@ -1558,8 +1670,11 @@ class HybridCacheController(BaseHiCacheController):
         return host_indices, device_indices, resolved_pool_transfers
 
     def _page_transfer(self, operation: PrefetchOperation) -> bool:
-        with self.mem_pool_host.layout_lease():
-            return self._page_transfer_with_stable_layout(operation)
+        try:
+            with self.mem_pool_host.layout_lease():
+                return self._page_transfer_with_stable_layout(operation)
+        finally:
+            self._release_lookup_claims(operation)
 
     def _page_transfer_with_stable_layout(self, operation: PrefetchOperation) -> None:
         # KV pools and KV-derived pools first — determines actual completed page count

@@ -8,6 +8,7 @@ import types
 import unittest
 from array import array
 from contextlib import ExitStack
+from contextlib import nullcontext
 from enum import Enum
 from queue import Queue
 from types import SimpleNamespace
@@ -149,6 +150,8 @@ class _StrictPeerTransport(_CopyTransport):
     def __init__(self, layouts, peers):
         super().__init__(layouts)
         self.peers, self.reads = peers, []
+        self.claims, self.fetches = {}, []
+        self.next_claim = 0
 
     def _authorized(self, request_id):
         hint = self.hints.get(request_id)
@@ -175,10 +178,61 @@ class _StrictPeerTransport(_CopyTransport):
         self.reads.append(tuple(blocks))
         prior = self.storage
         try:
-            self.storage = self._authorized(request_id)
+            self.storage = {**self._authorized(request_id), **prior}
             return super().deliver(blocks, request_id)
         finally:
             self.storage = prior
+
+    def fetch(self, keys, request_id=None, expected_layout=None):
+        """Model a physical source check and a held local copy, unlike query."""
+        self.fetches.append(tuple(keys))
+        available = {**self._authorized(request_id), **self.storage}
+        result = {}
+        for key in keys:
+            data = available.get(key)
+            if data is None or not all(
+                label in data for label in expected_layout or ()
+            ):
+                result[key] = SimpleNamespace(success=False, release_handle=None)
+                continue
+            self.next_claim += 1
+            self.claims[self.next_claim] = key
+            self.storage[key] = copy.deepcopy(data)
+            result[key] = SimpleNamespace(success=True, release_handle=self.next_claim)
+        return self._complete(result)
+
+    def release(self, handles):
+        released = []
+        for handle in handles:
+            key = self.claims.pop(handle, None)
+            if key is not None:
+                # Force a premature release to fail the continuation test.
+                self.storage.pop(key, None)
+            released.append((handle, key is not None))
+        return released
+
+
+class _HintSupersetTransport(_StrictPeerTransport):
+    """A logical-page hint can advertise absent Mamba state as FETCHABLE."""
+
+    def query(self, keys, request_id=None):
+        hint = self.hints.get(request_id)
+        hashes = (
+            set(hint["actions"][0]["payload"]["block_hashes"])
+            if hint is not None
+            else set()
+        )
+        return [
+            (
+                _QueryStatus.HIT
+                if key in self.storage
+                else _QueryStatus.FETCHABLE
+                if int(key[:16], 16) in hashes
+                else _QueryStatus.MISS,
+                None,
+            )
+            for key in keys
+        ]
 
 
 class _BoundedCopyTransport(_CopyTransport):
@@ -614,6 +668,198 @@ class TestKVCRStorage(CustomTestCase):
         for name, pool in destination_pools.items():
             for prior, actual in zip(before[name], pool.buffers):
                 self.assertTrue(torch.equal(prior, actual))
+
+    def test_advisory_mamba_hint_requires_source_checkpoint_and_held_copy(self):
+        """A logical-page hint must not admit absent Mamba, and a confirmed
+        checkpoint must survive source removal until host delivery completes.
+        """
+        self.backend._runner = None
+        source_pools = {
+            PoolName.KV: self.pool,
+            PoolName.INDEXER: _HostPool(sizes=(5,)),
+            PoolName.MAMBA: _HostPool(sizes=(9, 3)),
+        }
+        for name in (PoolName.INDEXER, PoolName.MAMBA):
+            self.backend.register_mem_host_pool_v2(source_pools[name], name)
+        self.backend._namespace = storage_namespace(self.config, self.backend._layouts)
+        source = self.backend._runner = _CopyTransport(self.backend._layouts)
+        key = RadixKey(array("q", range(8)))
+        hashes = get_storage_hash_str(key, page_size=2)
+        for number, pool in enumerate(source_pools.values()):
+            for component, buffer in enumerate(pool.buffers):
+                buffer[:4].fill_(19 + number * 11 + component)
+        self.backend.batch_set_v2(
+            [
+                PoolTransfer(name, keys=hashes, host_indices=torch.arange(8))
+                for name in (PoolName.KV, PoolName.INDEXER)
+            ]
+            + [
+                PoolTransfer(
+                    PoolName.MAMBA,
+                    keys=hashes[-1:],
+                    host_indices=torch.arange(2),
+                )
+            ]
+        )
+
+        destination_pools = {
+            name: _HostPool(sizes=tuple(b.shape[1] for b in pool.buffers))
+            for name, pool in source_pools.items()
+        }
+        reader = KVCRStore(self.config, destination_pools[PoolName.KV])
+        for name in (PoolName.INDEXER, PoolName.MAMBA):
+            reader.register_mem_host_pool_v2(destination_pools[name], name)
+        reader._namespace = storage_namespace(self.config, reader._layouts)
+        transport = reader._runner = _HintSupersetTransport(
+            reader._layouts, {"tcp://peer:32100": source.storage}
+        )
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.page_size, controller.storage_backend = 2, reader
+        controller.page_get_func = controller._page_get_zero_copy
+        controller.prefetch_queue, controller.prefetch_sync_queue = Queue(), Queue()
+        controller.prefetch_buffer = Queue()
+        controller.pp_prefetch_command_group = None
+        controller.prefetch_hits_sync_groups = []
+        controller._all_reduce = lambda *_args, **_kwargs: None
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={}, layout_lease=lambda: nullcontext()
+        )
+        hint = {
+            "protocol_version": "0.1",
+            "actions": [
+                {
+                    "action_type": "kv.fetch",
+                    "action_version": "1.0",
+                    "payload": {
+                        "source_control_endpoint": "tcp://peer:32100",
+                        "block_hashes": [int(h[:16], 16) for h in hashes],
+                    },
+                }
+            ],
+        }
+
+        def submit(end_pages):
+            end_hashes = hashes[:end_pages]
+            transfers = [
+                PoolTransfer(
+                    PoolName.INDEXER,
+                    keys=end_hashes,
+                    host_indices=torch.arange(8, 8 + end_pages * 2),
+                    indices_from_pool=PoolName.KV,
+                ),
+                PoolTransfer(
+                    PoolName.MAMBA,
+                    keys=end_hashes[-1:],
+                    host_indices=torch.arange(8, 10),
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                ),
+            ]
+            operation = controller.submit_prefetch(
+                CacheRequestHandle(f"boundary-{end_pages}", 0),
+                key[: end_pages * 2],
+                None,
+                None,
+                [],
+                transfers,
+                kv_hints=hint,
+            ).operation
+            self.assertIs(controller.prefetch_queue.get_nowait(), operation)
+            hashes_found, advisory_tokens = controller._storage_hit_query(operation)
+            self.assertEqual(hashes_found, end_hashes)
+            self.assertEqual(advisory_tokens, end_pages * 2)
+            return operation, controller._sync_prefetch_hit_query(
+                operation, advisory_tokens
+            )
+
+        middle, confirmed = submit(2)
+        self.assertEqual(confirmed, 0)
+        self.assertEqual(middle.pool_storage_result.restorable_prefix_pages, [])
+        self.assertEqual(middle.query_pool_hit_pages[PoolName.MAMBA], 0)
+        self.assertFalse(transport.claims)
+
+        full, confirmed = submit(4)
+        self.assertEqual(confirmed, 8)
+        self.assertEqual(full.query_pool_hit_pages[PoolName.MAMBA], 4)
+        self.assertEqual(len(transport.claims), 1)
+        self.assertEqual(
+            transport.fetches[0][-1], block_key(hashes[1], reader._namespace, "mamba")
+        )
+        mamba_key = block_key(hashes[-1], reader._namespace, "mamba")
+        source.storage.pop(mamba_key)
+        full.hash_value = hashes
+        full.host_indices = torch.arange(8, 16)
+        controller.enqueue_prefetch_transfer(full)
+        controller.release_unqueued_prefetch_claims(full)
+        self.assertEqual(len(transport.claims), 1)
+        controller._page_transfer(full)
+        self.assertFalse(transport.claims)
+        self.assertFalse(reader._lookup_claims)
+        self.assertTrue(
+            torch.equal(
+                source_pools[PoolName.MAMBA].buffers[0][0],
+                destination_pools[PoolName.MAMBA].buffers[0][4],
+            )
+        )
+
+        # An advisory full-chain hit can still fall back to a shorter source
+        # checkpoint. Only the physically confirmed boundary may be admitted.
+        for component, buffer in enumerate(source_pools[PoolName.MAMBA].buffers):
+            buffer[0].fill_(73 + component)
+        self.assertEqual(
+            self.backend.batch_set_v2(
+                [
+                    PoolTransfer(
+                        PoolName.MAMBA,
+                        keys=hashes[1:2],
+                        host_indices=torch.arange(2),
+                    )
+                ]
+            )[PoolName.MAMBA],
+            [True],
+        )
+        fallback, confirmed = submit(4)
+        self.assertEqual(confirmed, 4)
+        self.assertEqual(fallback.pool_storage_result.restorable_prefix_pages, [2])
+        self.assertEqual(fallback.query_pool_hit_pages[PoolName.MAMBA], 2)
+        self.assertEqual(len(transport.claims), 1)
+        fallback.hash_value = hashes[:2]
+        fallback.host_indices = torch.arange(8, 12)
+        controller._page_transfer(fallback)
+        self.assertFalse(transport.claims)
+        self.assertTrue(
+            torch.equal(
+                source_pools[PoolName.MAMBA].buffers[0][0],
+                destination_pools[PoolName.MAMBA].buffers[0][4],
+            )
+        )
+
+        dropped, confirmed = submit(4)
+        self.assertEqual(confirmed, 4)
+        self.assertEqual(len(transport.claims), 1)
+        controller.release_unqueued_prefetch_claims(dropped)
+        self.assertFalse(transport.claims)
+        self.assertFalse(reader._lookup_claims)
+
+        # A rank that lacks the same trailing-pool requirement must not let
+        # another rank admit the advisory boundary without confirmation.
+        fetches_before = len(transport.fetches)
+
+        def disagree_on_confirmation_flags(tensor, *_args, **_kwargs):
+            if tensor.numel() == len(PoolName) + 5:
+                tensor[-2:] = 0
+
+        controller._all_reduce = disagree_on_confirmation_flags
+        mixed, confirmed = submit(4)
+        self.assertEqual(confirmed, 0)
+        self.assertEqual(mixed.pool_storage_result.restorable_prefix_pages, [])
+        self.assertEqual(len(transport.fetches), fetches_before)
+
+        controller._all_reduce = lambda *_args, **_kwargs: None
+        with patch.object(transport, "fetch", side_effect=RuntimeError("source lost")):
+            failed, confirmed = submit(4)
+        self.assertEqual(confirmed, 0)
+        self.assertEqual(failed.query_pool_hit_pages[PoolName.MAMBA], 0)
+        self.assertFalse(transport.claims)
 
     def test_invalid_startup_budget_is_rejected_before_registration(self):
         """An invalid optional deadline must not reach native registration."""

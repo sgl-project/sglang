@@ -85,6 +85,8 @@ class _NoFrameworkPinning:
 class KVCRStore(HiCacheStorage):
     """Optional NIXL/UCX L3 backend using KVCR's indexed-region public API."""
 
+    requires_lookup_confirmation = True
+
     def __init__(self, storage_config, mem_pool_host):
         self.config = storage_config
         self.mem_pool_host = mem_pool_host
@@ -95,6 +97,9 @@ class KVCRStore(HiCacheStorage):
         self._lock = threading.RLock()
         self._completion = threading.Condition(self._lock)
         self._completed = {}
+        # scope -> physical trailing-state keys and their local-DRAM claims.
+        # A router FETCHABLE verdict alone does not prove source residency.
+        self._lookup_claims = {}
         self._poll_thread = None
         self._stop_poll = threading.Event()
         self._closed = False
@@ -827,6 +832,87 @@ class KVCRStore(HiCacheStorage):
         valid = sorted(restorable)
         return PoolTransferResult(max(valid, default=0), hits, valid)
 
+    def _release_lookup_locked(self, scope):
+        claims = self._lookup_claims.get(scope)
+        if not claims:
+            self._lookup_claims.pop(scope, None)
+            return
+        handles = list(claims.values())
+        released = self._runner.release(handles)
+        if len(released) != len(handles) or not all(ok for _, ok in released):
+            raise RuntimeError("KVCR trailing-state claim release failed")
+        del self._lookup_claims[scope]
+
+    def release_lookup(self, scope: str) -> None:
+        with self._lock:
+            self._release_lookup_locked(scope)
+
+    def release_all_lookup_claims(self) -> None:
+        with self._lock:
+            for scope in list(self._lookup_claims):
+                self._release_lookup_locked(scope)
+
+    def confirm_lookup(
+        self, keys, pool_transfers, hit_pages, extra_info, scope
+    ) -> bool:
+        """Physically fetch the selected trailing checkpoint and pin its copy.
+
+        ``FETCHABLE`` means that a logical page matched a router hint; it is
+        not a source inventory check. Fetch must finish successfully for every
+        required trailing pool before this boundary can be admitted. The
+        claims keep the fetched local copies resident until host delivery ends.
+        """
+        if not scope or not isinstance(scope, str):
+            raise ValueError("KVCR lookup confirmation requires an operation scope")
+        if not isinstance(hit_pages, int) or not 0 <= hit_pages <= len(keys):
+            raise ValueError("Invalid KVCR lookup boundary")
+        with self._lock:
+            self._release_lookup_locked(scope)
+            if hit_pages == 0:
+                return False
+            self._start()
+            windows = {}
+            for transfer in pool_transfers:
+                if transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES:
+                    continue
+                name = str(transfer.name)
+                window_size = max(1, len(transfer.keys or []))
+                if window_size > hit_pages or name not in self._layouts:
+                    return False
+                windows[name] = [
+                    block_key(key, self._namespace, name)
+                    for key in keys[hit_pages - window_size : hit_pages]
+                ]
+            if not windows:
+                return True
+            claims = self._lookup_claims.setdefault(scope, {})
+            try:
+                for name, pending in windows.items():
+                    labels = [part.name for part in self._layouts[name].components]
+                    with self._hint(extra_info, pending) as request_id:
+                        handle = self._runner.fetch(
+                            pending,
+                            request_id=request_id,
+                            expected_layout=labels,
+                        )
+                        result = self._wait(handle)
+                    complete = True
+                    for key in pending:
+                        entry = result.get(key)
+                        if entry is None or not entry.success:
+                            complete = False
+                        elif entry.release_handle is None:
+                            complete = False
+                        else:
+                            claims[key] = entry.release_handle
+                    if not complete:
+                        self._release_lookup_locked(scope)
+                        return False
+                return True
+            except Exception:
+                self._release_lookup_locked(scope)
+                raise
+
     def batch_exists(self, keys, extra_info=None):
         return self.batch_exists_v2(keys, extra_info=extra_info).kv_hit_pages
 
@@ -859,6 +945,7 @@ class KVCRStore(HiCacheStorage):
         with self._lock:
             if self._runner is not None:
                 try:
+                    self.release_all_lookup_claims()
                     if self._diagnostic_telemetry:
                         self._drain_diagnostics(force=True)
                     self._runner.close()
