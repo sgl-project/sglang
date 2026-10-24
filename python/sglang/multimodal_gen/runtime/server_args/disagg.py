@@ -119,7 +119,7 @@ class DisaggServerArgsMixin:
             "--disagg-role-device",
             type=str,
             default=cls.disagg_role_device,
-            choices=["auto", "cpu", "cuda"],
+            choices=["auto", "cpu", "cuda", "xpu"],
             help=(
                 "Per-role device override. 'cpu' is intended for same-machine "
                 "encoder roles."
