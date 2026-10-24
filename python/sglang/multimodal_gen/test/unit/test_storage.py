@@ -5,11 +5,9 @@ Tests verify file upload, cleanup, URL generation, and error handling.
 """
 
 import asyncio
-import importlib
 import os
+import sys
 from types import SimpleNamespace
-
-import pytest
 
 import sglang.multimodal_gen.runtime.entrypoints.openai.storage as storage_mod
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import CloudStorage
@@ -188,45 +186,45 @@ def test_content_type_detection(tmp_path):
         assert called["content_type"] == expected_type
 
 
-# requires moto and boto3
-has_moto = (
-    importlib.util.find_spec("moto") is not None
-    and importlib.util.find_spec("boto3") is not None
-)
+def test_env_configured_storage_uploads_and_cleans_up(tmp_path, monkeypatch):
+    """CloudStorage() builds its boto3 client from the SGLANG_S3_* env vars."""
+    monkeypatch.setenv("SGLANG_CLOUD_STORAGE_TYPE", "S3")
+    monkeypatch.setenv("SGLANG_S3_BUCKET_NAME", "integration-test")
+    monkeypatch.setenv("SGLANG_S3_REGION_NAME", "us-east-1")
+    monkeypatch.setenv("SGLANG_S3_ACCESS_KEY_ID", "key-id")
+    monkeypatch.setenv("SGLANG_S3_SECRET_ACCESS_KEY", "secret")
+    monkeypatch.delenv("SGLANG_S3_ENDPOINT_URL", raising=False)
+    uploads = []
+    client_kwargs = {}
 
+    def fake_client(service, **kwargs):
+        client_kwargs.update(kwargs, service=service)
+        return SimpleNamespace(
+            upload_file=lambda *args, **kw: uploads.append((args, kw))
+        )
 
-@pytest.mark.skipif(not has_moto, reason="moto/boto3 not installed")
-def test_integration_with_moto(tmp_path):
-    """Integration test using moto to mock real S3 service."""
-    import boto3
-    from moto import mock_aws
+    monkeypatch.setitem(sys.modules, "boto3", SimpleNamespace(client=fake_client))
 
-    os.environ["SGLANG_CLOUD_STORAGE_TYPE"] = "s3"
-    os.environ["SGLANG_S3_BUCKET_NAME"] = "integration-test"
-    os.environ["SGLANG_S3_REGION_NAME"] = "us-east-1"
+    storage = CloudStorage()
+    assert storage.is_enabled()
+    assert client_kwargs == {
+        "service": "s3",
+        "aws_access_key_id": "key-id",
+        "aws_secret_access_key": "secret",
+        "endpoint_url": None,
+        "region_name": "us-east-1",
+    }
 
-    with mock_aws():
-        s3 = boto3.client("s3", region_name="us-east-1")
-        s3.create_bucket(Bucket="integration-test")
+    file_path = _create_temp_file(tmp_path, "integration.png", b"test_data")
+    url = asyncio.run(storage.upload_and_cleanup(file_path))
 
-        storage = CloudStorage()
-        assert storage.is_enabled()
-
-        file_path = _create_temp_file(tmp_path, "integration.png", b"test_data")
-
-        url = asyncio.run(storage.upload_and_cleanup(file_path))
-
-        assert url is not None
-        assert "integration-test" in url
-        assert "integration.png" in url
-        assert not os.path.exists(file_path)
-
-        obj = s3.get_object(Bucket="integration-test", Key="integration.png")
-        assert obj["Body"].read() == b"test_data"
-
-    for key in [
-        "SGLANG_CLOUD_STORAGE_TYPE",
-        "SGLANG_S3_BUCKET_NAME",
-        "SGLANG_S3_REGION_NAME",
-    ]:
-        os.environ.pop(key, None)
+    assert url == (
+        "https://integration-test.s3.us-east-1.amazonaws.com/integration.png"
+    )
+    assert not os.path.exists(file_path)
+    assert uploads == [
+        (
+            (file_path, "integration-test", "integration.png"),
+            {"ExtraArgs": {"ContentType": "image/png"}},
+        )
+    ]

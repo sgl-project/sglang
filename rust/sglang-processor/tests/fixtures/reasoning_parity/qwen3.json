@@ -1,0 +1,513 @@
+{
+  "parser": "qwen3",
+  "inputs": [
+    {
+      "chunks": ["The user", " greets me.\n", "</think>", "\n\nHello!"],
+      "force_nonempty_content": true
+    },
+    {"chunks": ["Let me think</th", "ink>\n\nAnswer"]},
+    {"chunks": ["<think>", "\nreason\n", "</think>", "\n\ndone"]},
+    {
+      "chunks": [
+        "I should call a tool.\n\n", "<tool_",
+        "call>\n<function=get_weather>\n</function>\n</tool_call>"
+      ]
+    },
+    {"chunks": ["mention <tool_call> inline", "</think>", "ans"]},
+    {"chunks": ["ends at <tool_"], "force_nonempty_content": true},
+    {"chunks": ["Only reasoning, cut off mid-thought"], "force_nonempty_content": true},
+    {"chunks": ["\n\n</think>\n\n", "Direct answer."]},
+    {"chunks": ["No thinking at all."]},
+    {"chunks": ["<think>\n\n</think>\n\n", "Thinking disabled."]},
+    {"chunks": ["a", "<", "/", "t", "h", "i", "n", "k", ">", "b"]}
+  ],
+  "cases": [
+    {
+      "input": 0,
+      "force": true,
+      "stream": true,
+      "steps": [["The user", ""], [" greets me.\n", ""], ["", ""], ["", "\n\nHello!"], ["", ""]],
+      "unary": ["The user greets me.\n", "\n\nHello!"]
+    },
+    {
+      "input": 0,
+      "force": true,
+      "stream": true,
+      "nonempty": true,
+      "steps": [["The user", ""], [" greets me.\n", ""], ["", ""], ["", "\n\nHello!"], ["", ""]],
+      "unary": ["The user greets me.\n", "\n\nHello!"]
+    },
+    {
+      "input": 0,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["The user greets me.\n", ""], ["", "\n\nHello!"], ["", ""]],
+      "unary": ["The user greets me.\n", "\n\nHello!"]
+    },
+    {
+      "input": 0,
+      "force": true,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", ""], ["", ""], ["The user greets me.\n", ""], ["", "\n\nHello!"], ["", ""]],
+      "unary": ["The user greets me.\n", "\n\nHello!"]
+    },
+    {
+      "input": 0,
+      "force": false,
+      "stream": true,
+      "steps": [["", "The user"], ["", " greets me.\n"], ["", "</think>"], ["", "\n\nHello!"], ["", ""]],
+      "unary": ["", "The user greets me.\n</think>\n\nHello!"]
+    },
+    {
+      "input": 0,
+      "force": false,
+      "stream": true,
+      "nonempty": true,
+      "steps": [["", "The user"], ["", " greets me.\n"], ["", "</think>"], ["", "\n\nHello!"], ["", ""]],
+      "unary": ["", "The user greets me.\n</think>\n\nHello!"]
+    },
+    {
+      "input": 0,
+      "force": false,
+      "stream": false,
+      "steps": [["", "The user"], ["", " greets me.\n"], ["", "</think>"], ["", "\n\nHello!"], ["", ""]],
+      "unary": ["", "The user greets me.\n</think>\n\nHello!"]
+    },
+    {
+      "input": 0,
+      "force": false,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", "The user"], ["", " greets me.\n"], ["", "</think>"], ["", "\n\nHello!"], ["", ""]],
+      "unary": ["", "The user greets me.\n</think>\n\nHello!"]
+    },
+    {
+      "input": 1,
+      "force": true,
+      "stream": true,
+      "steps": [["Let me think", ""], ["", "\n\nAnswer"], ["", ""]],
+      "unary": ["Let me think", "\n\nAnswer"]
+    },
+    {
+      "input": 1,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["Let me think", "\n\nAnswer"], ["", ""]],
+      "unary": ["Let me think", "\n\nAnswer"]
+    },
+    {
+      "input": 1,
+      "force": false,
+      "stream": true,
+      "steps": [["", "Let me think</th"], ["", "ink>\n\nAnswer"], ["", ""]],
+      "unary": ["", "Let me think</think>\n\nAnswer"]
+    },
+    {
+      "input": 1,
+      "force": false,
+      "stream": false,
+      "steps": [["", "Let me think</th"], ["", "ink>\n\nAnswer"], ["", ""]],
+      "unary": ["", "Let me think</think>\n\nAnswer"]
+    },
+    {
+      "input": 2,
+      "force": true,
+      "stream": true,
+      "steps": [["", ""], ["\nreason\n", ""], ["", ""], ["", "\n\ndone"], ["", ""]],
+      "unary": ["\nreason\n", "\n\ndone"]
+    },
+    {
+      "input": 2,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["\nreason\n", ""], ["", "\n\ndone"], ["", ""]],
+      "unary": ["\nreason\n", "\n\ndone"]
+    },
+    {
+      "input": 2,
+      "force": false,
+      "stream": true,
+      "steps": [["", ""], ["\nreason\n", ""], ["", ""], ["", "\n\ndone"], ["", ""]],
+      "unary": ["\nreason\n", "\n\ndone"]
+    },
+    {
+      "input": 2,
+      "force": false,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["\nreason\n", ""], ["", "\n\ndone"], ["", ""]],
+      "unary": ["\nreason\n", "\n\ndone"]
+    },
+    {
+      "input": 3,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["I should call a tool.\n\n", ""],
+        ["", ""],
+        ["", "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"],
+        ["", ""]
+      ],
+      "unary": [
+        "I should call a tool.\n\n",
+        "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"
+      ]
+    },
+    {
+      "input": 3,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        [
+          "I should call a tool.\n\n",
+          "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"
+        ],
+        ["", ""]
+      ],
+      "unary": [
+        "I should call a tool.\n\n",
+        "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"
+      ]
+    },
+    {
+      "input": 3,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "I should call a tool.\n\n"],
+        ["", ""],
+        ["", "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"],
+        ["", ""]
+      ],
+      "unary": [
+        "",
+        "I should call a tool.\n\n<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"
+      ]
+    },
+    {
+      "input": 3,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "I should call a tool.\n\n"],
+        ["", ""],
+        ["", "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"],
+        ["", ""]
+      ],
+      "unary": [
+        "",
+        "I should call a tool.\n\n<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"
+      ]
+    },
+    {
+      "input": 4,
+      "force": true,
+      "stream": true,
+      "steps": [["mention ", "<tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
+      "unary": ["mention <tool_call> inline", "ans"]
+    },
+    {
+      "input": 4,
+      "force": true,
+      "stream": false,
+      "steps": [["mention ", "<tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
+      "unary": ["mention <tool_call> inline", "ans"]
+    },
+    {
+      "input": 4,
+      "force": false,
+      "stream": true,
+      "steps": [["", "mention <tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
+      "unary": ["", "mention <tool_call> inline</think>ans"]
+    },
+    {
+      "input": 4,
+      "force": false,
+      "stream": false,
+      "steps": [["", "mention <tool_call> inline"], ["", "</think>"], ["", "ans"], ["", ""]],
+      "unary": ["", "mention <tool_call> inline</think>ans"]
+    },
+    {
+      "input": 5,
+      "force": true,
+      "stream": true,
+      "steps": [["ends at ", ""], ["<tool_", ""]],
+      "unary": ["ends at <tool_", ""]
+    },
+    {
+      "input": 5,
+      "force": true,
+      "stream": true,
+      "nonempty": true,
+      "steps": [["ends at ", ""], ["", "ends at <tool_"]],
+      "unary": ["", "ends at <tool_"]
+    },
+    {
+      "input": 5,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["ends at <tool_", ""]],
+      "unary": ["ends at <tool_", ""]
+    },
+    {
+      "input": 5,
+      "force": true,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", ""], ["", "ends at <tool_"]],
+      "unary": ["", "ends at <tool_"]
+    },
+    {
+      "input": 5,
+      "force": false,
+      "stream": true,
+      "steps": [["", "ends at <tool_"], ["", ""]],
+      "unary": ["", "ends at <tool_"]
+    },
+    {
+      "input": 5,
+      "force": false,
+      "stream": true,
+      "nonempty": true,
+      "steps": [["", "ends at <tool_"], ["", ""]],
+      "unary": ["", "ends at <tool_"]
+    },
+    {
+      "input": 5,
+      "force": false,
+      "stream": false,
+      "steps": [["", "ends at <tool_"], ["", ""]],
+      "unary": ["", "ends at <tool_"]
+    },
+    {
+      "input": 5,
+      "force": false,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", "ends at <tool_"], ["", ""]],
+      "unary": ["", "ends at <tool_"]
+    },
+    {
+      "input": 6,
+      "force": true,
+      "stream": true,
+      "steps": [["Only reasoning, cut off mid-thought", ""], ["", ""]],
+      "unary": ["Only reasoning, cut off mid-thought", ""]
+    },
+    {
+      "input": 6,
+      "force": true,
+      "stream": true,
+      "nonempty": true,
+      "steps": [["Only reasoning, cut off mid-thought", ""], ["", "Only reasoning, cut off mid-thought"]],
+      "unary": ["", "Only reasoning, cut off mid-thought"]
+    },
+    {
+      "input": 6,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["Only reasoning, cut off mid-thought", ""]],
+      "unary": ["Only reasoning, cut off mid-thought", ""]
+    },
+    {
+      "input": 6,
+      "force": true,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", ""], ["", "Only reasoning, cut off mid-thought"]],
+      "unary": ["", "Only reasoning, cut off mid-thought"]
+    },
+    {
+      "input": 6,
+      "force": false,
+      "stream": true,
+      "steps": [["", "Only reasoning, cut off mid-thought"], ["", ""]],
+      "unary": ["", "Only reasoning, cut off mid-thought"]
+    },
+    {
+      "input": 6,
+      "force": false,
+      "stream": true,
+      "nonempty": true,
+      "steps": [["", "Only reasoning, cut off mid-thought"], ["", ""]],
+      "unary": ["", "Only reasoning, cut off mid-thought"]
+    },
+    {
+      "input": 6,
+      "force": false,
+      "stream": false,
+      "steps": [["", "Only reasoning, cut off mid-thought"], ["", ""]],
+      "unary": ["", "Only reasoning, cut off mid-thought"]
+    },
+    {
+      "input": 6,
+      "force": false,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", "Only reasoning, cut off mid-thought"], ["", ""]],
+      "unary": ["", "Only reasoning, cut off mid-thought"]
+    },
+    {
+      "input": 7,
+      "force": true,
+      "stream": true,
+      "steps": [["\n\n", "\n\n"], ["", "Direct answer."], ["", ""]],
+      "unary": ["\n\n", "\n\nDirect answer."]
+    },
+    {
+      "input": 7,
+      "force": true,
+      "stream": false,
+      "steps": [["\n\n", "\n\n"], ["", "Direct answer."], ["", ""]],
+      "unary": ["\n\n", "\n\nDirect answer."]
+    },
+    {
+      "input": 7,
+      "force": false,
+      "stream": true,
+      "steps": [["", "\n\n</think>\n\n"], ["", "Direct answer."], ["", ""]],
+      "unary": ["", "\n\n</think>\n\nDirect answer."]
+    },
+    {
+      "input": 7,
+      "force": false,
+      "stream": false,
+      "steps": [["", "\n\n</think>\n\n"], ["", "Direct answer."], ["", ""]],
+      "unary": ["", "\n\n</think>\n\nDirect answer."]
+    },
+    {
+      "input": 8,
+      "force": true,
+      "stream": true,
+      "steps": [["No thinking at all.", ""], ["", ""]],
+      "unary": ["No thinking at all.", ""]
+    },
+    {
+      "input": 8,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["No thinking at all.", ""]],
+      "unary": ["No thinking at all.", ""]
+    },
+    {
+      "input": 8,
+      "force": false,
+      "stream": true,
+      "steps": [["", "No thinking at all."], ["", ""]],
+      "unary": ["", "No thinking at all."]
+    },
+    {
+      "input": 8,
+      "force": false,
+      "stream": false,
+      "steps": [["", "No thinking at all."], ["", ""]],
+      "unary": ["", "No thinking at all."]
+    },
+    {
+      "input": 9,
+      "force": true,
+      "stream": true,
+      "steps": [["\n\n", "\n\n"], ["", "Thinking disabled."], ["", ""]],
+      "unary": ["\n\n", "\n\nThinking disabled."]
+    },
+    {
+      "input": 9,
+      "force": true,
+      "stream": false,
+      "steps": [["\n\n", "\n\n"], ["", "Thinking disabled."], ["", ""]],
+      "unary": ["\n\n", "\n\nThinking disabled."]
+    },
+    {
+      "input": 9,
+      "force": false,
+      "stream": true,
+      "steps": [["\n\n", "\n\n"], ["", "Thinking disabled."], ["", ""]],
+      "unary": ["\n\n", "\n\nThinking disabled."]
+    },
+    {
+      "input": 9,
+      "force": false,
+      "stream": false,
+      "steps": [["\n\n", "\n\n"], ["", "Thinking disabled."], ["", ""]],
+      "unary": ["\n\n", "\n\nThinking disabled."]
+    },
+    {
+      "input": 10,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["a", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", "b"],
+        ["", ""]
+      ],
+      "unary": ["a", "b"]
+    },
+    {
+      "input": 10,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["a", ""],
+        ["", "b"],
+        ["", ""]
+      ],
+      "unary": ["a", "b"]
+    },
+    {
+      "input": 10,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "a"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", "</think>"],
+        ["", "b"],
+        ["", ""]
+      ],
+      "unary": ["", "a</think>b"]
+    },
+    {
+      "input": 10,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "a"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", "</think>"],
+        ["", "b"],
+        ["", ""]
+      ],
+      "unary": ["", "a</think>b"]
+    }
+  ]
+}

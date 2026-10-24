@@ -34,6 +34,27 @@ class _FakeProcess:
 
 
 class TestLaunchServerShutdown(unittest.TestCase):
+    def test_http_graceful_shutdown_timeout_is_forwarded(self):
+        for timeout in (None, 0, 30):
+            with self.subTest(timeout=timeout):
+                server_args = SimpleNamespace(
+                    log_level="info",
+                    host="127.0.0.1",
+                    port=30000,
+                    http_graceful_shutdown_timeout=timeout,
+                )
+                with (
+                    patch.object(ls, "init_diffusion_tracing"),
+                    patch.object(ls, "set_global_server_args"),
+                    patch.object(ls, "create_app"),
+                    patch.object(ls.uvicorn, "run") as run,
+                ):
+                    ls.launch_http_server_only(server_args)
+
+                self.assertEqual(
+                    run.call_args.kwargs["timeout_graceful_shutdown"], timeout
+                )
+
     def test_monolithic_shutdown_requests_scheduler_then_forces_worker(self):
         process = _FakeProcess()
         server_args = SimpleNamespace(disagg_role=RoleType.MONOLITHIC)

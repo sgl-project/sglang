@@ -90,7 +90,7 @@ class TestMiniMaxSparseHiCacheIntegration(unittest.TestCase):
             with self.subTest(layout=layout):
                 pool = _make_cpu_minimax_sparse_pool(start_layer=0)
                 kv_host = MHATokenToKVPoolHost(
-                    device_pool=pool.main_pool,
+                    buffer_info=pool.main_pool.get_device_pool_infos()[0].buffer_info,
                     host_to_device_ratio=2.0,
                     host_size=0,
                     page_size=pool.page_size,
@@ -98,6 +98,12 @@ class TestMiniMaxSparseHiCacheIntegration(unittest.TestCase):
                     pin_memory=False,
                     device="cpu",
                     allocator_type="default",
+                    device_capacity_tokens=pool.main_pool.size
+                    if pool.main_pool.host_capacity_tokens is None
+                    else pool.main_pool.host_capacity_tokens,
+                    start_layer=pool.main_pool.start_layer,
+                    end_layer=pool.main_pool.end_layer,
+                    write_back_staging=pool.main_pool.hicache_write_back_staging,
                 )
                 index_host = MHATokenToKOnlyPoolHost(
                     pool.index_k_pool,
@@ -255,7 +261,9 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
             ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
         try:
             kv_host = MHATokenToKVPoolHost(
-                device_pool=device_pool.main_pool,
+                buffer_info=device_pool.main_pool.get_device_pool_infos()[
+                    0
+                ].buffer_info,
                 host_to_device_ratio=2.0,
                 host_size=0,
                 page_size=page_size,
@@ -263,6 +271,12 @@ class TestMiniMaxSparseHiCacheTransfer(unittest.TestCase):
                 pin_memory=pin_memory,
                 device="cpu",
                 allocator_type="default",
+                device_capacity_tokens=device_pool.main_pool.size
+                if device_pool.main_pool.host_capacity_tokens is None
+                else device_pool.main_pool.host_capacity_tokens,
+                start_layer=device_pool.main_pool.start_layer,
+                end_layer=device_pool.main_pool.end_layer,
+                write_back_staging=device_pool.main_pool.hicache_write_back_staging,
             )
             index_host = MHATokenToKOnlyPoolHost(
                 device_pool.index_k_pool,

@@ -17,13 +17,14 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
-from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+from sglang.srt.multimodal.cache import resolve_multimodal_item_hash, snapshot_media
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
@@ -49,7 +50,12 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
+from sglang.srt.multimodal.processors.kimi_common import (
+    KimiGridMMDataMixin,
+    KimiLoadedImage,
+    kimi_image_identity,
+    unwrap_kimi_images,
+)
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
     _get_image_dimensions,
@@ -381,6 +387,7 @@ class KimiK3ImageProcessor(
     auto_mm_preprocess_cache_size_mb = 256
     supports_mm_processor_concurrency = True
     preserve_processor_input_ids = True
+    uses_wide_image_identity = True
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         mm_tokens = MultimodalSpecialTokens(
@@ -406,6 +413,7 @@ class KimiK3ImageProcessor(
         """
         when raw_bytes <= processed_bytes, preprocess first would introduce larger payload, so deferring gpu preprocessing would benefit
         """
+        images = unwrap_kimi_images(images or [])
         if (
             not images
             or self.mm_feature_transport != "cpu"
@@ -452,13 +460,14 @@ class KimiK3ImageProcessor(
         return raw_bytes <= processed_bytes
 
     def _build_deferred_output(self, base_output):
+        images = unwrap_kimi_images(base_output.images)
         (
             input_ids,
             resize_configs,
             deferred_preprocessing,
         ) = self._processor.prepare_deferred(
             base_output.input_text,
-            base_output.images,
+            images,
             base_output.input_ids,
         )
         offsets = self.get_mm_items_offset(
@@ -468,9 +477,7 @@ class KimiK3ImageProcessor(
             raise ValueError("Expected one Kimi-K3 image span for each image")
 
         items = []
-        for image, resize_config, offset in zip(
-            base_output.images, resize_configs, offsets
-        ):
+        for image, resize_config, offset in zip(images, resize_configs, offsets):
             grid_thw = _grid_thw_from_resize_config(
                 resize_config, self._processor.preprocess_config.patch_size
             )
@@ -487,6 +494,7 @@ class KimiK3ImageProcessor(
             )
             items.append(item)
 
+        self.assign_kimi_image_identities(items, base_output.images)
         self._precompute_hashes_before_cpu_transfer(items)
         return MultimodalProcessorOutput(
             input_ids=input_ids.flatten().tolist(),
@@ -644,7 +652,12 @@ class KimiK3ImageProcessor(
                 offsets=[offset],
                 model_specific_data=model_specific_data,
             )
-            item.set_hash(artifact.feature_hash)
+            if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+                item.set_hash(artifact.feature_hash)
+            else:
+                item.set_identity(
+                    kimi_image_identity(artifact.artifact_key, artifact.grid_thw)
+                )
             if self.keep_mm_features_on_device and item.feature is not None:
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True
@@ -703,6 +716,17 @@ class KimiK3ImageProcessor(
             im_token_id=self.mm_tokens.image_token_id,
         )
 
+    def kimi_content_config_digest(self, media) -> str:
+        self._kimi_config_fingerprint()
+        digest = (
+            media.content_digest
+            if isinstance(media, KimiLoadedImage)
+            else snapshot_media(media).content_digest
+        )
+        return self._artifact_key(
+            digest, media.image if isinstance(media, KimiLoadedImage) else media
+        )
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes, Dict]],
@@ -713,6 +737,7 @@ class KimiK3ImageProcessor(
     ):
         if request_obj.video_data or kwargs.get("audio_data"):
             raise ValueError("Kimi-K3 supports image input only")
+        self.reject_caller_image_identity(image_data, request_obj)
 
         expected_image_count = len(image_data or [])
         placeholder_count = self.count_image_placeholders(

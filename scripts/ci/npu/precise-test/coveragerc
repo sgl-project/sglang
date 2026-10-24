@@ -3,7 +3,11 @@ branch = True
 relative_files = False
 parallel = True
 concurrency = thread,multiprocessing
-sigterm = False
+# Subprocess coverage (server/scheduler/detokenizer) relies on this:
+# scheduler and detokenizer have no SIGTERM handler of their own, so the
+# coverage handler installed at process_startup() is what flushes their
+# data when the teardown SIGTERMs the tree before SIGKILL escalation.
+sigterm = True
 disable_warnings = no-data-collected,module-not-python
 
 include =
@@ -12,5 +16,3 @@ include =
 omit =
     */.local/*
     /usr/*
-    */sglang/test/*
-    */sglang/benchmark/*

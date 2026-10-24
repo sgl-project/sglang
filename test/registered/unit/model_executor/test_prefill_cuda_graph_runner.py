@@ -1,5 +1,6 @@
 """CPU coverage for chunked-prefix Full prefill CUDA-graph state."""
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,6 +10,18 @@ import torch
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    _local_prefill_cuda_graph_vote,
+)
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    LayerWiseLoadCounter,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -29,6 +42,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+def _static_pool_translator():
+    """A static pool's translator: its plans hand every batch its own ids."""
+    return KVIndexTranslator(
+        req_to_token=torch.zeros((1, 8), dtype=torch.int32),
+        token_to_kv_pool_allocator=None,
+        token_to_kv_pool=object(),
+        page_size=1,
+        device="cpu",
+    )
 
 
 class _FakeAttentionBackend:
@@ -95,6 +119,26 @@ class _FakeBatchRegistry:
 
 
 class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
+    def test_full_backend_accepts_mixed_chunks(self):
+        """Full pads the token and request axes and refreshes attention
+        metadata on every replay, so the mixed-chunk startup guard must not
+        reject it; it used to accept Breakable only."""
+        with (
+            get_context().override_server_args(
+                enable_mixed_chunk=True,
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(backend=Backend.FULL)
+                ),
+            ),
+            patch.object(
+                runner_module.BaseCudaGraphRunner,
+                "__init__",
+                side_effect=RuntimeError("reached base initialization"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "reached base initialization"),
+        ):
+            PrefillCudaGraphRunner(object())
+
     @patch(
         "sglang.srt.model_executor.model_runner.require_gathered_buffer",
         return_value=True,
@@ -141,7 +185,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
                 self.assertIs(runner.prepare_dummy_forward_batch(batch), batch)
                 self.assertEqual(batch.attn_tp_sequence_sharded, expected)
 
-    def test_capture_prepare_applies_model_runner_batch_hook(self):
+    def _capture_runner(self, *, prefill_backend_name, capture_req_slots):
         class Slot:
             def __init__(self, buffer):
                 self.buffer = buffer
@@ -168,13 +212,15 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             prepare_dummy_forward_batch=lambda batch: prepared.append(batch) or batch,
             attn_tp_sequence_sharded=lambda _: False,
             attn_backend=attention_backend,
+            kv_index_translator=_static_pool_translator(),
         )
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.model_runner = model_runner
         runner.device = torch.device("cpu")
-        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.prefill_backend_name = prefill_backend_name
         runner.max_context_size = None
-        runner._capture_req_slots = 1
+        runner.max_seq_len = None
+        runner._capture_req_slots = capture_req_slots
         runner.max_bs = 4
         runner._prefill_static_buffers = None
         runner.buffer_registry = registry
@@ -190,12 +236,36 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.tbo_plugin = SimpleNamespace(
             capture_one_batch_size=lambda batch, **_: captured.append(batch)
         )
+        return runner, prepared, captured, attention_backend
+
+    def test_capture_prepare_applies_model_runner_batch_hook(self):
+        runner, prepared, captured, attention_backend = self._capture_runner(
+            prefill_backend_name=Backend.BREAKABLE, capture_req_slots=1
+        )
 
         batch, backend = runner.capture_prepare(4)
 
         self.assertEqual(prepared, [batch])
         self.assertEqual(captured, [batch])
         self.assertIs(backend, attention_backend)
+
+    def test_capture_prepare_marks_full_prefill_capture(self):
+        """Only Full capture batches carry zero-length padding request slots.
+
+        A model that selects rows per request reads the flag to keep those
+        slots out of the selection; a Breakable capture has no such slots.
+        """
+        for backend_name, expected in (
+            (Backend.FULL, True),
+            (Backend.BREAKABLE, False),
+        ):
+            with self.subTest(backend=backend_name):
+                runner, _, _, _ = self._capture_runner(
+                    prefill_backend_name=backend_name, capture_req_slots=2
+                )
+                batch, _ = runner.capture_prepare(4)
+                self.assertEqual(batch.full_prefill_cuda_graph_capture, expected)
+                self.assertEqual(batch.batch_size, 2 if expected else 1)
 
     def test_trim_logits_output_preserves_customized_info(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
@@ -319,11 +389,14 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner._capture_chunked_prefix = False
         runner.buffer_registry = _FakeBatchRegistry()
+        translator = _static_pool_translator()
         runner.model_runner = SimpleNamespace(
             attn_tp_sequence_sharded=lambda _: False,
             prepare_dummy_forward_batch=lambda batch: batch,
+            kv_index_translator=translator,
         )
         runner.enable_cp_bcg_capture = False
         runner._is_full_backend = False
@@ -357,8 +430,9 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_forward_mode=ForwardMode.EXTEND,
         )
+        translator.bind_own_plan(forward_batch)
 
-        static_batch = runner.load_batch(forward_batch)
+        static_batch, _ = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
 
@@ -549,6 +623,81 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             [(first, True), (second, True), (second, False)],
         )
 
+    def test_fa4_multimodal_batch_cannot_replay_text_only_full_graph(self):
+        """FA4 multimodal prefill must fall back before full graph replay.
+
+        Both the DP vote and forward-time gate reject multimodal batches;
+        image batches are rejected before image_token_ranges is installed.
+        """
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._capture_req_slots = 4
+        runner.enable_lora = False
+        runner._qwen_bcg_hc_sidechannel = False
+        runner._qwen_bcg_mtp_draft = False
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+        runner.max_num_tokens = 4
+        runner.capture_num_tokens = [4]
+        runner.max_context_size = None
+        runner.max_seq_len = None
+        runner._capture_chunked_prefix = False
+        runner.has_mha_companion_layers = False
+
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([2, 2]),
+            out_cache_loc=torch.arange(4),
+            seq_lens_sum=4,
+            extend_prefix_lens_cpu=[0, 0],
+        )
+        image = MultimodalInputs(
+            mm_items=[MultimodalDataItem(modality=Modality.IMAGE, offsets=[(0, 1)])]
+        )
+        audio = MultimodalInputs(mm_items=[MultimodalDataItem(modality=Modality.AUDIO)])
+        video = MultimodalInputs(mm_items=[MultimodalDataItem(modality=Modality.VIDEO)])
+        for backend, fa4 in (
+            (Backend.FULL, True),
+            (Backend.FULL, False),
+            (Backend.BREAKABLE, True),
+            (Backend.TC_PIECEWISE, True),
+        ):
+            runner.prefill_backend_name = backend
+            runner._is_full_backend = backend == Backend.FULL
+            runner._fa4_prefill = fa4
+            # Text -> mixed text/image -> text also checks that the fallback
+            # is per batch, not a permanent disabling of captured graphs.
+            for mm_inputs in (None, [None, image], [None, audio], [None, video], None):
+                with self.subTest(backend=backend, fa4=fa4, mm_inputs=mm_inputs):
+                    batch.mm_inputs = mm_inputs
+                    expected = not (
+                        backend == Backend.FULL and fa4 and mm_inputs is not None
+                    )
+                    self.assertEqual(runner.can_run_graph(batch), expected)
+                    schedule_batch = SimpleNamespace(
+                        forward_mode=ForwardMode.EXTEND,
+                        batch_size=lambda: 2,
+                        extend_num_tokens=4,
+                        input_embeds=None,
+                        replace_embeds=None,
+                        prefix_lens=[0, 0],
+                        return_logprob=False,
+                        multimodal_inputs=mm_inputs,
+                    )
+                    self.assertEqual(
+                        _local_prefill_cuda_graph_vote(
+                            local_batch=schedule_batch,
+                            num_tokens=4,
+                            prefill_graph_runner=runner,
+                            coordinated_prefill=True,
+                            breakable_prefill=backend == Backend.BREAKABLE,
+                            spec_algorithm=None,
+                            model_config=None,
+                        ),
+                        expected,
+                    )
+
     def test_prefix_gate_only_applies_to_chunked_prefix_variant(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._capture_req_slots = 4
@@ -557,6 +706,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.max_num_tokens = 32
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner.backend = SimpleNamespace()
         runner.prefill_backend_name = Backend.FULL
         runner.has_mha_companion_layers = False
@@ -572,6 +722,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens_cpu=None,
             dp_prefill_cuda_graph_max_prefix_len=0,
+            contains_mm_inputs=lambda: False,
             return_logprob=False,
             extend_prefix_lens_cpu=[8],
         )
@@ -603,6 +754,50 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         )
         forward_batch.extend_prefix_lens_cpu = [9, 1]
         self.assertFalse(runner.can_run_graph(forward_batch))
+
+
+class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
+    @staticmethod
+    def _runner(counter, is_full_backend=True):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = is_full_backend
+        runner.model_runner = SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
+        )
+        return runner
+
+    def test_replay_waits_for_every_layer_of_an_inflight_load(self):
+        """Replay skips per-layer waits, so it must not start while the batch's
+        layer-wise load is still writing its last layer."""
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        counter.complete(0, 0)
+        counter.complete(0, 1)
+        waiter = threading.Thread(
+            target=self._runner(counter)._wait_for_layer_loads,
+            daemon=True,
+        )
+        waiter.start()
+        waiter.join(timeout=0.2)
+        self.assertTrue(waiter.is_alive())
+
+        counter.complete(0, 2)
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
+
+    def test_replay_without_a_layer_transfer_counter(self):
+        self._runner(None)._wait_for_layer_loads()
+
+    def test_breakable_replay_keeps_per_layer_load_overlap(self):
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        waiter = threading.Thread(
+            target=self._runner(counter, is_full_backend=False)._wait_for_layer_loads,
+            daemon=True,
+        )
+        waiter.start()
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
 
 
 if __name__ == "__main__":

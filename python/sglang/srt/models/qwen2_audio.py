@@ -38,8 +38,8 @@ from transformers.models.qwen2_audio.modeling_qwen2_audio import (
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -99,10 +99,9 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         self.language_model = Qwen2ForCausalLM(
             config.text_config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        return self.pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # Extract audio features from input items

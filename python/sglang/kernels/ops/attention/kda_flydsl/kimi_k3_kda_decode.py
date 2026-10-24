@@ -11,9 +11,6 @@ from collections.abc import Iterable
 import torch
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from .kernels.kimi_k3_kda_decode import (
-    create_kimi_k3_kda_decode_kernel,
-)
 from .kernels.kimi_k3_kda_decode_fb import (
     create_kimi_k3_kda_decode_fb_kernel,
 )
@@ -127,7 +124,7 @@ def _validate_kda_inputs(
     norm_weight: torch.Tensor,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Validate operands shared by both explicit KDA specializations."""
+    """Validate the KDA decode operands."""
     if not is_flydsl_kimi_k3_kda_decode_supported(device):
         raise RuntimeError(f"`{api_name}` requires a gfx950 GPU.")
     if batch <= 0:
@@ -256,109 +253,6 @@ def _validate_kda_inputs(
     return out
 
 
-def flydsl_kimi_k3_kda_decode(
-    x: torch.Tensor,
-    conv_weight: torch.Tensor,
-    conv_bias: torch.Tensor | None,
-    conv_state: torch.Tensor,
-    raw_g: torch.Tensor,
-    raw_beta: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    lower_bound: float | None,
-    state: torch.Tensor,
-    state_indices: torch.Tensor,
-    output_gate: torch.Tensor,
-    norm_weight: torch.Tensor,
-    norm_eps: float,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Run fused Kimi-K3 KDA decode on MI350-series GPUs.
-
-    This pure-decode specialization fuses the packed width-4 Q/K/V causal
-    convolution, the FP32 recurrent-state update, and the BF16
-    RMSNorm/sigmoid output gate. Slot zero is reserved: non-positive
-    ``state_indices`` produce zero output without modifying either cache.
-
-    The layout is fixed to Kimi-K3 TP8: 12 local heads and 128-dimensional
-    key/value state. Call
-    :func:`is_flydsl_kimi_k3_kda_decode_supported` before dispatching from a
-    model implementation.
-    """
-    if x.ndim != 2:
-        raise ValueError(f"`x` must have rank 2, got rank {x.ndim}.")
-    if not x.is_cuda:
-        raise ValueError("`x` must be a CUDA tensor.")
-    device = x.device
-    batch = x.shape[0]
-    out = _validate_kda_inputs(
-        api_name="flydsl_kimi_k3_kda_decode",
-        batch_source="x",
-        device=device,
-        batch=batch,
-        x=x,
-        conv_weight=conv_weight,
-        conv_bias=conv_bias,
-        conv_state=conv_state,
-        raw_beta=raw_beta,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        lower_bound=lower_bound,
-        state=state,
-        state_indices=state_indices,
-        output_gate=output_gate,
-        norm_weight=norm_weight,
-        out=out,
-    )
-    _check_same_device((("raw_g", raw_g),), device)
-    _check_tensor(
-        "raw_g",
-        raw_g,
-        shape=(1, batch, _HEADS, _DIM),
-        dtype=torch.bfloat16,
-        device=device,
-        inner_strides=(_DIM, 1),
-    )
-
-    executable = create_kimi_k3_kda_decode_kernel(
-        float(norm_eps),
-        float(lower_bound),
-    )
-    with torch.cuda.device(device):
-        stream = torch.cuda.current_stream(device)
-        _run_compiled(
-            executable,
-            x,
-            conv_weight,
-            conv_state,
-            raw_g,
-            raw_beta,
-            A_log,
-            dt_bias,
-            state,
-            state_indices,
-            output_gate,
-            norm_weight,
-            out,
-            batch,
-            x.stride(0),
-            conv_weight.stride(0),
-            conv_weight.stride(1),
-            conv_state.stride(0),
-            conv_state.stride(1),
-            conv_state.stride(2),
-            raw_g.stride(1),
-            raw_beta.stride(1),
-            state.stride(0),
-            output_gate.stride(0),
-            output_gate.stride(1),
-            out.stride(1),
-            out.stride(2),
-            stream,
-        )
-    return out
-
-
 def flydsl_kimi_k3_kda_decode_with_f_b(
     f_a: torch.Tensor,
     f_b_weight: torch.Tensor,
@@ -471,7 +365,6 @@ def flydsl_kimi_k3_kda_decode_with_f_b(
 
 
 __all__ = [
-    "flydsl_kimi_k3_kda_decode",
     "flydsl_kimi_k3_kda_decode_with_f_b",
     "is_flydsl_kimi_k3_kda_decode_supported",
 ]

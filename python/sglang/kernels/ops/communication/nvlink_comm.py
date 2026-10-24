@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from sglang.kernels.ops.communication.all_reduce import Communicator
 
 
-_PRIMITIVES: Final = ["all_reduce", "all_gather", "reduce_scatter"]
+_PRIMITIVES: Final = ["all_gather"]
 
 
 def get_multicast_ptr(tensor: torch.Tensor) -> int:
@@ -61,17 +61,6 @@ def _jit_push_module(dtype: torch.dtype, world_size: int) -> Module:
 
 # `residual` on any of these is folded into the reduction; it may be shaped like
 # this rank's shard or like the whole tensor, of which this rank's slice is taken.
-def all_reduce_push(
-    comm: Communicator,
-    input: torch.Tensor,
-    output: torch.Tensor,
-    residual: torch.Tensor | None = None,
-) -> None:
-    _jit_push_module(input.dtype, comm.world_size).all_reduce(
-        comm, input, output, residual
-    )
-
-
 def all_gather_push(
     comm: Communicator,
     input: torch.Tensor,
@@ -80,39 +69,6 @@ def all_gather_push(
 ) -> None:
     _jit_push_module(input.dtype, comm.world_size).all_gather(
         comm, input, output, residual
-    )
-
-
-def reduce_scatter_push(
-    comm: Communicator,
-    input: torch.Tensor,
-    output: torch.Tensor,
-    residual: torch.Tensor | None = None,
-) -> None:
-    _jit_push_module(input.dtype, comm.world_size).reduce_scatter(
-        comm, input, output, residual
-    )
-
-
-def all_reduce_pull(
-    comm: Communicator,
-    input: torch.Tensor,
-    output: torch.Tensor,
-    residual: torch.Tensor | None = None,
-    *,
-    in_mc_ptr: int = 0,
-    out_mc_ptr: int = 0,
-    num_unroll=4,
-    num_blocks_hint: int = 0,
-) -> None:
-    _jit_pull_module(input.dtype, num_unroll).all_reduce(
-        comm,
-        input,
-        output,
-        residual,
-        in_mc_ptr or get_multicast_ptr(input),
-        out_mc_ptr or get_multicast_ptr(output),
-        num_blocks_hint,
     )
 
 
@@ -132,25 +88,5 @@ def all_gather_pull(
         output,
         residual,
         out_mc_ptr or get_multicast_ptr(output),
-        num_blocks_hint,
-    )
-
-
-def reduce_scatter_pull(
-    comm: Communicator,
-    input: torch.Tensor,
-    output: torch.Tensor,
-    residual: torch.Tensor | None = None,
-    *,
-    in_mc_ptr: int = 0,
-    num_unroll=4,
-    num_blocks_hint: int = 0,
-) -> None:
-    _jit_pull_module(input.dtype, num_unroll).reduce_scatter(
-        comm,
-        input,
-        output,
-        residual,
-        in_mc_ptr or get_multicast_ptr(input),
         num_blocks_hint,
     )

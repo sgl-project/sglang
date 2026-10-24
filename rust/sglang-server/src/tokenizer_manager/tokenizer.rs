@@ -15,6 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::message::request::{Request, RequestKind};
+use crate::message::response::ResponseItem;
 use crate::message::types::TokenIds;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::wiring::TmEvent;
@@ -193,10 +194,42 @@ impl TokenizerWorker {
     }
 }
 
+impl TokenizerWorker {
+    /// `RequestKind::Tokenize`: Python's `tokenizer.encode(text,
+    /// add_special_tokens=...)`. An empty text is not an error here, unlike a
+    /// generate prompt: it encodes to just the auto-added specials.
+    fn tokenize(&self, text: &str, add_special_tokens: bool) -> Result<TokenIds, Error> {
+        let ids = if text.is_empty() {
+            self.auto_specials.clone()
+        } else {
+            self.tokenizer.encode(text)?
+        };
+        Ok(if add_special_tokens {
+            ids
+        } else {
+            strip_auto_specials(ids, &self.auto_specials)
+        })
+    }
+}
+
 impl Runnable for TokenizerWorker {
     fn run(self) {
         while let Ok(mut req) = self.rx.recv() {
-            // The tokenizer pool only ever receives generate requests. Encode,
+            // A tokenize request is answered here, through its own sink: it is
+            // not registered with a detok shard and does not return to intake.
+            if let RequestKind::Tokenize {
+                text,
+                add_special_tokens,
+            } = &req.kind
+            {
+                let item = match self.tokenize(text, *add_special_tokens) {
+                    Ok(ids) => ResponseItem::TokenIds(ids),
+                    Err(err) => ResponseItem::Error(err),
+                };
+                let _ = req.sink.try_send(item); // client may be gone
+                continue;
+            }
+            // Every other request is a generate request. Encode,
             // then advance the FSM: `TokenizeDone` on success (-> PreSendValidating,
             // or -> Encoding for a multimodal prompt; the state's `then` says which).
             // A request is never dropped here: a kind this pool cannot serve
@@ -327,6 +360,7 @@ mod tests {
                 sink: ResponseSink::Local(sink_tx),
                 kind: RequestKind::Detokenize {
                     token_ids: vec![1, 2],
+                    skip_special_tokens: true,
                 },
             })
             .expect("send");
@@ -403,5 +437,40 @@ mod tests {
         };
         assert_eq!(run(false), vec![0, 2], "plain text prompts keep specials");
         assert_eq!(run(true), vec![2], "rendered prompts lose the auto BOS");
+    }
+
+    /// A tokenize request is answered through its own sink and never returns
+    /// to intake. `add_special_tokens` keeps or strips the auto specials, and
+    /// an empty text encodes to just those specials, as Python's
+    /// `encode("")` does.
+    #[test]
+    fn tokenize_answers_through_the_sink_without_returning_to_intake() {
+        let run = |text: &str, add_special_tokens: bool| {
+            let (req_tx, req_rx) = flume::unbounded::<Request>();
+            let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(4);
+            req_tx
+                .send(Request {
+                    rid: "t".into(),
+                    state: RequestState::Queued,
+                    sink: ResponseSink::Local(sink_tx),
+                    kind: RequestKind::Tokenize {
+                        text: text.into(),
+                        add_special_tokens,
+                    },
+                })
+                .expect("send");
+            drop(req_tx);
+            TokenizerWorker::new(req_rx, tm_tx, Arc::new(MarkedTokenizer)).run();
+            assert!(tm_rx.try_recv().is_err(), "answered here, not by intake");
+            match sink_rx.try_recv() {
+                Ok(ResponseItem::TokenIds(ids)) => ids,
+                other => panic!("expected token ids, got {other:?}"),
+            }
+        };
+        assert_eq!(run("hi", true /* add_special_tokens */), vec![0, 2]);
+        assert_eq!(run("hi", false /* add_special_tokens */), vec![2]);
+        assert_eq!(run("", true /* add_special_tokens */), vec![0]);
+        assert_eq!(run("", false /* add_special_tokens */), Vec::<i64>::new());
     }
 }

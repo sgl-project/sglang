@@ -5,6 +5,7 @@ from collections.abc import Iterator
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
@@ -40,7 +41,7 @@ def _resolve_profiler_log_dir(log_dir: str | None) -> str:
     if log_dir is not None:
         return log_dir
 
-    diffusion_profiler_dir = os.getenv("SGLANG_DIFFUSION_TORCH_PROFILER_DIR")
+    diffusion_profiler_dir = envs.SGLANG_DIFFUSION_TORCH_PROFILER_DIR
     if diffusion_profiler_dir:
         return diffusion_profiler_dir
 

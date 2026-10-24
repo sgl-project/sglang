@@ -8,6 +8,7 @@ export const InternS1Deployment = () => {
         { id: 'b300', label: 'B300', default: false },
         { id: 'h100', label: 'H100', default: false },
         { id: 'h200', label: 'H200', default: false },
+        { id: 'xeon', label: 'XEON', default: false },
       ],
     },
     modelsize: {
@@ -51,6 +52,7 @@ export const InternS1Deployment = () => {
       h200: { bf16: { tp: 8 }, fp8: { tp: 8, ep: 2 } },
       b200: { bf16: { tp: 8 }, fp8: { tp: 8, ep: 2 } },
       b300: { bf16: { tp: 8 }, fp8: { tp: 8, ep: 2 } },
+      xeon: { bf16: { tp: 6 }, fp8: { tp: 6 } },
     },
     'S1-mini': {
       baseName: 'S1-mini',
@@ -58,15 +60,20 @@ export const InternS1Deployment = () => {
       h200: { bf16: { tp: 1 }, fp8: { tp: 1 } },
       b200: { bf16: { tp: 1 }, fp8: { tp: 1 } },
       b300: { bf16: { tp: 1 }, fp8: { tp: 1 } },
+      xeon: { bf16: { tp: 1 }, fp8: { tp: 1 } },
     },
   };
 
+  const resolveItems = (option, vals) =>
+    typeof option.getDynamicItems === 'function' ? option.getDynamicItems(vals) : option.items;
+
   const getInitialState = () => {
     const initialState = {};
-    Object.entries(options).forEach(([key, option]) => {
-      const defaultItem = option.items.find((item) => item.default);
-      initialState[key] = defaultItem ? defaultItem.id : option.items[0].id;
-    });
+    for (const [key, option] of Object.entries(options)) {
+      const items = resolveItems(option, initialState);
+      const defaultItem = items.find((item) => item.default && !item.disabled) || items.find((item) => !item.disabled) || items[0];
+      initialState[key] = defaultItem.id;
+    }
     return initialState;
   };
 
@@ -95,6 +102,22 @@ export const InternS1Deployment = () => {
     setValues((prev) => ({ ...prev, [optionName]: value }));
   };
 
+  useEffect(() => {
+    setValues((prev) => {
+      const next = { ...prev };
+      for (const [key, option] of Object.entries(options)) {
+        if (typeof option.getDynamicItems !== 'function') continue;
+        const items = option.getDynamicItems(next);
+        const current = items.find((item) => item.id === next[key]);
+        if (!current || current.disabled) {
+          const fallback = items.find((item) => item.default && !item.disabled) || items.find((item) => !item.disabled);
+          if (fallback) next[key] = fallback.id;
+        }
+      }
+      return next;
+    });
+  }, [values.hardware]);
+
   const generateCommand = () => {
     const { hardware, modelsize, quantization, reasoning, toolcall } = values;
     const modelConfig = modelConfigs[modelsize];
@@ -103,11 +126,16 @@ export const InternS1Deployment = () => {
       return '# Please select a valid hardware and quantization combination';
     }
 
+    const isXeon = hardware === 'xeon';
     const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
     const modelName = `internlm/Intern-${modelConfig.baseName}${quantSuffix}`;
 
     const flags = [];
     flags.push(`  --model ${modelName}`);
+    if (isXeon) {
+      flags.push('  --device cpu');
+      flags.push('  --disable-overlap-schedule');
+    }
     if (hwConfig.tp > 1) flags.push(`  --tp ${hwConfig.tp}`);
     if (hwConfig.ep) flags.push(`  --ep ${hwConfig.ep}`);
     if (quantization === 'fp8') flags.push(`  --tokenizer-path internlm/Intern-${modelConfig.baseName}`);
@@ -130,20 +158,23 @@ export const InternS1Deployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(options).map(([key, option]) => (
+      {Object.entries(options).map(([key, option]) => {
+        const items = resolveItems(option, values);
+        return (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>
           <div style={itemsStyle}>
-            {option.items.map((item) => {
+            {items.map((item) => {
               const isChecked = values[option.name] === item.id;
               return (
-                <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
+                <label key={item.id} title={item.disabledReason || ''} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(item.disabled ? { cursor: 'not-allowed', opacity: 0.5 } : {}) }}>
                   <input
                     type="radio"
                     name={option.name}
                     value={item.id}
                     checked={isChecked}
-                    onChange={() => handleRadioChange(option.name, item.id)}
+                    disabled={Boolean(item.disabled)}
+                    onChange={() => !item.disabled && handleRadioChange(option.name, item.id)}
                     style={{ display: 'none' }}
                   />
                   {item.label}
@@ -157,7 +188,8 @@ export const InternS1Deployment = () => {
             })}
           </div>
         </div>
-      ))}
+        );
+      })}
       <div style={cardStyle}>
         <div style={titleStyle}>Run this Command:</div>
         <pre style={commandDisplayStyle}>{generateCommand()}</pre>

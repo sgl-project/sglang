@@ -13,7 +13,8 @@ from sglang.test.kits.spec_server_kits import SpecParityKit
 from sglang.test.server_fixtures.spec_eagle_fixture import Eagle3Base
 
 register_cuda_ci(est_time=126, stage="base-b", runner_config="1-gpu-large")
-register_xpu_ci(est_time=360, suite="nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(est_time=360, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
+register_xpu_ci(est_time=360, suite="nightly-xpu-kernel-wheel-1-gpu", nightly=True)
 
 _is_xpu = is_xpu()
 
@@ -35,6 +36,8 @@ class TestEagle3ParityCUDA(SpecParityKit, _Eagle3ParityBase):
     """
 
     disable_overlap = False
+    # Deterministic FlashInfer prefill requires chunks of at least one split tile.
+    chunked_prefill_size = 4096
 
 
 @unittest.skipUnless(_is_xpu, "XPU runner only")
@@ -50,6 +53,10 @@ class TestEagle3ParityXPU(SpecParityKit, _Eagle3ParityBase):
     # EAGLE3 + full CUDA-graph decode capture on XPU takes >600s from cold on
     # Arc-class GPUs; the 600s default trips a spurious launch timeout here.
     server_launch_timeout = 1800
+    # XPU captures target-verify, draft-decode and draft-extend full graphs;
+    # at 0.80 the 2.25 GiB draft-extend attn_logits buffer OOMs at capture,
+    # and 0.75 leaves too little for the first prefill.
+    mem_fraction_static = 0.70
 
 
 if __name__ == "__main__":

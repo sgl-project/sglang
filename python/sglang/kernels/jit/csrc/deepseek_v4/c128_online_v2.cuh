@@ -233,8 +233,8 @@ constexpr float kPadScore = -FLT_MAX;
 
   __syncthreads();
 
-  // Cross-warp reduction. Same recipe as c128_online.cuh: each block-thread
-  // pair reduces a (tile_id, lane_id) slot using a kNumWarps-wide warp shuffle.
+  // Cross-warp reduction: each block-thread pair reduces a (tile_id, lane_id)
+  // slot using a kNumWarps-wide warp shuffle.
   constexpr uint32_t kReductionCount = kTileElements * kWarpThreads * kNumWarps;
   constexpr uint32_t kIteration = kReductionCount / kPrefillBlockSize;
   static_assert(kTileElements * kNumWarps == kWarpThreads, "TODO: support other configs");

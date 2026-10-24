@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""FastH3 (4-step VSA-distilled MiniMax-H3) registration and admission contracts."""
+"""FastH3 8-Step V2 (VSA-distilled MiniMax-H3) registration and admission contracts."""
 
 from __future__ import annotations
 
@@ -25,11 +25,18 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
+    MiniMaxH3ReleaseMetadata,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+    minimax_h3_time_shift_sigmas,
+)
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
 
-FASTH3_MODEL_ID = "FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree"
+FASTH3_MODEL_ID = "FastVideo/FastVideo-FastH3-8-Step-V2"
+DMD_STEPS = (999, 874, 749, 624, 500, 375, 250, 125)
 
 
 def _ensure_single_process_parallel_runtime() -> None:
@@ -45,18 +52,20 @@ def test_registry_resolves_fasth3_configs() -> None:
     assert info.pipeline_config_cls is FastH3PipelineConfig
     assert get_non_diffusers_pipeline_name(FASTH3_MODEL_ID) == "FastH3Pipeline"
     materialized = (
-        "/cache/materialized_models/"
-        "FastVideo__FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree-0123abcd"
+        "/cache/materialized_models/FastVideo__FastVideo-FastH3-8-Step-V2-0123abcd"
     )
     assert get_model_info(materialized).sampling_param_cls is FastH3SamplingParams
 
 
 def test_fasth3_sampling_defaults_and_task_rejection() -> None:
     params = FastH3SamplingParams(prompt="p")
-    assert params.num_inference_steps == 5
+    assert params.num_inference_steps == 8
     assert params.guidance_scale == 1.0
+    assert params.quality == "lossless"
+    assert FastH3SamplingParams(prompt="p", quality="extra-high").quality == "lossless"
+    assert FastH3SamplingParams(prompt="p", quality="exact").quality == "exact"
 
-    with pytest.raises(ValueError, match="exactly five sigma grid points"):
+    with pytest.raises(ValueError, match="exactly eight inference steps"):
         FastH3SamplingParams(prompt="p", num_inference_steps=50)
 
     with pytest.raises(ValueError, match="distilled for t2va only"):
@@ -72,8 +81,56 @@ def test_fasth3_sampling_defaults_and_task_rejection() -> None:
         )
 
 
+def test_fasth3_dmd_schedule_matches_trained_rungs() -> None:
+    """The distilled rungs are shifted exactly once, as FastVideo serves them, and
+    a wrong step count or non-decreasing rungs are rejected."""
+    metadata = MiniMaxH3ReleaseMetadata.from_model_index(
+        {
+            "_minimax_h3": {
+                "schema_version": 1,
+                "partition": "fl2va",
+                "tasks": ["t2va"],
+                "sigma_shift_scales": {"video": 10.0, "audio": 3.0},
+                "dmd_denoising_steps": list(DMD_STEPS),
+            }
+        }
+    )
+    assert metadata.dmd_denoising_steps == DMD_STEPS
+    # FastVideo's _set_dmd_schedule output for the video / audio shifts 10 / 3
+    served = {
+        10.0: [
+            *(0.9999, 0.985788, 0.967575, 0.943168, 0.909091),
+            *(0.857143, 0.769231, 0.588235, 0.0),
+        ],
+        3.0: [
+            *(0.999666, 0.954148, 0.89952, 0.83274, 0.75),
+            *(0.642857, 0.5, 0.3, 0.0),
+        ],
+    }
+    for shift, expected in served.items():
+        sigmas = minimax_h3_time_shift_sigmas(
+            num_steps=8, shift_scale=shift, dmd_steps=DMD_STEPS
+        )
+        assert sigmas == pytest.approx(expected, abs=1e-6)
+    with pytest.raises(ValueError, match="8 DiT forwards"):
+        minimax_h3_time_shift_sigmas(num_steps=5, shift_scale=10.0, dmd_steps=DMD_STEPS)
+    with pytest.raises(ValueError, match="strictly decreasing"):
+        MiniMaxH3ReleaseMetadata.from_model_index(
+            {
+                "_minimax_h3": {
+                    "schema_version": 1,
+                    "partition": "fl2va",
+                    "tasks": ["t2va"],
+                    "sigma_shift_scales": {"video": 10.0, "audio": 3.0},
+                    "dmd_denoising_steps": [999, 999],
+                }
+            }
+        )
+
+
 def test_fasth3_pipeline_config_gates_and_rejections() -> None:
     config = FastH3PipelineConfig()
+    assert config.vsa_sparsity == 0.8
     assert config.dit_config.arch_config.has_gate_compress
     assert not MiniMaxH3PipelineConfig().dit_config.arch_config.has_gate_compress
     mapping = config.dit_config.arch_config.param_names_mapping

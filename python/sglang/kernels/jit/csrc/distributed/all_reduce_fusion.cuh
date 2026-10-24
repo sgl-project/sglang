@@ -68,13 +68,14 @@ SGL_DEVICE void barrier_cluster_wait() {
 
 template <uint32_t kWorldSize, typename WeightT>
 struct MoeFinalizeAllReduceParams {
-  bf16_t* out;                // [num_tokens, kHiddenDim], output-only
-  const bf16_t* gemm2;        // [P, kHiddenDim], permuted / padded rows
-  const int32_t* idx;         // [num_tokens * kTopK], -1 = dropped slot
-  const WeightT* weights;     // [num_tokens, kTopK], scaling already folded in
-  const bf16_t* shared;       // [num_tokens, kHiddenDim] (kHasShared only)
-  const bf16_t* norm_weight;  // [kHiddenDim] (kNorm only)
-  float norm_eps;             // kNorm only
+  bf16_t* out;                         // [num_tokens, kHiddenDim], output-only
+  const bf16_t* gemm2;                 // [P, kHiddenDim], permuted / padded rows
+  const int32_t* idx;                  // [num_tokens * kTopK], -1 = dropped slot
+  const WeightT* weights;              // [num_tokens, kTopK], scaling already folded in
+  const bf16_t* shared;                // [num_tokens, kHiddenDim] (kHasShared only)
+  const float* shared_gate = nullptr;  // Optional FP32 sigmoid, one per token.
+  const bf16_t* norm_weight;           // [kHiddenDim] (kNorm only)
+  float norm_eps;                      // kNorm only
   // Caller's promise that everything read before the PDL wait is complete when
   // the predecessor merely *triggers*: no all-reduce on this plane right before
   // it, and the routing metadata's producers finished (PDL completion is not
@@ -199,7 +200,14 @@ struct RowClusterTrait {
 // --- stage 1: the deferred finalize of one 16B vector ------------------------
 // The shared-expert vector is loaded first so that load is in flight while the
 // routing rows and the kTopK gathers are fetched.
-template <uint32_t kHiddenDim, uint32_t kTopK, bool kHasShared, bool kUsePDL, uint32_t kWorldSize, typename WeightT>
+template <
+    uint32_t kHiddenDim,
+    uint32_t kTopK,
+    bool kHasShared,
+    bool kUsePDL,
+    uint32_t kWorldSize,
+    typename WeightT,
+    bool kGatedShared = false>
 SGL_DEVICE StageVec
 finalize_vec(const MoeFinalizeAllReduceParams<kWorldSize, WeightT>& params, uint32_t token, uint32_t hvec) {
   using namespace device;
@@ -263,7 +271,12 @@ finalize_vec(const MoeFinalizeAllReduceParams<kWorldSize, WeightT>& params, uint
     if constexpr (kHasShared) {
       const auto routed = cast<fp32x2_t>(cast<bf16x2_t>(acc[j]));
       const auto sh = cast<fp32x2_t>(shared_in[j]);
-      out[j] = cast<bf16x2_t>(fp32x2_t{routed.x + sh.x, routed.y + sh.y});
+      if constexpr (kGatedShared) {
+        const float gate = params.shared_gate[token];
+        out[j] = cast<bf16x2_t>(fp32x2_t{fmaf(gate, sh.x, routed.x), fmaf(gate, sh.y, routed.y)});
+      } else {
+        out[j] = cast<bf16x2_t>(fp32x2_t{routed.x + sh.x, routed.y + sh.y});
+      }
     } else {
       out[j] = cast<bf16x2_t>(acc[j]);
     }
@@ -287,7 +300,8 @@ template <
     typename WeightT,
     bool kMhc = false,
     bool kQuant = false,
-    bool kCollapse = false>
+    bool kCollapse = false,
+    bool kGatedShared = false>
 __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSize)
     __cluster_dims__(1, kClusterSize, 1) void moe_finalize_all_reduce_kernel(
         const __grid_constant__ MoeFinalizeAllReduceParams<kWorldSize, WeightT> params) {
@@ -342,7 +356,8 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize>::kBlockSi
   // stage 1: finalize this row's vector in registers and push it to every peer
   const auto vid = row_idx * kRowVecs + hvec;
   {
-    auto vec = finalize_vec<kHiddenDim, kTopK, kHasShared, kUsePDL>(params, row_idx, hvec);
+    auto vec =
+        finalize_vec<kHiddenDim, kTopK, kHasShared, kUsePDL, kWorldSize, WeightT, kGatedShared>(params, row_idx, hvec);
     Lamport::clear_pos_zero(vec.data());
 #pragma unroll
     for (uint32_t i = 0; i < kWorldSize; ++i) {
@@ -456,7 +471,8 @@ template <
     typename WeightT,
     bool kMhc = false,
     bool kQuant = false,
-    bool kCollapse = false>
+    bool kCollapse = false,
+    bool kGatedShared = false>
 struct MoeFinalizeAllReduceKernel {
  private:
   static_assert(std::is_same_v<WeightT, bf16_t> || std::is_same_v<WeightT, fp32_t>);
@@ -476,7 +492,8 @@ struct MoeFinalizeAllReduceKernel {
       WeightT,
       kMhc,
       kQuant,
-      kCollapse>;
+      kCollapse,
+      kGatedShared>;
 
  public:
   /// out = [allreduce over ranks of] finalize(gemm2_out, idx, weights) [+ shared] [-> RMSNorm(norm_weight, eps)].
@@ -509,8 +526,39 @@ struct MoeFinalizeAllReduceKernel {
         std::nullopt);
   }
 
+  // Preserve routed BF16 rounding, then apply the FP32 shared gate with FMA.
+  static void run_shared_gate(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView gemm2_out,
+      TensorView permuted_idx,
+      TensorView expert_weights,
+      TensorView shared_output,
+      TensorView shared_gate) {
+    static_assert(kGatedShared && !kMhc);
+    run_impl(
+        ref,
+        out,
+        gemm2_out,
+        permuted_idx,
+        expert_weights,
+        shared_output,
+        std::nullopt,
+        0.0,
+        false,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        shared_gate);
+  }
+
   /// Finalize + all-reduce + HC=4 post; original reduced output is retained.
-  static void run_mhc(
+  static void run_mhc_post(
       CommunicatorRef ref,
       TensorView out,
       TensorView gemm2_out,
@@ -538,41 +586,7 @@ struct MoeFinalizeAllReduceKernel {
         comb);
   }
 
-  // Keep the original RMSNorm as a separate kernel, while reusing the
-  // BF16-rounded post values for the next sublayer's pre-combine.
-  static void run_mhc_combine(
-      CommunicatorRef ref,
-      TensorView out,
-      TensorView gemm2_out,
-      TensorView permuted_idx,
-      TensorView expert_weights,
-      std::optional<TensorView> shared_output,
-      TensorView mhc_out,
-      TensorView residual,
-      TensorView post,
-      TensorView comb,
-      TensorView pre,
-      TensorView combined) {
-    static_assert(kMhc && kCollapse && !kQuant);
-    run_impl(
-        ref,
-        out,
-        gemm2_out,
-        permuted_idx,
-        expert_weights,
-        shared_output,
-        std::nullopt,
-        0.0,
-        false,
-        mhc_out,
-        residual,
-        post,
-        comb,
-        pre,
-        combined);
-  }
-
-  static void run_mhc_norm(
+  static void run_mhc_post_combine_norm(
       CommunicatorRef ref,
       TensorView out,
       TensorView gemm2_out,
@@ -606,7 +620,7 @@ struct MoeFinalizeAllReduceKernel {
         normalized);
   }
 
-  static void run_mhc_quant(
+  static void run_mhc_post_combine_norm_quant(
       CommunicatorRef ref,
       TensorView out,
       TensorView gemm2_out,
@@ -662,7 +676,8 @@ struct MoeFinalizeAllReduceKernel {
       std::optional<TensorView> pre = std::nullopt,
       std::optional<TensorView> normalized = std::nullopt,
       std::optional<TensorView> quantized = std::nullopt,
-      std::optional<TensorView> scales = std::nullopt) {
+      std::optional<TensorView> scales = std::nullopt,
+      std::optional<TensorView> shared_gate = std::nullopt) {
     using namespace host;
     const auto& comm = *ref.get();
     const auto& push = comm.get_push_obj();
@@ -698,6 +713,10 @@ struct MoeFinalizeAllReduceKernel {
           .with_device<kDLCUDA>(device)
           .verify(shared_output.value());
     }
+    if constexpr (kGatedShared) {
+      CHECK_HOST(shared_output.has_value() && shared_gate.has_value());
+      TensorMatcher({T}).with_dtype<fp32_t>().with_device<kDLCUDA>(device).verify(shared_gate.value());
+    }
     if (norm_weight.has_value()) {
       TensorMatcher({kHiddenDim})
           .with_strides({1})
@@ -707,7 +726,7 @@ struct MoeFinalizeAllReduceKernel {
     }
     const auto num_tokens = static_cast<uint32_t>(T.unwrap());
     if constexpr (kQuant) {
-      CHECK_HOST(num_tokens <= 8);
+      CHECK_HOST(num_tokens <= 128) << "the quant epilogue writes one 128-row scale tile";
       CHECK_HOST(norm_weight.has_value());
       TensorMatcher({T, kHiddenDim}).with_dtype<fp8_e4m3_t>().with_device<kDLCUDA>(device).verify(quantized.value());
       TensorMatcher({(kHiddenDim / 32) * 128})
@@ -751,6 +770,7 @@ struct MoeFinalizeAllReduceKernel {
         .idx = static_cast<const int32_t*>(permuted_idx.data_ptr()),
         .weights = static_cast<const WeightT*>(expert_weights.data_ptr()),
         .shared = shared_output.has_value() ? static_cast<const bf16_t*>(shared_output.value().data_ptr()) : nullptr,
+        .shared_gate = shared_gate.has_value() ? static_cast<const float*>(shared_gate.value().data_ptr()) : nullptr,
         .norm_weight = norm_weight.has_value() ? static_cast<const bf16_t*>(norm_weight.value().data_ptr()) : nullptr,
         .norm_eps = static_cast<float>(eps),
         .prefetch_metadata = prefetch_metadata,

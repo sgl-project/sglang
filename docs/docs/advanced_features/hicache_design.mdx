@@ -162,6 +162,8 @@ SGLang supports a PD (Prefill-Decode) disaggregation deployment mode through the
 
 HiCache encapsulates all read, write, and query operations on L3 backends within the `class HiCacheStorage(ABC)`, exposing a set of simple and consistent interfaces. This design supports a wide range of L3 storage backends and allows users to select the one that best fits their specific use cases.
 
+When a backend is attached, HiCache hands it the host memory pools in a fixed order: `register_mem_pool_host` receives the anchor pool first, then every pool of the host pool group (Mamba state, indexer, SWA, draft sidecars, ...) arrives through `register_mem_host_pool_v2`, and `on_host_pools_registered` fires exactly once when this initial burst is over. Pools attached dynamically later still arrive through `register_mem_host_pool_v2` alone. Backends that talk to an external service whose instance specification must be complete up front (e.g. a remote cache manager) should finalize it inside `on_host_pools_registered`; raising there fails the attach.
+
 - **Mooncake**: Mooncake is a high-performance caching system for LLM inference that leverages RDMA and multi-NIC resources to enable zero-copy, ultra-fast data transfers. Try Mooncake [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/mooncake_store).
 
 - **DeepSeek 3FS (HF3FS)**: HF3FS is a Kubernetes-native distributed storage solution with operator-based deployment. Try HF3FS [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/hf3fs).

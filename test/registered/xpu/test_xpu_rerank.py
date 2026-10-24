@@ -23,7 +23,8 @@ from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
-register_xpu_ci(est_time=180, suite="nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(est_time=180, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
+register_xpu_ci(est_time=180, suite="nightly-xpu-kernel-wheel-1-gpu", nightly=True)
 
 MODEL_PATH = "Qwen/Qwen3-Reranker-0.6B"
 TP_SIZE = 1
@@ -165,6 +166,11 @@ CROSS_ENCODER_ATTENTION_BACKEND = "triton"
 CROSS_ENCODER_MEM_FRACTION_STATIC = 0.65
 
 
+@unittest.skip(
+    "XPU store_cache supports only fp16/bf16/uint8 K/V; this fp32 cross-encoder "
+    "fails with 'store_cache only supports k/v dtype in {fp16, bf16, uint8}; got Float'. "
+    "Re-enable once more XPU KV cache dtypes are upstreamed."
+)
 class TestXPUCrossEncoderRerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):

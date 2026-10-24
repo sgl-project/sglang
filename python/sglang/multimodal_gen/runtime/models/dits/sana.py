@@ -7,8 +7,6 @@ from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbed
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    can_use_fused_bias_glu,
-    can_use_fused_bias_silu,
     can_use_fused_layernorm_modulate,
     fused_bias_glu,
     fused_bias_silu,
@@ -106,7 +104,7 @@ def sana_ln_modulate(
         and is_plain_layer_norm(norm, x.shape[-1])
     ):
         x_c = x.contiguous()
-        if not can_use_fused_layernorm_modulate(x_c, scale[:, 0], shift[:, 0]):
+        if not can_use_fused_layernorm_modulate(x_c.dtype, x_c.shape[-1]):
             return _eager_ln_modulate(norm, x, scale, shift)
         try:
             out = fused_layernorm_modulate_raw(x_c, scale[:, 0], shift[:, 0], norm.eps)
@@ -119,10 +117,6 @@ def sana_ln_modulate(
                 _eager_ln_modulate(norm, x, scale, shift),
                 sig=sig,
                 logger=logger,
-                mismatch_msg=(
-                    "Sana fused LN+modulate fast path is not bit-exact against "
-                    "this platform's LayerNorm dispatch; falling back to eager"
-                ),
             )
             _SANA_LN_MOD_DISABLED = _SANA_LN_MOD.disabled
             return result
@@ -185,7 +179,7 @@ def sana_conv_bias_silu(
         return F.silu(_mps_safe_conv2d(conv, x))
 
     raw = _conv2d_without_bias(conv, x)
-    if not can_use_fused_bias_silu(raw, conv.bias):
+    if raw.dtype is not torch.bfloat16:
         return F.silu(raw + conv.bias[None, :, None, None])
     verified = _SANA_CONV_SILU.verified
     if not verified and not _SANA_CONV_SILU.can_attempt_once():
@@ -201,10 +195,6 @@ def sana_conv_bias_silu(
         out,
         F.silu(raw + conv.bias[None, :, None, None]),
         logger=logger,
-        mismatch_msg=(
-            "Sana fused conv bias-SiLU path is not bit-exact on this "
-            "platform; falling back to eager"
-        ),
     )
 
 
@@ -217,10 +207,8 @@ def sana_conv_bias_glu(
         return hidden_states * F.silu(gate)
 
     raw = _conv2d_without_bias(conv, x)
-    if not can_use_fused_bias_glu(raw, conv.bias):
-        hidden_states, gate = torch.chunk(
-            raw + conv.bias[None, :, None, None], 2, dim=1
-        )
+    if raw.dtype is not torch.bfloat16:
+        hidden_states, gate = (raw + conv.bias[None, :, None, None]).chunk(2, dim=1)
         return hidden_states * F.silu(gate)
     verified = _SANA_CONV_GLU.verified
     if not verified and not _SANA_CONV_GLU.can_attempt_once():
@@ -244,10 +232,6 @@ def sana_conv_bias_glu(
         out,
         hidden_states * F.silu(gate),
         logger=logger,
-        mismatch_msg=(
-            "Sana fused conv bias-GLU path is not bit-exact on this "
-            "platform; falling back to eager"
-        ),
     )
 
 

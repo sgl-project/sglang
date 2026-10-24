@@ -39,7 +39,7 @@ jobs:
       (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'cu130')
     strategy:
       matrix:
-        python-version: ["3.10"]
+        python-version: ["3.11"]
         cuda-version: ["13.0"]
         arch: [x86_64, aarch64]
         include:
@@ -174,8 +174,9 @@ jobs:
       matrix:
         python-version: ["3.10"]
         # ROCm 10.0.0 builds inside a Python 3.12 container; the wheel is still
-        # tagged cp310-abi3 (wheel.py-api in pyproject.toml), so it stays under
-        # the same python-version leg as the 7.x wheels.
+        # tagged cp310-abi3 (build_rocm.sh sets wheel.py-api to cp310 for every
+        # ROCm flavor), so it stays under the same python-version leg as the 7.x
+        # wheels.
         #
         # A dispatch that names one flavor builds only that flavor. Every extra
         # leg is another image build on the shared AMD node, and its release job

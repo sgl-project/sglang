@@ -32,6 +32,7 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
             "dp_size": 1,
             "use_fsdp_inference": False,
             "resolve_component_attention_backend": mock.Mock(return_value=(None, None)),
+            "resolve_component_backend_by_role": mock.Mock(return_value={}),
             "requested_component_attention_backend": mock.Mock(return_value=None),
             "should_direct_gpu_weight_load_component": mock.Mock(return_value=False),
             "should_use_fsdp_for_component": mock.Mock(return_value=fsdp_requested),

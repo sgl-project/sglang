@@ -21,8 +21,7 @@ from sglang.srt.utils.cuda_vmm_utils import (
     align_down,
     align_up,
     check_drv,
-    exchange_posix_fds,
-    export_shareable_handles,
+    exchange_shareable_handles,
     get_device_granularity,
     import_peer_handle,
     make_device_allocation_prop,
@@ -138,11 +137,6 @@ class DWDPTransport:
         prop = make_device_allocation_prop(device_id)
 
         handle_list = [self._handle_set.get_handle(li, n) for li, n in sorted_keys]
-        fabric_handles, local_posix_fds, use_fabric = export_shareable_handles(
-            handle_list, cpu_group, layout.dwdp_rank
-        )
-        peer_fds: Dict[Tuple[int, int], int] = {}
-
         key_counts = [None] * layout.dwdp_size
         dist.all_gather_object(key_counts, len(sorted_keys), group=cpu_group)
         if any(count != len(sorted_keys) for count in key_counts):
@@ -150,18 +144,9 @@ class DWDPTransport:
                 f"Mismatched DWDP weight handle counts across ranks: {key_counts}"
             )
 
-        if use_fabric:
-            all_fabric = [None] * layout.dwdp_size
-            dist.all_gather_object(all_fabric, fabric_handles, group=cpu_group)
-        else:
-            all_fabric = None
-            peer_fds = exchange_posix_fds(
-                cpu_group,
-                layout.dwdp_rank,
-                layout.dwdp_size,
-                local_posix_fds,
-                key_counts,
-            )
+        use_fabric, peer_handles = exchange_shareable_handles(
+            handle_list, cpu_group, layout.dwdp_rank, layout.dwdp_size
+        )
         logger.info(
             "DWDP handle exchange via %s (%d handles)",
             "FABRIC" if use_fabric else "POSIX fd",
@@ -175,8 +160,9 @@ class DWDPTransport:
                 if peer_rank == layout.dwdp_rank:
                     continue
 
-                fabric_handle = all_fabric[peer_rank][key_idx] if use_fabric else None
-                fd = None if use_fabric else peer_fds[(peer_rank, key_idx)]
+                handle = peer_handles[(peer_rank, key_idx)]
+                fabric_handle = handle if use_fabric else None
+                fd = None if use_fabric else handle
                 peer_handle = import_peer_handle(
                     fabric_handle, fd, use_fabric=use_fabric, peer_rank=peer_rank
                 )
@@ -209,8 +195,8 @@ class DWDPTransport:
                 )
                 self._peer_views[(peer_rank, layer_idx, name)] = peer_tensor
 
-        _close_fds(local_posix_fds)
-        _close_fds(peer_fds.values())
+        if not use_fabric:
+            _close_fds(peer_handles.values())
 
     @property
     def handle_set(self) -> MnnvlHandleSet:

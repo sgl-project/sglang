@@ -84,7 +84,7 @@ __global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCac
 /// Elements per thread of the V4.1 store (`512 / vec` threads per token): 4 for fp8 rows, 2 for
 /// fp4, whose per-element IEEE divisions spread better over more threads (measured on B200, bs 1..512).
 constexpr uint32_t v41_store_vec_size(deepseek_v4::KVLayout layout) {
-  return layout == deepseek_v4::KVLayout::V41 ? 4 : 2;
+  return deepseek_v4::kv_encoding(layout) == deepseek_v4::KVLayout::V41 ? 4 : 2;
 }
 
 template <

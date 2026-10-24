@@ -1,25 +1,32 @@
 ---
 title: Z-Image-Turbo
+description: "Deploy Z-Image-Turbo with SGLang - community contribution guide for Z-Image's fast image generation model."
 metatags:
     description: "Deploy Z-Image-Turbo with SGLang - community contribution guide for Z-Image's fast image generation model."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { ZImageTurboDeployment } from '/src/snippets/diffusion/zimage-turbo-deployment.jsx';
 
 <DiffusionModelTags tags={["image", "text-to-image", "6B S3-DiT", "8-step", "bilingual text"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/TongyiMAI/z-image-turbo.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) is a distilled 6B single-stream DiT for fast text-to-image generation. It reaches its intended operating point in 8 function evaluations and is particularly strong at photorealistic scenes, prompt adherence, and English/Chinese text rendering.
 
 Choose it when latency and a relatively small deployment footprint matter more than the editability or maximum capacity of larger image models. It is a generation-only checkpoint; use Qwen-Image-Edit or FLUX.2 when the request includes source images or identity-preserving edits.
-
-## 2. SGLang-diffusion Installation
-
-SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
-
-Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -29,9 +36,7 @@ This section provides deployment configurations optimized for different hardware
 
 Z-Image-Turbo is optimized for high-quality image generation with only 8 inference steps. The recommended launch configurations vary by hardware.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model version. SGLang supports serving Z-Image-Turbo on NVIDIA B200, H200, H100, and AMD MI355X, MI325X, MI300X GPUs, Ascend A2, A3 NPUs and Intel Arc Pro B-Series GPUs(codename: BMG (Battlemage)).
-
-<ZImageTurboDeployment />
+Use the [command builder](#1-quick-start) above.
 
 ### 3.2 Configuration Tips
 
@@ -72,6 +77,12 @@ with open("output.png", "wb") as f:
 ```
 
 ### 4.2 Advanced Usage
+
+Z-Image uses `positive + guidance_scale * (positive - negative)` guidance, unlike
+the standard CFG convention. Any positive `guidance_scale` enables CFG; omitted
+negative prompts use an empty string. Z-Image-Turbo defaults to `guidance_scale=0`
+and does not run the negative branch. Enabling CFG adds a second DiT branch, so
+expect additional inference cost; it is not automatically recommended for Turbo.
 
 #### 4.2.1 Cache-DiT Acceleration
 

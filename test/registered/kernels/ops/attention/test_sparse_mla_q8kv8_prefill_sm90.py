@@ -691,9 +691,7 @@ def test_sparse_mla_q8kv8_prefill_large_skv():
 )
 @pytest.mark.parametrize("s_q,topk", [(437, 2048), (7, 128), (65, 256), (4096, 2048)])
 def test_q8kv8_topk_length_backscan(s_q: int, topk: int):
-    from sglang.kernels.ops.kvcache.cache_ops import (
-        q8kv8_topk_length_from_indices,
-    )
+    from sglang.kernels.ops.attention.metadata import q8kv8_topk_length_from_indices
 
     generator = torch.Generator(device="cuda")
     generator.manual_seed(4000 + s_q + topk)

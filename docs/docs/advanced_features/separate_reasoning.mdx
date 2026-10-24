@@ -115,6 +115,8 @@ wait_for_server(f"http://localhost:{port}")
 
 Note that `--reasoning-parser` defines the parser used to interpret responses.
 
+To cap how many tokens the model spends thinking, see [Thinking Budget](/docs/advanced_features/thinking_budget).
+
 
 ### OpenAI Compatible API
 

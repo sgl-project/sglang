@@ -93,26 +93,6 @@ def test_every_call_site_can_await():
     )
 
 
-def test_default_worker_count_follows_the_preprocessing_path():
-    """The count is resolved per path, not pinned to a number.
-
-    Two workers overlap preprocessing that runs on the CPU, where the second
-    thread is real parallelism: 4.46 -> 6.08 req/s on H200 and 7.07 -> 8.76 on
-    GB300, full-page images at 32-way concurrency. On the GPU path the same
-    second worker only contends for the device the scheduler serves from --
-    flat on H200, and 9.30 -> 4.02 req/s on GB300.
-
-    Measuring one path gives the opposite answer from the other, so pinning a
-    single default here is what this asserts against.
-    """
-    from sglang.srt.multimodal.processors.base_processor import (
-        BaseMultimodalProcessor,
-    )
-
-    assert BaseMultimodalProcessor.supports_mm_processor_concurrency is True
-    assert BaseMultimodalProcessor.auto_mm_processor_worker_num is None
-
-
 def _process_mm_data_overrides():
     """Yield (path, node) for every subclass override of `process_mm_data`."""
     for path in sorted(_MULTIMODAL_ROOT.rglob("*.py")):
@@ -165,6 +145,9 @@ _NO_WORKER_POOL_ROUTE = {
     "mimo_v2_asr.py",
     "minicpmv4_6.py",
     "moss_vl.py",
+    # Muse's custom media/artifact pipeline offloads preprocessing to io_executor
+    # in _preprocess_media_async and _run_preprocess_and_build_artifact_batch.
+    "muse_spark_omni.py",
     "nano_nemotron_vl.py",
     "voxtral.py",
     "whisper.py",

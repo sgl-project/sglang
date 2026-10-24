@@ -16,6 +16,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.rust_server.multimodal import (  # noqa: E402
     RustMmProcessor,
     RustMmSpec,
@@ -107,8 +108,6 @@ class TestWrapEncoded(CustomTestCase):
         self.assertEqual(output.mm_items[0].feature[0, 0].item(), 99)
 
     def test_optional_pad_values_use_precomputed_hashes(self):
-        from sglang.srt.managers.schedule_batch import _compute_pad_value
-
         # The whole point of worker-precomputed hashes is that the scheduler
         # loop never runs hash_feature — make any call a hard failure.
         with (
@@ -119,10 +118,11 @@ class TestWrapEncoded(CustomTestCase):
             ),
         ):
             output, _ = self.build()
-        self.assertEqual(
-            [item.pad_value for item in output.mm_items],
-            [_compute_pad_value(101), _compute_pad_value(202)],
-        )
+        for item, item_hash in zip(output.mm_items, self.HASHES):
+            expected = MultimodalDataItem(modality=Modality.IMAGE, hash=item_hash)
+            expected.set_pad_value()
+            self.assertEqual(item.padding_values(), expected.padding_values())
+            self.assertEqual(len(item.padding_values()), 4)
 
 
 class FakeShmBuffer:

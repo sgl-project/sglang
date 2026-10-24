@@ -40,7 +40,14 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_xpu, next_power_of_2
+
+_is_xpu = is_xpu()
+
+if is_cuda() or is_hip():
+    from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
+elif not _is_xpu:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 # Sentinel for "no ancestor / not-yet-found child": any value >= n. Reductions use
 # n for min-searches (first child/sibling) and -1 for max-searches (parent).
@@ -150,4 +157,38 @@ def reconstruct_indices_from_tree_mask_triton(
         n,
         block_n,
         num_warps=_num_warps_for(block_n),
+    )
+
+
+def reconstruct_indices_from_tree_mask_func(
+    tree_mask: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    positions: torch.Tensor,  # mutable
+    retrieve_index: torch.Tensor,  # mutable
+    retrieve_next_token: torch.Tensor,  # mutable
+    retrieve_next_sibling: torch.Tensor,  # mutable
+    batch_size: int,
+    draft_token_num: int,
+) -> None:
+    if _is_xpu:
+        reconstruct_indices_from_tree_mask_triton(
+            tree_mask,
+            verified_seq_len,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            batch_size,
+            draft_token_num,
+        )
+        return
+    reconstruct_indices_from_tree_mask(
+        tree_mask,
+        verified_seq_len,
+        positions,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        batch_size,
+        draft_token_num,
     )

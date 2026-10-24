@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 
-# KDA-1.5 submission b4181149c8884ddb (https://github.com/radixark/KDA-1.5/pull/4);
-# source SHA256 4f9977f88abfea4393a2add3a2c9255699f7e13b981dbc1a976b024b3b00e909.
 """Shape-specialized Qwen3.8 packed QSA decode kernel for SM121."""
 
 from __future__ import annotations

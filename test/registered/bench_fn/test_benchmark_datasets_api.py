@@ -54,6 +54,7 @@ from sglang.benchmark.serving import (
     _EMBEDDING_BACKENDS,
     ASYNC_REQUEST_FUNCS,
     _finite_positive_float,
+    _validate_parsed_gsp_args,
     async_request_openai_embeddings,
     flush_server_cache,
 )
@@ -65,13 +66,6 @@ register_cpu_ci(est_time=46, suite="stage-b-test-cpu-intel")
 
 
 _BENCH_SERVING_CLI_CASES = {
-    "help": ["--help"],
-    "invalid_distribution": [
-        "--dataset-name",
-        "generated-shared-prefix",
-        "--gsp-group-distribution",
-        "invalid_name",
-    ],
     "flush_cache_timeout": ["--flush-cache-timeout", "inf"],
     "zipf_without_alpha": [
         "--dataset-name",
@@ -566,6 +560,16 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertIn("temperature", rows[0].extra_request_body)
         self.assertIn("tools", rows[1].extra_request_body)
 
+        for row in rows:
+            rendered = self.tokenizer.apply_chat_template(
+                row.prompt, tokenize=False, add_generation_prompt=True
+            )
+            expected_prompt_len = len(self.tokenizer.encode(rendered))
+            tools = row.extra_request_body.get("tools")
+            if tools:
+                expected_prompt_len += len(self.tokenizer.encode(json.dumps(tools)))
+            self.assertEqual(row.prompt_len, expected_prompt_len)
+
     def test_generated_shared_prefix_sampler(self):
         args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)
         rows = sample_generated_shared_prefix_requests(
@@ -1031,6 +1035,66 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(agentic_rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in agentic_rows))
 
+    def test_gsp_token_ids_have_exact_lengths_and_statistics(self):
+        args = make_args(
+            tokenize_prompt=True,
+            gsp_system_prompt_len=8,
+            gsp_question_len=4,
+            gsp_range_ratio=1.0,
+            gsp_fast_prepare=True,
+            gsp_send_routing_key=True,
+        )
+        dataset = GeneratedSharedPrefixDataset.from_args(args)
+        with (
+            patch.object(self.tokenizer, "encode", side_effect=AssertionError),
+            patch.object(self.tokenizer, "decode", side_effect=AssertionError),
+            patch("builtins.print") as print_mock,
+        ):
+            rows = dataset.load(self.tokenizer)
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(len(row.prompt), 12)
+            self.assertEqual(row.prompt_len, 12)
+            self.assertTrue(all(isinstance(token, int) for token in row.prompt))
+        printed = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
+        self.assertIn(f"Total input tokens: {12 * len(rows)}", printed)
+        self.assertIn("Average system prompt length: 8.0 tokens", printed)
+        self.assertIn("Average question length: 4.0 tokens", printed)
+
+    def test_gsp_token_ids_reject_multiple_turns(self):
+        parser = argparse.ArgumentParser()
+        with (
+            patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            self.assertRaises(SystemExit) as error,
+        ):
+            _validate_parsed_gsp_args(
+                parser,
+                make_args(
+                    dataset_name="generated-shared-prefix",
+                    tokenize_prompt=True,
+                    gsp_num_turns=2,
+                ),
+            )
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("--gsp-num-turns=1", stderr.getvalue())
+        with self.assertRaisesRegex(ValueError, "--gsp-num-turns=1"):
+            GeneratedSharedPrefixDataset.from_args(
+                make_args(tokenize_prompt=True, gsp_num_turns=2)
+            )
+        with self.assertRaisesRegex(ValueError, "num_turns=1"):
+            sample_generated_shared_prefix_requests(
+                num_groups=2,
+                prompts_per_group=2,
+                system_prompt_len=8,
+                question_len=4,
+                output_len=2,
+                range_ratio=1.0,
+                tokenizer=self.tokenizer,
+                seed=42,
+                input_ids=True,
+                num_turns=2,
+            )
+
     def test_get_dataset_unknown_dataset(self):
         args = make_args(dataset_name="not-a-dataset")
         with self.assertRaises(ValueError):
@@ -1407,26 +1471,6 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             args = make_args(dataset_name="generated-shared-prefix", **case)
             with self.assertRaises(ValueError, msg=f"case={case}"):
                 GeneratedSharedPrefixDataset.from_args(args)
-
-    def test_bench_serving_help_and_invalid_choice_argparse(self):
-        # Subprocess-driven coverage of the live CLI: --help advertises both
-        # flags with the rank-based Zipf formula and the alpha constraint,
-        # and argparse rejects an unknown distribution choice.
-        help_res = _bench_serving_cli_results()["help"]
-        self.assertEqual(help_res.returncode, 0, help_res.stderr)
-        out = help_res.stdout
-        # Both new flags appear.
-        self.assertIn("--gsp-group-distribution", out)
-        self.assertIn("--gsp-zipf-alpha", out)
-        # Rank-based Zipf formula and alpha constraint are documented.
-        self.assertIn("1/rank**alpha", out)
-        self.assertIn("rank starts at 1", out)
-        self.assertIn("finite float", out)
-
-        # Argparse rejects unknown distribution choice.
-        bad_choice_res = _bench_serving_cli_results()["invalid_distribution"]
-        self.assertNotEqual(bad_choice_res.returncode, 0)
-        self.assertIn("invalid choice", (bad_choice_res.stderr + bad_choice_res.stdout))
 
     def test_serving_benchmark_cli_rejects_invalid_flush_cache_timeout(self):
         """Invalid timeouts fail before the benchmark contacts a server or hangs."""

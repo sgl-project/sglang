@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
+
 
 def can_use_flux2_strided_qknorm_rope(q, k, q_weight, k_weight, cache) -> bool:
     if (
@@ -91,6 +93,7 @@ def _flux2_strided_qknorm_rope_kernel(
     tl.store(y_ptr + rows * 128 + dims, rotated, mask=rows < ROWS)
 
 
+@replay_launches
 def flux2_strided_qknorm_rope(
     q: torch.Tensor,
     k: torch.Tensor,

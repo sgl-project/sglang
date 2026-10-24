@@ -21,8 +21,8 @@ from sglang.kernels.ops.attention.dsa.indexer_k import (
     fused_k_indexer_norm_rope,
     fused_k_indexer_norm_rope_store,
 )
-from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
-from sglang.kernels.ops.attention.fused_store_index_cache import (
+from sglang.kernels.ops.attention.dsa.indexer_q import fused_q_indexer_rope_first_quant
+from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )

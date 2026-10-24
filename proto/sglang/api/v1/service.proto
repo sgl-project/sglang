@@ -1,0 +1,176 @@
+// The native SGLang gRPC service served by rust/sglang-server's tonic
+// transport, over the same api_core the HTTP endpoints use. Covers exactly the
+// surface the native server implements (the legacy sglang.runtime.v1 bridge's
+// embed/classify/tokenize RPCs have no native backend here and are not
+// carried over).
+
+syntax = "proto3";
+
+package sglang.api.v1;
+
+import "sglang/api/v1/generate.proto";
+import "sglang/api/v1/hicache.proto";
+import "sglang/json/v1/options.proto";
+
+service SglangService {
+  // `/generate`: always server-streaming (a unary request is a one-frame
+  // stream); per-batch-item failures ride the stream as GenerateStreamItem
+  // errors, pre-submit failures end the RPC with a gRPC status.
+  rpc Generate(GenerateRequest) returns (stream GenerateStreamItem);
+
+  // `/health_generate`: fires a 1-token probe and watches the response
+  // heartbeat. UNAVAILABLE on a stalled pipeline.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // `/get_model_info`: static model metadata, no scheduler round-trip.
+  rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
+
+  // `/server_info`: one control round-trip, shaped through the runtime-metric
+  // allowlist (never the raw server-args dump, which embeds keys).
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+
+  // `/hicache/storage-backend`: configuration snapshot and runtime attach/detach.
+  rpc GetHiCacheStorage(GetHiCacheStorageRequest) returns (HiCacheStatus);
+  rpc AttachHiCacheStorage(AttachHiCacheStorageRequest) returns (HiCacheStorageResponse);
+  rpc DetachHiCacheStorage(DetachHiCacheStorageRequest) returns (HiCacheStorageResponse);
+
+  // `/hicache/storage-backend/clear`: clear the storage backend's cached entries.
+  rpc ClearHiCacheStorage(ClearHiCacheStorageRequest) returns (HiCacheStorageResponse);
+  // The same static model cards as HTTP `/v1/models`.
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
+  // Decode token IDs locally, without running model inference.
+  rpc Detokenize(DetokenizeRequest) returns (DetokenizeResponse);
+
+  // Cancel by the native rid used by HTTP `/generate` or gRPC Generate, or
+  // cancel all active frontend generations with abort_all. HTTP chat/completion
+  // response IDs are not supported as rid selectors.
+  // Duplicate native IDs cancel all matching generations. A later reuse of the
+  // ID is unaffected. Internal control/detokenization requests are not targeted.
+  rpc Abort(AbortRequest) returns (AbortResponse);
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated ModelCard models = 1;
+}
+
+message ModelCard {
+  string id = 1;
+  string root = 2;
+  optional string parent = 3;
+  uint64 max_model_len = 4;
+}
+
+message DetokenizeRequest {
+  repeated int64 tokens = 1;
+}
+
+message DetokenizeResponse {
+  string text = 1;
+}
+
+message AbortRequest {
+  // Native generation rid (HTTP `/generate` or gRPC Generate), not an HTTP
+  // chat/completion response ID.
+  // Required and nonempty unless abort_all is true.
+  string rid = 1;
+  // When true, rid must be empty. Targets all frontend generations active at
+  // this call, including HTTP chat/completions.
+  bool abort_all = 2;
+}
+
+message AbortResponse {
+  // True if at least one active generation matched and cancellation was
+  // requested. Not an acknowledgement that the scheduler has stopped yet.
+  // False for an unknown/already-finished ID; repeated aborts are harmless.
+  bool success = 1;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+}
+
+message GetModelInfoRequest {}
+
+message GetModelInfoResponse {
+  string model_path = 1;
+  string served_model_name = 2;
+  string tokenizer_path = 3;
+  bool is_generation = 4;
+  // The launch-time `--preferred-sampling-params` object, or null when unset.
+  // JSON carries the object itself (the HTTP `/get_model_info` shape); the
+  // protobuf field holds it as JSON text.
+  optional string preferred_sampling_params = 5 [
+    (sglang.json.v1.field_json).raw_json = true,
+    (sglang.json.v1.field_json).emit_null_when_absent = true
+  ];
+  optional string weight_version = 6 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string load_format = 7 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string reasoning_parser = 8 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+  optional string tool_call_parser = 9 [(sglang.json.v1.field_json).emit_null_when_absent = true];
+}
+
+message GetServerInfoRequest {}
+
+message GetServerInfoResponse {
+  string model_path = 1;
+  string served_model_name = 2;
+  string tokenizer_path = 3;
+  uint32 max_context_length = 4;
+  optional uint64 max_total_num_tokens = 5;
+  string version = 6;
+  // The allowlisted runtime metrics (last_gen_throughput, memory_usage,
+  // effective_max_running_requests_per_dp, avg_spec_accept_length,
+  // step_time_dict), untyped because the scheduler owns their shapes; JSON
+  // passes them through verbatim.
+  repeated string internal_states = 7 [(sglang.json.v1.field_json).raw_json = true];
+
+  // Public serving endpoint configuration.
+  string host = 8;
+  uint32 port = 9;
+  bool incremental_streaming_output = 10;
+  string disaggregation_mode = 11;
+
+  // Distributed deployment metadata required by out-of-process orchestrators.
+  DeploymentInfo deployment_info = 12;
+}
+
+message DeploymentInfo {
+  // Distributed process topology.
+  optional uint32 disaggregation_bootstrap_port = 1;
+  uint32 node_rank = 2;
+  uint32 nnodes = 3;
+  uint32 dp_size = 4;
+  optional uint32 dp_rank = 5;
+  optional string dist_init_addr = 6;
+  uint32 base_gpu_id = 7;
+  optional uint32 page_size = 8;
+  uint32 dcp_size = 9;
+
+  // Request scheduling and execution limits.
+  optional uint64 max_running_requests = 10;
+  uint64 max_prefill_tokens = 11;
+  bool enable_dp_attention = 12;
+  optional string speculative_algorithm = 13;
+
+  // Hierarchical KV-cache configuration.
+  bool enable_hierarchical_cache = 14;
+  optional double hicache_ratio = 15;
+  uint64 hicache_size = 16;
+  optional string hicache_write_policy = 17;
+  optional uint64 hicache_host_total_tokens = 18;
+
+  // KV-cache event streams published by this deployment.
+  repeated KvEventSource kv_event_sources = 19;
+}
+
+message KvEventSource {
+  uint32 dp_rank = 1;
+  string endpoint = 2;
+  string topic = 3;
+  uint32 block_size = 4;
+}

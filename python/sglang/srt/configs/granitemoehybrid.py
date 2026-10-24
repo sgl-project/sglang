@@ -272,8 +272,7 @@ class GraniteMoeHybridConfig(PretrainedConfig):
             **kwargs,
         )
 
-        # HF's `PreTrainedConfig.validate_layer_type` rewrites layer_types to
-        # transformers >= 5.15 schema, so map them back afterwards.
+        # `PreTrainedConfig` rewrites legacy layer_types on init, so map them back.
         self.layer_types = _to_sglang_layer_types(self.layer_types)
 
     @property

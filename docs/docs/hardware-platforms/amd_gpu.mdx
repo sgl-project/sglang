@@ -45,7 +45,7 @@ You can install SGLang using one of the methods below.
 
 ```bash Command
 # Use the last release branch
-git clone -b v0.5.18 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.21 https://github.com/sgl-project/sglang.git
 cd sglang
 
 # Compile sgl-kernel
@@ -194,3 +194,36 @@ drun -p 30000:30000 \
 ### Warmup Step
 
 When the server displays `The server is fired up and ready to roll!`, it means the startup is successful.
+
+## Strix Halo / gfx1151 (RDNA3.5 iGPU)
+
+AMD Ryzen AI MAX+ / Strix Halo (`gfx1151`) and Strix Point (`gfx1150`) are wave32 RDNA3.5 iGPUs. They are **not** covered by the Instinct/CDNA `rocm.Dockerfile` image. Use the dedicated gfx1151 image instead.
+
+**Official image tag pattern** (nightly on Docker Hub [`rocm/sgl-dev`](https://hub.docker.com/r/rocm/sgl-dev/tags)):
+
+```bash
+rocm/sgl-dev:*-gfx1151*
+# example: rocm/sgl-dev:v0.5.20-rocm724-gfx1151-20260924
+```
+
+The image sets `SGLANG_USE_AITER=0` (see `docker/rocm-gfx1151.Dockerfile`). AITER kernels are CDNA/wave64-oriented and are unsafe as defaults on gfx115x.
+
+**Host requirements**: expose `/dev/kfd` and `/dev/dri`, and add the container to the `video` and `render` groups. Strix Halo has no discrete VRAM — the GPU carves memory from system RAM (configure GTT / BIOS aperture as needed on the host).
+
+```bash
+docker run -it --rm \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add video --group-add render \
+  --security-opt seccomp=unconfined \
+  --ipc=host --shm-size 16g \
+  -p 30000:30000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  rocm/sgl-dev:v0.5.20-rocm724-gfx1151-20260924 \
+  bash
+```
+
+**Serving defaults on gfx1151**:
+
+- LLM / SRT: `--attention-backend triton` (or rely on the gfx115 auto-default), `--num-gpus 1`
+- Diffusion / DiT (e.g. Wan2.2): `--attention-backend torch_sdpa`, `--num-gpus 1`
+- Keep `SGLANG_USE_AITER=0` (already set in the official image)

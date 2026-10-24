@@ -138,9 +138,10 @@ class SpeculativeAlgorithm(Enum):
     def supports_prefill_shared_read_done(self) -> bool:
         """Whether target EXTEND has no later speculative shared-buffer reader.
 
-        The backend must still declare a pre-replay read end. Other algorithms
-        must stage their draft's shared reads before publishing the target event.
+        The backend must still declare a pre-replay read end.
         """
+        # DSPARK's draft KV inject runs after the target prefill, but on write
+        # locations it computes before the target forward.
         return self.is_none() or self.is_dflash_family()
 
     def supports_mixed_chunk(self) -> bool:
@@ -410,6 +411,11 @@ class SpecInput(ABC):
     dsa_topk_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
+
+    # A multi-step draft's per-step sliding-window read rail; only the
+    # multi-step draft backend of a sliding-window KV pool builds it.
+    window_kv_indptr: Optional[torch.Tensor] = None
+    window_kv_indices: Optional[torch.Tensor] = None
 
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type

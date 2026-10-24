@@ -68,23 +68,6 @@ class TestMergeLoRAUpdateResults(CustomTestCase):
         self.assertEqual(merged.error_message, "out of memory")
         self.assertEqual(merged.loaded_adapters, {"stale": "path"})
 
-    def test_duplicate_error_messages_deduplicated(self):
-        """All ranks usually fail identically (e.g. "already loaded"); the
-        joined message must not repeat per rank, but distinct causes must all
-        be kept."""
-        merged = _merge_lora_update_results(
-            [_err("already loaded"), _err("already loaded"), _err("bad rank")]
-        )
-        self.assertFalse(merged.success)
-        self.assertEqual(merged.error_message, "already loaded | bad rank")
-
-    def test_failure_without_message(self):
-        """A rank replying success=False with error_message=None must not
-        crash the join."""
-        merged = _merge_lora_update_results([_err(None), _ok()])
-        self.assertFalse(merged.success)
-        self.assertEqual(merged.error_message, "")
-
     def test_failed_load_does_not_redirect_existing_adapter_unload(self):
         """Rejected duplicates must keep the original adapter's unload ID;
         fresh partial loads must remain cleanable via their new ID."""

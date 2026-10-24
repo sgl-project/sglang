@@ -81,21 +81,19 @@ def pad_qwen_prompt_kwargs(
             out["encoder_attention_mask"], dim=1, source=seq, target=bucket
         )
 
-    freqs_cis = out.get("freqs_cis")
-    if isinstance(freqs_cis, tuple) and len(freqs_cis) == 2:
-        img_cache, txt_cache = freqs_cis
-        txt_cache = bcg_utils.pad_nested_dim(
-            txt_cache, dim=0, source=seq, target=bucket
-        )
-        out["freqs_cis"] = (img_cache, txt_cache)
-    elif isinstance(freqs_cis, list) and len(freqs_cis) == 2:
-        img_cache, txt_cache = freqs_cis
-        txt_cache = bcg_utils.pad_nested_dim(
-            txt_cache, dim=0, source=seq, target=bucket
-        )
-        out["freqs_cis"] = [img_cache, txt_cache]
+    # the real and the complex RoPE caches both carry the text length on dim 0
+    for key in ("freqs_cis", "freqs_complex"):
+        freqs = out.get(key)
+        if isinstance(freqs, (tuple, list)) and len(freqs) == 2:
+            img_cache, txt_cache = freqs
+            txt_cache = bcg_utils.pad_nested_dim(
+                txt_cache, dim=0, source=seq, target=bucket
+            )
+            out[key] = type(freqs)((img_cache, txt_cache))
 
-    out["txt_seq_lens"] = bcg_utils.bucket_txt_seq_lens(out.get("txt_seq_lens"), bucket)
+    # the mask alone marks the valid text: a bucketed length would make the
+    # eager forward of a missed graph attend the pad rows
+    out["txt_seq_lens"] = None
     return out
 
 

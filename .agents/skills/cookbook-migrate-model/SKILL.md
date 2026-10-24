@@ -118,7 +118,7 @@ that **changes other parts of the command** (TP, mem) must (the Playground
 can't do coupled changes), and so does a toggle the legacy page itself labels
 with operating-point words — e.g. a `dpattention` radio whose options are
 subtitled "Low Latency" / "High Throughput" (GLM-5.1 / Kimi-K2.6 pattern) —
-even when its flags are uncoupled (`--dp N --enable-dp-attention` is a pure
+even when its flags are uncoupled (`--attn-dp-size N` is a pure
 flag add). Any other toggle that only adds/removes its own flags becomes a
 Playground axis with the flags baked into cells when the legacy default was
 ON — EXCEPT parsers:

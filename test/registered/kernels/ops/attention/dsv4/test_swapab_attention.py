@@ -4,12 +4,12 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.elementwise import fused_rope_inplace
+from sglang.kernels.ops.attention.dsv4.norm_rope import fused_rope_inplace
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # backend-specific: the HIP swap-AB Gluon kernel runs on gfx950.
 register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
@@ -49,6 +49,8 @@ def make_cache(page, pages=11):
 
 
 def reference(q, values, ids, lengths, sink, extra=None):
+    heads = q.shape[-2]
+
     def gather(vals, idx, lens):
         idx = idx[:, 0]
         valid = (idx >= 0) & (idx < vals.shape[0])
@@ -63,7 +65,7 @@ def reference(q, values, ids, lengths, sink, extra=None):
     scores = q[:, 0].double() @ kv.transpose(1, 2) * 512**-0.5
     scores.masked_fill_(~valid[:, None, :], -torch.inf)
     scores = torch.cat(
-        (scores, sink[None, :16, None].double().expand(q.shape[0], -1, -1)), -1
+        (scores, sink[None, :heads, None].double().expand(q.shape[0], -1, -1)), -1
     )
     prob = torch.nan_to_num(torch.softmax(scores, -1)[..., :-1])
     return prob @ kv
@@ -75,12 +77,12 @@ def reference(q, values, ids, lengths, sink, extra=None):
     "requires Blackwell SM100/SM103 or AMD gfx950",
 )
 class TestSwapABAttention(CustomTestCase):
-    def check_case(self, b, page, nk, ne, graph=False):
+    def check_case(self, b, page, nk, ne, graph=False, heads=16):
         torch.manual_seed(20260915 + b + nk + ne)
         storage = torch.full(
             (b, 1, 64, 512), float("nan"), device="cuda", dtype=torch.bfloat16
         )
-        q = storage[:, :, :16]
+        q = storage[:, :, :heads]
         q.copy_(torch.randn_like(q) * 0.5)
         raw, kv, values = make_cache(page)
         extra_raw, extra_kv, extra_values = make_cache(16)
@@ -98,15 +100,16 @@ class TestSwapABAttention(CustomTestCase):
         )
         ei = ei_storage[..., :ne]
         lengths = torch.tensor(
-            [0, 1, 31, 63, 64, nk - 1, nk, nk + 3][:b], device="cuda", dtype=torch.int32
-        )
+            [0, 1, 31, 63, 64, nk - 1, nk, nk + 3] * 5, device="cuda", dtype=torch.int32
+        )[:b]
         el = torch.tensor(
-            [ne, ne // 2, 1, 0, 63, ne - 1, 65, ne][:b],
+            [ne, ne // 2, 1, 0, 63, ne - 1, 65, ne] * 5,
             device="cuda",
             dtype=torch.int32,
-        )
+        )[:b]
         sink = torch.randn(64, device="cuda")
-        sink[0], sink[1], sink[2] = -torch.inf, torch.inf, 20.0
+        for h0 in range(0, heads, 16):
+            sink[h0], sink[h0 + 1], sink[h0 + 2] = -torch.inf, torch.inf, 20.0
         originals = [x.clone() for x in (raw, extra_raw, ids, ei, q, lengths, el, sink)]
 
         def candidate():
@@ -221,6 +224,23 @@ class TestSwapABAttention(CustomTestCase):
 
     def test_dynamic_graph_replay(self):
         self.check_case(6, 64, 192, 512, graph=True)
+
+    @unittest.skipIf(is_hip(), "the gfx950 kernel keeps the 16-head contract")
+    def test_tp2_head_groups(self):
+        """TP2's 32 local heads run as two 16-head groups; each group must read
+        its own query heads and sinks and write its own output rows."""
+        for case in ((1, 1, 1, 0), (5, 16, 133, 0), (8, 128, 192, 1024)):
+            with self.subTest(case=case):
+                self.check_case(*case, heads=32)
+        self.check_case(6, 64, 192, 512, graph=True, heads=32)
+
+    @unittest.skipIf(is_hip(), "the gfx950 kernel keeps the 8-row cap")
+    def test_rows_up_to_cap(self):
+        """SM100 admits up to 40 rows: DSpark verify at TP4 bs <= 8."""
+        for case in ((20, 16, 133, 0), (40, 128, 192, 1024)):
+            with self.subTest(case=case):
+                self.check_case(*case)
+        self.check_case(40, 64, 192, 512, graph=True)
 
 
 if __name__ == "__main__":

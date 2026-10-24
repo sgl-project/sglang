@@ -73,6 +73,7 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
             and config.use_parallel_decode
             and config.use_parallel_tiling
             and bool(arch.vae_parallel_tiling),
+            stack_tiling=config.stack_tiling,
             tile_size=int(arch.vae_tile_size),
             tile_overlap_min=int(arch.vae_tile_overlap_min),
             encoder_parallel=False,

@@ -48,6 +48,7 @@ class JoyEchoMultishotSetupStage(PipelineStage):
             logger.info("JoyEcho memory bank reset for new multi-shot session")
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        batch.extra["retain_decoded_frames"] = batch.enable_memory_bank
         if not batch.enable_memory_bank:
             return batch
 

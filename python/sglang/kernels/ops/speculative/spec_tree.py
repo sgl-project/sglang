@@ -11,8 +11,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+from enum import IntEnum
+
+import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_musa, is_npu, is_xpu
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_musa = is_musa()
+_is_npu = is_npu()
+_is_xpu = is_xpu()
+_is_cpu = is_cpu()
+
+if _is_cuda or _is_hip:
+    from sglang.kernels.ops.speculative.tree import (
+        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
+    )
+elif _is_musa:
+    from sgl_kernel import (
+        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
+    )
+elif _is_cpu:
+    from sgl_kernel import (
+        build_tree_kernel_efficient_cpu as sgl_build_tree_kernel_efficient_cpu,
+    )
+    from sgl_kernel import verify_tree_greedy_cpu as sgl_verify_tree_greedy_cpu
+
+
+class TreeMaskMode(IntEnum):
+    FULL_MASK = 0
+    QLEN_ONLY = 1
+    QLEN_ONLY_BITPACKING = 2
 
 
 @triton.jit
@@ -279,3 +311,232 @@ def verify_tree_greedy_kernel_triton(
         target_predict_ptr + target_row * num_draft_tokens + target_col
     )
     tl.store(predicts_ptr + last_accept_retrieve_idx, final_target)
+
+
+def sgl_build_tree_kernel_triton(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    topk: int,
+    depth: int,
+    draft_token_num: int,
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
+):
+    """Triton-based implementation."""
+    # TODO: Add support for QLEN_ONLY_BITPACKING mode
+    if tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
+        raise NotImplementedError(
+            "QLEN_ONLY_BITPACKING is not supported in Triton implementation"
+        )
+
+    batch_size = verified_seq_len.shape[0]
+    seq_len_prefix_sum = torch.cumsum(verified_seq_len, dim=0) - verified_seq_len
+
+    # Launch kernel with one program per batch item
+    grid = (batch_size,)
+
+    sgl_build_tree_kernel_efficient_triton[grid](
+        parent_list,
+        selected_index,
+        verified_seq_len,
+        seq_len_prefix_sum,
+        tree_mask,
+        positions,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        topk=topk,
+        depth=depth,
+        draft_token_num=draft_token_num,
+        tree_mask_mode=int(tree_mask_mode),
+        batch_size=batch_size,
+        parent_list_stride=(
+            parent_list.stride(0) if parent_list.dim() > 1 else parent_list.shape[0]
+        ),
+        selected_index_stride=selected_index.stride(0),
+    )
+
+
+def build_tree_kernel_efficient_func(
+    parent_list: torch.Tensor,
+    top_scores_index: torch.Tensor,
+    seq_lens: torch.Tensor,
+    tree_mask: torch.Tensor,  # mutable
+    positions: torch.Tensor,  # mutable
+    retrieve_index: torch.Tensor,  # mutable
+    retrieve_next_token: torch.Tensor,  # mutable
+    retrieve_next_sibling: torch.Tensor,  # mutable
+    topk: int,
+    spec_steps: int,
+    num_verify_tokens: int,
+    tree_mask_mode: TreeMaskMode,
+) -> None:
+    if _is_npu:
+        torch.ops.npu.build_tree_kernel_efficient(
+            parent_list.to(dtype=torch.int64),
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
+    elif _is_xpu:
+        sgl_build_tree_kernel_triton(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
+    elif _is_cpu:
+        sgl_build_tree_kernel_efficient_cpu(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
+    else:
+        sgl_build_tree_kernel_efficient(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
+
+
+def verify_tree_greedy_triton(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+):
+    """Triton-based implementation."""
+    batch_size = candidates.shape[0]
+    num_speculative_tokens = accept_index.shape[1]
+    num_draft_tokens = candidates.shape[1]
+
+    # Launch kernel with one program per batch item
+    grid = (batch_size,)
+
+    verify_tree_greedy_kernel_triton[grid](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        target_predict,
+        batch_size=batch_size,
+        num_speculative_tokens=num_speculative_tokens,
+        num_draft_tokens=num_draft_tokens,
+    )
+
+
+def verify_tree_greedy_func(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    target_predict: torch.Tensor,
+    topk: int = -1,
+):
+    if _is_cuda or _is_hip or _is_musa:
+        if _is_cuda or _is_hip:
+            from sglang.kernels.ops.speculative.tree import verify_tree_greedy
+        else:
+            from sgl_kernel import verify_tree_greedy
+
+        verify_tree_greedy(
+            predicts=predicts,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=accept_token_num,  # mutable
+            candidates=candidates,
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
+
+    elif _is_cpu:
+        sgl_verify_tree_greedy_cpu(
+            predicts=predicts,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=accept_token_num,  # mutable
+            candidates=candidates,
+            # kwarg LHS retained as `retrive_*` to match the CUDA op schema, so
+            # the CPU/CUDA call sites stay grep-symmetric.
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
+
+    elif _is_npu:
+        from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
+
+        verify_tree_greedy(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
+    elif _is_xpu:
+        verify_tree_greedy_triton(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            target_predict=target_predict,
+        )
+    return predicts, accept_index, accept_token_num

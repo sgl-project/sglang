@@ -187,6 +187,61 @@ class TestFusedRMSFP8GroupQuant(CustomTestCase):
                 self.assertEqual(repaired.data_ptr(), scale_transposed.data_ptr())
                 self.assertEqual(materialized.data_ptr(), scale_transposed.data_ptr())
 
+    def test_transposed_scale_preserves_fused_rms_outputs(self):
+        from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+
+        for res1_enabled, output_unquantized in itertools.product(
+            (False, True), repeat=2
+        ):
+            with self.subTest(
+                res1_enabled=res1_enabled,
+                output_unquantized=output_unquantized,
+            ):
+                torch.manual_seed(0)
+                m, k = 8, 1024
+                x1 = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+                x2 = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+                weight1 = torch.ones(k, dtype=torch.float32, device="cuda")
+                weight2 = torch.ones(k, dtype=torch.float32, device="cuda")
+                res1 = (
+                    torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+                    if res1_enabled
+                    else None
+                )
+                kwargs = dict(
+                    inp2=x2,
+                    inp2_weight=weight2,
+                    inp2_epsilon=1e-6,
+                    group_size=128,
+                    dtype_quant=torch.float8_e4m3fn,
+                    res1=res1,
+                    output_unquantized_inp1=output_unquantized,
+                )
+
+                row_major = fused_rms_fp8_group_quant(
+                    x1, weight1, 1e-6, transpose_scale=False, **kwargs
+                )
+                transposed = fused_rms_fp8_group_quant(
+                    x1, weight1, 1e-6, transpose_scale=True, **kwargs
+                )
+
+                (q_row_major, scale_row_major), *row_side_outputs = row_major
+                (q_transposed, scale_transposed), *transposed_side_outputs = transposed
+                repaired = view_aiter_fused_rms_transposed_fp8_scale(scale_transposed)
+                materialized = materialize_bpreshuffle_fp8_scale(scale_row_major)
+
+                torch.testing.assert_close(q_transposed, q_row_major, rtol=0, atol=0)
+                torch.testing.assert_close(repaired, materialized, rtol=0, atol=0)
+                for actual, expected in zip(
+                    transposed_side_outputs, row_side_outputs, strict=True
+                ):
+                    if actual is None or expected is None:
+                        self.assertIs(actual, expected)
+                    else:
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                self.assertEqual(repaired.stride(), (1, m))
+                self.assertEqual(repaired.data_ptr(), scale_transposed.data_ptr())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

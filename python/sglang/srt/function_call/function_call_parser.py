@@ -59,6 +59,7 @@ from sglang.srt.function_call.utils import (
     _get_tool_schema_defs,
     get_json_schema_constraint,
 )
+from sglang.srt.parser.response_template import ResponseTemplateToolDetector
 
 logger = logging.getLogger(__name__)
 
@@ -115,10 +116,16 @@ class FunctionCallParser:
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
         "iquest_q1": IQuestQ1Detector,
+        "response_template": ResponseTemplateToolDetector,
     }
 
     def __init__(
-        self, tools: List[Tool], tool_call_parser: str, tokenizer=None, tool_choice=None
+        self,
+        tools: List[Tool],
+        tool_call_parser: str,
+        tokenizer=None,
+        tool_choice=None,
+        prefix: str = "",
     ):
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
@@ -127,6 +134,8 @@ class FunctionCallParser:
                 sig = inspect.signature(detector_class)
                 if "tokenizer" in sig.parameters:
                     kwargs["tokenizer"] = tokenizer
+            if prefix and issubclass(detector_class, ResponseTemplateToolDetector):
+                kwargs["prefix"] = prefix
             detector = detector_class(**kwargs)
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
@@ -297,6 +306,12 @@ class FunctionCallParser:
             any(tool.function.strict for tool in self.tools)
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
+        if isinstance(self.detector, ResponseTemplateToolDetector):
+            self.detector.validate_structure_constraint_request(
+                tool_choice,
+                parallel_tool_calls,
+                should_constrain_auto,
+            )
 
         try:
             if (

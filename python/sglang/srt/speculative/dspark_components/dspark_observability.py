@@ -12,11 +12,13 @@ from typing import Callable, ContextManager, Iterator, Optional, Union
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dflash import (
+    compute_dflash_correct_drafts_and_bonus,
+)
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.speculative.dflash_utils import compute_dflash_correct_drafts_and_bonus
 from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator import (
     create_block_accept_estimate_recorder,
 )
@@ -193,9 +195,10 @@ class DsparkInfoDumper:
         self._pending: Optional[_PendingStep] = None
         self._prev_stamp: Optional[float] = None
 
-        self._d2h_stream: Optional[torch.cuda.Stream] = None
+        self._device_module = torch.get_device_module(device)
+        self._d2h_stream = None
         if self.enabled and InfoComponent.REQS in self._components:
-            self._d2h_stream = torch.cuda.Stream(device=device)
+            self._d2h_stream = self._device_module.Stream(device=device)
 
         self._current_segments: dict[
             InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]
@@ -303,7 +306,7 @@ class DsparkInfoDumper:
         return False
 
     def _open_segment(self, segment: InfoSegment) -> None:
-        start = torch.cuda.Event(enable_timing=True)
+        start = self._device_module.Event(enable_timing=True)
         start.record()
         self._open_segments[segment] = start
 
@@ -311,7 +314,7 @@ class DsparkInfoDumper:
         start = self._open_segments.pop(segment, None)
         if start is None:
             return
-        end = torch.cuda.Event(enable_timing=True)
+        end = self._device_module.Event(enable_timing=True)
         end.record()
         self._current_segments[segment] = (start, end)
 
@@ -824,6 +827,7 @@ class DsparkStepObservers:
         target_logits: Optional[torch.Tensor],
         layout,
         confidence: Optional[torch.Tensor],
+        confidence_raw: Optional[torch.Tensor],
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
         draft_block,
@@ -838,20 +842,20 @@ class DsparkStepObservers:
         dp_tier_num_tokens: Optional[int],
     ) -> None:
         planner = self._planner
-        if not proposal_folded:
-            self._maybe_record_sts_collect(
-                verify_ids_2d=verify_ids_2d,
-                target_logits=target_logits,
-                bs=bs,
-            )
-            self._confidence_probe.maybe_observe(
-                carries_confidence=planner.carries_confidence,
-                is_compact_mode=planner.is_compact_mode,
-                confidence_raw=planner.last_confidence_raw,
-                verify_ids_2d=verify_ids_2d,
-                target_logits=target_logits,
-                bs=bs,
-            )
+        self._maybe_record_sts_collect(
+            confidence_raw=confidence_raw,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=target_logits,
+            bs=bs,
+        )
+        self._confidence_probe.maybe_observe(
+            carries_confidence=planner.carries_confidence,
+            is_compact_mode=planner.is_compact_mode,
+            confidence_raw=confidence_raw,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=target_logits,
+            bs=bs,
+        )
         if self._block_accept_recorder is not None and not proposal_folded:
             self._block_accept_recorder.observe_verify_step(
                 forward_ct=forward_ct,
@@ -929,15 +933,13 @@ class DsparkStepObservers:
     def _maybe_record_sts_collect(
         self,
         *,
+        confidence_raw: Optional[torch.Tensor],
         verify_ids_2d: torch.Tensor,
         target_logits: Optional[torch.Tensor],
         bs: int,
     ) -> None:
         if not self._sts_collect_path:
             return
-        if not self._planner.carries_confidence:
-            return
-        confidence_raw = self._planner.last_confidence_raw
         if confidence_raw is None:
             return
         if self._sts_recorder is None:

@@ -12,10 +12,11 @@ from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.attention import attn_res
 from sglang.kernels.ops.communication import all_reduce_residual as all_reduce
 from sglang.kernels.ops.communication import (
+    attn_res_collective,
     gemm_ag,
     sp_collective,
 )
-from sglang.kernels.ops.communication.mp import register_comm_cleanup
+from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
@@ -73,7 +74,7 @@ def _init_comm():
         raise RuntimeError("Kimi K3 collectives require multicast symmetric memory")
     all_reduce.register_comm(comm.obj)
     sp_collective.register_comm(comm.obj)
-    attn_res.register_comm(comm.obj)
+    attn_res_collective.register_comm(comm.obj)
     register_comm_cleanup(comm)
     return comm
 
@@ -285,7 +286,7 @@ def test_attention_residual_direct_all_gather():
     )
 
     output, handle, multicast_ptr = _symmetric_tensor(tuple(full_reference.shape))
-    attn_res.attn_res_fused_direct_ag(
+    attn_res_collective.attn_res_fused_direct_ag(
         comm.world_size,
         prefix,
         bank,

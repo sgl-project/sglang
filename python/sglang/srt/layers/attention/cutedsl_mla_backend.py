@@ -21,28 +21,37 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
+)
 from sglang.kernels.ops.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
     mla_quantize_without_rope_for_fp8,
 )
+from sglang.kernels.ops.quantization.fp8_quantize import fp8_quantize
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.mem_cache.layout.paged_view import paged_row_view
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
 
 if is_flashinfer_available():
     import flashinfer
+    import flashinfer.rope as _flashinfer_rope
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +184,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             assert q_rope is not None and k_rope is not None
             if cos_sin_cache is None:
                 if save_kv_cache and self._fused_set_kv_concat_q_fp8:
-                    loc = self._resolve_fused_write_loc(forward_batch)
+                    loc = forward_batch.out_cache_loc
                     if loc is not None:
                         query = self._set_kv_and_concat_q_fp8_fused(
                             layer=layer,
@@ -206,7 +215,10 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         if query is None and save_kv_cache:
             assert k is not None and k_rope is not None
             self.token_to_kv_pool.set_mla_kv_buffer(
-                layer, self._kv_write_loc(forward_batch), k, k_rope
+                layer,
+                KVWriteLoc.for_batch(forward_batch),
+                k,
+                k_rope,
             )
 
         if query is not None:
@@ -226,7 +238,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             query = query.unsqueeze(1)
 
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_cache = paged_row_view(k_cache, self.page_size).unsqueeze(1)
 
         metadata = (
             getattr(forward_batch, "decode_trtllm_mla_metadata", None)
@@ -291,3 +303,139 @@ class CuteDslMLAMultiStepDraftBackend(TRTLLMMLAMultiStepDraftBackend):
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
             )
+
+
+class CuteDslMLAPrefillBackend(TRTLLMMLABackend):
+    """trtllm_mla prefill for cutedsl_mla deployments with FP8 KV.
+
+    The model-side MHA hooks below build FP8 Q/K/V with fused RoPE + quantize
+    and write the FP8 KV cache directly, so the ragged prefill kernel consumes
+    them without the per-tensor casts of the BF16 path.
+    """
+
+    @staticmethod
+    def _fused_rope_fp8_quantize(
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        cos_sin_cache: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        is_neox: bool,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused RoPE + FP8 quantize that also packs nope+pe along the last
+        dim, so FMHA consumes contig FP8 Q/K without an extra concat or cast.
+
+        ``cos_sin_cache`` is None for NoPE layers (``skip_rope``); they keep the
+        FP8 quantize and the packed layout, only the rotation is dropped.
+        """
+        num_heads = q_nope.shape[1]
+        seq_len = q_nope.shape[0]
+        q_fp8 = torch.empty(
+            (seq_len, num_heads, qk_nope_head_dim + qk_rope_head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=q_nope.device,
+        )
+        k_fp8 = torch.empty(
+            (seq_len, num_heads, qk_nope_head_dim + qk_rope_head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=k_nope.device,
+        )
+        if seq_len == 0:
+            return q_fp8, k_fp8
+
+        # Broadcast the shared latent k_pe across heads — RoPE is position-only
+        # so per-head outputs are identical, and the cache write below reuses
+        # head 0.
+        if k_pe.dim() == 3 and k_pe.shape[1] == 1:
+            k_pe_expanded = k_pe.expand(-1, num_heads, -1)
+        else:
+            k_pe_expanded = k_pe
+
+        if cos_sin_cache is None:
+            # NoPE layer: quantize straight into the packed buffers.
+            q_fp8[..., :qk_nope_head_dim].copy_(q_nope)
+            q_fp8[..., qk_nope_head_dim:].copy_(q_pe)
+            k_fp8[..., :qk_nope_head_dim].copy_(k_nope)
+            k_fp8[..., qk_nope_head_dim:].copy_(k_pe_expanded)
+            return q_fp8, k_fp8
+
+        _flashinfer_rope.mla_rope_quantize_fp8(
+            q_rope=q_pe,
+            k_rope=k_pe_expanded,
+            q_nope=q_nope,
+            k_nope=k_nope,
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=positions,
+            is_neox=is_neox,
+            quantize_dtype=torch.float8_e4m3fn,
+            q_rope_out=q_fp8[..., qk_nope_head_dim:],
+            k_rope_out=k_fp8[..., qk_nope_head_dim:],
+            q_nope_out=q_fp8[..., :qk_nope_head_dim],
+            k_nope_out=k_fp8[..., :qk_nope_head_dim],
+            quant_scale_q=1.0,
+            quant_scale_kv=1.0,
+            enable_pdl=is_arch_support_pdl(),
+        )
+        return q_fp8, k_fp8
+
+    def prepare_prefill_qkv(
+        self,
+        *,
+        q: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_a: torch.Tensor,
+        k_pe: torch.Tensor,
+        positions: torch.Tensor,
+        layer: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build FP8 (Q, K, V) for the FMHA kernel and write FP8 KV cache."""
+        kv = layer.kv_b_proj(kv_a)[0]
+        kv = kv.view(
+            -1, layer.num_local_heads, layer.qk_nope_head_dim + layer.v_head_dim
+        )
+        k_nope = kv[..., : layer.qk_nope_head_dim]
+        v_bf16 = kv[..., layer.qk_nope_head_dim :]
+        q_nope = q[..., : layer.qk_nope_head_dim]
+
+        rotary_emb = layer.rotary_emb
+        q_fp8, k_fp8 = self._fused_rope_fp8_quantize(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            cos_sin_cache=None if rotary_emb is None else rotary_emb.cos_sin_cache,
+            positions=positions,
+            is_neox=True if rotary_emb is None else rotary_emb.is_neox_style,
+            qk_nope_head_dim=layer.qk_nope_head_dim,
+            qk_rope_head_dim=layer.qk_rope_head_dim,
+        )
+        v_fp8 = fp8_quantize(v_bf16, enable_pdl=is_arch_support_pdl())
+
+        # k_pe is shared across heads (RoPE is position-only), so head 0
+        # reproduces the original [tokens, 1, qk_rope] latent layout.
+        kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=is_arch_support_pdl())
+        k_pe_fp8 = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
+        self.token_to_kv_pool.set_mla_kv_buffer(
+            layer.attn_mha,
+            KVWriteLoc.for_batch(forward_batch),
+            kv_a_fp8.unsqueeze(1),
+            k_pe_fp8,
+        )
+        return q_fp8, k_fp8, v_fp8
+
+    def pack_prefix_chunk_kv(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pack strided ``k_nope``+``k_pe`` into contig FP8 K and quantize
+        strided ``v`` into contig FP8 V in a single kernel.
+        """
+        return mla_kv_pack_quantize_fp8(
+            k_nope, k_pe, v, enable_pdl=is_arch_support_pdl()
+        )

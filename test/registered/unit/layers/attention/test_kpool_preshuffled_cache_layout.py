@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.kernels.ops.attention.dsa.index_buf_accessor import SetKAndS, _is_fp8_fnuz
+from sglang.kernels.ops.kvcache.dsa_index_k_cache import SetKAndS, _is_fp8_fnuz
 from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
     INDEX_HEAD_DIM,
     gather_index_k_scale_prefix_into,
@@ -24,7 +24,7 @@ class TestKpoolPreshuffledCacheLayout(CustomTestCase):
         """A layout mismatch between the two writers never raises; it silently
         returns the wrong top-k."""
         torch.manual_seed(0)
-        pool = SimpleNamespace(page_size=PAGE_SIZE)
+        pool = SimpleNamespace(page_size=4 * PAGE_SIZE, index_page_size=PAGE_SIZE)
         num_pages, seq_len = 2, PAGE_SIZE + 5
         buf = torch.zeros(
             num_pages,

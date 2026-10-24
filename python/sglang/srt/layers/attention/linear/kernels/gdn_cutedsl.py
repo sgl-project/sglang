@@ -4,7 +4,7 @@ Decode path uses the existing ``cutedsl_fused_sigmoid_gating_delta_rule_update``
 (works on SM90+).
 
 Prefill (extend) path uses the ported vLLM SM100 chunkwise kernel
-(``chunk_gated_delta_rule_cutedsl``). Requires SM100+ and ``head_k_dim == 128``.
+(``chunk_gated_delta_rule_cutedsl``). Requires SM10x and ``head_k_dim == 128``.
 """
 
 import logging
@@ -22,12 +22,15 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 logger = logging.getLogger(__name__)
 
 
-def _is_blackwell() -> bool:
-    """True iff running on SM100+ (Blackwell) where the ported kernel is valid."""
+def _is_sm10x() -> bool:
+    """True iff running on SM10x, the only arch with the tcgen05/TMEM the kernel uses.
+
+    SM120 (desktop Blackwell) lacks tcgen05 despite its larger capability number.
+    """
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability()
-    return major >= 10
+    return major == 10
 
 
 class CuteDSLGDNKernel(LinearAttnKernelBase):
@@ -35,15 +38,15 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
 
     Decode: ``cutedsl_fused_sigmoid_gating_delta_rule_update`` (SM90+).
     Extend (prefill): chunkwise ``chunk_gated_delta_rule_cutedsl``
-    (SM100+ only, ``head_k_dim`` must be 128). On SM90 the prefill path is
+    (SM10x only, ``head_k_dim`` must be 128). Elsewhere the prefill path is
     unsupported; callers should query :attr:`supports_prefill` and fall back
     to another backend (e.g. Triton).
     """
 
     def __init__(self):
-        # The Blackwell extend kernel uses tcgen05/TMA-bulk-swizzle features
-        # that don't exist on SM90. The decode kernel does work on SM90+.
-        self.supports_prefill = _is_blackwell()
+        # The extend kernel uses tcgen05/TMA-bulk-swizzle features that exist
+        # only on SM10x. The decode kernel does work on SM90+.
+        self.supports_prefill = _is_sm10x()
 
         # Heavy CuteDSL imports are deferred to extend() so SM90 boxes can
         # still construct the kernel just for decode.
@@ -61,7 +64,7 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
                 else -1
             )
             raise RuntimeError(
-                f"CuTe DSL GDN prefill requires SM100+ (Blackwell); got SM{major}."
+                f"CuTe DSL GDN prefill requires SM10x (tcgen05); got SM{major}."
             )
         if head_k_dim != 128:
             raise RuntimeError(

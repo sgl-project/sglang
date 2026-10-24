@@ -94,6 +94,7 @@ def _run_sgl_eval(
     chat_template_kwargs: Optional[dict] = None,
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
     accept_length_thres: Optional[float] = None,
 ):
     """Shared sgl-eval driver for the MMLU sanity gate and the GSM8K ``sgl_eval`` backend.
@@ -118,6 +119,7 @@ def _run_sgl_eval(
         num_threads=num_threads,
         max_tokens=max_tokens,
         temperature=temperature,
+        top_p=top_p,
         chat_template_kwargs=(
             chat_template_kwargs
             if chat_template_kwargs is not None
@@ -176,7 +178,7 @@ class GSM8KMixin:
     gsm8k_backend: str = "run_eval"  # "run_eval" | "sgl_eval"
     gsm8k_thinking: bool = False  # sgl_eval backend
     gsm8k_max_tokens: Optional[int] = None  # sgl_eval backend
-    # None keeps run_eval's greedy default; set both to route the run through
+    # None keeps the backend's default; set both to route the run through
     # the sampling path.
     gsm8k_temperature: Optional[float] = None
     gsm8k_top_p: Optional[float] = None
@@ -200,6 +202,8 @@ class GSM8KMixin:
                 num_threads=self.gsm8k_num_threads,
                 thinking=self.gsm8k_thinking,
                 max_tokens=self.gsm8k_max_tokens,
+                temperature=self.gsm8k_temperature,
+                top_p=self.gsm8k_top_p,
                 accept_length_thres=self.gsm8k_accept_length_thres,
             )
         else:

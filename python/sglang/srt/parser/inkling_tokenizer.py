@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any
-
 END_OF_TEXT = "<|endoftext|>"
 MESSAGE_USER = "<|message_user|>"
 MESSAGE_MODEL = "<|message_model|>"
@@ -56,50 +52,3 @@ INKLING_CONTROL_TOKENS: frozenset[str] = frozenset(
         "<|model_trigger_generation|>",
     }
 )
-
-INKLING_SPECIAL_TOKEN_NAMES: dict[str, str] = {
-    token.removeprefix("<|").removesuffix("|>"): token
-    for token in INKLING_SPECIAL_TOKENS
-}
-
-ROLE_MESSAGE_TOKENS: dict[str, str] = {
-    "user": MESSAGE_USER,
-    "assistant": MESSAGE_MODEL,
-    "system": MESSAGE_SYSTEM,
-    "tool": MESSAGE_TOOL,
-}
-
-
-def normalize_special_token(token: str) -> str:
-    """Accept either message_user or <|message_user|> spellings."""
-    if token in INKLING_SPECIAL_TOKENS:
-        return token
-    try:
-        return INKLING_SPECIAL_TOKEN_NAMES[token]
-    except KeyError as exc:
-        raise KeyError(f"unknown Inkling special token: {token!r}") from exc
-
-
-@dataclass(frozen=True)
-class InklingTokenizer:
-    """Small wrapper around a base text tokenizer plus Inkling framing IDs.
-
-    Plain text is encoded by the base tokenizer, while the minimal chat
-    framing tokens are inserted from the fixed overlay map.
-    """
-
-    tokenizer: Any
-    special_token_ids: Mapping[str, int] | None = None
-
-    def encode_text(self, text: str) -> list[int]:
-        if not isinstance(text, str):
-            raise TypeError(f"text must be str, got {type(text).__name__}")
-        return list(self.tokenizer.encode(text, add_special_tokens=False))
-
-    def encode_special(self, token: str) -> int:
-        special = normalize_special_token(token)
-        token_ids = self.special_token_ids or INKLING_SPECIAL_TOKEN_IDS
-        return int(token_ids[special])
-
-    def decode(self, token_ids: list[int]) -> str:
-        return self.tokenizer.decode(token_ids)

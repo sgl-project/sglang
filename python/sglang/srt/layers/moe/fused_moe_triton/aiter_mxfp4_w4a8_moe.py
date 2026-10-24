@@ -16,7 +16,10 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
+import triton
 
 _TDM_DISABLED = False
 
@@ -47,10 +50,84 @@ def _import_aiter_w4a8():
         _TDM_DISABLED = True
 
     return (
-        _routing_mod.routing,
+        _routing_mod,
         moe_gemm_a8w4,
         downcast_to_static_fp8,
     )
+
+
+def build_ep_expert_map(
+    num_experts: int, num_local_experts: int, ep_rank: int, device
+) -> torch.Tensor:
+    """Global expert id -> local expert id (-1 for experts owned by another
+    rank), in the form ``ep_sort_routing`` expects: one entry longer than the
+    global expert count."""
+    expert_map = torch.full((num_experts + 1,), -1, dtype=torch.int32, device=device)
+    start = ep_rank * num_local_experts
+    expert_map[start : start + num_local_experts] = torch.arange(
+        num_local_experts, dtype=torch.int32, device=device
+    )
+    return expert_map
+
+
+def _ep_routing(
+    routing_mod,
+    router_logits: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    expert_map: torch.Tensor,
+    num_local_experts: int,
+):
+    """Routing for one expert-parallel rank from the GLOBAL router logits.
+
+    Every rank sees all tokens (standard dispatcher); gates routed to experts
+    owned by other ranks land in a sentinel bin that no GEMM block is scheduled
+    for, and are excluded from the GEMM2 reduction via ``gate_valid``. The
+    partial outputs are summed across ranks by the layer's all-reduce.
+    """
+    num_tokens, n_expts_tot = router_logits.shape
+    n_gates = num_tokens * topk
+    device = router_logits.device
+
+    if renormalize:
+        vals, topk_ids = torch.topk(router_logits, topk, dim=-1)
+        topk_weights = torch.softmax(vals.float(), dim=-1)
+    else:
+        probs = torch.softmax(router_logits.float(), dim=-1)
+        topk_weights, topk_ids = torch.topk(probs, topk, dim=-1)
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+    topk_weights = topk_weights.contiguous()
+
+    # Same block_m heuristic as ``routing()``, keyed off the GLOBAL expert count.
+    tokens_per_expt = max(1, n_gates // n_expts_tot)
+    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    expt_data_bufs = routing_mod._compute_expt_data_internal(
+        num_local_experts, n_gates, block_m, device
+    )
+    token_offs_raw, token_offs_pad, block_pid_map = expt_data_bufs[:3]
+    num_local_tokens = torch.full((1,), num_tokens, dtype=torch.int32, device=device)
+
+    hist_full, gather_idx, scatter_idx, gate_scal, gate_valid, _ = (
+        routing_mod.ep_sort_routing(
+            topk_weights,
+            topk_ids,
+            expert_map,
+            num_local_experts,
+            num_local_tokens,
+            num_tokens,
+            topk,
+            n_gates,
+            expt_data_bufs,
+        )
+    )
+    hist = hist_full[:num_local_experts]
+    expt_data = routing_mod.ExptData(
+        hist, token_offs_raw, token_offs_pad, block_pid_map
+    )
+    routing_data = routing_mod.RoutingData(
+        block_m, gate_scal, hist, num_local_experts, topk, expt_data
+    )
+    return routing_data, gather_idx, scatter_idx, gate_valid
 
 
 def _interleave_gate_up(t: torch.Tensor) -> torch.Tensor:
@@ -131,6 +208,8 @@ def aiter_w4a8_gfx1250_forward(
     gemm1_limit: float,
     renormalize: bool = True,
     apply_router_weight_on_input: bool = False,
+    expert_map: Optional[torch.Tensor] = None,
+    num_local_experts: Optional[int] = None,
 ) -> torch.Tensor:
     """MXFP4 W4A8 GPT-OSS MoE forward for gfx1250 via aiter triton
     ``moe_gemm_a8w4``.
@@ -146,21 +225,39 @@ def aiter_w4a8_gfx1250_forward(
             "aiter triton W4A8 MoE (moe_gemm_a8w4) is required for the gfx1250 "
             "GPT-OSS MXFP4 path but was not found in the installed aiter build."
         )
-    routing, moe_gemm_a8w4, downcast_to_static_fp8 = imported
+    routing_mod, moe_gemm_a8w4, downcast_to_static_fp8 = imported
 
     assert hidden_states.dtype == torch.bfloat16
 
-    # aiter routing on the raw router logits. renormalize=True (GPT-OSS)
-    # corresponds to applying softmax to the top-k selection inside the kernel
-    # (sm_first=False).
-    routing_data, gather_idx, scatter_idx = routing(
-        router_logits, topk, sm_first=not renormalize
-    )
+    if hidden_states.shape[0] == 0:
+        return hidden_states.new_empty(hidden_states.shape)
+
+    if expert_map is not None:
+        routing_data, gather_idx, scatter_idx, gate_valid = _ep_routing(
+            routing_mod,
+            router_logits,
+            topk,
+            renormalize,
+            expert_map,
+            num_local_experts,
+        )
+    else:
+        # aiter routing on the raw router logits. renormalize=True (GPT-OSS)
+        # corresponds to applying softmax to the top-k selection inside the
+        # kernel (sm_first=False).
+        routing_data, gather_idx, scatter_idx = routing_mod.routing(
+            router_logits, topk, sm_first=not renormalize
+        )
+        gate_valid = None
     gammas = routing_data.gate_scal
 
     # gfx1250: the in-kernel gather is broken, so we pass gather_indx=None to
     # moe_gemm_a8w4 and perform the gather ourselves.
     gather_src = gather_idx.to(torch.long) // topk
+    if expert_map is not None:
+        # Rows past the local experts (sentinel bin) are left unwritten by
+        # ep_sort_routing and never consumed by the GEMMs.
+        gather_src = gather_src.clamp_(0, hidden_states.shape[0] - 1)
     x = hidden_states[gather_src]
     if apply_router_weight_on_input:
         # Router weights must be applied in bf16 before quantization.
@@ -205,6 +302,7 @@ def aiter_w4a8_gfx1250_forward(
         gammas=None if apply_router_weight_on_input else gammas,
         swizzle_mx_scale=None,
         out_dtype=torch.bfloat16,
+        gate_valid=gate_valid,
     )
 
     return intermediate_cache3.contiguous()

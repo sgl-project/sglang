@@ -134,6 +134,7 @@ class CanaryManager:
         )
         self._health_checker = KernelRunCounterHealthChecker(
             config=config,
+            is_draft_runner=is_eagle_draft_decode,
             device_state=self._device_state,
             active_tags=self._active_tags,
             outer_step_counter_getter=self._get_outer_step_counter,

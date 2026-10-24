@@ -783,11 +783,18 @@ class PerformanceValidator:
             and math.isfinite(expected_load_ms)
             and expected_load_ms > 0
         ), "Load baseline missing or invalid"
+        # Startup time swings with the runner's page-cache state far more than
+        # request latency does, so a profile may give it its own tolerance.
+        load_tolerance = (
+            self.tolerances.load
+            if self.tolerances.load is not None
+            else self.tolerances.e2e
+        )
         self._assert_le(
             "Load Latency (excluding warmup)",
             load_ms,
             expected_load_ms,
-            self._timing_tol(self.tolerances.e2e),
+            self._timing_tol(load_tolerance),
         )
 
     def _validate_denoise_agg(self, summary: PerformanceSummary) -> None:

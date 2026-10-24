@@ -7,16 +7,13 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-    HybridCacheController,
-)
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import _split_hicache_size
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
-from sglang.srt.mem_cache.pool_host.group import PoolEntry
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
 
@@ -74,133 +71,70 @@ class TestHostGateCapacity(unittest.TestCase):
         self.assertEqual(full.schedulable_available_size(), before)
 
 
-class TestSwaLoadAllocation(unittest.TestCase):
-    def _controller(self, bind, free=None, evict=None):
-        controller = object.__new__(HybridCacheController)
-        entry = PoolEntry(
-            name=PoolName.SWA,
-            host_pool=SimpleNamespace(),
-            device_pool=SimpleNamespace(),
-            layer_mapper=lambda i: i,
-            device_indices_from_anchor_fn=bind,
-            device_free_fn=free or Mock(),
-            device_evict_fn=evict,
-        )
-        controller.mem_pool_host = SimpleNamespace(entry_map={PoolName.SWA: entry})
-        return controller
-
-    def _transfer(self, parts, count):
-        transfer = PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(count))
-        transfer.anchor_index_parts = parts
-        return transfer
-
-    def test_swa_only_load_uses_resident_full_ids(self):
-        bind = Mock(side_effect=lambda x: x + 100)
-        controller = self._controller(bind)
-        transfer = self._transfer([torch.tensor([13, 14])], 2)
-        result = controller._resolve_device_transfers(
-            [transfer], torch.empty(0, dtype=torch.int64)
-        )
-        self.assertIsNotNone(result)
-        torch.testing.assert_close(transfer.device_indices, torch.tensor([113, 114]))
-
-    def test_mixed_load_skips_resident_swa_nodes(self):
-        bind = Mock(side_effect=lambda x: x + 100)
-        controller = self._controller(bind)
-        transfer = self._transfer([torch.tensor([13, 14]), slice(2, 4)], 4)
-        controller._resolve_device_transfers(
-            [transfer], torch.tensor([20, 21, 22, 23, 24, 25])
-        )
-        torch.testing.assert_close(
-            transfer.device_indices, torch.tensor([113, 114, 122, 123])
-        )
-
-    def test_binding_retries_after_eviction(self):
-        bind = Mock(side_effect=[None, torch.tensor([41, 42])])
-        evict = Mock()
-        controller = self._controller(bind, evict=evict)
-        transfer = self._transfer([slice(0, 2)], 2)
-        self.assertIsNotNone(
-            controller._resolve_device_transfers([transfer], torch.tensor([11, 12]))
-        )
-        evict.assert_called_once_with(2)
-        self.assertEqual(bind.call_count, 2)
-
-    def test_rollback_releases_swa_binding_by_virtual_ids(self):
-        free = Mock()
-        controller = self._controller(lambda x: x + 100, free=free)
-        transfer = self._transfer([torch.tensor([13, 14])], 2)
-        # A missing sidecar source fails after SWA has bound its pages.
-        sidecar = PoolTransfer(name=PoolName.MAMBA, indices_from_pool=PoolName.INDEXER)
-        result = controller._resolve_device_transfers(
-            [transfer, sidecar], torch.empty(0, dtype=torch.int64)
-        )
-        self.assertIsNone(result)
-        torch.testing.assert_close(free.call_args.args[0], torch.tensor([13, 14]))
-        self.assertIsNone(transfer.device_indices)
-
-    def test_independent_allocations_precede_kernel_id_resolution(self):
-        events = []
-        controller = self._controller(lambda x: events.append("bind") or x + 100)
-        controller.mem_pool_host.entry_map[PoolName.MAMBA] = PoolEntry(
-            name=PoolName.MAMBA,
-            host_pool=SimpleNamespace(),
-            device_pool=SimpleNamespace(),
-            layer_mapper=lambda i: i,
-            device_alloc_fn=lambda n: events.append("mamba") or torch.arange(n),
-            device_free_fn=Mock(),
-        )
-        swa = self._transfer([slice(0, 2)], 2)
-        mamba = PoolTransfer(name=PoolName.MAMBA, host_indices=torch.arange(1))
-        self.assertIsNotNone(
-            controller._resolve_device_transfers([swa, mamba], torch.tensor([10, 11]))
-        )
-        self.assertEqual(events, ["mamba", "bind"])
-
-    def test_tree_spec_preserves_node_correspondence(self):
-        kv = PoolTransfer(
-            name=PoolName.KV, host_indices=torch.arange(4), nodes_to_load=[2, 3]
-        )
-        swa = PoolTransfer(
-            name=PoolName.SWA, host_indices=torch.arange(4), nodes_to_load=[1, 3]
-        )
-        nodes = {
-            i: SimpleNamespace(
-                id=i,
-                key=[i, i],
-                load_back_pending_id=None,
-                component_data={
-                    ComponentType.FULL: SimpleNamespace(
-                        value=torch.tensor([10, 11]) if i == 1 else None
-                    )
-                },
-            )
-            for i in (1, 2, 3)
-        }
-        full_component = SimpleNamespace(
-            component_type=ComponentType.FULL,
-            build_hicache_transfers=lambda *a, **k: [kv],
-        )
-        swa_component = SimpleNamespace(
-            component_type=ComponentType.SWA,
-            build_hicache_transfers=lambda *a, **k: [swa],
-        )
-        core = SimpleNamespace(
-            node_by_id=nodes.__getitem__,
-            components=[full_component, swa_component],
-            components_by_type={
-                ComponentType.FULL: full_component,
-                ComponentType.SWA: swa_component,
-            },
-        )
-        UnifiedTreeCore.build_load_back_spec(core, 3)
-        parts = swa.anchor_index_parts
-        torch.testing.assert_close(parts[0], torch.tensor([10, 11]))
-        self.assertEqual(parts[1], slice(2, 4))
-
-
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestTransferStreamOrdering(unittest.TestCase):
+    def test_write_back_drain_waits_for_forward_before_copying_queued_nodes(self):
+        from sglang.srt.managers.cache_controller import (
+            CacheOperation,
+            HiCacheController,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        values = torch.full((8,), -1, dtype=torch.int64, device="cuda")
+        expected = torch.arange(8, dtype=torch.int64, device="cuda")
+        copied = torch.empty(8, dtype=torch.int64, pin_memory=True)
+        forward = torch.cuda.Stream()
+        engine = L2TransferEngine("kernel")
+        host = SimpleNamespace(
+            prepare_transfer_indices=lambda h, d, backend: (h, d),
+            backup_from_device_all_layer_physical=lambda pool, h, d, backend: (
+                copied.copy_(values[d], non_blocking=True)
+            ),
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.write_fence_stream = forward
+        controller.l2_transfer_engine = engine
+        controller.mem_pool_device_allocator = Mock()
+        controller.ack_write_queue = []
+        # A tick's queued backup and the eviction victim share one drain.
+        controller.write_queue = [
+            CacheOperation(torch.arange(4), torch.arange(4, device="cuda"), 1),
+            CacheOperation(torch.arange(4, 8), torch.arange(4, 8, device="cuda"), 2),
+        ]
+        controller._move_write_operation = lambda op: (
+            op.host_indices,
+            op.device_indices,
+            op.pool_transfers,
+        )
+        controller._l2_transfers = lambda h, d, extra: [
+            L2Transfer(host, SimpleNamespace(), h, d)
+        ]
+        controller._num_tokens_by_pool = lambda op: {}
+        controller._transfer_num_bytes = lambda op: 64
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.cache_controller = controller
+        cache.ongoing_write_through = {1: None, 2: None}
+        cache._finish_write_through_ack = cache.ongoing_write_through.pop
+        cache.metrics_collector = None
+        # Warm up temporary allocations so cudaMalloc cannot hide a missing fence.
+        operations = list(controller.write_queue)
+        cache.writing_check(write_back=True)
+        controller.write_queue = operations
+        cache.ongoing_write_through.update({1: None, 2: None})
+        torch.cuda.synchronize()
+
+        with torch.cuda.stream(forward):
+            torch.cuda._sleep(100_000_000)
+            values.copy_(expected)
+        try:
+            cache.writing_check(write_back=True)
+            self.assertTrue(torch.equal(copied, torch.arange(8)))
+            self.assertEqual(controller.write_queue, [])
+            self.assertEqual(controller.ack_write_queue, [])
+            self.assertEqual(cache.ongoing_write_through, {})
+        finally:
+            forward.synchronize()
+
     def test_load_translation_follows_supplied_start_event(self):
         # The start event precedes translation; transfer must wait for both.
         engine = L2TransferEngine("kernel")
@@ -253,6 +187,7 @@ class TestSwaBackupAfterCompaction(unittest.TestCase):
         )
         component = SimpleNamespace(
             component_type=ComponentType.SWA,
+            pool_name=PoolName.SWA,
             tree_core=SimpleNamespace(has_swa_host_pool=True),
             _collect_unbacked_swa_nodes=lambda n: [n],
             _unified_allocator=lambda: object(),
@@ -286,19 +221,25 @@ class TestDirectBackendTranslation(unittest.TestCase):
         torch.testing.assert_close(result, torch.tensor([6, 9]))
 
 
-class TestTriPoolAssembly(unittest.TestCase):
+class TestTriPoolAssembly(CustomTestCase):
     def test_swa_allocation_and_rollback_match_pool_id_ownership(self):
+        from sglang.srt.mem_cache.allocator.unified_sub_pool import (
+            MultiEndedAllocator,
+        )
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 
         for unified in (False, True):
             with self.subTest(unified=unified):
-                swa_allocator = SimpleNamespace(alloc=Mock(), free=Mock())
-                composite = SimpleNamespace(
-                    swa_attn_allocator=swa_allocator,
-                    bind_swa_for_loaded_rows=Mock(),
-                    free_swa=Mock(),
+                # Unified memory always builds a MultiEndedAllocator SWA end.
+                swa_allocator = (
+                    object.__new__(MultiEndedAllocator)
+                    if unified
+                    else SimpleNamespace(alloc=Mock(), free=Mock())
                 )
+                composite = SimpleNamespace(swa_attn_allocator=swa_allocator)
                 params = SimpleNamespace(
+                    mtp_draft_device_pools=(),
+                    mtp_draft_mamba_pools=(),
                     token_to_kv_pool_allocator=composite,
                     req_to_token_pool=SimpleNamespace(
                         mamba_allocator=SimpleNamespace(alloc=Mock(), free=Mock())
@@ -312,17 +253,29 @@ class TestTriPoolAssembly(unittest.TestCase):
                         assembler, "_get_allocator_type", return_value="default"
                     ),
                     patch.object(assembler, "build_kv_host_pool", return_value=host),
-                    patch.object(assembler, "MambaPoolHost", return_value=host),
+                    patch.object(assembler, "build_mamba_host_pool", return_value=host),
                     patch.object(assembler, "HybridCacheController"),
                 ):
                     group, _ = assembler.build_hybrid_mamba_swa_stack(
                         params=params,
                         full_kv_pool=object(),
                         swa_kv_pool=object(),
-                        mamba_pool=object(),
+                        mamba_pool=SimpleNamespace(
+                            get_device_pool_infos=lambda: (
+                                DevicePoolInfo(
+                                    pool_name=PoolName.MAMBA,
+                                    indices_from_pool=PoolName.MAMBA,
+                                    layer_ids=(2,),
+                                    buffer_info=MambaStateBufferInfo(
+                                        temporal=torch.zeros(1, 2, 1),
+                                        conv=(torch.zeros(1, 2, 1),),
+                                    ),
+                                ),
+                            )
+                        ),
                         full_layer_mapping={0: 0},
                         swa_layer_mapping={1: 0},
-                        mamba_layer_mapping={2: 0},
+                        start_layer=0,
                         page_size=1,
                         tp_group=None,
                         load_cache_event=None,
@@ -330,16 +283,15 @@ class TestTriPoolAssembly(unittest.TestCase):
                     )
                 entry = group.entry_map[PoolName.SWA]
                 if unified:
-                    self.assertIs(
-                        entry.device_indices_from_anchor_fn,
-                        composite.bind_swa_for_loaded_rows,
+                    self.assertEqual(
+                        entry.device_alloc_fn, swa_allocator.alloc_physical
                     )
-                    self.assertIs(entry.device_free_fn, composite.free_swa)
-                    self.assertIsNone(entry.device_alloc_fn)
+                    self.assertEqual(
+                        entry.device_free_fn, swa_allocator.cancel_physical_reservation
+                    )
                 else:
                     self.assertIs(entry.device_alloc_fn, swa_allocator.alloc)
                     self.assertIs(entry.device_free_fn, swa_allocator.free)
-                    self.assertIsNone(entry.device_indices_from_anchor_fn)
 
 
 if __name__ == "__main__":

@@ -363,6 +363,7 @@ def chunk_gated_delta_rule_fwd_h(
     inplace_update: bool = True,
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
+    chunk_offsets: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert not (use_exp2 and g is not None), (
         "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
@@ -386,11 +387,11 @@ def chunk_gated_delta_rule_fwd_h(
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
     else:
-        N, NT, chunk_offsets = (
-            len(cu_seqlens) - 1,
-            len(chunk_indices),
-            prepare_chunk_offsets(cu_seqlens, BT),
-        )
+        # A caller-built chunk_offsets (CUDA-graph capture) must not go through
+        # prepare_chunk_offsets: its tensor_cache would replay capture-time values.
+        N, NT = len(cu_seqlens) - 1, len(chunk_indices)
+        if chunk_offsets is None:
+            chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
     h = k.new_empty(B, NT, H, V, K)

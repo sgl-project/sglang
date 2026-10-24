@@ -55,7 +55,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.kernels.ops.diffusion.common.numerics import (
+from sglang.kernels.numerics import (
     mul_rn_f32,
     round_bf16_to_fp32,
     rsqrt_approx_f32,
@@ -155,59 +155,83 @@ def _threads_per_row(hidden: int) -> int | None:
     return tpr
 
 
-def _is_row_broadcast(t: torch.Tensor, x: torch.Tensor) -> bool:
+def _is_row_broadcast(t: torch.Tensor, shape: tuple, device: torch.device) -> bool:
     return (
         t.dtype is torch.bfloat16
-        and t.is_cuda
-        and t.device == x.device
-        and t.shape == (x.shape[0], 1, x.shape[-1])
+        and t.device == device
+        and t.shape == shape
         and t.is_contiguous()
     )
 
 
-def can_use_fused_rmsnorm_scale_shift(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    shift: torch.Tensor,
+def can_use_fused_rmsnorm_modulation(
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
 ) -> bool:
-    return (
-        # ROCm cannot compile the inline PTX above: LLVM makes the unusable
-        # `=f` constraint a fatal error that kills the process, so reject
-        # before the first launch rather than rely on the caller's fallback.
-        is_cuda()
-        and x.dtype is torch.bfloat16
+    """Whether this kernel can serve ``x`` with this ``scale``/``shift``.
+
+    The launcher raises on everything it cannot serve, which is the right
+    answer for a caller that has already committed. A request-gated caller has
+    not: a fast path that meets an input it cannot handle has to fall back,
+    not fail the request. So it asks here first, and this mirrors exactly what
+    :func:`_validate_rmsnorm_modulate` checks about ``x`` and the modulation
+    rows -- a dtype-and-width check alone leaves the layout of ``scale`` and
+    ``shift`` to chance.
+    """
+    if not (
+        can_use_fused_rmsnorm_scale_shift(x.dtype, x.shape[-1])
         and x.is_cuda
-        and x.dim() == 3
+        and x.ndim == 3
         and x.is_contiguous()
-        and _threads_per_row(x.shape[-1]) is not None
-        and weight.dtype is torch.bfloat16
-        and weight.is_cuda
-        and weight.device == x.device
-        and weight.shape == (x.shape[-1],)
-        and weight.is_contiguous()
-        and _is_row_broadcast(scale, x)
-        and _is_row_broadcast(shift, x)
+    ):
+        return False
+    row_shape = (x.shape[0], 1, x.shape[-1])
+    return _is_row_broadcast(scale, row_shape, x.device) and _is_row_broadcast(
+        shift, row_shape, x.device
     )
 
 
-def can_use_fused_scale_residual_rmsnorm_scale_shift(
-    residual: torch.Tensor,
-    update: torch.Tensor,
-    gate: torch.Tensor,
-    weight: torch.Tensor,
-    scale: torch.Tensor,
-    shift: torch.Tensor,
-) -> bool:
+def can_use_fused_rmsnorm_scale_shift(dtype: torch.dtype, hidden: int) -> bool:
+    """Select the BF16 FlashInfer reduction replicated by this kernel."""
     return (
-        can_use_fused_rmsnorm_scale_shift(residual, weight, scale, shift)
-        and update.dtype is torch.bfloat16
-        and update.is_cuda
-        and update.device == residual.device
-        and update.shape == residual.shape
-        and update.is_contiguous()
-        and _is_row_broadcast(gate, residual)
+        is_cuda() and dtype is torch.bfloat16 and _threads_per_row(hidden) is not None
     )
+
+
+def _validate_rmsnorm_modulate(x, weight, scale, shift) -> tuple[int, int, int, int]:
+    shape = x.shape
+    if not (
+        is_cuda()
+        and x.is_cuda
+        and x.dtype is torch.bfloat16
+        and len(shape) == 3
+        and x.is_contiguous()
+    ):
+        raise RuntimeError(
+            "RMSNorm modulation expects contiguous BF16 CUDA [B, S, D], D in (2048, 4096)"
+        )
+    batch, seq_len, hidden = shape
+    tpr = _threads_per_row(hidden)
+    if tpr is None:
+        raise RuntimeError("RMSNorm modulation requires D in (2048, 4096)")
+    device = x.device
+    if not (
+        weight.dtype is torch.bfloat16
+        and weight.device == device
+        and weight.shape == (hidden,)
+        and weight.is_contiguous()
+    ):
+        raise RuntimeError(
+            "weight must be a contiguous [D] vector matching x's dtype/device"
+        )
+    row_shape = (batch, 1, hidden)
+    if not (
+        _is_row_broadcast(scale, row_shape, device)
+        and _is_row_broadcast(shift, row_shape, device)
+    ):
+        raise RuntimeError(
+            "scale and shift must be contiguous [B, 1, D] tensors matching x's dtype/device"
+        )
+    return batch, seq_len, hidden, tpr
 
 
 def _fake_norm_scale_shift(
@@ -233,8 +257,7 @@ def fused_rmsnorm_scale_shift_bitexact(
     eps: float,
 ) -> torch.Tensor:
     """``norm(x) * (1 + scale) + shift``, bit-exact vs the eager chain."""
-    batch, seq_len, hidden = x.shape
-    tpr = _threads_per_row(hidden)
+    batch, seq_len, hidden, tpr = _validate_rmsnorm_modulate(x, weight, scale, shift)
     out = torch.empty_like(x)
     with torch.cuda.device(x.device):
         _rmsnorm_scale_shift_kernel[(batch * seq_len,)](
@@ -291,8 +314,19 @@ def fused_scale_residual_rmsnorm_scale_shift_bitexact(
     Returns ``(modulated, res)``, both bit-exact vs the eager pair + norm
     chain (and therefore vs the ``residual_gate_add_cuda`` fast path).
     """
-    batch, seq_len, hidden = residual.shape
-    tpr = _threads_per_row(hidden)
+    batch, seq_len, hidden, tpr = _validate_rmsnorm_modulate(
+        residual, weight, scale, shift
+    )
+    if not (
+        update.dtype == residual.dtype
+        and update.device == residual.device
+        and update.shape == residual.shape
+        and update.is_contiguous()
+        and _is_row_broadcast(gate, (batch, 1, hidden), residual.device)
+    ):
+        raise RuntimeError(
+            "update must match residual; gate must be contiguous [B, 1, D] with the same dtype/device"
+        )
     out = torch.empty_like(residual)
     res_out = torch.empty_like(residual)
     with torch.cuda.device(residual.device):
