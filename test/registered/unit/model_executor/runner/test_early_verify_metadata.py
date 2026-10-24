@@ -3,7 +3,7 @@ graph staged on a side stream beside the draft graph (waiting only for the head)
 the runner gating that keeps every other configuration and variant on the main path."""
 
 import sys
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -200,6 +200,7 @@ class _Metadata:
     def __init__(self, page_table):
         # As the real full build: the SWA write locations are left to the in-graph op.
         self.core_attn_metadata = _Core(page_table, None)
+        self.q_mega_pad_buffer = None
 
     def copy_(self, other):
         self.core_attn_metadata.copy_(other.core_attn_metadata)
@@ -211,10 +212,11 @@ def _building_backend():
         assert graph_backed
         return _Metadata(raw_metadata.clone())
 
-    return SimpleNamespace(
+    backend = SimpleNamespace(
         builds_verify_metadata_early=True,
         cuda_graph_metadata_of_bucket_and_bs={_GraphBucket.TARGET_VERIFY: {}},
         _early_verify_metadata_ids=set(),
+        _last_kept_metadata=None,
         low_ratios=(1, 2),
         make_forward_metadata_from_raw_verify=build,
         online_c128_mtp=SimpleNamespace(state_slot_offset=lambda: 0),
@@ -224,6 +226,10 @@ def _building_backend():
             translate_loc_from_full_to_swa=lambda loc: loc + 1000,
         ),
     )
+    backend._share_q_mega_pad_buffer = MethodType(
+        DeepseekV4AttnBackend._share_q_mega_pad_buffer, backend
+    )
+    return backend
 
 
 def test_every_capture_and_replay_writes_the_first_captured_early_object(monkeypatch):
@@ -258,6 +264,29 @@ def test_every_capture_and_replay_writes_the_first_captured_early_object(monkeyp
     # The verify graphs read the captured write locations by address.
     assert captured.core_attn_metadata.swa_out_cache_loc is swa
     assert swa.tolist() == [1007, 1008]
+
+
+def test_early_verify_graphs_share_one_packed_query_buffer(monkeypatch):
+    """Each early verify graph keeps its metadata for the server's lifetime, so a
+    graph captured later must take the MegaAttention packed-query buffer of the one
+    captured before it instead of holding a buffer of its own."""
+    monkeypatch.setattr(
+        capture_mode, "_capture_attention_variant", DSV41_CANDIDATE_UNFILTERED
+    )
+    backend = _building_backend()
+    for graph_key in (4, 2):  # captured largest first
+        DeepseekV4AttnBackend._install_early_verify_metadata(
+            backend,
+            graph_key=graph_key,
+            raw_metadata=torch.tensor([1, 2]),
+            out_cache_loc=torch.tensor([5, 6]),
+        )
+        if graph_key == 4:
+            # What the captured forward's first MegaAttention layer allocates.
+            backend.forward_metadata.q_mega_pad_buffer = torch.zeros(12, 64, 512)
+    bucket = backend.cuda_graph_metadata_of_bucket_and_bs[_GraphBucket.TARGET_VERIFY]
+    shared = bucket[(4, "early")].q_mega_pad_buffer
+    assert bucket[(2, "early")].q_mega_pad_buffer is shared
 
 
 if __name__ == "__main__":
