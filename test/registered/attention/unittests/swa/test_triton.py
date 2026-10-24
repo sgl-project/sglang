@@ -30,9 +30,24 @@ register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
-    CASES = make_swa_no_prefix_input_config_cases(
-        "triton"
-    ) + make_swa_prefix_input_config_cases("triton")
+    CASES = (
+        make_swa_no_prefix_input_config_cases("triton")
+        + make_swa_prefix_input_config_cases("triton")
+        + (
+            # Decode at the window edge (seq_len == sliding_window_size + 1) must
+            # attend to the query and the sliding_window_size keys before it.
+            DenseAttentionCase(
+                name="swa_decode_window_edges",
+                backend="triton",
+                forward_mode=ForwardMode.DECODE,
+                num_heads=4,
+                num_kv_heads=4,
+                page_size=16,
+                prefix_lens=(3, 4, 5),
+                sliding_window_size=4,
+            ),
+        )
+    )
     CUDA_GRAPH_CASES = (
         DenseAttentionCase(
             name="runner_cuda_graph_swa_decode_within_window",
@@ -44,8 +59,8 @@ class TestTritonSWAAttentionBackendCorrectness(CustomTestCase):
             prefix_lens=(1, 2, 3),
             sliding_window_size=4,
         ),
-        # Above-window decode exercises the `min(seq_lens, window)`
-        # clipping in the replay metadata builder.
+        # Above-window decode: the replay metadata builder must read the
+        # query plus `sliding_window_size` earlier keys.
         DenseAttentionCase(
             name="runner_cuda_graph_swa_decode_above_window",
             backend="triton",

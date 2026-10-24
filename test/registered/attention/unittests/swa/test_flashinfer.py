@@ -58,11 +58,7 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
             sliding_window_size=4,
         ),
     )
-    # Above-window decode case requires the `extend_window` reference rule
-    # (window+1 keys), not the `min_seq_len_window` rule — FlashInfer's
-    # decode metadata uses `clamp(seq_lens, max=window+1)` per
-    # `flashinfer_backend.py:1031`. See `_SWA_DECODE_EXTEND_WINDOW` in
-    # `common/attention_methods/dense_attention.py`.
+    # Above-window decode reads window+1 keys (`clamp(seq_lens, max=window+1)`).
     CUDA_GRAPH_CASES = (
         DenseAttentionCase(
             name="runner_cuda_graph_swa_decode_within_window",
