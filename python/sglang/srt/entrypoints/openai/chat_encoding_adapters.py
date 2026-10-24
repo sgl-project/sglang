@@ -114,7 +114,6 @@ def select_new_output_ids(
     finish_reason_type: Optional[str],
     incremental: bool,
 ) -> list[int]:
-    """The ids one streamed engine chunk adds for a token-level output parser."""
     if not incremental:
         # Intermediate chunks share the live output list; completion_tokens is
         # this chunk's snapshot, so later tokens wait for their own chunk.

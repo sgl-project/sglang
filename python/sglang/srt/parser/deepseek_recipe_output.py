@@ -44,7 +44,6 @@ class RecipeToolCall(msgspec.Struct, frozen=True):
 
 
 def whole_tool_calls(delta: RecipeOutputDelta) -> list[RecipeToolCall]:
-    """The calls of a finished output, their argument pieces joined."""
     calls: dict[int, list[str]] = {}
     for piece in delta.tool_calls:
         if piece.name is not None:
@@ -61,7 +60,7 @@ class DeepSeekRecipeOutputParser:
     """One choice's output through recipe's StreamProcessor, fed the engine's token
     ids. Stops stay SGLang's: the scheduler matches them and `finish` cuts the match.
     `thinking_stage` is recipe's ThinkingInitialStage, None after a non-thinking
-    prompt; `stop` is the request's stop strings."""
+    prompt."""
 
     def __init__(
         self,
@@ -113,8 +112,6 @@ class DeepSeekRecipeOutputParser:
         )
 
     def _release_pending_ids(self) -> list[int]:
-        """The pending ids before the shortest tail spanning a stop string's
-        length less one character, where a later match could start."""
         held = len(self._pending_ids)
         while held > 0 and self._stop_hold_chars > len(
             self._hf_tokenizer.decode(
