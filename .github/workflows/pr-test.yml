@@ -447,7 +447,6 @@ jobs:
       matrix:
         include:
           - { runner_config: 2-gpu-gb300, run_timeout: '30', timeout_per_file: '1800' }
-          - { runner_config: 4-gpu-gb300, run_timeout: '30', timeout_per_file: '1800' }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-${{ matrix.runner_config }}

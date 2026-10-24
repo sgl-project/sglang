@@ -120,10 +120,12 @@ jobs:
           # - arch_label: sm120
           #   runner: 1-gpu-5090
           #   wheel_arch: x86_64
-          - arch_label: sm100-aarch64
-            runner: 4-gpu-gb300
-            wheel_arch: aarch64
-            timeout: 180
+          # Skipped while the 4-GPU GB300 runners are split into 2-GPU ones: the
+          # suite needs test changes to fit on 2 GPUs.
+          # - arch_label: sm100-aarch64
+          #   runner: 2-gpu-gb300
+          #   wheel_arch: aarch64
+          #   timeout: 180
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     steps:
