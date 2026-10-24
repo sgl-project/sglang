@@ -100,12 +100,6 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             "--dsv4-attn-backend trtllm does not support context parallelism "
             "(prefill CP, attention CP, or decode CP)."
         )
-        # The PD handshake rejects peers whose KV layouts differ, but the
-        # uniform-FP8 layout has not been run under PD (#37838).
-        assert cfg.disaggregation_mode == "null", (
-            "--dsv4-attn-backend trtllm does not support PD disaggregation yet "
-            "(untested; see https://github.com/sgl-project/sglang/issues/37838)."
-        )
         # The trtllm-gen semaphore buffer is sized from the prefill chunk
         # bound; with chunking disabled a single long request has no bound.
         assert cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0, (
@@ -320,10 +314,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ),
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
-        (
-            "TRT-LLM with encoder SWA bounded replay",
-            cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
-        ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),
     )

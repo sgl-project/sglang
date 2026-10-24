@@ -28,8 +28,7 @@ DSV4_FLASH_ENV = {
 
 # Force retraction on decode; the interval of 20 passes is arbitrary, sparse
 # enough to keep the run short.
-DSV4_FLASH_DECODE_ENV = {
-    **DSV4_FLASH_ENV,
+DECODE_RETRACT_ENV = {
     "SGLANG_TEST_RETRACT": "1",
     "SGLANG_TEST_RETRACT_INTERVAL": "20",
 }
@@ -50,12 +49,16 @@ class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8
     gsm8k_accuracy_thres = 0.93
     accept_length_thres = 1.8
     bs_1_speed_thres = 140
+    # Variants (e.g. other attention backends) override these.
+    model_repo = DSV4_FLASH_MODEL
+    server_env = DSV4_FLASH_ENV
+    extra_server_args: list = []
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
 
-        cls.model = try_cached_model(DSV4_FLASH_MODEL)
+        cls.model = try_cached_model(cls.model_repo)
 
         cls.start_prefill()
         cls.start_decode()
@@ -90,6 +93,7 @@ class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8
             *_EAGLE_SPEC_ARGS,
             "--watchdog-timeout",
             "900",
+            *cls.extra_server_args,
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(4))
         cls.process_prefill = popen_launch_pd_server(
@@ -97,7 +101,7 @@ class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8
             cls.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
-            env=DSV4_FLASH_ENV,
+            env=cls.server_env,
         )
 
     @classmethod
@@ -128,6 +132,7 @@ class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8
             "--watchdog-timeout",
             "900",
             "--enable-metrics",
+            *cls.extra_server_args,
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices_for(range(4, 8))
         cls.process_decode = popen_launch_pd_server(
@@ -135,7 +140,7 @@ class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8
             cls.decode_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
-            env=DSV4_FLASH_DECODE_ENV,
+            env={**cls.server_env, **DECODE_RETRACT_ENV},
         )
 
     def test_gsm8k(self):
