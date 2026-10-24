@@ -1953,6 +1953,14 @@ class DenoisingStage(PipelineStage):
         reserved_frames_mask,
     ):
         bsz = batch.raw_latent_shape[0]
+        row_timesteps = batch.comfyui_row_timesteps
+        if row_timesteps is not None:
+            if tuple(row_timesteps.shape) != (int(bsz),):
+                raise ValueError(
+                    f"comfyui_row_timesteps has shape {tuple(row_timesteps.shape)}, "
+                    f"expected one timestep per latent row ({bsz},)"
+                )
+            return row_timesteps.to(device=t_device.device, dtype=t_device.dtype)
         should_preprocess_for_wan_ti2v = should_apply_wan_ti2v(batch, server_args)
 
         # expand timestep

@@ -7,14 +7,18 @@ from .base import SGLDiffusionExecutor
 class ZImageAdapter(ComfyUIModelAdapter):
     model_types = ("lumina2",)
     pipeline_class_name = "ZImagePipeline"
+    supports_native_batching = True
 
     def pack(self, x, timestep, context, **kwargs) -> PackedForward:
-        context = context.squeeze(0)
+        batch = int(x.shape[0])
+        if batch == 1:
+            context = context.squeeze(0)
+        # ComfyUI gives every row of a batch the same context length.
         return PackedForward(
             latents=x.unsqueeze(2),
             timesteps=timestep * 1000.0,
             prompt_embeds=[context],
-            prompt_seq_lens=[[int(context.shape[0])]],
+            prompt_seq_lens=[[int(context.shape[-2])] * batch],
             height=x.shape[-2] * 8,
             width=x.shape[-1] * 8,
         )
