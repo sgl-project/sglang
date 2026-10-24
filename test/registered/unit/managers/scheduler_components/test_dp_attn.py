@@ -453,18 +453,33 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
 
 
 class TestPrefillCudaGraphVote(CustomTestCase):
-    def _vote(self, mode, *, mm=None):
+    @staticmethod
+    def _runner(*, multimodal_eager=False):
+        """A runner with fixed state whose ``can_replay_locally`` is the real
+        policy."""
         runner_cls = dp_attn.PrefillCudaGraphRunner
         runner = Mock(spec=runner_cls)
         runner.enable_lora = False
         runner.max_context_size = None
         runner.max_seq_len = None
-        runner._qwen_bcg_hc_sidechannel = True
+        runner._qwen_bcg_multimodal_eager = multimodal_eager
         runner._backend_vote_prefill_cuda_graph = None
+        runner._is_full_backend = False
+        runner._captured_attn_metadata_max_bs = None
+        runner.prefer_eager_mixed_prefill = False
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.has_mha_companion_layers = False
+        runner._has_uncapturable_chunked_prefix.return_value = False
+        runner.max_num_tokens = 64
+        runner.capture_num_tokens = [4, 64]
+        runner._pad_to_bucket = runner_cls._pad_to_bucket
         runner.can_replay_locally.side_effect = lambda **kwargs: (
-            not kwargs["contains_mm_inputs"]
-            or runner_cls.can_replay_locally(self=runner, **kwargs)
+            runner_cls.can_replay_locally(self=runner, **kwargs)
         )
+        return runner
+
+    def _vote(self, mode, *, mm=None, multimodal_eager=False):
+        runner = self._runner(multimodal_eager=multimodal_eager)
         batch = SimpleNamespace(
             forward_mode=mode,
             extend_num_tokens=4,
@@ -504,25 +519,8 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         """An extend or mixed batch over the captured attention metadata's
         request bound votes eager, so no dp rank replays while another falls
         back at forward time."""
-        runner_cls = dp_attn.PrefillCudaGraphRunner
-        runner = Mock(spec=runner_cls)
-        runner.enable_lora = False
-        runner.max_context_size = None
-        runner.max_seq_len = None
-        runner._qwen_bcg_hc_sidechannel = False
-        runner._backend_vote_prefill_cuda_graph = None
-        runner._is_full_backend = False
+        runner = self._runner()
         runner._captured_attn_metadata_max_bs = 2
-        runner.prefer_eager_mixed_prefill = False
-        runner.prefill_backend_name = Backend.BREAKABLE
-        runner.has_mha_companion_layers = False
-        runner._has_uncapturable_chunked_prefix.return_value = False
-        runner.max_num_tokens = 64
-        runner.capture_num_tokens = [64]
-        runner._pad_to_bucket = runner_cls._pad_to_bucket
-        runner.can_replay_locally.side_effect = lambda **kwargs: (
-            runner_cls.can_replay_locally(self=runner, **kwargs)
-        )
 
         def vote(mode, batch_size):
             batch = SimpleNamespace(
@@ -553,29 +551,45 @@ class TestPrefillCudaGraphVote(CustomTestCase):
 
     @patch.object(dp_attn, "get_parallel")
     @patch.object(dp_attn, "exchange_sync_rows")
-    def test_multimodal_ranks_vote_eager(self, gather, parallel):
-        infos = [
-            dp_attn.MLPSyncBatchInfo(
-                num_dp_ranks=2,
-                tp_size=1,
-                cp_size=1,
-                num_tokens=4,
-                num_tokens_for_logprob=1,
-                can_run_decode_cuda_graph=False,
-                can_run_draft_cuda_graph=False,
-                can_run_prefill_cuda_graph=self._vote(ForwardMode.EXTEND, mm=mm)[0],
-                is_extend_in_batch=True,
-                local_can_run_tbo=False,
-                local_forward_mode=ForwardMode.EXTEND.value,
-            )
-            for mm in ([SimpleNamespace(contains_mm_input=lambda: True)], None)
-        ]
-        values = torch.cat([i._get_local_tensor(device="cpu") for i in infos])
-        gather.side_effect = lambda output, *a, **kw: output.copy_(values)
+    def test_multimodal_rank_vote_follows_speculative_policy(self, gather, parallel):
+        """When the runner refuses multimodal batches (speculative decoding on),
+        an image rank keeps the whole group eager; otherwise the image rank
+        replays. The flag is derived from the speculative algorithm in
+        test_qwen_breakable_multimodal_policy_follows_speculative_decoding
+        (test_prefill_cuda_graph_runner.py)."""
+        image = [SimpleNamespace(contains_mm_input=lambda: True)]
         parallel.return_value.tp_group.active_ranks_cpu = torch.ones(2)
-        for info in infos:
-            info.all_gather(device="cpu", group=None)
-            self.assertFalse(info.can_run_prefill_cuda_graph)
+        for multimodal_eager in (True, False):
+            with self.subTest(multimodal_eager=multimodal_eager):
+                infos = [
+                    dp_attn.MLPSyncBatchInfo(
+                        num_dp_ranks=2,
+                        tp_size=1,
+                        cp_size=1,
+                        num_tokens=4,
+                        num_tokens_for_logprob=1,
+                        can_run_decode_cuda_graph=False,
+                        can_run_draft_cuda_graph=False,
+                        can_run_prefill_cuda_graph=self._vote(
+                            ForwardMode.EXTEND,
+                            mm=mm,
+                            multimodal_eager=multimodal_eager,
+                        )[0],
+                        is_extend_in_batch=True,
+                        local_can_run_tbo=False,
+                        local_forward_mode=ForwardMode.EXTEND.value,
+                    )
+                    for mm in (image, None)
+                ]
+                values = torch.cat(
+                    [info._get_local_tensor(device="cpu") for info in infos]
+                )
+                gather.side_effect = lambda output, *a, **kw: output.copy_(values)
+                for info in infos:
+                    info.all_gather(device="cpu", group=None)
+                    self.assertEqual(
+                        info.can_run_prefill_cuda_graph, not multimodal_eager
+                    )
 
 
 # The ring path (2), primes, an even non-power-of-two, and two powers of two

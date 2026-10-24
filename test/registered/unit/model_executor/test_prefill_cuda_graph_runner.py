@@ -37,7 +37,8 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -138,6 +139,81 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             self.assertRaisesRegex(RuntimeError, "reached base initialization"),
         ):
             PrefillCudaGraphRunner(object())
+
+    def test_qwen_breakable_multimodal_policy_follows_speculative_decoding(self):
+        """A Qwen breakable runner refuses multimodal batches only when
+        speculative decoding is on: the draft runner refuses them and, under dp
+        attention, follows the target's replay vote. NGRAM has no draft model
+        and keeps refusing."""
+        qwen = "Qwen4ExpForConditionalGeneration"
+        qwen_mtp = "Qwen4ExpForCausalLMMTP"
+        other = "Glm5NextForConditionalGeneration"
+        no_spec = SpeculativeAlgorithm.NONE
+        eagle = SpeculativeAlgorithm.EAGLE
+        ngram = SpeculativeAlgorithm.NGRAM
+        # (backend, architecture, is_draft_worker, spec_algorithm,
+        #  multimodal_eager, hc_sidechannel)
+        policy = (
+            (Backend.BREAKABLE, qwen, False, no_spec, False, True),
+            (Backend.BREAKABLE, qwen, False, eagle, True, True),
+            (Backend.BREAKABLE, qwen, False, ngram, True, True),
+            (Backend.BREAKABLE, qwen_mtp, True, eagle, True, False),
+            (Backend.BREAKABLE, other, False, eagle, False, False),
+            (Backend.FULL, qwen, False, eagle, False, False),
+        )
+        for (
+            backend,
+            architecture,
+            is_draft_worker,
+            spec_algorithm,
+            multimodal_eager,
+            hc_sidechannel,
+        ) in policy:
+            with self.subTest(
+                backend=backend,
+                architecture=architecture,
+                is_draft_worker=is_draft_worker,
+                spec_algorithm=spec_algorithm,
+            ):
+                model_runner = SimpleNamespace(
+                    attn_backend=SimpleNamespace(dllm_attention=None),
+                    model=SimpleNamespace(),
+                    model_config=SimpleNamespace(
+                        is_multimodal=True,
+                        hf_config=SimpleNamespace(
+                            model_type="not_deepseek_v41",
+                            architectures=[architecture],
+                        ),
+                    ),
+                    lora_manager=None,
+                    is_generation=True,
+                    is_draft_worker=is_draft_worker,
+                    spec_algorithm=spec_algorithm,
+                )
+                runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+                with (
+                    get_context().override_server_args(
+                        cuda_graph_config=SimpleNamespace(
+                            prefill=SimpleNamespace(backend=backend, bs=[4])
+                        ),
+                    ),
+                    get_parallel().override(attn_dp_enabled=False),
+                    patch.object(
+                        runner_module.BaseCudaGraphRunner,
+                        "__init__",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        runner_module,
+                        "get_prefill_num_tokens_to_capture",
+                        side_effect=RuntimeError("policy flags are set"),
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "policy flags are set"),
+                ):
+                    runner.__init__(model_runner)
+
+                self.assertEqual(runner._qwen_bcg_multimodal_eager, multimodal_eager)
+                self.assertEqual(runner._qwen_bcg_hc_sidechannel, hc_sidechannel)
 
     @patch(
         "sglang.srt.model_executor.model_runner.require_gathered_buffer",
@@ -632,8 +708,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._capture_req_slots = 4
         runner.enable_lora = False
-        runner._qwen_bcg_hc_sidechannel = False
-        runner._qwen_bcg_mtp_draft = False
+        runner._qwen_bcg_multimodal_eager = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.max_num_tokens = 4
         runner.capture_num_tokens = [4]

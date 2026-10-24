@@ -36,8 +36,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
     def _make_prefill_runner(self, backend):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = False
-        runner._qwen_bcg_hc_sidechannel = False
-        runner._qwen_bcg_mtp_draft = False
+        runner._qwen_bcg_multimodal_eager = False
         runner.enable_lora = False
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = backend
@@ -94,6 +93,16 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner = self._make_prefill_runner(Backend.BREAKABLE)
 
         self.assertTrue(runner.can_run_graph(self._make_multimodal_forward_batch()))
+
+    def test_multimodal_eager_runner_refuses_only_multimodal_batches(self):
+        runner = self._make_prefill_runner(Backend.BREAKABLE)
+        runner._qwen_bcg_multimodal_eager = True
+        text_batch = self._make_multimodal_forward_batch()
+        text_batch.mm_inputs = None
+        text_batch.contains_mm_inputs = lambda: False
+
+        self.assertFalse(runner.can_run_graph(self._make_multimodal_forward_batch()))
+        self.assertTrue(runner.can_run_graph(text_batch))
 
     def test_breakable_prefill_takes_nonzero_prefix_on_cuda_only(self):
         runner = self._make_prefill_runner(Backend.BREAKABLE)
