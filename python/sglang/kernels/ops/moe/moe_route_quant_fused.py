@@ -17,7 +17,7 @@ serving through sglang.srt.layers.moe.route_quant_handoff.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, NamedTuple, Tuple
 
 import torch
 
@@ -32,6 +32,8 @@ from sglang.kernels.ops.moe import moe_route_radix
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+    from sglang.kernels.ops.communication.all_reduce import Communicator
+
 _HIDDEN = 3584
 _GROUP_SIZE = 32
 _NUM_GROUPS = _HIDDEN // _GROUP_SIZE
@@ -41,27 +43,55 @@ _NUM_GROUPS = _HIDDEN // _GROUP_SIZE
 _MAX_TOKENS = 64
 
 
+class QuantGather(NamedTuple):
+    comm: Communicator
+    output: torch.Tensor
+    scale_scratch: torch.Tensor
+    output_mc: int
+    scales_mc: int
+    routing_weights: torch.Tensor | None = None
+    routing_batch: torch.Tensor | None = None
+
+
 @cache_once
-def _jit_module() -> Module:
-    args = make_cpp_args(is_arch_support_pdl())
+def _jit_module(gather_world: int = 0, gather_hidden: int = 0) -> Module:
+    args = (
+        make_cpp_args(gather_world, gather_hidden, is_arch_support_pdl())
+        if gather_world
+        else make_cpp_args(is_arch_support_pdl())
+    )
+    name, source, kernel = (
+        (
+            "kimi_k3_route_quant_gather",
+            "kimi_k3/moe/route_quant_gather.cuh",
+            "RouteQuantGatherKernel",
+        )
+        if gather_world
+        else (
+            "moe_route_quant_fused",
+            "moe/route_quant_fused.cuh",
+            "RouteQuantFusedKernel",
+        )
+    )
     return load_jit(
-        "moe_route_quant_fused",
+        name,
         *args,
-        cuda_files=["moe/route_quant_fused.cuh"],
-        cuda_wrappers=[("run", f"RouteQuantFusedKernel<{args}>::run")],
-        # No fast-math: the routing half must stay bit-identical to
-        # route_radix (see its module comment); the quant half's math is
-        # fast-math-independent (explicit intrinsics + bit manipulation).
+        cuda_files=[source],
+        cuda_wrappers=[("run", f"{kernel}<{args}>::run")],
+        # Preserve the radix router's arithmetic: no fast-math in either path.
         extra_cuda_cflags=["-O3"],
     )
 
 
 @cache_once
-def available() -> bool:
+def available(gather_world: int = 0, gather_hidden: int = 0) -> bool:
     import logging
 
     try:
-        _jit_module()
+        if gather_world:
+            _jit_module(gather_world, gather_hidden)
+        else:
+            _jit_module()
         return True
     except Exception as e:  # pragma: no cover - toolchain dependent
         logging.getLogger(__name__).warning(
@@ -101,30 +131,72 @@ def route_quant_fused(
     renormalize: bool,
     routed_scaling_factor: float,
     apply_scale: bool,
+    *,
+    gather: QuantGather | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns ``(weights [M, topk] fp32, ids [M, topk] int32, packed [M, topk]
     int32, x_q [M, 3584] fp8_e4m3, x_s [M, 28] int32 row-major packed UE8M0)``.
-    Caller must have checked covered(). Winners come out in expert-id-ascending
+    Plain callers check covered(); sharded callers supply a layer-owned gather.
+    Winners come out in expert-id-ascending
     order (the standalone production dispatch's sorted=False)."""
     M = scores.shape[0]
     device = scores.device
     out_w = torch.empty((M, topk), dtype=torch.float32, device=device)
     out_i = torch.empty((M, topk), dtype=torch.int32, device=device)
     out_packed = torch.empty((M, topk), dtype=torch.int32, device=device)
-    out_q = torch.empty((M, _HIDDEN), dtype=torch.float8_e4m3fn, device=device)
-    out_s = torch.empty((M, _NUM_GROUPS // 4), dtype=torch.int32, device=device)
-    _jit_module().run(
-        scores,
-        bias,
-        out_w,
-        out_i,
-        out_packed,
-        x,
-        out_q,
-        out_s,
-        topk,
-        float(routed_scaling_factor),
-        bool(renormalize),
-        bool(apply_scale),
+    out_q = (
+        gather.output
+        if gather is not None
+        else torch.empty((M, _HIDDEN), dtype=torch.float8_e4m3fn, device=device)
     )
+    hidden = out_q.shape[1]
+    out_s = torch.empty(
+        (M, (hidden // _GROUP_SIZE + 3) // 4), dtype=torch.int32, device=device
+    )
+    if gather is not None:
+        local_width = x.shape[1]
+        local_groups = local_width // _GROUP_SIZE
+        local_q = torch.empty(
+            (M, local_width), dtype=torch.float8_e4m3fn, device=device
+        )
+        local_s = torch.empty(
+            (M, gather.scale_scratch.shape[-1]), dtype=torch.int32, device=device
+        )
+        local_s = local_s[:, : (local_groups + 3) // 4]
+        _jit_module(gather.comm.world_size, hidden).run(
+            gather.comm,
+            scores,
+            bias,
+            out_w,
+            out_i,
+            out_packed,
+            x,
+            local_q,
+            local_s,
+            out_q,
+            gather.scale_scratch,
+            out_s,
+            gather.output_mc,
+            gather.scales_mc,
+            float(routed_scaling_factor),
+            bool(renormalize),
+            bool(apply_scale),
+            gather.routing_weights,
+            gather.routing_batch,
+        )
+    else:
+        _jit_module().run(
+            scores,
+            bias,
+            out_w,
+            out_i,
+            out_packed,
+            x,
+            out_q,
+            out_s,
+            topk,
+            float(routed_scaling_factor),
+            bool(renormalize),
+            bool(apply_scale),
+        )
     return out_w, out_i, out_packed, out_q, out_s

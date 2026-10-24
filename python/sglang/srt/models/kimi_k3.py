@@ -21,10 +21,7 @@ from torch import nn
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
-from sglang.srt.distributed import (
-    divide,
-    tensor_model_parallel_all_reduce,
-)
+from sglang.srt.distributed import divide, tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -122,10 +119,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
-from sglang.srt.models.kimi_k3_vl import (
-    KimiK3MultiModalProjector,
-    KimiK3VisionTower,
-)
+from sglang.srt.models.kimi_k3_vl import KimiK3MultiModalProjector, KimiK3VisionTower
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
@@ -138,6 +132,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
     get_exec,
+    get_flags,
     get_parallel,
     get_platform,
     get_spec,
@@ -466,6 +461,8 @@ class KimiK3MoE(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
+        self.num_layers = config.num_hidden_layers
+        self.is_draft = get_flags().moe.in_speculative_scope
 
         self.use_latent_moe = _uses_latent_moe(config)
         # Merged front weight ([H, gate_up + E + latent]), built after weight
@@ -753,6 +750,8 @@ class KimiK3MoE(nn.Module):
             "_eligible_for_fused_front",
             "_front_fp32",
             "_routing_contract_ok",
+            "_precomputed_routing_contract_ok",
+            "_sharded_front_eligible",
             "_ep_front_eligible",
         ):
             self.__dict__.pop(prop, None)
@@ -884,37 +883,27 @@ class KimiK3MoE(nn.Module):
         return self.routed_expert_norm(latent)
 
     @cached_property
-    def _routing_contract_ok(self) -> bool:
-        """Whether a kernel may emit (weights, ids) itself and bypass
-        select_experts. Shared by the fused router and the merged front."""
-        if self._eligible_for_fused_front:
-            return False
+    def _precomputed_routing_contract_ok(self) -> bool:
+        """Shared routing contract for the merged and TP-sharded fronts."""
         cfg = self.topk.topk_config
-        if cfg.output_format is not TopKOutputFormat.STANDARD:
-            return False
-        # The kernel implements sigmoid scoring with bias-ranked ungrouped top-k.
-        # K3 passes moe_router_activation_func explicitly to TopK. The legacy
-        # GPU biased_grouped_topk path also hardwires sigmoid, but other platform
-        # implementations consume cfg.scoring_func directly.
-        if cfg.scoring_func != "sigmoid":
-            return False
-        if not (cfg.use_grouped_topk and cfg.correction_bias is not None):
-            return False
-        if (cfg.num_expert_group or 1) > 1 or (cfg.topk_group or 1) > 1:
-            return False
-        # A waterfill balancer rewrites the routing after the top-k; leave it on
-        # the layer path that supports it.
-        if self.topk.waterfill_balancer is not None or self.topk.enable_waterfill:
-            return False
-        if self.gate.e_score_correction_bias is None:
-            return False
-        # K3 calls self.topk() without a padding mask or EPLB dispatch info, so
-        # select_experts' post-processing collapses to the capture hook and the
-        # recorder -- both of which build_precomputed_topk_output runs. Bail out
-        # if that ever stops holding rather than silently dropping the remap.
-        if not precomputed_topk_postprocess_is_noop(cfg):
-            return False
-        if get_exec().deterministic.enable_deterministic_inference:
+        return (
+            cfg.output_format is TopKOutputFormat.STANDARD
+            and cfg.use_grouped_topk
+            and cfg.scoring_func == "sigmoid"
+            and cfg.correction_bias is not None
+            and (cfg.num_expert_group or 1) == 1
+            and (cfg.topk_group or 1) == 1
+            and cfg.custom_routing_function is None
+            and not cfg.torch_native
+            and self.topk.waterfill_balancer is None
+            and not self.topk.enable_waterfill
+            and precomputed_topk_postprocess_is_noop(cfg)
+            and not get_exec().deterministic.enable_deterministic_inference
+        )
+
+    @cached_property
+    def _routing_contract_ok(self) -> bool:
+        if self._eligible_for_fused_front or not self._precomputed_routing_contract_ok:
             return False
         try:
             from sglang.kernels.ops.moe import moe_front
@@ -1070,9 +1059,7 @@ class KimiK3MoE(nn.Module):
         ):
             return False
 
-        from sglang.srt.batch_overlap.two_batch_overlap import (
-            MaybeTboDeepEPDispatcher,
-        )
+        from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
         from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
             is_in_tc_piecewise_cuda_graph,
         )
@@ -1314,14 +1301,28 @@ class KimiK3MoE(nn.Module):
             latent.copy_(expert_output)
 
     def _forward_routed_deferred(self, hidden_states, router_logits, routed_input):
-        """Routed experts with the in-op finalize skipped: returns the
-        FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
-        expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
-        all-reduce."""
-        if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+        """Return deferred expert outputs for the finalize-fused AllReduce."""
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            if routed_input.shape[1] != self.moe_hidden_size:
+                config = self.topk.topk_config
+                prepared, routing = self._sharded_front_workspace.route(
+                    self.layer_idx,
+                    router_logits,
+                    config.correction_bias,
+                    routed_input,
+                    config,
+                )
+                weights, ids, packed, routed_input, scales = prepared
+                topk_output = build_precomputed_topk_output(
+                    weights, ids, config, self.layer_idx
+                )
+                route_quant_handoff.publish(
+                    routed_input, packed, routed_input, scales, routing=routing
+                )
+            else:
+                if self._route_quant_fuse_eligible:
+                    route_quant_handoff.stage(routed_input)
+                topk_output = self.topk(hidden_states, router_logits)
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -1344,6 +1345,45 @@ class KimiK3MoE(nn.Module):
         assert self.fuse_ar_norm and norm is not None
         return norm.weight, norm.variance_epsilon
 
+    @cached_property
+    def _sharded_front_eligible(self) -> bool:
+        from sglang.kernels.ops.moe.moe_route_radix import supports_shape
+        from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+
+        config = self.topk.topk_config
+        return (
+            get_platform().is_sm100
+            and not self.is_draft
+            and get_bf16_gemm_backend().is_cutedsl()
+            and self.tp_size > 1
+            and get_parallel().moe_tp_size == self.tp_size
+            and not get_exec().overlap.enable_two_batch_overlap
+            and self._front_fp32
+            and self.moe_hidden_size % (self.tp_size * 32) == 0
+            and not self._moe_front_needs_dense_bf16
+            and self._precomputed_routing_contract_ok
+            and supports_shape(self._front_sizes[1], config.top_k)
+            and self.experts.num_experts == self._front_sizes[1]
+        )
+
+    @cached_property
+    def _sharded_front_workspace(self):
+        from sglang.srt.layers.moe.kimi_k3_front import (
+            FRONT_SHARD_ROWS,
+            KimiK3FrontWorkspace,
+        )
+        from sglang.srt.runtime_context import get_buffer
+
+        return get_buffer(
+            "k3_sharded_front",
+            lambda: KimiK3FrontWorkspace(
+                get_parallel().tp_group,
+                self.num_layers,
+                self.moe_hidden_size,
+                max(FRONT_SHARD_ROWS),
+            ),
+        )
+
     def _forward_fused(
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
     ) -> torch.Tensor:
@@ -1365,14 +1405,63 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
+        fused_comm = k3_ar_fusion.enabled()
+        defer_finalize = (
+            fused_comm
+            and self.alt_stream is not None
+            and self._defer_moe_finalize
+            and self.fuse_ar_norm
+            and k3_ar_fusion.finalize_push_fits(num_tokens)
         )
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
+        sharded_front = False
+        if defer_finalize and self._sharded_front_eligible:
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                supports_weight_row_mapping,
+            )
+            from sglang.srt.layers.moe.kimi_k3_front import (
+                FRONT_SHARD_ROWS,
+                sharded_front_available,
+            )
+
+            sharded_front = (
+                num_tokens in FRONT_SHARD_ROWS
+                and supports_weight_row_mapping(
+                    num_tokens,
+                    hidden_size,
+                    sum(self._front_sizes[:2]),
+                    self.moe_hidden_size // self.tp_size,
+                )
+                and sharded_front_available(
+                    get_parallel().tp_group, self.moe_hidden_size
+                )
+            )
+        if sharded_front:
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm_out
+
+            workspace = self._sharded_front_workspace
+            sizes = (*self._front_sizes[:2], self.moe_hidden_size // self.tp_size)
+            fused = torch.empty(
+                (num_tokens, sum(sizes)),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            prefix = sum(sizes[:2])
+            offset = workspace.rank * sizes[2]
+            cutedsl_bf16_gemm_out(
+                hidden_states,
+                self._front_w[: sum(sizes) + offset],
+                fused,
+                prefix_size=prefix,
+                row_offset=offset,
+            )
+        else:
+            sizes = self._front_sizes
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+        gate_up, router_logits, routed_input = torch.split(fused, sizes, dim=-1)
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
         if self._moe_front_needs_dense_bf16:
@@ -1380,7 +1469,7 @@ class KimiK3MoE(nn.Module):
             # contiguous() behind it is free; off a bf16 front it is the copy
             routed_input = routed_input.to(hidden_states.dtype).contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
-        if k3_ar_fusion.enabled():
+        if fused_comm:
             # the shared-expert AR is pull-only, so its input must be a
             # symm_buffer slice for every rank to resolve the same offset
             buf = k3_ar_fusion.symm_buffer(
@@ -1398,12 +1487,7 @@ class KimiK3MoE(nn.Module):
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         fused_norm = False
-        if self.alt_stream is not None and k3_ar_fusion.enabled():
-            defer_finalize = (
-                self._defer_moe_finalize
-                and self.fuse_ar_norm
-                and k3_ar_fusion.finalize_push_fits(num_tokens)
-            )
+        if self.alt_stream is not None and fused_comm:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             if defer_finalize:
@@ -1416,7 +1500,11 @@ class KimiK3MoE(nn.Module):
                 self._forward_shared(gate_up, shared_output)
                 # low-SM pull so the side-stream AR leaves the SMs to the
                 # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
-                k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
+                k3_ar_fusion.all_reduce_low_sm(
+                    shared_output,
+                    num_blocks=1 if sharded_front and num_tokens == 1 else 4,
+                    unroll=8,
+                )
             current_stream.wait_stream(self.alt_stream)
             # The latent AR must stay serialized after the shared AR (both
             # reuse the v2 pull semaphores); the join above does it.
@@ -1456,14 +1544,14 @@ class KimiK3MoE(nn.Module):
         else:  # single collective over the flat [latent | shared] pair
             self._forward_shared(gate_up, shared_output)
             self._forward_routed(hidden_states, router_logits, routed_input, latent)
-            if self.fuse_ar_norm and k3_ar_fusion.enabled():
+            if self.fuse_ar_norm and fused_comm:
                 fused_norm = True
                 k3_ar_fusion.all_reduce_norm(
                     buf.view(-1, k3_ar_fusion.NORM_DIM),
                     *self._get_fused_norm_params(),
                     num_tokens=num_tokens,
                 )
-            elif k3_ar_fusion.enabled():
+            elif fused_comm:
                 k3_ar_fusion.all_reduce(buf)
             else:
                 buf = self._reduce_latent_and_shared(buf)

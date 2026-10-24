@@ -164,27 +164,34 @@ constexpr uint32_t kFinTopK = 16;
 // broadcast-load the same routing rows. `W` is the routing-weight dtype
 // (bf16 or fp32; see finalize_push_norm).
 template <typename W>
-SGL_DEVICE device::AlignedVector<bf16x2_t, 4> finalize_vec(const FusionParams& params, uint32_t vid) {
+struct FinalizeMetadata {
+  static constexpr uint32_t kIdxVecSize = device::kMaxVecBytes / sizeof(int32_t);
+  static constexpr uint32_t kWVecSize = device::kMaxVecBytes / sizeof(W);
+  device::AlignedVector<int32_t, kIdxVecSize> idx[kFinTopK / kIdxVecSize];
+  device::AlignedVector<W, kWVecSize> weight[kFinTopK / kWVecSize];
+
+  SGL_DEVICE void load(const FusionParams& params, uint32_t token) {
+#pragma unroll
+    for (uint32_t j = 0; j < kFinTopK / kIdxVecSize; ++j)
+      idx[j].load(params.fin_idx, token * (kFinTopK / kIdxVecSize) + j);
+#pragma unroll
+    for (uint32_t j = 0; j < kFinTopK / kWVecSize; ++j)
+      weight[j].load(params.fin_weights, token * (kFinTopK / kWVecSize) + j);
+  }
+};
+
+template <typename W>
+SGL_DEVICE device::AlignedVector<bf16x2_t, 4>
+finalize_vec(const FusionParams& params, uint32_t vid, const FinalizeMetadata<W>& metadata) {
   using namespace device;
   static_assert(std::is_same_v<W, bf16_t> || std::is_same_v<W, fp32_t>, "unsupported routing-weight dtype");
   constexpr uint32_t kIdxVecSize = kMaxVecBytes / sizeof(int32_t);
   constexpr uint32_t kWVecSize = kMaxVecBytes / sizeof(W);
-  constexpr uint32_t kIdxVecs = kFinTopK / kIdxVecSize;  // 2 on SM100+
-  constexpr uint32_t kWVecs = kFinTopK / kWVecSize;      // 1 (bf16) / 2 (fp32) on SM100+
 
-  const uint32_t token = vid / kNormRowVecs;
   const uint32_t hvec = vid % kNormRowVecs;
 
-  AlignedVector<int32_t, kIdxVecSize> idx[kIdxVecs];
-#pragma unroll
-  for (uint32_t j = 0; j < kIdxVecs; ++j) {
-    idx[j].load(params.fin_idx, token * kIdxVecs + j);
-  }
-  AlignedVector<W, kWVecSize> weight[kWVecs];
-#pragma unroll
-  for (uint32_t j = 0; j < kWVecs; ++j) {
-    weight[j].load(params.fin_weights, token * kWVecs + j);
-  }
+  const auto& idx = metadata.idx;
+  const auto& weight = metadata.weight;
 
   const auto* g2 = reinterpret_cast<const bf16_t*>(params.fin_gemm2);
   AlignedVector<bf16_t, 8> in[kFinTopK];
@@ -267,6 +274,17 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
   // and never stages, so it must not be counted or its share of vids is dropped
   const auto num_threads = kBlockSize * num_row_clusters * kClusterSize;
 
+  // Routing metadata and norm weights are ready before the GEMM2 producer.
+  // Read only those inputs early; GEMM2 values still wait on its PDL fence.
+  using PrefetchWeight = std::conditional_t<kFinalize, FinWeight, bf16_t>;
+  FinalizeMetadata<PrefetchWeight> metadata;
+  vec_t w;
+  if constexpr (kFinalize) {
+    if (num_rows == 1 && row_idx != num_row_clusters) {
+      w.load(params.norm_weight, (bx % kClusterSize) * kBlockSize + tx);
+      metadata.load(params, 0);
+    }
+  }
   PDLWaitPrimary<kUsePDL>();
 
   // special case: the bumper cluster flips every remaining counter so the
@@ -294,7 +312,8 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
   for (auto vid = global_tid; vid < num_vecs; vid += num_threads) {
     vec_t vec;
     if constexpr (kFinalize) {
-      vec = finalize_vec<FinWeight>(params, vid);
+      if (num_rows != 1) metadata.load(params, vid / kNormRowVecs);
+      vec = finalize_vec<FinWeight>(params, vid, metadata);
     } else {
       ptx::ld_global_16B(vec, params.input, vid);
     }
@@ -305,8 +324,7 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
   // stage 2: one row per cluster pass (the bumper cluster owns no rows)
   const auto cluster = cg::this_cluster();
   const auto cluster_rank = bx % kClusterSize;
-  vec_t w;
-  w.load(params.norm_weight, cluster_rank * kBlockSize + tx);
+  if (!kFinalize || num_rows != 1) w.load(params.norm_weight, cluster_rank * kBlockSize + tx);
   vec_t zero_vec;
   Lamport::fill_pos_zero(zero_vec.data());
   __shared__ alignas(8) float smem_raw[2][kClusterSize][kNumWarps];

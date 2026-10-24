@@ -28,7 +28,7 @@ activation address.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import msgspec
 import torch
@@ -42,6 +42,8 @@ class _Handoff(msgspec.Struct):
     packed: Optional[torch.Tensor] = None
     x_q: Optional[torch.Tensor] = None
     x_s: Optional[torch.Tensor] = None
+    routing: Any = None
+    routing_packed: Optional[torch.Tensor] = None
 
 
 _handoff = _Handoff()
@@ -60,6 +62,29 @@ def clear() -> None:
     _handoff.packed = None
     _handoff.x_q = None
     _handoff.x_s = None
+    _handoff.routing = None
+    _handoff.routing_packed = None
+
+
+def publish(x, packed, x_q, x_s, *, routing=None) -> None:
+    """Publish already prepared inputs for one experts call, paired with clear()."""
+    _handoff.request_x = None
+    _handoff.produced_x = x
+    _handoff.packed = packed
+    _handoff.x_q = x_q
+    _handoff.x_s = x_s
+    _handoff.routing = routing
+    _handoff.routing_packed = packed
+
+
+def take_routing(packed):
+    """Consume routing metadata only for the packed IDs that produced it."""
+    if packed is not _handoff.routing_packed:
+        return None
+    routing = _handoff.routing
+    _handoff.routing = None
+    _handoff.routing_packed = None
+    return routing
 
 
 def try_route_quant_fused(
@@ -98,11 +123,7 @@ def try_route_quant_fused(
         ),
         apply_scale=apply_routed_scaling_factor_on_output,
     )
-    _handoff.request_x = None
-    _handoff.produced_x = x
-    _handoff.packed = packed
-    _handoff.x_q = x_q
-    _handoff.x_s = x_s
+    publish(x, packed, x_q, x_s)
     return weights, ids
 
 
