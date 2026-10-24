@@ -84,6 +84,31 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
         raise ValueError("KV sharding with trtllm_mla requires chunked prefix caching.")
 
 
+def check_kv_shard_storage(
+    *,
+    storage_backend: str,
+    host_memory_mode: str,
+    extra_config: Optional[dict] = None,
+) -> None:
+    """The HiCache storage configurations KV sharding supports (v1). Runs at
+    launch and again at attach, which also sees runtime attaches and the
+    parsed extra config."""
+    if storage_backend not in ("mooncake", "file"):
+        raise ValueError(
+            "--enable-kv-cache-sharding supports only the mooncake and file "
+            f"HiCache storage backends, got {storage_backend!r}."
+        )
+    if host_memory_mode != "cache":
+        raise ValueError(
+            "--enable-kv-cache-sharding requires --hicache-host-memory-mode "
+            "cache with a storage backend."
+        )
+    if (extra_config or {}).get("tp_lcm_size"):
+        raise ValueError(
+            "--enable-kv-cache-sharding does not support tp_lcm_size (split heads)."
+        )
+
+
 def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) -> None:
     """Validate KV sharding and declare its derived eager-prefill settings."""
     cfg = resolving_view(server_args)
@@ -174,10 +199,9 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "allocator index space."
         )
     if cfg.enable_hierarchical_cache and cfg.hicache_storage_backend is not None:
-        raise ValueError(
-            "--enable-kv-cache-sharding supports HiCache host offload but not "
-            "--hicache-storage-backend yet: the storage path reads and writes "
-            "whole pages per rank, not each rank's own stripe."
+        check_kv_shard_storage(
+            storage_backend=cfg.hicache_storage_backend,
+            host_memory_mode=cfg.hicache_host_memory_mode,
         )
     if cfg.enable_hierarchical_cache and is_deepseek_dsa(
         model_config_of(server_args).hf_config

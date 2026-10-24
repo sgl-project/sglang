@@ -245,6 +245,13 @@ class UnifiedTreeCoreInterface(ABC):
         ``rotation_base_of``."""
         return None
 
+    def rotation_base_below(self, node_id: NodeId, key: RadixKey) -> Optional[int]:
+        """Logical-page KV sharding: the base of the node's child that key's
+        first page descends into, which a host insert of key must match; None
+        when there is no such child or sharding is off. Concrete for the same
+        reason as ``rotation_base_of``."""
+        return None
+
     @abstractmethod
     def get_last_hash_value(self, node_id: NodeId) -> Optional[str]:
         """The node's last page hash, or None when it was never hashed."""
@@ -584,8 +591,12 @@ class UnifiedTreeCoreInterface(ABC):
         key: RadixKey,
         host_value: torch.Tensor,
         hash_value: list[str],
+        rotation_base: Optional[int] = None,
     ) -> InsertResult:
-        """Insert a host-side (backuped) tree path descending from the given node."""
+        """Insert a host-side (backuped) tree path descending from the given node.
+
+        ``rotation_base`` (logical-page KV sharding) is stamped on new nodes; a
+        path whose first child carries another base is declined untouched."""
         ...
 
     @abstractmethod

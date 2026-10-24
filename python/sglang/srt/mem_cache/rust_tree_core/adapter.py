@@ -933,7 +933,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         key: RadixKey,
         host_value: torch.Tensor,
         hash_value: list[str],
+        rotation_base: Optional[int] = None,
     ) -> InsertResult:
+        # Sharded HiCache storage is gated to the Python core (kv_shard_hook).
+        assert rotation_base is None, "Rust insert_host does not stamp rotation bases"
         result = self._binding.insert_host(
             node_id,
             key.extra_key,

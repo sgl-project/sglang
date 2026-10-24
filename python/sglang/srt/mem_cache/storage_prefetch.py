@@ -34,6 +34,10 @@ class StoragePrefetchRetries:
     def refetch(self, req_id: str, storage_hit_end: Optional[int] = None) -> None:
         self._pending[req_id] = _StoragePrefetchRetry(True, storage_hit_end)
 
+    def refetch_pending(self, req_id: str) -> bool:
+        retry = self._pending.get(req_id)
+        return retry is not None and retry.immediate
+
     def cancel(self, req_id: str) -> None:
         self._pending.pop(req_id, None)
 
