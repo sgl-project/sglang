@@ -839,7 +839,7 @@ class Scheduler(
                         output_batch, "Scheduler.return_result.spill_arrays"
                     ):
                         output_batch.output = spill_large_arrays_to_file_refs(
-                            output_batch.output
+                            output_batch.output, identity
                         )
 
                 with self._record_return_stage(

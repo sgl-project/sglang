@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.ipc_array import (
+    array_ipc_request,
     is_local_endpoint,
     materialize_file_refs,
 )
@@ -181,12 +182,15 @@ class SchedulerClient:
             socket.setsockopt(zmq.LINGER, 0)
             effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
-            socket.connect(endpoint)
-            socket.send_pyobj(_prepare_local_payload(endpoint, batch))
-            output_batch = socket.recv_pyobj()
-            _materialize_output_batch_file_refs(output_batch)
-            _materialize_local_cuda_refs(endpoint, output_batch)
-            return output_batch
+            with array_ipc_request(endpoint) as identity:
+                if identity is not None:
+                    socket.setsockopt(zmq.IDENTITY, identity)
+                socket.connect(endpoint)
+                socket.send_pyobj(_prepare_local_payload(endpoint, batch))
+                output_batch = socket.recv_pyobj()
+                _materialize_output_batch_file_refs(output_batch)
+                _materialize_local_cuda_refs(endpoint, output_batch)
+                return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from %s.", endpoint)
             raise TimeoutError("Scheduler did not respond in time.")
@@ -294,13 +298,16 @@ class AsyncSchedulerClient:
             socket.setsockopt(zmq.LINGER, 0)
             effective_timeout = _resolve_timeout_ms(self.server_args, timeout_ms)
             _configure_recv_timeout(socket, effective_timeout)
-            socket.connect(endpoint)
-            await socket.send(pickle.dumps(_prepare_local_payload(endpoint, batch)))
-            payload = await socket.recv()
-            output_batch = pickle.loads(payload)
-            _materialize_output_batch_file_refs(output_batch)
-            _materialize_local_cuda_refs(endpoint, output_batch)
-            return output_batch
+            with array_ipc_request(endpoint) as identity:
+                if identity is not None:
+                    socket.setsockopt(zmq.IDENTITY, identity)
+                socket.connect(endpoint)
+                await socket.send(pickle.dumps(_prepare_local_payload(endpoint, batch)))
+                payload = await socket.recv()
+                output_batch = pickle.loads(payload)
+                _materialize_output_batch_file_refs(output_batch)
+                _materialize_local_cuda_refs(endpoint, output_batch)
+                return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from %s.", endpoint)
             raise TimeoutError("Scheduler did not respond in time.")
