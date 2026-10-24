@@ -10,6 +10,11 @@ from sglang.srt.multimodal.transport.memory_pool import (
     StreamOrderedMmFeaturePool,
     StreamOrderedPoolConsumerMixin,
 )
+from sglang.srt.utils import get_device_module, is_npu
+
+_is_npu = is_npu()
+_DEVICE_TYPE = "npu" if _is_npu else "cuda"
+_TRANSPORT_NAME = "NPU IPC" if _is_npu else "CUDA IPC"
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +68,8 @@ def _normalize_pool_cache_key(pool_handle, device_index: int) -> tuple[Any, ...]
 
 
 def _open_pooled_storage_uncached(pool_handle):
+    if _is_npu:
+        return torch.UntypedStorage._new_shared_npu(*pool_handle)
     return torch.UntypedStorage._new_shared_cuda(*pool_handle)
 
 
@@ -104,7 +111,9 @@ class MmItemMemoryPool:
         self.device_id = base_gpu_id
         self.consumer_count = consumer_count
         self.memory_pool = torch.empty(
-            memory_size, dtype=torch.uint8, device=f"cuda:{base_gpu_id}"
+            memory_size,
+            dtype=torch.uint8,
+            device=f"{_DEVICE_TYPE}:{base_gpu_id}",
         ).contiguous()
         self._pool = StreamOrderedMmFeaturePool(
             memory_size=memory_size,
@@ -113,11 +122,14 @@ class MmItemMemoryPool:
             device_id=base_gpu_id,
             consumer_count=consumer_count,
             recycle_interval=recycle_interval,
-            transport_name="CUDA IPC",
+            transport_name=_TRANSPORT_NAME,
             max_inflight_slices=max_inflight_slices,
         )
         storage = self.memory_pool.untyped_storage()
-        self._pool_ipc_handle = storage._share_cuda_()
+        if _is_npu:
+            self._pool_ipc_handle = storage._share_npu_()
+        else:
+            self._pool_ipc_handle = storage._share_cuda_()
         self._pool_full_warned = False
 
         logger.debug(
@@ -182,12 +194,12 @@ class MmItemMemoryPool:
 
 
 class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
-    """Serializable view of one tensor stored in a CUDA IPC memory pool.
+    """Serializable view of one tensor stored in a device IPC memory pool.
 
     The producer-ready word and one acknowledgement word per consumer live in
-    the same CUDA allocation as the tensor. CUDA stream memory operations order
-    the producer copy, consumer copy, and pool reuse without CPU shared memory
-    or device-wide synchronization.
+    the same device allocation as the tensor. Stream-ordered value operations
+    (CUDA driver or CANN runtime) order the producer copy, consumer copy, and
+    pool reuse without CPU shared memory or device-wide synchronization.
     """
 
     def __init__(
@@ -214,7 +226,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             ack_byte_offset=ack_byte_offset,
             generation=generation,
             total_consumer_count=total_consumer_count,
-            transport_name="CUDA IPC",
+            transport_name=_TRANSPORT_NAME,
         )
 
         self.proxy_state = {
@@ -246,12 +258,35 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         shape = ipc_extra["shape"]
         dtype = ipc_extra["dtype"]
         stride = ipc_extra["stride"]
-        # Redirect handle[0] to the consumer's device so _new_shared_cuda's
-        # CUDAGuard stays there; peer access handles the cross-GPU open.
+        # Redirect handle[0] to the consumer's device so the device guard inside
+        # _new_shared_cuda/_new_shared_npu stays there; peer access handles the
+        # cross-device open.
         pool_handle = ipc_extra["pool_handle"]
         redirected_handle = (rebuild_device_idx,) + tuple(pool_handle)[1:]
-        target_device = torch.device(f"cuda:{rebuild_device_idx}")
         cache_key = _normalize_pool_cache_key(pool_handle, rebuild_device_idx)
+
+        if _is_npu:
+            if use_cache:
+                pool_storage = _pool_handle_cache_get_or_open(
+                    cache_key, redirected_handle
+                )
+            else:
+                pool_storage = _open_pooled_storage_uncached(redirected_handle)
+            # set_ initializes the NPUStorageDesc that later NPU ops read;
+            # the storage's DataPtr owns the IPC mapping.
+            pool_tensor = torch.empty(
+                0,
+                dtype=torch.uint8,
+                device=torch.device(f"{_DEVICE_TYPE}:{rebuild_device_idx}"),
+            ).set_(pool_storage)
+            slice_tensor = pool_tensor.as_strided(
+                size=shape,
+                stride=stride,
+                storage_offset=ipc_extra["pool_byte_offset"],
+            )
+            return slice_tensor, pool_storage
+
+        target_device = torch.device(f"cuda:{rebuild_device_idx}")
 
         with torch.cuda.device(target_device):
             if use_cache:
@@ -309,7 +344,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             # An uncached mapping is owned only by this proxy. The caller
             # replaces the proxy immediately, so finish the current stream
             # before allowing the mapping to close.
-            torch.cuda.current_stream(device_id).synchronize()
+            get_device_module().current_stream(device_id).synchronize()
 
     def acknowledge_consumption(
         self, consumer_count: int = 1, consumer_rank: Optional[int] = None
@@ -317,8 +352,8 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         """Stream-order pool release when a cache hit needs no tensor copy."""
         if self._consumer_acknowledged:
             return
-        device_id = torch.cuda.current_device()
-        with torch.cuda.device(device_id):
+        device_id = get_device_module().current_device()
+        with get_device_module().device(device_id):
             _, storage = self._open_pool_slice(device_id)
             base_address = storage.data_ptr()
             self._wait_until_ready(base_address, device_id)
@@ -335,7 +370,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         if not ipc_extra["use_pool_handle_cache"] or self._consumer_acknowledged:
             return None
 
-        with torch.cuda.device(rebuild_device_idx):
+        with get_device_module().device(rebuild_device_idx):
             slice_tensor, storage = self._open_pool_slice(rebuild_device_idx)
             base_address = storage.data_ptr()
             self._wait_until_ready(base_address, rebuild_device_idx)
@@ -356,12 +391,9 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         if storage is None:
             return
         device_id = self._borrowed_device_id
-        with torch.cuda.device(device_id):
+        with get_device_module().device(device_id):
             self._acknowledge_on_stream(
-                self._borrowed_base_address,
-                device_id,
-                consumer_count,
-                consumer_rank,
+                self._borrowed_base_address, device_id, consumer_count, consumer_rank
             )
         self._retain_storage_until_stream_completes(storage, device_id)
         self._borrowed_storage = None
@@ -381,7 +413,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         consumer_count: int = 1,
         consumer_rank: Optional[int] = None,
     ):
-        rebuild_device = torch.device(f"cuda:{rebuild_device_idx}")
+        rebuild_device = torch.device(f"{_DEVICE_TYPE}:{rebuild_device_idx}")
         if (
             isinstance(self.reconstruct_tensor, torch.Tensor)
             and self.reconstruct_tensor.device == rebuild_device
@@ -389,7 +421,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             return self.reconstruct_tensor
 
         ipc_extra = self.proxy_state["ipc_extra"]
-        with torch.cuda.device(rebuild_device):
+        with get_device_module().device(rebuild_device):
             slice_tensor, storage = self._open_pool_slice(rebuild_device_idx)
             base_address = storage.data_ptr()
             self._wait_until_ready(base_address, rebuild_device_idx)
@@ -400,10 +432,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             ).contiguous()
             reconstructed_tensor.view(torch.uint8).reshape(-1).copy_(slice_tensor)
             self._acknowledge_on_stream(
-                base_address,
-                rebuild_device_idx,
-                consumer_count,
-                consumer_rank,
+                base_address, rebuild_device_idx, consumer_count, consumer_rank
             )
 
         self._retain_storage_until_stream_completes(storage, rebuild_device_idx)

@@ -91,8 +91,10 @@ from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
+    get_device_module,
     is_cpu,
     is_npu,
+    is_pin_memory_available,
     round_up,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -1479,12 +1481,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         items: List[MultimodalDataItem],
         indices: Iterable[int],
         preserve_for_reprefill: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, Optional[torch.cuda.Event]]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, Optional[torch.Event]]]:
         device = self.visual.device
         device_index = device.index
-        if device.type == "cuda" and device_index is None:
-            device_index = torch.cuda.current_device()
-        if device.type == "cuda":
+        device_module = get_device_module()
+        dest_device_type = "npu" if _is_npu else "cuda"
+        if device.type == dest_device_type and device_index is None:
+            device_index = device_module.current_device()
+        if device.type == dest_device_type:
             parallel = get_parallel()
             consumer_count = max(parallel.tp_size, 1)
 
@@ -1493,14 +1497,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         feature_offset = 0
         for index in indices:
             item = items[index]
-            if device.type == "cuda":
+            if device.type == dest_device_type:
                 proxy = item.feature
                 model_specific_data = getattr(item, "model_specific_data", {})
                 pending_copy = model_specific_data.pop(
                     CUDA_IPC_FEATURE_COPY_EVENT_KEY, None
                 )
                 if pending_copy is not None:
-                    torch.cuda.current_stream(device_index).wait_event(pending_copy)
+                    device_module.current_stream(device_index).wait_event(pending_copy)
                 borrow_requested = model_specific_data.pop(
                     BORROW_CUDA_IPC_FEATURE_KEY, False
                 )
@@ -1544,8 +1548,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             raise
         packed_ready = None
         if borrowed_items:
-            source_stream = torch.cuda.current_stream(device_index)
-            packed_ready = torch.cuda.Event()
+            source_stream = device_module.current_stream(device_index)
+            packed_ready = device_module.Event()
             packed_ready.record(source_stream)
             for item, proxy, offset, length in borrowed_items:
                 item.feature = materialized.narrow(0, offset, length)
@@ -1570,30 +1574,32 @@ class Qwen3VLForConditionalGeneration(nn.Module):
     ) -> None:
         """Preserve inputs for re-prefill without delaying the ViT launch."""
         try:
+            device = self.visual.device
+            device_module = get_device_module()
             host_features = torch.empty(
                 materialized.shape,
                 dtype=materialized.dtype,
                 device="cpu",
-                pin_memory=torch.cuda.is_available(),
+                pin_memory=is_pin_memory_available(device),
             )
             copy_stream = getattr(self, "_mm_feature_copy_stream", None)
             if copy_stream is None:
-                copy_stream = torch.cuda.Stream(device=self.visual.device)
+                copy_stream = device_module.Stream(device=device)
                 self._mm_feature_copy_stream = copy_stream
-            with torch.cuda.stream(copy_stream):
+            with device_module.stream(copy_stream):
                 copy_stream.wait_event(packed_ready)
                 host_features.copy_(materialized, non_blocking=True)
-                host_ready = torch.cuda.Event()
+                host_ready = device_module.Event()
                 host_ready.record(copy_stream)
-            if materialized.is_cuda:
+            if materialized.device.type in ("cuda", "npu"):
                 materialized.record_stream(copy_stream)
             for item, _, offset, length in borrowed_items:
                 item.feature = host_features.narrow(0, offset, length)
                 item.model_specific_data[CUDA_IPC_FEATURE_COPY_EVENT_KEY] = host_ready
         except Exception:
-            # The generic multimodal path will offload the owned CUDA slices.
+            # The generic multimodal path will offload the owned device slices.
             logger.warning(
-                "Failed to preserve CUDA IPC features on the copy stream; "
+                "Failed to preserve IPC features on the copy stream; "
                 "falling back to the generic offload path",
                 exc_info=True,
             )

@@ -142,15 +142,16 @@ class Mm(msgspec.Struct):
         bool, "Deprecated. Use --image-processor-backend=pil instead."
     ] = False
     mm_feature_transport: A[
-        Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
+        Optional[Literal["cpu", "cuda_ipc", "cuda_vmm", "npu_ipc"]],
         Arg(
             help=(
                 "Transport multimodal features through CPU memory, a bounded CUDA IPC "
-                "pool, or a bounded CUDA VMM pool. "
+                "pool, a bounded CUDA VMM pool, or a bounded NPU IPC pool. "
                 "Unset uses cpu except for validated multi-node GB200/GB300 MNNVL models, "
                 "which use cuda_vmm when an IMEX channel is available. Select cuda_ipc "
-                "explicitly for single-node GPU transport. GPU transports reserve "
-                "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base GPU and fall "
+                "explicitly for single-node GPU transport, or npu_ipc for single-node "
+                "NPU transport. Device transports reserve "
+                "SGLANG_MM_FEATURE_CACHE_MB (default 1024 MiB) on the base device and fall "
                 "back to CPU transport when the pool is full."
             ),
             resolvable=True,
