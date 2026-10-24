@@ -69,15 +69,16 @@ mod tests {
             ..Default::default()
         });
         let state = Arc::new(AppState {
-            core: crate::api_server::core::CoreHandle::new(
+            core: crate::api_server::handlers::CoreHandle::new(
                 flume::unbounded().0,
                 flume::unbounded().0,
-                crate::api_server::core::CoreConfig {
+                crate::api_server::handlers::CoreConfig {
                     response_capacity: 8,
                     response_activity: Default::default(),
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    peer_endpoints: Vec::new(),
                     metadata: Default::default(),
                 },
             ),

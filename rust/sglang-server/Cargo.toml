@@ -62,6 +62,9 @@ numpy = "0.29.0"
 # "anything Rust admits, Python can compile" invariant in `message::sampling`.
 # A minor bump can widen it and silently reopen a scheduler-killing hole.
 regex-syntax = "=0.8.11"
+# Plain HTTP only: the client that relays control requests to the other DP
+# ranks' listeners (`api_server::core::peer`). Already in the tree via dynamo.
+reqwest = { version = "0.12", default-features = false }
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 # Already in the tree; `/weights_checker`'s `per_engine_checksum`.

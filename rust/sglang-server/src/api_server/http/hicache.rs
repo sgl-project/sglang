@@ -11,7 +11,8 @@ use axum::{
 };
 use sglang_api_types::api::v1 as api;
 
-use crate::api_server::core::{CoreError, HiCacheManager};
+use crate::api_server::core::CoreError;
+use crate::api_server::handlers::HiCacheManager;
 
 pub(super) fn routes(manager: Arc<HiCacheManager>) -> Router {
     Router::new()
@@ -78,7 +79,7 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    use crate::api_server::core::{CoreConfig, CoreHandle};
+    use crate::api_server::handlers::{CoreConfig, CoreHandle};
     use crate::message::{config::ServerArgs, request::RequestKind, response::ResponseItem};
     use crate::tokenizer_manager::wiring::TmEvent;
 
@@ -98,6 +99,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                peer_endpoints: Vec::new(),
                 metadata: (&args).into(),
             },
         );

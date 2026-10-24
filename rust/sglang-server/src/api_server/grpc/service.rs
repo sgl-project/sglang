@@ -11,7 +11,8 @@ use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
-use crate::api_server::core::{CoreHandle, HealthStatus, HiCacheManager};
+use crate::api_server::core::HealthStatus;
+use crate::api_server::handlers::{CoreHandle, HiCacheManager};
 use crate::message::config::{PreferredSamplingParams, ServerArgs};
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
@@ -274,7 +275,7 @@ mod tests {
     use tonic::{Code, Request};
 
     use super::GrpcService;
-    use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+    use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
     use crate::message::config::{ModelConfig, PreferredSamplingParams, ServerArgs};
     use crate::message::finish_reason::FinishReason;
     use crate::message::ids::Rid;
@@ -318,6 +319,7 @@ mod tests {
                     startup_ready,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(&ServerArgs {
                         served_model_name: "test-model".into(),
                         model_config: ModelConfig {
@@ -658,6 +660,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::default(),
             },
         );

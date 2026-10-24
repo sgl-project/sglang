@@ -1,7 +1,7 @@
 //! Common control-plane endpoints — `/server_info`, `/get_model_info`
 //! (+ `/model_info` alias), `/flush_cache`, `/weights_checker`,
 //! `/abort_request`, backed by typed operations on
-//! [`crate::api_server::core::CoreHandle`]. Data-plane endpoints (incl. `/health*`,
+//! [`crate::api_server::handlers::CoreHandle`]. Data-plane endpoints (incl. `/health*`,
 //! which round-trips a generate probe) live in the sibling `native_api` and
 //! `openai` modules; the shared `AppState` lives in the parent
 //! `api_server` module.
@@ -13,7 +13,7 @@ use axum::{
         Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use super::app::AppState;
 use super::native_api::native_error;
-use crate::api_server::core::CoreError;
+use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
 use crate::message::info::ServerInfo;
 
 /// The routes this module owns, mounted by `api_server::serve`.
@@ -40,6 +40,25 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/flush_cache", get(flush_cache).post(flush_cache))
         .route("/weights_checker", get(check_weights).post(check_weights))
         .route("/abort_request", post(abort_request))
+        // Listener-to-listener: another DP rank's control request for this
+        // rank's scheduler (see `api_server::core::peer`).
+        .route(FORWARD_PEER_PATH, post(forward_control_req))
+}
+
+/// `POST /internal/peer` — the body is a control message's wire bytes,
+/// encoded by another DP rank's listener; the reply body is this scheduler's
+/// encoded output. Errors are plain text so the relaying side can carry the
+/// message into its own merged error.
+async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    match state.core.forward_control_req(body).await {
+        Ok(reply) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/msgpack")],
+            reply,
+        )
+            .into_response(),
+        Err(error) => (error.http_status(), error.to_string()).into_response(),
+    }
 }
 
 /// Await the core's complete semantic server-info result. HTTP status and
@@ -317,7 +336,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::api_server::core::{CoreConfig, CoreEvent, CoreHandle, CoreMetadata};
+    use crate::api_server::core::CoreEvent;
+    use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
     use crate::message::config::{DisaggregationMode, ModelConfig, ServerArgs};
     use crate::message::ids::Rid;
     use crate::message::request::{GenerateRequest, RequestKind};
@@ -343,6 +363,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::from(server_args.as_ref()),
             },
         );
@@ -903,6 +924,61 @@ mod tests {
             }
             drop(request);
         }
+    }
+
+    /// A forwarded control request reaches the local scheduler under the rid
+    /// its sender encoded, and the scheduler's bytes come back as the body.
+    #[tokio::test]
+    async fn forward_control_relays_the_sender_rid_and_the_reply_bytes() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let header = crate::message::io_struct::ControlRequest::FlushCacheReqInput(
+            crate::message::io_struct::FlushCacheReqInput::new("sender-rid".into(), Some(2.0)),
+        )
+        .encode()
+        .unwrap();
+        let response = tokio::spawn(
+            routes().with_state(state.clone()).oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(FORWARD_PEER_PATH)
+                    .body(Body::from(header.clone()))
+                    .unwrap(),
+            ),
+        );
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("forwarded control must submit one control request");
+        };
+        assert!(admission.try_accept());
+        assert_eq!(request.rid.as_str(), "sender-rid");
+        let RequestKind::Control(control) = &request.kind else {
+            panic!("expected a control request");
+        };
+        assert_eq!(control.encode().unwrap(), header, "relayed unchanged");
+        request
+            .sink
+            .try_send(ResponseItem::Control(Bytes::from_static(
+                b"scheduler-reply",
+            )))
+            .unwrap();
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), b"scheduler-reply");
+
+        // A body without a rid cannot be routed back: rejected before intake.
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(FORWARD_PEER_PATH)
+                    .body(Body::from(Bytes::from_static(b"\xc0")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(intake_rx.try_recv().is_err());
     }
 
     #[tokio::test]

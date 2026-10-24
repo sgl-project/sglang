@@ -44,6 +44,7 @@ def _scheduler_for_typed_config():
         tokenizer=None,
         max_total_num_tokens=1024,
         load_snapshot_writer=None,
+        rust_server_endpoints=[{"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}],
     )
 
 
@@ -122,6 +123,9 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
         extension.ServerArgs.call_args.kwargs["deployment_info"]
     )
     assert deployment_info["kv_event_sources"] == [{"endpoint": "tcp://127.0.0.1:5557"}]
+    assert deployment_info["rust_server_endpoints"] == [
+        {"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}
+    ]
 
 
 @pytest.mark.parametrize(
