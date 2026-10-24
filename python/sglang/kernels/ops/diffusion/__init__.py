@@ -442,6 +442,14 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        # no XPU CapabilityRequirement exists yet; validated on Intel XPU only,
+        # CUDA runs the sageattention package
+        "diffusion.sage_attn_qk_int8_pv_fp16",
+        KernelBackend.TRITON,
+        "attention.sage_attn_triton:sage_attn_qk_int8_pv_fp16",
+        frozenset(),
+    ),
+    (
         "diffusion.fused_qknorm_rope_out_of_place",
         KernelBackend.JIT,
         "rope.qknorm_rope_jit:fused_qknorm_rope_out_of_place",
@@ -785,6 +793,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_fused_situ_softcap_mul": "activation.situ_softcap_mul_bitexact",
     "fused_situ_softcap_mul_bitexact": "activation.situ_softcap_mul_bitexact",
     # Diffusion attention kernels
+    "sage_attn_qk_int8_pv_fp16": "attention.sage_attn_triton",
     "cam_scan_bidi_chunkwise": "attention.sana_wm_gdn_chunkwise_triton",
     "fused_bigdn_func": "attention.sana_wm_gdn_triton",
     "fused_qk_inv_rms": "attention.sana_wm_gdn_triton",
