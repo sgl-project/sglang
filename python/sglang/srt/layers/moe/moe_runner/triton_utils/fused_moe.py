@@ -765,10 +765,13 @@ def _fused_moe_kernel_sequence(
 
             if filter_expert:
                 swiglu_limit_for_triton = swiglu_limit
+            elif _is_hip:
+                # No fused silu_and_mul_clamp on HIP. Clamp the scratch gate/up
+                # halves in place, then run the regular silu_and_mul below.
+                gate_up = intermediate_cache1.view(-1, N)
+                gate_up[:, : N // 2].clamp_(max=swiglu_limit)
+                gate_up[:, N // 2 :].clamp_(min=-swiglu_limit, max=swiglu_limit)
             else:
-                assert _is_cuda or _is_xpu, (
-                    "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
-                )
                 swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
 
             if not filter_expert:
