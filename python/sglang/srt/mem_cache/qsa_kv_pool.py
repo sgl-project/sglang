@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
+from sglang.srt.platforms import current_platform
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,67 @@ class QSATokenToKVPool(HybridLinearKVPool):
         ]
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
+
+    def _qsa_ring_rows(self, req_pool_index) -> torch.Tensor:
+        r = self.qsa_compress_ratio
+        start = int(req_pool_index) * r
+        return torch.arange(
+            start, start + r, device=self.qsa_rope_position_buffer.device
+        )
+
+    def _qsa_compressed_slots(self, indices) -> torch.Tensor:
+        # A request's tokens start page-aligned and pages are a multiple of the
+        # ratio, so every ratio-th token opens a group. Keep request order (not
+        # sorted) so group k maps to the new allocation's group k on load.
+        return indices.long()[:: self.qsa_compress_ratio] // self.qsa_compress_ratio
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """KV + Mamba (parent) plus the QSA indexer state of the request.
+
+        Retraction reuses KV pages and request rows, so the compressed index
+        keys of the request's pages and its pending ring must travel with the
+        KV, or the resumed request selects blocks with another request's keys.
+        """
+        parent = super().get_cpu_copy(
+            indices, mamba_indices=mamba_indices, req_pool_index=req_pool_index
+        )
+        comp = self._qsa_compressed_slots(indices)
+        compressed_cpu = [
+            buf[comp].to("cpu", non_blocking=True)
+            for buf in self.qsa_compressed_k_buffer_pool
+        ]
+        ring_cpu = None
+        if req_pool_index is not None and self.qsa_key_state_buffer_pool:
+            ring = self._qsa_ring_rows(req_pool_index)
+            ring_cpu = (
+                [
+                    buf[ring].to("cpu", non_blocking=True)
+                    for buf in self.qsa_key_state_buffer_pool
+                ],
+                self.qsa_rope_position_buffer[ring].to("cpu", non_blocking=True),
+            )
+        current_platform.synchronize()
+        return parent, (compressed_cpu, ring_cpu)
+
+    def load_cpu_copy(
+        self, cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        parent, (compressed_cpu, ring_cpu) = cache_cpu
+        super().load_cpu_copy(
+            parent, indices, mamba_indices=mamba_indices, req_pool_index=req_pool_index
+        )
+        comp = self._qsa_compressed_slots(indices)
+        for buf, data in zip(self.qsa_compressed_k_buffer_pool, compressed_cpu):
+            buf[comp] = data.to(buf.device, non_blocking=True)
+        if ring_cpu is not None and req_pool_index is not None:
+            ring = self._qsa_ring_rows(req_pool_index)
+            keys_cpu, rope_cpu = ring_cpu
+            for buf, data in zip(self.qsa_key_state_buffer_pool, keys_cpu):
+                buf[ring] = data.to(buf.device, non_blocking=True)
+            self.qsa_rope_position_buffer[ring] = rope_cpu.to(
+                self.qsa_rope_position_buffer.device, non_blocking=True
+            )
+        current_platform.synchronize()
 
     def get_qsa_key_state_buffer(self, layer_id: int) -> torch.Tensor:
         return self.qsa_key_state_buffer_pool[
