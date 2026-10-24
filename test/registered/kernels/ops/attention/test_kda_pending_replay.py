@@ -79,11 +79,11 @@ def test_fallback_transition_and_captured_stage():
 
     pending.flush = counted_flush
     pending.stage(*rings, slots, accepted)
-    for batch_size in (16, 32, 48):
+    for batch_size in range(1, 65):
         pending.before_verify(batch_size=batch_size, block_size=8)
     assert not calls
-    pending.before_verify(batch_size=1, block_size=8)
-    pending.before_verify(batch_size=1, block_size=8)
+    pending.before_verify(batch_size=65, block_size=8)
+    pending.before_verify(batch_size=65, block_size=8)
     assert len(calls) == 1
     torch.testing.assert_close(state, expected, rtol=1e-5, atol=1e-6)
 
@@ -91,10 +91,10 @@ def test_fallback_transition_and_captured_stage():
     with torch.cuda.graph(graph):
         pending.stage(*rings, slots, accepted)
     state.copy_(initial)
-    pending.before_verify(batch_size=1, block_size=8)
+    pending.before_verify(batch_size=65, block_size=8)
     state.copy_(initial)
     graph.replay()
-    pending.before_verify(batch_size=1, block_size=8)
+    pending.before_verify(batch_size=65, block_size=8)
     torch.testing.assert_close(state, expected, rtol=1e-5, atol=1e-6)
 
 
@@ -136,3 +136,31 @@ def test_tracking_commits_immediately_and_other_rows_defer():
     assert pending.counts[:, 1].count_nonzero().item() > 0
     pending.flush()
     torch.testing.assert_close(state, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_changing_batch_preserves_pending_slot_ownership():
+    torch.manual_seed(43)
+    state = torch.randn(2, 70, 2, 128, 128, device="cuda") * 0.01
+    expected = state.clone()
+    pending = KdaPendingReplay(state)
+    for batch_size in (31, 17, 33, 48, 64, 16, 1):
+        # The same slot can move to a different row or leave the next batch.
+        slots = torch.randperm(70, device="cuda")[:batch_size].to(torch.int32)
+        accepted = (torch.arange(batch_size, device="cuda") % 9).to(torch.int32)
+        pending.before_verify(batch_size=batch_size, block_size=8)
+        # Model per-layer consumption before replacing this slot's ring.
+        for layer in range(2):
+            pending.flush(layer=layer, indices=slots)
+        shape = (2, 70, 2, 16, 128)
+        rawv = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        rings = (
+            rawv,
+            torch.randn_like(rawv),
+            -torch.rand(shape, device="cuda") * 0.1,
+            torch.rand(shape[:-1], device="cuda"),
+        )
+        pending.stage(*rings, slots, accepted)
+        fold(expected, rings, slots, accepted)
+    pending.before_verify(batch_size=65, block_size=8)
+    torch.testing.assert_close(state, expected, rtol=1e-5, atol=1e-6)
+    assert pending.counts.count_nonzero().item() == 0

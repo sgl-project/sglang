@@ -1563,7 +1563,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             commit_kda_replayssm_after_verify(
                 pending_replay=(
                     getattr(mamba_pool, "kda_pending_replay", None)
-                    if request_number in (16, 32, 48) and src_indices_raw is None
+                    if 1 <= request_number <= 64 and src_indices_raw is None
                     else None
                 ),
                 spec_state=mamba_caches,

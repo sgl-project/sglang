@@ -1218,7 +1218,7 @@ def commit_mamba_states_after_verify(
         commit_kda_replayssm_after_verify(
             pending_replay=(
                 getattr(mamba_pool, "kda_pending_replay", None)
-                if state_batch_indices.numel() in (16, 32, 48)
+                if 1 <= state_batch_indices.numel() <= 64
                 and draft_token_num == 8
                 and src_indices_raw is None
                 else None

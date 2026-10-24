@@ -1337,7 +1337,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 pending_layer = self.req_to_token_pool.mamba2_layer_index(
                     layer.layer_id
                 )
-                if draft_token_num == 8 and query_start_loc.numel() in (17, 33, 49):
+                if draft_token_num == 8 and 2 <= query_start_loc.numel() <= 65:
                     pending_kwargs = self.pending_replay.layer_kwargs(pending_layer)
                 # Other buckets are flushed once by DFlash before graph replay.
             return self._run_dspark_cutedsl_mtp(
@@ -1358,7 +1358,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=mamba_cache_params.replayssm_g,
                 replayssm_beta=mamba_cache_params.replayssm_beta,
             )
-        if self.pending_replay is not None and query_start_loc.numel() in (17, 33, 49):
+        if self.pending_replay is not None and 2 <= query_start_loc.numel() <= 65:
             self.pending_replay.flush(
                 self.req_to_token_pool.mamba2_layer_index(layer.layer_id),
                 indices=self.forward_metadata.mamba_cache_indices,

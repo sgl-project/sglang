@@ -168,11 +168,12 @@ class KdaPendingReplay:
     def before_verify(self, *, batch_size, block_size):
         """Run on the forward stream, outside captured graphs, before verify.
 
-        A change away from the fused bucket materializes all pending state once.
-        Repeated BS1 verifies then have no extra flush kernels. The graph-stage
-        case remains conservative because replays do not update Python flags.
+        Leaving the supported batch range materializes pending state once.
+        Changing batch size within that range does not require a global flush.
+        The graph-stage case remains conservative because replays do not update
+        Python flags.
         """
-        if batch_size in (16, 32, 48) and block_size == 8:
+        if 1 <= batch_size <= 64 and block_size == 8:
             return
         if self._may_have_pending or self._stage_in_graph:
             self.flush()

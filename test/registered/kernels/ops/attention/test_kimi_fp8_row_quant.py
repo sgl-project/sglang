@@ -11,7 +11,7 @@ if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
     pytest.skip("Blackwell CUDA is required", allow_module_level=True)
 
 
-@pytest.mark.parametrize("m", [256, 384])
+@pytest.mark.parametrize("m", [136, 144, 248, 256, 264, 376, 384, 512])
 @pytest.mark.parametrize("k", [1536, 7168])
 def test_row_schedule_matches_flat(m, k):
     from sglang.kernels.ops.quantization.fp8_kernel import (

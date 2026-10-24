@@ -194,7 +194,7 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
 
 
-@pytest.mark.parametrize("batch", [1, 16, 32, 48])
+@pytest.mark.parametrize("batch", range(1, 65))
 def test_deferred_replay_matches_fold_then_verify(batch, monkeypatch):
     from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
         commit_kda_replayssm_spec,
@@ -214,7 +214,7 @@ def test_deferred_replay_matches_fold_then_verify(batch, monkeypatch):
     gate = -torch.rand(slots, heads, 8, 128, device=DEV) * 0.2
     beta = torch.rand(slots, heads, 8, device=DEV)
     accepted = torch.tensor(
-        [4] if batch == 1 else [0, 1, 4, 8] * (batch // 4),
+        [4] if batch == 1 else ([0, 1, 4, 8] * ((batch + 3) // 4))[:batch],
         dtype=torch.int32,
         device=DEV,
     )

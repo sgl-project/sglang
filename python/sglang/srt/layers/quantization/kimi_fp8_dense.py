@@ -7,15 +7,15 @@ import torch
 
 
 def use_deepgemm(m: int, n: int, k: int) -> bool:
-    # MLA Q-B remains on FlashInfer at M256: measured DeepGEMM regression.
-    # Larger decode buckets use the measured quant+GEMM winner.
+    # Keep MLA Q-B on FlashInfer through M256; use DeepGEMM above it.
+    # DFlash block8 produces aligned rows even for unpadded batch sizes.
     return (
         (
-            m in (8, 128, 256, 384)
+            (m == 8 or (128 <= m <= 384 and m % 8 == 0))
             and (n, k) in ((6144, 7168), (2112, 7168), (1536, 7168))
         )
-        or (m in (128, 256, 384) and (n, k) == (7168, 1536))
-        or (m == 384 and (n, k) == (2304, 1536))
+        or ((128 <= m <= 384 and m % 8 == 0) and (n, k) == (7168, 1536))
+        or (264 <= m <= 384 and m % 8 == 0 and (n, k) == (2304, 1536))
     )
 
 
@@ -61,7 +61,7 @@ def try_apply(layer, x, bias):
         deepgemm_w8a8_block_fp8_linear_with_fallback,
     )
 
-    if m in (256, 384):
+    if 128 < m <= 384:
         q, scales = quantize_rows(x.view(m, x.shape[-1]))
         output = deepgemm_w8a8_block_fp8_linear_with_fallback(
             q,
@@ -99,9 +99,9 @@ def _row_quant_module():
 
 
 def quantize_rows(x):
-    """BF16 -> FP8 with packed, column-major UE8M0 scales for M256/M384."""
+    """BF16 -> FP8 with packed, column-major UE8M0 scales for aligned decode rows."""
     m, k = x.shape
-    if m not in (256, 384) or k % 512 or not x.is_contiguous():
+    if not (128 <= m <= 512 and m % 8 == 0) or k % 512 or not x.is_contiguous():
         raise ValueError("Unsupported Kimi row-quantization layout")
     q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     scales = torch.empty((k // 512, m), dtype=torch.int32, device=x.device).t()
