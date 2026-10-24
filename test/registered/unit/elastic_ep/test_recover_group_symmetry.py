@@ -1,16 +1,5 @@
-"""Unit tests for how wide a rank's readmission is — no server, no Mooncake.
-
-A rank has to rejoin exactly the groups its peers readmit it to. If a survivor calls
-``recover_ranks`` on a group the returning rank never called ``join_group`` on, or the
-other way round, Mooncake sizes that group's next collective from a bitmap the two
-sides disagree about. ``mlp_sync`` runs over ``tp_group``, so a plain fault recovery
-hits it immediately.
-
-Shrink announces a departure in every live group, so a bare fault has to be recovered
-just as widely. A scale regrow must stay narrow: its joiner is inactive rather than
-faulted, and ``joinGroup`` takes only an isolated or inactive rank. These tests pin
-both breadths and, most importantly, that the two sides of each agree.
-"""
+"""A rank must rejoin exactly the groups its peers readmit it to, or Mooncake mis-sizes
+that group's next collective. No server, no Mooncake."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -28,13 +17,8 @@ FAULTED_RANK = 2
 
 
 class FakePg:
-    """Stands in for a ProcessGroup. Identity is all the code under test uses."""
-
     def __init__(self, label):
         self.label = label
-
-    def __repr__(self):
-        return f"FakePg({self.label})"
 
 
 class FakeGroup:
@@ -50,13 +34,12 @@ class FakeGroup:
         self.mq_broadcaster = None
 
 
-class RecordingMooncake:
-    """Records which PGs each side touched, which is the whole point here."""
+class RecordingMooncake(types.ModuleType):
+    """Stands in for ``mooncake.pg`` and records which PGs each side touched."""
 
     def __init__(self):
-        self.recovered = []
-        self.joined = []
-        self.peer_state_ok = True
+        super().__init__("mooncake.pg")
+        self.recovered, self.joined, self.peer_state_ok = [], [], True
 
     def recover_ranks(self, pg, ranks):
         self.recovered.append((pg.label, tuple(ranks)))
@@ -70,14 +53,6 @@ class RecordingMooncake:
     def deactivate_ranks(self, pg, ranks):
         pass
 
-    def as_module(self):
-        module = types.ModuleType("mooncake.pg")
-        module.recover_ranks = self.recover_ranks
-        module.join_group = self.join_group
-        module.get_peer_state = self.get_peer_state
-        module.deactivate_ranks = self.deactivate_ranks
-        return module
-
 
 class _GroupFixture(CustomTestCase):
     """A world group plus the sub-groups a shrink would have deactivated."""
@@ -86,81 +61,61 @@ class _GroupFixture(CustomTestCase):
         import sglang.srt.elastic_ep.elastic_ep as eep
 
         self.eep = eep
-        ranks = list(range(WORLD_SIZE))
-        self.world = FakeGroup("world:0", ranks)
-        self.tp = FakeGroup("tp:0", ranks)
-        self.moe_ep = FakeGroup("moe_ep:0", ranks)
-        self.attn = FakeGroup("attn_tp:0", ranks)
+        self.world, self.tp, self.moe_ep, self.attn = (
+            FakeGroup(name, range(WORLD_SIZE))
+            for name in ("world:0", "tp:0", "moe_ep:0", "attn_tp:0")
+        )
         # Nothing to join in a group of one, and no peer holds the other side.
         self.solo = FakeGroup("solo:0", [FAULTED_RANK])
         self.groups = [self.world, self.tp, self.moe_ep, self.attn, self.solo]
-
         self.mooncake = RecordingMooncake()
         self.default_pg = FakePg("default_world")
-
-        patches = [
-            mock.patch.dict(
-                sys.modules,
-                {
-                    "mooncake": types.ModuleType("mooncake"),
-                    "mooncake.pg": self.mooncake.as_module(),
-                },
+        modules = {
+            "mooncake": types.ModuleType("mooncake"),
+            "mooncake.pg": self.mooncake,
+        }
+        for patch in (
+            mock.patch.dict(sys.modules, modules),
+            mock.patch.object(
+                eep, "_iter_live_parallel_groups", lambda: iter(self.groups)
             ),
             mock.patch.object(
-                self.eep, "_iter_live_parallel_groups", lambda: iter(self.groups)
+                eep.torch.distributed, "group", mock.Mock(WORLD=self.default_pg)
             ),
-            mock.patch.object(
-                self.eep.torch.distributed, "group", mock.Mock(WORLD=self.default_pg)
-            ),
-        ]
-        for patch in patches:
+            # _WORLD is in the registry the iterator walks, so both paths must skip it;
+            # its own PGs are handled by the WORLD-scope step.
+            mock.patch.object(eep.parallel_state, "_WORLD", self.world),
+        ):
             patch.start()
             self.addCleanup(patch.stop)
-        # _WORLD is in the same registry the iterator walks, so both paths have to
-        # recognise and skip it; its own PGs are handled by the WORLD-scope step.
-        world_patch = mock.patch.object(self.eep.parallel_state, "_WORLD", self.world)
-        world_patch.start()
-        self.addCleanup(world_patch.stop)
 
     def sub_group_labels(self):
         """Every non-WORLD PG a shrink would have deactivated for the faulted rank."""
-        labels = set()
-        for group in (self.tp, self.moe_ep, self.attn):
-            labels.add(group.device_group.label)
-            labels.add(group.cpu_group.label)
-        return labels
+        return {
+            pg.label
+            for group in (self.tp, self.moe_ep, self.attn)
+            for pg in (group.device_group, group.cpu_group)
+        }
+
+    def join_all(self):
+        self.eep._join_world_group(include_subgroups=True, include_parallel_groups=True)
 
 
 class TestBareFaultRecoveryIsSymmetric(_GroupFixture):
-    def test_survivor_readmits_every_sub_group(self):
+    def test_the_two_sides_agree_on_every_sub_group(self):
         self.assertTrue(self.eep._recover_parallel_groups([FAULTED_RANK]))
-        recovered = {label for label, _ in self.mooncake.recovered}
+        readmitted = {label for label, _ in self.mooncake.recovered}
         self.assertEqual(
-            recovered,
+            readmitted,
             self.sub_group_labels(),
             "a group left out here mis-sizes its next collective",
         )
-
-    def test_returning_rank_joins_exactly_what_survivors_readmit(self):
-        self.eep._join_world_group(include_subgroups=True, include_parallel_groups=True)
-        joined = set(self.mooncake.joined)
-        # The WORLD-scope PGs are on both sides of the handshake too, but they are the
-        # part that already worked; the sub-groups are what this test exists for.
-        self.assertEqual(
-            joined & self.sub_group_labels(),
-            self.sub_group_labels(),
-            "the returning rank must join every group a survivor readmits it to",
-        )
-
-    def test_the_two_sides_agree(self):
-        self.eep._recover_parallel_groups([FAULTED_RANK])
-        readmitted = {label for label, _ in self.mooncake.recovered}
         self.mooncake.recovered.clear()
-        self.eep._join_world_group(include_subgroups=True, include_parallel_groups=True)
-        joined = set(self.mooncake.joined)
+        self.join_all()
+        # WORLD-scope PGs are on both sides too; the sub-groups are what this covers.
         self.assertEqual(
+            set(self.mooncake.joined) & self.sub_group_labels(),
             readmitted,
-            joined & self.sub_group_labels(),
             "readmit and rejoin must cover the same groups",
         )
 
@@ -169,8 +124,7 @@ class TestBareFaultRecoveryIsSymmetric(_GroupFixture):
         self.eep._recover_parallel_groups([FAULTED_RANK])
         for label, _ in self.mooncake.recovered:
             self.assertNotIn("world:0", label)
-
-        self.eep._join_world_group(include_subgroups=True, include_parallel_groups=True)
+        self.join_all()
         self.assertEqual(
             self.mooncake.joined.count("world:0.cpu"),
             1,
@@ -180,10 +134,9 @@ class TestBareFaultRecoveryIsSymmetric(_GroupFixture):
     def test_a_solo_group_is_skipped_on_both_sides(self):
         """No peer holds the other half of a one-rank group."""
         self.eep._recover_parallel_groups([FAULTED_RANK])
-        self.eep._join_world_group(include_subgroups=True, include_parallel_groups=True)
-        touched = {label for label, _ in self.mooncake.recovered} | set(
-            self.mooncake.joined
-        )
+        self.join_all()
+        touched = {label for label, _ in self.mooncake.recovered}
+        touched.update(self.mooncake.joined)
         self.assertNotIn(self.solo.device_group.label, touched)
         self.assertNotIn(self.solo.cpu_group.label, touched)
 

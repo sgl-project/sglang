@@ -343,8 +343,7 @@ def refresh_deep_gemm_layout_memory_budget(
     )
 
     world_group = get_parallel().world_group
-    # Solo boot: deep_gemm's WORLD all_reduce has no matching peer -> wedge.
-    solo_join = get_exec().moe.is_ep_offset_joiner
+    solo_join = get_exec().moe.is_ep_offset_joiner  # No WORLD peers to all_reduce with.
     available_memory_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,

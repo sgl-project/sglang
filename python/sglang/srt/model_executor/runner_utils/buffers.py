@@ -210,12 +210,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 encoder_lens = None
 
             if require_mlp_tp_gather:
-                # Pool ceiling, not live width: a captured graph replays against this
-                # exact storage, so a scale must not resize it.
-                dp_capacity = dp_capacity_for(num_dp_ranks)
-                global_num_tokens_gpu = torch.zeros((dp_capacity,), dtype=torch.int32)
+                # Pool ceiling, not live width: captured graphs replay this storage.
+                num_dp_ranks = dp_capacity_for(num_dp_ranks)
+                global_num_tokens_gpu = torch.zeros((num_dp_ranks,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros(
-                    (dp_capacity,), dtype=torch.int32
+                    (num_dp_ranks,), dtype=torch.int32
                 )
             else:
                 global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
