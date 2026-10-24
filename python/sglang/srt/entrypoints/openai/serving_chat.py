@@ -1106,7 +1106,13 @@ class OpenAIServingChat(OpenAIServingBase):
             and not chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)
             and not prefers_prompt_ids
         ):
-            return "text", processed_messages.prompt
+            prompt = processed_messages.prompt
+            if prompt is None:
+                # A text-only request that is sent as text is decoded only here.
+                prompt = self.tokenizer_manager.tokenizer.decode(
+                    processed_messages.prompt_ids
+                )
+            return "text", prompt
         if isinstance(processed_messages.prompt_ids, str):
             return "text", processed_messages.prompt_ids
         return "input_ids", processed_messages.prompt_ids
@@ -1711,13 +1717,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self._tokenizer_auto_adds_specials
                 else {}
             )
+            # Only a request with media needs the prompt text and its cache: the
+            # MM processor reads the text. A text-only request is decoded later,
+            # and only if it is not sent as ids.
+            has_media = bool(image_data or video_data or audio_data or modalities)
             try:
                 prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
                     openai_compatible_messages,
                     tools=tools,
                     template_kwargs=extra_template_kwargs,
                     encode_kwargs=encode_kwargs,
-                    use_cache=is_multimodal,
+                    use_cache=is_multimodal and has_media,
                 )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
@@ -1733,7 +1743,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=tools,
                         template_kwargs=extra_template_kwargs,
                         encode_kwargs=encode_kwargs,
-                        use_cache=is_multimodal,
+                        use_cache=is_multimodal and has_media,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -1749,12 +1759,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 # The cached decode corresponds to prompt_ids before the prefix.
                 decoded_prompt = None
 
-            if is_multimodal:
+            if is_multimodal and has_media:
                 prompt = (
                     decoded_prompt
                     if decoded_prompt is not None
                     else self.tokenizer_manager.tokenizer.decode(prompt_ids)
                 )
+            elif is_multimodal:
+                prompt = None
 
         stop = request.stop
         image_data = image_data if image_data else None

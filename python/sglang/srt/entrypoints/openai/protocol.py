@@ -2338,7 +2338,8 @@ class RequestResponseMetadata(BaseModel):
 
 @dataclass
 class MessageProcessingResult:
-    prompt: str
+    # None: a text-only prompt on a multimodal model that was not decoded yet.
+    prompt: Optional[str]
     prompt_ids: Union[str, List[int]]
     image_data: Optional[Any]
     audio_data: Optional[Any]
