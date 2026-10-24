@@ -647,8 +647,23 @@ def test_default_image_output_format_preserves_rgba():
     assert _resolve_image_output_format("webp", QwenImage21SamplingParams) == "webp"
 
 
-@pytest.mark.parametrize("outputs", [1, 2])
-def test_dynamic_batching_preserves_output_order_and_seeds(outputs):
+@pytest.mark.parametrize(
+    "outputs,seeds,expected_seeds",
+    [
+        (1, (7, 17), [7, 17]),
+        (1, ([7], [17]), [7, 17]),
+        (2, (7, 17), [7, 8, 17, 18]),
+        (2, ([7, 101], [17, 203]), [7, 101, 17, 203]),
+        (2, ([7, 101], 17), [7, 101, 17, 18]),
+        (2, (7, [17, 203]), [7, 8, 17, 203]),
+        (2, ([7, 7], [17, 17]), [7, 7, 17, 17]),
+        (2, ([17, 203], [7, 101]), [17, 203, 7, 101]),
+        (3, ([7, 101, 303], [17, 203, 505]), [7, 101, 303, 17, 203, 505]),
+    ],
+)
+def test_dynamic_batching_preserves_output_order_and_seeds(
+    outputs, seeds, expected_seeds
+):
     scheduler = object.__new__(Scheduler)
     config = QwenImage21PipelineConfig()
     scheduler.server_args = SimpleNamespace(pipeline_config=config)
@@ -657,12 +672,35 @@ def test_dynamic_batching_preserves_output_order_and_seeds(outputs):
     requests = []
     for i, prompt in enumerate(["short", "a longer prompt"]):
         params = QwenImage21SamplingParams(
-            prompt=prompt, seed=7 + i * 10, num_outputs_per_prompt=outputs
+            prompt=prompt,
+            seed=seeds[i],
+            num_outputs_per_prompt=outputs,
+            generator_device="cpu",
         )
         requests.append(Req(request_id=f"request-{i}", sampling_params=params))
+
+    stage = InputValidationStage()
+    individual_noise = []
+    for request in requests:
+        stage._generate_seeds(request, scheduler.server_args)
+        individual_noise.extend(
+            torch.randn((2, 3), generator=generator) for generator in request.generator
+        )
+
     merged = scheduler._try_merge_generation_reqs(requests)
+    assert merged is not None
     assert merged.prompt == ["short", "a longer prompt"]
-    assert merged.extra["dynamic_batch_seeds"] == [7, 17]
+    stage._generate_seeds(merged, scheduler.server_args)
+    assert merged.seeds == expected_seeds
+    assert [
+        generator.initial_seed() for generator in merged.generator
+    ] == expected_seeds
+    merged_noise = [
+        torch.randn((2, 3), generator=generator) for generator in merged.generator
+    ]
+    torch.testing.assert_close(
+        torch.stack(merged_noise), torch.stack(individual_noise), rtol=0, atol=0
+    )
     result = torch.arange(outputs * 2).reshape(-1, 1)
     split = scheduler._split_batched_output(OutputBatch(output=result), requests)
     assert len(split) == 2
