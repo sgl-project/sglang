@@ -2332,6 +2332,38 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertTrue(full_text.startswith("Let me"))
         self.assertGreater(len(all_calls), 0)
 
+    def test_streaming_stray_closing_tags_do_not_corrupt_arguments(self):
+        """
+        Test stray closing tags after a complete call stay inert.
+
+        Scenario: a finished call is followed by a stray tail repeating the
+        closers (`</invoke>`, `</function>`, `</tool_call>`), which models
+        sometimes emit. Purpose: the stray `</function>` must not emit a
+        second `}` into the finished call's arguments (regression for #45226).
+        """
+        chunks = [
+            "<tool_call>",
+            "<function=get_current_weather>",
+            "<parameter=location>Boston</parameter>",
+            "</function>",
+            "</tool_call>",
+            "\n</invoke>\n\n</function>\n</tool_call>\n",
+        ]
+
+        detector = Qwen3CoderDetector()
+        collected_params = ""
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.parameters:
+                    collected_params += call.parameters
+
+        # The finished call's arguments stay valid JSON (the stray
+        # `</function>` used to append a second `}`).
+        params = json.loads(collected_params)
+        self.assertEqual(params["location"], "Boston")
+
     # ==================== Parameter Type Tests ====================
 
     def test_integer_parameter_conversion(self):
