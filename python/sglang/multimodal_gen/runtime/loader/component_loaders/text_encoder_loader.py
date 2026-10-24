@@ -498,15 +498,16 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         self,
         model: EncoderTensorParallelMixin,
         model_path: str,
+        to_cpu: bool,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         def include_checkpoint_weight(name: str) -> bool:
             return not name.endswith(
                 ".comfy_quant"
             ) and model.should_materialize_checkpoint_weight(name)
 
-        # copy into the allocated parameters without a second GPU weight tensor
         yield from checkpoint_weights_iterator(
             model_path,
+            to_cpu=to_cpu,
             key_filter=include_checkpoint_weight,
             index_file=SAFE_WEIGHTS_INDEX_NAME,
         )
@@ -749,7 +750,12 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     key_filter=model.should_materialize_checkpoint_weight,
                 )
             else:
-                checkpoint_weights = self._get_all_weights(model, model_path)
+                # copy into the allocated parameters without a second GPU weight tensor
+                checkpoint_weights = self._get_all_weights(
+                    model,
+                    model_path,
+                    to_cpu=True,
+                )
             if isinstance(quant_config, QuantoInt8Config):
                 checkpoint_weights = normalize_quanto_int8_weights(checkpoint_weights)
             loaded_weights = model.load_weights(checkpoint_weights)
