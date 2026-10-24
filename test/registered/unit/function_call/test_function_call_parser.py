@@ -2729,7 +2729,7 @@ class TestGptOssDetector(unittest.TestCase):
         self.assertIsInstance(grammar, xgr.Grammar)
 
 
-class TestGlm4MoeDetector(unittest.TestCase):
+class TestGlm4MoeDetector(CustomTestCase):
     def setUp(self):
         self.tools = [
             Tool(
@@ -2749,6 +2749,34 @@ class TestGlm4MoeDetector(unittest.TestCase):
             ),
         ]
         self.detector = Glm4MoeDetector()
+
+    def test_nonstreaming_function_name_whitespace(self):
+        """Whitespace around a defined name must not silently drop the call."""
+        for name in (
+            "get_weather",
+            " get_weather",
+            "get_weather ",
+            "get_weather\t",
+            "get_weather\r",
+            "\tget_weather \t",
+        ):
+            for separator in ("\n", r"\n"):
+                with self.subTest(name=name, separator=separator):
+                    text = (
+                        f"<tool_call>{name}{separator}"
+                        "<arg_key>city</arg_key>\n<arg_value>  Beijing  </arg_value>\n"
+                        "<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n"
+                        "</tool_call>"
+                    )
+                    result = self.detector.detect_and_parse(text, self.tools)
+                    self.assertEqual(result.normal_text, "")
+                    self.assertEqual(len(result.calls), 1)
+                    self.assertEqual(result.calls[0].tool_index, 0)
+                    self.assertEqual(result.calls[0].name, "get_weather")
+                    self.assertEqual(
+                        json.loads(result.calls[0].parameters),
+                        {"city": "  Beijing  ", "date": "2024-06-27"},
+                    )
 
     def test_multiple_tool_calls(self):
         text = (
