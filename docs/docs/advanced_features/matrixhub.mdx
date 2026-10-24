@@ -1,0 +1,99 @@
+---
+title: "MatrixHub"
+metatags:
+    description: "Use MatrixHub as a self-hosted model registry and distribution layer for SGLang: cache Hugging Face models on-premises, cut cold-start time, and share model artifacts across inference fleets."
+---
+
+[MatrixHub](https://matrixhub.ai/) is a self-hosted model registry and distribution layer for production AI infrastructure. It exposes a Hugging Face-compatible endpoint, so SGLang can pull model artifacts from a private on-premises cache instead of reaching the public Hugging Face Hub on every cold start. The client keeps using the original Hugging Face repo name — integration is just setting `HF_ENDPOINT`.
+
+## What MatrixHub adds to an SGLang deployment
+
+A single SGLang server loads its checkpoint from `--model-path` on startup. In private networks or multi-node fleets, every replica pointing at the same model can end up downloading it independently from Hugging Face, so cold-start time depends on public bandwidth, rate limits, and remote availability. MatrixHub sits in front of SGLang as a caching registry layer:
+
+- **[Hugging Face-compatible proxy](https://matrixhub.ai/).** SGLang keeps referencing the original Hugging Face repo (e.g. `Qwen/Qwen3-0.6B`); the only change is pointing `HF_ENDPOINT` at the MatrixHub proxy. No SGLang code or server-argument changes are required.
+- **On-premises model cache.** The first request for a model fills the MatrixHub cache from upstream Hugging Face; later requests for the same model are served from the local cache, eliminating repeated downloads across replicas and machines.
+- **Distribution layer for inference fleets.** SGLang, vLLM, Transformers, and other Hugging Face-compatible clients share a single model entrypoint, so the same cached artifacts feed every serving workflow in the cluster.
+- **Predictable startup in private networks.** Removing the live dependency on public Hugging Face makes cold-start time stable and reproducible, which matters for autoscaling and CI-driven deployments.
+
+## How it works
+
+```text
+SGLang / vLLM / Transformers
+        ↓  (HF_ENDPOINT)
+MatrixHub Proxy Project
+        ↓
+MatrixHub local cache  →  (cache miss)  →  upstream Hugging Face
+```
+
+The client always references the original Hugging Face repo name. MatrixHub transparently serves cached files on a hit, or pulls from upstream on a miss and caches them for subsequent requests.
+
+## Get started
+
+1. **Create a Hugging Face Registry in MatrixHub** and expose it through a Proxy Project. The Proxy Project is a Hugging Face-compatible entrypoint that starts empty — MatrixHub does not sync upstream models until they are first requested. See the [MatrixHub documentation](https://matrixhub.ai/) for setup.
+2. **Pre-warm the cache** (optional) so the model is available before the first SGLang cold start:
+
+   ```bash
+   HF_ENDPOINT=http://127.0.0.1:3002 hf download Qwen/Qwen3-0.6B
+   ```
+
+   If the files are not cached yet, MatrixHub pulls them from upstream Hugging Face and stores them locally.
+
+3. **Point SGLang at MatrixHub** by setting `HF_ENDPOINT`:
+
+   ```bash
+   HF_ENDPOINT=http://127.0.0.1:3002 python -m sglang.launch_server \
+     --model-path Qwen/Qwen3-0.6B \
+     --host 0.0.0.0 \
+     --port 30000
+   ```
+
+   The startup log confirms the endpoint used for model downloads:
+
+   ```text
+   Hugging Face endpoint for model downloads: http://127.0.0.1:3002
+   ```
+
+   Once the weights are fetched, the server becomes ready:
+
+   ```text
+   The server is fired up and ready to roll!
+   ```
+
+## Performance
+
+A cold-start comparison with `Qwen/Qwen3-0.6B` — local Hugging Face cache cleared before each run, identical SGLang arguments, only `HF_ENDPOINT` changed:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "40%"}} />
+    <col style={{width: "35%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Model source</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Endpoint</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Startup time</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MatrixHub cache</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>http://127.0.0.1:3002</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>~35 seconds</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Hugging Face</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>https://huggingface.co</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>~125 seconds</td>
+    </tr>
+  </tbody>
+</table>
+
+`Qwen3-0.6B` is a small model. With larger checkpoints, or with many machines repeatedly pulling the same models, the shared cache layer has a proportionally larger effect. See the [full benchmark write-up](https://matrixhub.ai/blog/sglang-matrixhub-cache-acceleration) for details.
+
+## See Also
+
+- [Model Loading](./model_loading)
+- [Loading Models from Object Storage](./object_storage)
+- [llm-d](./llm-d)
