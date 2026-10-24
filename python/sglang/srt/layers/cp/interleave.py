@@ -298,8 +298,13 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         if physical_rank_len == 0:
             return x.new_empty((0, *x.shape[1:]))
 
-        padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
-        padded_x[:local_logical_len] = x[:local_logical_len]
+        # Equal shards already have the collective shape. Avoid a zero fill
+        # and D2D staging copy before launching the attention KV collective.
+        if local_logical_len == physical_rank_len and x.is_contiguous():
+            padded_x = x[:physical_rank_len]
+        else:
+            padded_x = x.new_zeros((physical_rank_len, *x.shape[1:]))
+            padded_x[:local_logical_len] = x[:local_logical_len]
 
         with use_symmetric_memory(
             get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()

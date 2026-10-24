@@ -16,39 +16,35 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestCPIndexerOverlap(CustomTestCase):
-    def test_ready_event_precedes_scoring_and_join_covers_errors(self):
-        for score, fails in ((True, False), (False, False), (True, True)):
-            with self.subTest(score=score, fails=fails):
+    def test_kv_precedes_indexer_and_join_covers_errors(self):
+        for failure in (None, "gather", "indexer"):
+            with self.subTest(failure=failure):
                 operations = []
                 main = SimpleNamespace(
                     wait_stream=lambda other: operations.append("join")
                 )
                 side = SimpleNamespace(
-                    wait_event=lambda event: operations.append("wait-ready")
-                )
-                event = SimpleNamespace(
-                    record=lambda stream: operations.append("ready")
+                    wait_stream=lambda other: operations.append("wait-ready")
                 )
                 result = SimpleNamespace(
                     record_stream=lambda stream: operations.append("retain")
                 )
 
                 def forward_cuda(**kwargs):
-                    operations.append("index-key-collective")
-                    if score:
-                        kwargs["on_logits_start"]()
-                        operations.append("score")
+                    self.assertFalse(kwargs["use_cuda_graph"])
+                    operations.append("indexer")
+                    if failure == "indexer":
+                        raise RuntimeError("indexer failed")
                     return "topk"
 
                 def gather(kv, batch):
                     operations.append("kv-collective")
-                    if fails:
-                        raise RuntimeError("collective failed")
+                    if failure == "gather":
+                        raise RuntimeError("gather failed")
                     return result
 
                 with (
                     patch.object(torch.cuda, "current_stream", return_value=main),
-                    patch.object(torch.cuda, "Event", return_value=event),
                     patch.object(torch.cuda, "stream", return_value=nullcontext()),
                     patch("sglang.srt.runtime_context.get_stream", return_value=side),
                     patch.object(
@@ -66,16 +62,16 @@ class TestCPIndexerOverlap(CustomTestCase):
                         0,
                         torch.empty(1, 1),
                     )
-                    if fails:
-                        with self.assertRaisesRegex(RuntimeError, "collective failed"):
+                    if failure:
+                        with self.assertRaisesRegex(RuntimeError, failure + " failed"):
                             call()
                     else:
                         self.assertEqual(call(), ("topk", result))
-                expected = ["index-key-collective", "ready"]
-                if score:
-                    expected.append("score")
-                expected += ["wait-ready", "kv-collective", "join"]
-                if not fails:
+                expected = ["wait-ready", "kv-collective"]
+                if failure != "gather":
+                    expected.append("indexer")
+                expected.append("join")
+                if not failure:
                     expected.append("retain")
                 self.assertEqual(operations, expected)
 
@@ -90,7 +86,7 @@ class TestCPIndexerOverlap(CustomTestCase):
             return value.repeat(2, 1)
 
         def forward_cuda(**kwargs):
-            kwargs["on_logits_start"]()
+            self.assertFalse(kwargs["use_cuda_graph"])
             return None
 
         with (

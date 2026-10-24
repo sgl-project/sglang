@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
 from einops import rearrange
@@ -1485,7 +1485,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
         topk_result: Optional[torch.Tensor] = None,
-        on_logits_start: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -1606,9 +1605,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
                         q_fp8[:q_offset], weights[:q_offset]
                     )
-                    if on_logits_start is not None:
-                        on_logits_start()
-                        on_logits_start = None
                     logits = resolve_fp8_mqa_logits_fn()(
                         q_padded,
                         kv_fp8,
@@ -1674,9 +1670,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
                         q_fp8[start:end], weights[start:end]
                     )
-                    if on_logits_start is not None:
-                        on_logits_start()
-                        on_logits_start = None
                     logits_chunk = resolve_fp8_mqa_logits_fn()(
                         q_padded,
                         kv_fp8,
@@ -1922,7 +1915,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
-        on_logits_start: Optional[Callable[[], None]] = None,
+        use_cuda_graph: bool = True,
     ) -> Optional[torch.Tensor]:
         # A padded eager IDLE rank has no real requests and therefore no valid
         # DSA page-table rows to index. Return invalid rows with the physical DP
@@ -1948,7 +1941,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         in_piecewise_or_breakable_cuda_graph = (
-            on_logits_start is None and _is_in_piecewise_or_breakable_cuda_graph()
+            use_cuda_graph and _is_in_piecewise_or_breakable_cuda_graph()
         )
 
         # In piecewise/breakable CUDA graph mode, metadata is fetched inside
@@ -2247,7 +2240,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     q_fp8,
                     weights,
                     metadata,
-                    on_logits_start=on_logits_start,
                 )
         else:
             raise NotImplementedError("DSA indexer only supports CUDA, HIP, and NPU")
