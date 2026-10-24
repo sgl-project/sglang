@@ -175,10 +175,8 @@ pub fn lower_completion(
     } else {
         Vec::new()
     };
-    let lowered = GenerateRequest {
-        custom_labels: labels,
-        ..generate_body(&request, headers)?
-    };
+    let mut lowered = generate_body(&request, headers)?;
+    lowered.custom_labels = labels;
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
     let responder = CompletionResponder {

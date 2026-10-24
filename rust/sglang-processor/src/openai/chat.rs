@@ -327,12 +327,10 @@ pub fn lower_chat(
         _ => None,
     };
 
-    let mut lowered = GenerateRequest {
-        custom_labels: labels,
-        ..generate_body(
-            &request, &kwargs, model, prompt_ids, thinking, headers, settings,
-        )?
-    };
+    let mut lowered = generate_body(
+        &request, &kwargs, model, prompt_ids, thinking, headers, settings,
+    )?;
+    lowered.custom_labels = labels;
     // `get_structure_constraint`: K3's tool parser constrains `auto` calls by
     // its structural tag, unless the request is already constrained; Python
     // tests the constraints by truthiness, so empty strings are unset.
