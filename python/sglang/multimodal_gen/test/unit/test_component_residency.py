@@ -634,14 +634,23 @@ def test_warmup_records_use_and_transition_peaks(monkeypatch):
     manager.finish_request()
 
     peaks = manager.take_warmup_phase_peaks()
-    assert peaks["request:before-stage"] == 7
-    assert peaks["0:denoise:setup"] == 7
-    assert peaks["0:denoise:transition:idle->transformer"] == 7
-    assert peaks["0:denoise:use:transformer"] == 7
-    assert peaks["0:denoise:transition:transformer->idle"] == 7
-    assert peaks["0:denoise:between"] == 7
-    assert peaks["request:cleanup:transformer"] == 7
-    assert peaks["idle"] == 2
+    inactive_peak = WarmupPhasePeak((), 7)
+    transformer_peak = WarmupPhasePeak(
+        ("transformer",), 7, used_components=("transformer",)
+    )
+    assert peaks["request:before-stage"] == inactive_peak
+    assert peaks["0:denoise:setup"] == inactive_peak
+    assert peaks["0:denoise:transition:idle->transformer"] == transformer_peak
+    assert peaks["0:denoise:use:transformer"] == transformer_peak
+    assert peaks["0:denoise:transition:transformer->idle"] == transformer_peak
+    assert peaks["0:denoise:between"] == inactive_peak
+    # A non-preferred component is being released during cleanup, so it is no
+    # longer part of the placement that follows this transition.
+    assert peaks["request:cleanup:transformer"] == inactive_peak
+    assert peaks["idle"] == WarmupPhasePeak(
+        active_components=(),
+        allocated_bytes=2,
+    )
 
 
 def test_warmup_skips_memory_tracking_for_unsupported_pipeline(monkeypatch):
@@ -701,9 +710,9 @@ def test_warmup_records_same_component_dtype_prepare_as_transition(monkeypatch):
     manager.begin_use(second, module=module)
 
     manager._record_warmup_phase_peak()
-    assert (
-        manager._warmup_phase_peaks["0:stage:transition:transformer->transformer"] == 7
-    )
+    assert manager._warmup_phase_peaks[
+        "0:stage:transition:transformer->transformer"
+    ] == WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
     assert strategy.prepare_for_use.call_count == 2
 
 
@@ -794,8 +803,12 @@ def test_warmup_splits_sequential_component_transition(monkeypatch):
     manager.begin_use(second)
     manager._record_warmup_phase_peak()
 
-    assert manager._warmup_phase_peaks["0:stage:transition:text_encoder->idle"] == 7
-    assert manager._warmup_phase_peaks["0:stage:transition:idle->transformer"] == 7
+    assert manager._warmup_phase_peaks["0:stage:transition:text_encoder->idle"] == (
+        WarmupPhasePeak(("text_encoder",), 7, used_components=("text_encoder",))
+    )
+    assert manager._warmup_phase_peaks["0:stage:transition:idle->transformer"] == (
+        WarmupPhasePeak(("transformer",), 7, used_components=("transformer",))
+    )
 
 
 def _manager_for_stage(stage, modules):

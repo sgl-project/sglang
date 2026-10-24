@@ -135,8 +135,6 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _resolve_warmup_num_frames,
 )
 
-PLANNER_UNAVAILABLE = "residency planner not available"
-
 
 def _record(
     *,
@@ -4908,7 +4906,7 @@ class TestAutoResidencySkipReason:
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
         monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args(**overrides))
-        assert reason == PLANNER_UNAVAILABLE
+        assert reason is None
 
     def test_fixed_loading_components_are_excluded_individually(self):
         from sglang.multimodal_gen.runtime.server_args.auto_tune import (
@@ -4961,7 +4959,7 @@ class TestAutoResidencySkipReason:
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
         monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args(**overrides))
-        assert reason == PLANNER_UNAVAILABLE
+        assert reason is None
 
     def test_eligible_path_reaches_planner_gate(self, monkeypatch):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
