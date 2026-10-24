@@ -1782,6 +1782,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-speculative-step-cuda-graph`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Capture each EAGLE decode step (draft, target verify, draft extend and the work between them) as one CUDA graph per batch size and sampling setup, reusing the per-stage CUDA graphs, and turn on the fused verify and relay paths for topk-1 chains (outputs are bitwise identical). Lowers per-step launch and host overhead at small batch sizes. Steps it cannot capture (e.g. logprobs, mixed constrained and unconstrained requests, batch sizes above 8) run the regular path; the reason is logged once.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
 </tbody>
 </table>
 

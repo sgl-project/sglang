@@ -507,6 +507,14 @@ class DeepseekSparseAttnBackend(
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
+    def out_graph_metadata_capturable(self, forward_mode: ForwardMode) -> bool:
+        # The graph replay prep above is device-only for these modes.
+        return (
+            forward_mode.is_decode()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        )
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -4164,6 +4172,12 @@ class DeepseekSparseAttnMultiStepBackend:
     # Per-step draft decode replays from precomputed GPU metadata; opt out so
     # decide_needs_cpu_seq_lens' OR over the backends stays False.
     needs_cpu_seq_lens: bool = False
+
+    def out_graph_metadata_capturable(self, forward_mode: ForwardMode) -> bool:
+        return all(
+            backend.out_graph_metadata_capturable(forward_mode)
+            for backend in self.attn_backends
+        )
 
     def __init__(
         self,
