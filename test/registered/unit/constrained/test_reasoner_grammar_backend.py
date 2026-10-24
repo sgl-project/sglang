@@ -94,6 +94,25 @@ def _allowed_token_ids(vocab_mask, token_ids):
 
 
 class TestReasonerGrammarObject(CustomTestCase):
+    def test_needs_vocab_mask_follows_state_and_filter(self):
+        obj = self._make_strict_object()
+        obj.maybe_init_reasoning(True)
+        self.assertTrue(obj.needs_vocab_mask())  # thinking with the token filter
+        obj.enable_token_filter = False
+        self.assertFalse(obj.needs_vocab_mask())  # thinking, nothing to filter
+        obj.enable_token_filter = True
+        obj.maybe_init_reasoning(False)
+        self.assertFalse(obj.needs_vocab_mask())  # past think end, no inner grammar
+        with_inner = ReasonerGrammarObject(
+            grammar=MagicMock(),
+            think_end_ids=[7],
+            enable_token_filter=False,
+        )
+        with_inner.maybe_init_reasoning(True)
+        self.assertTrue(with_inner.needs_vocab_mask())  # inner grammar may apply
+        with_inner.maybe_init_reasoning(False)
+        self.assertTrue(with_inner.needs_vocab_mask())
+
     def _make_strict_object(self):
         return ReasonerGrammarObject(
             grammar=None,
