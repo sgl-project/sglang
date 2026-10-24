@@ -541,3 +541,10 @@ class MinimaxM3Detector(BaseFormatDetector):
             if chunk:
                 return chunk.startswith("<item>")
         return False
+
+    def finish(self, tools):
+        normal = ""
+        if self._buffer:
+            normal = self._buffer
+            self._buffer = ""
+        return StreamingParseResult(normal_text=normal, calls=[])
