@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 import torch
-from fastapi import APIRouter, FastAPI, Request, Response
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
@@ -399,27 +399,31 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
     server_args = get_global_server_args()
     params = vertex_req.parameters or {}
 
-    futures = []
+    requests = []
 
     for inst in vertex_req.instances:
         rid = f"vertex_{uuid.uuid4()}"
 
-        sp = build_sampling_params(
-            rid,
-            prompt=inst.get("prompt") or inst.get("text"),
-            image_path=inst.get("image") or inst.get("image_url"),
-            num_frames=params.get("num_frames"),
-            fps=params.get("fps"),
-            width=params.get("width"),
-            height=params.get("height"),
-            guidance_scale=params.get("guidance_scale"),
-            save_output=params.get("save_output"),
-        )
+        try:
+            sp = build_sampling_params(
+                rid,
+                prompt=inst.get("prompt") or inst.get("text"),
+                image_path=inst.get("image") or inst.get("image_url"),
+                num_frames=params.get("num_frames"),
+                fps=params.get("fps"),
+                width=params.get("width"),
+                height=params.get("height"),
+                guidance_scale=params.get("guidance_scale"),
+                save_output=params.get("save_output"),
+            )
+            requests.append(prepare_request(server_args, sampling_params=sp))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        backend_req = prepare_request(server_args, sampling_params=sp)
-        futures.append(forward_to_scheduler(backend_req, sp))
-
-    results = await asyncio.gather(*futures)
+    # validate every instance before creating coroutines or dispatching work
+    results = await asyncio.gather(
+        *(forward_to_scheduler(req, req.sampling_params) for req in requests)
+    )
 
     return orjson_response({"predictions": results})
 

@@ -14,6 +14,7 @@ import torch
 from fastapi import FastAPI
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints import http_server
@@ -156,6 +157,57 @@ def test_vertex_slow_output_read_does_not_block_liveness(monkeypatch, tmp_path):
             release.set()
             response = await task
         assert base64.b64decode(response["output"]) == path.read_bytes()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "invalid", [{}, {"prompt": 123}], ids=["missing-prompt", "numeric-prompt"]
+)
+def test_vertex_validates_batch_before_dispatch(monkeypatch, tmp_path, invalid):
+    server_args = SimpleNamespace(
+        model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        pipeline_class_name="WanPipeline",
+        pipeline_config=WanT2V480PConfig(),
+        output_path=str(tmp_path),
+        num_gpus=1,
+        comfyui_mode=False,
+        attention_backend_config={},
+        enable_trace=False,
+        backend="auto",
+        model_id=None,
+    )
+    for module in (http_server, openai_utils):
+        monkeypatch.setattr(module, "get_global_server_args", lambda: server_args)
+    path = tmp_path / "out.mp4"
+    path.write_bytes(b"encoded video")
+    forward = AsyncMock(return_value=OutputBatch(output_file_paths=[str(path)]))
+    monkeypatch.setattr(async_scheduler_client, "forward", forward)
+    app = FastAPI()
+    app.include_router(http_server.vertex_router)
+
+    async def run():
+        valid = {"prompt": "test"}
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            for instances in ([invalid], [valid, invalid], [invalid, valid]):
+                response = await client.post(
+                    http_server.VERTEX_ROUTE, json={"instances": instances}
+                )
+                assert response.status_code == 400, response.text
+                assert "prompt" in response.json()["detail"]
+                forward.assert_not_awaited()
+            response = await client.post(
+                http_server.VERTEX_ROUTE, json={"instances": [valid]}
+            )
+            assert response.status_code == 200, response.text
+            assert (
+                base64.b64decode(response.json()["predictions"][0]["output"])
+                == path.read_bytes()
+            )
+            forward.assert_awaited_once()
 
     asyncio.run(run())
 
