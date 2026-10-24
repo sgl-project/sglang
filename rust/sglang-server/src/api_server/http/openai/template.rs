@@ -5,8 +5,10 @@
 
 use std::collections::HashMap;
 
-use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
 use serde_json::Value;
+use sglang_processor::dynamo_protocols::types::{
+    ChatCompletionRequestMessage, CreateChatCompletionRequest,
+};
 use sglang_processor::dynamo_renderer::{OAIChatLikeRequest, TextInput};
 
 pub use sglang_processor::ChatFormatter;
