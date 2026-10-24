@@ -3976,7 +3976,10 @@ class Scheduler(
         if ret:
             set_schedule_time_batch(ret)
 
-        return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+        plan = NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
+        if self.scripted_scheduler_hook is not None:
+            self.scripted_scheduler_hook.on_schedule(plan)
+        return plan
 
     def get_num_allocatable_reqs(
         self,
@@ -5067,6 +5070,9 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+        if self.scripted_scheduler_hook is not None:
+            self.scripted_scheduler_hook.on_process_result(batch)
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult

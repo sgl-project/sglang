@@ -145,6 +145,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.result_processes = Counter()
         self.depths = []
         self.scheduler_stage_metrics = None
+        self.scripted_scheduler_hook = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.is_generation = True
