@@ -628,6 +628,10 @@ class MambaComponent(TreeComponent):
         if is_finished:
             if cache_len is None:
                 cache_len = 0
+            if cache_len <= 0:
+                # There is no tracked state to checkpoint. In extra-buffer mode
+                # the selected ping-pong slot may never have been written.
+                return 0
             if self.cache.enable_mamba_extra_buffer:
                 checkpoint = self._select_finished_checkpoint(req, token_ids_len)
                 if checkpoint is None:
