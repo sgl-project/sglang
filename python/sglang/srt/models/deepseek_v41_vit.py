@@ -12,11 +12,28 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.utils.common import get_compiler_backend
 
 
 def _rms_norm(dim: int) -> RMSNorm:
     # The fused CUDA kernels do not take an fp32 weight with a bf16 input.
     return RMSNorm(dim, eps=1e-6, weight_dtype=torch.float32, force_native=True)
+
+
+# The encoder's norms, rotary and gated activation run in fp32 and cost several
+# eager kernels each; compiled, each is one kernel. dynamic=True keeps one graph
+# across image sizes.
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    # RMSNorm.forward_native's arithmetic.
+    dtype = x.dtype
+    x = x.float()
+    x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return (x * weight).to(dtype)
+
+
+def _norm(norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
+    return rms_norm(x, norm.weight, norm.variance_epsilon)
 
 
 @lru_cache(8)
@@ -29,10 +46,29 @@ def get_vision_cos_sin(n_h: int, n_w: int, dim: int, theta: float):
     return freqs.cos().unsqueeze(1), freqs.sin().unsqueeze(1)
 
 
+@lru_cache(32)
+def get_vision_inputs(n_h: int, n_w: int, dim: int, theta: float, device):
+    """Device rotary tables and attention metadata for one image grid."""
+    cos, sin = get_vision_cos_sin(n_h, n_w, dim, theta)
+    n = n_h * n_w
+    # Passing the known length avoids device-to-host length discovery per layer.
+    metadata = prepare_vision_attention_metadata(
+        torch.tensor([0, n], dtype=torch.int32), device, max_seqlen=n
+    )
+    return cos.to(device), sin.to(device), metadata
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     dtype = x.dtype
     x1, x2 = x.float().chunk(2, dim=-1)
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(dtype)
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    gate, up = x.chunk(2, dim=-1)
+    return F.silu(gate) * up
 
 
 class PatchEmbed(nn.Module):
@@ -86,8 +122,7 @@ class MLP(nn.Module):
         self.w2 = nn.Linear(args.vision_inter_dim, args.vision_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, up = self.w1(x).chunk(2, dim=-1)
-        return self.w2(F.silu(gate) * up)
+        return self.w2(silu_and_mul(self.w1(x)))
 
 
 class Block(nn.Module):
@@ -105,8 +140,8 @@ class Block(nn.Module):
         sin: torch.Tensor,
         metadata: VisionAttentionMetadata,
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), cos, sin, metadata)
-        return x + self.mlp(self.norm2(x))
+        x = x + self.attn(_norm(self.norm1, x), cos, sin, metadata)
+        return x + self.mlp(_norm(self.norm2, x))
 
 
 class ViT(nn.Module):
@@ -120,19 +155,15 @@ class ViT(nn.Module):
         self.blocks = nn.ModuleList([Block(args) for _ in range(args.vision_n_layers)])
         self.norm = _rms_norm(args.vision_dim)
 
+    def inputs(self, n_h: int, n_w: int, device):
+        return get_vision_inputs(n_h, n_w, self.rope_dim, self.rope_theta, device)
+
     def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
         x = self.patch_embed(patches)
-        cos, sin = get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
-        cos, sin = cos.to(x.device), sin.to(x.device)
-        # Passing the known length avoids device-to-host length discovery per layer.
-        metadata = prepare_vision_attention_metadata(
-            torch.tensor([0, x.shape[0]], dtype=torch.int32),
-            x.device,
-            max_seqlen=x.shape[0],
-        )
+        cos, sin, metadata = self.inputs(n_h, n_w, x.device)
         for block in self.blocks:
             x = block(x, cos, sin, metadata)
-        return self.norm(x)
+        return _norm(self.norm, x)
 
 
 class Aligner(nn.Module):
@@ -149,3 +180,26 @@ class Aligner(nn.Module):
         x = F.pad(x, (0, -n_w % r, 0, -n_h % r))
         x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
         return self.w2(F.gelu(self.w1(x)))
+
+
+def assemble_image_span(
+    features: torch.Tensor,
+    n_llm_h: int,
+    n_llm_w: int,
+    start: torch.Tensor,
+    newline: torch.Tensor,
+    end: torch.Tensor,
+) -> torch.Tensor:
+    """LLM span of one image in the image_token_types layout, without host syncs.
+
+    [start] + ([feature] * n_llm_w + [newline]) * n_llm_h + [end]
+    """
+    d = features.shape[-1]
+    rows = torch.cat(
+        [
+            features.view(n_llm_h, n_llm_w, d),
+            newline.view(1, 1, d).expand(n_llm_h, 1, d),
+        ],
+        dim=1,
+    )
+    return torch.cat([start.view(1, d), rows.view(-1, d), end.view(1, d)])
