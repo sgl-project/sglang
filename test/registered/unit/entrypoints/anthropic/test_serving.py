@@ -873,9 +873,7 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [False])
 
     def test_request_thinking_enabled_with_budget_tokens_logs_warning(self):
-        """SDK shape: ``enabled`` requires ``budget_tokens``. We accept it
-        (the SDK would), but log a WARNING because the local backend has
-        no equivalent hard-cap knob — the budget is not enforced."""
+        """The SDK accepts ``budget_tokens``; the backend cannot enforce it, so it warns."""
         import logging
 
         serving = self._serving()
@@ -892,67 +890,24 @@ class TestAnthropicServing(unittest.TestCase):
             f"expected unenforced-budget warning: {log.output}",
         )
 
-    def test_request_thinking_enabled_requires_budget_tokens(self):
-        """SDK requires ``budget_tokens`` for ``type=enabled`` — Pydantic 400."""
+    def test_request_thinking_shape_violations_are_rejected(self):
+        """Each SDK thinking variant's field rules (``thinking_config_*_param.py``)."""
         from pydantic import ValidationError
 
-        with self.assertRaises(ValidationError) as ctx:
-            self._anthropic_request(thinking={"type": "enabled"}, stream=False)
-        self.assertIn("budget_tokens", str(ctx.exception))
-
-    def test_request_thinking_enabled_budget_below_min_is_rejected(self):
-        """SDK doc: ``budget_tokens`` must be >= 1024."""
-        from pydantic import ValidationError
-
-        with self.assertRaises(ValidationError) as ctx:
-            self._anthropic_request(
-                thinking={"type": "enabled", "budget_tokens": 512}, stream=False
-            )
-        self.assertIn("1024", str(ctx.exception))
-
-    def test_request_thinking_disabled_with_display_is_rejected(self):
-        """SDK ``ThinkingConfigDisabledParam`` has no ``display`` field."""
-        from pydantic import ValidationError
-
-        with self.assertRaises(ValidationError) as ctx:
-            self._anthropic_request(
-                thinking={"type": "disabled", "display": "omitted"}, stream=False
-            )
-        self.assertIn("display", str(ctx.exception))
-
-    def test_request_thinking_disabled_with_budget_is_rejected(self):
-        """SDK ``ThinkingConfigDisabledParam`` has no ``budget_tokens`` field."""
-        from pydantic import ValidationError
-
-        with self.assertRaises(ValidationError) as ctx:
-            self._anthropic_request(
-                thinking={"type": "disabled", "budget_tokens": 2048}, stream=False
-            )
-        self.assertIn("budget_tokens", str(ctx.exception))
-
-    def test_request_thinking_adaptive_with_budget_is_rejected(self):
-        """SDK ``ThinkingConfigAdaptiveParam`` has no ``budget_tokens`` field."""
-        from pydantic import ValidationError
-
-        with self.assertRaises(ValidationError) as ctx:
-            self._anthropic_request(
-                thinking={"type": "adaptive", "budget_tokens": 2048}, stream=False
-            )
-        self.assertIn("budget_tokens", str(ctx.exception))
-
-    def test_request_thinking_adaptive_is_treated_as_enabled(self):
-        """Claude 4.7 ``thinking.type='adaptive'`` (the SDK default for
-        unknown models) must be accepted and routed to ``apply_reasoning_enabled(True)``.
-        """
-        serving = self._serving()
-        request = self._anthropic_request(thinking={"type": "adaptive"}, stream=False)
-        serving._convert_to_chat_completion_request(request)
-        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+        for thinking, field in [
+            ({"type": "enabled"}, "budget_tokens"),
+            ({"type": "enabled", "budget_tokens": 512}, "1024"),
+            ({"type": "disabled", "display": "omitted"}, "display"),
+            ({"type": "disabled", "budget_tokens": 2048}, "budget_tokens"),
+            ({"type": "adaptive", "budget_tokens": 2048}, "budget_tokens"),
+        ]:
+            with self.subTest(thinking=thinking):
+                with self.assertRaises(ValidationError) as ctx:
+                    self._anthropic_request(thinking=thinking, stream=False)
+                self.assertIn(field, str(ctx.exception))
 
     def test_request_thinking_display_omitted_logs_warning_but_still_enables(self):
-        """``thinking.display='omitted'`` is accepted; reasoning stays on
-        because we cannot suppress reasoning text from the OpenAI stream.
-        ``enabled`` requires ``budget_tokens`` per SDK shape."""
+        """Reasoning text cannot be suppressed, so ``omitted`` warns and keeps reasoning on."""
         import logging
 
         serving = self._serving()
@@ -971,22 +926,47 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
         self.assertTrue(any("omitted" in r for r in log.output))
 
-    def test_request_output_config_effort_maps_to_reasoning_effort(self):
-        """``output_config.effort`` rows map onto ``reasoning_effort``."""
-        for anthropic_effort, openai_effort in [
-            ("low", "low"),
-            ("medium", "medium"),
-            ("high", "high"),
-            ("xhigh", "max"),  # OpenAI Literal has no xhigh
-            ("max", "max"),
-        ]:
-            with self.subTest(anthropic_effort=anthropic_effort):
-                serving = self._serving()
-                request = self._anthropic_request(
-                    output_config={"effort": anthropic_effort}, stream=False
-                )
-                chat_request = serving._convert_to_chat_completion_request(request)
-                self.assertEqual(chat_request.reasoning_effort, openai_effort)
+    def test_request_claude_code_display_updates_is_accepted(self):
+        """Claude Code's opening request (beta ``display="updates"`` with
+        ``output_config`` and ``context_management``) must not 400."""
+        import logging
+
+        serving = self._serving()
+        request = self._anthropic_request(
+            thinking={"type": "adaptive", "display": "updates"},
+            output_config={"effort": "high"},
+            context_management={
+                "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+            },
+            metadata={"user_id": "session"},
+            stream=False,
+        )
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+        ) as log:
+            chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+        self.assertEqual(chat_request.reasoning_effort, "high")
+        self.assertTrue(any("updates" in r for r in log.output))
+
+    def test_request_thinking_unknown_display_is_rejected(self):
+        """Only the SDK's display values pass; anything else is a 400."""
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            self._anthropic_request(
+                thinking={"type": "adaptive", "display": "streaming"}, stream=False
+            )
+        self.assertIn("display", str(ctx.exception))
+
+    def test_request_output_config_xhigh_effort_maps_to_max(self):
+        """The OpenAI effort Literal has no ``xhigh``."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            output_config={"effort": "xhigh"}, stream=False
+        )
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(chat_request.reasoning_effort, "max")
 
     def test_request_output_config_task_budget_is_logged_not_enforced(self):
         """``task_budget`` is a soft hint; ``max_tokens`` is the hard cap."""
