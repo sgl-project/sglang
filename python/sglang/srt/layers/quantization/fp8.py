@@ -1483,6 +1483,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
         self.weight_block_size = self.quant_config.weight_block_size
         self.is_fp4_expert = self.quant_config.is_fp4_experts
+        self.use_small_m_w8a16_moe = (
+            _is_cuda
+            and get_platform().is_sm90
+            and envs.SGLANG_OPT_HOPPER_SMALL_M_FP8_MOE.get()
+            and not self.use_mxfp8
+            and not self.is_fp4_expert
+            and self.weight_block_size == [128, 128]
+        )
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
         # The MxFP4 wrapper methods borrow this instance for weight loading;
@@ -3010,6 +3018,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             block_shape=self.weight_block_size,
+            small_m_w8a16=self.use_small_m_w8a16_moe,
         )
 
     def _process_npu_fp4_expert_weights(self, layer: torch.nn.Module) -> None:
