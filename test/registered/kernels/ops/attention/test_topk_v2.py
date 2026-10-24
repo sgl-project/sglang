@@ -50,6 +50,8 @@ PAGE_SIZE = 64  # c4 page size = 256 // 4
 PAGE_BITS = PAGE_SIZE.bit_length() - 1
 PAGE_MASK = PAGE_SIZE - 1
 MAX_PERMIT_ERROR = 5
+# No cluster path in the packed kernel: CUDA pins it exact (ROCm keeps the default).
+PACKED_PERMIT_ERROR = MAX_PERMIT_ERROR if is_hip() else 0
 
 # (batch, seq) chosen to land on each template and each dispatch boundary.
 FIXED_CONFIGS = [
@@ -568,9 +570,6 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
 
 
-@pytest.mark.skipif(
-    not is_hip(), reason="packed layout is compiled under USE_ROCM only"
-)
 @pytest.mark.parametrize("k", [512, 2048])
 @pytest.mark.parametrize(
     "extend_lens",
@@ -638,12 +637,17 @@ def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
         window = scores_cpu[r, start : start + L]
         ref = torch.topk(window, k, sorted=False).indices.tolist()
         our = _invert(out_cpu[r], inv_cpu[req])
-        _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
+        _assert_topk_close(
+            window.unsqueeze(0),
+            [ref],
+            [our],
+            1,
+            [L],
+            k,
+            max_permit_error=PACKED_PERMIT_ERROR,
+        )
 
 
-@pytest.mark.skipif(
-    not is_hip(), reason="packed layout is compiled under USE_ROCM only"
-)
 @pytest.mark.parametrize("residue", [1, 2, 3])
 @pytest.mark.parametrize("boundary", [8192, 16384])
 @torch.inference_mode()
@@ -703,7 +707,15 @@ def test_topk_v2_packed_level_boundary(boundary: int, residue: int) -> None:
             assert all(v == -1 for v in out_cpu[r][L:]), f"row {r} padding wrong"
             continue
         ref = torch.topk(window, k, sorted=False).indices.tolist()
-        _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
+        _assert_topk_close(
+            window.unsqueeze(0),
+            [ref],
+            [our],
+            1,
+            [L],
+            k,
+            max_permit_error=PACKED_PERMIT_ERROR,
+        )
 
 
 @pytest.mark.skipif(not is_hip(), reason="ROCm split path")
