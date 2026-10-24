@@ -89,6 +89,9 @@ def deepep_permute_triton_kernel(
 ):
     OutDtype = gateup_input_ptr.dtype.element_ty
 
+    if a1_scales_ptr is not None:
+        inv_a1_scale = 1.0 / tl.load(a1_scales_ptr)
+
     src_idx = tl.program_id(0)
     src2dst_ptr = src2dst_ptr + src_idx * topk
     topk_ids_ptr = topk_ids_ptr + src_idx * topk
@@ -98,7 +101,14 @@ def deepep_permute_triton_kernel(
     for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
         offset = start_offset + tl.arange(0, BLOCK_SIZE)
         mask = offset < hidden_size
-        in_data = tl.load(src_ptr + offset, mask=mask).to(OutDtype)
+        in_data = tl.load(src_ptr + offset, mask=mask)
+        if a1_scales_ptr is not None:
+            in_data = tl.clamp(
+                in_data.to(tl.float32) * inv_a1_scale,
+                -448.0,
+                448.0,
+            )
+        in_data = in_data.to(OutDtype)
 
         for idx in range(topk):
             dst_idx = tl.load(src2dst_ptr + idx).to(tl.int64)
