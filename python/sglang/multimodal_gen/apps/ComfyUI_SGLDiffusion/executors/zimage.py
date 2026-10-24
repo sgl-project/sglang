@@ -11,13 +11,7 @@ class ZImageAdapter(ComfyUIModelAdapter):
     def pack(
         self, x, timestep, context, siglip_feats=None, ref_contexts=None, **kwargs
     ) -> PackedForward:
-        # ComfyUI's Lumina2 always sends num_tokens (derived from the text
-        # context) and an attention_mask that native ComfyUI itself discards
-        # in patchify_and_embed, so dropping those two matches native
-        # behavior exactly. siglip_feats/ref_contexts (Z-Image Omni's
-        # multi-reference inputs) are different: the worker's ZImagePipeline
-        # has no code path for them, so forwarding would silently run as a
-        # plain text-to-image call instead of the requested reference edit.
+        # The worker has no path for Z-Image Omni's reference conditioning.
         if siglip_feats or ref_contexts:
             raise ValueError(
                 "ZImageAdapter does not support Z-Image Omni reference "

@@ -89,30 +89,21 @@ class QwenImageEditAdapter(QwenImageAdapter):
         transformer_options=None,
         **kwargs,
     ) -> PackedForward:
-        # The worker's QwenImagePipeline fixes zero_cond_t per checkpoint at
-        # load time and has no code path for a per-call additional_t_cond or
-        # attention_mask, so forwarding them would silently ignore the value
-        # instead of applying it. ref_latents_method switches native
-        # ComfyUI's RoPE/timestep handling (comfy/comfy/ldm/qwen_image/
-        # model.py); the worker always uses the default ("index") mode.
+        # The worker has no path for these; forwarding would silently ignore them.
         if attention_mask is not None:
             raise ValueError(
                 "QwenImageEditAdapter does not forward ComfyUI's attention_mask "
-                "to the worker; it would silently run without it instead of "
-                "masking the conditioning as requested."
+                "to the worker; it would silently run without it."
             )
         if additional_t_cond is not None:
             raise ValueError(
                 "QwenImageEditAdapter does not forward ComfyUI's "
-                "additional_t_cond to the worker; the checkpoint's own "
-                "zero_cond_t setting would silently override it."
+                "additional_t_cond to the worker; it would be silently ignored."
             )
         if ref_latents_method is not None and ref_latents_method != "index":
             raise ValueError(
                 f"QwenImageEditAdapter does not support ref_latents_method="
-                f"{ref_latents_method!r}; the worker always applies reference "
-                "latents the way ComfyUI's default 'index' method does, so "
-                "'index_timestep_zero' or 'negative_index' would silently diverge."
+                f"{ref_latents_method!r}; the worker always uses 'index'."
             )
         packed = super().pack(x, timestep, context, **kwargs)
         if ref_latents:

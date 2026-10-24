@@ -255,10 +255,8 @@ def test_qwen_image_edit_pack_keeps_all_ref_latents() -> None:
 
 
 def test_qwen_image_edit_pack_rejects_unsupported_kwargs() -> None:
-    """ComfyUI's native Qwen-Image forward passes attention_mask,
-    additional_t_cond and ref_latents_method; the worker has no path for any
-    of them (zero_cond_t is fixed per checkpoint), so they must be rejected
-    instead of silently ignored."""
+    """attention_mask, additional_t_cond and ref_latents_method must be
+    rejected instead of silently dropped."""
     adapter = _qwen_image_edit_adapter()
     x = torch.ones(1, 16, 1, 90, 160)
     timestep = torch.tensor([1.0])
@@ -277,13 +275,8 @@ def test_qwen_image_edit_pack_rejects_unsupported_kwargs() -> None:
 
 
 def test_zimage_pack_rejects_omni_reference_conditioning() -> None:
-    """ComfyUI's native Lumina2 forward passes Z-Image Omni's siglip_feats /
-    ref_contexts when a reference image is wired in; the worker's
-    ZImagePipeline has no path for them, so they must be rejected instead of
-    silently dropped. num_tokens and attention_mask are sent on every call
-    (num_tokens always, attention_mask only with padding) and must keep
-    working: native ComfyUI itself discards attention_mask's effect, and
-    num_tokens is redundant with the context tensor's own shape."""
+    """siglip_feats/ref_contexts must be rejected; num_tokens/attention_mask
+    (sent on every real call) must keep working."""
     adapter = ZImageAdapter()
     x = torch.ones(1, 16, 90, 160)
     timestep = torch.tensor([1.0])
