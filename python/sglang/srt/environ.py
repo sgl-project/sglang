@@ -1134,6 +1134,14 @@ class Envs:
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
     # ===================================================================
+    # Intel XPU
+    # ===================================================================
+    # Triton warps per program for the XPU LayerNorm+modulate kernels. Layout
+    # only, the bit-exact result does not depend on it; 4 measured fastest on
+    # Arc Pro B70.
+    SGLANG_XPU_LN_MOD_NUM_WARPS = EnvInt(4)
+
+    # ===================================================================
     # Quantization
     # ===================================================================
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -1566,7 +1574,7 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
-    # Currently supported by the Kimi-K2.5 image processor only.
+    # Supported by Kimi-K2.5 image and Cosmos3 V2V frame preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
@@ -1691,10 +1699,12 @@ class Envs:
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Set True to dequantize the FP4 experts to FP8 at runtime
     SGLANG_DSV4_FP4_DEQUANT = EnvBool(False)
-    # Flash-0731 also accepts "low"; the active profile is checkpoint-resolved.
+    # DeepSeek-V4 default when a request carries no reasoning_effort: a
+    # deepseek-recipe tier name; unset -> deepseek-recipe's default.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
     # DeepSeek-V4.1 default when a request carries no reasoning_effort: one of
-    # low/high/xhigh/max or an integer budget in [1, 100]; unset -> the encoder default.
+    # a deepseek-recipe tier name or an integer budget in [1, 100]; unset ->
+    # deepseek-recipe's default.
     SGLANG_DSV41_REASONING_EFFORT = EnvStr(None)
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
@@ -1707,7 +1717,8 @@ class Envs:
     SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS = EnvInt(2048)
     # Paged KV layout of the DeepSeek-V4 family pools: "v4" (584 B/token, every
     # GPU), "v41" (the SM100 FlashMLA V4.1 formats: 528 B fp8 SWA cache, fp8 or
-    # fp4 compressed caches) or "auto" (v41 on SM100, v4 elsewhere).
+    # fp4 compressed caches), "v41_new" (the same bytes interleaved per token, for
+    # FlashMLA's 2026.09.30 kernels) or "auto" (v41 on SM100, v4 elsewhere).
     SGLANG_DSV4_KV_LAYOUT = EnvStr("v4")
     # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
     # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
@@ -1766,6 +1777,11 @@ class Envs:
     # Scheduler-side staging of shared host-table rows on GPUs without ATS
     # (engram_staging.py); pays off for large prefill batches.
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
+    # Keep each rank's engram row shard in exportable device memory (CUDA VMM,
+    # FABRIC handles across an NVLink domain) mapped by every rank of the TP group:
+    # a rank reads its own tokens' rows from the owning shard, with no id gather
+    # and no reduce-scatter. Takes precedence over the host table.
+    SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

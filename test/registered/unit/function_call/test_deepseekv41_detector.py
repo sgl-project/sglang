@@ -8,7 +8,6 @@ import xgrammar as xgr
 from xgrammar.structural_tag import JSONSchemaFormat
 from xgrammar.testing import _is_grammar_accept_string
 
-from sglang.srt.entrypoints.openai import encoding_dsv41
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
     Tool,
@@ -17,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.parser.deepseek_recipe_renderer import load_deepseek_recipe
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -25,6 +25,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 CHUNK_SIZES = [1, 2, 3, 5, 7, 11, 23, 1000]
 DSML = "｜DSML｜"
+EOS = "<｜end▁of▁sentence｜>"
 
 
 def _tools():
@@ -59,6 +60,34 @@ def _tools():
     ]
 
 
+def _render_assistant(message, *, thinking):
+    """The assistant turn as deepseek-recipe renders it, minus the generation
+    header (`<think>` / `</think>`) that ends the prompt before it."""
+    recipe = load_deepseek_recipe()
+    calls = [
+        {**call, "id": f"call_{i}"} for i, call in enumerate(message["tool_calls"])
+    ]
+    results = [
+        {"role": "tool", "tool_call_id": call["id"], "content": "ok"} for call in calls
+    ]
+    body = {
+        "model": "DeepSeek-V4.1-Flash",
+        "messages": [
+            {"role": "user", "content": "question"},
+            {**message, "tool_calls": calls},
+            *results,
+        ],
+        "thinking": {"type": "enabled" if thinking else "disabled"},
+        # Declared tools keep the turn's reasoning in the rendered history.
+        "tools": [tool.model_dump(exclude_none=True) for tool in _tools()],
+    }
+    converted = recipe.ChatCompletionRequest(body).convert(recipe.ConversionOptions())
+    prompt = recipe.DeepseekV41Encoding().render_conversation(converted.conversation)
+    turn = prompt.prompt.split("<｜User｜>question<｜Assistant｜>", 1)[1]
+    turn = turn[: turn.index(EOS) + len(EOS)]
+    return turn.removeprefix("<think>" if thinking else "</think>")
+
+
 def _assemble(calls):
     """Streamed ToolCallItems -> [(name, parsed arguments)] per tool_index."""
     by_index = {}
@@ -81,26 +110,22 @@ class TestDeepSeekV41RoundTrip(CustomTestCase):
 
     def setUp(self):
         self.tools = _tools()
-        self.completion = encoding_dsv41.render_message(
-            1,
-            [
-                {"role": "user", "content": "question"},
-                {
-                    "role": "assistant",
-                    "reasoning_content": "reason",
-                    "content": "summary",
-                    "tool_calls": [
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "lookup",
-                                "arguments": json.dumps(self.ARGUMENTS),
-                            },
-                        }
-                    ],
-                },
-            ],
-            thinking_mode="thinking",
+        self.completion = _render_assistant(
+            {
+                "role": "assistant",
+                "reasoning_content": "reason",
+                "content": "summary",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": json.dumps(self.ARGUMENTS),
+                        },
+                    }
+                ],
+            },
+            thinking=True,
         )
         self.completion = "<think>" + self.completion
         self.expected = [("lookup", self.ARGUMENTS)]
@@ -221,29 +246,21 @@ class TestDeepSeekV41ParameterGrammar(CustomTestCase):
 
     @staticmethod
     def _render(arguments, *, thinking=False, count=1, name="get_weather"):
-        return encoding_dsv41.render_message(
-            1,
-            [
-                {"role": "user", "content": "question"},
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "reasoning_content": "reason",
-                    "wo_eos": True,
-                    "tool_calls": [
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": json.dumps(arguments),
-                            },
-                        }
-                    ]
-                    * count,
-                },
-            ],
-            thinking_mode="thinking" if thinking else "chat",
-        )
+        return _render_assistant(
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "reason",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(arguments)},
+                    }
+                ]
+                * count,
+            },
+            thinking=thinking,
+        ).removesuffix(EOS)
 
     def _grammar(self, choice="required", thinking=False, parallel=True):
         constraint = FunctionCallParser(

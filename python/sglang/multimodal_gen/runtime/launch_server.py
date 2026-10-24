@@ -491,6 +491,7 @@ def launch_http_server_only(server_args):
         port=server_args.port,
         reload=False,
         ws_per_message_deflate=False,
+        timeout_graceful_shutdown=server_args.http_graceful_shutdown_timeout,
     )
 
 
