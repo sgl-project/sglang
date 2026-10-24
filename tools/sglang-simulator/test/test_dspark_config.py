@@ -2,6 +2,7 @@
 
 import copy
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -89,12 +90,35 @@ def test_malformed_asset_is_passed_to_predictor_validator_not_repaired(factory):
     assert calls == [result]
 
 
-def test_model_config_root_is_optional_and_malformed_values_are_not_repaired(factory):
+@pytest.mark.parametrize("invalid", [123, "", " "])
+def test_model_config_root_is_optional_and_malformed_values_are_not_repaired(
+    factory, invalid
+):
     calls, raw, _ = factory
     raw["predictor"].pop("model_config_root")
     result = ConfigManager.get_inference_time_predictor(None, None, None)
     assert not hasattr(result, "model_config_root")
-    raw["predictor"]["model_config_root"] = 123
+    raw["predictor"]["model_config_root"] = invalid
     result = ConfigManager.get_inference_time_predictor(None, None, None)
-    assert result.model_config_root == 123
+    assert result.model_config_root == invalid
     assert calls[-1] is result
+
+
+@pytest.mark.parametrize("relative", [True, False])
+def test_model_config_root_keeps_requested_link_for_native_binding(
+    factory, monkeypatch, relative
+):
+    _, raw, folder = factory
+    alias, target = folder / "cache-alias", folder / "actual-cache"
+    original_resolve = Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        return target if path == alias else original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    raw["predictor"]["model_config_root"] = alias.name if relative else str(alias)
+    original = copy.deepcopy(raw)
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert result.model_config_root == str(alias.absolute())
+    assert result.model_config_root != str(target)
+    assert raw == original

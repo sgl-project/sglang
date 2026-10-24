@@ -311,10 +311,18 @@ class ConfigManager:
             options["systems_root"] = cls.resolve_infercast_path(
                 options.get("systems_root")
             )
-            if type(options.get("model_config_root")) is str:
-                options["model_config_root"] = cls.resolve_infercast_path(
-                    options["model_config_root"]
-                )
+            if (
+                type(options.get("model_config_root")) is str
+                and options["model_config_root"].strip()
+            ):
+                root = Path(
+                    os.path.expandvars(options["model_config_root"])
+                ).expanduser()
+                if not root.is_absolute():
+                    root = Path(Envs.config_path()).resolve().parent / root
+                # Preserve the requested root's link identity. The factory
+                # resolves and checks it across native model binding.
+                options["model_config_root"] = str(root.absolute())
             for key in ("runtime_profile", "progress_artifact"):
                 ref = options.get(key)
                 if isinstance(ref, dict) and type(ref.get("path")) is str:
