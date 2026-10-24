@@ -8,6 +8,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.utils import is_hip
+
 
 def average_pool_qsa_keys(key_groups: torch.Tensor) -> torch.Tensor:
     """FP32-average complete key groups shaped ``[groups, ratio, kv_heads, dim]``."""
@@ -31,6 +34,19 @@ def qsa_fast_topk(
     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
     starts = row_starts.to(device=logits.device, dtype=torch.int32)
     if logits.is_cuda:
+        if is_batch_invariant_mode_enabled() and not is_hip():
+            from flashinfer import TopKTieBreak, top_k_ragged_transform
+
+            return top_k_ragged_transform(
+                logits,
+                torch.zeros_like(starts),
+                lengths,
+                topk,
+                deterministic=True,
+                tie_break=TopKTieBreak.SMALL,
+                dsa_graph_safe=True,
+                row_starts=starts,
+            )
         if topk == 512:
             # Prefer the JIT kernel: it ships with the sglang python package,
             # so top-k 512 works regardless of the installed sgl_kernel version.
