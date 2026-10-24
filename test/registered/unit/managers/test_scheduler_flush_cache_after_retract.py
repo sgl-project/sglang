@@ -1,6 +1,8 @@
 import unittest
 from collections import deque
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -8,7 +10,9 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -107,6 +111,17 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
         self.assertFalse(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_not_called()
+
+    def test_flush_cache_drops_cached_mm_embeddings(self):
+        """Encoder outputs cached before a weight update must not survive the flush."""
+        cache = MultiModalStaticCache(max_size=1 << 20)
+        cache.set(mm_hash=1, embedding=EmbeddingResult(embedding=torch.zeros(4, 8)))
+        scheduler = self._new_scheduler()
+
+        with patch.object(mm_schedule, "embedding_cache", cache):
+            self.assertTrue(scheduler.flush_cache())
+
+        self.assertEqual(len(cache), 0)
 
 
 if __name__ == "__main__":
