@@ -132,6 +132,18 @@ class RocmPlatform(Platform):
                     dtype,
                 )
 
+        elif selected_backend == AttentionBackendEnum.SOL_ATTN:
+            if cls.get_gcn_arch_name().startswith("gfx1201"):
+                import aiter
+
+                if hasattr(aiter, "gfx1201_sol_attention"):
+                    logger.info("Using Sol-Attn backend on ROCm (aiter gfx1201).")
+                    return "sglang.multimodal_gen.runtime.layers.attention.backends.sol_attn.SolAttnBackend"
+            raise ValueError(
+                "SOL_ATTN on ROCm requires a gfx1201 GPU and an aiter build "
+                "that provides gfx1201_sol_attention."
+            )
+
         elif selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,
