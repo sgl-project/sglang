@@ -3,12 +3,14 @@
 import unittest
 import weakref
 from types import SimpleNamespace as NS
+from unittest.mock import patch
 
 import torch
 import torch_mlu  # noqa: F401
 
 from sglang.srt.hardware_backend.mlu.attention import MLUAttnBackend
 from sglang.srt.hardware_backend.mlu.memory_pool import MLUMHATokenToKVPool
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_mlu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -108,6 +110,9 @@ class TestAttentionMLU(CustomTestCase):
             v_head_dim=64,
             scaling=64**-0.5,
             sliding_window_size=-1,
+            logit_cap=0.0,
+            is_cross_attention=False,
+            attn_type=AttentionType.DECODER,
         )
         k = torch.randn(56, 2, 64, device="mlu", dtype=torch.bfloat16)
         v = torch.randn_like(k)
@@ -135,6 +140,18 @@ class TestAttentionMLU(CustomTestCase):
             )
             backend.init_forward_metadata(fb)
             fn = backend.forward_decode if mode.is_decode() else backend.forward_extend
+            # Unsupported semantics used to silently produce ordinary causal
+            # attention. Exercise the real forward paths, not only a validator.
+            for field, value, message in (
+                ("logit_cap", 0.5, "logit_cap"),
+                ("attn_type", AttentionType.ENCODER_ONLY, "causal decoder"),
+                ("attn_type", AttentionType.DECODER_BIDIRECTIONAL, "causal decoder"),
+                ("is_cross_attention", True, "cross-attention"),
+            ):
+                with self.subTest(mode=mode, field=field, value=value):
+                    with patch.object(layer, field, value):
+                        with self.assertRaisesRegex(ValueError, message):
+                            fn(q, None, None, layer, fb, save_kv_cache=False)
             actual = (
                 fn(q, None, None, layer, fb, save_kv_cache=False)
                 .view(-1, 4, 64)

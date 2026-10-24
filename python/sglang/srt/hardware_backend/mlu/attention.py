@@ -12,6 +12,7 @@ import torch
 import torch_mlu_ops
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
@@ -101,9 +102,21 @@ class MLUAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    @staticmethod
+    def _validate_layer(layer):
+        if layer.logit_cap != 0:
+            raise ValueError("MLU attention does not support nonzero logit_cap.")
+        if layer.is_cross_attention:
+            raise ValueError("MLU attention does not support cross-attention.")
+        if layer.attn_type != AttentionType.DECODER:
+            raise ValueError(
+                "MLU attention only supports causal decoder self-attention."
+            )
+
     def forward_extend(
         self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
     ):
+        self._validate_layer(layer)
         meta = self.forward_metadata
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         if save_kv_cache:
@@ -139,6 +152,7 @@ class MLUAttnBackend(AttentionBackend):
     def forward_decode(
         self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs
     ):
+        self._validate_layer(layer)
         meta = self.forward_metadata
         q = q.view(-1, 1, layer.tp_q_head_num, layer.qk_head_dim)
         if save_kv_cache:
