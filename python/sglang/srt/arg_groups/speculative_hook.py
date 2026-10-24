@@ -991,8 +991,21 @@ def _handle_iquest_q1_mtp_draft(server_args: ServerArgs) -> bool:
     return True
 
 
+def _check_oot_speculative_algorithm(algorithm: str, device: str) -> None:
+    if current_platform.is_out_of_tree() and not (
+        current_platform.supports_speculative_algorithm(algorithm)
+    ):
+        raise ValueError(
+            f"{algorithm} speculative decoding is not supported by "
+            f"{type(current_platform).__name__} on device {device!r}."
+        )
+
+
 def _handle_eagle_family(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
+    _check_oot_speculative_algorithm(
+        algorithm=cfg.speculative_algorithm, device=cfg.device
+    )
 
     if cfg.speculative_algorithm == "STANDALONE" and attn_dp_enabled_of(
         resolved_view(server_args)
