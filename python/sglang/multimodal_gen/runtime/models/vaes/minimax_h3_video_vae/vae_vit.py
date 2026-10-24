@@ -34,9 +34,9 @@ def _cuda_autocast_disabled(tensor: torch.Tensor):
 def _fused_blocks_available(blocks, hidden_states) -> bool:
     if not envs.MINIMAX_H3_VAE_DECODER_FUSED_NORM:
         return False
-    # The fused Triton norms decode to all-NaN on ROCm (MI300), where
-    # tensor.is_cuda is also true; keep ROCm on the unfused fp32-norm path.
-    if not current_platform.is_cuda():
+    # The fused Triton norms need numerics.mul_rn_f32, which has PTX and ROCm
+    # inline-asm paths only.
+    if not (current_platform.is_cuda() or current_platform.is_rocm()):
         return False
     if (
         not hidden_states.is_cuda
