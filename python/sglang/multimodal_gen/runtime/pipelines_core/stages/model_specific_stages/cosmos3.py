@@ -45,6 +45,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
+    EncodeWhileDecoding,
+    streamed_video_output_path,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
     ACTION_MODE_FORWARD_DYNAMICS,
     ACTION_MODE_INVERSE_DYNAMICS,
@@ -1341,7 +1345,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             )
 
     @staticmethod
-    def _cfg_active_at(t: torch.Tensor, interval: tuple[float, float] | None) -> bool:
+    def _cfg_active_at(t: float, interval: tuple[float, float] | None) -> bool:
         """Return True iff CFG should be applied at timestep ``t``.
 
         T2I uses a CFG window (e.g. ``[400, 1000]``) to skip guidance at low
@@ -1350,9 +1354,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         """
         if interval is None:
             return True
-        t_scalar = float(t.item()) if torch.is_tensor(t) else float(t)
         lo, hi = interval
-        return lo <= t_scalar <= hi
+        return lo <= t <= hi
 
     def _normalize_transfer_video(
         self, video: torch.Tensor, device: torch.device, dtype: torch.dtype
@@ -1688,6 +1691,9 @@ class Cosmos3DenoisingStage(PipelineStage):
             desc="Denoising",
             batch=batch,
         )
+        # host copy for the per-step CFG window checks: a device read per step
+        # would stall the host on every step's kernels
+        timestep_values = timesteps.tolist()
 
         for i, t in progress_bar:
             # Precision is chosen once per step, before any transformer call,
@@ -1698,7 +1704,9 @@ class Cosmos3DenoisingStage(PipelineStage):
             # Outside the CFG window the effective scale collapses to 1.0,
             # which reduces CFG to the cond branch (cfg-parallel safe).
             effective_scale = (
-                guidance_scale if self._cfg_active_at(t, guidance_interval) else 1.0
+                guidance_scale
+                if self._cfg_active_at(timestep_values[i], guidance_interval)
+                else 1.0
             )
             # Transfer control-CFG: active only when a control video is present,
             # ``control_guidance != 1.0``, and the step is inside the (optional)
@@ -1707,7 +1715,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             control_cfg_active = (
                 control_latents is not None
                 and control_guidance != 1.0
-                and self._cfg_active_at(t, control_guidance_interval)
+                and self._cfg_active_at(timestep_values[i], control_guidance_interval)
             )
 
             if control_cfg_active:
@@ -2423,12 +2431,13 @@ class Cosmos3DecodingStage(PipelineStage):
         scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
         return latents / scaling_factor
 
-    def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
+    def _decode_latents(self, latents: torch.Tensor, on_frames=None) -> torch.Tensor:
         """Decode latents to video frames. Returns tensor in [B, C, T, H, W] format."""
         latents = self._denormalize_latents(latents)
 
         # Decode - returns [B, C, T, H, W]
-        video = self.vae.decode(latents)
+        decode_kwargs = {} if on_frames is None else {"on_frames": on_frames}
+        video = self.vae.decode(latents, **decode_kwargs)
         # Handle both dict return and direct tensor return
         if hasattr(video, "sample"):
             video = video.sample
@@ -2440,6 +2449,27 @@ class Cosmos3DecodingStage(PipelineStage):
     @staticmethod
     def _postprocess_tensor(decoded: torch.Tensor) -> torch.Tensor:
         return decoded.mul_(0.5).add_(0.5).clamp_(0, 1).float()
+
+    def _encode_while_decoding(
+        self, batch: Req, server_args: ServerArgs
+    ) -> EncodeWhileDecoding | None:
+        """An encoder fed by the decode, if the plain video frames go straight to the MP4."""
+        if (
+            not self.vae.supports_decode_on_frames
+            or (self._guardrails and batch.use_guardrails is not False)
+            or (self.sound_tokenizer is not None and batch.audio_latents is not None)
+            or batch.action_latents is not None
+            or batch.extra.get("transfer_plan") is not None
+        ):
+            return None
+        save_file_path = streamed_video_output_path(
+            batch, server_args, int(batch.latents.shape[0])
+        )
+        if save_file_path is None:
+            return None
+        return EncodeWhileDecoding(
+            save_file_path, batch, finish_frames=self._postprocess_tensor
+        )
 
     @staticmethod
     def _postprocess_video_np(video: torch.Tensor, is_image_gen: bool) -> np.ndarray:
@@ -2542,9 +2572,26 @@ class Cosmos3DecodingStage(PipelineStage):
         device = batch.latents.device
         decoded = batch.extra.get("transfer_decoded_output")
         if decoded is None:
+            stream = self._encode_while_decoding(batch, server_args)
+            output_file_paths = None
             with self.use_declared_component(component_name="vae", module=self.vae):
                 with torch.no_grad():
-                    decoded = self._decode_latents(batch.latents)
+                    try:
+                        decoded = self._decode_latents(batch.latents, on_frames=stream)
+                        if stream is not None:
+                            output_file_paths = stream.finish()
+                    except BaseException:
+                        if stream is not None:
+                            stream.abort()
+                        raise
+            if output_file_paths is not None:
+                return OutputBatch(
+                    output=None,
+                    output_file_paths=output_file_paths,
+                    metrics=batch.metrics,
+                    rollout_trajectory_data=batch.rollout_trajectory_data,
+                    **action_metadata,
+                )
 
         self.log_debug("Decoded tensor shape: %s", decoded.shape)
         output = self._postprocess_tensor(decoded)
