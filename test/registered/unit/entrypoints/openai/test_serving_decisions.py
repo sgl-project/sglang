@@ -1401,5 +1401,177 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 500)
 
 
+class TestStartLuxSystemOne(unittest.IsolatedAsyncioTestCase):
+    """A StartLux checkpoint reads its own trained prompt and answer letters."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER)
+        cls.letters = list(string.ascii_uppercase)
+        cls.letter_ids = cls.tokenizer.convert_tokens_to_ids(cls.letters)
+
+    def setUp(self):
+        self.addCleanup(restore_context, snapshot_context())
+
+    def _manager(self, decision_config=None, **kwargs):
+        manager = ScoringManager(self.tokenizer, **kwargs)
+        manager.model_config.decision_config = decision_config
+        return manager
+
+    def _serving(self, manager):
+        return _handler(manager, serving_class=SystemOneServing)
+
+    def _startlux(self, temperature=None):
+        return {
+            "format": "lodestar-letter-readout-v1",
+            "codes": list(self.letters),
+            "token_ids": list(self.letter_ids),
+            "temperature_by_type": temperature
+            or {"choice": 0.9503, "score": 1.0108, "noul": 1.376},
+            "max_options_per_pass": 26,
+            "wide_choice": {"group": 25, "keep": 3, "residual": 0.001},
+        }
+
+    def _expected(self, ids, temperature):
+        weights = torch.softmax(self.manager.logprobs[ids] / temperature, dim=0)
+        return weights
+
+    async def test_the_prompt_is_the_trained_format(self):
+        """The prompt literal is the trained one-pass prompt of StartLux-Decision."""
+        self.manager = self._manager(self._startlux())
+        request = _systemone_request(
+            {"urgent": {"type": "noul", "instructions": "Urgent?"}}
+        )
+        response = await self._serving(self.manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 200, response.body[:400])
+        scored = self.manager.requests[0]
+        self.assertEqual(
+            self.tokenizer.decode(scored.input_ids[0]),
+            "<|im_start|>system\n"
+            "Apply the criterion to the evidence. Choose exactly one listed option. "
+            "Answer with its letter only.<|im_end|>\n"
+            "<|im_start|>user\nEvidence:\nThe integration keeps failing.\n\n"
+            "Question: Urgent?\nOptions:\nA) yes\nB) no<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        )
+        self.assertEqual(scored.token_ids_logprob[0], self.letter_ids[:2])
+
+    async def test_each_question_type_uses_its_own_temperature(self):
+        """The checkpoint calibrates choice, score and yes or no separately."""
+        self.manager = self._manager(
+            self._startlux({"choice": 0.9503, "score": 1.0108, "noul": 1.376})
+        )
+        request = _systemone_request(
+            {
+                "urgent": {"type": "noul", "instructions": "Urgent?"},
+                "mood": {
+                    "type": "score",
+                    "instructions": "How bad?",
+                    "criteria": ["calm", "annoyed"],
+                },
+            }
+        )
+        response = await self._serving(self.manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 200, response.body[:400])
+        answers = json.loads(response.body)["answers"]
+        noul_ids, score_ids = self.letter_ids[:2], self.letter_ids[:2]
+        torch.testing.assert_close(
+            torch.tensor(answers["urgent"]["noul"]),
+            self._expected(noul_ids, 1.376)[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            torch.tensor(list(answers["mood"]["probabilities"].values())),
+            self._expected(score_ids, 1.0108),
+            check_dtype=False,
+        )
+
+    async def test_the_none_candidate_is_read_and_split_out(self):
+        """The checkpoint reads an extra "None of the above" option and reports its share."""
+        self.manager = self._manager(self._startlux())
+        request = _systemone_request(
+            {
+                "team": {
+                    "type": "choice",
+                    "instructions": "Which team?",
+                    "criteria": {"billing": "Payments", "technical": "Bugs"},
+                }
+            }
+        )
+        response = await self._serving(self.manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 200, response.body[:400])
+        answer = json.loads(response.body)["answers"]["team"]
+        read = self._expected(self.letter_ids[:3], 0.9503)
+        listed = read[:2] / read[:2].sum()
+        self.assertAlmostEqual(answer["none_probability"], float(read[2]), places=6)
+        torch.testing.assert_close(
+            torch.tensor(list(answer["probabilities"].values())),
+            listed,
+            check_dtype=False,
+        )
+        self.assertIn(answer["choice"], ("billing", "technical"))
+        # The prompt labels the extra option like any other one.
+        prompt = self.tokenizer.decode(self.manager.requests[0].input_ids[0])
+        self.assertIn("C) None of the above", prompt)
+
+    async def test_without_the_none_read_out_the_letters_are_the_listed_options(self):
+        self.manager = self._manager(self._startlux())
+        request = _systemone_request(
+            {
+                "team": {
+                    "type": "choice",
+                    "instructions": "Which team?",
+                    "criteria": {"billing": "Payments", "technical": "Bugs"},
+                }
+            },
+            none_check=False,
+        )
+        response = await self._serving(self.manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 200, response.body[:400])
+        answer = json.loads(response.body)["answers"]["team"]
+        self.assertNotIn("none_probability", answer)
+        self.assertEqual(
+            self.manager.requests[0].token_ids_logprob[0], self.letter_ids[:2]
+        )
+        torch.testing.assert_close(
+            torch.tensor(list(answer["probabilities"].values())),
+            self._expected(self.letter_ids[:2], 0.9503),
+            check_dtype=False,
+        )
+
+    async def test_a_thought_request_is_refused_rather_than_ignored(self):
+        """This route reads one answer and generates nothing, so it cannot think."""
+        with self.assertRaises(ValidationError):
+            _systemone_request(
+                {"urgent": {"type": "noul", "instructions": "Urgent?"}},
+                think_mode="auto",
+            )
+
+    async def test_a_choice_list_over_one_read_out_is_refused(self):
+        """A longer list needs the checkpoint's own grouping rounds."""
+        self.manager = self._manager(self._startlux())
+        request = _systemone_request(
+            {
+                "pick": {
+                    "type": "choice",
+                    "instructions": "Pick one",
+                    "criteria": {f"option {i}": None for i in range(26)},
+                }
+            }
+        )
+        response = await self._serving(self.manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("longer choice list", json.loads(response.body)["message"])
+
+    async def test_a_none_read_out_needs_a_startlux_checkpoint(self):
+        manager = self._manager(None)
+        request = _systemone_request(
+            {"q": {"type": "noul", "instructions": "x"}}, none_check=False
+        )
+        response = await self._serving(manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("lodestar", json.loads(response.body)["message"])
+
+
 if __name__ == "__main__":
     unittest.main()

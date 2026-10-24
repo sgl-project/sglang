@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import string
 from enum import Enum, IntEnum, auto
 from functools import cached_property, lru_cache
 from pathlib import Path
@@ -258,11 +259,20 @@ def is_dspark_draft(config) -> bool:
 
 # The decision_config.json attention mode whose full-attention layers read the whole prompt.
 NONCAUSAL_FULL_ATTENTION = "noncausal_full_attention"
+# The decision_config.json format of a StartLux-Decision checkpoint, whose trained LM
+# head reads one answer letter per option.
+STARTLUX_FORMAT = "lodestar-letter-readout-v1"
+# The format of a decision_config.json that ships its own readout rows.
+READOUT_FORMAT = "readout-v1"
+# Architectures that ship a language model head a StartLux readout can read.
+STARTLUX_ARCHITECTURES = (
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
+)
 
 
 @lru_cache
-def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[dict]:
-    """decision_config.json of a checkpoint whose LM head is a decision readout."""
+def _read_decision_config(model_path: str, revision: Optional[str]) -> Optional[dict]:
     path = cached_file(
         model_path,
         "decision_config.json",
@@ -272,7 +282,75 @@ def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[d
     if path is None:
         return None
     with open(path) as f:
-        config = json.load(f)
+        return json.load(f)
+
+
+def _startlux_decision_config(config: dict) -> dict:
+    """Validate a StartLux decision_config.json and normalize it for the serving path."""
+    letters = config.get("letter_token_ids")
+    if not isinstance(letters, list) or len(letters) != 26:
+        raise ValueError(
+            "decision_config.json letter_token_ids must list the 26 answer letters"
+        )
+    if any(not isinstance(value, int) for value in letters):
+        raise ValueError("decision_config.json letter_token_ids must be integers")
+    if len(set(letters)) != len(letters):
+        raise ValueError("decision_config.json letter_token_ids must be distinct")
+    temperatures = config.get("temperature_by_type")
+    if not isinstance(temperatures, dict) or not temperatures:
+        raise ValueError("decision_config.json needs temperature_by_type")
+    unknown = set(temperatures) - {"choice", "score", "noul"}
+    if unknown:
+        raise ValueError(
+            "decision_config.json temperature_by_type has unsupported question "
+            f"types {sorted(unknown)}"
+        )
+    for kind, value in temperatures.items():
+        if not isinstance(value, (int, float)) or not 0 < float(value) < float("inf"):
+            raise ValueError(
+                f"decision_config.json temperature_by_type[{kind!r}] must be finite "
+                "and above 0"
+            )
+    max_options = config.get("max_options_per_pass", 26)
+    if not isinstance(max_options, int) or not 2 <= max_options <= 26:
+        raise ValueError("decision_config.json max_options_per_pass must be 2 to 26")
+    wide_choice = config.get("wide_choice") or {}
+    if not isinstance(wide_choice, dict):
+        raise ValueError("decision_config.json wide_choice must be an object")
+    normalized = dict(config)
+    normalized["format"] = STARTLUX_FORMAT
+    # Derived once here, so that the serving path reads one shape per family.
+    normalized["codes"] = list(string.ascii_uppercase[:max_options])
+    normalized["token_ids"] = list(letters[:max_options])
+    normalized["temperature_by_type"] = {
+        kind: float(value) for kind, value in temperatures.items()
+    }
+    normalized["max_options_per_pass"] = max_options
+    normalized["wide_choice"] = wide_choice
+    # A StartLux checkpoint reads its answers causally from its own LM head.
+    normalized.setdefault("attention_mode", "causal")
+    normalized.setdefault("pooling", "last")
+    return normalized
+
+
+@lru_cache
+def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[dict]:
+    """decision_config.json of a checkpoint whose answers are read from option tokens.
+
+    Two formats exist: one that ships its own readout rows, which the loader places in
+    the LM head, and a StartLux-Decision checkpoint whose trained LM head is the
+    readout. A format this loader does not honor is refused, since serving it as
+    another format would silently change the answers.
+    """
+    config = _read_decision_config(model_path, revision)
+    if config is None:
+        return None
+    if config.get("format") is not None:
+        if config["format"] != STARTLUX_FORMAT:
+            raise ValueError(
+                f"decision_config.json format {config['format']!r} is not supported"
+            )
+        return _startlux_decision_config(config)
     if config["format_version"] != 1:
         raise ValueError(
             f"decision_config.json format_version {config['format_version']} "
@@ -289,6 +367,7 @@ def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[d
         raise ValueError(
             f"decision_config.json pooling {pooling!r} is not supported, only 'last' is"
         )
+    config["format"] = READOUT_FORMAT
     return config
 
 
@@ -623,9 +702,18 @@ class ModelConfig:
             revision = self.revision
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.decision_config = None
-        if self.hf_config.architectures == ["Qwen3_5Model"]:
+        decision_architectures = tuple(self.hf_config.architectures or ())
+        if decision_architectures == ("Qwen3_5Model",):
             self.decision_config = load_decision_config(self.model_path, revision)
             if self.decision_config is not None:
+                if self.decision_config["format"] == STARTLUX_FORMAT:
+                    # The StartLux readout is the checkpoint's own LM head, and a bare
+                    # backbone ships none.
+                    raise ValueError(
+                        "decision_config.json reads a StartLux-Decision answer, which "
+                        "needs the checkpoint's LM head: architectures "
+                        '["Qwen3_5Model"] has none'
+                    )
                 # A bare backbone whose readout the loader places in the LM head.
                 self.hf_config.architectures = ["Qwen3_5ForConditionalGeneration"]
                 if (
@@ -634,6 +722,21 @@ class ModelConfig:
                 ):
                     # Full attention sees the whole prompt, while linear attention stays causal.
                     self.hf_text_config.is_causal = False
+        elif (
+            len(decision_architectures) == 1
+            and decision_architectures[0] in STARTLUX_ARCHITECTURES
+        ):
+            # A StartLux-Decision checkpoint keeps its own LM head, whose rows of the
+            # answer letters are the readout.
+            decision_config = load_decision_config(self.model_path, revision)
+            if decision_config is not None:
+                if decision_config["format"] != STARTLUX_FORMAT:
+                    raise ValueError(
+                        "decision_config.json format_version "
+                        f"{decision_config['format_version']} needs architectures "
+                        '["Qwen3_5Model"], a bare backbone with a readout file'
+                    )
+                self.decision_config = decision_config
         self.joint_head_config = None
         if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
             self.joint_head_config = load_joint_head_config(self.model_path, revision)
