@@ -69,6 +69,7 @@ from sglang.srt.managers.data_parallel_controller import (
     run_scheduler_process_with_init_pipe,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
+from sglang.srt.managers.disagg_service import start_disagg_service_for_rust_server
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     CloseSessionReqInput,
@@ -180,6 +181,8 @@ class SchedulerInitResult:
     wait_for_ready: Callable[[], None] = lambda: None
     block_until_scheduler_exits: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
+    # Rust-server mode only: a KV bootstrap server the Rust server cannot serve.
+    kv_bootstrap_server: Optional[Any] = None
     grpc_server: Optional[Any] = None
 
     def stop_grpc_server(self) -> None:
@@ -1293,6 +1296,11 @@ class Engine(EngineScoreMixin, EngineBase):
         # not start the Python detokenizer subprocess(es) or tokenizer manager.
         # Do not use RayEngine with the Rust server, as it is not supported.
         if envs.SGLANG_RUST_SERVER.get():
+            # In place of the tokenizer manager, which starts the KV bootstrap
+            # server in Python mode.
+            scheduler_init_result.kv_bootstrap_server = (
+                start_disagg_service_for_rust_server()
+            )
             scheduler_init_result.wait_for_ready()
             # Set up subprocess liveness watchdog to detect crashes
             processes = list(scheduler_procs or [])
