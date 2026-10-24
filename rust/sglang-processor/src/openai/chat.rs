@@ -85,10 +85,8 @@ impl ChatModel {
         }
     }
 
-    /// `_get_reasoning_from_request` under `reasoning_parser`, given the
-    /// request's template kwargs over the server's defaults: whether the reply
-    /// starts in reasoning. `None` without a reasoning parser, or for one
-    /// SGLang's port does not cover, which keeps its own default.
+    /// `_get_reasoning_from_request` over the merged template kwargs: whether the
+    /// reply starts in reasoning. `None` for no parser or one the port does not cover.
     fn thinking(
         &self,
         reasoning_parser: Option<&str>,
@@ -107,9 +105,8 @@ impl ChatModel {
         )
     }
 
-    /// [`Self::thinking`] for a raw chat `body` under the server's `defaults`:
-    /// its kwargs take the thinking toggle its effort implies, then the
-    /// defaults, as the request validator and `_process_messages` fill them.
+    /// [`Self::thinking`] for a raw chat `body` under the server's `defaults`,
+    /// its kwargs filled as `_process_messages` fills them.
     #[cfg(feature = "render")]
     pub fn request_thinking(
         &self,
@@ -129,9 +126,8 @@ impl ChatModel {
     }
 }
 
-/// `_process_messages`' template kwargs: the request's, then the thinking
-/// toggle its effort implies and the server's `defaults` filling in; the
-/// effort itself moves onto the request.
+/// `_process_messages`' template kwargs: the request's, then the thinking toggle
+/// its effort implies, then the server's `defaults`; the effort moves onto the request.
 fn template_kwargs<'a>(
     mut kwargs: Map<String, Value>,
     thinking: Option<Value>,
@@ -1305,9 +1301,8 @@ impl ChatResponder {
 mod tests {
     use super::*;
 
-    /// Kimi K3's reply starts in reasoning unless the merged kwargs turn
-    /// `thinking` off, here through `reasoning_effort: "none"`; a parser
-    /// SGLang's port does not cover keeps its own default.
+    /// Kimi K3 starts in reasoning unless the merged kwargs turn `thinking` off;
+    /// a parser the port does not cover keeps its own default.
     #[test]
     fn chat_model_decides_reasoning_as_python() {
         let k3 = ChatModel {

@@ -1,6 +1,5 @@
-//! SGLang's chat layer around a template without an SGLang request path
-//! (Jinja, Dynamo's encoders, legacy conversations): the kwargs
-//! `_process_messages` hands the template.
+//! The kwargs SGLang's `_process_messages` hands a template without an SGLang
+//! request path (Jinja, Dynamo's encoders, legacy conversations).
 
 use std::collections::HashMap;
 
@@ -10,24 +9,19 @@ use serde_json::Value;
 
 use super::{ChatFormatter, TemplateError};
 
-/// What SGLang's chat layer reads off a raw chat body for its template. The
-/// body must be one SGLang's `ChatCompletionRequest` accepts; it is not
-/// re-validated.
+/// What SGLang's chat layer reads off a raw chat body (not re-validated) for its template.
 #[derive(Debug, Clone, Default)]
 pub struct TemplateArgs {
     kwargs: HashMap<String, Value>,
 }
 
 impl TemplateArgs {
-    /// Python's template kwargs (`_process_messages`): the server `defaults`
-    /// under the request's own `chat_template_kwargs`.
+    /// The server `defaults` under the request's own `chat_template_kwargs`.
     pub fn new(body: &Value, defaults: &HashMap<String, Value>) -> Self {
         let mut kwargs = defaults.clone();
-        let own = body["chat_template_kwargs"]
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        kwargs.extend(own);
+        if let Some(own) = body["chat_template_kwargs"].as_object() {
+            kwargs.extend(own.clone());
+        }
         Self { kwargs }
     }
 }

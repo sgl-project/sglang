@@ -1,7 +1,5 @@
-//! Chat prompt rendering through `sglang-processor`.
-//!
-//! The processor owns template loading and the SGLang-parity formatters; this
-//! module adapts the server's wire request to it.
+//! Chat prompt rendering: adapts the server's wire request to the
+//! `sglang-processor` formatters.
 
 use std::collections::HashMap;
 
@@ -16,10 +14,8 @@ pub(super) use crate::message::request::RenderedChat;
 /// Extra variables for the chat template (`chat_template_kwargs`).
 pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 
-/// Render a chat request for the tokenizer pool.
-/// Formatters with an SGLang request path render the raw `body` and return the
-/// `continue_final_message` prefix separately; the rest render `request`, and
-/// their templates fold any continuation into the prompt.
+/// Render a chat request for the tokenizer pool: the raw `body` through the
+/// SGLang request path when there is one, else `request` through the template.
 pub(super) fn render_chat(
     formatter: &ChatFormatter,
     body: Value,
@@ -28,9 +24,7 @@ pub(super) fn render_chat(
 ) -> Result<RenderedChat, TemplateError> {
     let args = TemplateArgs::new(&body, defaults);
     match render_body(formatter, body, defaults) {
-        // Formatters without an SGLang request path render through their
-        // template, and so do the valid requests that path declines, which
-        // only the engine renders; one with no other path declines them again.
+        // Valid requests the SGLang path declines render through the template too.
         Some(Err(TemplateError::NeedsRenderFallback { .. })) | None => formatter
             .render_template(request, &args)
             .map(|prompt| RenderedChat {
@@ -47,17 +41,13 @@ pub(super) fn render_body(
     body: Value,
     defaults: &ChatTemplateKwargs,
 ) -> Option<Result<RenderedChat, TemplateError>> {
-    if !formatter.renders_requests() {
-        return None;
-    }
-    Some(
-        formatter
-            .render_request(body, defaults)
-            .map(|(prompt, continuation)| RenderedChat {
-                prompt,
-                continuation,
-            }),
-    )
+    formatter.renders_requests().then(|| {
+        let (prompt, continuation) = formatter.render_request(body, defaults)?;
+        Ok(RenderedChat {
+            prompt,
+            continuation,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -65,9 +55,8 @@ mod tests {
     use super::super::test_utils::checkpoint_formatter;
     use super::*;
 
-    /// Qwen3.8's renderer declines floats serde_json prints unlike Python;
-    /// with no engine to hand them to, the template renders them instead of
-    /// the request failing.
+    /// Floats Qwen3.8's renderer declines (serde_json prints them unlike Python)
+    /// render through the template instead of failing the request.
     #[test]
     fn declined_requests_render_through_the_template() {
         let path = concat!(

@@ -1,8 +1,6 @@
-//! Chat completions through sglang-processor's port of Python's OpenAI layer.
-//!
-//! The processor lowers the chat body into a `/generate` body, which the
-//! native route's decoder and the core serve, and builds the OpenAI response
-//! from the `/generate` frames. Requests it does not reproduce go to `chat.rs`.
+//! Chat completions through sglang-processor's port of Python's OpenAI layer:
+//! the chat body is lowered to a `/generate` body and the reply built from its
+//! frames. Requests the processor does not reproduce go to `chat.rs`.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -29,6 +27,7 @@ use crate::api_server::http::native_api::{
 };
 use crate::message::config::ServerArgs;
 use crate::message::request::check_prompt_copies;
+use crate::utils::error::Error;
 
 /// The server facts and tokenizer the processor's chat layer reads.
 pub struct OpenAiChat {
@@ -176,46 +175,9 @@ pub(super) async fn chat(
     .await
     .ok()??;
 
-    // The core samples one sequence per request, so `n` choices are a batch of
-    // the prompt, whose indexed frames are what Python's `n` streams.
-    let n = generate["sampling_params"]["n"].as_u64().unwrap_or(1);
-    let n = usize::try_from(n).unwrap_or(usize::MAX);
     let stream = generate["stream"] == true;
-    if n > 1 {
-        // Bounded before the prompt is copied: a huge `n` would overflow or
-        // exhaust the allocation.
-        let per_clone = generate["input_ids"]
-            .as_array()
-            .map_or(0, |ids| ids.len().saturating_mul(size_of::<Value>()));
-        if let Err(error) = check_prompt_copies(per_clone, n) {
-            return Some(error_response(StatusCode::BAD_REQUEST, &error.to_string()));
-        }
-        generate["sampling_params"]["n"] = 1.into();
-        generate["input_ids"] = Value::Array(vec![generate["input_ids"].take(); n]);
-        // Python's parallel sampling repeats the prompt's list-form fields
-        // with it, and a rid list names the one prompt.
-        for key in [
-            "bootstrap_host",
-            "bootstrap_port",
-            "bootstrap_room",
-            "extra_key",
-            "cache_salt",
-            "lora_path",
-        ] {
-            if let Some(Value::Array(items)) = generate.get_mut(key) {
-                *items = items
-                    .iter()
-                    .cycle()
-                    .take(items.len() * n)
-                    .cloned()
-                    .collect();
-            }
-        }
-        if let Some(Value::Array(rids)) = generate.get_mut("rid")
-            && rids.len() == 1
-        {
-            generate["rid"] = rids.remove(0);
-        }
+    if let Err(error) = copy_prompt_per_choice(&mut generate) {
+        return Some(error_response(StatusCode::BAD_REQUEST, &error.to_string()));
     }
     // Python's `adapted_request` takes the router's override headers.
     if state.server_args.enable_request_header_overrides
@@ -304,10 +266,50 @@ pub(super) async fn chat(
     )
 }
 
-/// Python's `/generate` streams a scheduler abort, whatever its status, as a
-/// frame whose `finish_reason` carries the status, which its chat layer
-/// answers with an error event under that status; other failures stay
-/// error frames.
+/// The core samples one sequence per request, so `n` choices are a batch of
+/// the prompt, whose indexed frames are what Python's `n` streams.
+fn copy_prompt_per_choice(generate: &mut Value) -> Result<(), Error> {
+    let n = generate["sampling_params"]["n"].as_u64().unwrap_or(1);
+    let n = usize::try_from(n).unwrap_or(usize::MAX);
+    if n <= 1 {
+        return Ok(());
+    }
+    // Bounded before the copy: a huge `n` would overflow or exhaust the allocation.
+    let per_clone = generate["input_ids"]
+        .as_array()
+        .map_or(0, |ids| ids.len().saturating_mul(size_of::<Value>()));
+    check_prompt_copies(per_clone, n)?;
+    generate["sampling_params"]["n"] = 1.into();
+    generate["input_ids"] = Value::Array(vec![generate["input_ids"].take(); n]);
+    // Python's parallel sampling repeats the prompt's list-form fields with it,
+    // and a rid list names the one prompt.
+    for key in [
+        "bootstrap_host",
+        "bootstrap_port",
+        "bootstrap_room",
+        "extra_key",
+        "cache_salt",
+        "lora_path",
+    ] {
+        if let Some(Value::Array(items)) = generate.get_mut(key) {
+            *items = items
+                .iter()
+                .cycle()
+                .take(items.len() * n)
+                .cloned()
+                .collect();
+        }
+    }
+    if let Some(Value::Array(rids)) = generate.get_mut("rid")
+        && rids.len() == 1
+    {
+        generate["rid"] = rids.remove(0);
+    }
+    Ok(())
+}
+
+/// Python's `/generate` streams a scheduler abort as a frame whose
+/// `finish_reason` carries its status, which its chat layer answers as an error event.
 fn python_error_frame(error: &CoreError, index: Option<u32>) -> String {
     let CoreError::RuntimeRejected {
         message,
@@ -331,9 +333,8 @@ fn python_error_frame(error: &CoreError, index: Option<u32>) -> String {
     .to_string()
 }
 
-/// `OpenAIServingBase.create_error_response`: a 400 is the `ValueError` it
-/// answers as a `BadRequestError`; any other status is an `HTTPException`,
-/// whose status code is the type.
+/// `OpenAIServingBase.create_error_response`: a 400 is a `BadRequestError`;
+/// any other status is an `HTTPException`, typed by its status code.
 fn error_response(status: StatusCode, message: &str) -> Response {
     let code = status.as_u16();
     let err_type = match status {
@@ -361,10 +362,11 @@ mod tests {
 
     use axum::Router;
 
-    use super::super::test_utils::{answering_app_state_with_item, body_json, chunk, post_json};
+    use super::super::test_utils::{
+        answering_app_state_with_item, body_json, chunk, oneshot, post_json,
+    };
     use super::*;
     use crate::message::response::{ChunkExtras, ResponseItem};
-    use crate::utils::error::Error;
 
     /// A byte-level word tokenizer's `tokenizer.json`; id 3 is `é`'s bytes.
     fn tokenizer_path() -> &'static str {
@@ -444,15 +446,8 @@ mod tests {
             "bootstrap_host": ["h"],
             "bootstrap_room": [5],
         });
-        let response = post_json(app, "/v1/chat/completions", body).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            body_json(response).await["choices"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
+        let value = body_json(post_json(app, "/v1/chat/completions", body).await).await;
+        assert_eq!(value["choices"].as_array().unwrap().len(), 2);
     }
 
     /// A scheduler abort in a stream, whatever its status, is Python's error
@@ -509,22 +504,17 @@ mod tests {
         };
         let app = lowered_state_with(args, |rid| chunk(rid, "ok", true));
         let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
-        let request = axum::http::Request::post("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .header("x-override-rid", "routed")
-            .body(axum::body::Body::from(body.to_string()))
-            .unwrap();
-        let response = tower::ServiceExt::oneshot(app.clone(), request)
-            .await
-            .unwrap();
+        let post = |header: &str, value: &str| {
+            let request = axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header(header, value)
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            oneshot(app.clone(), request)
+        };
+        let response = post("x-override-rid", "routed").await;
         assert_eq!(body_json(response).await["id"], "routed");
-
-        let request = axum::http::Request::post("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .header("x-override-priority", "high")
-            .body(axum::body::Body::from(body.to_string()))
-            .unwrap();
-        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        let response = post("x-override-priority", "high").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 

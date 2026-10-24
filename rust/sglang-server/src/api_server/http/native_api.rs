@@ -352,9 +352,8 @@ async fn generate(
     }
 }
 
-/// Decode a `/generate` body beneath the launch-time sampling defaults into
-/// its requests, and whether it was a batch. An error carries the body's
-/// `stream` flag once it is known.
+/// Decode a `/generate` body under the launch-time defaults into its requests and
+/// whether it is a batch; an error carries the body's `stream` flag once known.
 pub(super) fn generate_requests(
     state: &AppState,
     mut body: serde_json::Value,

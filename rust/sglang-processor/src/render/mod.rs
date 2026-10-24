@@ -345,9 +345,8 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
     }
 }
 
-/// How the SGLang-parity renderers end the message refusing a valid request:
-/// [`ChatFormatter::render_request`] maps such messages to
-/// [`TemplateError::NeedsRenderFallback`], so a renderer's refusal must keep it.
+/// How a parity renderer ends the message refusing a valid request, which
+/// [`ChatFormatter::render_request`] maps to [`TemplateError::NeedsRenderFallback`].
 const RENDER_FALLBACK_SUFFIX: &str = "a fallback renderer";
 
 #[derive(Debug, Error)]
@@ -392,9 +391,8 @@ pub enum TemplateError {
     #[error("invalid chat template: {message}")]
     Renderer { message: String },
 
-    /// [`ChatFormatter::render_request`] declines a valid request it cannot
-    /// render byte-for-byte as SGLang does ("... requires a fallback renderer"); the
-    /// host should render it another way, not reject it.
+    /// A valid request [`ChatFormatter::render_request`] cannot render exactly as
+    /// SGLang does; the host should render it another way, not reject it.
     #[error("{message}")]
     NeedsRenderFallback { message: String },
 

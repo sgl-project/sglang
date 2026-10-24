@@ -13,8 +13,7 @@ pub trait TextTokenizer: Send + Sync {
         None
     }
 
-    /// Python's chat encode: the rendered template without the tokenizer's own
-    /// specials, then the `continue_final_message` text encoded on its own
+    /// Python's chat encode: the template without specials, then the continuation
     /// minus one leading BOS (`_append_assistant_prefix_to_prompt_ids`).
     fn encode_chat(
         &self,
@@ -24,11 +23,11 @@ pub trait TextTokenizer: Send + Sync {
         let mut ids = self.encode_segments(prompt, false)?;
         if !continuation.is_empty() {
             let suffix = self.encode(continuation, true)?;
-            let leading_bos = self
-                .bos_token_id()
-                .is_some_and(|bos| suffix.first() == Some(&bos));
-            let skip = usize::from(leading_bos);
-            ids.extend_from_slice(&suffix[skip..]);
+            let bos = self.bos_token_id();
+            ids.extend_from_slice(
+                bos.and_then(|bos| suffix.strip_prefix(&[bos]))
+                    .unwrap_or(&suffix),
+            );
         }
         Ok(ids)
     }
@@ -110,10 +109,8 @@ impl DynamoTokenizer {
     }
 }
 
-/// `bos_token` from `tokenizer_config.json`, as Python's `bos_token_id` reads
-/// it: `convert_tokens_to_ids`. tiktoken has no vocab lookup, so it encodes
-/// the token as a special instead, taking the last id: an auto-added BOS may
-/// precede it.
+/// `bos_token` from `tokenizer_config.json`, looked up as Python's `bos_token_id`;
+/// tiktoken has no vocab lookup, so it takes the last id of its special encoding.
 fn configured_bos(
     tokenizer: &dynamo_tokenizers::Tokenizer,
     path: &str,
@@ -183,9 +180,8 @@ mod tests {
 
     use super::*;
 
-    /// An HF tokenizer whose post-processor prepends `<s>`, which
-    /// `tokenizer_config.json` names as BOS: the template encodes without it,
-    /// and the continuation loses one leading BOS, as on Python.
+    /// With a configured, auto-added `<s>`, the template encodes without it and the
+    /// continuation loses one leading BOS, as on Python.
     #[test]
     fn chat_encode_drops_one_configured_bos() {
         let dir = std::env::temp_dir().join(format!("processor-bos-{}", std::process::id()));
