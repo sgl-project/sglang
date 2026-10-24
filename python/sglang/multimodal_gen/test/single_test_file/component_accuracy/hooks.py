@@ -48,6 +48,8 @@ class TransformerHookCompat:
     negate_reference_output: bool = False
     omit_reference_guidance: bool = False
     use_2d_hidden_states: bool = False
+    # FLUX-style DiTs take guidance pre-multiplied by TIMESTEP_NORMALIZATION_FACTOR.
+    normalize_sglang_guidance: bool = True
 
 
 def _resolve_transformer_hook_compat(case: Any) -> TransformerHookCompat:
@@ -61,6 +63,12 @@ def _resolve_transformer_hook_compat(case: Any) -> TransformerHookCompat:
         return TransformerHookCompat(
             normalize_reference_timestep=True,
             omit_reference_guidance=True,
+        )
+    if "sana_sprint" in model_path or "sana-sprint" in model_path:
+        # Guidance-distilled: both DiTs take the same embedded guidance value.
+        return TransformerHookCompat(
+            use_2d_hidden_states=True,
+            normalize_sglang_guidance=False,
         )
     if "sana-video" in model_path or "sana_video" in model_path:
         return TransformerHookCompat(omit_reference_guidance=True)
@@ -513,7 +521,7 @@ def _prepare_transformer_hook_call(
             )
             if should_include_guidance or requires_guidance_arg:
                 guidance_value = inputs["guidance"]
-                if side == "sglang":
+                if side == "sglang" and compat.normalize_sglang_guidance:
                     guidance_value = guidance_value * TIMESTEP_NORMALIZATION_FACTOR
                 kwargs["guidance"] = guidance_value
 

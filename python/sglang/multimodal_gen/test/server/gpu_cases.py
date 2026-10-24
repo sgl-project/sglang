@@ -35,6 +35,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
     PI05_ACTION_CI_sampling_params,
     REALTIME_MODEL_sampling_params,
+    SANA_SPRINT_T2I_CI_sampling_params,
     SANA_VIDEO_T2V_CI_sampling_params,
     SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
@@ -58,6 +59,8 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SANA_SPRINT_1_6B_MODEL_NAME_FOR_TEST,
+    DEFAULT_SANA_SPRINT_MODEL_NAME_FOR_TEST,
     DEFAULT_SANA_VIDEO_MODEL_NAME_FOR_TEST,
     DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -209,6 +212,26 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_perf_check=False,
         run_consistency_check=True,
         run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "sana_sprint_0.6b_t2i",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SANA_SPRINT_MODEL_NAME_FOR_TEST,
+            modality="image",
+        ),
+        SANA_SPRINT_T2I_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+    ),
+    DiffusionTestCase(
+        "sana_sprint_1.6b_t2i",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SANA_SPRINT_1_6B_MODEL_NAME_FOR_TEST,
+            modality="image",
+        ),
+        SANA_SPRINT_T2I_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
     ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(

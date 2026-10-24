@@ -664,6 +664,13 @@ T2I_sampling_params = DiffusionSamplingParams(
     output_size="1024x1024",
 )
 
+# SANA-Sprint's native operating point: 2 steps, embedded guidance 4.5.
+SANA_SPRINT_T2I_CI_sampling_params = DiffusionSamplingParams(
+    prompt="a tiny astronaut hatching from an egg on the moon",
+    output_size="1024x1024",
+    extras={"num_inference_steps": 2, "guidance_scale": 4.5, "seed": 42},
+)
+
 IDEOGRAM4_CI_TEXT_PROMPT = "A cat sitting on a bench"
 
 IDEOGRAM4_CI_PROMPT = json.dumps(

@@ -31,13 +31,14 @@ class SanaArchConfig(DiTArchConfig):
     caption_channels: int = 2304
 
     mlp_ratio: float = 2.5
-    # "rms_norm_across_heads" applies RMSNorm over the full (num_heads * head_dim)
-
-    qk_norm: str = "rms_norm_across_heads"
+    # "rms_norm_across_heads" applies RMSNorm over the full (num_heads * head_dim).
+    # None matches Diffusers: SANA 1.0 configs omit the key and carry no norm weights.
+    qk_norm: str | None = None
     norm_elementwise_affine: bool = False
     norm_eps: float = 1e-6
     sample_size: int = 32
     guidance_embeds: bool = False
+    guidance_embeds_scale: float = 0.1
 
     param_names_mapping: dict = field(
         default_factory=lambda: {

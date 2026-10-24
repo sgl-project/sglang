@@ -307,8 +307,13 @@ def register_pipeline(
 _configs_discovered: bool = False
 
 # SANA-WM (register BEFORE generic SANA T2I to prevent "sana" detector false-match)
-# SANA-Video (register before generic SANA to avoid detector overlap).
-_CONFIG_REGISTER_PRIORITY: Tuple[str, ...] = ("sana_wm", "sana_video2", "sana_video")
+# SANA-Video and SANA-Sprint (register before generic SANA to avoid detector overlap).
+_CONFIG_REGISTER_PRIORITY: Tuple[str, ...] = (
+    "sana_wm",
+    "sana_video2",
+    "sana_video",
+    "sana_sprint",
+)
 
 
 @defer_full_gc_for_imports()
