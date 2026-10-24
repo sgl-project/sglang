@@ -514,7 +514,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     @staticmethod
     def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
         from sglang.srt.layers.attention.qsa.config import (
-            parse_qsa_profile,
+            get_active_qsa_profile,
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
@@ -523,7 +523,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         if num_layers == 0:
             return 0
-        qsa_profile = parse_qsa_profile(hf_config)
+        qsa_profile = get_active_qsa_profile(hf_config)
         if qsa_profile is None:
             return 0
         return QSATokenToKVPool.qsa_bytes_per_token(

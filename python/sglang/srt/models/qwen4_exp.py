@@ -528,7 +528,7 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
             self._jit_group_size is not None
-            and x.is_cuda
+            and x.device.type == "cuda"
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
@@ -1806,10 +1806,12 @@ class Qwen4ExpAttentionDecoderLayer(
             is_nextn,
             build_stages=False,
         )
-        from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
+        from sglang.srt.layers.attention.qsa.config import (
+            get_active_qsa_profile,
+        )
         from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
-        self.is_qsa = is_qwen_qsa(config)
+        self.is_qsa = get_active_qsa_profile(config) is not None
         self._qsa_prefill_topk_bridge = None
         if self.is_qsa:
             self.indexer = build_qsa_indexer(
@@ -1940,7 +1942,7 @@ class Qwen4ExpAttentionDecoderLayer(
 
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
         if gate is not None:
-            if attn_output.is_cuda:
+            if attn_output.device.type == "cuda":
                 # The strided 3D gate view feeds the kernel directly, so the
                 # gate reshape copy disappears along with the sigmoid + mul.
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
@@ -2460,10 +2462,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_shard_params: Set[str] = set()
         skipped_visual_count = 0
 
+        # Dense fallback builds no indexer modules; drop their checkpoint weights.
+        from sglang.srt.layers.attention.qsa.config import qsa_dense_fallback
+
+        skip_qsa_indexer = qsa_dense_fallback()
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
+                continue
+            if skip_qsa_indexer and ".indexer." in name:
                 continue
             if "visual" in name and self.language_model_only:
                 skipped_visual_count += 1
