@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 from contextvars import ContextVar
 
 import torch
@@ -24,6 +25,22 @@ import triton.language as tl
 from sglang.srt.utils import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
+
+
+@triton.jit
+def _localize_experts(
+    e, valid, expert_mask_ptr, num_experts, E_POW2: tl.constexpr, SENTINEL
+):
+    # EP: global expert id -> local id (number of local experts below it), as aiter's
+    # masked sort emits; pairs routed to another rank become SENTINEL and drop out
+    offs_e = tl.arange(0, E_POW2)
+    m = (tl.load(expert_mask_ptr + offs_e, mask=offs_e < num_experts, other=0) != 0).to(
+        tl.int32
+    )
+    local = tl.cumsum(m, 0) - m
+    e_safe = tl.where(valid, e, 0)
+    is_local = valid & (tl.gather(m, e_safe, 0) != 0)
+    return tl.where(is_local, tl.gather(local, e_safe, 0), SENTINEL), is_local
 
 
 # P <= 64: one sort CTA does the whole P x P rank compare
@@ -41,13 +58,17 @@ def _moe_sorting_small_kernel(
     qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only)
     qout_ptr,  # [M, N_COLS] fp8 out
     qscale_ptr,  # swizzled e8m0 bytes, one per (sorted_row, group)
+    expert_mask_ptr,  # [num_experts] i32, 1 = expert on this rank (HAS_MASK only)
     M,
+    num_experts,
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     P_POW2: tl.constexpr,  # >= M * topk
+    E_POW2: tl.constexpr,  # > num_experts (HAS_MASK only)
     PAD_POW2: tl.constexpr,  # >= (M * topk) * BLOCK_SIZE (worst-case padded len)
     BUF_BLOCK: tl.constexpr,
     num_buf,  # buf-zero CTAs occupy pids [1, num_buf]
+    HAS_MASK: tl.constexpr,
     EMIT_MX: tl.constexpr,  # also emit the mxfp8 quant of qx (group_size 32)
     N_COLS: tl.constexpr,
     QCHUNK: tl.constexpr,  # columns per quant iteration (multiple of 32)
@@ -70,6 +91,11 @@ def _moe_sorting_small_kernel(
     # sentinel expert keeps inactive lanes out of every "smaller expert" count
     e = tl.load(topk_ids_ptr + offs_p, mask=mask_p, other=0x7FFFFFFF)
     w = tl.load(topk_weights_ptr + offs_p, mask=mask_p, other=0.0)
+    if HAS_MASK:
+        # from here on mask_p marks the pairs this rank computes
+        e, mask_p = _localize_experts(
+            e, mask_p, expert_mask_ptr, num_experts, E_POW2, 0x7FFFFFFF
+        )
     token = offs_p // TOPK
     slot = offs_p % TOPK
 
@@ -99,6 +125,8 @@ def _moe_sorting_small_kernel(
             offs_g = tl.arange(0, QCHUNK // 32)
             token_p = tl.sum(tl.where(offs_p == p, token, 0), axis=0)
             dest_p = tl.sum(tl.where(offs_p == p, dest, 0), axis=0)
+            # a remote pair has no sorted row; its token's fp8 row is still written
+            local_p = tl.sum(tl.where((offs_p == p) & mask_p, 1, 0), axis=0) > 0
             base_sw = (
                 (dest_p // 32) * (SCALEN_PAD * 32)
                 + (dest_p % 16) * 4
@@ -121,7 +149,7 @@ def _moe_sorting_small_kernel(
                 )
             y = c0 // 32 + offs_g
             sw = base_sw + (y // 8) * 256 + (y % 4) * 64 + ((y % 8) // 4) * 2
-            tl.store(qscale_ptr + sw, exp.to(tl.uint8))
+            tl.store(qscale_ptr + sw, exp.to(tl.uint8), mask=(offs_g >= 0) & local_p)
         return
 
     total_blocks = tl.sum(tl.where(is_leader, blocks_of_e, 0), axis=0)
@@ -294,7 +322,8 @@ def _moe_sorting_small_kernel_distributed(
             tl.store(qscale_ptr + sw, exp.to(tl.uint8))
 
 
-# no-quant path: histogram + bitonic sort keep every pair in registers of one CTA
+# histogram + bitonic sort keep every pair in registers of one CTA; with EMIT_MX, one quant CTA
+# per (token, column chunk) writes the fp8 row once and the scale bytes of all its pairs
 @triton.jit(do_not_specialize=["M", "moe_buf_numel", "num_buf"])
 def _moe_sorting_small_kernel_sorted(
     topk_ids_ptr,  # [M, topk] i32
@@ -305,17 +334,28 @@ def _moe_sorting_small_kernel_sorted(
     num_valid_ids_ptr,  # [2] i32
     moe_buf_ptr,
     moe_buf_numel,
+    qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only)
+    qout_ptr,  # [M, N_COLS] fp8 out
+    qscale_ptr,  # swizzled e8m0 bytes, one per (sorted_row, group)
+    expert_mask_ptr,  # [num_experts] i32, 1 = expert on this rank (HAS_MASK only)
     M,
+    num_experts,
     TOPK: tl.constexpr,
+    TOPK_POW2: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     P_POW2: tl.constexpr,  # >= M * topk
     E_POW2: tl.constexpr,  # > num_experts; bin E_POW2 - 1 holds the inactive lanes
     PAD_POW2: tl.constexpr,  # >= (M * topk) * BLOCK_SIZE (worst-case padded len)
     BUF_BLOCK: tl.constexpr,
     num_buf,  # buf-zero CTAs occupy pids [1, num_buf]
+    HAS_MASK: tl.constexpr,
+    EMIT_MX: tl.constexpr,
+    N_COLS: tl.constexpr,
+    QCHUNK: tl.constexpr,
+    SCALEN_PAD: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    if pid > 0:
+    if pid > 0 and pid <= num_buf:
         offs = (pid - 1) * BUF_BLOCK + tl.arange(0, BUF_BLOCK)
         tl.store(
             moe_buf_ptr + offs,
@@ -327,11 +367,65 @@ def _moe_sorting_small_kernel_sorted(
     P = M * TOPK
     offs_p = tl.arange(0, P_POW2)
     e = tl.load(topk_ids_ptr + offs_p, mask=offs_p < P, other=E_POW2 - 1)
+    if HAS_MASK:
+        # remote pairs join the inactive lanes in bin E_POW2 - 1
+        e, _ = _localize_experts(
+            e, offs_p < P, expert_mask_ptr, num_experts, E_POW2, E_POW2 - 1
+        )
     offs_e = tl.arange(0, E_POW2)
     cnt = tl.where(offs_e < E_POW2 - 1, tl.histogram(e, E_POW2), 0)
     blocks = (cnt + BLOCK_SIZE - 1) // BLOCK_SIZE
+    # first padded row of each expert
+    start = (tl.cumsum(blocks, 0) - blocks) * BLOCK_SIZE
+
+    if EMIT_MX and pid > num_buf:
+        # quant CTA: token t, columns [c0, c0 + QCHUNK); math as fused_dynamic_mxfp8_quant_moe_sort
+        q_id = pid - num_buf - 1
+        CHUNKS: tl.constexpr = N_COLS // QCHUNK
+        t = q_id // CHUNKS
+        c0 = (q_id % CHUNKS) * QCHUNK
+        offs_k = tl.arange(0, TOPK_POW2)
+        mask_k = offs_k < TOPK
+        pk = t * TOPK + offs_k
+        ek = tl.load(topk_ids_ptr + pk, mask=mask_k, other=0)
+        if HAS_MASK:
+            # the fp8 row is written for every token; scale bytes only for local pairs
+            ek, mask_k = _localize_experts(
+                ek, mask_k, expert_mask_ptr, num_experts, E_POW2, 0
+            )
+        # stable rank of each of the token's pairs within its expert
+        same = (e[None, :] == ek[:, None]) & (offs_p[None, :] < pk[:, None])
+        dest = tl.gather(start, ek, 0) + tl.sum(tl.where(same, 1, 0), axis=1)
+
+        offs_q = tl.arange(0, QCHUNK)
+        x = tl.load(qx_ptr + t * N_COLS + c0 + offs_q).to(tl.float32)
+        x2 = tl.reshape(x, (QCHUNK // 32, 32))
+        amax = tl.maximum(tl.max(tl.abs(x2), axis=1), 1e-10)
+        sf = amax * (1.0 / 448.0)
+        bits = sf.to(tl.int32, bitcast=True)
+        exp = (bits >> 23) & 0xFF
+        exp = tl.where((bits & 0x7FFFFF) != 0, exp + 1, exp)
+        scale = (exp << 23).to(tl.float32, bitcast=True)
+        q = tl.clamp(x2 / scale[:, None], -448.0, 448.0)
+        tl.store(
+            qout_ptr + t * N_COLS + c0 + offs_q,
+            tl.reshape(q, (QCHUNK,)).to(qout_ptr.dtype.element_ty),
+        )
+        y = c0 // 32 + tl.arange(0, QCHUNK // 32)
+        base_sw = (dest // 32) * (SCALEN_PAD * 32) + (dest % 16) * 4 + (dest % 32) // 16
+        sw = (
+            base_sw[:, None]
+            + ((y // 8) * 256 + (y % 4) * 64 + ((y % 8) // 4) * 2)[None, :]
+        )
+        tl.store(
+            qscale_ptr + sw,
+            (exp[None, :] + tl.zeros((TOPK_POW2, QCHUNK // 32), tl.int32)).to(tl.uint8),
+            mask=mask_k[:, None],
+        )
+        return
+
     # sorted position of a pair -> padded dest: add the block-tail padding of smaller experts
-    shift = (tl.cumsum(blocks, 0) - blocks) * BLOCK_SIZE - (tl.cumsum(cnt, 0) - cnt)
+    shift = start - (tl.cumsum(cnt, 0) - cnt)
     num_valid = tl.sum(blocks, 0) * BLOCK_SIZE
 
     # pad the whole used region first, then scatter the real pairs over it
@@ -351,7 +445,8 @@ def _moe_sorting_small_kernel_sorted(
     key = tl.sort(e * P_POW2 + offs_p)
     es = key // P_POW2
     ps = key % P_POW2
-    valid = offs_p < P
+    # pairs this rank computes; equals P without an expert mask
+    valid = offs_p < tl.sum(cnt, 0)
     dest = offs_p + tl.gather(shift, tl.where(valid, es, 0), 0)
     tl.store(sorted_ids_ptr + dest, ((ps % TOPK) << 24) | (ps // TOPK), mask=valid)
     tl.store(
@@ -367,23 +462,37 @@ def _moe_sorting_small_kernel_sorted(
     )
 
 
+# pairs above which the sorted kernel replaces the compact / distributed variants
+_SORTED_MIN_PAIRS = 32
+
+
 def _small_sort_supported(
-    topk_ids, block_size, expert_mask, num_local_tokens, num_experts, emit_mx=True
+    topk_ids, block_size, expert_mask, num_local_tokens, num_experts
 ):
     m, topk = topk_ids.shape
     p = m * topk
+    # EP: the compact and sorted kernels localize expert ids in-kernel; the distributed
+    # variant does not, so a masked batch must fit one of the other two
+    mask_ok = expert_mask is None or (
+        expert_mask.dtype == torch.int32
+        and expert_mask.is_contiguous()
+        and expert_mask.numel() == num_experts
+        and (
+            (p <= 64 and p <= 2 * block_size)
+            or (p > _SORTED_MIN_PAIRS and num_experts < 512)
+        )
+    )
     return (
-        expert_mask is None
+        mask_ok
         and num_local_tokens is None
         and p <= 256
         # ponytail: the distributed variant scans every 64-expert chunk per pair, so it beats
-        # aiter at E=129 but loses at E=513; cutoff untuned in between. The no-quant
-        # path past 32 pairs takes the histogram + bitonic sort kernel instead, which
-        # does not scan per expert chunk (measured up to E=385, i.e. E_POW2 <= 512).
+        # aiter at E=129 but loses at E=513; cutoff untuned in between
         and (
             (p <= 64 and p <= 2 * block_size)
             or num_experts <= 256
-            or (not emit_mx and p > 32 and num_experts < 512)
+            # the sorted kernel does not scan expert chunks per pair; tested up to E=385
+            or (p > _SORTED_MIN_PAIRS and num_experts < 512)
         )
         and topk < 128
         and topk_ids.dtype == torch.int32
@@ -402,9 +511,12 @@ def _run_small_sort(
     block_size,
     mx_quant_input,
     num_experts,
+    expert_mask=None,
 ):
     m, topk = topk_ids.shape
     p = m * topk
+    has_mask = expert_mask is not None
+    mask_arg = expert_mask if has_mask else topk_ids  # unused placeholder pointer
     buf_block = 4096
     emit_mx = mx_quant_input is not None
     if emit_mx:
@@ -421,10 +533,13 @@ def _run_small_sort(
     else:
         n_cols, scalen_pad = 32, 8
         qout = qscale = moe_buf  # unused placeholder pointers
+    # largest power-of-two chunk (up to 2048 columns) that divides the row
+    qchunk = math.gcd(n_cols, 2048)
     num_buf = triton.cdiv(max(moe_buf.numel(), 1), buf_block)
-    if not emit_mx and p > 32:
-        # beyond one 32-lane tile the sort variant beats both P x P compare kernels
-        _moe_sorting_small_kernel_sorted[(1 + num_buf,)](
+    # with the quant at E >= 512 (E_POW2 >= 1024), the compact kernel beats the sorted one
+    if p > _SORTED_MIN_PAIRS and (not emit_mx or num_experts < 512):
+        num_quant = (m * (n_cols // qchunk)) if emit_mx else 0
+        _moe_sorting_small_kernel_sorted[(1 + num_buf + num_quant,)](
             topk_ids,
             topk_weights,
             sorted_ids,
@@ -433,20 +548,33 @@ def _run_small_sort(
             num_valid_ids,
             moe_buf,
             moe_buf.numel(),
+            mx_quant_input if emit_mx else moe_buf,
+            qout,
+            qscale,
+            mask_arg,
             m,
+            num_experts,
             TOPK=topk,
+            TOPK_POW2=triton.next_power_of_2(topk),
             BLOCK_SIZE=block_size,
             P_POW2=triton.next_power_of_2(p),
             E_POW2=triton.next_power_of_2(num_experts + 1),
             PAD_POW2=triton.next_power_of_2(p * block_size),
             BUF_BLOCK=buf_block,
             num_buf=num_buf,
+            HAS_MASK=has_mask,
+            EMIT_MX=emit_mx,
+            N_COLS=n_cols,
+            QCHUNK=qchunk,
+            SCALEN_PAD=scalen_pad,
             num_warps=4,
         )
+        if emit_mx:
+            return qout, qscale.view(torch.float8_e8m0fnu)
         return None
     if p <= 64 and p <= 2 * block_size:
         # compact variant: one sort CTA does the P x P rank compare
-        num_quant = (p * (n_cols // min(2048, n_cols))) if emit_mx else 0
+        num_quant = (p * (n_cols // qchunk)) if emit_mx else 0
         grid = (1 + num_buf + num_quant,)
         _moe_sorting_small_kernel[grid](
             topk_ids,
@@ -460,16 +588,20 @@ def _run_small_sort(
             mx_quant_input if emit_mx else moe_buf,
             qout,
             qscale,
+            mask_arg,
             m,
+            num_experts,
             TOPK=topk,
             BLOCK_SIZE=block_size,
             P_POW2=triton.next_power_of_2(p),
+            E_POW2=triton.next_power_of_2(num_experts + 1) if has_mask else 1,
             PAD_POW2=triton.next_power_of_2(p * block_size),
             BUF_BLOCK=buf_block,
             num_buf=num_buf,
+            HAS_MASK=has_mask,
             EMIT_MX=emit_mx,
             N_COLS=n_cols,
-            QCHUNK=min(2048, n_cols),
+            QCHUNK=qchunk,
             SCALEN_PAD=scalen_pad,
             num_warps=4,
         )
@@ -505,7 +637,7 @@ def _run_small_sort(
         num_buf=num_buf,
         EMIT_MX=emit_mx,
         N_COLS=n_cols,
-        QCHUNK=min(2048, n_cols),
+        QCHUNK=qchunk,
         SCALEN_PAD=scalen_pad,
         num_warps=8,
     )
@@ -522,6 +654,14 @@ _pending_quant_input: ContextVar[torch.Tensor | None] = ContextVar(
 _emitted_quant: ContextVar[tuple[torch.Tensor, torch.Tensor] | None] = ContextVar(
     "aiter_emitted_quant", default=None
 )
+
+
+@functools.cache
+def _log_first_ep_sort(quant_fused: bool) -> None:
+    logger.info(
+        "small-batch MoE sort serving an EP-masked batch (stage-1 quant fused: %s)",
+        quant_fused,
+    )
 
 
 @functools.cache
@@ -551,7 +691,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
             and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
             and hidden_states.dtype in (torch.bfloat16, torch.float16)
             and hidden_states.is_contiguous()
-            and hidden_states.shape[-1] % 2048 == 0
+            and hidden_states.shape[-1] % 1024 == 0
             and topk_ids.numel() <= 256
         )
         input_token = _pending_quant_input.set(hidden_states if emit else None)
@@ -592,7 +732,6 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 expert_mask,
                 num_local_tokens,
                 int(num_experts),
-                emit_mx=_pending_quant_input.get() is not None,
             )
         ):
             device = topk_ids.device
@@ -613,7 +752,8 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 max_num_m_blocks, dtype=dtypes.i32, device=device
             )
             num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-            if accumulate:
+            # EP stage2 accumulates only local experts, so it always needs the zeroed buffer
+            if accumulate or expert_mask is not None:
                 moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
             else:
                 moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
@@ -628,9 +768,12 @@ def apply_aiter_small_moe_sort_patch() -> None:
                 int(block_size),
                 _pending_quant_input.get(),
                 int(num_experts),
+                expert_mask,
             )
             if quant_ret is not None:
                 _emitted_quant.set(quant_ret)
+            if expert_mask is not None:
+                _log_first_ep_sort(quant_ret is not None)
             return (
                 sorted_ids,
                 sorted_weights,
