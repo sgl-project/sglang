@@ -14,6 +14,7 @@ def softcap_inplace_logits_kernel(
     output_ptr=None,
     output_row_stride=0,
     CAST_TO_FP32: tl.constexpr = False,
+    APPLY_SOFTCAP: tl.constexpr = True,
 ):
     row = tl.program_id(1).to(tl.int64)
     pid = tl.program_id(0).to(tl.int64)
@@ -27,9 +28,10 @@ def softcap_inplace_logits_kernel(
     if CAST_TO_FP32:
         x = x.to(tl.float32)
 
-    x = x / softcapping_value
-    x = libdevice.tanh(x)
-    x = x * softcapping_value
+    if APPLY_SOFTCAP:
+        x = x / softcapping_value
+        x = libdevice.tanh(x)
+        x = x * softcapping_value
 
     # Store result
     if CAST_TO_FP32:
@@ -70,6 +72,7 @@ def _softcap_logits(full_logits, final_logit_softcapping, output=None):
         if output is not None
         else 0,
         CAST_TO_FP32=output is not None,
+        APPLY_SOFTCAP=final_logit_softcapping is not None,
     )
     return full_logits if output is None else output
 
@@ -81,6 +84,11 @@ def softcap_inplace_logits(full_logits, final_logit_softcapping):
 def softcap_to_float32_logits(logits, final_logit_softcapping, output):
     """Write softcapped FP32 logits to an equally shaped, row-contiguous output."""
     return _softcap_logits(logits, final_logit_softcapping, output)
+
+
+def cast_to_float32_logits(logits, output):
+    """Write FP32 logits to an equally shaped, row-contiguous output."""
+    return _softcap_logits(logits, None, output)
 
 
 @triton.jit
