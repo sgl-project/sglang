@@ -343,3 +343,26 @@ sglang serve \
 ```
 
 Front the server with `sglang_router --policy cache_aware --dp-aware`, so a multi-turn session lands on the DP rank already holding its prefix.
+
+### 3.7 Static Expert Placement
+
+Requests do not spread evenly over the 384 routed experts. With expert parallelism, every MoE layer waits for the EP rank whose experts got the most tokens. `--init-expert-location` places the experts at startup from recorded per-expert token counts, so each rank carries a similar load. Placement happens once at load: no redundant experts, no extra memory, no rebalancing while serving.
+
+Record the counts on the traffic you serve, then restart with them:
+
+```bash
+# 1. Serve with the recorder on and replay representative traffic.
+SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR=/data/eplb \
+sglang serve <your args> --expert-distribution-recorder-mode stat
+
+curl -X POST http://127.0.0.1:30000/start_expert_distribution_record
+# ... about 10 minutes of real requests ...
+curl -X POST http://127.0.0.1:30000/dump_expert_distribution_record
+
+# 2. Serve with the dumped counts.
+sglang serve <your args> --init-expert-location /data/eplb/<dump>.pt
+```
+
+- The dump holds per-layer, per-expert token counts (the last 1000 forward passes by default; `--expert-distribution-recorder-buffer-size -1` keeps every pass). The placement is computed at startup, so one dump serves any EP size.
+- Record on real requests. On a GB300 DP2 TP2 EP2 prefill server, counts recorded from agentic coding traffic raised prefill throughput on that traffic by 2.4%. Counts recorded from random token ids gave no gain on it.
+- `--ep-num-redundant-experts N` adds replicas of the hottest experts on top. On the same server's step benchmark, 16 replicas cut step time by a further 0.4% and shrank the KV cache pool by 20%.
