@@ -696,7 +696,12 @@ PY
 # Build Mooncake
 ENV PATH=$PATH:/usr/local/go/bin
 
-RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
+# The rocm/pytorch base images ship the deadsnakes PPA, which nothing in this
+# build installs from. Drop it so a Launchpad outage (503 on the PPA index)
+# can't fail `apt update` here, in Mooncake's dependencies.sh, or in any
+# later apt-get update step.
+RUN rm -f /etc/apt/sources.list.d/*deadsnakes* && \
+    if [ "$BUILD_MOONCAKE" = "1" ]; then \
      apt update && apt install -y zip unzip wget && \
      apt install -y gcc make libtool autoconf  librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool  libibverbs-dev rdma-core && \
      apt install -y openssh-server openmpi-bin openmpi-common libopenmpi-dev && \
