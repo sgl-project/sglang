@@ -301,6 +301,7 @@ class KimiK3MLP(nn.Module):
         activation_situ_beta: float | None = None,
         activation_situ_linear_beta: float | None = None,
         parallel_group: Optional[LinearParallelGroup] = None,
+        symmetric_output: bool = True,
     ) -> None:
         super().__init__()
         default_group = parallel_group is None
@@ -324,6 +325,7 @@ class KimiK3MLP(nn.Module):
             use_dp_attention_reduce=self._dense_attn_tp,
             prefix=f"{prefix}.down_proj",
             parallel_group=parallel_group,
+            symmetric_output=symmetric_output,
         )
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
@@ -635,6 +637,10 @@ class KimiK3MoE(nn.Module):
                 activation_situ_beta=config.activation_situ_beta,
                 activation_situ_linear_beta=config.activation_situ_linear_beta,
                 parallel_group=shared_experts_parallel_group,
+                # tp1 shared experts are complete per rank and never feed a
+                # collective, but run on the side stream under SBO; a
+                # symmetric output there would only grow the pool rank-locally.
+                symmetric_output=not self._shared_experts_tp1,
             )
         else:
             self.shared_experts = None
