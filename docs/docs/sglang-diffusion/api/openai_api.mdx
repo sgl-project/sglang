@@ -283,6 +283,12 @@ output files. Manage output retention separately.
 
 The server implements a subset of the OpenAI Videos API under the `/v1/videos` namespace.
 
+With `--input-save-path ""`, uploads use request-owned temporary directories,
+removed on rejection or after the background job exits. Configured input and
+output directories remain persistent. Cancelling preparation waits for active
+CPU preprocessing to finish before cleanup; it does not abort queued GPU work.
+With `--output-path ""`, cloud upload must succeed before a job reports completion.
+
 **Create a video (text-to-video)**
 
 **Endpoint:** `POST /v1/videos`
