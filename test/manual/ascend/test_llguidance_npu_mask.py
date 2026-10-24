@@ -1,10 +1,10 @@
 """NPU device-branch tests for llguidance backend's bitmask application path.
 
-These tests verify that ``GuidanceGrammar.apply_vocab_mask`` dispatches to the
-NPU kernel when the logits tensor is on an NPU device, and falls back to the
-generic ``llguidance`` implementation otherwise.  They are device-agnostic:
-the NPU path is exercised via a mocked ``torch.ops.npu.apply_token_bitmask`` so
-the tests run on CPU-only CI.
+Manual Ascend suite (not registered to CPU CI). Verifies that
+``GuidanceGrammar.apply_vocab_mask`` dispatches to the NPU kernel when logits
+are on an NPU device, and falls back to the generic ``llguidance``
+implementation otherwise. The NPU path is exercised via a mocked
+``torch.ops.npu.apply_token_bitmask`` so the tests can run without Ascend HW.
 
 Requires: torch, llguidance.  When either is unavailable, a placeholder test
 documents the skip so the module still collects and passes on this machine.
@@ -15,11 +15,6 @@ import sys
 import types
 import unittest
 from unittest.mock import MagicMock
-
-from sglang.test.ci.ci_register import register_cpu_ci
-
-# Mock-based NPU dispatch tests; run on CPU CI without Ascend hardware.
-register_cpu_ci(est_time=40, suite="stage-b-test-cpu-intel")
 
 try:
     import torch
