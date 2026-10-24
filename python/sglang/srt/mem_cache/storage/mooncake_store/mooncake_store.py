@@ -54,6 +54,13 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
             size *= d
         size *= torch.tensor([], dtype=self.dtype).element_size()
         ptr_int = self.allocator.alloc(size)
+        if not ptr_int:
+            raise RuntimeError(
+                f"MooncakeHostMemAllocator.alloc returned a null pointer for "
+                f"{size / 1024**3:.3f} GB ({size} bytes); the mooncake host memory "
+                f"allocator could not map the segment (check host memory "
+                f"availability and the mooncake allocator logs)."
+            )
         self.ptr = ptr_int
         c_type = ctypes.c_byte * size
         c_array = c_type.from_address(ptr_int)
@@ -390,6 +397,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
         MooncakeBaseStore.__init__(self)
+        self.dcp_size = storage_config.dcp_size if storage_config is not None else 1
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
@@ -438,6 +446,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if storage_config is not None and storage_config.model_name:
                 model_name = "-".join(storage_config.model_name.split("/"))
                 config_prefix_parts.append(model_name)
+            if self.dcp_size > 1:
+                # DCP reuse is limited to matching topologies and logical pages.
+                config_prefix_parts.append(
+                    f"tp{storage_config.tp_size}_dcp{self.dcp_size}"
+                    f"_page{storage_config.logical_page_size}"
+                    f"_pp{storage_config.pp_size}_cp{storage_config.attn_cp_size}"
+                )
             if config_prefix_parts:
                 self.config_prefix = "_".join(config_prefix_parts)
                 logger.info(f"Using Mooncake config prefix: {self.config_prefix}")
@@ -603,6 +618,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
+
+            if self.dcp_size > 1:
+                # Equivalent MLA replicas share one object per DCP/CP shard.
+                # Keep PP last for cross-stage queries in _batch_exist().
+                self.mla_suffix = (
+                    f"dcp{storage_config.dcp_rank}_cp{self.attn_cp_rank}"
+                    + (f"_{self.pp_rank}" if self.enable_pp else "")
+                )
 
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
@@ -899,11 +922,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             all_component_keys.extend(component_keys)
             prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
 
-        all_exists = (
-            self._batch_exist(all_component_keys, extra_info)
-            if all_component_keys
-            else []
-        )
+        all_exists = self._batch_exist(all_component_keys) if all_component_keys else []
         for transfer, key_multiplier, start, end in prepared:
             if not restorable:
                 break
@@ -1168,7 +1187,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
-        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+        page_size = (
+            self.storage_config.logical_page_size
+            if self.dcp_size > 1
+            else self.mem_pool_host.page_size
+        )
+        assert len(keys) == len(host_indices) // page_size
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
@@ -1441,7 +1465,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     query_keys.append(f"{key}_{self.mha_suffix}_v")
                 key_multiplier = 2
 
-        exist_result = self._batch_exist(query_keys, extra_info)
+        exist_result = self._batch_exist(query_keys)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
@@ -1493,21 +1517,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
-    def _batch_exist(
-        self, key_strs: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
-    ) -> List[int]:
-        pp_rank = (
-            (extra_info.extra_info or {}).get("pp_rank")
-            if extra_info is not None
-            else None
-        )
-        if pp_rank is not None:
-            # PP is the last rank field before the pool suffix. Replace from
-            # the right so an identical TP rank or backend tag stays unchanged.
-            key_strs = [
-                f"_{pp_rank}_".join(key.rsplit(f"_{self.pp_rank}_", 1))
-                for key in key_strs
-            ]
+    def _batch_exist(self, key_strs: List[str]) -> List[int]:
         return self.store.batch_is_exist(key_strs)
 
     def get_stats(self):

@@ -24,7 +24,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
+from sglang.kernels.ops.activation.swiglu_mxfp8_swizzled import (
     can_use_silu_mul_mxfp8,
     swiglu_oai_mxfp8,
     swiglu_oai_mxfp8_deepgemm,
@@ -36,7 +36,6 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -430,6 +429,7 @@ class MiniMaxM3MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         if self.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.intermediate_size * self.n_shared_experts
@@ -534,10 +534,6 @@ class MiniMaxM3MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)

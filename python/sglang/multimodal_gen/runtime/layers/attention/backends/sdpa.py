@@ -325,8 +325,12 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
         if self._is_sm100:
             # B200/sm_100: cuDNN SDPA measured 1.25-1.5x faster than FA4 CuTe
             # for dense non-causal diffusion attention, both self-attn
-            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len).
-            return True
+            # (Sq == Skv, up to S=506K) and cross-attn (Skv = text len). A side
+            # shorter than one 128-row tile while the other is not drops cuDNN to
+            # an sm80 kernel that FA4 beats 2-3x (B300, 126 x 1536 tokens:
+            # 24.9 vs 12.1 us)
+            short_side, long_side = sorted((query.shape[1], key.shape[1]))
+            return short_side >= 128 or long_side < 128
         if query.shape[1] != key.shape[1]:
             return False
         return query.shape[-1] == 64 and query.shape[1] == 1024 and query.shape[0] >= 4

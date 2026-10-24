@@ -38,7 +38,6 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -341,6 +340,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 config.model_type == "qwen3_5_moe_text" and uses_cutedsl_ar_fusion()
             ),
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -527,7 +530,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         shared_output,
                     )
                 elif _is_hip:
-                    from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
+                    from sglang.kernels.ops.elementwise.elementwise import (
                         sigmoid_gate_mul_broadcast,
                     )
 
@@ -607,14 +610,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    )
-                    if not self.is_nextn
-                    else None
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -663,16 +658,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=(
-                    forward_batch.moe_num_token_non_padded()
-                    if forward_batch is not None
-                    else None
-                ),
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                    if not self.is_nextn
-                    else None
-                ),
             )
             if self.enable_shared_expert_fusion:
                 topk_output = self._append_shared_to_topk_output(
