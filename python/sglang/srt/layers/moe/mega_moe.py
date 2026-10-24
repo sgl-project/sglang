@@ -30,7 +30,11 @@ from sglang.srt.layers.moe.mega_moe_sm90 import (
     is_sm90_fp8_mega_moe_available,
     run_sm90_mega_routed,
 )
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    is_sbo_enabled,
+    is_tbo_enabled,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
@@ -126,7 +130,8 @@ def _get_mega_moe_symm_buffer(
     num_shared_experts: int = 0,
     *,
     mma_type: str,
-) -> SymmBuffer:
+    create: bool = True,
+) -> Optional[SymmBuffer]:
     import deep_gemm
 
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
@@ -142,7 +147,7 @@ def _get_mega_moe_symm_buffer(
             deep_gemm.get_num_sms(),
         )
         buf = _MEGA_MOE_SYMM_BUFFER.get(key)
-        if buf is None:
+        if buf is None and create:
             buf = deep_gemm.get_symm_buffer_for_mega_moe(
                 group,
                 num_experts,
@@ -156,6 +161,69 @@ def _get_mega_moe_symm_buffer(
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
+
+
+class PreparedMegaMoeInput(NamedTuple):
+    buffer: object
+    num_tokens: int
+    shared_block_m: int
+    rows: Optional[torch.Tensor] = None
+
+    def views(self):
+        return (
+            self.buffer.x[: self.num_tokens],
+            self.buffer.x_sf[: self.num_tokens],
+            self.buffer.shared_l1_acts_sf[: self.num_tokens],
+            self.shared_block_m,
+        )
+
+
+def prepare_mhc_mega_moe_input(moe, num_tokens: int):
+    """Reuse an allocated buffer; a rank-local producer must never allocate it."""
+    import deep_gemm
+
+    from sglang.srt.runtime_context import get_forward, get_parallel
+
+    if (
+        num_tokens < 16384
+        or _device_sm // 10 != 10
+        or get_is_capture_mode()
+        or not get_forward().is_extend_in_batch
+        or get_forward().sp_active
+        or is_tbo_enabled()
+        or is_sbo_enabled()
+        or is_dsa_enable_prefill_cp()
+        or not get_moe_a2a_backend().is_megamoe()
+        or not is_mega_moe_experts_ready(moe.experts)
+        or moe.mega_shared_l1_weights is None
+        or _mega_moe_mma_type(moe.experts) != "fp8xfp4"
+    ):
+        return None
+    cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    if num_tokens > cap:
+        return None
+    buf = _get_mega_moe_symm_buffer(
+        get_parallel().moe_ep_group.device_group,
+        num_experts=moe.experts.num_experts,
+        num_max_tokens_per_rank=cap,
+        num_topk=moe.config.num_experts_per_tok + moe.num_fused_shared_experts,
+        hidden=moe.config.hidden_size,
+        intermediate_hidden=moe.config.moe_intermediate_size,
+        num_shared_experts=moe.n_shared_experts,
+        mma_type="fp8xfp4",
+        create=False,
+    )
+    if buf is None or not buf.x_sf[:num_tokens].is_contiguous():
+        return None
+    block_m = deep_gemm.get_block_m_for_mega_moe(
+        num_ranks=buf.group.size(),
+        num_experts=buf.num_experts,
+        num_max_tokens_per_rank=buf.num_max_tokens_per_rank,
+        num_tokens=num_tokens,
+        num_topk=buf.num_topk,
+        mma_type=buf.mma_type,
+    )
+    return PreparedMegaMoeInput(buf, num_tokens, block_m)
 
 
 def is_mega_moe_experts_ready(experts) -> bool:
@@ -210,6 +278,7 @@ def forward_mega_moe(
     hidden_states: torch.Tensor,
     forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
+    prepared_input: Optional[PreparedMegaMoeInput] = None,
 ) -> torch.Tensor:
     if _use_amd_flydsl_mega_moe():
         from sglang.srt.layers.moe.mega_moe_flydsl import (
@@ -240,7 +309,12 @@ def forward_mega_moe(
 
     with mega_stream_ctx:
         y = _run_mega_routed(
-            moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            moe,
+            hidden_states,
+            forward_batch,
+            input_ids_global,
+            num_tokens,
+            prepared_input,
         )
 
     if fork_mega_moe:
@@ -338,6 +412,7 @@ def _run_mega_routed(
     forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
+    prepared_input: Optional[PreparedMegaMoeInput] = None,
 ) -> torch.Tensor:
     hidden_size = moe.config.hidden_size
 
@@ -407,6 +482,7 @@ def _run_mega_routed(
         shared_l1_weights=moe.mega_shared_l1_weights,
         shared_l2_weights=moe.mega_shared_l2_weights,
         routing_in_buffer=routing is not None and routing.in_buffer,
+        prepared_input=prepared_input,
     )
 
 
@@ -426,6 +502,7 @@ def run_mega_routed_experts(
     shared_l1_weights=None,
     shared_l2_weights=None,
     routing_in_buffer: bool = False,
+    prepared_input: Optional[PreparedMegaMoeInput] = None,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
@@ -536,7 +613,22 @@ def run_mega_routed_experts(
                 num_topk=buf.num_topk,
                 mma_type=buf.mma_type,
             )
-        if not (
+        if (
+            prepared_input is not None
+            and prepared_input.buffer is buf
+            and prepared_input.rows is hidden_states
+            and prepared_input.num_tokens == num_tokens
+            and prepared_input.shared_block_m == shared_block_m
+        ):
+            if not routing_in_buffer:
+                from sglang.kernels.ops.moe.mega_moe_metadata import (
+                    copy_mega_moe_metadata,
+                )
+
+                copy_mega_moe_metadata(
+                    topk_ids_in, topk_weights_in, buf.topk_idx, buf.topk_weights
+                )
+        elif not (
             routing_in_buffer
             and _mega_moe_input_in_buffer(hidden_states, buf, num_tokens)
         ):

@@ -58,6 +58,35 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
         super().tearDown()
 
+    def test_producer_lookup_never_allocates_a_symmetric_buffer(self):
+        """One rank may prepare an activation while its peer is idle."""
+        deep_gemm = self.deep_gemm
+        expected_buffer = object()
+        deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(return_value=expected_buffer)
+        group = object()
+        args = dict(
+            num_experts=8,
+            num_max_tokens_per_rank=64,
+            num_topk=2,
+            hidden=128,
+            intermediate_hidden=256,
+            mma_type="fp8xfp4",
+        )
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+            self.assertIsNone(
+                mega_moe._get_mega_moe_symm_buffer(group, **args, create=False)
+            )
+            deep_gemm.get_symm_buffer_for_mega_moe.assert_not_called()
+            self.assertIs(
+                mega_moe._get_mega_moe_symm_buffer(group, **args), expected_buffer
+            )
+            deep_gemm.get_symm_buffer_for_mega_moe.reset_mock()
+            self.assertIs(
+                mega_moe._get_mega_moe_symm_buffer(group, **args, create=False),
+                expected_buffer,
+            )
+            deep_gemm.get_symm_buffer_for_mega_moe.assert_not_called()
+
     def test_mxf4_buffer_uses_typed_api(self):
         deep_gemm = self.deep_gemm
         expected_buffer = object()

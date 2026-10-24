@@ -188,6 +188,7 @@ class HcReadCall(HcRead):
             hc=hc,
             accepts_mxfp8_deepgemm=self.attention
             and self.layer.self_attn.accepts_deepgemm_mxfp8_input(),
+            mega_moe=None if self.attention else self.layer.mlp,
             mega_moe_input=(
                 None
                 if self.attention
@@ -220,7 +221,11 @@ class HcReadCall(HcRead):
             mhc.fork_stats_stream(stream)
             quantized = (
                 []
-                if self.attention and layer.self_attn.accepts_mxfp8_swizzled_input()
+                if (self.attention and layer.self_attn.accepts_mxfp8_swizzled_input())
+                or (
+                    isinstance(residual.input, mhc.HcNormed)
+                    and residual.input.mega_moe_input is not None
+                )
                 else None
             )
             hc = layer.attn_hc if self.attention else layer.ffn_hc
