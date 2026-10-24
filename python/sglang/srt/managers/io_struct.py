@@ -662,8 +662,8 @@ class GenerateReqInput:
                 )
 
             self.modalities = []
-            if len(self.image_data) > 0 and isinstance(self.image_data[0], list):
-                # Already a list of lists, keep as is
+            if any(isinstance(images, list) for images in self.image_data):
+                # One image list per request; a request without images may be None
                 for i in range(len(self.image_data)):
                     if self.image_data[i] is None or self.image_data[i] == [None]:
                         self.modalities.append(None)
