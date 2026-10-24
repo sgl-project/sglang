@@ -491,6 +491,19 @@ python3 -m sglang.launch_server \
 > - ModelSlim supplies packed MXFP4 `w13` and `w2` expert weights with UE8M0 block scales (block size 32).
 > - Ascend TP and DeepEP dispatch activations as BF16; this path does not request MXFP4 dispatch. SGLang dynamically quantizes each expert input to MXFP4 immediately before grouped matmul.
 
+## Static compressed-tensors W8A8
+
+On Ascend A3, dense compressed-tensors checkpoints support symmetric INT8 weights
+with per-channel or per-tensor scales, static symmetric per-tensor activation
+scales, and FP16 or BF16 activations.
+The loader detects the quantization configuration from the checkpoint's
+`config.json`.
+
+Fused QKV and gate/up projections must have identical activation scales across
+their logical shards. Each shard keeps its exported INT8 weight codes and weight
+scale. The calibrated activation scale stays fixed for every token. Asymmetric
+activations are rejected at loading.
+
 ## Diffusion Model Quantization on Ascend NPU
 
 SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion models (such as Wan2.2) on Ascend NPUs. MXFP8 requires Ascend 950PR/DT Series; the ModelSlim W8A8/W4A4 schemes work on A2/A3 Series.
