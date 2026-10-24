@@ -42,6 +42,9 @@ class SessionSlot:
     # Until the first turn finishes or is retracted, its checkpoints publish
     # the prompt into the tree and move the lock onto the deepest published node.
     publishes_prompt: bool = False
+    # The retracted turn whose KV the record holds past the session's last
+    # finished turn; aborting that turn must drop the record with it.
+    retracted_rid: Optional[str] = None
 
 
 def is_virtual_node(node: Any) -> bool:
@@ -81,6 +84,7 @@ class StreamingSession:
             return None
         if req.to_finish is not None:
             req.release_mm_inputs_on_abort()
+            self.release_retracted_turn(req)
             req.session.abort_req()
             req.session = None
             return None
@@ -186,10 +190,25 @@ class StreamingSession:
         # by ~1 under overlap); clamp so committed <= allocated.
         slot.kv.kv_committed_len = min(target, slot.kv.kv_allocated_len)
 
-        # Update req_nodes to this successfully finished request.
-        req.session.finish_req(req)
+        if req.finished():
+            # Update req_nodes to this successfully finished request.
+            req.session.finish_req(req)
+            slot.retracted_rid = None
+        else:
+            # A retracted turn is still in flight: it keeps the session busy and
+            # leaves the rollback point at the last finished turn.
+            slot.retracted_rid = req.rid
 
         return True
+
+    def release_retracted_turn(self, req: Req) -> None:
+        """An aborted retracted turn leaves its own KV in the record; drop the
+        record so the next turn re-prefills from the last finished turn."""
+        if not _is_streaming(req):
+            return
+        slot = self.slots.get(req.session.session_id)
+        if slot is not None and slot.retracted_rid == req.rid:
+            self.release_session(req.session.session_id)
 
     def try_checkpoint(self, req: Req, *, up_to: int, **kwargs) -> bool:
         # A turn publishes nothing of its own, except the first prompt: the slot

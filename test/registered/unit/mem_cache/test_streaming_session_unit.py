@@ -88,10 +88,12 @@ class _FakeInnerCache:
 
 class _FakeReq:
     release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
+    finished = Req.finished
 
     def __init__(
         self, session_id: str, req_pool_idx: int, committed: int, allocated: int
     ):
+        self.rid = f"{session_id}-turn"
         self.session = SimpleNamespace(
             session_id=session_id,
             streaming=True,
@@ -152,6 +154,50 @@ def test_finished_turn_leaves_its_record_in_the_slot():
     assert slot.kv.component_evicted_seqlens == {ComponentType.SWA: 2}
     assert req.kv is not record
     assert req.swa_branching_seqlen is None
+
+
+def _retracted_turn(tree_cache, req):
+    """The session took the record at allocation; retract_decode then released
+    the turn, which is still unfinished and goes back to the waiting queue."""
+    session_calls = []
+    req.session.finish_req = lambda finished_req: session_calls.append("finish")
+    req.session.abort_req = lambda: session_calls.append("abort")
+    tree_cache.maybe_hand_to_session(req)
+    assert tree_cache.session.try_cache_finished_req(req)
+    return session_calls
+
+
+def test_retracted_turn_stays_in_flight():
+    """A retracted turn was recorded as finished, which let the session accept a
+    concurrent turn and made the unfinished turn its rollback point."""
+    tree_cache = _single_row_cache()
+    req = _FakeReq("session-a", req_pool_idx=0, committed=6, allocated=6)
+
+    session_calls = _retracted_turn(tree_cache, req)
+
+    assert session_calls == []
+    assert tree_cache.session.slots["session-a"].kv.kv_committed_len == 6
+
+
+@pytest.mark.parametrize("abort_path", ["scheduler_abort", "preabort_match"])
+def test_aborted_retracted_turn_drops_its_record(abort_path):
+    """An aborted retracted turn left its own KV in the slot, so the next turn
+    continued from it instead of re-prefilling from the last finished turn."""
+    tree_cache = _single_row_cache()
+    req = _FakeReq("session-a", req_pool_idx=0, committed=6, allocated=6)
+    _retracted_turn(tree_cache, req)
+
+    req.to_finish = FINISH_ABORT("client abort")
+    if abort_path == "scheduler_abort":
+        tree_cache.session.release_retracted_turn(req)
+    else:
+        tree_cache.session.find_active_slot(req)
+
+    assert "session-a" not in tree_cache.session.slots
+    assert tree_cache.req_to_token_pool.free_slots == [0]
+    assert torch.cat(tree_cache.token_to_kv_pool_allocator.freed).tolist() == list(
+        range(6)
+    )
 
 
 def test_preabort_detaches_session_and_preserves_slot():
