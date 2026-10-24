@@ -358,7 +358,9 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             match_kv_cache(r, self.tree_cache, prefix_ids)
             if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                candidates.append((r, prefix_ids))
+                # Only the first DEPRIORITIZE_THRESHOLD tokens can decide a match.
+                key_ids = prefix_ids[:IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD]
+                candidates.append((r, key_ids))
 
         if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
             # The first request of a shared-prefix group runs; the rest wait for it.
