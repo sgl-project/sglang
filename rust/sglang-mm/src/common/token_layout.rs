@@ -25,7 +25,9 @@ pub struct ExpandedPrompt {
 ///   exactly once — a family that forgets a tail segment must not silently
 ///   truncate the prompt;
 /// * every one of the `n_items` media items is placed exactly once;
-/// * no item expands to zero tokens (which would have no representable offset).
+/// * no item expands to zero tokens (which would have no representable offset);
+/// * every item's span fits the `u32` offsets pair — an expanded prompt that
+///   would cross `2^32` tokens is rejected instead of silently wrapping.
 pub fn apply_layout(
     src: &[i64],
     layout: &TokenLayout,
@@ -57,24 +59,35 @@ pub fn apply_layout(
                     ));
                 }
                 consumed += 1;
-                let start = out.len() as u32;
+                if *item >= offsets.len() {
+                    return Err(format!("layout: media item {item} out of range"));
+                }
+                let start = out.len();
                 let n = match pattern {
-                    TokenPattern::Repeat { id, n } => {
-                        out.resize(out.len() + n, *id);
-                        *n
-                    }
-                    TokenPattern::Explicit(ids) => {
-                        out.extend_from_slice(ids);
-                        ids.len()
-                    }
+                    TokenPattern::Repeat { n, .. } => *n,
+                    TokenPattern::Explicit(ids) => ids.len(),
                 };
                 if n == 0 {
                     return Err(format!("layout: media item {item} expands to zero tokens"));
                 }
-                let slot = offsets
-                    .get_mut(*item)
-                    .ok_or_else(|| format!("layout: media item {item} out of range"))?;
-                if slot.replace((start, start + n as u32 - 1)).is_some() {
+                // The offsets pair is the u32 `get_mm_items_offset` convention,
+                // while `out` (and thus every downstream length) stays usize:
+                // a span crossing 2^32 would wrap here and still pass every
+                // downstream bounds check, which validates the wrapped pair
+                // against the true length. Reject it up front, before the
+                // expansion is even built.
+                let end = start + n - 1;
+                if end > u32::MAX as usize {
+                    return Err(format!(
+                        "layout: media item {item} spans to token {end}, past the \
+                         u32::MAX offset limit; expanded prompt too long"
+                    ));
+                }
+                match pattern {
+                    TokenPattern::Repeat { id, n } => out.resize(start + n, *id),
+                    TokenPattern::Explicit(ids) => out.extend_from_slice(ids),
+                }
+                if offsets[*item].replace((start as u32, end as u32)).is_some() {
                     return Err(format!("layout: media item {item} placed twice"));
                 }
             }
@@ -235,5 +248,37 @@ mod tests {
                 "case {i} should be rejected"
             );
         }
+    }
+
+    /// Offsets are the u32 `get_mm_items_offset` pair while `input_ids` stays
+    /// 64-bit: a media span crossing 2^32 would wrap and still pass every
+    /// downstream bounds check (they validate against the true length),
+    /// silently corrupting position math. It must be rejected instead —
+    /// before the multi-gigabyte expansion is even materialized.
+    #[test]
+    fn span_past_u32_offset_limit_errs() {
+        // Two text tokens, then a media span ending at exactly 2^32.
+        let layout = TokenLayout {
+            segments: vec![
+                Segment::Text(0..1),
+                Segment::Text(1..2),
+                Segment::Media {
+                    item: 0,
+                    pattern: TokenPattern::Repeat { id: 5, n: u32::MAX as usize },
+                },
+            ],
+        };
+        let err = apply_layout(&[7, 1, 9], &layout, 1).err().unwrap();
+        assert!(err.contains("u32::MAX"), "{err}");
+
+        // Crossing at the very first token is rejected as well.
+        let over = TokenLayout {
+            segments: vec![Segment::Media {
+                item: 0,
+                pattern: TokenPattern::Repeat { id: 5, n: u32::MAX as usize + 2 },
+            }],
+        };
+        let err = apply_layout(&[1], &over, 1).err().unwrap();
+        assert!(err.contains("u32::MAX"), "{err}");
     }
 }
