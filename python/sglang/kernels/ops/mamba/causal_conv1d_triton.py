@@ -618,6 +618,7 @@ def _causal_conv1d_update_kernel(
     retrieve_next_token_ptr,
     retrieve_next_sibling_ptr,
     retrieve_parent_token_ptr,
+    query_start_loc_ptr,  # (batch + 1,) packed row offsets, IS_VARLEN only
     o_ptr,  # (batch, dim, seqlen)
     # Matrix dimensions
     batch: int,
@@ -663,7 +664,10 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    IS_VARLEN: tl.constexpr = False,
     USE_GDC: tl.constexpr = False,
+    DEDUP_CONV_WINDOW: tl.constexpr = False,
+    NP2_WINDOW_COLS: tl.constexpr = 1,
 ):
     # ruff: noqa: E501
     if USE_GDC:
@@ -673,6 +677,15 @@ def _causal_conv1d_update_kernel(
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
+
+    if IS_VARLEN:
+        # Packed rows: sequence idx_seq owns x/o rows
+        # [query_start_loc[idx_seq], query_start_loc[idx_seq + 1]), at most seqlen.
+        # Its steps past x_len read zeros, like a zero-padded dense row.
+        x_start = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
+        x_len = tl.load(query_start_loc_ptr + idx_seq + 1).to(tl.int64) - x_start
+    else:
+        x_len = seqlen
 
     # [BLOCK_N,] elements along the feature-dimension (channel)
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -692,6 +705,10 @@ def _causal_conv1d_update_kernel(
     if USE_PAD_SLOT:  # noqa
         if conv_state_batch_coord == pad_slot_id:
             # not processing as this is not the actual sequence
+            return
+    if IS_VARLEN:
+        if x_len == 0:
+            # A packed sequence with no rows (CUDA-graph padding) is skipped.
             return
 
     if IS_SPEC_DECODING:
@@ -757,7 +774,14 @@ def _causal_conv1d_update_kernel(
     conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
     VAL = state_len - seqlen
-    x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
+    if IS_VARLEN:
+        x_base = (
+            x_ptr + x_start * stride_x_token + (idx_feats * stride_x_dim)
+        )  # [BLOCK_N]
+    else:
+        x_base = (
+            x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)
+        )  # [BLOCK_N]
 
     x_ptrs = (
         x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
@@ -765,7 +789,7 @@ def _causal_conv1d_update_kernel(
 
     mask_x = (
         (idx_tokens - VAL >= 0)[:, None]
-        & (idx_tokens - VAL < seqlen)[:, None]
+        & (idx_tokens - VAL < x_len)[:, None]
         & (idx_feats < dim)[None, :]
     )  # token-index  # token-index  # feature-index
     loaded_x = tl.load(x_ptrs, mask_x, 0.0)
@@ -831,6 +855,34 @@ def _causal_conv1d_update_kernel(
 
     x_base_1d = x_base  # starting of chunk [BLOCK_N]
     mask_x_1d = idx_feats < dim
+
+    if SAVE_INTERMEDIATE and DEDUP_CONV_WINDOW:
+        tl.static_assert(KERNEL_WIDTH == 4)
+        tl.static_assert(not HAS_EAGLE_TREE_CUSTOM_ATTN_MASK)
+        # Deduplicated window (KERNEL_WIDTH == 4, linear chain): step t's window is
+        # columns t..t+2 of one shared per-channel row
+        # [state[1], state[2], x_0, ..., x_{seqlen-1}]. Write those seqlen + 2
+        # columns as one [BLOCK_N, NP2_WINDOW_COLS] tile instead of three
+        # lane-strided stores per token; the bytes are the same.
+        idx_c = tl.arange(0, NP2_WINDOW_COLS)
+        x_win = tl.load(
+            x_base[:, None] + ((idx_c - 2) * stride_x_token)[None, :],
+            mask_w[:, None] & ((idx_c >= 2) & (idx_c < x_len + 2))[None, :],
+            other=0.0,
+        )
+        win = tl.where(
+            (idx_c == 0)[None, :],
+            col1[:, None],
+            tl.where((idx_c == 1)[None, :], col2[:, None], x_win),
+        )
+        tl.store(
+            intermediate_conv_window_ptr
+            + intermediate_state_batch_coord * stride_inter_seq
+            + (idx_feats * stride_inter_dim)[:, None]
+            + (idx_c * stride_inter_win)[None, :],
+            win,
+            mask=mask_w[:, None] & (idx_c < seqlen + 2)[None, :],
+        )
 
     # STEP 5: compute each token
     for idx_token in tl.static_range(seqlen):
@@ -944,7 +996,11 @@ def _causal_conv1d_update_kernel(
                     if j == 1:  # KERNEL_WIDTH-1:
                         matrix_w = w_col1
                         x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                        matrix_x = tl.load(
+                            x_ptrs_1d,
+                            mask=mask_x_1d & (idx_token < x_len),
+                            other=0.0,
+                        )
                 elif KERNEL_WIDTH == 3:
                     if j == 1:
                         matrix_w = w_col1
@@ -952,7 +1008,11 @@ def _causal_conv1d_update_kernel(
                     elif j == 2:
                         matrix_w = w_col2
                         x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                        matrix_x = tl.load(
+                            x_ptrs_1d,
+                            mask=mask_x_1d & (idx_token < x_len),
+                            other=0.0,
+                        )
                 elif KERNEL_WIDTH == 4:
                     if j == 1:
                         matrix_w = w_col1
@@ -963,7 +1023,11 @@ def _causal_conv1d_update_kernel(
                     elif j == 3:
                         matrix_w = w_col3
                         x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                        matrix_x = tl.load(
+                            x_ptrs_1d,
+                            mask=mask_x_1d & (idx_token < x_len),
+                            other=0.0,
+                        )
 
                 acc += matrix_x * matrix_w  # [BLOCK_N]
 
@@ -977,7 +1041,7 @@ def _causal_conv1d_update_kernel(
                 col1 = col2
                 col2 = matrix_x
 
-            if SAVE_INTERMEDIATE:
+            if SAVE_INTERMEDIATE and not DEDUP_CONV_WINDOW:
                 # Save the window state after consuming this token
                 # Layout: [seq(cache line), step, dim, win(K-1)]
                 base_ptr = (
@@ -995,15 +1059,22 @@ def _causal_conv1d_update_kernel(
 
         if SILU_ACTIVATION:
             acc = acc / (1 + tl.exp(-acc))
-        mask_1d = (idx_token < seqlen) & (
+        mask_1d = (idx_token < x_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (idx_seq) * stride_o_seq
-            + idx_token * stride_o_token
-            + (idx_feats * stride_o_dim)
-        )
+        if IS_VARLEN:
+            o_ptrs = (
+                o_ptr
+                + (x_start + idx_token) * stride_o_token
+                + (idx_feats * stride_o_dim)
+            )
+        else:
+            o_ptrs = (
+                o_ptr
+                + (idx_seq) * stride_o_seq
+                + idx_token * stride_o_token
+                + (idx_feats * stride_o_dim)
+            )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
 
@@ -1035,11 +1106,14 @@ def causal_conv1d_update(
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,
+    query_start_loc: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
         [shape=2: single token prediction]
         [shape=3: single or multiple tokens prediction]
+        With query_start_loc, x is packed (num_tokens, dim) instead.
     conv_state: (..., dim, state_len), where state_len >= width - 1
     weight: (dim, width)
     bias: (dim,)
@@ -1058,7 +1132,18 @@ def causal_conv1d_update(
             for example: cache_indices = [pad_slot_id, 1 ,20 ,pad_slot_id]
             in this case, the kernel will not process entries at
             indices 0 and 3
-    out: (batch, dim) or (batch, dim, seqlen)
+    query_start_loc: (batch + 1,) int32. If not None, x and out are packed
+        (num_tokens, dim): sequence i owns rows
+        [query_start_loc[i], query_start_loc[i + 1]), at most max_seqlen of
+        them. Each sequence updates conv_state and the intermediate windows
+        like a dense row zero-padded to max_seqlen, and writes out only for
+        its own rows. A sequence with no rows is skipped; rows no sequence
+        covers are left unwritten. Linear chains only (no tree mask, no
+        num_accept_tokens).
+    max_seqlen: upper bound on the rows per sequence; required with
+        query_start_loc.
+    out: (batch, dim) or (batch, dim, seqlen); packed (num_tokens, dim) with
+        query_start_loc
     """
     if validate_data:
         assert cache_seqlens is None  # not implemented yet - ok for vLLM
@@ -1068,11 +1153,20 @@ def causal_conv1d_update(
         activation = "silu" if activation is True else None
     elif activation is not None:
         assert activation in ["silu", "swish"]
-    unsqueeze = x.dim() == 2
-    if unsqueeze:
-        # make it (batch, dim, seqlen) with seqlen == 1
-        x = x.unsqueeze(-1)
-    batch, dim, seqlen = x.shape
+    is_varlen = query_start_loc is not None
+    if is_varlen:
+        assert x.dim() == 2 and max_seqlen is not None and max_seqlen >= 1
+        assert num_accept_tokens is None and retrieve_next_token is None, (
+            "packed causal_conv1d_update supports linear chains only"
+        )
+        unsqueeze = False
+        batch, dim, seqlen = query_start_loc.shape[0] - 1, x.shape[1], max_seqlen
+    else:
+        unsqueeze = x.dim() == 2
+        if unsqueeze:
+            # make it (batch, dim, seqlen) with seqlen == 1
+            x = x.unsqueeze(-1)
+        batch, dim, seqlen = x.shape
     _, width = weight.shape
     # conv_state: (..., dim, state_len), where state_len >= width - 1
     num_cache_lines, _, state_len = conv_state.size()
@@ -1100,9 +1194,13 @@ def causal_conv1d_update(
     out = torch.empty_like(x)
     stride_w_dim, stride_w_width = weight.stride()
 
-    stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
-
-    stride_o_seq, stride_o_dim, stride_o_token = out.stride()
+    if is_varlen:
+        # Packed rows: no per-sequence stride.
+        stride_x_seq, (stride_x_token, stride_x_dim) = 0, x.stride()
+        stride_o_seq, (stride_o_token, stride_o_dim) = 0, out.stride()
+    else:
+        stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # (batch, dim, seqlen)
+        stride_o_seq, stride_o_dim, stride_o_token = out.stride()
     stride_istate_seq, stride_istate_dim, stride_istate_token = conv_state.stride()
     stride_state_indices = (
         conv_state_indices.stride(0) if conv_state_indices is not None else 0
@@ -1135,6 +1233,19 @@ def causal_conv1d_update(
         )
     else:
         stride_inter_seq = stride_inter_step = stride_inter_dim = stride_inter_win = 0
+    # In a width-4 linear chain, step t's window is columns t..t+2 of the row
+    # [state[1], state[2], x_0, ..., x_{seqlen-1}]. When the window view's step
+    # stride equals its window stride s, the per-token stores write column t + w
+    # of that row at (t + w) * s, and one store of the whole row writes column c
+    # at c * s: the same addresses and values for any layout with these strides
+    # (MambaPool's deduplicated view is one). The kernel then writes the row as
+    # one tile. Tree verify and other widths keep the per-token stores.
+    dedup_conv_window = (
+        intermediate_conv_window is not None
+        and retrieve_next_token is None
+        and width == 4
+        and stride_inter_step == stride_inter_win
+    )
 
     # prepare retrieve next token buffer strides if provided
     if retrieve_next_token is not None:
@@ -1179,6 +1290,7 @@ def causal_conv1d_update(
         retrieve_next_token,
         retrieve_next_sibling,
         retrieve_parent_token,
+        query_start_loc,
         out,
         # Matrix dimensions
         batch,
@@ -1224,6 +1336,11 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        IS_VARLEN=is_varlen,
+        DEDUP_CONV_WINDOW=dedup_conv_window,
+        NP2_WINDOW_COLS=(
+            triton.next_power_of_2(seqlen + width - 2) if dedup_conv_window else 1
+        ),
         **pdl_kwargs,
     )
     if unsqueeze:
