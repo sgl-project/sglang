@@ -710,6 +710,43 @@ class TestPythonicDetector(unittest.TestCase):
         self.assertEqual(params["location"], "Tokyo")
         self.assertEqual(params["data"], [1, 2, 3])
 
+    def test_parse_streaming_nested_brackets_small_chunks(self):
+        """The bracket depth carried between chunks must match a full rescan."""
+        text = "Hi [get_weather(location='[Tokyo]', data=[[1], [2, [3]]]), search(query='q')] bye"
+        for size in (1, 2, 3):
+            with self.subTest(size=size):
+                detector = PythonicDetector()
+                normal_text, calls = "", []
+                for i in range(0, len(text), size):
+                    result = detector.parse_streaming_increment(
+                        text[i : i + size], self.tools
+                    )
+                    normal_text += result.normal_text
+                    calls.extend(result.calls)
+
+                self.assertEqual(normal_text, "Hi  bye")
+                self.assertEqual(
+                    [call.name for call in calls], ["get_weather", "search"]
+                )
+                self.assertEqual(
+                    json.loads(calls[0].parameters),
+                    {"location": "[Tokyo]", "data": [[1], [2, [3]]]},
+                )
+
+    def test_parse_streaming_rescans_when_stripping_rewrites_buffer(self):
+        """Stripping can remove a special token that an earlier strip pieced
+        together, so the call must still be found in the shortened buffer."""
+        chunk1 = "[get_weather(location=<|python_<|python_start|>start|>"
+        result1 = self.detector.parse_streaming_increment(chunk1, self.tools)
+        self.assertEqual(result1.calls, [])
+        self.assertEqual(
+            self.detector._buffer, "[get_weather(location=<|python_start|>"
+        )
+
+        result2 = self.detector.parse_streaming_increment("'Oslo')]", self.tools)
+        self.assertEqual(len(result2.calls), 1)
+        self.assertEqual(json.loads(result2.calls[0].parameters), {"location": "Oslo"})
+
     def test_parse_streaming_with_python_start_and_end_token(self):
         """Test parsing a message that starts with <|python_start|> and <|python_end|> across chunks."""
         chunks = [
