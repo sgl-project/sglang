@@ -311,19 +311,16 @@ class BeamTrieConstraint:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         sparse = self.level2_sparse
         assert sparse is not None and logits.is_cuda
-        from sglang.kernels.ops.grammar.trie_mask import mask_sparse_logits
+        from sglang.kernels.ops.grammar.trie_mask import mask_sparse_prefix_logits
 
-        pair_rows = self._sparse_level2_rows(prefix_codes)
-        starts = sparse.offsets[pair_rows].long()
-        return (
-            mask_sparse_logits(
-                logits,
-                pair_rows,
-                sparse.offsets,
-                sparse.values,
-                sparse.max_children,
-            ),
-            sparse.values[starts].long().unsqueeze(1),
+        return mask_sparse_prefix_logits(
+            logits,
+            prefix_codes,
+            sparse.keys,
+            sparse.offsets,
+            sparse.values,
+            sparse.max_children,
+            self.config.codebook_size,
         )
 
     def valid_child_mask(self, prefix_codes: torch.Tensor, depth: int) -> torch.Tensor:
