@@ -50,6 +50,12 @@ class ExpertLocationDispatchInfo:
             "Expert dispatch requires placement metadata"
         )
 
+        expert_location_metadata = get_global_expert_location_metadata()
+        assert expert_location_metadata is not None, (
+            "no expert location metadata: the model class is missing "
+            "get_model_config_for_expert_location"
+        )
+
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
             rank_invariant=get_exec().moe.moe_a2a_backend == "none",
