@@ -37,11 +37,14 @@ Usage:
 import argparse
 import dataclasses
 import datetime
+import glob
+import json
 import logging
 import multiprocessing
 import os
 import signal
 import socket
+import struct
 import time
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
@@ -55,6 +58,7 @@ from sglang.srt.runtime_context import (
     SpawnRanks,
     get_exec,
     get_parallel,
+    get_schedule,
     publish,
     spawn_world_rank,
 )
@@ -85,6 +89,123 @@ if TYPE_CHECKING:
 # healthy client, yet guarantees one hung/dead peer can't stall the other
 # engine ranks indefinitely.
 CLIENT_CONNECTION_TIMEOUT = 30.0
+
+# A safetensors header is small JSON metadata; anything larger is a corrupt or
+# non-safetensors file and should fall back to the file size.
+_MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
+
+
+def _safetensors_nbytes(path: str) -> Optional[int]:
+    """Sum tensor payload bytes from a safetensors header, or None if unreadable."""
+    try:
+        with open(path, "rb") as f:
+            raw_header_len = f.read(8)
+            if len(raw_header_len) != 8:
+                return None
+            (header_len,) = struct.unpack("<Q", raw_header_len)
+            if header_len <= 0 or header_len > _MAX_SAFETENSORS_HEADER_BYTES:
+                return None
+            header = json.loads(f.read(header_len))
+        if not isinstance(header, dict):
+            return None
+
+        total = 0
+        for name, meta in header.items():
+            if name == "__metadata__" or not isinstance(meta, dict):
+                continue
+            nbytes = meta.get("nbytes")
+            if isinstance(nbytes, int) and not isinstance(nbytes, bool):
+                total += nbytes
+                continue
+            offsets = meta.get("data_offsets")
+            if (
+                isinstance(offsets, (list, tuple))
+                and len(offsets) == 2
+                and all(isinstance(o, int) and not isinstance(o, bool) for o in offsets)
+            ):
+                total += offsets[1] - offsets[0]
+        return total
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _resolve_local_checkpoint_dir(
+    model_path: str, revision: Optional[str]
+) -> Optional[str]:
+    """Return an existing local directory for a path or cached Hub repo id."""
+    if os.path.isdir(model_path):
+        return model_path
+    if os.path.isfile(model_path):
+        return None
+    try:
+        from sglang.srt.utils.common import find_local_repo_dir
+
+        return find_local_repo_dir(model_path, revision)
+    except Exception:
+        return None
+
+
+def _checkpoint_weight_files(model_path: str, revision: Optional[str]) -> list:
+    """List checkpoint weight files, preferring the safetensors index when present."""
+    if os.path.isfile(model_path):
+        return [model_path]
+
+    local_dir = _resolve_local_checkpoint_dir(model_path, revision)
+    if not local_dir:
+        return []
+
+    indexed = set()
+    for index_path in glob.glob(os.path.join(local_dir, "*.safetensors.index.json")):
+        try:
+            with open(index_path) as f:
+                weight_map = json.load(f).get("weight_map", {})
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not isinstance(weight_map, dict):
+            continue
+        for shard in weight_map.values():
+            if not isinstance(shard, str):
+                continue
+            shard_path = os.path.join(local_dir, shard)
+            if os.path.isfile(shard_path):
+                indexed.add(shard_path)
+    if indexed:
+        return sorted(indexed)
+
+    for pattern in ("*.safetensors", "*.bin"):
+        files = [
+            path
+            for path in glob.glob(os.path.join(local_dir, pattern))
+            if os.path.isfile(path)
+        ]
+        if files:
+            return sorted(files)
+    return []
+
+
+def estimate_checkpoint_bytes(
+    model_path: str, revision: Optional[str] = None
+) -> Optional[int]:
+    """Estimate checkpoint payload bytes before any weights are loaded.
+
+    Sums the tensor payload sizes in safetensors headers (falling back to file
+    size when a header is unreadable or the format is not safetensors). Returns
+    None when no local checkpoint is available, e.g. an uncached Hub repo id.
+    """
+    files = _checkpoint_weight_files(model_path, revision)
+    if not files:
+        return None
+
+    total = 0
+    for path in files:
+        nbytes = _safetensors_nbytes(path) if path.endswith(".safetensors") else None
+        if nbytes is None:
+            try:
+                nbytes = os.path.getsize(path)
+            except OSError:
+                return None
+        total += nbytes
+    return total
 
 
 @dataclasses.dataclass
@@ -176,6 +297,7 @@ class WeightCacheDaemon:
         self.model_loader_extra_config = cfg.model_loader_extra_config
         self.trust_remote_code = cfg.trust_remote_code
         self.revision = cfg.revision
+        self.weight_cache_max_bytes = cfg.weight_cache_max_bytes
         self.dist_init_method = dist_init_method
 
         device_uuid = current_platform.get_device_uuid(gpu_id)
@@ -266,6 +388,9 @@ class WeightCacheDaemon:
         # die mid-way with an opaque CUDA error. Fail fast with an actionable
         # message before touching the device.
         self._assert_ipc_compatible_allocator()
+        # Reject an oversized checkpoint from its on-disk size before touching
+        # the GPU, so a bad cap never allocates weight memory.
+        self._enforce_estimated_cap()
         current_platform.set_device(current_platform.get_device(self.gpu_id))
 
         # Reduce thread contention during multi-process loading
@@ -391,6 +516,7 @@ class WeightCacheDaemon:
         self.preloaded_weights_bytes = max(
             0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
         )
+        self._validate_loaded_weights()
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
@@ -399,6 +525,64 @@ class WeightCacheDaemon:
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
             f"Exported {len(self.state_entries)} tensors as IPC handles."
         )
+
+    def _enforce_estimated_cap(self) -> None:
+        max_bytes = self.weight_cache_max_bytes
+        if max_bytes is None:
+            return
+
+        estimated_bytes = estimate_checkpoint_bytes(self.model_path, self.revision)
+        if estimated_bytes is None:
+            logger.warning(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] cannot estimate the "
+                f"checkpoint size for {self.model_path!r}; --weight-cache-max-bytes "
+                f"will be enforced after loading."
+            )
+            return
+
+        logger.info(
+            f"[WeightCacheDaemon gpu={self.gpu_id}] estimated checkpoint size "
+            f"{estimated_bytes} bytes (cap {max_bytes} bytes)"
+        )
+        if estimated_bytes > max_bytes:
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] estimated checkpoint size "
+                f"({estimated_bytes} bytes) exceeds --weight-cache-max-bytes "
+                f"({max_bytes} bytes); refusing to load. Raise the cap or use a "
+                f"smaller model."
+            )
+
+    def _validate_loaded_weights(self) -> None:
+        max_bytes = self.weight_cache_max_bytes
+        if max_bytes is None:
+            return
+
+        loaded_bytes = self.preloaded_weights_bytes
+        if loaded_bytes > max_bytes:
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] loaded weights "
+                f"({loaded_bytes} bytes) exceed --weight-cache-max-bytes "
+                f"({max_bytes} bytes); refusing to serve. Raise the cap or use "
+                f"a smaller model."
+            )
+
+        mem_fraction_static = get_schedule().mem_fraction_static
+        if mem_fraction_static is None:
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] --weight-cache-max-bytes "
+                f"is set, but --mem-fraction-static is unresolved; cannot verify "
+                f"the weight cache memory budget."
+            )
+        total_bytes = current_platform.get_device_total_memory(self.gpu_id)
+        budget_bytes = int(total_bytes * mem_fraction_static)
+        if loaded_bytes > budget_bytes:
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] loaded weights "
+                f"({loaded_bytes} bytes) exceed the --mem-fraction-static budget "
+                f"({budget_bytes} bytes = {mem_fraction_static:.3f} of "
+                f"{total_bytes} bytes total GPU memory); refusing to serve. "
+                f"Reduce the weight footprint or raise --mem-fraction-static."
+            )
 
     @staticmethod
     def _assert_ipc_compatible_allocator() -> None:
