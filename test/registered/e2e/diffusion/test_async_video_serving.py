@@ -204,22 +204,41 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
     finally:
         bad_output.unlink()
 
+    timed_out = []
+    if mode == "single":
+        # pause during denoising, not just before dispatch, to cover late results
+        active = submit(num_frames=81, num_inference_steps=24)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            job = call("GET", f"/v1/videos/{active}").json()
+            assert job["status"] not in ("completed", "failed"), job
+            if job["status"] == "in_progress" and 0 < job["progress"] < 90:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail(f"No active denoising observed: {job}\n{ctx.log_tail()}")
+        timed_out.append(active)
+
+    failed_jobs = {}
     with _paused(workers):
-        timed_out = [submit() for _ in range(num_gpus if mode == "dp2" else 1)]
+        timed_out.extend(submit() for _ in range(num_gpus if mode == "dp2" else 1))
         wait(timed_out, expected="failed")
         for job_id in timed_out:
             call("GET", f"/v1/videos/{job_id}/content", expected=404)
             job = call("GET", f"/v1/videos/{job_id}").json()
             assert "Scheduler did not respond in time" in job["error"]["message"], job
+            failed_jobs[job_id] = job
 
     # timeout ends the RPC, not GPU work: drain every replica and reject late progress
-    for _ in range(num_gpus if mode == "dp2" else 1):
+    for _ in range(3 if mode == "single" else num_gpus):
         recovered = submit()
         wait([recovered])
         assert decoded_hash(recovered) == reference
     for job_id in timed_out:
         job = call("GET", f"/v1/videos/{job_id}").json()
-        assert job["status"] == "failed" and job["progress"] < 100, job
+        assert job == failed_jobs[job_id] and job["progress"] < 100, job
+        call("GET", f"/v1/videos/{job_id}/content", expected=404)
+    assert decoded_hash(baseline) == reference
     call("GET", "/health")
     if mode == "batch2":
         assert "Processed dynamic batch of 2/2" in ctx.stdout_file.read_text()
