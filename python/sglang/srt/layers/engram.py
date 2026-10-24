@@ -316,6 +316,14 @@ class EngramHasher(nn.Module):
         result.image_token_id = image_token_id
         return result
 
+    def new_hash_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """An uninitialized output for ``input_ids``' hash ids."""
+        return torch.empty(
+            (input_ids.shape[0], self.primes.shape[0], self.offsets.shape[1]),
+            dtype=torch.int64,
+            device=input_ids.device,
+        )
+
     def forward(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
@@ -325,11 +333,7 @@ class EngramHasher(nn.Module):
         mode = forward_batch.forward_mode
         if num_tokens == 0 or mode.is_idle():
             # A DP-attention idle batch carries pad rows; nothing reads its hashes.
-            return torch.zeros(
-                (num_tokens, self.primes.shape[0], self.offsets.shape[1]),
-                dtype=torch.int64,
-                device=input_ids.device,
-            )
+            return self.new_hash_ids(input_ids).zero_()
         if (
             mode.is_extend()
             and not mode.is_target_verify()
@@ -1344,7 +1348,8 @@ class Engram(nn.Module):
             and is_in_breakable_cuda_graph()
         ):
             # Every replay stages new rows, so the lookup runs between segments.
-            emb = _bcg_engram_embed(self, hash_ids, cp_all_tokens)
+            emb = self.embed._empty(hash_ids)
+            _bcg_engram_embed(self, hash_ids, cp_all_tokens, emb)
         else:
             emb = self.embed_rows(hash_ids, forward_batch, cp_all_tokens)
         if x.shape[0] == 0:
@@ -1381,8 +1386,8 @@ class Engram(nn.Module):
 
 @eager_on_graph
 def _bcg_engram_embed(
-    engram: Engram, hash_ids: torch.Tensor, cp_all_tokens: bool
-) -> torch.Tensor:
+    engram: Engram, hash_ids: torch.Tensor, cp_all_tokens: bool, out: torch.Tensor
+) -> None:
     # A replay builds a fresh batch; the capture-time one stages no rows.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
-    return engram.embed_rows(hash_ids, forward_batch, cp_all_tokens)
+    out.copy_(engram.embed_rows(hash_ids, forward_batch, cp_all_tokens))
