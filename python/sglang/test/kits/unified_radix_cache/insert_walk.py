@@ -33,7 +33,6 @@ class ResumableInsertWalkSWAFixtures(UnifiedRadixCacheFixtures):
         seq = list(range(1, self.cfg.sliding_window_size + 1))
         key = RadixKey(array("q", seq))
         evicted = self._alloc(allocator, len(seq))
-        # Window eviction already released the peers below the floor.
         allocator.free_swa(evicted)
         cache.insert(
             InsertParams(
@@ -229,7 +228,6 @@ class SegmentLockFuzzFixtures(UnifiedRadixCacheFixtures):
                 raise
             cache.sanity_check()
 
-        # Drain remaining locks; the tree must come back exactly balanced.
         for node_id, receipt, released in held:
             cache.dec_lock_ref(node_id, receipt.to_dec_params(), skip_swa=released)
         cache.sanity_check()
