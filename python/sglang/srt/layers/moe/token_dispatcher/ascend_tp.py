@@ -98,7 +98,6 @@ class AscendTPDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> AscendTPDispatchOutput:
         topk_weights, topk_ids, _ = topk_output
-        topk_weights = topk_weights.to(hidden_states.dtype)
         topk_ids = topk_ids.to(torch.int32)
         top_k = topk_weights.shape[-1]
 
