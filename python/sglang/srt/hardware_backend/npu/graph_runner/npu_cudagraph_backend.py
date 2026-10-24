@@ -93,6 +93,38 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     def cache_loc_dtype(self):
         return torch.int32
 
+    def get_update_attr_name(self):
+        """Preserve each runner's existing captured attention update protocol."""
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+        from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+            EAGLEDraftCudaGraphRunner,
+        )
+        from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+            EAGLEDraftExtendCudaGraphRunner,
+        )
+        from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
+            MultiLayerEagleDraftExtendCudaGraphRunner,
+        )
+
+        # FIA V1 uses actual_seq_lengths_kv; FIA V2 uses actual_seq_kvlen.
+        # Check specialized runners before their common decode base class.
+        runner_update_attrs = (
+            (MultiLayerEagleDraftExtendCudaGraphRunner, "actual_seq_kvlen"),
+            (EAGLEDraftExtendCudaGraphRunner, "actual_seq_lengths_kv"),
+            (EAGLEDraftCudaGraphRunner, "actual_seq_lengths_kv"),
+        )
+        for runner_type, attr_name in runner_update_attrs:
+            if isinstance(self._decode_runner, runner_type):
+                return attr_name
+        if isinstance(self._decode_runner, DecodeCudaGraphRunner):
+            return self._decode_update_attr_name()
+        raise TypeError(
+            "Unsupported NPU graph update runner: "
+            f"{type(self._decode_runner).__name__}"
+        )
+
     def _decode_update_attr_name(self):
         runner = self._decode_runner
         architectures = runner.model_runner.model_config.hf_config.architectures or []
@@ -416,7 +448,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 return self.replay_with_input_update(
                     shape_key,
                     seq_lens=self._decode_update_lengths(static_forward_batch),
-                    attr_name=self._decode_update_attr_name(),
+                    attr_name=self.get_update_attr_name(),
                     attr_type=[],
                 )
         self._graphs[shape_key].replay()

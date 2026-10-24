@@ -16,7 +16,8 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 def make_backend(*, dflash=False, width=1, bs=4, raw_bs=2):
     backend = mod.NPUCudaGraphBackend.__new__(mod.NPUCudaGraphBackend)
     attention = SimpleNamespace(forward_metadata=None)
-    runner = SimpleNamespace(
+    runner = runner_mod.DecodeCudaGraphRunner.__new__(runner_mod.DecodeCudaGraphRunner)
+    runner.__dict__.update(
         raw_bs=raw_bs,
         bs=bs,
         captured_req_width=width,

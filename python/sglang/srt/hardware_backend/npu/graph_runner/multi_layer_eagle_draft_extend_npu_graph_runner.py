@@ -39,7 +39,7 @@ class MultiLayerEagleDraftExtendNpuGraphRunner(
         return self.backend.replay_with_input_update(
             shape_key,
             seq_lens=seq_lens,
-            attr_name="actual_seq_kvlen",
+            attr_name=self.backend.get_update_attr_name(),
             attr_type=[],
         )
 
