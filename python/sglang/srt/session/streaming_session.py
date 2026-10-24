@@ -118,6 +118,13 @@ class StreamingSession:
                 self.release_session(req.session.session_id)
                 return None
 
+        # A one-token first turn retracted before it decoded matches nothing of
+        # its record, and lending it would hand alloc_for_extend a row without
+        # KV; drop the record and prefill the turn as a new request.
+        if min(slot.kv.kv_committed_len, len(params.key)) == 0:
+            self.release_session(req.session.session_id)
+            return None
+
         # Lend the record; the slot keeps the tree lock. A rejected chunked
         # request matches again next cycle and borrows the same record.
         req.kv = slot.kv

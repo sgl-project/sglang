@@ -1,3 +1,4 @@
+from array import array
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     MatchResult,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -152,6 +154,36 @@ def test_finished_turn_leaves_its_record_in_the_slot():
     assert slot.kv.component_evicted_seqlens == {ComponentType.SWA: 2}
     assert req.kv is not record
     assert req.swa_branching_seqlen is None
+
+
+def test_retracted_one_token_first_turn_is_prefilled_as_a_new_request():
+    """A one-token first turn retracted before it decoded matched nothing of
+    its record but still borrowed the record's row, without KV; the next prefill
+    asserted "a reused row must carry allocated KV" and the scheduler died."""
+    tree_cache = _single_row_cache()
+    tree_cache.match_results = [
+        MatchResult(
+            device_prefix_len=0,
+            last_device_node=None,
+            last_host_node=None,
+            best_match_node=None,
+        )
+    ]
+    req = _FakeReq("session-a", req_pool_idx=0, committed=1, allocated=1)
+    tree_cache.maybe_hand_to_session(req)
+    # retract_decode releases the unfinished turn through claim_kv_row.
+    assert tree_cache.session.try_cache_finished_req(req)
+
+    # The prefill match skips the last prompt token, so a one-token turn has
+    # an empty key.
+    result = tree_cache.match_prefix(
+        SimpleNamespace(req=req, key=RadixKey(array("q", [])))
+    )
+
+    assert result.device_prefix_len == 0
+    assert not req.kv.holds_kv
+    assert "session-a" not in tree_cache.session.slots
+    assert tree_cache.req_to_token_pool.free_slots == [0]
 
 
 def test_preabort_detaches_session_and_preserves_slot():
