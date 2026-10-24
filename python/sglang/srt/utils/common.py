@@ -90,7 +90,7 @@ import torch
 import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -2023,7 +2023,6 @@ def smart_to_rgb(
     if not isinstance(image, Image.Image):
         return image
 
-    image = ImageOps.exif_transpose(image)
     if image.mode in ("RGBA", "LA") or "transparency" in image.info:
         image = image.convert("RGBA")
         width, height = image.size
@@ -2081,10 +2080,19 @@ def _warn_fancy_jpeg_fallback(error: str) -> None:
     )
 
 
+@lru_cache(maxsize=16)
+def _warn_gpu_jpeg_fallback(error: str) -> None:
+    logger.warning(
+        "Failed to decode JPEG on GPU with torchcodec, falling back to PIL. Error: %s",
+        error,
+    )
+
+
 def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
     gpu_image_decode: GPUImageDecodeMode = True,
+    apply_exif_orientation: bool = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
     Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
@@ -2101,24 +2109,23 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
-            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
+            # torchcodec always applies the EXIF orientation, so opting out of
+            # it means decoding with PIL.
+            if apply_exif_orientation:
+                from torchcodec.decoders import decode_jpeg
 
-            encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
-            return image_tensor
+                return decode_jpeg(image_bytes, mode="RGB", device="cuda")
         except Exception as e:
             if gpu_image_decode == "nvjpeg_fancy":
                 _warn_fancy_jpeg_fallback(f"{type(e).__name__}: {e}")
             else:
-                logger.warning(
-                    "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
-                    e,
-                )
+                _warn_gpu_jpeg_fallback(f"{type(e).__name__}: {e}")
     try:
         image = Image.open(BytesIO(image_bytes))
     except (OSError, SyntaxError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
-    return _fully_load_pil_image(image)
+    image = _fully_load_pil_image(image)
+    return _apply_exif_orientation(image) if apply_exif_orientation else image
 
 
 def _fully_load_pil_image(image: Image.Image) -> Image.Image:
@@ -2130,13 +2137,31 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     return image
 
 
+def _apply_exif_orientation(image: Image.Image) -> Image.Image:
+    """Return ``image`` rotated/flipped upright per its EXIF Orientation tag.
+
+    Returns ``image`` itself when no transform is needed. Malformed EXIF is
+    treated as no rotation rather than failing an otherwise decodable image.
+    """
+    try:
+        orientation = image.getexif().get(ExifTags.Base.Orientation, 1)
+        if orientation not in (2, 3, 4, 5, 6, 7, 8):
+            return image
+        return ImageOps.exif_transpose(image)
+    except Exception:
+        return image
+
+
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
     gpu_image_decode: GPUImageDecodeMode = True,
+    apply_exif_orientation: bool = True,
 ) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
     """
     Load image from multiple input formats, including:
     ImageData, PIL Image, bytes, URL, file path, or base64 string.
+    With ``apply_exif_orientation=False``, images keep their stored orientation
+    and the EXIF Orientation tag is ignored.
     """
     if isinstance(image_file, ImageData):
         image_file = image_file.url
@@ -2145,26 +2170,49 @@ def load_image(
     image_size: Optional[tuple[int, int]] = None
     if isinstance(image_file, Image.Image):
         image = _fully_load_pil_image(image_file)
+        if apply_exif_orientation:
+            image = _apply_exif_orientation(image)
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
-        image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_bytes=image_file,
+            gpu_image_decode=gpu_image_decode,
+            apply_exif_orientation=apply_exif_orientation,
+        )
     elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=image_file,
+            gpu_image_decode=gpu_image_decode,
+            apply_exif_orientation=apply_exif_orientation,
+        )
     elif isinstance(image_file, str) and image_file.startswith("file://"):
         image = _load_image(
             image_file=unquote(urlparse(image_file).path),
             gpu_image_decode=gpu_image_decode,
+            apply_exif_orientation=apply_exif_orientation,
         )
     elif isinstance(image_file, str) and image_file.lower().endswith(
         image_extension_names
     ):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=image_file,
+            gpu_image_decode=gpu_image_decode,
+            apply_exif_orientation=apply_exif_orientation,
+        )
     elif isinstance(image_file, str) and image_file.startswith("data:"):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=image_file,
+            gpu_image_decode=gpu_image_decode,
+            apply_exif_orientation=apply_exif_orientation,
+        )
     elif isinstance(
         image_file, str
     ):  # Other formats, try to decode as base64 by default
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=image_file,
+            gpu_image_decode=gpu_image_decode,
+            apply_exif_orientation=apply_exif_orientation,
+        )
     else:
         raise ValueError(f"Invalid image: {image_file}")
     if image_size is not None and isinstance(image, Image.Image):

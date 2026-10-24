@@ -71,7 +71,7 @@ def _get_decoder_pool(device_id: int) -> _NvJpegDecoderPool:
 def decode_jpeg_with_fancy_upsampling(image_bytes: bytes) -> torch.Tensor:
     """Decode a JPEG to contiguous CHW RGB uint8 on the current CUDA device.
 
-    torchvision's CUDA JPEG decoder creates nvJPEG with its default flags,
+    torchcodec's CUDA JPEG decoder creates nvJPEG with its default flags,
     which use nearest-neighbor chroma upsampling. nvImageCodec exposes nvJPEG's
     interpolated ("fancy") upsampling and exports the result to PyTorch through
     DLPack without copying it.

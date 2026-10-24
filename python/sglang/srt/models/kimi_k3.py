@@ -3455,6 +3455,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
     }
     encoder_media_processor_config = EncoderMediaProcessorConfig(
         image_decode_mode="nvjpeg_fancy",
+        apply_exif_orientation=False,
         preserve_media_metadata=True,
     )
 

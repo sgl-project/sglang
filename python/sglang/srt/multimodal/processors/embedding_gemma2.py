@@ -97,6 +97,8 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
     # Plain nvJPEG skips fancy chroma upsampling and drifts from the PIL decode the
     # checkpoint was validated with (embedding cos ~0.99 vs HF); nvjpeg_fancy matches it.
     gpu_image_decode = "nvjpeg_fancy"
+    # nvImageCodec decoding ignores EXIF orientation; the PIL path must match.
+    apply_exif_orientation = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
