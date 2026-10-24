@@ -5,6 +5,8 @@ bootstrap thread records the ACK target while a transfer is outstanding; only
 the worker can send that ACK after every handle reaches DONE.
 """
 
+import threading
+import time
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
@@ -63,6 +65,68 @@ def _chunk() -> TransferKVChunk:
     )
 
 
+_HANDLE = object()
+
+
+class _ProcForeverAgent:
+    """Fake NIXL agent whose submitted handle stays healthy but non-terminal."""
+
+    def __init__(self):
+        self.state = "PROC"
+        self.reads = 0
+
+    def check_xfer_state(self, handle):
+        self.reads += 1
+        return self.state
+
+
+def _wait_until_polling(test_case, agent: _ProcForeverAgent) -> None:
+    deadline = time.monotonic() + 10
+    while agent.reads == 0 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    test_case.assertGreater(agent.reads, 0, "worker never started polling handles")
+
+
+def _abort_worker_manager(agent: _ProcForeverAgent) -> NixlKVManager:
+    """Manager able to run transfer_worker() up to the handle wait with one
+    fake handle produced by a mocked send_kvcache."""
+    manager = _manager()
+    manager.agent = agent
+    manager.enable_staging = False
+    manager._staging_ctx = None
+    manager._staging_outstanding = defaultdict(int)
+    manager.exceptions = {}
+    manager.is_mla_backend = False
+    manager.is_hybrid_mla_backend = False
+    manager.attn_tp_size = 1
+    manager.transfer_source_rank = 0
+    manager.kv_args = SimpleNamespace(kv_data_ptrs=[0x1000])
+    manager.decode_kv_args_table = {
+        "agent": SimpleNamespace(
+            decode_tp_size=1,
+            requires_dcp_relayout=False,
+            kv_xfer_segments=None,
+            dst_homogeneous_mem_kind="VRAM",
+            dst_kv_ptrs=[0x2000],
+            gpu_id=0,
+        )
+    }
+    manager.transfer_infos = {
+        ROOM: {
+            "req": SimpleNamespace(
+                room=ROOM,
+                is_dummy=False,
+                agent_name="agent",
+                dst_kv_indices=np.array([0], dtype=np.int64),
+                dst_aux_index=np.array([0], dtype=np.int64),
+                decode_prefix_len=0,
+            )
+        }
+    }
+    manager.send_kvcache = MagicMock(return_value=_HANDLE)
+    return manager
+
+
 class TestNixlAbortNotification(
     DeferredAbortNotificationScenarios,
     TaggedAbortNotificationScenarios,
@@ -85,7 +149,7 @@ class TestNixlAbortNotification(
         # A handle that never settles may still be writing, so the chunk stays
         # counted and the room is poisoned instead of notified.
         manager.conclude_failure = MagicMock()
-        manager._await_handles = MagicMock(return_value=(False, True))
+        manager._await_handles = MagicMock(return_value=(False, True, False))
         manager.check_status = MagicMock(side_effect=RuntimeError("worker error"))
         queue = SimpleNamespace(
             get=MagicMock(side_effect=(_chunk(), KeyboardInterrupt()))
@@ -226,6 +290,76 @@ class TestNixlAbortNotification(
         manager.conclude_failure.assert_called_once()
         self.assertEqual(manager._staging_outstanding[ROOM], 0)
         self.assertEqual(manager._sent, [])
+
+    def test_await_handles_wakes_when_room_aborted_mid_wait(self):
+        # https://github.com/sgl-project/sglang/issues/44369 - a healthy but
+        # non-terminal handle must not keep _await_handles() spinning after
+        # the room is aborted.
+        agent = _ProcForeverAgent()
+        manager = _manager()
+        manager.agent = agent
+        returned = threading.Event()
+        result = {}
+
+        def wait_for_handle():
+            result["value"] = manager._await_handles(
+                [_HANDLE], failure_seen=False, room=ROOM
+            )
+            returned.set()
+
+        thread = threading.Thread(target=wait_for_handle, daemon=True)
+        thread.start()
+        _wait_until_polling(self, agent)
+        # Sanity: without the abort the wait really does block.
+        self.assertFalse(returned.wait(0.2))
+
+        self._dispatch_abort(manager)
+
+        self.assertTrue(returned.wait(5))
+        self.assertEqual(result["value"], (False, False, True))
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+
+    def test_abort_during_handle_wait_releases_worker_and_acks(self):
+        # https://github.com/sgl-project/sglang/issues/44369 - aborting a
+        # room while its transfer worker waits on a healthy non-terminal
+        # handle must release the worker, drain the staging count, and fire
+        # the deferred abort ACK.
+        agent = _ProcForeverAgent()
+        manager = _abort_worker_manager(agent)
+        queue = SimpleNamespace(
+            get=MagicMock(side_effect=(_chunk(), KeyboardInterrupt()))
+        )
+        worker_done = threading.Event()
+        worker_errors = []
+
+        def run_worker():
+            try:
+                manager.transfer_worker(queue)
+            except KeyboardInterrupt:
+                pass
+            except BaseException as e:  # noqa: BLE001 - surfaced below
+                worker_errors.append(e)
+            finally:
+                worker_done.set()
+
+        thread = threading.Thread(target=run_worker, daemon=True)
+        thread.start()
+        _wait_until_polling(self, agent)
+
+        self._dispatch_abort(manager)
+
+        self.assertTrue(worker_done.wait(10))
+        thread.join(5)
+        self.assertEqual(worker_errors, [])
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
+        self.assertEqual(manager._staging_outstanding[ROOM], 0)
+        self.assertNotIn(ROOM, manager._deferred_ack_targets)
+        self.assertNotIn(ROOM, manager._deferred_ack_poisoned_rooms)
+        self.assertEqual(
+            manager._sent,
+            [(ROOM, AckTarget(DECODE_IP, DECODE_PORT, ABORT_GENERATION))],
+        )
 
 
 if __name__ == "__main__":
