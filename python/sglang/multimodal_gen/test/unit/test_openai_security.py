@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import errno
 import io
+import os
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -31,6 +36,7 @@ from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
     cache_get,
     cache_put,
 )
+from sglang.multimodal_gen.runtime.utils import image_io
 from sglang.multimodal_gen.runtime.utils.image_io import ensure_path_within_root
 
 
@@ -86,6 +92,50 @@ def test_save_image_sources_within_uploads_root(tmp_path, image_source):
     )
     assert Path(saved) == root / f"input{suffix}"
     assert Path(saved).read_bytes() == b"image"
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_failed_image_write_preserves_destination(
+    monkeypatch, tmp_path, image_source, existing
+):
+    """A failed input write must not publish partial bytes or truncate an old file."""
+    source, suffix = image_source
+    target = tmp_path / f"input{suffix}"
+    if existing:
+        target.write_bytes(b"previous image")
+
+    @contextmanager
+    def failing_write(opener, *args, **kwargs):
+        with opener(*args, **kwargs) as stream:
+            write = stream.write
+
+            def write_partial(data):
+                write(data[:1])
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+            with patch.object(stream, "write", side_effect=write_partial):
+                yield stream
+
+    with monkeypatch.context() as fault:
+        fault.setattr(utils, "open", partial(failing_write, open), raising=False)
+        fault.setattr(image_io, "open", partial(failing_write, open), raising=False)
+        fault.setattr(os, "fdopen", partial(failing_write, os.fdopen))
+        with pytest.raises(Exception, match="No space left on device"):
+            asyncio.run(
+                utils.save_image_to_path(
+                    source, str(tmp_path / "input"), uploads_root=str(tmp_path)
+                )
+            )
+    assert set(tmp_path.iterdir()) == ({target} if existing else set())
+    if existing:
+        assert target.read_bytes() == b"previous image"
+    # a later request must replace the file with a complete input
+    saved = asyncio.run(
+        utils.save_image_to_path(
+            b"complete image", str(target), uploads_root=str(tmp_path)
+        )
+    )
+    assert Path(saved).read_bytes() == b"complete image"
 
 
 def test_save_image_sources_reject_escape_before_writing(tmp_path, image_source):
