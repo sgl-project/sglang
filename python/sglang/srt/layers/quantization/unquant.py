@@ -866,6 +866,51 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     layer.w2_weight_bias.float(), requires_grad=False
                 )
 
+        if is_xpu() and not get_moe_runner_backend().is_triton():
+            # Align BF16 expert weights to Column-Major [E, K, N] for Intel Xe2 DPAS VNNI load.
+            # On Xe3 (CRI), plain BF16 GroupGemm expects row-major [E, N, K].
+            # Using _xpu_weights_transposed avoids flawed shape inspection on square matrices (e.g. 2*I == H or I == H).
+            # TODO: Optimize Xe3 MoE layout in a future PR to adopt column-major Layout B (currently kept row-major on Xe3).
+            try:
+                from sgl_kernel.utils import is_xe2_arch
+
+                _use_col_major = is_xe2_arch()
+            except Exception:
+                _use_col_major = False
+
+            if _use_col_major and not getattr(layer, "_xpu_weights_transposed", False):
+                if layer.w13_weight.ndim == 3:
+                    is_gpt_oss = (
+                        getattr(layer.moe_runner_config, "gemm1_alpha", None)
+                        is not None
+                    )
+                    w13_data = layer.w13_weight.data
+                    if is_gpt_oss:
+                        # GPT-OSS checkpoints store W13 as [G0, U0, G1, U1, ...].
+                        # Xe2 fused GEMM expects contiguous gate/up halves.
+                        w13_data = torch.cat(
+                            (w13_data[:, 0::2, :], w13_data[:, 1::2, :]), dim=1
+                        ).contiguous()
+                    else:
+                        w13_data = w13_data.transpose(1, 2).contiguous()
+                    copy_or_rebind_param(
+                        layer,
+                        "w13_weight",
+                        w13_data.transpose(1, 2).contiguous()
+                        if is_gpt_oss
+                        else w13_data,
+                    )
+                    copy_or_rebind_param(
+                        layer,
+                        "w2_weight",
+                        layer.w2_weight.data.transpose(1, 2).contiguous(),
+                    )
+                    layer._xpu_weights_transposed = True
+                    setattr(layer.w13_weight, "_xpu_weights_transposed", True)
+                    setattr(layer.w2_weight, "_xpu_weights_transposed", True)
+                    if is_gpt_oss:
+                        setattr(layer.w13_weight, "_xpu_gate_up_block_split", True)
+
         if (
             self.use_deep_gemm
             and layer.w13_weight.dtype == torch.bfloat16
