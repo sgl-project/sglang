@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.attention.mla_qk_prep import absorbed_bmm_concat_cast_q_fp8
+from sglang.kernels.ops.attention.utils import concat_mla_absorb_q_general
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
@@ -43,6 +44,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
     _is_musa,
+    _is_sail,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import (
@@ -551,7 +553,7 @@ class DeepseekMLAForwardMixin:
                     expected_m,
                 )
                 q_nope_out = q_nope_out[:, :expected_m, :]
-            elif self.w_kc.dtype == torch.float8_e4m3fn:
+            elif self.w_kc.dtype == torch.float8_e4m3fn and not _is_sail:
                 if _is_cpu:
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
@@ -764,8 +766,8 @@ class DeepseekMLAForwardMixin:
                     ),
                 )
         else:
-            q = torch.cat([q_nope_out, q_pe], dim=-1)
-            k = torch.cat([k_nope, k_pe], dim=-1)
+            q = concat_mla_absorb_q_general(q_nope_out, q_pe)
+            k = concat_mla_absorb_q_general(k_nope, k_pe)
 
             # Apply llama 4 scaling if provided
             if llama_4_scaling is not None:
@@ -868,7 +870,7 @@ class DeepseekMLAForwardMixin:
             attn_bmm_output = (
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
-        elif self.w_vc.dtype == torch.float8_e4m3fn:
+        elif self.w_vc.dtype == torch.float8_e4m3fn and not _is_sail:
             if _is_cpu:
                 attn_bmm_output = torch.bmm(
                     attn_output.to(torch.bfloat16).transpose(0, 1),

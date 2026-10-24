@@ -302,9 +302,9 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
     if not use_mla_backend:
         # MHA architecture
 
-        if get_platform().is_hopper_with_cuda_12_3 and is_no_spec_infer_or_topk_one(
-            resolved_view(server_args)
-        ):
+        if (
+            get_platform().is_sail or get_platform().is_hopper_with_cuda_12_3
+        ) and is_no_spec_infer_or_topk_one(resolved_view(server_args)):
             # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
             # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
             # ref: https://github.com/sgl-project/sglang/issues/17411

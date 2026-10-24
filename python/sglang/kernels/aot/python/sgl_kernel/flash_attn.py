@@ -3,13 +3,15 @@ from typing import Optional, Union
 
 import torch
 from sgl_kernel.debug_utils import maybe_wrap_debug_kernel
+from sgl_kernel.utils import is_sail
 
-try:
-    from sgl_kernel import flash_ops
-except:
-    raise ImportError(
-        "Can not import FA3 in sgl_kernel. Please check your installation."
-    )
+if not is_sail():
+    try:
+        from sgl_kernel import flash_ops
+    except:
+        raise ImportError(
+            "Can not import FA3 in sgl_kernel. Please check your installation."
+        )
 
 
 @lru_cache(maxsize=1)

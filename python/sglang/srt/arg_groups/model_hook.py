@@ -429,6 +429,20 @@ def handle_model_specific_adjustments(server_args: Any):
                     ),
                 )
 
+            # A captured prefill graph pins MLA to the absorbed path, which
+            # hands the backend a non-None q_v; the SAIL FA3 interface rejects
+            # that argument, so MLA prefill must stay eager on SAIL.
+            if get_platform().is_sail and use_mla_backend(server_args):
+                declare_resolution(
+                    server_args,
+                    "_handle_model_specific_adjustments",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.PREFILL,
+                        backend=Backend.DISABLED,
+                    ),
+                )
+
         # Set moe backend for DeepSeek: the sm100 quant/moe resolution
         # moved to the resolution pipeline (arg_groups/overrides.py:
         # _deepseek_moe_quant_resolution -- a slot pass, because the DSA
