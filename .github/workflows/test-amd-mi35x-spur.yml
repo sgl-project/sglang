@@ -1,0 +1,59 @@
+name: Test AMD MI35x (Spur)
+
+# Smoke test for MI35x nodes scheduled through Spur. The runner sits on the
+# cluster's login node and submits one single-node job per leg through
+# scripts/ci/slurm/launch_amd_ci_mi35x.sh, which runs the same container steps
+# as the linux-mi35x-gpu-* jobs in pr-test-amd.yml.
+#
+# Per-cluster settings (SLURM_PARTITION / SLURM_ACCOUNT / SLURM_QOS and the
+# node-local CI_NODE_SCRATCH) come from the runner's environment, as they do
+# for nightly-amd-mi355x-disagg.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to test. Leave empty for the dispatching ref.'
+        required: false
+        default: ''
+      rocm_version:
+        description: 'ROCm image line'
+        required: false
+        default: 'rocm10'
+        type: choice
+        options: [rocm10, rocm724, rocm720]
+
+concurrency:
+  group: test-amd-mi35x-spur-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  stage-a-test-1-gpu-small-amd-mi35x-spur:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: linux-sglang-mi35x-spur
+    timeout-minutes: 120
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Run suite on a cluster node
+        timeout-minutes: 110
+        run: |
+          bash scripts/ci/slurm/launch_amd_ci_mi35x.sh \
+            --suite stage-a-test-1-gpu-small-amd \
+            --rocm-version "${{ inputs.rocm_version || 'rocm10' }}"
+
+      - name: Cancel cluster jobs on failure/cancel
+        if: failure() || cancelled()
+        continue-on-error: true
+        run: |
+          # Same prefix launch_amd_ci_mi35x.sh names its jobs with. %200j widens
+          # the name column; Spur's squeue does not accept --me.
+          PREFIX="amd-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-"
+          JOBS=$(squeue --noheader --format="%i %200j" | grep -F "$PREFIX" | awk '{print $1}' || true)
+          if [ -n "$JOBS" ]; then
+            echo "Cancelling: $JOBS"
+            scancel $JOBS
+          fi
