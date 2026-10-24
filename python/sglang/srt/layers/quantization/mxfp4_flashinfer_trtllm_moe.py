@@ -10,8 +10,9 @@ from torch.nn.parameter import Parameter
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -126,7 +127,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             and config.scoring_func == "sigmoid"
             and config.correction_bias is not None
             and config.custom_routing_function is None
-            and config.num_fused_shared_experts == 0
+            and config.num_shared_topk_slots == 0
             and not config.torch_native
         )
         self._bypassed_routing_method = (
@@ -163,6 +164,14 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             if swiglu_limit is not None
             else None
         )
+
+    def get_moe_runner_backend(self, layer):
+        return MoeRunnerBackend.FLASHINFER_MXFP4
+
+    def get_moe_routing_method_type(
+        self, layer: Module, requested_method: RoutingMethodType | None
+    ) -> RoutingMethodType | None:
+        return requested_method
 
     def create_weights(
         self,
@@ -460,11 +469,14 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         # Deferred finalize returns the permuted GEMM2 output plus the routing
         # triple instead of the finalized [T, hidden] tensor.
         defer_finalize = is_deferred_finalize_enabled()
+        # FlashInfer keys its tactic cache on the output shape. At <= 32 rows the tuned
+        # tactic measured slower on real routing, so those keep the (M, 0) key.
+        if envs.SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE.get():
+            deferred_output_shape = num_tokens > 32
+        else:
+            deferred_output_shape = 96 < num_tokens <= 384
         symm_output = None
-        # Preserve the ordinary output shape in the medium-batch autotuner
-        # cache key. The deferred ABI ignores this allocation and returns the
-        # expanded GEMM output for the separate fused finalize epilogue.
-        if not defer_finalize or 96 < num_tokens <= 384:
+        if not defer_finalize or deferred_output_shape:
             with use_symmetric_memory(
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):

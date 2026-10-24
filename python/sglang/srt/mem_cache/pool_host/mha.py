@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.device_pool_info import (
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
 )
+from sglang.srt.mem_cache.pool_host._kvcacheio import require_kvcacheio_ops
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -58,6 +59,21 @@ _is_xpu = is_xpu()
 _is_mps = is_mps()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
+        transfer_kv_all_layer,
+        transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_all_layer_lf_pf,
+        transfer_kv_all_layer_lf_ph,
+        transfer_kv_all_layer_mla_lf_pf,
+        transfer_kv_direct,
+        transfer_kv_per_layer,
+        transfer_kv_per_layer_direct_pf_lf,
+        transfer_kv_per_layer_mla,
+        transfer_kv_per_layer_mla_pf_lf,
+        transfer_kv_per_layer_pf_lf,
+        transfer_kv_per_layer_ph_lf,
+    )
+elif _is_xpu:
+    from sglang.srt.mem_cache.pool_host._kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
@@ -136,6 +152,10 @@ class MHATokenToKVPoolHost(HostKVCache):
         pool_label: str = "kv",
         head_group_num: int = 1,
     ):
+        if _is_xpu:
+            require_kvcacheio_ops(
+                pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+            )
         infos = (buffer_info, *draft_buffer_infos)
         for info in infos:
             if (
@@ -234,7 +254,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             # transfer kernels address the fused buffer directly instead.
             self.k_data_refs = []
             self.v_data_refs = []
-        elif self.layout == "page_first":
+        elif self.layout in ("page_first", "page_first_direct"):
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
             # This swaps strides without copying data
             k_transposed = self.k_buffer.transpose(0, 1)
@@ -374,6 +394,30 @@ class MHATokenToKVPoolHost(HostKVCache):
     @property
     def v_buffer(self):
         return self.kv_buffer[1]
+
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+        # checked at construction; keep in step with their branches.
+        _kvcacheio_ops = {
+            "kernel": {
+                "layer_first": ("transfer_kv_per_layer", "transfer_kv_all_layer"),
+                "page_first": (
+                    "transfer_kv_per_layer_pf_lf",
+                    "transfer_kv_all_layer_lf_pf",
+                ),
+                "page_head": (
+                    "transfer_kv_per_layer_ph_lf",
+                    "transfer_kv_all_layer_lf_ph",
+                ),
+            },
+            "direct": {
+                "layer_first": ("transfer_kv_direct",),
+                "page_first_direct": (
+                    "transfer_kv_per_layer_direct_pf_lf",
+                    "transfer_kv_all_layer_direct_lf_pf",
+                ),
+            },
+        }
 
     def load_to_device_per_layer(
         self,
@@ -870,6 +914,10 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         allocator_type: str = "default",
     ):
         self._destroyed = False
+        if _is_xpu:
+            require_kvcacheio_ops(
+                pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+            )
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size
         self.layout = layout
@@ -978,6 +1026,27 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
 
     def get_hybrid_pool_buffer(self):
         return [self.k_buffer]
+
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+        # checked at construction; keep in step with their branches.
+        # layer_first backs up one layer at a time.
+        _kvcacheio_ops = {
+            "kernel": {
+                "layer_first": ("transfer_kv_per_layer_mla",),
+                "page_first": (
+                    "transfer_kv_per_layer_mla_pf_lf",
+                    "transfer_kv_all_layer_mla_lf_pf",
+                ),
+            },
+            "direct": {
+                "layer_first": ("transfer_kv_direct",),
+                "page_first_direct": (
+                    "transfer_kv_per_layer_direct_pf_lf",
+                    "transfer_kv_all_layer_direct_lf_pf",
+                ),
+            },
+        }
 
     def load_to_device_per_layer(
         self,
@@ -1351,6 +1420,24 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             "interface used by HiCache L3 storage backends {hf3fs, eic, nixl}. "
             "Use a backend that does not use this interface (e.g. mooncake, simm)."
         )
+
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+        # checked at construction; keep in step with their branches.
+        _kvcacheio_ops = {
+            "kernel": {
+                "page_first": (
+                    "transfer_kv_per_layer_mla_pf_lf",
+                    "transfer_kv_all_layer_mla_lf_pf",
+                ),
+            },
+            "direct": {
+                "page_first_direct": (
+                    "transfer_kv_per_layer_direct_pf_lf",
+                    "transfer_kv_all_layer_direct_lf_pf",
+                ),
+            },
+        }
 
     def load_to_device_per_layer(
         self,

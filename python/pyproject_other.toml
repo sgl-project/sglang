@@ -28,6 +28,7 @@ runtime_base = [
   "blobfile==3.0.0",
   "build",
   "datasets",
+  "deepseek-recipe==0.2.0 ; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin'",
   "easydict",
   "einops",
   "fastapi",
@@ -107,9 +108,9 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
-# Monokernels for gfx950 (--monokernel-backend amd); the ROCm image checks out this pin too.
+# Monokernels for gfx950 (--enable-amd-monokernel); the ROCm image checks out this pin too.
 monokernels_hip = [
-  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@e07665c8b36f7d42a48f6615bacf911d0656f5c5",
+  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@05e0bb02e1519b95d6337808d6f7645261f554d8",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -161,6 +162,14 @@ diffusion_hip = [
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
 srt_hpu = ["sglang[runtime_common]"]
 
+# https://docs.sglang.io/hardware-platforms/sail
+srt_sail = [
+  "sailify==1.0.0",
+  "sglang[runtime_common]",
+  "torch-for-sail",
+  "triton-for-sail",
+]
+
 # https://docs.sglang.io/platforms/mthreads_gpu.md
 srt_musa = [
   "apache-tvm-ffi==0.1.11.post1+musa.1",
@@ -195,7 +204,7 @@ diffusion_musa = [
 
 # https://docs.sglang.io/hardware-platforms/apple_metal
 srt_mps = [
-    "mlx>=0.32.0",
+    "mlx>=0.32.4",
     "mlx-lm",
     "sglang[runtime_common]",
     "torch==2.13.0",
@@ -235,6 +244,7 @@ all_hip = ["sglang[diffusion_hip]", "sglang[srt_hip]", "sglang[tracing]"]
 all_hip_rocm724 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm724]", "sglang[tracing]"]
 all_hip_rocm101 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm101]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
+all_sail = ["sglang[srt_sail]"]
 all_musa = ["sglang[diffusion_musa]", "sglang[srt_musa]"]
 all_mps = ["sglang[diffusion_mps]", "sglang[srt_mps]"]
 
@@ -242,6 +252,7 @@ dev_hip = ["sglang[all_hip]", "sglang[test]"]
 dev_hip_rocm724 = ["sglang[all_hip_rocm724]", "sglang[test]"]
 dev_hip_rocm101 = ["sglang[all_hip_rocm101]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
+dev_sail = ["sglang[all_sail]", "sglang[test]"]
 dev_musa = ["sglang[all_musa]", "sglang[test]"]
 dev_mps = ["sglang[all_mps]", "sglang[test]"]
 

@@ -452,11 +452,9 @@ impl Intake {
     /// Client disconnected (or a detok terminal): deregister the sink, then push an
     /// `AbortReq(rid)` so the scheduler stops generating for it.
     ///
-    /// A failed push is logged, not retried: the scheduler keeps generating and the
-    /// chunks arrive for a rid no longer in the detok table, where they are dropped.
-    /// That wastes GPU work until the request finishes on its own, but it cannot be
-    /// misdelivered — the rid is unique to this request for the process's lifetime
-    /// ([`Rid::from_client`]), so no later request can ever answer to it.
+    /// Aborts use the reserved scheduler-control lane, so request-ring
+    /// backpressure cannot discard cancellation after public selector state is
+    /// retired.
     ///
     /// A request out in a pool never reached the scheduler, so there is nothing to
     /// abort there yet: it is marked `Aborted` and dropped when it returns.
@@ -475,19 +473,13 @@ impl Intake {
             return;
         }
 
-        // The channel is BOUNDED and drops pushes under exactly the load this matters
-        // for, so report the miss rather than assuming the scheduler was told.
         match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
             Ok(header) => {
-                if !self.to_scheduler_tx.try_push(SchedulerRequest {
+                if !self.to_scheduler_tx.push_priority(SchedulerRequest {
                     header,
                     buffers: Vec::new(),
                 }) {
-                    tracing::error!(
-                        rid = %rid,
-                        "abort dropped: to_scheduler channel is full; the scheduler keeps generating \
-                         for this request until it finishes on its own"
-                    );
+                    tracing::debug!(rid = %rid, "abort ignored during scheduler shutdown");
                 }
             }
             Err(e) => tracing::error!(rid = %rid, error = %e, "abort encode failed"),
