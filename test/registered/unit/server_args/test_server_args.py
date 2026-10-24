@@ -2649,6 +2649,34 @@ class TestHiCacheArgs(CustomTestCase):
 
         handle_cache_compatibility(args)
 
+    def test_enable_lmcache_rejected_when_model_capability_disables_radix_cache(self):
+        """Models that force disable_radix_cache in handle_model_capability_adjustments
+        must still fail the LMCache radix-cache gate."""
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(f"{tmpdir}/config.json", "w") as f:
+                json.dump(
+                    {
+                        "architectures": ["HrmTextForCausalLM"],
+                        "model_type": "llama",
+                        "hidden_size": 16,
+                        "intermediate_size": 32,
+                        "num_attention_heads": 2,
+                        "num_key_value_heads": 2,
+                        "num_hidden_layers": 2,
+                        "vocab_size": 128,
+                        "max_position_embeddings": 512,
+                    },
+                    f,
+                )
+            args = ServerArgs(model_path=tmpdir, enable_lmcache=True)
+            with self.assertRaisesRegex(
+                ValueError, "--enable-lmcache requires radix cache to be enabled"
+            ):
+                args.resolve_once()
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):

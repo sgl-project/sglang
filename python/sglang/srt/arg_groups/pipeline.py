@@ -362,9 +362,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     finalize_cuda_graph_prefill_max_context(server_args)
 
-    # Capability adjustments can late-force a different attention backend or
-    # disable chunked prefill. Re-run the idempotent sharding gate over the
-    # final resolving view.
+    # Capability adjustments can late-force a different attention backend,
+    # disable chunked prefill, or disable the radix cache. Re-run the
+    # idempotent cache and sharding gates over the final resolving view.
+    run_hook(handle_cache_compatibility, server_args)
     run_hook(handle_kv_cache_sharding, server_args)
 
     # Validate after all batch-size declarations are visible.

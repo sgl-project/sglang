@@ -51,6 +51,39 @@ class TestOnIdleStallPublish(CustomTestCase):
             s.on_idle()
         self.assertEqual(s.publish_load_snapshot.call_count, 2)
 
+    def test_is_fully_idle_with_lmcache_and_disabled_radix_cache(self):
+        """A disabled radix cache builds a plain UnifiedRadixCache even when
+        enable_lmcache is set; is_fully_idle must not crash on missing LMCache
+        hooks."""
+        from types import SimpleNamespace
+
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+        from sglang.srt.runtime_context import get_context
+
+        override = get_context().override_server_args(
+            enable_lmcache=True, disable_radix_cache=True
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        s = Scheduler.__new__(Scheduler)
+        s.running_batch = SimpleNamespace(is_empty=lambda: True)
+        s.chunked_req = None
+        s.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+        s.last_batch = None
+        s.enable_overlap = False
+        s.result_queue = []
+        s.waiting_queue = []
+        s.grammar_manager = SimpleNamespace(grammar_queue=[])
+        s.disaggregation_mode = DisaggregationMode.NULL
+        s.enable_hisparse = False
+        s.enable_hierarchical_cache = False
+        s.enable_lmcache = True
+        s.disable_radix_cache = True
+        s.tree_cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+
+        self.assertTrue(s.is_fully_idle())
+
 
 if __name__ == "__main__":
     unittest.main()
