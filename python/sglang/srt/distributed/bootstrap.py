@@ -210,8 +210,12 @@ def measure_pre_model_load_memory(*, device: str, is_draft_worker: bool) -> floa
         distributed=get_world_group().world_size > 1 and not is_draft_worker,
         cpu_group=get_world_group().cpu_group,
     )
+    # Check memory for tensor parallelism. The balance heuristic assumes CUDA
+    # idle-capacity semantics and mis-fires on NPU/Ascend, where
+    # torch.npu.mem_get_info() free-memory reporting does not map to that
+    # assumption, so it is skipped on NPU.
     local_gpu_memory = get_available_gpu_memory(device, get_device().gpu_id)
-    if get_parallel().tp_size > 1 and not is_draft_worker:
+    if get_parallel().tp_size > 1 and not is_draft_worker and device != "npu":
         _check_tp_memory_balance(
             pre_model_load_memory=pre_model_load_memory,
             local_gpu_memory=local_gpu_memory,
