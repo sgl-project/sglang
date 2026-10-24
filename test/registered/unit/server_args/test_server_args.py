@@ -4845,17 +4845,17 @@ class TestTrtllmMlaArchGuard(CustomTestCase):
 
     @override_platform(is_sm100=False, is_sm120=False, is_blackwell=False)
     def test_trtllm_mla_decode_rejected_off_blackwell(self):
-        with self.assertRaises(ValueError) as context:
-            handle_attention_backend_compatibility(
-                self._make_args(
-                    attention_backend="triton",
-                    decode_attention_backend="trtllm_mla",
+        for backends in (
+            {"attention_backend": "triton", "decode_attention_backend": "trtllm_mla"},
+            {"attention_backend": "trtllm_mla"},
+        ):
+            with self.subTest(**backends):
+                with self.assertRaises(ValueError) as context:
+                    handle_attention_backend_compatibility(self._make_args(**backends))
+                self.assertEqual(
+                    str(context.exception),
+                    "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend.",
                 )
-            )
-        self.assertEqual(
-            str(context.exception),
-            "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend.",
-        )
 
     @override_platform(is_sm100=True, is_sm120=False, is_blackwell=True)
     def test_trtllm_mla_invalid_kv_cache_dtype_rejected(self):
