@@ -217,11 +217,12 @@ class DpPaddingMode(IntEnum):
 def _decode_sum_len_fits_custom_all_reduce(global_num_tokens: List[int]) -> bool:
     """SUM_LEN gathers and combines DP decode rows with one TP all-reduce of the
     summed buffer; take it while the custom all-reduce can hold that buffer.
-    A batch with an idle rank keeps the cost-based choice below."""
+    A one-rank gather or a batch with an idle rank keeps the cost-based choice."""
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     if (
-        len(global_num_tokens) <= 1
+        dp_gather_width() <= 1
+        or len(global_num_tokens) <= 1
         or min(global_num_tokens) == 0
         or not get_moe_a2a_backend().is_none()
         or get_spec().speculative_algorithm is not None
