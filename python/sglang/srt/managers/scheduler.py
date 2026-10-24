@@ -6045,8 +6045,13 @@ class Scheduler(
             self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
-        if self.idle_sleeper is not None:
-            self.idle_sleeper.maybe_sleep()
+        if self.idle_sleeper is None:
+            return
+        # EPD embeddings arrive on per-request sockets the idle sleeper does not
+        # poll; sleeping here would delay every image request by its timeout.
+        if self.mm_receiver is not None and self.mm_receiver.waiting_list:
+            return
+        self.idle_sleeper.maybe_sleep()
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
