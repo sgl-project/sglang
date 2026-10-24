@@ -592,13 +592,43 @@ class TpModelWorker(BaseTpWorker):
         if self.dllm_algorithm.fdfo and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]
 
-        (
-            logits_output,
-            next_token_ids,
-            accept_length_per_req_cpu,
-            dllm_algo_state,
-            can_run_cuda_graph,
-        ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
+        paired_output = None
+        if envs.SGLANG_SDAR_REFRESH_PAIR.get():
+            if batch is None:
+                raise RuntimeError(
+                    "Refresh pairing requires scheduler request metadata"
+                )
+            if not hasattr(self, "_sdar_refresh_pair"):
+                from sglang.srt.dllm.refresh_pair_serving import RefreshPairServing
+
+                self._sdar_refresh_pair = RefreshPairServing(
+                    self.model_runner, self.dllm_algorithm
+                )
+            paired_output = self._sdar_refresh_pair.run(forward_batch, batch.reqs)
+
+        if paired_output is None:
+            (
+                logits_output,
+                next_token_ids,
+                accept_length_per_req_cpu,
+                dllm_algo_state,
+                can_run_cuda_graph,
+            ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
+        else:
+            from sglang.srt.dllm.refresh_pair_serving import finish_paired_step
+
+            (
+                logits_output,
+                next_token_ids,
+                accept_length_per_req_cpu,
+                dllm_algo_state,
+                can_run_cuda_graph,
+            ) = finish_paired_step(
+                self.dllm_algorithm,
+                forward_batch,
+                paired_output,
+                algo_states,
+            )
 
         return GenerationBatchResult(
             logits_output=logits_output,
