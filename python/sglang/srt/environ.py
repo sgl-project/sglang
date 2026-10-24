@@ -298,6 +298,10 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Qwen4-Exp speculative decoding (NEXTN, topk 1, <= 8 running requests, TP 1) through the FlyDSL monokernel
+    # (sglang.kernels.ops.speculative.qwen4_exp_monokernel, SGLANG_USE_AITER=1, gfx950): target verify / MTP draft forwards.
+    SGLANG_ENABLE_QWEN4_MONOKERNEL = EnvBool(False)
+    SGLANG_ENABLE_QWEN4_MTP_MONOKERNEL = EnvBool(False)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device

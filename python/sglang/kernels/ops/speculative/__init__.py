@@ -6,7 +6,12 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 # (module, public_fn) migrated from speculative/triton_ops.
 _TRITON_KERNELS = [
@@ -68,6 +73,17 @@ register_kernel(
         op="speculative.pack_verify_mask_into",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.pack_verify_mask:pack_verify_mask_into",
+    )
+)
+
+# Qwen4-Exp monokernel: the decoder stack of a speculative target verify / MTP draft step in persistent
+# FlyDSL launches (gfx950); the builder returns the launcher for one batch shape.
+register_kernel(
+    KernelSpec(
+        op="speculative.build_qwen4_exp_monokernel",
+        backend=KernelBackend.FLYDSL,
+        target="sglang.kernels.ops.speculative.qwen4_exp_monokernel.kernel:build_qwen4_exp_monokernel",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
     )
 )
 

@@ -70,6 +70,21 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        # Qwen4ExpMTPMonoRunner when SGLANG_ENABLE_QWEN4_MTP_MONOKERNEL is set
+        self._mono = None
+
+    def precompile_kernels_after_loading(self) -> None:
+        from sglang.srt.models.qwen4_exp_monokernel import (
+            Qwen4ExpMTPMonoRunner,
+            mtp_monokernel_enabled,
+        )
+        from sglang.srt.runtime_context import get_spec
+
+        if mtp_monokernel_enabled():
+            # Built after loading: it reads the FusedMoE / FP8 params after their AITER shuffle.
+            self._mono = Qwen4ExpMTPMonoRunner(
+                self, ntok_extend=get_spec().speculative_num_draft_tokens
+            )
 
     def _init_pre_fc_norms(self, config: PretrainedConfig) -> None:
         self.pre_fc_norm_embedding = GemmaRMSNorm(
@@ -197,6 +212,18 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        mono = self._mono
+        if mono is not None and mono.applicable(forward_batch, input_ids):
+            hidden_states, hc_hidden_states = mono.forward(
+                input_ids, forward_batch, forward_batch.spec_info.hidden_states
+            )
+            logits_output = self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+            self._set_hc_logits_hidden_states(
+                logits_output, hc_hidden_states, forward_batch
+            )
+            return logits_output
         with self._npu_quant_context():
             input_embeds = self._prepare_input_embeds(
                 input_ids, forward_batch, input_embeds
