@@ -2325,8 +2325,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
     def _wait_for_layer_loads(self) -> None:
-        # Full replay skips the per-layer load waits in the pool accessors; breakable
-        # replay still runs them at its eager breaks.
+        # Full replay skips the pool accessors. BCG's dynamic KDA waits do not
+        # cover Full graph's KV/state reads, so Full still needs this barrier.
         if not self._is_full_backend:
             return
         counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
