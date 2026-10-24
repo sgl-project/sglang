@@ -17,7 +17,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -65,6 +68,22 @@ class SDPABackend(AttentionBackend):
     #     return FlashAttentionMetadata
 
 
+# AOTriton's flash path only applies to dense operands; on a strided
+# [B, H, S, D] view it falls back to a generic kernel. The heads-first view of
+# a contiguous [B, S, H, D] activation is always strided, so the copy decides
+# between the two. Measured on gfx1151 (32 heads x 128, bf16):
+#
+#     S      1024   2048   4096   8192  16384
+#     gain   1.18x  1.09x  1.30x  3.01x  9.28x
+#
+# Below the threshold the copy buys little and the allocation churn costs more
+# than it saves: Qwen-Image 2.1 at 1024^2 (S=4096) lost 5.7% end to end while
+# its attention kernel alone was 1.3x faster, whereas at 2048^2 (S=16384) the
+# step time dropped 3.5x. So materialize only where the kernel gain dominates.
+_DENSE_SDPA_OPERANDS = current_platform.is_hip()
+_DENSE_SDPA_MIN_SEQ = 8192
+
+
 class SDPAImpl(AttentionImpl):
     def __init__(
         self,
@@ -94,9 +113,7 @@ class SDPAImpl(AttentionImpl):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         # transpose to bs, heads, seq_len, head_dim
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
+        query, key, value = sdpa_operands(query, key, value)
         attn_mask = None
         is_causal = self.causal
         if self.causal and query.shape[-2] != key.shape[-2]:
@@ -389,3 +406,15 @@ class DynamicCudnnSDPAImpl(SDPAImpl):
                 )
                 self._cudnn_failed = True
         return self.fa_impl.forward(query, key, value, attn_metadata, **kwargs)
+
+
+def sdpa_operands(query, key, value):
+    """[B, S, H, D] activations -> the [B, H, S, D] SDPA takes, dense when it pays."""
+    query, key, value = (
+        query.transpose(1, 2),
+        key.transpose(1, 2),
+        value.transpose(1, 2),
+    )
+    if not _DENSE_SDPA_OPERANDS or query.shape[-2] < _DENSE_SDPA_MIN_SEQ:
+        return query, key, value
+    return query.contiguous(), key.contiguous(), value.contiguous()
