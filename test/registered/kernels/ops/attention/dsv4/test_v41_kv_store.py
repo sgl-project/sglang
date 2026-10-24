@@ -612,15 +612,14 @@ class TestV41KVDequant(CustomTestCase):
                     dtype=torch.int64,
                 )
                 ref = self._gather_ref(dequant, pages, page_size, ids)
-                workspace = torch.zeros(
-                    305, 1, 512, dtype=torch.bfloat16, device="cuda"
-                )
+                workspace = torch.ones(310, 1, 512, dtype=torch.bfloat16, device="cuda")
                 out = dequantize_k_cache_paged_dsv4(
-                    pages, ids, page_size, out=workspace[5:], layout=layout
+                    pages, ids, page_size, out=workspace[5:305], layout=layout
                 )
                 # NaN payloads (fp8 0x7F / e4m3 NaN scales) compare through their bits.
-                self.assertTrue(torch.equal(bits(workspace[5:]), bits(ref)))
-                self.assertEqual(int(workspace[:5].abs().sum()), 0)
+                self.assertTrue(torch.equal(bits(workspace[5:305]), bits(ref)))
+                self.assertTrue(bool((workspace[:5] == 1).all()))
+                self.assertTrue(bool((workspace[305:] == 1).all()))
 
 
 HEAD_DIM, ROPE_DIM = 512, 64
