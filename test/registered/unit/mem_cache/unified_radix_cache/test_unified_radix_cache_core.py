@@ -915,6 +915,53 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertIsNone(node_device_value(cache, node, ComponentType.SWA))
         cache.sanity_check()
 
+    def _swa_head_len(self, tokens) -> int:
+        """Tokens a fresh insert leaves above its window-capped SWA leaf."""
+        page_size = self.cfg.page_size
+        window = self.cfg.sliding_window_size
+        return len(tokens) - (window + page_size - 1) // page_size * page_size
+
+    def _swa_match_len(self, cache, tokens) -> int:
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+        return match.device_prefix_len
+
+    @requires_swa_only
+    def test_swa_evict_reclaims_branch_tails_last(self):
+        """SWA pressure tombstones windows no branch ends on before the tail of
+        an older branch, and still reclaims tails once nothing else is left."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        n_pages = (self.cfg.sliding_window_size // self.cfg.page_size) + 4
+        idle = self._make_seq(1, n_pages)
+        busy = self._make_seq(5000, n_pages)
+        self._insert(cache, allocator, req_to_token_pool, idle)
+        self._insert(cache, allocator, req_to_token_pool, busy)
+
+        cache.evict(EvictParams(swa_num_tokens=2 * self._swa_head_len(idle)))
+        self.assertEqual(self._swa_match_len(cache, idle), len(idle))
+        self.assertEqual(self._swa_match_len(cache, busy), len(busy))
+
+        cache.evict(EvictParams(swa_num_tokens=len(idle) + len(busy)))
+        self.assertEqual(self._swa_match_len(cache, idle), 0)
+        self.assertEqual(self._swa_match_len(cache, busy), 0)
+        cache.sanity_check()
+
+    @requires_swa_only
+    def test_swa_evict_spares_the_window_above_a_fork(self):
+        """A window two branches fork from outlives the stale windows of those
+        branches, so a third branch still reuses the shared prefix."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        n_pages = (self.cfg.sliding_window_size // self.cfg.page_size) + 4
+        shared = self._make_seq(1, n_pages)
+        self._insert(cache, allocator, req_to_token_pool, shared)
+        for start in (5000, 6000):
+            branch = shared + self._make_seq(start, n_pages)
+            self._insert(cache, allocator, req_to_token_pool, branch)
+
+        cache.evict(EvictParams(swa_num_tokens=2 * self._swa_head_len(shared)))
+        third = shared + self._make_seq(7000, 1)
+        self.assertEqual(self._swa_match_len(cache, third), len(shared))
+        cache.sanity_check()
+
     @requires_swa_and_mamba
     def test_leaf_transition_swa_evict_spares_locked_full(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
