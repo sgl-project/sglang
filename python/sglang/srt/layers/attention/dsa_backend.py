@@ -1092,6 +1092,12 @@ class DeepseekSparseAttnBackend(
             actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
         )
 
+        self.init_kernel_metadata(forward_batch)
+
+    def init_kernel_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Refresh custom kernel state after eager or out-of-graph metadata setup."""
+        pass
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
@@ -1423,6 +1429,7 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
+        self.init_kernel_metadata(forward_batch)
 
     def _cal_indexer_k_start_end(
         self,
@@ -4202,18 +4209,23 @@ class DeepseekSparseAttnMultiStepBackend:
     ):
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+        )
         if in_capture:
-            inner_fb = build_inner_fb_view(
-                forward_batch,
-                bs=forward_batch.batch_size,
-                forward_mode=ForwardMode.DECODE,
-            )
             for i in range(self.speculative_num_steps - 1):
                 self.attn_backends[i].init_forward_metadata_out_graph(
                     inner_fb, in_capture=True
                 )
             return
 
+        self._init_forward_metadata_replay(forward_batch)
+        for backend in self.attn_backends[: self.speculative_num_steps - 1]:
+            backend.init_kernel_metadata(inner_fb)
+
+    def _init_forward_metadata_replay(self, forward_batch: ForwardBatch) -> None:
         bs = forward_batch.batch_size
         # Precompute metadata once (shared across all backends)
         precomputed = self.attn_backends[0]._precompute_replay_metadata(
