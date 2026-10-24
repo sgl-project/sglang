@@ -18,6 +18,15 @@ ADMIN_PATHS = [
     "/stop_profile",
     "/set_trace_level",
     "/freeze_gc",
+    "/update_weights_from_disk",
+    "/update_weights_from_tensor",
+    "/update_weights_from_distributed",
+    "/update_weights_from_ipc",
+    "/update_weight_version",
+    "/init_weights_update_group",
+    "/destroy_weights_update_group",
+    "/begin_weight_update",
+    "/end_weight_update",
 ]
 
 
