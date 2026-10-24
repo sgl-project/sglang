@@ -5,11 +5,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
@@ -346,14 +347,54 @@ class PerImageRequestInfo:
     overlapping: List[Tuple[int, MultimodalDataItem, int]] = field(default_factory=list)
 
 
+def _npu_image_batch_budget(data_embedding_func, items) -> int:
+    """Opt in to single-NPU, unquantized Qwen3-VL eager image encoding."""
+    if not _is_npu:
+        return 0
+    budget = envs.SGLANG_NPU_VIT_MAX_BATCH_PATCHES.get()
+    owner = getattr(data_embedding_func, "__self__", None)
+    if (
+        budget <= 0
+        or envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+        or owner is None
+        or owner.__class__.__name__ != "Qwen3VLForConditionalGeneration"
+        or getattr(data_embedding_func, "__name__", None) != "get_image_feature"
+        or owner.use_data_parallel
+        or getattr(owner, "quant_config", None) is not None
+        or get_parallel().tp_size != 1
+        or not all(
+            item.is_image()
+            and isinstance(item.feature, torch.Tensor)
+            and item.feature.ndim == 2
+            for item in items
+        )
+    ):
+        return 0
+    return budget
+
+
+def _image_batch_ranges(items, max_patches):
+    """Bound input patches, not merged LLM tokens; never split an image."""
+    start, patches = 0, 0
+    for index, item in enumerate(items):
+        size = item.feature.shape[0] if max_patches else 0
+        if max_patches and index > start and patches + size > max_patches:
+            yield start, index
+            start, patches = index, 0
+        patches += size
+    if start < len(items):
+        yield start, len(items)
+
+
 def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
     device: torch.device,
+    max_patches: int = 0,
 ) -> Dict[Tuple[Optional[int], int], torch.Tensor]:
     """
     Collect cache misses across ALL per-image requests, deduplicate by hash and
-    expected token count, encode in a single ViT call, and populate the cache.
+    expected token count, encode with an optional patch budget, and fill the cache.
 
     Returns:
         hash_to_embedding: mapping from (item.hash, token_count) to its full
@@ -400,10 +441,12 @@ def _batch_encode_per_image_misses(
                     item.model_specific_data[BORROW_CUDA_IPC_FEATURE_KEY] = True
                 unique_misses[cache_key] = (item, expected_token_count)
 
-    # Phase 1b: single ViT call for all unique cache misses
-    if unique_misses:
-        ordered_cache_keys = list(unique_misses.keys())
-        miss_items = [unique_misses[key][0] for key in ordered_cache_keys]
+    # Phase 1b: encode unique misses, bounded by input patches on NPU.
+    ordered_keys = list(unique_misses)
+    ordered_items = [unique_misses[key][0] for key in ordered_keys]
+    for start, end in _image_batch_ranges(ordered_items, max_patches):
+        ordered_cache_keys = ordered_keys[start:end]
+        miss_items = ordered_items[start:end]
         token_counts = [unique_misses[key][1] for key in ordered_cache_keys]
 
         _move_items_to_device(miss_items, device, data_embedding_func)
@@ -553,6 +596,7 @@ def _get_chunked_prefill_embedding(
     ViT call for efficiency.
     """
     device = input_ids.device
+    npu_batch_budget = _npu_image_batch_budget(data_embedding_func, embedding_items)
     # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
@@ -595,9 +639,9 @@ def _get_chunked_prefill_embedding(
             for item in embedding_items_per_req
         )
         if is_per_image:
-            if _is_hip or _is_npu or _is_xpu:
+            if _is_hip or (_is_npu and not npu_batch_budget) or _is_xpu:
                 # ROCm CI regressed with one large cross-request ViT batch; keep
-                # the previous per-request path on HIP/NPU/XPU while CUDA uses batching.
+                # the per-request path on HIP/XPU and non-opted-in NPU paths.
                 chunk_slices = _get_chunked_embedding_by_item(
                     data_embedding_func,
                     embedding_items_per_req,
@@ -615,7 +659,7 @@ def _get_chunked_prefill_embedding(
     hash_to_embedding: Dict[Tuple[Optional[int], int], torch.Tensor] = {}
     if per_image_requests:
         hash_to_embedding = _batch_encode_per_image_misses(
-            data_embedding_func, per_image_requests, device
+            data_embedding_func, per_image_requests, device, npu_batch_budget
         )
 
     # Phase 2: assemble per-request chunks in original request order
