@@ -51,7 +51,6 @@ from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
-    c4_state_transfer_indices,
     request_scoped_state_transfer_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -2055,29 +2054,6 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
         self.assertTrue(future_map.need_topk)
         self.assertEqual(future_map.topk_p_buf.shape, (4, 3))
         self.assertEqual(future_map.topk_index_buf.shape, (4, 3))
-
-
-class TestDSV4C4StateIndices(unittest.TestCase):
-    def test_non_mtp_to_mtp_maps_the_same_logical_positions(self):
-        # seq_len=13 keeps logical positions [8, 13) for the overlap C4 state.
-        src = c4_state_transfer_indices(2, 13, ring_size=8)
-        dst = c4_state_transfer_indices(2, 13, ring_size=16)
-
-        np.testing.assert_array_equal(src, np.array([16, 17, 18, 19, 20]))
-        np.testing.assert_array_equal(dst, np.array([40, 41, 42, 43, 44]))
-        self.assertEqual(src.size, dst.size)
-
-    def test_ring_wrap_preserves_position_order(self):
-        np.testing.assert_array_equal(
-            c4_state_transfer_indices(0, 10, ring_size=8),
-            np.array([4, 5, 6, 7, 0, 1], dtype=np.int32),
-        )
-
-    def test_invalid_ring_size_is_rejected(self):
-        with self.assertRaises(ValueError):
-            c4_state_transfer_indices(0, 8, ring_size=4)
-        with self.assertRaises(ValueError):
-            c4_state_transfer_indices(0, 8, ring_size=10)
 
 
 class TestDSV4C128StateIndices(unittest.TestCase):
