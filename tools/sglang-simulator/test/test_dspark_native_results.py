@@ -36,6 +36,7 @@ assert isinstance(result, GenerationBatchResult)
 assert isinstance(result.next_draft_input, DFlashDraftInputV2)
 assert result.next_token_ids.tolist() == [1] * 6
 assert result.accept_lens.tolist() == [2]
+assert result.block_accept_lens is None and result.cap_lens is None
 assert result.new_seq_lens.tolist() == [514]
 assert result.next_draft_input.new_seq_lens.tolist() == [514]
 assert result.next_draft_input.bonus_tokens.tolist() == [1]

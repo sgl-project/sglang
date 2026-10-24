@@ -209,12 +209,11 @@ class NativeDSparkResults:
             new_seq_lens=new_seq_lens,
             next_draft_input=next_input,
             accept_lens=None if prefill else torch.tensor(commits, dtype=torch.int32),
-            block_accept_lens=None
-            if prefill
-            else torch.tensor(commits, dtype=torch.int32),
-            cap_lens=None
-            if prefill
-            else torch.tensor([r.extend_len for r in requests], dtype=torch.int32),
+            # The progress artifact models committed counts. It does not
+            # predict pre-trim block acceptance, and the current adapter has
+            # no ragged layout. Preserve the native optional/unknown fields.
+            block_accept_lens=None,
+            cap_lens=None,
             speculative_num_draft_tokens=width,
             speculative_output_stride=None if prefill else width,
             num_correct_drafts=0 if prefill else sum(commits) - len(commits),
