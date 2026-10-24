@@ -260,6 +260,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
                             "page_unified" if unified else "page_first"
                         )
                         controller.mem_pool_host.size = 256
+                        controller.mem_pool_host.logical_size = 256
                         controller.host_memory_mode = "cache"
                         controller.storage_stop_event = threading.Event()
                         config = HiCacheStorageConfig(
@@ -284,6 +285,10 @@ class TestControllerUnifiedKeys(CustomTestCase):
                             patch(
                                 "sglang.srt.managers.cache_controller.get_memory",
                                 return_value=memory,
+                            ),
+                            patch(
+                                "sglang.srt.managers.cache_controller.get_parallel",
+                                return_value=SimpleNamespace(attn_dcp_size=1),
                             ),
                             patch.object(controller, "_stop_storage_threads"),
                             patch.object(controller, "_start_storage_threads"),
@@ -319,6 +324,8 @@ class TestControllerUnifiedKeys(CustomTestCase):
             attn_cp_rank=1,
             attn_cp_size=2,
             attn_dp_rank=1,
+            attn_dcp_size=1,
+            attn_dcp_rank=0,
             pp_rank=0,
             pp_size=1,
         )

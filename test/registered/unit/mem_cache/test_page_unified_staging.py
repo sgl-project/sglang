@@ -255,6 +255,17 @@ class TestPageUnifiedStaging(CustomTestCase):
             self.assertEqual(host.page_unified_layout, _geometry(is_mla=True))
             self.assertEqual(host.staging_buffer.data_ptr(), prepared.data_ptr())
 
+            # Storage indexes name logical DCP pages; bytes stay rank-local.
+            values = torch.arange(host.kv_buffer.numel()) % 251
+            host.kv_buffer.copy_(values.reshape(host.kv_buffer.shape))
+            expected_page = host.kv_buffer[2:3].clone()
+            logical_page_size = PAGE_SIZE * 2
+            data_page = host.get_data_page(2 * logical_page_size)
+            torch.testing.assert_close(data_page, expected_page.flatten())
+            host.kv_buffer[4:5].zero_()
+            host.set_from_flat_data_page(4 * logical_page_size, data_page)
+            torch.testing.assert_close(host.kv_buffer[4:5], expected_page)
+
     def test_mha_head_groups_match_staging_and_host_layout(self):
         for key_scheme, head_partition, head_group_num in (
             ("rank-suffix", None, 1),

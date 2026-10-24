@@ -275,6 +275,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
     def get_moe_runner_backend(self, layer):
         return self.gpu_method.get_moe_runner_backend(layer)
 
+    def get_moe_routing_method_type(self, layer, requested_method):
+        return self.gpu_method.get_moe_routing_method_type(layer, requested_method)
+
     def submit(
         self,
         layer: torch.nn.Module,
@@ -344,6 +347,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             Combined computation results from CPU and GPU experts
         """
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        if TopKOutputChecker.format_is_bypassed(dispatch_output.topk_output):
+            dispatch_output = dispatch_output._replace(
+                topk_output=dispatch_output.topk_output.to_standard()
+            )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

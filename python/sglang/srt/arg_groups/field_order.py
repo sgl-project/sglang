@@ -550,5 +550,6 @@ POSITIONAL_FIELD_ORDER = (
     "hicache_storage_key_scheme",
     "hicache_storage_head_partition",
     "hicache_storage_layer_partition",
+    "prefill_decode_interval_min_bs",
 )
 # fmt: on
