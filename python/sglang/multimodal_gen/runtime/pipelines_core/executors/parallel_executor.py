@@ -42,6 +42,8 @@ class ParallelExecutor(PipelineExecutor):
         run_stage: Callable[[PipelineStage, Any], Any],
     ) -> Any:
         """Execute stages while respecting their declared parallelism type."""
+        run_stage = self.stage_runner(stages, server_args, run_stage)
+
         if server_args.enable_cfg_parallel:
             rank = get_classifier_free_guidance_rank()
         else:

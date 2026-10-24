@@ -23,7 +23,9 @@ Run directly:
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import os
 import subprocess
 import time
@@ -101,6 +103,9 @@ class DisaggCluster:
         extra_role_args: dict[str, list[str]] | None = None,
         startup_timeout: float = _STARTUP_TIMEOUT_S,
         warmup_kwargs: dict | None = None,
+        stage_groups: dict[str, list[str | int]] | None = None,
+        stage_outputs: tuple[str, ...] | None = None,
+        stage_contracts: list[dict] | None = None,
     ) -> None:
         self.model = model
         self.name = name
@@ -108,6 +113,9 @@ class DisaggCluster:
         self.extra_role_args = extra_role_args or {}
         self.startup_timeout = startup_timeout
         self.warmup_kwargs = warmup_kwargs or {}
+        self.stage_groups = stage_groups
+        self.stage_outputs = stage_outputs
+        self.stage_contracts = stage_contracts
         self._procs: list[subprocess.Popen] = []
         self._fhs: list = []
         self._logs: dict[str, Path] = {}
@@ -117,6 +125,22 @@ class DisaggCluster:
         self.base_port = find_free_port(HOST)
         self.api_port = find_free_port(HOST)
         self._role_ports = {role: find_free_port(HOST) for role in self.gpu_layout}
+        if self.stage_groups:
+            self.deployment_path = _LOG_DIR / f"disagg_{self.name}.json"
+            deployment = {
+                "roles": {
+                    role: {
+                        "stages": self.stage_groups[role],
+                        "endpoints": [f"tcp://{HOST}:{port}"],
+                    }
+                    for role, port in self._role_ports.items()
+                }
+            }
+            if self.stage_outputs is not None:
+                deployment["outputs"] = self.stage_outputs
+            if self.stage_contracts is not None:
+                deployment["stages"] = self.stage_contracts
+            self.deployment_path.write_text(json.dumps(deployment))
 
     # -- context manager -----------------------------------------------------
 
@@ -164,17 +188,29 @@ class DisaggCluster:
             log = _LOG_DIR / f"disagg_{self.name}_{role}.log"
             self._logs[role] = log
 
+            mode_args = [
+                "--disagg-role",
+                role,
+                "--disagg-server-addr",
+                f"tcp://{HOST}:{self.base_port}",
+            ]
+            if self.stage_groups:
+                mode_args = [
+                    "--stage-deployment",
+                    str(self.deployment_path),
+                    "--stage-role",
+                    role,
+                    "--stage-endpoint",
+                    f"tcp://{HOST}:{port}",
+                ]
             cmd = [
                 "sglang",
                 "serve",
                 "--model-path",
                 self.model,
-                "--disagg-role",
-                role,
-                "--disagg-server-addr",
-                f"tcp://{HOST}:{self.base_port}",
+                *mode_args,
                 "--scheduler-port",
-                str(port),
+                str(find_free_port(HOST) if self.stage_groups else port),
                 "--num-gpus",
                 str(len(gpus)),
                 "--base-gpu-id",
@@ -187,7 +223,11 @@ class DisaggCluster:
             ]
             proc = self._start_proc(cmd, log)
 
-            ready_msg = f"Role {role.upper()} ready"
+            ready_msg = (
+                f"Stage role {role} ready"
+                if self.stage_groups
+                else f"Role {role.upper()} ready"
+            )
             if not _wait_for_log(log, ready_msg, self.startup_timeout, proc):
                 raise RuntimeError(
                     f"{role} failed to start for {self.name}. Log tail:\n"
@@ -198,13 +238,17 @@ class DisaggCluster:
         log = _LOG_DIR / f"disagg_{self.name}_server.log"
         self._logs["server"] = log
         # Match the literal hostname advertised by the workers.
+        mode_args = (
+            ["--stage-deployment", str(self.deployment_path)]
+            if self.stage_groups
+            else ["--disagg-role", "server"]
+        )
         cmd = [
             "sglang",
             "serve",
             "--model-path",
             self.model,
-            "--disagg-role",
-            "server",
+            *mode_args,
             "--scheduler-port",
             str(self.base_port),
             "--port",
@@ -217,8 +261,9 @@ class DisaggCluster:
             "info",
             *self.extra_role_args.get("server", []),
         ]
-        for role, port in self._role_ports.items():
-            cmd.extend([f"--{role.replace('_', '-')}-urls", f"tcp://{HOST}:{port}"])
+        if not self.stage_groups:
+            for role, port in self._role_ports.items():
+                cmd.extend([f"--{role.replace('_', '-')}-urls", f"tcp://{HOST}:{port}"])
         self._start_proc(cmd, log)
         try:
             wait_for_server_health(
@@ -305,6 +350,8 @@ class _DisaggTestBase(CustomTestCase):
     gpu_layout: dict[str, list[int]] = {}
     extra_role_args: dict[str, list[str]] = {}
     warmup_kwargs: dict = {}
+    stage_groups: dict[str, list[str | int]] | None = None
+    stage_outputs: tuple[str, ...] | None = None
 
     cluster: DisaggCluster | None = None
 
@@ -318,6 +365,8 @@ class _DisaggTestBase(CustomTestCase):
             gpu_layout=cls.gpu_layout,
             extra_role_args=cls.extra_role_args,
             warmup_kwargs=cls.warmup_kwargs,
+            stage_groups=cls.stage_groups,
+            stage_outputs=cls.stage_outputs,
         )
         cls.cluster.__enter__()
 
@@ -475,6 +524,79 @@ class TestDisaggFlux3Image(_DisaggTestBase):
                 np.asarray(Image.open(BytesIO(actual))),
                 np.asarray(Image.open(BytesIO(expected))),
             )
+
+
+class TestStageDeploymentFlux3(TestDisaggFlux3Image):
+    """Arbitrary role names, parallel encoding, tensor return, and full generation."""
+
+    cluster_name = "flux3_stages"
+    stage_groups = {
+        "text": ["flux3_text_encode"],
+        "reference": ["flux3_condition_encode"],
+        "sample": ["flux3_denoise"],
+        "render": ["flux3_decode", "flux3_postprocess"],
+    }
+    gpu_layout = {"text": [0], "reference": [0], "sample": [1], "render": [0]}
+    stage_outputs = ("result.output", "extra.flux3_text", "extra.flux3_condition")
+    extra_role_args = {
+        role: ["--warmup-mode", "off"] for role in (*gpu_layout, "server")
+    }
+
+    def test_encoder_tensor_return(self):
+        from io import BytesIO
+
+        from PIL import Image
+        from torch.utils._pytree import tree_leaves
+
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.client import (
+            EncodingClient,
+        )
+
+        reference = BytesIO()
+        Image.new("RGB", (64, 64), "teal").save(reference, format="PNG")
+        uri = "data:image/png;base64," + base64.b64encode(reference.getvalue()).decode()
+        fields = ["extra.flux3_text", "extra.flux3_condition"]
+        request = {
+            "prompt": "A mountain landscape",
+            "image_path": [uri],
+            "quality": "exact",
+        }
+
+        async def check():
+            async with EncodingClient(
+                f"tcp://{HOST}:{self.cluster.base_port}", device="cuda:0"
+            ) as client:
+                first, second = await asyncio.gather(
+                    client.encode(request, fields),
+                    client.encode(
+                        {**request, "prompt": "A watercolor landscape"}, fields
+                    ),
+                )
+                tensors = [
+                    value
+                    for value in tree_leaves(first)
+                    if isinstance(value, torch.Tensor)
+                ]
+                self.assertTrue(tensors)
+                self.assertTrue(
+                    all(value.device == torch.device("cuda:0") for value in tensors)
+                )
+                with self.assertRaises(RuntimeError):
+                    await client.encode(
+                        {
+                            **request,
+                            "image_path": ["/nonexistent/encoding-reference.png"],
+                        },
+                        fields,
+                    )
+                third = await client.encode(request, fields)
+                torch.testing.assert_close(first, third, rtol=0, atol=0)
+                fourth = await client.encode(
+                    {**request, "prompt": "A watercolor landscape"}, fields
+                )
+                torch.testing.assert_close(second, fourth, rtol=0, atol=0)
+
+        asyncio.run(check())
 
 
 # ---------------------------------------------------------------------------

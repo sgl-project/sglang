@@ -64,6 +64,30 @@ class DisaggServerArgsMixin:
 
     @classmethod
     def add_disagg_cli_args(cls, parser: FlexibleArgumentParser) -> None:
+        parser.add_argument(
+            "--stage-node",
+            type=str,
+            default=None,
+            help="Launch every stage worker assigned to this node in --stage-deployment.",
+        )
+        parser.add_argument(
+            "--stage-deployment",
+            type=str,
+            default=None,
+            help="JSON stage contracts and role placement; omit --stage-role to launch the coordinator.",
+        )
+        parser.add_argument(
+            "--stage-role",
+            type=str,
+            default=None,
+            help="Named stage group to execute from --stage-deployment.",
+        )
+        parser.add_argument(
+            "--stage-endpoint",
+            type=str,
+            default=None,
+            help="This stage worker's private TCP endpoint, as listed in the deployment.",
+        )
         role_default = (
             cls.disagg_role.value
             if isinstance(cls.disagg_role, RoleType)

@@ -3,6 +3,21 @@ import base64
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
+
+
+def inline_local_image_paths(image_paths):
+    """inline head-owned files while preserving remote URLs and existing data URIs"""
+    paths = image_paths if isinstance(image_paths, (list, tuple)) else [image_paths]
+    return [
+        "data:application/octet-stream;base64,"
+        + base64.b64encode(Path(path).read_bytes()).decode("ascii")
+        if isinstance(path, str)
+        and urlsplit(path).scheme not in ("http", "https", "data")
+        and Path(path).is_file()
+        else path
+        for path in paths
+    ]
 
 
 def ensure_path_within_root(target_path: str, root_dir: str) -> str:

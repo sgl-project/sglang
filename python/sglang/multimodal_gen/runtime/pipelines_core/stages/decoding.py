@@ -114,17 +114,26 @@ class DecodingStage(PipelineStage):
     output format (e.g., pixel values).
     """
 
+    separate_postprocess: bool = False
+
     @property
     def role_affinity(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
         return RoleType.DECODER
 
-    def __init__(self, vae, pipeline=None, component_name: str = "vae") -> None:
+    def __init__(
+        self,
+        vae,
+        pipeline=None,
+        component_name: str = "vae",
+        separate_postprocess: bool = False,
+    ) -> None:
         super().__init__()
         self.vae: ParallelTiledVAE = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
         self.component_name = component_name
+        self.separate_postprocess = separate_postprocess
         self._compiled_vae_decode = ActiveTargetCompiledCallable()
 
     def component_uses(
@@ -389,7 +398,7 @@ class DecodingStage(PipelineStage):
         self,
         batch: Req,
         server_args: ServerArgs,
-    ) -> OutputBatch:
+    ) -> Req | OutputBatch:
         """
         Decode latent representations into pixel space.
 
@@ -466,6 +475,12 @@ class DecodingStage(PipelineStage):
                     trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
                 else:
                     trajectory_decoded = None
+
+        if self.separate_postprocess:
+            batch.output = frames if output_file_paths is None else None
+            batch.extra["decoded_output_paths"] = output_file_paths
+            batch.extra["trajectory_decoded"] = trajectory_decoded
+            return batch
 
         if output_file_paths is None:
             frames = server_args.pipeline_config.post_decoding(frames, server_args)

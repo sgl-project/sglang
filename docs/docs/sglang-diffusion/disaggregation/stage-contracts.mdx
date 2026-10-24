@@ -1,0 +1,212 @@
+---
+title: "Stage deployment reference"
+description: "Stage contracts, placement fields, execution modes, transport configuration, and operational limits."
+---
+
+Start with the [deployment examples](/docs/sglang-diffusion/disaggregation).
+This page describes the experimental `--stage-deployment` path; the existing
+`--disagg-role` interface is documented under
+[preset role deployments](/docs/sglang-diffusion/disaggregation/preset-roles).
+
+## Deployment fields
+
+| Field | Meaning |
+| --- | --- |
+| `stages` | Ordered stage contracts. Omit to use the pipeline's `stage_specs` |
+| `roles.<name>.stages` | Registered stage names or zero-based integer indices |
+| `roles.<name>.endpoints` | Unique `tcp://HOST:PORT` endpoints, one per replica |
+| `roles.<name>.node` | Node-launch label; defaults to `local` |
+| `roles.<name>.server_args` | Worker settings used by `--stage-node`, with Python argument names |
+| `outputs` | Terminal fields; defaults to `result.output` in automatic mode |
+
+`--stage-node` starts every local replica assigned to that label. For replica
+index `i`, the base GPU is `base_gpu_id + i * num_gpus`. Each replica has
+its own model components, transfer pool, and internal scheduler/master ports.
+
+For an individually managed role, use its registered endpoint:
+
+```bash
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --stage-deployment deployment.json --stage-role denoiser \
+  --stage-endpoint tcp://127.0.0.1:19010 \
+  --num-gpus 1 --base-gpu-id 1 --scheduler-port 19110 --master-port 19210
+```
+
+This worker uses its own CLI settings, not `roles.denoiser.server_args`.
+Do not also run a node launcher for the same endpoint. Stage deployment does not
+combine with preset `--disagg-role`, `--dp-size > 1`, or
+`--batching-max-size > 1`; use endpoint replicas for concurrency.
+
+## Declaring stage boundaries
+
+Expose `stage_specs` on the pipeline class, or supply the equivalent contracts
+in the deployment's top-level `stages` array.
+
+- Stage names must be nonempty, unique, and match `add_stage` /
+  `add_stage_factory` exactly, including case. An unnamed `add_stage` uses
+  its Python class name. Prefer stable semantic names for new contracts.
+- Indices select from the full ordered contract list before role filtering.
+  Names and indices may be mixed, but a stage may only be assigned once.
+  Negative/out-of-range indices and booleans are rejected. `"0"` is a name.
+- Grouping does not reorder stages. Inserting or reordering contracts changes
+  indices; use names when configurations must survive pipeline updates.
+- Component names must match the pipeline's module keys. Custom loaders must
+  honor the selected component set, and factories must avoid constructing
+  unselected stages.
+
+Model transforms belong in stages. File saving and HTTP formatting remain at
+the output boundary. Standard decoding exposes a separate postprocessing stage;
+specialized decoders need an accurate contract before splitting their internals.
+See [supporting new models](/docs/sglang-diffusion/support_new_models) for pipeline
+integration.
+
+### Automatic sequential mode
+
+When no stage declares `inputs` or `outputs`, every boundary transfers the
+request context. All stages must be placed, each role must contain consecutive
+stages, and the original sequential order is preserved.
+
+The codec extracts nested tensors, including scheduler tensors, for tensor
+transport. It also preserves generator state and model-specific request fields.
+Root tracing, metrics, and model modules remain process-local. Request module
+maps and nested model modules are rejected.
+
+This removes field-by-field payload definitions, not every integration
+requirement. Custom runtime objects must be serializable; hidden mutable state
+in a stage instance is not migrated. General overlapping-view/storage aliasing
+is not guaranteed. Full-context mode does not infer parallel branches or their
+merge semantics.
+
+### Explicit-field graph mode
+
+Use explicit contracts when independent branches need to run concurrently or
+when you want to minimize transfer volume.
+
+| Field | Meaning |
+| --- | --- |
+| `inputs` | Fields read by this stage |
+| `outputs` | Fields written by this stage |
+| `components` | Model/config modules required by this stage |
+| `after` | Control dependencies; defaults to the preceding stage. `after=()` removes that default |
+| `colocate_with` | Stages that must remain in the same role |
+
+Data dependencies still apply when `after=()`. Reads bind to the latest
+preceding writer. The stage list must be topologically ordered, and grouping
+must leave an acyclic role graph. A role cannot supply an earlier version of
+a field that it overwrites later; split that role instead.
+
+Field paths refer to request fields, `extra.<key>`, or `result.<field>`.
+Declared payloads contain tensors and JSON-safe metadata; keep generators,
+schedulers, modules, and CUDA events local in this mode. Unsupported required
+fields fail instead of silently disappearing.
+
+A stage returning `OutputBatch` exposes it to later stages. When replacing
+the output, declare both the request field `output` and terminal
+`result.output` as appropriate. Automatic mode defaults to `result.output`;
+explicit mode defaults to the produced `result.*` fields unless `outputs`
+is set.
+
+## Parallel-branch placement example
+
+After implementing the matching `stage_specs` and factories shown in the
+[parallel encoder example](/docs/sglang-diffusion/disaggregation#parallel-encoders),
+a five-GPU placement could be:
+
+```json
+{
+  "roles": {
+    "text": {
+      "stages": ["text_encode"],
+      "endpoints": ["tcp://127.0.0.1:19000"],
+      "node": "node1",
+      "server_args": {"num_gpus": 1, "base_gpu_id": 0}
+    },
+    "image": {
+      "stages": ["image_encode"],
+      "endpoints": ["tcp://127.0.0.1:19010"],
+      "node": "node1",
+      "server_args": {"num_gpus": 1, "base_gpu_id": 1}
+    },
+    "vae": {
+      "stages": ["vae_encode"],
+      "endpoints": ["tcp://127.0.0.1:19020"],
+      "node": "node1",
+      "server_args": {"num_gpus": 1, "base_gpu_id": 2}
+    },
+    "generate": {
+      "stages": ["denoise"],
+      "endpoints": ["tcp://127.0.0.1:19030"],
+      "node": "node1",
+      "server_args": {"num_gpus": 1, "base_gpu_id": 3}
+    },
+    "output": {
+      "stages": ["decode"],
+      "endpoints": ["tcp://127.0.0.1:19040"],
+      "node": "node1",
+      "server_args": {"num_gpus": 1, "base_gpu_id": 4}
+    }
+  }
+}
+```
+
+Role names have no scheduling semantics: the contracts define the dependencies.
+`text`, `image`, and `vae` are independent; `generate` joins their
+outputs; `output` waits for generation. These are illustrative names, not
+built-in stage aliases or a Wan configuration.
+
+## Transport and ports
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `--stage-endpoint` | Required with `--stage-role` | Private control endpoint listed in the placement |
+| `--disagg-p2p-hostname` | `127.0.0.1` | Advertised Mooncake address; use a routable private address across machines |
+| `--disagg-ib-device` | Auto | Optional RDMA device selection |
+| `--disagg-transfer-pool-size` | 268435456 bytes | GPU tensor transfer pool per worker |
+| `--disagg-timeout` | 3600 seconds | Deployment request/lease timeout |
+| `--disagg-max-slots-per-instance` | 8 | Admission and retained-result bounds |
+| `--disagg-dispatch-policy` | `round_robin` | Replica selection; also supports `max_free_slots` |
+
+The coordinator's `--scheduler-port` serves internal requests behind HTTP.
+Worker stage endpoints are explicit. The preset-role result-port offsets
+(`scheduler_port + 1` through `+5`) are not the stage-deployment protocol.
+
+Workers advertise transfer sessions over control RPC, then move tensor data
+directly through Mooncake. The HTTP coordinator receives the terminal result;
+it does not relay intermediate GPU tensors. Node launch selects distinct
+internal scheduler/master ports; external orchestration must reserve them
+explicitly when launching workers individually.
+
+Kernel implementations stay in stages/models. Custom communication engines
+integrate through the existing transfer-engine factory; both endpoints must
+obey its registration, buffer ownership, and completion contract.
+
+## Memory, failures, and numerics
+
+- Size transfer pools for simultaneous incoming and outgoing tensors. Retained
+  results own copies of tensor storage so reusable model buffers cannot corrupt
+  earlier requests. Budget those copies in addition to weights and activations.
+- Fan-out results remain leased until consumers finish or the lease expires.
+  An unacknowledged transfer quarantines its receive slot rather than allowing
+  a late sender to overwrite a new request. Resolve the transport error and
+  restart an exhausted worker.
+- Admission and pending work are bounded. Errors propagate to callers;
+  cancellation cleans up pending graph work and late results but does not
+  preempt a running GPU kernel or denoising loop.
+- This is not a durable queue. Failed inference is not automatically replayed,
+  and hosts/resources are not provisioned by the launcher.
+- Each worker serializes computation. Use replicas for concurrent requests;
+  this path does not enable per-worker dynamic batching.
+- TP/SP apply within each worker group. Boundary tensors are complete tensors,
+  not arbitrary shards; incompatible layouts need explicit gather/reshard
+  stages or colocation.
+- Stateful loops and encode-while-decode streaming must stay inside a compatible
+  role. They cannot be split into independently retried operations.
+- The reported peak is the maximum per-worker reserved memory, not the sum of
+  multiple processes sharing one GPU.
+
+For zero-tolerance comparison, match attention backend, precision, numerical
+flags, and the parallel layout of every stage, including VAE decoding. Automatic
+VAE memory format can depend on the worker's local GPU count. Set
+`SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D` consistently to `true` or `false`
+for the baseline and all workers; identical latents alone do not guarantee
+identical decoded pixels.

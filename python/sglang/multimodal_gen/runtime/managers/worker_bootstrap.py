@@ -154,6 +154,26 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
     )
 
 
+def bootstrap_stage_role(server_args: ServerArgsPayload) -> None:
+    from sglang.multimodal_gen.runtime.platforms import initialize_current_platform
+    from sglang.multimodal_gen.runtime.utils.process import kill_itself_when_parent_died
+
+    kill_itself_when_parent_died()
+    initialize_current_platform()
+
+    from sglang.multimodal_gen.runtime.platforms.plugins import (
+        apply_plugin_hooks,
+        load_plugins,
+    )
+
+    load_plugins()
+    apply_plugin_hooks()
+
+    from sglang.multimodal_gen.runtime import launch_server
+
+    launch_server.launch_stage_deployment(server_args.materialize())
+
+
 def bootstrap_http_server_process(server_args: ServerArgsPayload) -> None:
     from sglang.multimodal_gen.runtime.utils.process import (
         defer_full_gc_for_imports,

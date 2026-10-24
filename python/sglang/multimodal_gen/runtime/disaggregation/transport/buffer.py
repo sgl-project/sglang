@@ -18,6 +18,16 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
 logger = logging.getLogger(__name__)
 
 
+def tensor_payload_size(tensors: dict) -> int:
+    return sum(
+        (tensor.numel() * tensor.element_size() + 511) & ~511
+        for value in tensors.values()
+        if value is not None
+        for tensor in (value if isinstance(value, list) else [value])
+        if tensor is not None
+    )
+
+
 @dataclass
 class SlotHandle:
     request_id: str
@@ -117,7 +127,7 @@ class TransferTensorBuffer:
         dst = self._pool[
             handle.offset + byte_offset : handle.offset + byte_offset + nbytes
         ]
-        src_bytes = src_tensor.view(torch.uint8).reshape(-1)
+        src_bytes = src_tensor.reshape(-1).view(torch.uint8)
 
         if stream is not None:
             with torch.get_device_module().stream(stream):

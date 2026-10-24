@@ -361,6 +361,16 @@ Use a custom single-purpose stage only when the reference pipeline has one step
 that cannot be represented cleanly by a hook or native-stage subclass. Keep the
 custom stage narrow and reuse native stages before and after it.
 
+For [declarative disaggregation](/docs/sglang-diffusion/disaggregation/stage-contracts#declaring-stage-boundaries),
+expose `stage_specs` with stable stage names and the components each stage needs.
+Sequential groups can transfer request context without listing individual
+fields; parallel branches require complete input/output field contracts.
+Register stage factories so unselected stages are not constructed, and make
+custom loaders honor the selected component set.
+Use colocation constraints for non-transferable state rather than adding a new
+hardcoded role. The standard decoding helper separates VAE decoding from
+`PostprocessStage`; keep file writing and HTTP formatting outside model transforms.
+
 ```python
 class MyModelPipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "MyModelPipeline"

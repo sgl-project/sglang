@@ -121,16 +121,24 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 
 ### Disaggregated serving
 
-- `--disagg-role {monolithic|encoder|prompt_encoder|image_encoder|denoiser|decoder|server}`: select the stages run by this process. `monolithic` is the default; the split `prompt_encoder` and `image_encoder` roles currently support FLUX.3 Image.
+- `--stage-deployment {JSON_PATH}`: stage contracts and named role placement. Without a worker selector, launches the coordinator and existing generation API.
+- `--stage-node {NAME}`: launch all worker processes assigned to this node, using their declared server arguments.
+- `--stage-role {NAME}` and `--stage-endpoint {TCP_ENDPOINT}`: launch one named worker using its own CLI arguments instead of the node launcher.
+
+Declarative stage deployment currently targets Linux/NVIDIA with Mooncake and requires compatible stage/component contracts and loaders. It does not automatically support every native pipeline. Do not combine it with the preset `--disagg-role` mode.
+
+- `--disagg-role {monolithic|encoder|prompt_encoder|image_encoder|denoiser|decoder|server}`: select the stages run by this process. `monolithic` is the default; split encoder roles require pipeline support.
 - `--disagg-server-addr {TCP_ENDPOINT}`: head scheduler endpoint used by workers for registration and result routing.
 - `--encoder-urls {ENDPOINTS}`: combined encoder pool on the head. For split encoding, replace it with both `--prompt-encoder-urls` and `--image-encoder-urls`; do not mix the two topologies.
 - `--denoiser-urls {ENDPOINTS}` and `--decoder-urls {ENDPOINTS}`: downstream worker pools on the head. Each pool URL flag accepts a quoted, semicolon-separated list of TCP endpoints.
 - `--disagg-p2p-hostname {HOST}` and `--disagg-ib-device {DEVICE}`: worker address and optional RDMA device for tensor transfers. The advertised worker address and scheduler port must match its entry in the head's URL list.
 - `--disagg-transfer-pool-size {BYTES}`: transfer buffer per worker (default: 268435456 bytes). Include space for incoming tensors, outgoing tensors, and preallocated receive slots.
 
-See [Disaggregated diffusion](/docs/sglang-diffusion/disaggregation#flux3-split-encoding)
-for deployment commands, ports, and the validation scope. Generation and editing
-still use the existing image APIs; encoding is not exposed as a standalone API.
+See [Disaggregated serving](/docs/sglang-diffusion/disaggregation)
+for single/multi-machine examples, TP/SP, and replicas, and the
+[stage deployment reference](/docs/sglang-diffusion/disaggregation/stage-contracts)
+for contracts and operational limits. Full-generation
+deployments retain the existing generation and editing APIs.
 
 ### Sampling and output
 

@@ -1742,7 +1742,14 @@
               "docs/sglang-diffusion/index",
               "docs/sglang-diffusion/installation",
               "docs/sglang-diffusion/compatibility_matrix",
-              "docs/sglang-diffusion/disaggregation",
+              {
+                "group": "Disaggregated serving",
+                "pages": [
+                  "docs/sglang-diffusion/disaggregation",
+                  "docs/sglang-diffusion/disaggregation/stage-contracts",
+                  "docs/sglang-diffusion/disaggregation/preset-roles"
+                ]
+              },
               {
                 "group": "Usage",
                 "pages": [
