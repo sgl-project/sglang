@@ -2253,8 +2253,13 @@ class DeepseekV4HipRadixBackend(
             device=device,
             whole_extend=late_layer_whole_extend(forward_batch, dspark=self.is_dspark),
         )
+        # Padding rows (MLP sync, DP attention) can follow the request's tokens;
+        # the contiguous slice would then keep them.
         contiguous_start = (
-            extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None
+            extend_lens_cpu[0] - tail_lens_cpu[0]
+            if len(extend_lens_cpu) == 1
+            and forward_batch.out_cache_loc.shape[0] == extend_lens_cpu[0]
+            else None
         )
         out_cache_loc = _tail_rows(
             forward_batch.out_cache_loc,
