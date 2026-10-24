@@ -12,7 +12,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 )
 
 
-class MlaCPIndexerOverlap:
+class DSAInterleaveCPIndexerOverlap:
     """Per-forward MLA orchestration for attention KV/indexer overlap.
 
     No-RoPE models can launch the indexer at its original boundary. RoPE

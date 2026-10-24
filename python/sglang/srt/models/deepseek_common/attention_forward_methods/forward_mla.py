@@ -14,8 +14,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
+from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
 from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
-from sglang.srt.layers.cp.indexer_overlap import MlaCPIndexerOverlap
+from sglang.srt.layers.cp.indexer_overlap import DSAInterleaveCPIndexerOverlap
+from sglang.srt.layers.cp.interleave import is_interleave_extend
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -309,11 +311,15 @@ class DeepseekMLAForwardMixin:
             else None
         )
 
-        cp_overlap = MlaCPIndexerOverlap(self, forward_batch)
+        cp_overlap = (
+            DSAInterleaveCPIndexerOverlap(self, forward_batch)
+            if self.use_dsa and is_interleave_extend(forward_batch)
+            else None
+        )
         fuse_bmm_attention = (
             self.q_lora_rank is not None
             and self._can_fuse_bmm_into_attention(forward_batch)
-            and cp_overlap.can_fuse_bmm
+            and (cp_overlap is None or cp_overlap.can_fuse_bmm)
         )
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
@@ -450,15 +456,24 @@ class DeepseekMLAForwardMixin:
 
                 if q_lora is not None:
                     if self.should_run_indexer(prev_topk_indices):
-                        topk_indices = cp_overlap.run_indexer(
-                            x=hidden_states,
-                            q_lora=q_lora,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            layer_id=self.layer_id,
-                            k_nope=k_nope,
-                            latent_cache=latent_cache,
-                        )
+                        if cp_overlap is not None:
+                            topk_indices = cp_overlap.run_indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                                k_nope=k_nope,
+                                latent_cache=latent_cache,
+                            )
+                        else:
+                            topk_indices = self.indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                            )
                     else:
                         topk_indices = maybe_capture_indexer_topk(
                             self.layer_id, prev_topk_indices
@@ -639,14 +654,23 @@ class DeepseekMLAForwardMixin:
                 num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
             )
 
-        q_nope_out, q_pe, k_nope, k_pe, topk_indices = cp_overlap.prepare_qkv(
-            q_nope_out,
-            q_pe,
-            k_nope,
-            k_pe,
-            topk_indices,
-            defer_materialization=fuse_rope_for_trtllm_mla,
-        )
+        if cp_overlap is not None:
+            q_nope_out, q_pe, k_nope, k_pe, topk_indices = cp_overlap.prepare_qkv(
+                q_nope_out,
+                q_pe,
+                k_nope,
+                k_pe,
+                topk_indices,
+                defer_materialization=fuse_rope_for_trtllm_mla,
+            )
+        else:
+            k_nope, k_pe = prepare_kv_for_attention(
+                self,
+                forward_batch,
+                k_nope,
+                k_pe,
+                defer_materialization=fuse_rope_for_trtllm_mla,
+            )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
         if self.dcp_size > 1:
