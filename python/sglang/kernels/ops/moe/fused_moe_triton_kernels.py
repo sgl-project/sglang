@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.activation._triton_silu import _silu_fast_math
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -647,36 +648,10 @@ def fused_moe_kernel(
         # tile; silu(gate) * up is applied in-register and only the
         # half-width activation is stored, eliminating intermediate_cache1
         # and the standalone activation launch.
-        #
-        # The asm below is the bit-parity contract with the `silu_and_mul` this
-        # replaces, not an optimization: that kernel uses the fast-math
-        # intrinsics `__fdividef(x, 1 + __expf(-x))`, while Triton's operators
-        # lower to accurate expf and IEEE `div.rn`. The 1-2 ULP gap is enough to
-        # flip the stored bf16 (8 mantissa bits) on many inputs. The final
-        # multiply needs no asm -- plain fp32 multiply matches `mul.ftz.f32`
-        # except on denormals. Silu stays fp32 until the store, as in the
-        # reference; rounding it to bf16 first double-rounds and diverges.
         acc_pairs = tl.reshape(accumulator, (BLOCK_SIZE_M, BLOCK_SIZE_N // 2, 2))
         gate_b, up_b = tl.split(acc_pairs)
         gate_f = gate_b.to(tl.float32)
-        # __expf(-x) == ex2.approx(x * -log2(e)); folding the negation into
-        # the constant (0fBFB8AA3B == -log2(e)) flips the sign exactly.
-        exp_neg = tl.inline_asm_elementwise(
-            "{ mul.ftz.f32 $0, $1, 0fBFB8AA3B; ex2.approx.ftz.f32 $0, $0; }",
-            "=f,f",
-            [gate_f],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-        silu_f = tl.inline_asm_elementwise(
-            "div.approx.ftz.f32 $0, $1, $2;",
-            "=f,f,f",
-            [gate_f, 1.0 + exp_neg],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
+        silu_f = _silu_fast_math(gate_f)
         out_act = (silu_f * up_b.to(tl.float32)).to(compute_type)
         offs_half = pid_n * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2)
         if c_sorted:

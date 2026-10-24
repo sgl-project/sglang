@@ -533,3 +533,11 @@ register_kernel(
         capabilities=_SM10X,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gemm_bf16x3_cublas",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",
+        capabilities=CUDA_ONLY,
+    )
+)
