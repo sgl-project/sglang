@@ -9,6 +9,10 @@ from typing import Any, Callable, Protocol
 
 import msgspec
 
+# Balanced fixed-capacity decode rows, before Graph padding.
+DIRECT_STAGE_ROWS = (16, 20, 24, 32, 36, 40, 48)
+DIRECT_BALANCED_LANE_ROWS = tuple(((rows, rows),) * 8 for rows in DIRECT_STAGE_ROWS)
+
 
 class AFDError(RuntimeError):
     """Fail-closed AFD error with a stable machine-readable code."""
@@ -41,6 +45,7 @@ class AFDRole(str, Enum):
 class MetadataContract(str, Enum):
     STANDARD_FA = "standard-fa-padded-stage-refresh-v1"
     PRIVATE_DSA = "private-dsa-padded-stage-breakable-v1"
+    PRIVATE_DSV4 = "private-dsv4-compressed-kv-padded-stage-v1"
 
 
 class AFDEndpoint(msgspec.Struct, frozen=True, kw_only=True):
@@ -87,7 +92,7 @@ def attention_lane_group(
 class AFDPairedTopology(msgspec.Struct, frozen=True, kw_only=True):
     """Contiguous A ingress groups over F shards; all F ranks execute the FFN.
 
-    Integral A/F layouts retain their original per-F wire groups. Other layouts
+    Integral A/F layouts use per-F wire groups. Other layouts
     use one F-first A/F wire world, including F ranks with no ingress. Empty
     ingress never removes a rank from the separate F compute collectives.
     """
@@ -106,7 +111,7 @@ class AFDPairedTopology(msgspec.Struct, frozen=True, kw_only=True):
 
     @property
     def lanes_per_ffn(self) -> int:
-        """Maximum ingress group width; uniform for legacy integral layouts."""
+        """Maximum ingress group width; uniform for integral A/F layouts."""
 
         return (self.attention_size + self.lanes - 1) // self.lanes
 
@@ -425,6 +430,7 @@ class AFDModelAdapter(Protocol):
     num_layers: int
     hidden_size: int
     metadata_contract: MetadataContract
+    requires_token_ids: bool
 
     def validate_model(self) -> None: ...
 
@@ -506,6 +512,7 @@ class AFDStepDescriptor(msgspec.Struct, frozen=True, kw_only=True):
     graph_eligible: bool
     # Global batch mode, independent of graph eligibility (IDLE is decode).
     is_extend_in_batch: bool = False
+    uses_direct: bool = False
     close_usage: dict[str, Any] | None = None
     # Wire field retained; this base runtime only admits one decode token/request.
     tokens_per_request: int = 1
@@ -523,8 +530,20 @@ class AFDStepDescriptor(msgspec.Struct, frozen=True, kw_only=True):
         if (
             type(self.is_extend_in_batch) is not bool
             or type(self.graph_eligible) is not bool
+            or type(self.uses_direct) is not bool
         ):
             raise AFDError("AFD_STEP_DESCRIPTOR_MODE_INVALID")
+        if self.uses_direct and (
+            self.is_extend_in_batch
+            or self.kind not in ("STEP", "CAPTURE")
+            or not self.lane_stage_rows
+            or any(
+                len(rows) != 2 or any(type(n) is not int or n < 0 for n in rows)
+                for rows in self.lane_stage_rows
+            )
+            or not any(any(rows) for rows in self.lane_stage_rows)
+        ):
+            raise AFDError("AFD_DIRECT_STEP_UNSUPPORTED")
         if self.is_extend_in_batch and self.graph_eligible:
             raise AFDError(
                 "AFD_STEP_DESCRIPTOR_MODE_MISMATCH", "extend cannot be graphed"
@@ -635,6 +654,7 @@ class AFDTransport(Protocol):
         hidden_size: int,
         dtype: Any,
         retain: bool,
+        include_input_ids: bool = False,
     ) -> tuple[Any, ...]: ...
 
     def release_buffers(self, *, key: str) -> None: ...

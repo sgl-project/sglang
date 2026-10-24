@@ -44,6 +44,7 @@ def test_ffn_inherits_native_communication_environment(
         nnodes=nnodes,
         node_rank=0,
         enable_symm_mem=False,
+        enable_kv_cache_sharding=False,
         enable_nccl_nvls=False,
         dcp_size=1,
         enable_metrics=False,
@@ -97,7 +98,7 @@ def test_runtime_context_is_the_only_role_owner(monkeypatch, role):
 @pytest.mark.parametrize(
     "role,draft", [("attention", False), ("off", False), ("attention", True)]
 )
-def test_attention_runner_uses_captured_tp_rank(monkeypatch, role, draft):
+def test_attention_runner_uses_native_runtime_tp_rank(monkeypatch, role, draft):
     from sglang.srt.afd import integration
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -109,9 +110,11 @@ def test_attention_runner_uses_captured_tp_rank(monkeypatch, role, draft):
     pipeline = object()
     enabled = role == "attention" and not draft
     if enabled:
-        # ModelRunner captures placement during native distributed initialization.
-        # No legacy ``ps`` attribute or published global context is needed here.
-        runner.tp_rank = 3
+        # Native placement is owned by RuntimeContext, not ModelRunner.
+        monkeypatch.setattr(
+            "sglang.srt.model_executor.model_runner.get_parallel",
+            lambda: SimpleNamespace(tp_rank=3),
+        )
         runner.model = SimpleNamespace(
             model=SimpleNamespace(set_afd_pipeline=attached.append)
         )
@@ -135,27 +138,34 @@ def test_attention_runner_uses_captured_tp_rank(monkeypatch, role, draft):
 
 
 @pytest.mark.parametrize(
-    "role,draft,tp,ep,error",
+    "role,draft,tp,ep,intermediate_size,error",
     [
-        ("attention", False, 3, 1, None),
-        ("attention", False, 20, 1, None),
-        ("attention", False, 4, 1, None),
-        ("attention", False, 8, 1, None),
-        ("off", False, 3, 1, "moe_intermediate_size"),
-        ("off", False, 20, 1, "moe_intermediate_size"),
-        ("ffn", False, 3, 1, "moe_intermediate_size"),
-        ("ffn", False, 20, 1, "moe_intermediate_size"),
-        ("attention", True, 3, 1, "moe_intermediate_size"),
-        ("attention", True, 20, 1, "moe_intermediate_size"),
-        ("off", False, 4, 1, None),
-        ("ffn", False, 4, 4, None),
-        ("ffn", False, 32, 32, None),
-        ("off", False, 3, 2, "must be divisible by ep_size"),
-        ("ffn", False, 32, 1, "For quantized MoE models"),
+        ("attention", False, 3, 1, 2048, None),
+        ("attention", False, 20, 1, 2048, None),
+        ("attention", False, 4, 1, 2048, None),
+        ("attention", False, 8, 1, 2048, None),
+        ("off", False, 3, 1, 2048, "moe_intermediate_size"),
+        ("off", False, 20, 1, 2048, "moe_intermediate_size"),
+        ("ffn", False, 3, 1, 2048, "moe_intermediate_size"),
+        ("ffn", False, 20, 1, 2048, "moe_intermediate_size"),
+        ("attention", True, 3, 1, 2048, "moe_intermediate_size"),
+        ("attention", True, 20, 1, 2048, "moe_intermediate_size"),
+        ("off", False, 4, 1, 2048, None),
+        ("ffn", False, 4, 4, 2048, None),
+        ("ffn", False, 32, 32, 2048, None),
+        ("off", False, 3, 2, 2048, "must be divisible by ep_size"),
+        ("ffn", False, 32, 1, 2048, "For quantized MoE models"),
+        # Official Qwen3-235B FP8: only roles without local experts skip the gate.
+        ("attention", False, 8, 1, 1536, None),
+        ("attention", False, 24, 1, 1536, None),
+        ("ffn", False, 8, 8, 1536, None),
+        ("off", False, 8, 8, 1536, None),
+        ("off", False, 8, 1, 1536, "For quantized MoE models"),
+        ("attention", True, 8, 1, 1536, "For quantized MoE models"),
     ],
 )
 def test_runner_quantized_moe_check_applies_to_local_expert_owners(
-    monkeypatch, role, draft, tp, ep, error
+    monkeypatch, role, draft, tp, ep, intermediate_size, error
 ):
     from sglang.srt.model_executor import model_runner
     from sglang.srt.model_executor.model_runner_components import moe_ep_setup
@@ -165,14 +175,14 @@ def test_runner_quantized_moe_check_applies_to_local_expert_owners(
     monkeypatch.setattr(
         model_runner,
         "get_parallel",
-        lambda: SimpleNamespace(moe_ep_size=ep, moe_dp_size=1),
+        lambda: SimpleNamespace(tp_size=tp, moe_ep_size=ep, moe_dp_size=1),
     )
     runner = object.__new__(model_runner.ModelRunner)
     runner.is_draft_worker = draft
     runner.server_args = SimpleNamespace(afd_execution_mode=role)
     runner.tp_size = tp
     hf = SimpleNamespace(
-        moe_intermediate_size=2048,
+        moe_intermediate_size=intermediate_size,
         quantization_config={"weight_block_size": [128, 128]},
     )
     runner.model_config = SimpleNamespace(hf_config=hf, hf_text_config=hf)
@@ -200,7 +210,6 @@ def test_runner_quantized_moe_check_applies_to_local_expert_owners(
         ("max_buckets", 8),
         ("graph_mode", "child"),
         ("router_on_attention", True),
-        ("ffn_backend", "none"),
         ("ffn_merge_reduce_scatter", True),
         ("ffn_expert_parallel", True),
         ("mtp_draft_extend_graph", True),
@@ -217,6 +226,8 @@ def test_real_msgspec_types_and_frozen_configuration():
     value = config.AFDConfig.from_json('{"stages": 2, "nccl_num_channels": 16}')
     assert value.stages == 2
     assert value.nccl_num_channels == 16
+    with pytest.raises(AFDError, match="AFD_FFN_BACKEND_INVALID"):
+        config.AFDConfig.from_json('{"ffn_backend": "none"}')
     with pytest.raises(AttributeError):
         value.stages = 2
 

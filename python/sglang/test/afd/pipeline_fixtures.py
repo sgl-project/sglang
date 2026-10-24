@@ -76,6 +76,7 @@ class RetainedGraph(EagerGraph):
 class TraceTransport:
     def __init__(self, descriptor, lane=0, capturing=False, group=1):
         self.descriptor = descriptor
+        self.direct = None
         self.lane = lane
         self.timeline = []
         self.recv_widths = []
@@ -126,6 +127,7 @@ class TraceTransport:
 
 
 class FFNAdapter:
+    requires_token_ids = False
     role = contracts.AFDRole.FFN
     hidden_size = 8
 
@@ -236,8 +238,13 @@ class DecodeBatch:
     forward_mode = DecodeMode()
     is_extend_in_batch = False
 
+    @staticmethod
+    def moe_num_token_non_padded():
+        return None
+
 
 class AttentionAdapter:
+    requires_token_ids = False
     role = contracts.AFDRole.ATTENTION
     num_layers = 2
     hidden_size = 8

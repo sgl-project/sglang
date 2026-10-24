@@ -170,20 +170,11 @@ def _load_model(*, server_args: Any, device: Any, lane: int) -> tuple[Any, Any]:
 
 
 def _close_within_deadline(pipeline: Any, *, seconds: int) -> None:
-    """Close the pipeline, or let the kernel end this process trying.
+    """Bound pipeline shutdown even when graph destruction holds the GIL.
 
-    The graph teardown finishes in a CUDAGraph destructor, a C++ call reached
-    through Py_DECREF that never releases the GIL, so neither a joinable worker nor
-    a Timer can preempt it -- the idiom transport.close() uses for ncclCommAbort
-    works only because ctypes does release the GIL. A signal left at its default
-    disposition is delivered by the kernel and needs no interpreter, so it is the
-    one deadline that still holds here. Measured cost of having none: four GB300
-    GPUs pinned at 100% util for 12 h 22 m after a single broken wave, recoverable
-    only by killing the container from outside.
-
-    Dying on the alarm is the good outcome: the exit status is non-zero, so
-    _run_lanes reports AFD_FFN_LANE_EXITED instead of waiting forever, and the
-    driver reclaims the context.
+    A Python thread cannot interrupt a CUDAGraph destructor holding the GIL.
+    A default-action alarm terminates the process without interpreter progress,
+    allowing the parent to report AFD_FFN_LANE_EXITED and reclaim resources.
     """
 
     import signal
@@ -258,7 +249,7 @@ def run_lane(server_args: Any, lane: int) -> None:
 
 
 def _stop_workers(workers: list[Any], *, seconds: float) -> None:
-    """Reap only our started children, with a shared deadline per signal phase."""
+    """Reap this server's children with a shared deadline per signal phase."""
     import time
 
     started = [worker for worker in workers if worker.pid is not None]

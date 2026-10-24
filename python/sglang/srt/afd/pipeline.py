@@ -3,14 +3,7 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
-from functools import partial
 from typing import Any
-
-from sglang.srt.batch_overlap.operations import (
-    YieldOperation,
-    execute_overlapped_operations,
-)
 
 from .config import AFDConfig
 from .connector import AFDConnector
@@ -21,6 +14,9 @@ from .contracts import (
     AFDShapeFactory,
     AFDStepDescriptor,
 )
+from .expert_exchange import direct_step_reason, select_direct_step
+from .layer_executor import execute_layer_operations
+from .model_adapters.base import stage_forward_context
 
 logger = logging.getLogger(__name__)
 
@@ -56,25 +52,6 @@ def _stage_participation(
     )
 
 
-def _execute_layer_operations(num_layers: int, operation: Any) -> None:
-    execute_overlapped_operations(
-        inputs_arr=[{}, {}],
-        operations_arr=[
-            [
-                op
-                for layer in range(num_layers)
-                for op in (
-                    partial(operation, layer=layer, index=index),
-                    YieldOperation(),
-                )
-            ]
-            for index in range(2)
-        ],
-        delta_stages=[0, 0],
-        stage_contexts=[nullcontext, nullcontext],
-    )
-
-
 class AFDAttentionPipeline:
     """Attention role: local attention, A2E, E2A, then layer postprocess."""
 
@@ -96,11 +73,11 @@ class AFDAttentionPipeline:
         self._startup_capture = False
         # Not True or False, so the first step's verdict is always logged.
         self._last_eligible: bool | None = None
+        self._last_backend_selection = None
 
     def capture_startup(self, runner: Any) -> None:
         """Reuse native dummy decode inputs; only coordinate the role captures."""
         import torch
-
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         graph = self._connector.graph_strategy
@@ -121,7 +98,9 @@ class AFDAttentionPipeline:
                 torch.cuda.synchronize()
             graph.finish_capture()
             self._connector.transport.capture_ready()
-            runner.model_runner.tp_group.barrier()
+            from sglang.srt.runtime_context import get_parallel
+
+            get_parallel().tp_group.barrier()
             logger.info("AFD_STARTUP_CAPTURE_READY stage_sizes=%s", sizes)
         finally:
             self._startup_capture = False
@@ -174,6 +153,26 @@ class AFDAttentionPipeline:
             and not is_extend_in_batch
             and all(all(stage_rows) for stage_rows in lane_rows)
         )
+        backend = self._connector.transport.direct
+        reason = direct_step_reason(
+            self._config, lane_rows, is_extend_in_batch, backend=backend
+        )
+        uses_direct = reason == "direct"
+        if reason == "backend_not_qualified":
+            reason = getattr(
+                self._connector.transport, "direct_selection_reason", reason
+            )
+        if backend is not None and not uses_direct:
+            eligible = False
+        if reason != self._last_backend_selection:
+            self._last_backend_selection = reason
+            logger.info(
+                "AFD_FFN_SELECTION step_id=%d backend=%s reason=%s lane_rows=%r",
+                self._step_id,
+                "nccl_direct" if uses_direct else "fixed",
+                reason,
+                lane_rows,
+            )
         # The usage snapshot only carries a cumulative eligible_steps, which cannot
         # say whether the lanes disagreed on one particular step -- exactly what a
         # deadlock post-mortem needs. Log transitions only, so this is a handful of
@@ -205,7 +204,10 @@ class AFDAttentionPipeline:
             num_layers=self._adapter.num_layers,
             graph_eligible=eligible,
             is_extend_in_batch=is_extend_in_batch,
+            uses_direct=uses_direct,
         )
+        if uses_direct:
+            backend.prepare_step(shape=shape)
         self._connector.transport.begin_step(descriptor)
         backing_hbm_bytes = (
             sum(shape.bucket_rows)
@@ -263,6 +265,7 @@ class AFDAttentionPipeline:
                 recv_buffers=recv_buffers,
                 bucket_rows=shape.bucket_rows,
                 participates=participates,
+                uses_backend=uses_direct,
             )
         finally:
             end_reason = self._connector.graph_strategy.end_step()
@@ -282,8 +285,15 @@ class AFDAttentionPipeline:
         stages: list[Any],
         recv_buffers: list[Any],
         participates: tuple[bool, ...],
+        uses_backend: bool = False,
     ) -> None:
         recv_events: list[Any] = [None] * len(stages)
+        shared_outputs: list[Any] = [None] * len(stages)
+        first_backend_layer = (
+            self._connector.transport.direct.first_layer
+            if uses_backend
+            else self._adapter.num_layers
+        )
 
         def run_layer(*, state, layer, index):
             stage, recv_buffer = stages[index], recv_buffers[index]
@@ -299,27 +309,75 @@ class AFDAttentionPipeline:
                             self._adapter.finish_layer(
                                 layer=layer - 1,
                                 stage=stage,
-                                ffn_output=recv_buffer,
+                                ffn_output=(
+                                    recv_buffer
+                                    if shared_outputs[index] is None
+                                    else recv_buffer + shared_outputs[index]
+                                ),
                                 residual=stage.residual,
                             )
                         )
                 if stage.rows:
-                    self._adapter.prepare_stage(stage=stage)
-                    stage.hidden_states, stage.residual = self._adapter.local_compute(
-                        layer=layer,
-                        stage=stage,
-                        positions=stage.positions,
-                        hidden_states=stage.hidden_states,
-                        residual=stage.residual,
-                    )
+                    with stage_forward_context(stage.forward_batch):
+                        self._adapter.prepare_stage(stage=stage)
+                        stage.hidden_states, stage.residual = (
+                            self._adapter.local_compute(
+                                layer=layer,
+                                stage=stage,
+                                positions=stage.positions,
+                                hidden_states=stage.hidden_states,
+                                residual=stage.residual,
+                            )
+                        )
                 # Dispatch before the next stage's local compute, so the FFN
                 # role works on this stage while this role runs the next one.
+                if layer >= first_backend_layer:
+                    if stage.rows:
+                        with stage_forward_context(stage.forward_batch):
+                            topk = self._adapter.inner.layers[layer].mlp.route(
+                                stage.hidden_states
+                            )
+                        ids, weights = topk.topk_ids, topk.topk_weights
+                    else:
+                        import torch
+
+                        k = self._connector.transport.direct.top_k
+                        ids = torch.empty(
+                            (0, k), dtype=torch.int64, device=stage.hidden_states.device
+                        )
+                        weights = torch.empty(
+                            (0, k),
+                            dtype=torch.float32,
+                            device=stage.hidden_states.device,
+                        )
+                    recv_events[index] = self._connector.transport.direct.dispatch(
+                        hidden=stage.hidden_states,
+                        ids=ids,
+                        weights=weights,
+                        stage=index,
+                        output=recv_buffer,
+                    )
+                    # Shared expert stays local to each A lane. Both branches
+                    # only read hidden; join once after the routed return event.
+                    shared = getattr(
+                        self._adapter.inner.layers[layer].mlp, "shared_experts", None
+                    )
+                    with stage_forward_context(stage.forward_batch):
+                        shared_outputs[index] = (
+                            shared(stage.hidden_states) if shared is not None else None
+                        )
+                    return
+                shared_outputs[index] = None
+                if layer == 0 and self._adapter.requires_token_ids:
+                    self._connector.transport.dispatch(
+                        stage.forward_batch.input_ids.reshape(-1, 1)
+                    )
                 self._connector.transport.dispatch(stage.hidden_states)
                 recv_events[index] = self._connector.transport.receive_return(
                     recv_buffer
                 )
 
-        _execute_layer_operations(self._adapter.num_layers, run_layer)
+        execute_layer_operations(self._adapter.num_layers, run_layer)
         for index, (stage, ffn_output) in enumerate(zip(stages, recv_buffers)):
             if participates[stage.index]:
                 self._connector.transport.wait(recv_events[index])
@@ -327,7 +385,11 @@ class AFDAttentionPipeline:
                     stage.hidden_states, stage.residual = self._adapter.finish_layer(
                         layer=self._adapter.num_layers - 1,
                         stage=stage,
-                        ffn_output=ffn_output,
+                        ffn_output=(
+                            ffn_output
+                            if shared_outputs[index] is None
+                            else ffn_output + shared_outputs[index]
+                        ),
                         residual=stage.residual,
                     )
 
@@ -338,6 +400,7 @@ class AFDAttentionPipeline:
         recv_buffers: list[Any],
         bucket_rows: tuple[int, ...],
         participates: tuple[bool, ...],
+        uses_backend: bool = False,
     ) -> None:
         """Hand the whole layer loop to a strategy that captures it as one graph.
 
@@ -377,6 +440,7 @@ class AFDAttentionPipeline:
                 stages=stages,
                 recv_buffers=recv_buffers,
                 participates=participates,
+                uses_backend=uses_backend,
             )
             # Last thing in the region: the send side never rejoins on its own,
             # and an unjoined stream leaves its work outside the graph's order.
@@ -449,10 +513,15 @@ class AFDFFNPipeline:
             config=self._config,
             tokens_per_request=descriptor.tokens_per_request,
         )
+        if descriptor.uses_direct:
+            self._connector.transport.direct.prepare_step(shape=shape)
         # One block per (stage, lane) this rank serves, stage-major, which at k == 1
         # is the per-stage vector the symmetric path always allocated.
         capacities = shape.group_bucket_rows(ffn_ordinal=lane)
         group = len(shape.group_lanes(ffn_ordinal=lane))
+        input_ids_options = (
+            {"include_input_ids": True} if self._adapter.requires_token_ids else {}
+        )
         self._connector.graph_strategy.begin_step(
             capture=descriptor.kind == "CAPTURE",
             step_id=descriptor.step_id,
@@ -462,6 +531,7 @@ class AFDFFNPipeline:
                 sum(capacities)
                 * descriptor.hidden_size
                 * (2 if descriptor.dtype in ("bfloat16", "float16") else 0)
+                + (sum(capacities) * 8 if input_ids_options else 0)
             ),
         )
         retain = self._connector.graph_strategy.retains_backing
@@ -471,6 +541,7 @@ class AFDFFNPipeline:
             hidden_size=descriptor.hidden_size,
             dtype=self._dtype,
             retain=retain,
+            **input_ids_options,
         )
         if retain and not self._connector.graph_strategy.ensure_backing_hbm(
             retained_hbm_bytes=self._connector.transport.buffer_hbm_bytes(
@@ -485,6 +556,7 @@ class AFDFFNPipeline:
                 hidden_size=descriptor.hidden_size,
                 dtype=self._dtype,
                 retain=False,
+                **input_ids_options,
             )
         stages, recv_buffers = self._make_stages(
             descriptor=descriptor,
@@ -505,6 +577,7 @@ class AFDFFNPipeline:
                 stages=stages,
                 recv_buffers=recv_buffers,
                 participates=participates,
+                uses_backend=descriptor.uses_direct,
             )
         finally:
             end_reason = self._connector.graph_strategy.end_step()
@@ -522,20 +595,34 @@ class AFDFFNPipeline:
         stages: list[Any],
         recv_buffers: list[Any],
         participates: tuple[bool, ...],
+        num_layers: int | None = None,
     ) -> tuple[tuple[Any, ...], ...]:
+        num_layers = self._adapter.num_layers if num_layers is None else num_layers
         last: list[tuple[Any, ...]] = [() for _ in stages]
         active = tuple(index for index, present in enumerate(participates) if present)
-        if not active:
+        if not active or not num_layers:
             return tuple(last)
         # Only capture supplies the compute-to-receive edge protecting reused
         # stage buffers. Eager/warmup receives remain strictly one at a time.
         prefetch = len(active) == 2 and bool(self._connector.transport.capturing)
 
-        def receive(index: int) -> Any:
+        def receive(index: int, layer: int) -> Any:
+            if layer == 0 and self._adapter.requires_token_ids:
+                stage = stages[index]
+                # Warmup and capture call this same Python closure. Re-record
+                # the ID gather each invocation; otherwise capture would reuse
+                # warmup's tensor without recording its producer.
+                stage.merged_input_ids = None
+                self._connector.transport.receive_dispatch(
+                    tuple(
+                        ids[: hidden.shape[0]]
+                        for ids, hidden in zip(stage.input_ids, recv_buffers[index])
+                    )
+                )
             return self._connector.transport.receive_dispatch(recv_buffers[index])
 
         events: list[Any] = [None] * len(stages)
-        events[active[0]] = receive(active[0])
+        events[active[0]] = receive(active[0], 0)
 
         def run_boundary(*, state, layer, index):
             if not participates[index]:
@@ -543,11 +630,11 @@ class AFDFFNPipeline:
             stage = stages[index]
             next_index = 1 - index if len(active) == 2 else index
             next_layer = layer + (next_index <= index)
-            has_next = next_layer < self._adapter.num_layers
+            has_next = next_layer < num_layers
             # One-boundary lookahead includes the layer transition while keeping
             # each communicator's receive/return order identical to its peer.
             if prefetch and has_next:
-                events[next_index] = receive(next_index)
+                events[next_index] = receive(next_index, next_layer)
             self._connector.transport.wait(events[index])
             output, _ = self._adapter.local_compute(
                 layer=layer,
@@ -558,9 +645,9 @@ class AFDFFNPipeline:
             self._connector.transport.return_result(output)
             last[index] = output or (stage.graph_output,)
             if not prefetch and has_next:
-                events[next_index] = receive(next_index)
+                events[next_index] = receive(next_index, next_layer)
 
-        _execute_layer_operations(self._adapter.num_layers, run_boundary)
+        execute_layer_operations(num_layers, run_boundary)
         return tuple(last)
 
     def _run_step_as_unit(
@@ -569,6 +656,7 @@ class AFDFFNPipeline:
         stages: list[Any],
         recv_buffers: list[Any],
         participates: tuple[bool, ...],
+        uses_backend: bool = False,
     ) -> None:
         """Hand the whole layer loop to a strategy that captures it as one graph.
 
@@ -585,11 +673,23 @@ class AFDFFNPipeline:
             # leave over the wire, but a captured region still has to expose one
             # tensor it wrote, or nothing can distinguish it from a graph that
             # captured no work at all.
-            outputs = self._run_layers(
-                stages=stages,
-                recv_buffers=recv_buffers,
-                participates=participates,
-            )
+            if uses_backend:
+                first_layer = self._connector.transport.direct.first_layer
+                if first_layer:
+                    self._run_layers(
+                        stages=stages,
+                        recv_buffers=recv_buffers,
+                        participates=participates,
+                        num_layers=first_layer,
+                    )
+                    self._connector.transport.rejoin_streams()
+                outputs = self._connector.transport.direct.run_ffn_step()
+            else:
+                outputs = self._run_layers(
+                    stages=stages,
+                    recv_buffers=recv_buffers,
+                    participates=participates,
+                )
             # Last thing in the region: the send side never rejoins on its own,
             # and an unjoined stream leaves its work outside the graph's order.
             self._connector.transport.rejoin_streams()
@@ -605,6 +705,19 @@ class AFDFFNPipeline:
 
     def _validate_descriptor(self, *, descriptor: AFDStepDescriptor) -> None:
         descriptor.validate_mode()
+        if descriptor.uses_direct != select_direct_step(
+            self._config,
+            descriptor.lane_stage_rows,
+            descriptor.is_extend_in_batch,
+            backend=self._connector.transport.direct,
+        ):
+            raise AFDError("AFD_DIRECT_MODE_MISMATCH")
+        if (
+            self._connector.transport.direct is not None
+            and not descriptor.uses_direct
+            and descriptor.graph_eligible
+        ):
+            raise AFDError("AFD_DIRECT_FALLBACK_MUST_BE_EAGER")
         expected = (
             descriptor.kind in ("STEP", "CAPTURE")
             and len(descriptor.lane_stage_rows) == self._config.attention_lane_count

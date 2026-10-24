@@ -11,6 +11,7 @@ def _server_args(**overrides):
         "afd_config": config.AFDConfig(),
         "tp_size": 1,
         "dp_size": 1,
+        "attn_dp_size": 1,
         "ep_size": 1,
         "pp_size": 1,
         "nnodes": 1,

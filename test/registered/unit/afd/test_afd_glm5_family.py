@@ -109,7 +109,7 @@ def test_glm_attention_uses_native_tp_scope_and_layout(routing):
     events = []
     indices = torch.tensor([2])
     hidden, residual = torch.ones(1, 4), torch.zeros(1, 4)
-    batch = object()
+    batch = SimpleNamespace(residual_stream=SimpleNamespace(residual=residual))
 
     class Attention:
         @contextmanager
@@ -126,21 +126,23 @@ def test_glm_attention_uses_native_tp_scope_and_layout(routing):
             hidden_states,
             forward_batch,
             zero_allocator,
-            input_on_attention_tp_slices,
+            input_on_attn_tp_slices,
             prev_topk_indices,
         ):
             assert events == ["enter"]
-            assert not input_on_attention_tp_slices
+            assert not input_on_attn_tp_slices
             assert prev_topk_indices is indices
             return hidden_states, indices
 
     layer = SimpleNamespace(
         self_attn=Attention(),
-        layer_communicator=SimpleNamespace(
-            input_on_attention_tp_slices=False,
-            prepare_attn_and_capture_last_layer_outputs=lambda h, r, b, **kw: (h, r),
-            prepare_mlp=lambda h, r, b: (h, r),
+        attn_boundary=SimpleNamespace(
+            input_on_attn_tp_slices=False,
+            prepare=lambda h, b, **kw: h,
+            finish=lambda h, b: h,
         ),
+        ffn_boundary=SimpleNamespace(prepare=lambda h, b: h),
+        _resolve_gfx95_quant_format=lambda: "",
     )
     routing["afd_execution_mode"] = lambda: "attention"
     routing["get_attn_tp_context"] = lambda: SimpleNamespace(
@@ -196,7 +198,7 @@ def _carry_adapter(layers):
 
 
 def _stage(index):
-    return SimpleNamespace(index=index, positions=None, forward_batch=None)
+    return SimpleNamespace(index=index, positions=None, forward_batch=SimpleNamespace())
 
 
 def _install_state(adapter, index):

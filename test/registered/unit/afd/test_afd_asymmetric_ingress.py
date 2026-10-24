@@ -196,7 +196,9 @@ def test_empty_wire_edges_do_not_skip_global_s2_compute():
 
     pipeline = object.__new__(AFDFFNPipeline)
     pipeline._connector = SimpleNamespace(transport=transport)
-    pipeline._adapter = SimpleNamespace(num_layers=2, local_compute=compute)
+    pipeline._adapter = SimpleNamespace(
+        num_layers=2, local_compute=compute, requires_token_ids=False
+    )
     result = pipeline._run_layers(
         stages=stages, recv_buffers=[(), ()], participates=(True, True)
     )

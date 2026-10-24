@@ -301,6 +301,13 @@ def _native_backend(boundary, monkeypatch):
         "set_graph_pool_id",
         lambda pool: boundary.events.append(("global_pool", pool)),
     )
+    monkeypatch.setattr(
+        full,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            tp_group=SimpleNamespace(barrier=lambda: boundary.events.append("barrier"))
+        ),
+    )
     runner = SimpleNamespace(
         device_module=torch.cuda,
         model_runner=SimpleNamespace(

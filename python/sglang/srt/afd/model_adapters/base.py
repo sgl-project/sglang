@@ -2,8 +2,8 @@
 
 Everything here depends only on SGLang's ForwardBatch and on the model-side AFD
 contract (``forward_attention_for_afd`` / ``compute_ffn_output`` /
-``layer_communicator.postprocess_layer``). A model family contributes an
-identity check and a guard class; it does not reimplement orchestration.
+native stage boundaries). A model family contributes an
+identity check and metadata contract; it does not reimplement orchestration.
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import copy
 from typing import Any
 
 import msgspec
-
 from sglang.srt.model_executor.forward_batch_view import slice_batch_field
 from sglang.srt.runtime_context import get_parallel
 
@@ -22,6 +21,7 @@ from ..contracts import (
     MetadataContract,
     validate_non_speculative_batch,
 )
+from ..metadata import FlashAttentionMetadataGuard, metadata_guard_for_backend
 
 
 class AFDStage(msgspec.Struct, kw_only=True):
@@ -44,10 +44,40 @@ class AFDStage(msgspec.Struct, kw_only=True):
     # Empty-ingress F ranks still own a device/dtype template and compute experts.
     collective_input: Any = None
     graph_output: Any = None
+    input_ids: Any = None
+    collective_input_ids: Any = None
+    merged_input_ids: Any = None
 
     @property
     def rows(self) -> int:
         return self.token_stop - self.token_start
+
+
+def _non_prefix_moe_bound() -> None:
+    return None
+
+
+def stage_forward_context(forward_batch: Any) -> Any:
+    """Bind routing to the active A stage, or to F's non-prefix merge layout."""
+    from dataclasses import replace
+
+    from sglang.srt.model_executor.forward_context import (
+        ForwardContext,
+        forward_context,
+        get_forward_context,
+        has_forward_context,
+    )
+
+    ctx = (
+        get_forward_context()
+        if has_forward_context()
+        else ForwardContext(attn_backend=None)
+    )
+    if forward_batch is None:
+        # F concatenates padded peer/lane blocks. Real rows are not one prefix;
+        # a callable returning None also prevents inheriting an ambient bound.
+        ctx = replace(ctx, moe_num_token_non_padded=_non_prefix_moe_bound)
+    return forward_context(ctx, forward_batch=forward_batch)
 
 
 def _slice_positions(value: Any, token_slice: slice) -> Any:
@@ -104,11 +134,24 @@ def _slice_forward_batch(
     forward_batch: Any,
     request_slice: slice,
     token_slice: slice,
+    non_padded_tokens: int,
 ) -> Any:
     child = copy.copy(forward_batch)
     child.input_ids = slice_batch_field(forward_batch.input_ids, token_slice)
     child.positions = _slice_positions(forward_batch.positions, token_slice)
     child.out_cache_loc = slice_batch_field(forward_batch.out_cache_loc, token_slice)
+    child.out_cache_loc_virtual = slice_batch_field(
+        forward_batch.out_cache_loc_virtual, token_slice
+    )
+    child.origin_out_cache_loc = slice_batch_field(
+        forward_batch.origin_out_cache_loc, token_slice
+    )
+    if forward_batch.kv_loc_plan is not None:
+        child.kv_loc_cols = forward_batch.kv_loc_plan.cols_slice(
+            forward_batch.kv_loc_cols, token_slice
+        )
+    # Never inherit the parent or another microbatch's invocation state.
+    child.residual_stream = None
     child.input_embeds = slice_batch_field(forward_batch.input_embeds, token_slice)
     child.token_type_ids = slice_batch_field(forward_batch.token_type_ids, token_slice)
     child.req_pool_indices = slice_batch_field(
@@ -137,6 +180,19 @@ def _slice_forward_batch(
     child.lora_ids = slice_batch_field(forward_batch.lora_ids, request_slice)
     child.rids = slice_batch_field(forward_batch.rids, request_slice)
     child.batch_size = request_slice.stop - request_slice.start
+    child.global_num_token_non_padded_cpu = non_padded_tokens
+    if forward_batch.global_num_token_non_padded is not None:
+        child.global_num_token_non_padded = (
+            forward_batch.global_num_token_non_padded.new_tensor(non_padded_tokens)
+        )
+    if forward_batch.num_token_non_padded is not None:
+        # AFD's attention topology has attn_tp_size=1. Both bounds therefore
+        # describe this stage, never the parent batch or another S2 stage.
+        child.num_token_non_padded = (
+            child.global_num_token_non_padded
+            if child.global_num_token_non_padded is not None
+            else forward_batch.num_token_non_padded.new_tensor(non_padded_tokens)
+        )
     # Sum on the host copy. `.item()` on the device tensor blocks this host until
     # a freshly launched reduce comes back, and that reduce queues behind whatever
     # is already on the stream -- under CPU-overlap scheduling that is the previous
@@ -164,8 +220,9 @@ def _slice_forward_batch(
 class AFDDecoderAdapter:
     """Shared stage orchestration for one decoder-layer model family."""
 
-    guard_class: type
+    guard_class = FlashAttentionMetadataGuard
     family_error: str
+    requires_token_ids = False
 
     def __init__(
         self,
@@ -178,6 +235,10 @@ class AFDDecoderAdapter:
         self.model = model
         self.inner = model.model
         self.attention_backend = attention_backend
+        self.guard_class = metadata_guard_for_backend(
+            getattr(attention_backend, "decode_attention_backend_str", None),
+            default_guard=self.guard_class,
+        )
         self.num_layers = len(self.inner.layers)
         self.hidden_size = self.inner.config.hidden_size
 
@@ -238,7 +299,11 @@ class AFDDecoderAdapter:
     ) -> dict[str, str]:
         """Return the exact shared backend contract, checking the live role."""
 
-        guard_class = self.guard_class
+        # F has no attention backend object; resolve the same peer contract
+        # from configuration without changing the adapter's execution state.
+        guard_class = metadata_guard_for_backend(
+            configured_backend, default_guard=self.guard_class
+        )
         if configured_backend not in guard_class.backends:
             raise AFDError(
                 "AFD_ATTENTION_BACKEND_CONFIG_UNSUPPORTED",
@@ -254,7 +319,7 @@ class AFDDecoderAdapter:
         return {
             "backend": configured_backend,
             "backend_class": guard_class.backend_class,
-            "metadata_contract": self.metadata_contract.value,
+            "metadata_contract": guard_class.metadata_contract.value,
         }
 
     def initialize_graph_metadata(self, *, max_rows: int) -> int:
@@ -274,6 +339,11 @@ class AFDDecoderAdapter:
                 self.attention_backend.init_forward_metadata(stage.forward_batch)
                 stage.attention_metadata = self.attention_backend.forward_metadata
             self.attention_backend.forward_metadata = stage.attention_metadata
+            self.guard_class.prepare_stage_metadata(
+                backend=self.attention_backend,
+                metadata=stage.attention_metadata,
+                stage_index=stage.index,
+            )
 
     def make_ffn_stages(
         self,
@@ -386,11 +456,19 @@ class AFDDecoderAdapter:
         forward_batch: Any,
         stages: int,
     ) -> list[AFDStage]:
+        from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+
         token_lengths = _token_lengths(forward_batch)
         ranges = _stage_ranges(
             batch_size=forward_batch.batch_size,
             token_lengths=token_lengths,
             stages=stages,
+        )
+        non_padded_tokens = TboForwardBatchPreparer._split_num_token_non_padded(
+            tbo_split_token_index=ranges[0][3],
+            num_token_non_padded=TboForwardBatchPreparer._get_num_token_non_padded_cpu(
+                forward_batch
+            ),
         )
         result = []
         for index, (req_start, req_stop, token_start, token_stop) in enumerate(ranges):
@@ -399,6 +477,7 @@ class AFDDecoderAdapter:
                 forward_batch=forward_batch,
                 request_slice=slice(req_start, req_stop),
                 token_slice=token_slice,
+                non_padded_tokens=non_padded_tokens[index],
             )
             result.append(
                 AFDStage(
@@ -416,6 +495,22 @@ class AFDDecoderAdapter:
             )
         return result
 
+    @staticmethod
+    def _start_attention_layer(layer, stage, hidden_states, residual):
+        if layer != 0:
+            return
+        from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
+        from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+
+        # Capture may run the same Python closure several times. Reconstruct
+        # invocation state each time, over that run's address-stable inputs.
+        if residual is None:
+            stage.forward_batch.residual_stream = ResidualStream()
+        else:
+            _, stage.forward_batch.residual_stream = ResidualStream.from_handoff(
+                hidden_states, residual, PLAIN_ADD
+            )
+
     def local_compute(
         self,
         *,
@@ -427,6 +522,7 @@ class AFDDecoderAdapter:
     ) -> tuple[Any, ...]:
         decoder_layer = self.inner.layers[layer]
         if self.role == AFDRole.ATTENTION:
+            self._start_attention_layer(layer, stage, hidden_states, residual)
             return decoder_layer.forward_attention_for_afd(
                 positions=stage.positions if positions is None else positions,
                 hidden_states=hidden_states,
@@ -469,7 +565,6 @@ class AFDDecoderAdapter:
         """
 
         import torch
-
         from sglang.srt.runtime_context import get_forward
 
         widths = stage.group_widths
@@ -518,16 +613,21 @@ class AFDDecoderAdapter:
                     f"lane={stage.merge_lane} rank={tp_group.rank_in_group}",
                 )
         merged = merged_tensors[0]
-        if gather:
-            with get_forward().scoped(mlp_reduce_scatter=True):
-                partial = decoder_layer.compute_ffn_output(merged, stage.forward_batch)
-            output = tp_group.reduce_scatterv(partial, sizes=sizes)
-            if not lane_hidden_states:
-                # Expose real expert work to the replay sentinel, not an empty
-                # reduce-scatter result or a made-up constant.
-                stage.graph_output = partial
-        else:
-            output = decoder_layer.compute_ffn_output(merged, stage.forward_batch)
+        with stage_forward_context(None):
+            if gather:
+                with get_forward().scoped(mlp_reduce_scatter=True):
+                    partial = self._compute_ffn_output(
+                        decoder_layer, merged, stage, rows=rows, strides=strides
+                    )
+                output = tp_group.reduce_scatterv(partial, sizes=sizes)
+                if not lane_hidden_states:
+                    # Expose real expert work to the replay sentinel, not an empty
+                    # reduce-scatter result or a made-up constant.
+                    stage.graph_output = partial
+            else:
+                output = self._compute_ffn_output(
+                    decoder_layer, merged, stage, rows=rows, strides=strides
+                )
         if len(strides) == 1 and rows[0] == output.shape[0]:
             return (output,)
         result = []
@@ -536,6 +636,11 @@ class AFDDecoderAdapter:
             result.append(output.narrow(0, offset, row))
             offset += stride
         return tuple(result)
+
+    def _compute_ffn_output(
+        self, decoder_layer, hidden_states, stage, *, rows, strides
+    ):
+        return decoder_layer.compute_ffn_output(hidden_states, stage.forward_batch)
 
     def finish_layer(
         self,
@@ -547,11 +652,15 @@ class AFDDecoderAdapter:
     ) -> tuple[Any, Any]:
         if self.role != AFDRole.ATTENTION:
             return ffn_output, residual
-        return self.inner.layers[layer].layer_communicator.postprocess_layer(
-            ffn_output,
-            residual,
-            stage.forward_batch,
-        )
+        boundary = self.inner.layers[layer].ffn_boundary
+        output = boundary.complete_now(ffn_output, stage.forward_batch)
+        # Keep the tensor pair at the graph protocol boundary; the native stream
+        # owns the pending update until the following attention consumes it.
+        result = stage.forward_batch.residual_stream.export(output)
+        if layer == self.num_layers - 1:
+            # The terminal model consumer owns the exported tensor pair.
+            stage.forward_batch.residual_stream = None
+        return result
 
     def join_step(self, *, stages: list[AFDStage]) -> tuple[Any, Any]:
         import torch

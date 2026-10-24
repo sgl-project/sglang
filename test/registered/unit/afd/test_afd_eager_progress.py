@@ -450,7 +450,9 @@ def test_single_active_stage_keeps_hidden_until_compute(participates, capturing)
         timeline.append("compute")
         return payload, None
 
-    pipeline._adapter = SimpleNamespace(num_layers=3, local_compute=compute)
+    pipeline._adapter = SimpleNamespace(
+        num_layers=3, local_compute=compute, requires_token_ids=False
+    )
     pipeline._connector = SimpleNamespace(
         transport=SimpleNamespace(
             capturing=capturing,

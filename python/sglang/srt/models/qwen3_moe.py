@@ -23,11 +23,9 @@ from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
-from torch import nn
-from transformers import PretrainedConfig
-
 from sglang.srt.afd.config import AFDExecutionMode
 from sglang.srt.afd.model_hooks import (
+    afd_a_router_enabled,
     afd_execution_mode,
     afd_model_forward,
     afd_owns_expert_weights,
@@ -52,6 +50,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -87,6 +86,8 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from torch import nn
+from transformers import PretrainedConfig
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
@@ -239,6 +240,45 @@ def compute_yarn_parameters(
     return factor, low, high, attention_factor
 
 
+def _make_qwen_router(config, quant_config, layer_id, prefix):
+    """The same native gate/TopK construction for routed A and native F."""
+    from sglang.srt.layers.quantization.gguf import GGUFConfig
+
+    topk = TopK(
+        top_k=config.num_experts_per_tok,
+        renormalize=False
+        if isinstance(quant_config, GGUFConfig)
+        else getattr(config, "norm_topk_prob", True),
+        use_grouped_topk=False,
+        layer_id=layer_id,
+    )
+    gate = ReplicatedLinear(
+        config.hidden_size,
+        config.num_experts,
+        bias=False,
+        quant_config=quant_config
+        if quant_config is not None and quant_config.get_name() == "modelslim"
+        else None,
+        prefix=add_prefix("gate", prefix),
+    )
+    return gate, topk
+
+
+class Qwen3AFDRouter(nn.Module):
+    """Router-only A module for experimental direct exchange; no expert storage."""
+
+    def __init__(self, config, layer_id, prefix, quant_config=None):
+        super().__init__()
+        self.gate, self.topk = _make_qwen_router(config, quant_config, layer_id, prefix)
+        self.topk.bind_runner_backend(
+            get_moe_runner_backend(), routing_method_type=RoutingMethodType.Renormalize
+        )
+
+    def route(self, hidden_states):
+        logits, _ = self.gate(hidden_states)
+        return self.topk(hidden_states, logits)
+
+
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -257,18 +297,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        from sglang.srt.layers.quantization.gguf import GGUFConfig
-
-        norm_topk_prob = getattr(config, "norm_topk_prob", True)
-        if isinstance(quant_config, GGUFConfig):
-            norm_topk_prob = False
-
-        self.topk = TopK(
-            top_k=config.num_experts_per_tok,
-            renormalize=norm_topk_prob,
-            use_grouped_topk=False,
-            layer_id=layer_id,
-        )
+        self.gate, self.topk = _make_qwen_router(config, quant_config, layer_id, prefix)
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
@@ -283,24 +312,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.topk.bind_runner_backend(
             self.experts.runner_backend,
             routing_method_type=self.experts.routing_method_type,
-        )
-
-        # Router gate: description-driven quant. Only the offline ModelSlim path
-        # (which carries a per-layer quant_model_description) may quantise the
-        # gate — if the checkpoint stored it as MXFP8 it is loaded
-        # and dequantised correctly instead of cast to bf16 without its block scale.
-        # The online Fp8/mxfp8 path keeps the gate in bf16 (unchanged, verified).
-        gate_quant_config = (
-            quant_config
-            if (quant_config is not None and quant_config.get_name() == "modelslim")
-            else None
-        )
-        self.gate = ReplicatedLinear(
-            config.hidden_size,
-            config.num_experts,
-            bias=False,
-            quant_config=gate_quant_config,
-            prefix=add_prefix("gate", prefix),
         )
 
         if is_deepep_class_backend():
@@ -852,10 +863,20 @@ class Qwen3MoeDecoderLayer(nn.Module):
         self.layer_id = layer_id
 
         attn, ffn = self.stage_facts(config, layer_id)
-        self.is_layer_sparse = ffn.sparse
+        # Every Qwen3-MoE layer is sparse. The AFD attention role declares its
+        # remote FFN boundary as local/dense to avoid native expert collectives;
+        # that communication declaration must not suppress the local router.
+        self.is_layer_sparse = True
 
         if afd_execution_mode() == AFDExecutionMode.ATTENTION:
-            self.mlp = AFDProxyMLP()
+            self.mlp = (
+                Qwen3AFDRouter(
+                    config, self.layer_id, add_prefix("mlp", prefix), quant_config
+                )
+                if self.is_layer_sparse
+                and afd_a_router_enabled(model_family="qwen3_moe")
+                else AFDProxyMLP()
+            )
         elif self.is_layer_sparse:
             self.mlp = Qwen3MoeSparseMoeBlock(
                 layer_id=self.layer_id,
@@ -893,8 +914,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
         return (
             declare_attn(),
             declare_ffn(
-                sparse=is_layer_sparse,
+                # A receives a complete lane-local FFN result from F.
+                sparse=is_layer_sparse
+                and afd_execution_mode() != AFDExecutionMode.ATTENTION,
                 next_layer_sparse=is_next_layer_sparse,
+                dense_tp_size=(
+                    1 if afd_execution_mode() == AFDExecutionMode.ATTENTION else None
+                ),
             ),
         )
 
@@ -941,24 +967,15 @@ class Qwen3MoeDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if afd_execution_mode() != AFDExecutionMode.ATTENTION:
             raise RuntimeError("AFD_QWEN_ATTENTION_COMPUTE_ROLE_INVALID")
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=None,
-            )
-        )
+        hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        return self.layer_communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-        )
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        return hidden_states, residual_batch.written_residual(forward_batch)
 
     def compute_ffn_output(
         self,

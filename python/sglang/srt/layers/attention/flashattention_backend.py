@@ -1539,11 +1539,25 @@ class FlashAttentionBackend(AttentionBackend):
         Optional[torch.Tensor],
     ]:
         k_descale = v_descale = None
+        # Plain FA4 FP8 paged MHA requires Q/K/V to have the same dtype.
+        # Match the existing decode contract: Q descale is identity, while
+        # cached K/V retain their layer descales. MLA, MXFP8 and raw-KV
+        # embedding forwards keep their existing prefill behavior.
+        fa4_fp8_paged_prefill = (
+            is_prefill
+            and self.fa_impl_ver == 4
+            and not self.use_mla
+            and not self.fa_skip_kv_cache
+            and self.kv_cache_dtype
+            in (torch.float8_e4m3fn, torch.float8_e5m2)
+        )
         if (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
             and not self.kv_cache_is_mxfp8
-            and (not is_prefill or self.fa_impl_ver != 4)
+            and (
+                not is_prefill or self.fa_impl_ver != 4 or fa4_fp8_paged_prefill
+            )
         ):
             if layer.k_scale is not None:
                 descale_shape = (logical_batch_size, kv_head_num)

@@ -666,7 +666,7 @@ class AFDRoleGraphService:
         rows = sum(self._own_bucket_rows(shape=shape))
         if self.role == AFDRole.FFN and shape.attention_lanes % shape.ffn_size:
             # Every F computes merged rows, including ranks with no ingress.
-            # Budget the new layout conservatively; preserve legacy estimates.
+            # Include every lane's padded rows in the retained-memory estimate.
             rows = sum(sum(vector) for vector in shape.lane_bucket_rows)
         # Entry hidden, entry residual, and every layer's two intermediates live
         # in the graph pool for the whole step rather than being reused per op.

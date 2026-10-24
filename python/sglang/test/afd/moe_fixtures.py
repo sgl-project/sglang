@@ -91,6 +91,7 @@ def routing(monkeypatch):
         get_moe_runner_backend=lambda: SimpleNamespace(value="triton"),
         use_intel_amx_backend=lambda _: False,
         _use_mnnvl_cutedsl_fusion=lambda: False,
+        afd_a_router_enabled=lambda: False,
         _is_cuda=True,
         _is_musa=False,
         _is_xpu=False,
@@ -102,7 +103,6 @@ def routing(monkeypatch):
         tensor_model_parallel_all_reduce=lambda x: x,
         post_experts_all_reduce=lambda x: x,
         should_add_replicated_moe_output=lambda: True,
-        ExpertLocationDispatchInfo=SimpleNamespace(init_new=lambda **kwargs: None),
     )
     namespace["get_exec"] = lambda: SimpleNamespace(moe=namespace["get_server_args"]())
     namespace["get_forward"] = lambda: SimpleNamespace(flashinfer_trtllm_bypass=False)
@@ -159,7 +159,7 @@ class SelectedTopK(nn.Module):
             c.renormalize,
             c.num_expert_group,
             c.topk_group,
-            num_fused_shared_experts=c.num_fused_shared_experts,
+            num_fused_shared_experts=c.num_shared_topk_slots,
             routed_scaling_factor=c.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=c.apply_routed_scaling_factor_on_output,
         )
@@ -208,6 +208,7 @@ def _moe(namespace, *, prescaled=False, inplace=False, tp_size=1, shared_tp1=Fal
             self._fuse_shared_experts_inside_sbo = False
             self._shared_expert_tp1 = shared_tp1
             self.tp_size = tp_size
+            self.reduce_results = False
             self.num_fused_shared_experts = 0
             self.routed_scaling_factor = 2.5
 

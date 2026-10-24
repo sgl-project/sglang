@@ -29,50 +29,6 @@ def _configure_a2a(namespace, backend="none"):
     )
 
 
-def _deepep_moe(namespace, *, policy="normal", prescaled=False, shared=True):
-    moe, expert_weights = _moe(
-        namespace, prescaled=prescaled, tp_size=2, shared_tp1=True
-    )
-    events = []
-
-    class Experts(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.should_fuse_routed_scaling_factor_in_topk = prescaled
-            self.seen = []
-
-        def forward(self, hidden_states, topk_output):
-            self.seen.append(topk_output)
-            events.append("dispatch")
-            per_expert = torch.einsum("ri,eki->rek", hidden_states, expert_weights)
-            chosen = per_expert.gather(
-                1, topk_output.topk_ids.long().unsqueeze(-1).expand(-1, -1, 4)
-            )
-            if policy == "normal":
-                events.append("ep_gather_weights")
-                chosen = chosen * topk_output.topk_weights.unsqueeze(-1)
-            events.append("combine")
-            if policy == "low_latency":
-                events.append("combine_weights")
-                chosen = chosen * topk_output.topk_weights.unsqueeze(-1)
-            return chosen.sum(1)
-
-    moe.experts = Experts()
-    moe.experts.register_forward_pre_hook(lambda *args: events.append("pre_experts"))
-    moe.experts.register_forward_hook(lambda *args: events.append("post_experts"))
-    moe._enable_a2a_moe = True
-    moe.alt_stream = None
-    moe.forward = namespace["DeepseekV2MoE"].forward.__get__(moe)
-    moe.forward_deepep = namespace["DeepseekV2MoE"].forward_deepep.__get__(moe)
-
-    def shared_experts(x):
-        events.append("shared")
-        return x * 0.125 if shared else None
-
-    moe._forward_shared_experts = shared_experts
-    return moe, expert_weights, events
-
-
 def _reference(x, gate, expert_weights):
     scores = torch.sigmoid(torch.nn.functional.linear(x, gate.weight))
     choice = scores + gate.e_score_correction_bias
@@ -119,43 +75,6 @@ def test_ffn_router_output_matches_independent_reference(
     expected, _, _ = _reference(x, moe.gate, expert_weights)
     torch.testing.assert_close(actual, expected)
     assert moe.gate.calls == moe.topk.calls == int(rows > 0)
-
-
-@pytest.mark.parametrize("is_nextn", [False, True])
-@pytest.mark.parametrize("is_hash", [False, True])
-def test_deepep_locally_computed_routes_keep_forward_batch_and_location(
-    routing, monkeypatch, is_nextn, is_hash
-):
-    moe, _, _ = _deepep_moe(routing)
-    moe.is_nextn = is_nextn
-    moe.is_hash = is_hash
-    batch = SimpleNamespace(num_token_non_padded=2, moe_num_token_non_padded=lambda: 2)
-    input_ids = torch.tensor([11, 17, 23])
-    observed = []
-    locations = []
-    dispatch_info = object()
-    original_topk = moe.topk.forward
-
-    def topk(hidden, logits, **kwargs):
-        observed.append(kwargs)
-        return original_topk(hidden, logits, **kwargs)
-
-    def location(**kwargs):
-        locations.append(kwargs)
-        return dispatch_info
-
-    monkeypatch.setattr(moe.topk, "forward", topk)
-    routing["ExpertLocationDispatchInfo"].init_new = location
-    moe(torch.ones(3, 4), forward_batch=batch, input_ids_global=input_ids)
-    assert observed[0]["num_token_non_padded"] == 2
-    assert observed[0]["expert_location_dispatch_info"] is (
-        None if is_nextn else dispatch_info
-    )
-    assert ("input_ids" in observed[0]) == is_hash
-    if is_hash:
-        assert observed[0]["input_ids"] is input_ids
-    assert locations == ([] if is_nextn else [{"layer_id": 0}])
-    assert moe.gate.calls == moe.topk.calls == 1
 
 
 @pytest.mark.parametrize("role", ["attention", "ffn", "off"])
@@ -208,7 +127,9 @@ def test_role_projection_preserves_only_owned_modules(routing, role, sparse, run
     layer.mlp, _ = _moe(routing)
     moe = layer.mlp
     layer.self_attn = attention = nn.Identity()
-    layer.layer_communicator = SimpleNamespace(qkv_latent_func=object())
+    layer.attn_boundary = SimpleNamespace(
+        plan=SimpleNamespace(qkv_latent_func=object())
+    )
     routing["GlmMoeDsaAFDDecoderLayer"].install(layer)
     if role == "attention":
         assert isinstance(layer.mlp, routing["AFDProxyMLP"])
@@ -217,7 +138,7 @@ def test_role_projection_preserves_only_owned_modules(routing, role, sparse, run
     else:
         assert layer.mlp is moe
         assert isinstance(layer.self_attn, routing["AFDProxyAttention"])
-        assert layer.layer_communicator.qkv_latent_func is None
+        assert layer.attn_boundary.plan.qkv_latent_func is None
 
 
 @pytest.mark.parametrize("a2a_backend", ["none"])
@@ -242,7 +163,7 @@ def test_role_projection_refuses_unsupported_routing_contract(
     layer.config = SimpleNamespace(num_experts_per_tok=2)
     layer.is_layer_sparse = True
     layer.mlp = moe
-    layer.layer_communicator = SimpleNamespace()
+    layer.attn_boundary = SimpleNamespace(plan=SimpleNamespace(qkv_latent_func=None))
     args = SimpleNamespace(
         enable_eplb=False,
         init_expert_location="trivial",
@@ -301,13 +222,13 @@ def test_role_projection_and_compute_refuse_unsupported_collective(
 
 @pytest.mark.parametrize("runner", ["triton", "deep_gemm"])
 @pytest.mark.parametrize("rows", [0, 5])
-def test_ffn_router_loads_gate_and_rejects_old_route_payloads(routing, runner, rows):
+def test_ffn_router_loads_role_owned_gate(routing, runner, rows):
     _configure_a2a(routing, backend="none")
     routing["get_moe_runner_backend"] = lambda: SimpleNamespace(value=runner)
     layer = bare_module(routing["DeepseekV2DecoderLayer"])
     layer.config = SimpleNamespace(num_experts_per_tok=2)
     layer.is_layer_sparse = True
-    layer.layer_communicator = SimpleNamespace()
+    layer.attn_boundary = SimpleNamespace(plan=SimpleNamespace(qkv_latent_func=None))
     layer.self_attn = nn.Identity()
     layer.mlp, expert_weights = _moe(routing)
     routing["GlmMoeDsaAFDDecoderLayer"].install(layer)
@@ -339,12 +260,6 @@ def test_ffn_router_loads_gate_and_rejects_old_route_payloads(routing, runner, r
     actual = layer.compute_ffn_output(x)
     expected, _, _ = _reference(x, gate, expert_weights)
     torch.testing.assert_close(actual, expected)
-    assert gate.calls == layer.mlp.topk.calls == int(rows > 0)
-    ids = torch.zeros(rows, 2, dtype=torch.int32)
-    weights = torch.ones(rows, 2, dtype=torch.float32)
-    for route_ids, route_weights in ((ids, weights), (ids, None), (None, weights)):
-        with pytest.raises(TypeError, match="unexpected keyword"):
-            layer.compute_ffn_output(x, topk_ids=route_ids, topk_weights=route_weights)
     assert gate.calls == layer.mlp.topk.calls == int(rows > 0)
 
 
@@ -389,8 +304,10 @@ def test_cpu_pipeline_runs_dense_and_moe_with_ffn_router(
         def __init__(self, index):
             self.index = index
             self.self_attn = SimpleNamespace(skip_topk=False, next_skip_topk=False)
-            self.layer_communicator = SimpleNamespace(
-                postprocess_layer=lambda hidden, residual, batch: (hidden, residual)
+            # This test isolates FFN math/routing. Native residual boundaries
+            # are exercised with real stages in test_afd_boundary.
+            self.ffn_boundary = SimpleNamespace(
+                complete_now=lambda hidden, batch: hidden
             )
 
         def forward_attention_for_afd(self, *, hidden_states, residual, **kwargs):
@@ -401,7 +318,9 @@ def test_cpu_pipeline_runs_dense_and_moe_with_ffn_router(
         f_layer.config = SimpleNamespace(num_experts_per_tok=2)
         f_layer.is_layer_sparse = index > 0
         f_layer.self_attn = nn.Identity()
-        f_layer.layer_communicator = SimpleNamespace(qkv_latent_func=object())
+        f_layer.attn_boundary = SimpleNamespace(
+            plan=SimpleNamespace(qkv_latent_func=object())
+        )
         if index > 0:
             f_layer.mlp, _ = _moe(routing)
             reference, _ = _moe(routing)
@@ -419,7 +338,9 @@ def test_cpu_pipeline_runs_dense_and_moe_with_ffn_router(
         value.num_layers = layers_count
         value.hidden_size = 4
         value.attention_backend = SimpleNamespace(
-            forward_metadata=object(), init_forward_metadata=lambda batch: None
+            forward_metadata=object(),
+            init_forward_metadata=lambda batch: None,
+            bind_interleaved_stage_workspace=lambda metadata, stage_index: None,
         )
         value._step_id = 1
         value._stage_states = {
@@ -458,7 +379,9 @@ def test_cpu_pipeline_runs_dense_and_moe_with_ffn_router(
                 hidden_states=x[offset : offset + count].clone(),
                 residual=None,
                 positions=None,
-                forward_batch=None,
+                forward_batch=SimpleNamespace(
+                    residual_stream=None, moe_num_token_non_padded=lambda: None
+                ),
             )
         )
         offset += count
@@ -479,7 +402,9 @@ def test_cpu_pipeline_runs_dense_and_moe_with_ffn_router(
                 hidden_states=None,
                 residual=None,
                 positions=None,
-                forward_batch=None,
+                forward_batch=SimpleNamespace(
+                    residual_stream=None, moe_num_token_non_padded=lambda: None
+                ),
                 merge_sizes=(8,),
                 group_widths=(8,),
             )

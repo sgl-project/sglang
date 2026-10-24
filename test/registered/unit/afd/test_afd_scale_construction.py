@@ -1,9 +1,5 @@
 """CPU contracts for scale: production construction, routing and peer maps."""
 
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +11,9 @@ from sglang.test.afd.moe_fixtures import (
     bare_module,
     torch,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _install_constructor(routing, monkeypatch):
@@ -34,8 +33,12 @@ def _install_constructor(routing, monkeypatch):
         DeepseekV2MoE=forbidden,
         DeepseekV2MLP=forbidden,
         SpeculativeAlgorithm=SimpleNamespace(from_string=lambda x: x),
-        LayerFacts=SimpleNamespace(init_new=lambda **kw: kw),
-        LayerCommunicator=lambda **kw: SimpleNamespace(**kw),
+        append_stages=lambda *args, **kw: tuple(
+            SimpleNamespace(
+                plan=SimpleNamespace(qkv_latent_func=None), declaration=spec[0]
+            )
+            for spec in args
+        ),
         RMSNorm=lambda *a, **kw: torch.nn.Identity(),
         _is_gfx95_supported=False,
         enable_moe_dense_fully_dp=lambda: False,
@@ -104,6 +107,8 @@ def test_attention_constructor_never_allocates_router_or_experts(
     assert isinstance(layer.mlp, routing["AFDProxyMLP"])
     assert list(layer.mlp.parameters()) == [] and calls == []
     assert not hasattr(layer.mlp, "quant_method")
+    assert layer.ffn_boundary.declaration.dense_tp_size == 1
+    assert not layer.ffn_boundary.declaration.sparse
     loaded = []
 
     def load_weights(self, weights, is_nextn=False):
@@ -175,7 +180,8 @@ def test_scale_maps_every_rank_exactly_once_and_checks_both_roles(
             attention_lanes=attention,
             nnodes=size // 4,
             tp_size=size,
-            dp_size=size if role == "attention" else 1,
+            dp_size=1,
+            attn_dp_size=size if role == "attention" else 1,
             ep_size=1 if role == "attention" else ffn,
             enable_dp_attention=role == "attention",
         )

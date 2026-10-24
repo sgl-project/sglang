@@ -316,6 +316,8 @@ class DSAMetadata:
     pooled_topk_v2_plan: Optional[torch.Tensor] = None
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
     kpool_write_plan: Optional[KPoolWritePlan] = None
+    # Bound before capture; tensor storage remains stable across replays.
+    interleaved_stage_scratch: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
 
 @torch.compile
@@ -1092,6 +1094,26 @@ class DeepseekSparseAttnBackend(
             actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
         )
 
+    def bind_interleaved_stage_workspace(self, metadata, *, stage_index):
+        """Give overlapping stages private scratch; serial buckets may reuse it."""
+        if self.workspace_buffer is None or self._multi_ctas_kv_counter_buffer is None:
+            return
+        states = getattr(self, "_interleaved_stage_scratch", None)
+        if states is None:
+            states = self._interleaved_stage_scratch = {}
+        if stage_index not in states:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("DSA_STAGE_SCRATCH_NOT_PREPARED")
+            states[stage_index] = (
+                torch.zeros_like(self.workspace_buffer),
+                torch.zeros_like(self._multi_ctas_kv_counter_buffer),
+            )
+        object.__setattr__(metadata, "interleaved_stage_scratch", states[stage_index])
+
+    def _active_workspace_buffer(self):
+        scratch = getattr(self.forward_metadata, "interleaved_stage_scratch", None)
+        return self.workspace_buffer if scratch is None else scratch[0]
+
     def _validate_afd_breakable_batch(self, forward_batch: ForwardBatch) -> int:
         from sglang.srt.afd.contracts import validate_non_speculative_batch
 
@@ -1708,16 +1730,17 @@ class DeepseekSparseAttnBackend(
     def _multi_ctas_kv_counter_for(self, num_query_rows: int) -> Optional[torch.Tensor]:
         # A prefill batch wider than TRTLLM_MLA_MAX_BATCH_SIZE takes a temporary;
         # rebinding would free the allocation the decode graphs captured.
+        scratch = getattr(self.forward_metadata, "interleaved_stage_scratch", None)
+        buffer = self._multi_ctas_kv_counter_buffer if scratch is None else scratch[1]
         counter = grow_multi_ctas_kv_counter_buffer_if_needed(
-            buffer=self._multi_ctas_kv_counter_buffer,
+            buffer=buffer,
             device=torch.device(self.device),
             num_q_heads=self.num_dcp_q_heads,
             batch_size=num_query_rows,
         )
         # Capacity is set before capture, so a grow here is a broken invariant.
         assert (
-            counter is self._multi_ctas_kv_counter_buffer
-            or not torch.cuda.is_current_stream_capturing()
+            counter is buffer or not torch.cuda.is_current_stream_capturing()
         ), "multi_ctas_kv_counter_buffer grew during CUDA graph capture"
         return counter
 
@@ -3406,7 +3429,7 @@ class DeepseekSparseAttnBackend(
             kv_cache=kv_cache,
             indices=page_table_1,
             seq_lens=seq_lens,
-            workspace_buffer=self.workspace_buffer,
+            workspace_buffer=self._active_workspace_buffer(),
             page_size=self.physical_page_size,
             kv_cache_dim=self.kv_cache_dim,
             qk_nope_head_dim=self.qk_nope_head_dim,
@@ -3517,7 +3540,7 @@ class DeepseekSparseAttnBackend(
                 query=q,
                 key=k,
                 value=v,
-                workspace_buffer=self.workspace_buffer,
+                workspace_buffer=self._active_workspace_buffer(),
                 seq_lens=seq_lens,
                 max_q_len=metadata.max_seq_len_q,
                 max_kv_len=max_seqlen_k,
@@ -4080,7 +4103,7 @@ class DeepseekSparseAttnBackend(
 
         attention_kwargs = dict(
             kv_cache=kv,
-            workspace_buffer=self.workspace_buffer,
+            workspace_buffer=self._active_workspace_buffer(),
             qk_nope_head_dim=self.qk_nope_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,

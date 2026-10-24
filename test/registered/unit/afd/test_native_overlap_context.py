@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from sglang.srt.batch_overlap import operations
+from sglang.srt.model_executor.forward_context import ForwardContext
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -18,14 +19,19 @@ def test_two_batch_context_and_operation_order(monkeypatch, caller_owned):
     trace = []
 
     @contextmanager
-    def context(index):
+    def context(value):
+        if isinstance(value, ForwardContext):
+            index = value.attn_backend
+            assert value.moe_num_token_non_padded() == index + 1
+        else:
+            index = value
         trace.append(("enter", index))
         yield
         trace.append(("exit", index))
 
     dp = Mock()
     monkeypatch.setattr(operations, "set_dp_buffer_len", dp)
-    resolve = Mock(return_value=(0, 1))
+    resolve = Mock(return_value=tuple(ForwardContext(attn_backend=i) for i in range(2)))
     monkeypatch.setattr(operations, "_resolve_tbo_child_contexts", resolve)
     monkeypatch.setattr(operations, "forward_context", context)
 
@@ -40,8 +46,9 @@ def test_two_batch_context_and_operation_order(monkeypatch, caller_owned):
             tbo_padded_len=4,
             global_num_tokens_cpu=[8],
             dp_padding_mode=SimpleNamespace(is_max_len=lambda: True),
+            moe_num_token_non_padded=lambda index=index: index + 1,
         )
-        for _ in range(2)
+        for index in range(2)
     ]
     operations.execute_overlapped_operations(
         inputs_arr=[{} if caller_owned else {"forward_batch": b} for b in batches],
@@ -57,9 +64,9 @@ def test_two_batch_context_and_operation_order(monkeypatch, caller_owned):
             for index in range(2)
         ],
         delta_stages=[0, 0],
-        stage_contexts=[partial(context, i) for i in range(2)]
-        if caller_owned
-        else None,
+        stage_contexts=(
+            [partial(context, i) for i in range(2)] if caller_owned else None
+        ),
     )
     assert trace == [
         event

@@ -174,6 +174,38 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         )
         self.trtllm_workspace_buffer = _get_trtllm_workspace_buffer(self.device)
 
+    def prepare_interleaved_stage(self, stage_index: int) -> tuple:
+        """Allocate stable scratch once per stage, outside graph capture."""
+        states = getattr(self, "_interleaved_stage_scratch", None)
+        if states is None:
+            states = self._interleaved_stage_scratch = {}
+        if stage_index not in states:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("DSV4_TRTLLM_STAGE_SCRATCH_NOT_PREPARED")
+            # Clone the native counter: its allocator may itself cache storage.
+            counter = _fi_core._get_trtllm_gen_multi_ctas_kv_counter_buffer(
+                _trtllm_semaphore_rows,
+                self.model_runner.model_config.hf_text_config.num_attention_heads,
+                torch.cuda.get_device_properties(self.device).multi_processor_count,
+                self.device,
+            ).clone()
+            states[stage_index] = (
+                torch.zeros_like(self.trtllm_workspace_buffer),
+                counter,
+            )
+        return states[stage_index]
+
+    def bind_interleaved_stage_workspace(self, metadata, *, stage_index):
+        metadata.trtllm_stage_scratch = self.prepare_interleaved_stage(stage_index)
+
+    def _call_trtllm(self, **kwargs):
+        scratch = getattr(self.forward_metadata, "trtllm_stage_scratch", None)
+        if scratch is None:
+            return trtllm_batch_decode_sparse_mla_dsv4(**kwargs)
+        kwargs["workspace_buffer"] = scratch[0]
+        kwargs["multi_ctas_kv_counter_buffer"] = scratch[1]
+        return trtllm_batch_decode_sparse_mla_dsv4(**kwargs)
+
     def _forward_trtllm(
         self,
         *,
@@ -354,7 +386,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
         assert self.trtllm_workspace_buffer is not None
         _check_trtllm_query_rows(bs)
 
-        out = trtllm_batch_decode_sparse_mla_dsv4(
+        out = self._call_trtllm(
             query=q_fp8,
             swa_kv_cache=swa_kv_cache,
             workspace_buffer=self.trtllm_workspace_buffer,
@@ -498,7 +530,7 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             )
             out_arg = out_padded[:sum_q]
 
-        out = trtllm_batch_decode_sparse_mla_dsv4(
+        out = self._call_trtllm(
             query=q_fp8,
             swa_kv_cache=swa_kv_cache,
             workspace_buffer=self.trtllm_workspace_buffer,

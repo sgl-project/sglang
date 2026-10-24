@@ -169,6 +169,10 @@ class TRTLLMMHAMetadata:
     fmha_v2_copy_rows: torch.Tensor = None
     fmha_v2_copy_cols: torch.Tensor = None
     fmha_v2_block_table: torch.Tensor = None
+    # Private scratch for concurrently executing interleaved stages. Native
+    # invocations retain their existing backend-owned workspace when unset.
+    workspace_buffer: torch.Tensor = None
+    multi_ctas_kv_counter_buffer: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
@@ -180,6 +184,66 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     needs_cpu_seq_lens: bool = False
 
     supports_ragged_verify_graph: bool = True
+
+    def validate_interleaved_graph_support(self):
+        if (
+            self.is_xqa_impl
+            or self.is_nvfp4_kvcache
+            or self.use_sliding_window_kv_pool
+            or self.expand_encoder_only_verify
+            or self.speculative_num_draft_tokens not in (None, 0)
+        ):
+            raise RuntimeError(
+                "TRTLLM_INTERLEAVED_REQUIRES_GEN_MHA_NON_SPEC_FULL_ATTENTION"
+            )
+
+    def init_interleaved_graph_state(self, max_rows):
+        self.validate_interleaved_graph_support()
+        if self.decode_cuda_graph_metadata:
+            raise RuntimeError("TRTLLM_INTERLEAVED_STATE_ALREADY_INITIALIZED")
+        allocated = torch.cuda.memory_allocated(self.device)
+        reserved = torch.cuda.memory_reserved(self.device)
+        self.init_cuda_graph_state(max_rows, max_rows)
+        return max(
+            0,
+            torch.cuda.memory_allocated(self.device) - allocated,
+            torch.cuda.memory_reserved(self.device) - reserved,
+        )
+
+    def bind_interleaved_stage_workspace(self, metadata, *, stage_index):
+        self.validate_interleaved_graph_support()
+        if type(stage_index) is not int or stage_index not in (0, 1):
+            raise RuntimeError("TRTLLM_INTERLEAVED_STAGE_INDEX_INVALID")
+        if not hasattr(self, "_interleaved_stage_scratch"):
+            self._interleaved_stage_scratch = {}
+        if stage_index not in self._interleaved_stage_scratch:
+            self._interleaved_stage_scratch[stage_index] = (
+                torch.zeros_like(self.workspace_buffer),
+                torch.zeros_like(self._multi_ctas_kv_counter_buffer),
+            )
+        metadata.workspace_buffer, metadata.multi_ctas_kv_counter_buffer = (
+            self._interleaved_stage_scratch[stage_index]
+        )
+
+    def create_graph_metadata_snapshot(self, forward_batch, *, stage_index):
+        from sglang.srt.layers.attention.trtllm_mha_interleaved import (
+            TRTLLMInterleavedGraphMetadata,
+        )
+
+        return TRTLLMInterleavedGraphMetadata(
+            self,
+            forward_batch,
+            stage_index=stage_index,
+            metadata_type=TRTLLMMHAMetadata,
+        )
+
+    def _active_workspace_buffer(self):
+        private = getattr(self.forward_metadata, "workspace_buffer", None)
+        return self.workspace_buffer if private is None else private
+
+    def _active_kv_counter_buffer(self):
+        private = getattr(self.forward_metadata, "multi_ctas_kv_counter_buffer", None)
+        return self._multi_ctas_kv_counter_buffer if private is None else private
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
@@ -903,6 +967,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
+        metadata_override: TRTLLMMHAMetadata | None = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -922,14 +987,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
-        metadata = None
+        metadata = metadata_override
         seqlen_offset = 0
         cu_seqlens_q = None
         qlens = None
         q_stride = 0
         q_mode = Q_MODE_NONE
         if forward_mode.is_decode_or_idle():
-            if spec_info is not None:
+            if metadata_override is not None:
+                if spec_info is not None:
+                    raise ValueError(
+                        "Interleaved metadata does not support draft decode"
+                    )
+            elif spec_info is not None:
                 # Draft Decode
                 # Here we only support topk = 1 for now.
                 metadata = self.decode_cuda_graph_metadata[bs]
@@ -1468,7 +1538,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=group_query,
                 kv_cache=kv_cache,
-                workspace_buffer=self.workspace_buffer,
+                workspace_buffer=self._active_workspace_buffer(),
                 block_tables=group_block_tables,
                 seq_lens=group_seq_lens,
                 max_seq_len=self.max_context_len,
@@ -1480,7 +1550,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 out=group_out,
                 out_dtype=None if group_out is not None else resolved_out_dtype,
                 kv_cache_sf=kv_cache_sf,
-                multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                multi_ctas_kv_counter_buffer=self._active_kv_counter_buffer(),
                 **kwargs,
             )
 
@@ -1777,7 +1847,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                     query=q,
                     kv_cache=kv_cache,
-                    workspace_buffer=self.workspace_buffer,
+                    workspace_buffer=self._active_workspace_buffer(),
                     block_tables=self.forward_metadata.encoder_page_table,
                     seq_lens=self.forward_metadata.encoder_cache_seqlens,
                     max_seq_len=self.max_context_len,
@@ -1790,13 +1860,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     out_dtype=(None if uses_native_fp4 else self.q_data_type),
                     kv_cache_sf=kv_cache_block_scales,
                     q_len_per_req=1,
-                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                    multi_ctas_kv_counter_buffer=self._active_kv_counter_buffer(),
                 )
             elif self.forward_metadata.is_ragged_verify:
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                     query=q,
                     kv_cache=kv_cache,
-                    workspace_buffer=self.workspace_buffer,
+                    workspace_buffer=self._active_workspace_buffer(),
                     block_tables=page_table,
                     seq_lens=self.forward_metadata.cache_seqlens_int32,
                     max_seq_len=self.max_context_len,
@@ -1811,7 +1881,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     q_len_per_req=None,
                     max_q_len=self.forward_metadata.max_seq_len_q,
                     cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
-                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                    multi_ctas_kv_counter_buffer=self._active_kv_counter_buffer(),
                 )
             else:
                 mask = (
@@ -1892,7 +1962,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 return flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                     query=q_chunk,
                     kv_cache=kv_cache,
-                    workspace_buffer=self.workspace_buffer,
+                    workspace_buffer=self._active_workspace_buffer(),
                     block_tables=block_tables,
                     seq_lens=cache_seqlens,
                     max_q_len=max_seqlen_q,

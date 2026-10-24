@@ -21,6 +21,23 @@ def afd_execution_mode() -> AFDExecutionMode:
     return execution_mode_from_server_args(get_server_args())
 
 
+def afd_a_router_enabled(*, model_family: str | None = None) -> bool:
+    args = get_server_args()
+    config = getattr(args, "afd_config", None)
+    if config is None:
+        return False
+    mode = getattr(
+        config,
+        "direct_mode",
+        "direct" if getattr(config, "experimental_direct", False) else "fixed",
+    )
+    return mode == "direct" or (
+        mode == "auto"
+        and model_family == "qwen3_moe"
+        and getattr(args, "moe_a2a_backend", "none") in (None, "none")
+    )
+
+
 def afd_model_forward(
     *,
     model: Any,

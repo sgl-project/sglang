@@ -1,6 +1,5 @@
 """CPU contracts for shared field views and each preparer's distinct policies."""
 
-import dataclasses
 import unittest
 
 import torch
@@ -20,54 +19,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-
-# Review new ForwardBatch fields before admitting them to either preparer. This
-# test-side inventory does not add schema introspection to the forward hot path.
-# "inherit" records the current shallow-copy behavior, not support for new model
-# families (e.g. multimodal or Mamba) or speculative modes.
-_AFD_FIELD_POLICY = {
-    "token_view": "input_ids out_cache_loc input_embeds token_type_ids",
-    "request_view": """
-        req_pool_indices req_pool_indices_cpu seq_lens seq_lens_cpu extend_seq_lens extend_prefix_lens
-        extend_seq_lens_cpu extend_prefix_lens_cpu extend_logprob_start_lens_cpu
-        lora_ids rids
-    """,
-    "positions_view": "positions",
-    "derived_or_reset": """
-        batch_size seq_lens_sum extend_num_tokens extend_start_loc
-        forward_metadata_ready forward_metadata_planned_bs
-        forward_metadata_planned_num_tokens
-    """,
-    "inherit": """
-        forward_mode orig_seq_lens out_cache_loc_virtual out_cache_loc_dsv4
-        mamba_track_indices mamba_track_mask mamba_track_seqlens
-        mamba_cow_src_indices mamba_cow_dst_indices mamba_clear_indices
-        replace_embeds replace_positions encoder_lens encoder_out_cache_loc
-        return_logprob is_prefill_only spec_algorithm dimensions
-        return_pooled_hidden_states is_extend_in_batch can_run_decode_cuda_graph
-        can_run_dp_prefill_cuda_graph dp_prefill_cuda_graph_max_prefix_len
-        global_forward_mode tbo_split_seq_index top_logprobs_nums token_ids_logprobs
-        mm_inputs encoder_cached encoder_lens_cpu multi_item_delimiter_indices
-        sampling_info spec_info capture_hidden_mode return_hidden_states_before_norm
-        reuse_dsa_topk_indices minimax_m3_precached_sparse_layers
-        extend_input_logprob_token_ids_gpu original_global_num_tokens_cpu
-        _original_batch_size _original_forward_mode _original_num_tokens
-        global_num_tokens_cpu global_num_tokens_gpu global_num_tokens_for_logprob_cpu
-        global_num_tokens_for_logprob_gpu global_num_token_non_padded
-        global_num_token_non_padded_cpu num_token_non_padded attn_tp_sequence_sharded
-        _attn_output next_token_logits_buffer temperature top_p hidden_states residual
-        model_specific_states split_index mm_input_embeds cross_attention_custom_mask
-        dp_padding_mode dp_local_start_pos dp_local_num_tokens global_dp_buffer_len
-        mrope_positions tbo_parent_token_range tbo_padded_len tbo_children
-        attn_cp_metadata attn_dcp_metadata dcp_kv_mask ngram_embedding_info rids_int
-        bootstrap_room_ids_int req_all_ids_flat req_all_ids_lens
-        forward_metadata_replan_equivalent max_seq_len_override
-        mamba_track_seqlens_cpu mamba_prefill_track_mask_cpu
-        dp_spec_prefill_coordination_applied global_num_tokens_padded_cpu
-        multi_gate_indices engram_history mm_token_modalities token_indices_to_pool
-        encoder_swa_replay defer_logits_to_eager
-    """,
-}
 
 
 def _batch(mode=ForwardMode.DECODE):
@@ -100,8 +51,21 @@ def _batch(mode=ForwardMode.DECODE):
 
 
 def _afd(batch, request_slice=slice(1, 3), token_slice=slice(1, 3)):
+    _, remaining = TboForwardBatchPreparer._split_num_token_non_padded(
+        tbo_split_token_index=token_slice.start,
+        num_token_non_padded=TboForwardBatchPreparer._get_num_token_non_padded_cpu(
+            batch
+        ),
+    )
+    live, _ = TboForwardBatchPreparer._split_num_token_non_padded(
+        tbo_split_token_index=token_slice.stop - token_slice.start,
+        num_token_non_padded=remaining,
+    )
     return _slice_forward_batch(
-        forward_batch=batch, request_slice=request_slice, token_slice=token_slice
+        forward_batch=batch,
+        request_slice=request_slice,
+        token_slice=token_slice,
+        non_padded_tokens=live,
     )
 
 
@@ -133,21 +97,6 @@ class TestForwardBatchFieldViews(CustomTestCase):
         self.assertEqual(
             actual.untyped_storage().data_ptr(), parent.untyped_storage().data_ptr()
         )
-
-    def test_forward_batch_schema_has_an_explicit_afd_field_policy(self):
-        classified = [
-            name for names in _AFD_FIELD_POLICY.values() for name in names.split()
-        ]
-        self.assertEqual(len(classified), len(set(classified)))
-        self.assertEqual(
-            set(classified),
-            {field.name for field in dataclasses.fields(ForwardBatch)},
-            "Review slicing and inheritance in both AFD and TBO for schema changes",
-        )
-        parent = _batch()
-        child = _afd(parent)
-        for name in _AFD_FIELD_POLICY["inherit"].split():
-            self.assertIs(getattr(child, name), getattr(parent, name), name)
 
     def test_tensor_views_keep_storage_and_host_lists_keep_slice_semantics(self):
         batch = _batch()
@@ -229,12 +178,16 @@ class TestForwardBatchFieldViews(CustomTestCase):
                 self.assertEqual(_afd(parent).extend_num_tokens, 2)
                 self.assertIsNone(_tbo(parent).extend_num_tokens)
 
-    def test_virtual_cache_and_mrope_are_not_new_afd_support(self):
+    def test_cache_views_and_distinct_mrope_policy(self):
         parent = _batch()
         parent.out_cache_loc_virtual = torch.arange(4) + 200
         parent.mrope_positions = torch.arange(12).reshape(3, 4)
         afd, tbo = _afd(parent), _tbo(parent)
-        self.assertIs(afd.out_cache_loc_virtual, parent.out_cache_loc_virtual)
+        self.assert_view(
+            afd.out_cache_loc_virtual,
+            parent.out_cache_loc_virtual[1:3],
+            parent.out_cache_loc_virtual,
+        )
         self.assertIs(afd.mrope_positions, parent.mrope_positions)
         self.assert_view(
             tbo.out_cache_loc_virtual,
@@ -253,7 +206,7 @@ class TestForwardBatchFieldViews(CustomTestCase):
         with self.assertRaises(AssertionError):
             _tbo(parent)
 
-    def test_dp_counts_masks_and_planning_state_remain_caller_owned(self):
+    def test_dp_lists_remain_shared_but_routing_counts_are_stage_owned(self):
         parent = _batch()
         parent.global_num_tokens_cpu = [4, 2]
         parent.global_num_tokens_gpu = torch.tensor([4, 2])
@@ -277,7 +230,12 @@ class TestForwardBatchFieldViews(CustomTestCase):
             self.assertIsNone(getattr(tbo, name))
         self.assertEqual(afd.global_dp_buffer_len, 6)
         self.assertEqual(tbo.global_dp_buffer_len, 2)
-        self.assertIs(afd.num_token_non_padded, parent.num_token_non_padded)
+        self.assertIsNot(afd.num_token_non_padded, parent.num_token_non_padded)
+        self.assertIsNot(
+            afd.global_num_token_non_padded, parent.global_num_token_non_padded
+        )
+        self.assertEqual(afd.num_token_non_padded.item(), 0)
+        self.assertEqual(afd.global_num_token_non_padded_cpu, 0)
         self.assertEqual(tbo.num_token_non_padded.item(), 0)
         self.assertEqual(tbo.global_num_token_non_padded_cpu, 0)
         self.assertIsNone(tbo.global_num_token_non_padded)

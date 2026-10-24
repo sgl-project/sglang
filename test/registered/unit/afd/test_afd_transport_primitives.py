@@ -1,6 +1,3 @@
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import sys
 import threading
 import time
@@ -9,12 +6,16 @@ from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 import torch
 
 from sglang.srt.afd import config as afd_config
 from sglang.srt.afd import contracts as contracts
 from sglang.srt.afd import transport as afd_transport
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class FakeDeviceCuda:
@@ -705,14 +706,10 @@ def _feed(transport, descriptors):
 
 
 def test_one_lane_prefilling_does_not_kill_its_ffn_rank(monkeypatch):
-    """Eligibility is a lane's own property, so a group may legitimately disagree.
+    """Lanes may have different graph eligibility within the same step.
 
-    Measured at M=16: four lanes sent step_id=295 with identical rows but
-    graph_eligible True/True/True/False, because that flag is
-    `is_decode() and all(rows)` and forward_mode is not globally consistent under
-    DP attention -- three lanes decoded while the fourth prefilled a freshly
-    admitted request. Demanding equality made the FFN rank raise, exit, and wedge
-    every remaining rank at 100% util until the 600 s NCCL watchdog fired.
+    DP attention lanes can mix decode and prefill. The FFN group uses eager
+    execution when any contributing lane is ineligible for graph replay.
     """
 
     transport = _fanin_ffn_transport(monkeypatch, attention_lanes=16)
@@ -993,3 +990,47 @@ def test_new_receive_backing_orders_first_write_without_per_layer_wait(
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-x"]))
+
+
+@pytest.mark.parametrize("kind", ["CAPTURE", "STEP"])
+@pytest.mark.parametrize("stage_rows", [16, 32])
+@pytest.mark.parametrize("forward_to_follower", [False, True])
+def test_routed_mode_survives_ffn_receive_reconstruction(
+    monkeypatch, kind, stage_rows, forward_to_follower
+):
+    """Mode survives production descriptor reconstruction and FFN validation."""
+    from sglang.srt.afd.pipeline import AFDFFNPipeline
+
+    _, transport = _transport(monkeypatch, role=contracts.AFDRole.FFN, lanes=8)
+    sent = _descriptor(
+        kind=kind,
+        step_id=1,
+        lane_stage_rows=((stage_rows, stage_rows),) * 8,
+        hidden_size=4096,
+        num_layers=94,
+        uses_direct=True,
+    )
+    forwarded = []
+    transport._control_upstream = 0
+    transport._control_followers = (10,) if forward_to_follower else ()
+    transport._control = SimpleNamespace(
+        recv_obj=lambda src: msgspec.json.decode(
+            msgspec.json.encode(sent), type=contracts.AFDStepDescriptor
+        ),
+        send_obj=lambda value, dst: forwarded.append((dst, value)),
+    )
+    received = transport.begin_step(None)
+    pipeline = AFDFFNPipeline.__new__(AFDFFNPipeline)
+    pipeline._config = afd_config.AFDConfig(
+        lanes=8,
+        **{
+            "experimental_direct": True,
+            "experimental_direct_stage_rows": stage_rows,
+        },
+    )
+    pipeline._adapter = SimpleNamespace(hidden_size=4096, num_layers=94)
+    transport.direct = SimpleNamespace(max_rows=stage_rows)
+    pipeline._connector = SimpleNamespace(transport=transport)
+    pipeline._validate_descriptor(descriptor=received)
+    assert received == sent
+    assert forwarded == ([(10, sent)] if forward_to_follower else [])

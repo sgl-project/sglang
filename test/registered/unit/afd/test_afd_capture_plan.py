@@ -182,17 +182,20 @@ def test_startup_reuses_native_dummy_inputs_in_descending_order(
         ),
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("sync"))
-    if fail:
-        with pytest.raises(RuntimeError, match="capture failed"):
+    from sglang.srt.runtime_context import get_parallel
+
+    with get_parallel().override(tp_group=runner.model_runner.tp_group):
+        if fail:
+            with pytest.raises(RuntimeError, match="capture failed"):
+                pipeline.capture_startup(runner)
+            assert events == ["allocate", 8]
+        else:
             pipeline.capture_startup(runner)
-        assert events == ["allocate", 8]
-    else:
-        pipeline.capture_startup(runner)
-        assert events == (["allocate", 8, 4, 2, "sync"] if sizes else []) + [
-            "seal",
-            "ready_ack",
-            "barrier",
-        ]
+            assert events == (["allocate", 8, 4, 2, "sync"] if sizes else []) + [
+                "seal",
+                "ready_ack",
+                "barrier",
+            ]
     assert not pipeline._startup_capture
 
 

@@ -11,6 +11,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import dataclasses
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -33,10 +34,11 @@ def backend(monkeypatch):
     value.__dict__.update(
         _memory_saver_adapter=dsa_backend.TorchMemorySaverAdapter.create(enable=False),
         device=torch.device("cpu"),
+        workspace_buffer=None,
         prefill_attention_backend_str="nsa",
         decode_attention_backend_str="nsa",
         req_to_token=torch.arange(16 * 8, dtype=torch.int32).reshape(16, 8),
-        real_page_size=1,
+        physical_page_size=1,
         dsa_index_kpool=1,
         dsa_index_topk=4,
         dsa_decode_impl="triton",
@@ -54,8 +56,16 @@ def backend(monkeypatch):
     return value
 
 
-def _batch(slots=(1, 2), seq_lens=(3, 6), *, mode=ForwardMode.DECODE):
+def _batch(
+    slots=(1, 2),
+    seq_lens=(3, 6),
+    *,
+    mode=ForwardMode.DECODE,
+    non_padded=None,
+    scalar=False,
+):
     lengths = torch.tensor(seq_lens, dtype=torch.int32)
+    count = torch.tensor(non_padded, dtype=torch.int32) if scalar else None
     return ForwardBatch(
         forward_mode=mode,
         batch_size=len(slots),
@@ -66,11 +76,14 @@ def _batch(slots=(1, 2), seq_lens=(3, 6), *, mode=ForwardMode.DECODE):
         out_cache_loc=torch.tensor(slots, dtype=torch.int64),
         seq_lens_sum=sum(seq_lens),
         positions=lengths.to(torch.int64) - 1,
+        global_num_token_non_padded_cpu=non_padded,
+        global_num_token_non_padded=count,
+        num_token_non_padded=count,
     )
 
 
 def _guard(backend, batch, *, bucket_rows=4):
-    stage = SimpleNamespace(forward_batch=batch, attention_metadata=object())
+    stage = SimpleNamespace(index=0, forward_batch=batch, attention_metadata=object())
     return DSAMetadataGuard(backend=backend, stage=stage, bucket_rows=bucket_rows)
 
 
@@ -93,22 +106,22 @@ def _check_metadata(backend, metadata, batch):
     torch.testing.assert_close(
         metadata.page_table_1, backend.req_to_token[batch.req_pool_indices]
     )
-    if backend.real_page_size == 1:
+    if backend.physical_page_size == 1:
         assert metadata.real_page_table is metadata.page_table_1
     else:
         torch.testing.assert_close(
             metadata.real_page_table,
-            metadata.page_table_1[:, :: backend.real_page_size]
-            // backend.real_page_size,
+            metadata.page_table_1[:, :: backend.physical_page_size]
+            // backend.physical_page_size,
         )
 
 
 @pytest.mark.parametrize("bucket_rows", [(4, 4), (4, 8)])
 @pytest.mark.parametrize("page_size", [1, 2])
 def test_dsa_stages_refresh_real_metadata_without_replacing_storage(
-    backend, bucket_rows, page_size
+    backend, bucket_rows, page_size, monkeypatch
 ):
-    backend.real_page_size = page_size
+    backend.physical_page_size = page_size
     original_state = backend.decode_cuda_graph_metadata
     original_metadata = backend.forward_metadata
     batches = [_batch(), _batch((7,), (2,))]
@@ -134,6 +147,17 @@ def test_dsa_stages_refresh_real_metadata_without_replacing_storage(
         assert backend.decode_cuda_graph_metadata is original_state
         assert backend.forward_metadata is original_metadata
         assert guard._stage.forward_batch is batch
+
+    # Exercise scratch binding on the real frozen metadata, not a namespace.
+    backend.workspace_buffer = torch.zeros(8)
+    backend._multi_ctas_kv_counter_buffer = torch.zeros(4)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    for index, metadata in enumerate(captured):
+        backend.bind_interleaved_stage_workspace(metadata, stage_index=index)
+    for first, second in zip(
+        captured[0].interleaved_stage_scratch, captured[1].interleaved_stage_scratch
+    ):
+        assert first.data_ptr() != second.data_ptr()
 
     assert captured[0] is not captured[1]
     for field in ("page_table_1", "cache_seqlens_int32", "dsa_cache_seqlens_int32"):
@@ -393,21 +417,210 @@ def test_split_is_metadata_free_and_eager_initializes_each_stage_once():
     assert stages[0].attention_metadata is not stages[1].attention_metadata
 
 
-def test_repeated_warmup_activation_restores_original_batch_and_metadata(backend):
+def test_warmup_and_replay_preserve_stage_counts_and_restore_metadata(backend):
+    from sglang.srt.afd.model_adapters.base import stage_forward_context
+    from sglang.srt.model_executor.forward_context import get_forward_context
+
     original = backend.forward_metadata
-    batch = _batch()
+    batch = _batch(non_padded=2, scalar=True)
     guards = [_guard(backend, batch) for _ in range(2)]
-    stages = [guard._stage for guard in guards]
     for guard in guards:
         guard.capture(batch)
+    counts = [guard.graph_forward_batch.num_token_non_padded for guard in guards]
+    assert (
+        len({value.data_ptr() for value in [batch.num_token_non_padded, *counts]}) == 3
+    )
     for _ in range(3):
         for guard in guards:
             guard.activate_in_graph()
-            assert guard._stage.forward_batch is guard.graph_forward_batch
+            padded = guard.graph_forward_batch
+            with stage_forward_context(guard._stage.forward_batch):
+                assert get_forward_context().moe_num_token_non_padded.__self__ is padded
+                assert padded.global_num_token_non_padded_cpu == 2
     for guard in reversed(guards):
         guard.restore()
     assert backend.forward_metadata is original
-    assert all(stage.forward_batch is batch for stage in stages)
+    for index, guard in enumerate(guards):
+        live = _batch(
+            (1,),
+            (2,),
+            mode=ForwardMode.DECODE if index else ForwardMode.IDLE,
+            non_padded=index,
+            scalar=True,
+        )
+        peer = counts[1 - index].clone()
+        guard.prepare_replay(live)
+        guard.assert_stable()
+        padded = guard.graph_forward_batch
+        assert padded.num_token_non_padded is counts[index]
+        assert padded.global_num_token_non_padded is counts[index]
+        assert padded.global_num_token_non_padded_cpu == counts[index].item() == index
+        torch.testing.assert_close(counts[1 - index], peer)
+        guard.restore()
+        assert guard._stage.forward_batch is batch
+    assert batch.num_token_non_padded.item() == 2
     for guard in reversed(guards):
         guard.close()
     assert backend._afd_private_graph_states == {}
+
+
+def _split(batch):
+    from sglang.srt.afd.model_adapters.base import AFDDecoderAdapter
+
+    return object.__new__(AFDDecoderAdapter).split_step(
+        hidden_states=torch.ones(batch.input_ids.numel(), 4),
+        residual=None,
+        positions=batch.positions,
+        forward_batch=batch,
+        stages=2,
+    )
+
+
+def test_graph_kv_plan_owns_padded_slots_and_refreshes_stable_storage(backend):
+    from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+
+    translator = KVIndexTranslator(
+        req_to_token=backend.req_to_token,
+        token_to_kv_pool_allocator=object(),
+        token_to_kv_pool=object(),
+        page_size=1,
+        device="cpu",
+    )
+    backend.kv_index_translator = translator
+    batch = _batch()
+    translator.own_plan(batch).bind(batch, translator)
+    guard = _guard(backend, batch)
+    guard.capture(batch)
+    padded = guard.graph_forward_batch
+    pointer = padded.out_cache_loc.data_ptr()
+    assert padded.kv_loc_plan is not batch.kv_loc_plan
+    assert padded.kv_loc_plan.req_pool_indices is padded.req_pool_indices
+    assert padded.kv_loc_plan.seq_lens is padded.seq_lens
+    guard.restore()
+    for slots in ((7,), (3, 6, 8)):
+        live = _batch(slots, (2,) * len(slots))
+        translator.own_plan(live).bind(live, translator)
+        guard.prepare_replay(live)
+        assert padded.out_cache_loc.data_ptr() == pointer
+        torch.testing.assert_close(
+            translator.write_ids(padded),
+            torch.tensor(list(slots) + [0] * (4 - len(slots))),
+        )
+        assert padded.kv_loc_cols is None
+        assert padded.residual_stream is None
+        guard.restore()
+
+
+@pytest.mark.parametrize("scalar", [False, True])
+@pytest.mark.parametrize(
+    "lengths,mode,non_padded,expected",
+    [
+        ((1, 1, 1, 1), ForwardMode.DECODE, 4, (2, 2)),
+        ((1, 1, 1, 1, 1), ForwardMode.DECODE, 4, (3, 1)),
+        ((1, 1, 1, 1), ForwardMode.IDLE, 0, (0, 0)),
+        ((1,), ForwardMode.DECODE, 1, (1, 0)),
+        ((2, 5, 1), ForwardMode.EXTEND, 8, (7, 1)),
+    ],
+)
+def test_s2_prefix_counts_are_independent_of_parent(
+    lengths, mode, non_padded, expected, scalar
+):
+    batch = _batch(
+        tuple(range(len(lengths))),
+        lengths,
+        mode=mode,
+        non_padded=non_padded,
+        scalar=scalar,
+    )
+    batch.input_ids = batch.positions = torch.arange(sum(lengths))
+    batch.out_cache_loc = batch.input_ids.clone()
+    if mode.is_extend():
+        batch.extend_seq_lens_cpu = list(lengths)
+        batch.extend_seq_lens = torch.tensor(lengths, dtype=torch.int32)
+    children = [s.forward_batch for s in _split(batch)]
+    assert tuple(c.global_num_token_non_padded_cpu for c in children) == expected
+    if scalar:
+        children[0].num_token_non_padded.fill_(17)
+        assert batch.num_token_non_padded.item() == non_padded
+        assert children[1].num_token_non_padded.item() == expected[1]
+    else:
+        assert all(c.num_token_non_padded is None for c in children)
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("fails", [False, True])
+def test_attention_pipeline_binds_current_s2_counts_and_restores_parent(
+    monkeypatch, dp_size, fails
+):
+    from sglang.srt.afd import pipeline as pipeline_mod
+    from sglang.srt.layers import layer_boundary
+    from sglang.srt.layers.moe import utils as moe_utils
+    from sglang.srt.layers.moe.topk import resolve_routing_inputs
+    from sglang.srt.model_executor import forward_batch_info
+    from sglang.srt.model_executor.forward_context import (
+        ForwardContext,
+        forward_context,
+        get_forward_context,
+    )
+
+    monkeypatch.setattr(
+        forward_batch_info,
+        "get_parallel",
+        lambda: SimpleNamespace(attn_dp_size=dp_size, attn_cp_size=1),
+    )
+    monkeypatch.setattr(
+        moe_utils, "is_moe_input_scattered_across_dp_ranks", lambda: False
+    )
+    monkeypatch.setattr(layer_boundary, "batch_gathers_over_moe_cp", lambda _: False)
+    batch = _batch((1, 2, 3, 4, 5), (2,) * 5, non_padded=4, scalar=True)
+    stages = _split(batch)
+    seen = []
+
+    def observe(stage):
+        getter = get_forward_context().moe_num_token_non_padded
+        assert getter.__self__ is stage.forward_batch
+        bound, _ = resolve_routing_inputs(layer_id=0, is_draft=True)
+        # Native MoE dispatch cannot use one scalar after a DP gather.
+        expected_bound = (
+            None if dp_size > 1 else stage.forward_batch.num_token_non_padded
+        )
+        assert bound is expected_bound
+        seen.append(stage.forward_batch.global_num_token_non_padded_cpu)
+
+    def local_compute(*, stage, hidden_states, residual, **kwargs):
+        observe(stage)
+        if fails and stage.index == 1:
+            raise ValueError("attention failure")
+        return hidden_states, residual
+
+    pipeline = object.__new__(pipeline_mod.AFDAttentionPipeline)
+    pipeline._adapter = SimpleNamespace(
+        num_layers=1,
+        requires_token_ids=False,
+        prepare_stage=lambda *, stage: observe(stage),
+        local_compute=local_compute,
+        finish_layer=lambda *, ffn_output, residual, **kwargs: (ffn_output, residual),
+    )
+    pipeline._connector = SimpleNamespace(
+        transport=SimpleNamespace(
+            dispatch=lambda _: None,
+            receive_return=lambda _: None,
+            wait=lambda _: None,
+        )
+    )
+    parent = ForwardContext(
+        attn_backend=object(), moe_num_token_non_padded=batch.moe_num_token_non_padded
+    )
+    with forward_context(parent):
+        with (
+            pytest.raises(ValueError, match="attention failure")
+            if fails
+            else nullcontext()
+        ):
+            pipeline._run_layers(
+                stages=stages,
+                recv_buffers=[torch.ones(stage.rows, 4) for stage in stages],
+                participates=(True, True),
+            )
+        assert get_forward_context() is parent
+    assert seen == [3, 3, 1, 1]

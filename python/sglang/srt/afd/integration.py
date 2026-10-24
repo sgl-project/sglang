@@ -15,6 +15,7 @@ from sglang.srt.runtime_context import get_exec
 from .config import AFDConfig
 from .connector import AFDConnector
 from .contracts import AFDError, AFDModelAdapter, AFDRole, contract_digest
+from .expert_exchange import build_direct_exchange, validate_direct_backend
 from .pipeline import AFDAttentionPipeline, AFDFFNPipeline
 from .profiles import (
     ROLE_GRAPH_STRATEGY_ID,
@@ -42,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 # Incompatible profile, metadata, transport, graph, or lifecycle changes bump
 # this explicit protocol revision. Source-control coordinates are not protocol.
-_AFD_C1_ABI_REVISION = "afd-c1-abi-native-s2-startup-capture-r7"
+_AFD_C1_ABI_REVISION = "afd-c1-abi-native-s2-hash-ids-r8"
 _AFD_C1_ABI_CONTRACT = (
     "profile-factory-v1|native-s2-operations|fixed-stage-capture-plan|"
     "per-profile-metadata-contract|paired-lane-coordination-world|"
@@ -50,7 +51,8 @@ _AFD_C1_ABI_CONTRACT = (
     "whole-role-graph-with-captured-transport|close-ack-bounded-abort|"
     "ffn-router-ep-reduce-scatter|peer-major-hidden|"
     "step-is-extend-in-batch|"
-    "request-aligned-stage-buckets|startup-capture-ready|runtime-shared-graph-pool"
+    "request-aligned-stage-buckets|startup-capture-ready|runtime-shared-graph-pool|"
+    "profile-required-int64-input-ids-before-first-hidden-dispatch"
 )
 _AFD_C1_ABI = {
     "revision": _AFD_C1_ABI_REVISION,
@@ -70,6 +72,7 @@ def _model_descriptor(
     config: AFDConfig,
     dtype: Any,
     capture_sizes: tuple[int, ...],
+    direct_capability: dict | None = None,
 ) -> dict[str, Any]:
     value = str(dtype)
     runtime_contract = {
@@ -91,6 +94,12 @@ def _model_descriptor(
         ),
         "close_timeout_seconds": config.close_timeout_seconds,
     }
+    if direct_capability is not None and profile.model_family == "qwen3_moe":
+        runtime_contract["direct_execution"] = dict(
+            direct_capability,
+            eager_capacity=config.experimental_direct_stage_rows,
+            abi="native-nccl-rows-v3",
+        )
     descriptor = {
         "role": role.value,
         "execution_mode": role.value,
@@ -117,6 +126,13 @@ def _build_connector(
     base_hbm_bytes: int,
     capture_sizes: tuple[int, ...],
 ) -> AFDConnector:
+    direct_capability = validate_direct_backend(
+        config=config,
+        adapter=adapter,
+        model_family=factories.profile.model_family,
+        dtype=dtype,
+        capture_sizes=capture_sizes,
+    )
     topology = factories.make_topology(
         lanes=config.lanes,
         attention_lanes=config.attention_lanes,
@@ -134,9 +150,18 @@ def _build_connector(
             config=config,
             dtype=dtype,
             capture_sizes=capture_sizes,
+            direct_capability=direct_capability,
         ),
     )
+    capture_sizes = getattr(transport, "capture_sizes", capture_sizes)
+    if not hasattr(transport, "direct_selection_reason"):
+        transport.direct_selection_reason = direct_capability["reason"]
     try:
+        backend = build_direct_exchange(
+            transport=transport, adapter=adapter, config=config, device=device
+        )
+        if backend is not None:
+            base_hbm_bytes += backend.hbm_bytes
         graph_strategy = factories.make_graph_strategy(
             role=role,
             config=config,
@@ -196,6 +221,7 @@ def build_attention_pipeline(
         base_hbm_bytes=base_hbm_bytes,
         capture_sizes=capture_sizes,
     )
+    capture_sizes = connector.graph_strategy.capture_sizes
     return AFDAttentionPipeline(
         adapter=adapter,
         connector=connector,
@@ -234,6 +260,7 @@ def build_ffn_pipeline(
         base_hbm_bytes=0,
         capture_sizes=capture_sizes,
     )
+    capture_sizes = connector.graph_strategy.capture_sizes
     return AFDFFNPipeline(
         adapter=adapter,
         connector=connector,

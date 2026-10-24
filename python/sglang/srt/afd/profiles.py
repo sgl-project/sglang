@@ -20,6 +20,7 @@ from .contracts import (
     MetadataContract,
     contract_digest,
 )
+from .model_adapters.deepseek_v4 import DeepseekV4AFDAdapter, matches_deepseek_v4
 from .model_adapters.glm5 import Glm5AFDAdapter, matches_glm_moe_dsa
 from .model_adapters.qwen3_moe import Qwen3AFDAdapter, matches_qwen3_moe
 from .role_graph import AFDRoleGraphService, TorchRoleGraphDriver
@@ -27,6 +28,7 @@ from .transport import AFDPairedP2PTransport
 
 QWEN3_PAIRED_C1_ID = "qwen3-moe/paired/c1"
 GLM5_PAIRED_C1_ID = "glm-moe-dsa/paired/c1"
+DSV4_PAIRED_C1_ID = "deepseek-v4/paired/c1"
 ROLE_GRAPH_STRATEGY_ID = "whole-role-graph-with-captured-transport-v1"
 
 
@@ -60,6 +62,11 @@ class AFDCapabilityProfile:
             "fa_backends": list(self.fa_backends),
             "lanes": list(self.lanes),
             "attention_lane_policy": "positive-integer",
+            "ffn_lane_policy": (
+                "native-expert-placement"
+                if self.model_family == "qwen3_moe"
+                else "validated-profile-degrees"
+            ),
             "max_nodes": self.max_nodes,
             "cache_policy": self.cache_policy,
         }
@@ -79,7 +86,7 @@ class AFDCapabilityProfile:
                 "AFD_ATTENTION_BACKEND_UNSUPPORTED",
                 f"backend={config.attention_backend!r}",
             )
-        if config.lanes not in self.lanes:
+        if self.model_family != "qwen3_moe" and config.lanes not in self.lanes:
             raise AFDError(
                 "AFD_TOPOLOGY_LANE_COUNT_UNSUPPORTED",
                 f"lanes={config.lanes} admitted={self.lanes}",
@@ -140,11 +147,11 @@ class AFDCapabilityFactories:
         expected = topology.expected_parallelism(role=role)
         actual = (
             server_args.tp_size,
-            server_args.dp_size,
+            server_args.attn_dp_size,
             server_args.ep_size,
             getattr(server_args, "pp_size", 1),
         )
-        if actual != expected:
+        if actual != expected or server_args.dp_size != 1:
             raise AFDError(
                 "AFD_TOPOLOGY_PARALLELISM_MISMATCH",
                 (
@@ -166,12 +173,6 @@ class AFDCapabilityFactories:
                 "AFD_TOPOLOGY_ROLE_NODE_SPLIT_UNSUPPORTED",
                 f"role={role.value} role_size={role_size} "
                 f"nnodes={server_args.nnodes} max_nodes={self.profile.max_nodes}",
-            )
-        expects_dp = topology.expects_dp_attention(role=role)
-        if bool(getattr(server_args, "enable_dp_attention", False)) != expects_dp:
-            raise AFDError(
-                "AFD_TOPOLOGY_DP_ATTENTION_MISMATCH",
-                f"role={role.value} lanes={config.lanes} expected={expects_dp}",
             )
 
     def make_adapter(
@@ -216,7 +217,7 @@ QWEN3_PAIRED_C1 = AFDCapabilityProfile(
     transport_kind=("pynccl-p2p-dual-owned-streams-control-close-ack-bounded-abort-v1"),
     stage_plan="native-tbo-s2-lane-merged-return-v2",
     stages=(2,),
-    fa_backends=("fa3", "fa4"),
+    fa_backends=("fa3", "fa4", "trtllm_mha"),
     # Supported FFN degrees for the current native model/quantization paths;
     # these are not restrictions on the A/F topology or its ratio.
     lanes=(1, 2, 4, 8, 16, 32),
@@ -260,10 +261,35 @@ _GLM5_PAIRED_C1_FACTORIES = AFDCapabilityFactories(
     shape_factory=make_shape,
 )
 
+DSV4_PAIRED_C1 = AFDCapabilityProfile(
+    identity=DSV4_PAIRED_C1_ID,
+    model_family="deepseek_v4",
+    shape_contract="paired-lane-padded-stage-rows-v1",
+    metadata_contract=MetadataContract.PRIVATE_DSV4,
+    transport_kind="pynccl-p2p-dual-owned-streams-control-close-ack-bounded-abort-v1",
+    stage_plan="native-mhc-s2-real-hash-ids-lane-merged-return-v1",
+    stages=(2,),
+    fa_backends=("dsv4",),
+    lanes=(1, 2, 4, 8, 16, 32),
+    max_nodes=8,
+    cache_policy="native-capture-sizes-no-eviction-hard-hbm-v2",
+)
+
+_DSV4_PAIRED_C1_FACTORIES = AFDCapabilityFactories(
+    profile=DSV4_PAIRED_C1,
+    model_matcher=matches_deepseek_v4,
+    topology_factory=AFDPairedTopology.paired,
+    adapter_factory=DeepseekV4AFDAdapter,
+    transport_factory=AFDPairedP2PTransport,
+    graph_factory=_make_role_graph,
+    shape_factory=make_shape,
+)
+
 AFD_PROFILE_REGISTRY = MappingProxyType(
     {
         QWEN3_PAIRED_C1.identity: _QWEN3_PAIRED_C1_FACTORIES,
         GLM5_PAIRED_C1.identity: _GLM5_PAIRED_C1_FACTORIES,
+        DSV4_PAIRED_C1.identity: _DSV4_PAIRED_C1_FACTORIES,
     }
 )
 

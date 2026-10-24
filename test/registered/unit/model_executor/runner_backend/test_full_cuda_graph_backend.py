@@ -52,7 +52,11 @@ class _FakeGraphCtx:
 
 def _make_backend(runner):
     """Use the production constructor; replace only CUDA memory measurement."""
-    backend = FullCudaGraphBackend(runner)
+    with mock.patch(
+        "sglang.srt.model_executor.runner_backend.full_cuda_graph_backend.get_parallel",
+        return_value=SimpleNamespace(tp_group=SimpleNamespace(barrier=mock.Mock())),
+    ):
+        backend = FullCudaGraphBackend(runner)
     backend._precarve = SimpleNamespace(
         measure=contextlib.nullcontext, mint=mock.Mock()
     )
@@ -61,7 +65,6 @@ def _make_backend(runner):
     backend._memory_saver_adapter = None
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
-    backend._tp_group = SimpleNamespace(barrier=mock.Mock(name="barrier"))
     return backend
 
 

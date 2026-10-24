@@ -2663,6 +2663,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 config=config,
                 layer_id=layer_id,
                 quant_config=moe_quant_config_override or quant_config,
+                prefix=add_prefix("mlp", prefix),
             )
         elif self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
@@ -2720,11 +2721,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         return (
             declare_attn(output_transform=attn_output),
             declare_ffn(
-                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
+                # The AFD projection receives an already-reduced lane-local sum.
+                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn)
+                and afd_execution_mode() != AFDExecutionMode.ATTENTION,
                 next_layer_sparse=cls._is_layer_sparse(
                     config, layer_id + 1, is_nextn=False
                 ),
                 output_transform=output,
+                dense_tp_size=(
+                    1 if afd_execution_mode() == AFDExecutionMode.ATTENTION else None
+                ),
             ),
         )
 

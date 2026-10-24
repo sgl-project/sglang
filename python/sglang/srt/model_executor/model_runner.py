@@ -1145,7 +1145,7 @@ class ModelRunner:
             device=self.device,
             dtype=self.dtype,
             max_rows=self.max_running_requests,
-            lane=self.tp_rank,
+            lane=get_parallel().tp_rank,
         )
         self.model.model.set_afd_pipeline(self.afd_runtime)
 

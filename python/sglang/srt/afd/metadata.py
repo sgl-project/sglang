@@ -1,7 +1,7 @@
 """Attention-backend metadata ownership for AFD role-graph capture.
 
 One guard class per attention backend family. The guard owns the padded,
-address-stable ForwardBatch that a captured role graph is bound to, and it is
+address-stable ForwardBatch that a captured role graph is bound to, and
 delegates private metadata allocation and refresh to the backend, retaining
 stage activation and restoration here.
 """
@@ -38,7 +38,8 @@ def _update_padded_tensor(
             "AFD_PADDED_METADATA_ROWS_INVALID",
             f"source={source.shape[0]} rows={rows} capacity={target.shape[0]}",
         )
-    target.fill_(fill)
+    if rows < target.shape[0]:
+        target[rows:].fill_(fill)
     if rows:
         target[:rows].copy_(source)
 
@@ -82,6 +83,12 @@ class AFDPaddedStaticBatchGuard:
 
         raise NotImplementedError
 
+    @classmethod
+    def prepare_stage_metadata(
+        cls, *, backend: Any, metadata: Any, stage_index: int
+    ) -> None:
+        """Bind any backend-specific scratch needed outside graph capture."""
+
     @property
     def graph_forward_batch(self) -> Any:
         if self._capture_batch is None:
@@ -89,6 +96,8 @@ class AFDPaddedStaticBatchGuard:
         return self._capture_batch
 
     def _prepare_padded_batch(self, forward_batch: Any) -> None:
+        from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+
         validate_non_speculative_batch(forward_batch)
         real_requests = forward_batch.batch_size
         real_rows = real_requests
@@ -103,8 +112,23 @@ class AFDPaddedStaticBatchGuard:
                 f"ndim={forward_batch.positions.ndim}",
             )
         requests = self._bucket_rows
+        non_padded_tokens = TboForwardBatchPreparer._get_num_token_non_padded_cpu(
+            forward_batch
+        )
         if self._capture_batch is None:
             padded = copy.copy(forward_batch)
+            # Capture owns these scalar addresses. A later live stage must not
+            # replace them or retain a parent/S2 sibling's count storage.
+            global_count = forward_batch.global_num_token_non_padded
+            local_count = forward_batch.num_token_non_padded
+            if global_count is not None:
+                padded.global_num_token_non_padded = global_count.clone()
+            if local_count is not None:
+                padded.num_token_non_padded = (
+                    padded.global_num_token_non_padded
+                    if local_count is global_count
+                    else local_count.clone()
+                )
             for name in ("input_ids", "positions", "out_cache_loc"):
                 setattr(
                     padded,
@@ -154,8 +178,18 @@ class AFDPaddedStaticBatchGuard:
             if forward_batch.seq_lens_sum is None
             else forward_batch.seq_lens_sum + requests - real_requests
         )
+        if forward_batch.kv_loc_plan is not None:
+            self._backend.kv_index_translator.bind_runner_slots(padded)
+        padded.residual_stream = None
         padded.num_padding = requests - real_requests
-        padded.num_token_non_padded_cpu = real_rows
+        padded.global_num_token_non_padded_cpu = non_padded_tokens
+        if padded.global_num_token_non_padded is not None:
+            padded.global_num_token_non_padded.fill_(non_padded_tokens)
+        if (
+            padded.num_token_non_padded is not None
+            and padded.num_token_non_padded is not padded.global_num_token_non_padded
+        ):
+            padded.num_token_non_padded.fill_(non_padded_tokens)
         padded.forward_metadata_ready = False
         padded.forward_metadata_planned_bs = None
         padded.forward_metadata_planned_num_tokens = None
@@ -301,12 +335,79 @@ class FlashAttentionMetadataGuard(AFDPaddedStaticBatchGuard):
         raise exc
 
 
+class TRTLLMMHAMetadataGuard(FlashAttentionMetadataGuard):
+    """Own TRTLLM decode metadata and bind each stage's private scratch."""
+
+    # Padded stage ownership is shared with FA; the concrete backend identity
+    # and implementation remain peer-visible.
+    backends = ("trtllm_mha",)
+    backend_class = "sglang.srt.layers.attention.trtllm_mha_backend.TRTLLMHAAttnBackend"
+
+    @classmethod
+    def validate_backend(cls, backend: Any) -> tuple[Any, ...]:
+        identity = (
+            type(backend).__module__,
+            type(backend).__name__,
+            backend.prefill_attention_backend_str,
+            backend.decode_attention_backend_str,
+        )
+        if identity != (
+            "sglang.srt.layers.attention.trtllm_mha_backend",
+            "TRTLLMHAAttnBackend",
+            "trtllm_mha",
+            "trtllm_mha",
+        ):
+            raise AFDError("AFD_TRTLLM_METADATA_BACKEND_UNSUPPORTED", repr(identity))
+        backend.validate_interleaved_graph_support()
+        return identity
+
+    @classmethod
+    def prepare_stage_metadata(
+        cls, *, backend: Any, metadata: Any, stage_index: int
+    ) -> None:
+        # Prefill/extend stages need private scratch just like captured decode.
+        backend.bind_interleaved_stage_workspace(metadata, stage_index=stage_index)
+
+    def capture(self, forward_batch: Any) -> None:
+        if self._active:
+            raise AFDError("AFD_TRTLLM_METADATA_GUARD_REENTERED")
+        self._original_metadata = self._backend.forward_metadata
+        self._prepare_padded_batch(forward_batch)
+        self._active = True
+        try:
+            if self._snapshot is None:
+                self._snapshot = self._backend.create_graph_metadata_snapshot(
+                    self._capture_batch, stage_index=self._stage.index
+                )
+                self._capture_metadata = self._snapshot.metadata
+            else:
+                self._snapshot.refresh(self._capture_batch)
+        except BaseException:
+            self.restore()
+            raise
+
+    def _bind_in_graph(self) -> None:
+        self._snapshot.bind(self._capture_batch)
+
+    def assert_stable(self) -> None:
+        if self._snapshot is None or not self._snapshot.is_valid():
+            raise AFDError("AFD_TRTLLM_METADATA_CACHE_DRIFT")
+
+    @staticmethod
+    def _raise_backend_error(exc: Exception) -> None:
+        raise exc
+
+
 class DSAMetadataGuard(AFDPaddedStaticBatchGuard):
     """DSA capture against address-private graph state owned by this guard."""
 
     metadata_contract = MetadataContract.PRIVATE_DSA
     backends = ("nsa",)
     backend_class = "sglang.srt.layers.attention.dsa_backend.DeepseekSparseAttnBackend"
+
+    @classmethod
+    def prepare_stage_metadata(cls, *, backend, metadata, stage_index):
+        backend.bind_interleaved_stage_workspace(metadata, stage_index=stage_index)
 
     @classmethod
     def validate_backend(cls, backend: Any) -> tuple[Any, ...]:
@@ -348,6 +449,11 @@ class DSAMetadataGuard(AFDPaddedStaticBatchGuard):
                 )
                 if self._capture_metadata is None:
                     raise AFDError("AFD_DSA_METADATA_CAPTURE_MISSING")
+                self.prepare_stage_metadata(
+                    backend=self._backend,
+                    metadata=self._capture_metadata,
+                    stage_index=self._stage.index,
+                )
             else:
                 self.assert_stable()
                 self._refresh_private_metadata()
@@ -389,3 +495,187 @@ class DSAMetadataGuard(AFDPaddedStaticBatchGuard):
                 "AFD_DSA_METADATA_OWNERSHIP_LOST",
                 f"bucket_rows={self._bucket_rows}",
             )
+
+
+class DSV4MetadataGuard(AFDPaddedStaticBatchGuard):
+    """Keep raw decode operands private; record native materialization in graph.
+
+    V4's full metadata owns compressed page tables and lazy FlashMLA scheduling
+    buffers. Copying/replacing that object between replays loses captured
+    addresses. The native raw->full builder instead runs in each captured graph,
+    reading this guard's stable request/length/write-location tensors.
+    """
+
+    metadata_contract = MetadataContract.PRIVATE_DSV4
+    backends = ("dsv4",)
+    backend_class = (
+        "sglang.srt.layers.attention.deepseek_v4_backend.DeepseekV4AttnBackend"
+    )
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._raw_metadata = None
+        self._raw_addresses = None
+        self._saved_backend_state = None
+
+    @classmethod
+    def validate_backend(cls, backend: Any) -> tuple[Any, ...]:
+        identity = (type(backend).__module__, type(backend).__name__)
+        if (
+            identity
+            != (
+                "sglang.srt.layers.attention.deepseek_v4_backend",
+                "DeepseekV4AttnBackend",
+            )
+            or backend.trtllm_attn
+            or backend.mega_attn
+        ):
+            raise AFDError("AFD_DSV4_METADATA_BACKEND_UNSUPPORTED", repr(identity))
+        return (*identity, "dsv4", "dsv4")
+
+    @classmethod
+    def initialize_shared_state(cls, *, backend: Any, max_rows: int) -> int:
+        backend.init_cuda_graph_state(max_rows, max_rows)
+        return 0
+
+    def _save_backend(self) -> None:
+        self._original_metadata = self._backend.forward_metadata
+        self._saved_backend_state = tuple(
+            getattr(self._backend, name)
+            for name in ("tail_forward_metadata", "encoder_replay", "encoder_row_floor")
+        )
+
+    def _refresh_raw(self, forward_batch: Any) -> None:
+        self._prepare_padded_batch(forward_batch)
+        if not self._capture_batch.forward_mode.is_decode_or_idle():
+            raise AFDError("AFD_DSV4_GRAPH_DECODE_REQUIRED")
+        raw = self._backend._build_forward_metadata(self._capture_batch)
+        if type(raw).__name__ != "DSV4RawDecodeMetadata":
+            raise AFDError("AFD_DSV4_RAW_DECODE_METADATA_REQUIRED")
+        if self._raw_metadata is None:
+            self._raw_metadata = raw
+            self._raw_addresses = self._addresses()
+        else:
+            self._raw_metadata.copy_(raw)
+
+    def _addresses(self) -> tuple[Any, ...]:
+        return tuple(
+            (id(tensor), tensor.data_ptr(), tuple(tensor.shape), tensor.dtype)
+            for tensor in (
+                self._raw_metadata.req_pool_indices,
+                self._raw_metadata.seq_lens,
+                self._raw_metadata.out_cache_loc,
+            )
+        )
+
+    def capture(self, forward_batch: Any) -> None:
+        if self._active:
+            raise AFDError("AFD_DSV4_METADATA_GUARD_REENTERED")
+        self._save_backend()
+        self._active = True
+        try:
+            self._refresh_raw(forward_batch)
+        except BaseException:
+            self.restore()
+            raise
+
+    def _bind_in_graph(self) -> None:
+        # Called for every native warmup/capture invocation. Always regenerate
+        # from raw so materialization belongs to the graph, not just warmup.
+        for name in ("freqs_cis_c4", "freqs_cis_c128"):
+            self._capture_batch.__dict__.pop(name, None)
+        self._backend.forward_metadata = self._raw_metadata
+        self._backend.init_forward_metadata_in_graph(self._capture_batch)
+        self._capture_metadata = self._backend.forward_metadata
+        self._stage.attention_metadata = self._capture_metadata
+
+    def prepare_replay(self, forward_batch: Any) -> None:
+        self.assert_stable()
+        self._save_backend()
+        self._active = True
+        try:
+            self._refresh_raw(forward_batch)
+        except BaseException:
+            self.restore()
+            raise
+
+    def assert_stable(self) -> None:
+        if self._raw_metadata is None or self._addresses() != self._raw_addresses:
+            raise AFDError("AFD_DSV4_METADATA_ADDRESS_DRIFT")
+
+    def restore(self) -> None:
+        active = self._active
+        super().restore()
+        if active and self._saved_backend_state is not None:
+            (
+                self._backend.tail_forward_metadata,
+                self._backend.encoder_replay,
+                self._backend.encoder_row_floor,
+            ) = self._saved_backend_state
+            if self._backend.forward_metadata is not None:
+                self._backend._activate_request_window()
+        self._saved_backend_state = None
+
+    def _release_metadata(self) -> None:
+        self._raw_metadata = self._raw_addresses = None
+
+
+class DSV4TRTLLMMetadataGuard(DSV4MetadataGuard):
+    """Native sparse TRTLLM metadata with stage-private execution scratch."""
+
+    backend_class = (
+        "sglang.srt.layers.attention.deepseek_v4_trtllm_backend."
+        "DeepseekV4TrtllmAttnBackend"
+    )
+
+    @classmethod
+    def validate_backend(cls, backend):
+        identity = (type(backend).__module__, type(backend).__name__)
+        if (
+            ".".join(identity) != cls.backend_class
+            or not backend.trtllm_attn
+            or backend.mega_attn
+        ):
+            raise AFDError("AFD_DSV4_METADATA_BACKEND_UNSUPPORTED", repr(identity))
+        return (*identity, "dsv4", "dsv4")
+
+    @classmethod
+    def prepare_stage_metadata(cls, *, backend, metadata, stage_index):
+        backend.bind_interleaved_stage_workspace(metadata, stage_index=stage_index)
+
+    def capture(self, forward_batch):
+        # Allocate before entering CUDA capture, including the first bucket.
+        self._backend.prepare_interleaved_stage(self._stage.index)
+        super().capture(forward_batch)
+
+    def _bind_in_graph(self):
+        super()._bind_in_graph()
+        self.prepare_stage_metadata(
+            backend=self._backend,
+            metadata=self._capture_metadata,
+            stage_index=self._stage.index,
+        )
+
+
+def metadata_guard_for_backend(
+    backend: str | None, *, default_guard: type[AFDPaddedStaticBatchGuard]
+) -> type[AFDPaddedStaticBatchGuard]:
+    """Select a backend implementation within the model's metadata contract."""
+    if default_guard.metadata_contract is MetadataContract.PRIVATE_DSV4:
+        from sglang.srt.runtime_context import get_exec
+
+        if get_exec().kernel.dsv4_attn_backend == "trtllm":
+            return DSV4TRTLLMMetadataGuard
+    for guard in (
+        FlashAttentionMetadataGuard,
+        TRTLLMMHAMetadataGuard,
+        DSAMetadataGuard,
+        DSV4MetadataGuard,
+    ):
+        if (
+            guard.metadata_contract is default_guard.metadata_contract
+            and backend in guard.backends
+        ):
+            return guard
+    # Retain the contract's validator and error for unsupported backends.
+    return default_guard

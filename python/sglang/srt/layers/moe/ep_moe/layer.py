@@ -30,7 +30,7 @@ from sglang.srt.layers.moe.topk import (
     TopKOutputChecker,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -106,8 +106,14 @@ class DeepEPMoE(FusedMoE):
             self.deprecate_flag = True
         elif _is_npu:
             self.deprecate_flag = True
-        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
-            quant_config, Fp8Config
+        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and (
+            isinstance(quant_config, Fp8Config)
+            or (
+                isinstance(self.quant_method, Fp8MoEMethod)
+                and self.quant_method.block_quant
+                and getattr(self.quant_method, "_owns_moe_runner", False)
+                and self.quant_method.runner.runner_backend.is_deep_gemm()
+            )
         ):
             self.deprecate_flag = True
         elif (

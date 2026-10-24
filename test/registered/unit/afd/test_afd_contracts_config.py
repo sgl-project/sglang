@@ -317,7 +317,7 @@ def test_join_s2_rejects_residual_identity_or_shape_drift(rows, residuals, code)
         ),
         ({"moe_a2a_backend": "deepep"}, "AFD_INTERNAL_COLLECTIVE_UNSUPPORTED"),
         ({"speculative_algorithm": "EAGLE"}, "AFD_MTP_SPECULATIVE_UNSUPPORTED"),
-        ({"enable_dp_attention": True}, "AFD_TOPOLOGY_DP_ATTENTION_MISMATCH"),
+        ({"attn_dp_size": 2}, "AFD_TOPOLOGY_PARALLELISM_MISMATCH"),
     ],
 )
 def test_startup_exclusions_fail_closed(overrides, code):
@@ -329,12 +329,7 @@ def test_startup_exclusions_fail_closed(overrides, code):
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
 def test_cpu_overlap_schedule_is_admitted(role):
-    """Overlap is a supported configuration, not an excluded family.
-
-    Asserted positively because lifting the old refusal removed the only
-    reference to this behaviour, so a regression that restored the raise would
-    otherwise leave the suite green.
-    """
+    """Both roles accept CPU scheduling overlap."""
 
     config.validate_afd_server_args(
         _server_args(afd_execution_mode=role, disable_overlap_schedule=False)
@@ -345,7 +340,8 @@ def _role_args(role, lanes=1, attention_lanes=None, **overrides):
     width = lanes if role == "ffn" else (attention_lanes or lanes)
     values = dict(
         tp_size=width,
-        dp_size=width if role == "attention" else 1,
+        dp_size=1,
+        attn_dp_size=width if role == "attention" else 1,
         ep_size=lanes if role == "ffn" else 1,
         enable_dp_attention=role == "attention" and width > 1,
     )
@@ -362,10 +358,11 @@ def _role_args(role, lanes=1, attention_lanes=None, **overrides):
 def test_startup_parallelism_matches_each_roles_width(role, lanes, attention_lanes):
     args = _role_args(role, lanes, attention_lanes)
     config.validate_afd_server_args(args)
-    args.enable_dp_attention = not args.enable_dp_attention
-    with pytest.raises(contracts.AFDError, match="AFD_TOPOLOGY_DP_ATTENTION_MISMATCH"):
+    width = args.attn_dp_size
+    args.attn_dp_size = 1 if width > 1 else 2
+    with pytest.raises(contracts.AFDError, match="AFD_TOPOLOGY_PARALLELISM_MISMATCH"):
         config.validate_afd_server_args(args)
-    args.enable_dp_attention = not args.enable_dp_attention
+    args.attn_dp_size = width
     if attention_lanes is not None:
         args.tp_size = lanes if role == "attention" else attention_lanes
         if role == "attention":
@@ -380,16 +377,19 @@ def test_startup_parallelism_matches_each_roles_width(role, lanes, attention_lan
         config.validate_afd_server_args(args)
 
 
-def test_lane_count_outside_admitted_range_fails_config_validation():
-    """The config gate bounds lanes; the per-profile lane list stays authoritative."""
-
-    for lanes in (0, 33):
+def test_qwen_lane_count_uses_native_placement_not_a_topology_allowlist():
+    for lanes in (0, -1, True, 1.5):
         with pytest.raises(contracts.AFDError, match="AFD_GRAPH_LANE_COUNT_INVALID"):
             config.AFDConfig(lanes=lanes).validate()
-    # Three lanes clear the cheap bound but no profile admits them.
-    config.AFDConfig(lanes=3).validate()
+    for lanes in (3, 33):
+        candidate = config.AFDConfig(lanes=lanes)
+        candidate.validate()
+        profiles.QWEN3_PAIRED_C1.validate_shape(config=candidate)
+    # Other families retain their independently qualified profile degrees.
     with pytest.raises(contracts.AFDError, match="AFD_TOPOLOGY_LANE_COUNT_UNSUPPORTED"):
-        profiles.QWEN3_PAIRED_C1.validate_shape(config=config.AFDConfig(lanes=3))
+        profiles.GLM5_PAIRED_C1.validate_shape(
+            config=config.AFDConfig(lanes=3, attention_backend="nsa")
+        )
 
 
 @pytest.mark.parametrize("value", [0, -1, True, 5.0, "7"])
@@ -566,7 +566,7 @@ def _ffn_lane_harness(monkeypatch, *, lanes, tp_rank=None):
 
 
 def test_single_lane_ffn_still_serves_in_process(monkeypatch):
-    """The measured 1A1F path must not acquire a process fork."""
+    """Single-lane FFN startup runs in the current process."""
 
     server_args, calls = _ffn_lane_harness(monkeypatch, lanes=1, tp_rank=0)
     monkeypatch.setattr(
@@ -755,7 +755,7 @@ def test_default_graph_contract_is_bounded():
 
     value = config.AFDConfig()
     assert value.stages == 2
-    assert value.attention_backend == "fa3"
+    assert value.attention_backend == "trtllm_mha"
     assert value.close_timeout_seconds == 30
     assert value.nccl_num_channels == 8
     with pytest.raises(contracts.AFDError, match="CLOSE_TIMEOUT_INVALID"):
@@ -797,22 +797,26 @@ def _qwen_model(*, hidden_size=2048, num_hidden_layers=48):
     return model
 
 
-def test_model_adapter_accepts_only_admitted_qwen3_moe_identities(monkeypatch):
-    """Validated Qwen3-MoE shapes pass; a nearby size fails before any allocation."""
+def test_model_adapter_uses_native_qwen_geometry_and_rejects_invalid_geometry(
+    monkeypatch,
+):
+    """Geometry is native, while impossible expert/top-k geometry fails closed."""
 
     base = sys.modules[qwen3.Qwen3AFDAdapter.__mro__[1].__module__]
     cfg = SimpleNamespace(attn_cp_size=1, attn_dcp_size=1, enable_prefill_cp=False)
     monkeypatch.setattr(base, "get_parallel", lambda: cfg)
-    for layers, hidden in ((48, 2048), (94, 4096)):
+    for layers, hidden in ((48, 2048), (94, 4096), (48, 4096), (12, 1024)):
         qwen3.Qwen3AFDAdapter(
             role=contracts.AFDRole.FFN,
             model=_qwen_model(num_hidden_layers=layers, hidden_size=hidden),
             attention_backend=None,
         ).validate_model()
+    invalid = _qwen_model()
+    invalid.model.config.num_experts_per_tok = 129
     with pytest.raises(contracts.AFDError, match="QWEN3_MOE_REQUIRED"):
         qwen3.Qwen3AFDAdapter(
             role=contracts.AFDRole.FFN,
-            model=_qwen_model(hidden_size=4096),
+            model=invalid,
             attention_backend=None,
         ).validate_model()
 
@@ -877,7 +881,7 @@ def test_peer_runtime_capability_drift_fails_before_nccl_construction():
 
     attention_adapter = _qwen_adapter(contracts.AFDRole.ATTENTION)
     ffn_adapter = _qwen_adapter(contracts.AFDRole.FFN)
-    local_config = config.AFDConfig()
+    local_config = config.AFDConfig(attention_backend="fa3")
     attention_descriptor = _model_descriptor(
         adapter=attention_adapter,
         config=local_config,
@@ -926,13 +930,13 @@ def test_runtime_fa_backend_must_match_configured_peer_capability():
         )
     descriptor = _model_descriptor(
         adapter=attention_adapter,
-        config=config.AFDConfig(),
+        config=config.AFDConfig(attention_backend="fa3"),
     )
     runtime = descriptor["runtime_contract"]
     assert "base_identity" not in runtime
     assert runtime["capability_profile"] == profiles.QWEN3_PAIRED_C1.contract()
     assert runtime["capability_profile_digest"] == profiles.QWEN3_PAIRED_C1.digest
-    assert runtime["afd_abi"]["revision"] == "afd-c1-abi-native-s2-startup-capture-r7"
+    assert runtime["afd_abi"]["revision"] == "afd-c1-abi-native-s2-hash-ids-r8"
     assert len(runtime["afd_abi"]["contract_digest"]) == 64
 
 
@@ -970,10 +974,12 @@ def test_capability_registry_holds_one_profile_per_family_and_rejects_unknown():
     assert tuple(profiles.AFD_PROFILE_REGISTRY) == (
         profiles.QWEN3_PAIRED_C1_ID,
         profiles.GLM5_PAIRED_C1_ID,
+        profiles.DSV4_PAIRED_C1_ID,
     )
     assert profiles.registered_capability_profiles() == (
         profiles.QWEN3_PAIRED_C1,
         profiles.GLM5_PAIRED_C1,
+        profiles.DSV4_PAIRED_C1,
     )
     assert profiles.QWEN3_PAIRED_C1.digest != profiles.GLM5_PAIRED_C1.digest
     assert profiles.QWEN3_PAIRED_C1.model_family == "qwen3_moe"
@@ -982,7 +988,7 @@ def test_capability_registry_holds_one_profile_per_family_and_rejects_unknown():
         profiles.GLM5_PAIRED_C1.metadata_contract
         is contracts.MetadataContract.PRIVATE_DSA
     )
-    assert profiles.QWEN3_PAIRED_C1.fa_backends == ("fa3", "fa4")
+    assert profiles.QWEN3_PAIRED_C1.fa_backends == ("fa3", "fa4", "trtllm_mha")
     assert profiles.GLM5_PAIRED_C1.fa_backends == ("nsa",)
     server_args = _server_args()
     assert profiles.validate_startup_capabilities(
@@ -1269,7 +1275,7 @@ def test_an_ffn_split_that_would_strand_a_lane_fails_closed(
 
 @pytest.mark.parametrize("role", ["attention", "ffn"])
 @pytest.mark.parametrize("runner", ["triton", "deep_gemm"])
-def test_afd_config_preserves_community_moe_runner_option(role, runner):
+def test_afd_config_preserves_native_moe_runner_option(role, runner):
     cfg = config.AFDConfig.from_json(
         json.dumps(
             {

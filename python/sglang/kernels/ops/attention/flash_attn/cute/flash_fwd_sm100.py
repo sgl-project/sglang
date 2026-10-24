@@ -35,6 +35,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic
 import cutlass.utils.blockscaled_layout as blockscaled_layout
 from cutlass import Boolean, Float32, Int32, Int64, const_expr, pipeline
 from cutlass.base_dsl.arch import Arch
+from cutlass.base_dsl.typing import get_mlir_types
 from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import BaseDSL
@@ -195,7 +196,16 @@ class DescaleTensors(NamedTuple):
     v_descale: Optional[cute.Tensor] = None
 
     def __new_from_mlir_values__(self, values):
-        return DescaleTensors(*((*values, None, None, None)[:3]))
+        # DSL flattening omits None fields and a tensor may own several IR
+        # values. Rebuild each field from its template instead of shifting
+        # the flattened values into Q/K/V positions.
+        fields = []
+        for template in self:
+            count = len(get_mlir_types(template))
+            fields.append(cutlass.new_from_mlir_values(template, values[:count]))
+            values = values[count:]
+        assert not values, "Unexpected trailing descale IR values"
+        return DescaleTensors(*fields)
 
 
 class SfS2TCopies(NamedTuple):
@@ -3952,7 +3962,14 @@ class FlashAttentionForwardSm100:
             rescale_threshold = (
                 8.0
                 if const_expr(self.v_mma_dtype.width == 16)
-                else 4.0 if const_expr(self.v_mma_dtype.width == 8) else 0.0
+                # E4M3 P has only log2(448 / 2**8) bits of headroom.
+                # Skipping a max update by up to 4 bits can overflow P.
+                else 4.0
+                if const_expr(
+                    self.v_mma_dtype.width == 8
+                    and self.v_mma_dtype != cutlass.Float8E4M3FN
+                )
+                else 0.0
             )
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2_eff,

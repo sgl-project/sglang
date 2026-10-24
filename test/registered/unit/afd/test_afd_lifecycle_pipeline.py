@@ -180,7 +180,7 @@ def test_48_layer_qwen_callback_trace_is_stage_wise_wavefront(stages):
 
 
 def test_connector_rejects_aliased_a2e_e2a_streams():
-    """The old optional-own-stream flag must not reappear as an aliasing route."""
+    """A2F and F2A communication require distinct streams."""
 
     graph = role_service(role=contracts.AFDRole.ATTENTION, num_layers=1)[1]
     with pytest.raises(RuntimeError, match="DISTINCT_STREAMS_REQUIRED"):
@@ -235,7 +235,7 @@ class FlashAttentionBackend:
 
     def init_forward_metadata_out_graph(self, forward_batch, in_capture):
         self.out_graph_calls.append((forward_batch.batch_size, in_capture))
-        rows = forward_batch.num_token_non_padded_cpu
+        rows = forward_batch.global_num_token_non_padded_cpu
         self.metadata_values.append(
             (
                 tuple(forward_batch.req_pool_indices.tolist()[:rows]),
@@ -287,8 +287,11 @@ def fa_backend(monkeypatch):
 
 
 def _forward_batch(rows, *, offset=0):
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
     values = list(range(offset + 1, offset + rows + 1))
-    return SimpleNamespace(
+    return ForwardBatch(
+        forward_mode=ForwardMode.DECODE,
         batch_size=rows,
         input_ids=torch.tensor(values),
         positions=torch.tensor(values),
@@ -297,7 +300,8 @@ def _forward_batch(rows, *, offset=0):
         seq_lens_cpu=None,
         seq_lens_sum=sum(values),
         out_cache_loc=torch.tensor(values),
-        num_token_non_padded_cpu=rows,
+        kv_loc_plan=None,
+        global_num_token_non_padded_cpu=rows,
         forward_metadata_ready=False,
         forward_metadata_planned_bs=None,
         forward_metadata_planned_num_tokens=None,

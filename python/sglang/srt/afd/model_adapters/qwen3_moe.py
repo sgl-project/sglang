@@ -4,23 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..metadata import FlashAttentionMetadataGuard
 from .base import AFDDecoderAdapter
 
-# One AFD path serves every Qwen3MoeForCausalLM checkpoint, so the gate is an
-# explicit set of validated shapes rather than a single parameter count.
-_QWEN3_MOE_IDENTITIES = frozenset(
-    {
-        # Qwen3-30B-A3B
-        (48, 2048, 128, 8),
-        # Qwen3-235B-A22B
-        (94, 4096, 128, 8),
-    }
-)
+# Geometry comes from the native configuration; operator/placement admission
+# is checked separately by the selected execution backend.
 
 
 def matches_qwen3_moe(model: Any) -> bool:
-    """Return whether a model has an admitted C1 Qwen3-MoE identity."""
+    """Return whether a model has an admitted Qwen3-MoE identity."""
 
     try:
         config = model.model.config
@@ -34,12 +25,12 @@ def matches_qwen3_moe(model: Any) -> bool:
         return False
     return (
         type(model).__name__ == "Qwen3MoeForCausalLM"
-        and actual in _QWEN3_MOE_IDENTITIES
+        and all(type(value) is int and value > 0 for value in actual)
+        and config.num_experts_per_tok <= config.num_experts
     )
 
 
 class Qwen3AFDAdapter(AFDDecoderAdapter):
-    guard_class = FlashAttentionMetadataGuard
     family_error = "AFD_QWEN3_MOE_REQUIRED"
 
     def matches_family(self) -> bool:

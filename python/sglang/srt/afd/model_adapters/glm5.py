@@ -120,6 +120,7 @@ class Glm5AFDAdapter(AFDDecoderAdapter):
                 "AFD_GLM_DSA_STAGE_STATE_MISSING",
                 f"stage={stage.index}",
             )
+        self._start_attention_layer(layer, stage, hidden_states, residual)
         decoder_layer = self.inner.layers[layer]
         attention = decoder_layer.self_attn
         consumes = bool(getattr(attention, "skip_topk", None))

@@ -35,6 +35,7 @@ def _shared_step(descriptor: AFDStepDescriptor) -> tuple[Any, ...]:
         descriptor.num_layers,
         descriptor.is_extend_in_batch,
         descriptor.tokens_per_request,
+        descriptor.uses_direct,
     )
 
 
@@ -53,7 +54,6 @@ class _AFDControlChannels:
 
     def _channel(self, src: int, dst: int) -> Any:
         import torch
-
         from sglang.srt.distributed.utils import StatelessProcessGroup
 
         edge = (src, dst)
@@ -217,7 +217,6 @@ class AFDPairedP2PTransport:
         lane: int = 0,
     ) -> None:
         import torch
-
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
         )
@@ -330,6 +329,7 @@ class AFDPairedP2PTransport:
         self._retime_control_store(config.rendezvous_timeout_seconds)
         self._close_timeout_seconds = config.close_timeout_seconds
         self._closed = False
+        self.direct = None
         self._stats = {
             "a2e_send": 0,
             "a2e_recv": 0,
@@ -377,19 +377,50 @@ class AFDPairedP2PTransport:
                 or item["execution_mode"] != item["role"]
             ):
                 raise AFDError("AFD_TRANSPORT_CAPABILITY_DIGEST_INVALID")
+        contracts = [item["runtime_contract"] for item in descriptors]
+        self.direct_enabled = False
+        self.capture_sizes = tuple(
+            local_descriptor["runtime_contract"]["capture_stage_sizes"]
+        )
+        direct_offers = ["direct_execution" in contract for contract in contracts]
+        if any(direct_offers):
+            if not all(direct_offers):
+                raise AFDError("AFD_DIRECT_PROTOCOL_MISMATCH")
+            from .expert_exchange import negotiate_direct_capabilities
+
+            plan = negotiate_direct_capabilities(descriptors)
+            self.direct_enabled = plan["enabled"]
+            self.direct_selection_reason = plan["reason"]
+            self.capture_sizes = plan["capture_sizes"]
+            self.direct_buffer_sizes = plan["buffer_sizes"]
+            # Hashes above authenticate each role's own offer. The following
+            # comparison is over the resolved wire/graph plan, not user knobs
+            # that F would otherwise have to repeat by hand.
+            contracts = [dict(c) for c in contracts]
+            attention_contracts = [
+                d["runtime_contract"]["attention"]
+                for d in descriptors
+                if d["role"] == AFDRole.ATTENTION.value
+            ]
+            if any(c != attention_contracts[0] for c in attention_contracts):
+                raise AFDError("AFD_ATTENTION_CAPABILITY_MISMATCH")
+            for contract in contracts:
+                contract.pop("direct_execution")
+                contract["capture_stage_sizes"] = self.capture_sizes
+                contract["attention"] = attention_contracts[0]
         invariant_fields = (
             "model_family",
             "num_layers",
             "hidden_size",
             "dtype",
-            "runtime_contract",
-            "runtime_contract_digest",
         )
         drift = {
             field: tuple(item[field] for item in descriptors)
             for field in invariant_fields
             if any(item[field] != local_descriptor[field] for item in descriptors)
         }
+        if any(c != contracts[0] for c in contracts):
+            drift["runtime_contract"] = tuple(contracts)
         if (
             roles != {AFDRole.ATTENTION.value, AFDRole.FFN.value}
             or local_descriptor not in descriptors
@@ -530,6 +561,7 @@ class AFDPairedP2PTransport:
                 dtype=received[0].dtype,
                 num_layers=received[0].num_layers,
                 is_extend_in_batch=received[0].is_extend_in_batch,
+                uses_direct=received[0].uses_direct,
                 tokens_per_request=received[0].tokens_per_request,
                 graph_eligible=all(item.graph_eligible for item in received),
                 # The leader lane's, because only one can be carried and the
@@ -805,12 +837,21 @@ class AFDPairedP2PTransport:
         hidden_size: int,
         dtype: Any,
         retain: bool,
+        include_input_ids: bool = False,
     ) -> tuple[Any, ...]:
-        identity = (capacities, hidden_size, dtype, self._device)
+        identity = (capacities, hidden_size, dtype, self._device, include_input_ids)
 
         def allocate():
-            return tuple(
+            hidden = tuple(
                 self._torch.empty((rows, hidden_size), dtype=dtype, device=self._device)
+                for rows in capacities
+            )
+            if not include_input_ids:
+                return hidden
+            return hidden + tuple(
+                self._torch.empty(
+                    (rows, 1), dtype=self._torch.int64, device=self._device
+                )
                 for rows in capacities
             )
 
@@ -867,9 +908,18 @@ class AFDPairedP2PTransport:
     def close(self) -> dict[str, Any]:
         if self._closed:
             return dict(self._stats)
+        backend_error = None
+        backend = getattr(self, "direct", None)
+        if backend is not None:
+            try:
+                backend.close(seconds=self._close_timeout_seconds)
+            except BaseException as exc:
+                backend_error = exc
         outcomes: dict[str, BaseException | None] = {}
         threads = []
         communicators = (("a2e", self._a2e), ("e2a", self._e2a))
+        if backend is not None:
+            communicators += tuple(backend.communicators)
 
         # ncclCommAbort can block indefinitely when the peer is already gone, and a
         # synchronous C call cannot be interrupted. Running it on a joinable worker
@@ -914,6 +964,7 @@ class AFDPairedP2PTransport:
         self._a2e = None
         self._e2a = None
         self._control = None
+        self.direct = None
         self._closed = True
         if timed_out:
             raise AFDError(
@@ -925,4 +976,6 @@ class AFDPairedP2PTransport:
                 "AFD_TRANSPORT_NATIVE_CLOSE_FAILED",
                 f"communicators={failed!r}",
             ) from outcomes[failed[0]]
+        if backend_error is not None:
+            raise backend_error
         return dict(self._stats)

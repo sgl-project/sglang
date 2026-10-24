@@ -59,8 +59,14 @@ class AFDConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields
     """The sole AFD feature config; all retained allocation is bounded here."""
 
     stages: int = 2
+    experimental_direct_transport: str = "nccl"
+    # None is the capability-based default. An explicit legacy false still
+    # selects the fixed F path, including when the new selector is omitted.
+    experimental_direct: bool | None = None
+    ffn_backend: str = "auto"
+    experimental_direct_stage_rows: int = 32
     max_hbm_bytes: int = 8 * 1024 * 1024 * 1024
-    attention_backend: str = "fa3"
+    attention_backend: str = "trtllm_mha"
     lanes: int = 1
     # FFN ranks are `lanes`; attention ranks are independent positive integers.
     # None selects the symmetric layout. Model/parallelism checks still apply.
@@ -96,6 +102,12 @@ class AFDConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields
 
         return (self.attention_lane_count + self.lanes - 1) // self.lanes
 
+    @property
+    def direct_mode(self) -> str:
+        if self.experimental_direct is not None:
+            return "direct" if self.experimental_direct else "fixed"
+        return self.ffn_backend
+
     @classmethod
     def from_json(cls, value: str) -> AFDConfig:
         try:
@@ -106,6 +118,23 @@ class AFDConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields
         return config
 
     def validate(self) -> None:
+        if self.experimental_direct_transport not in ("nccl",) or (
+            self.experimental_direct_transport != "nccl"
+            and not self.experimental_direct
+        ):
+            raise AFDError("AFD_DIRECT_TRANSPORT_UNSUPPORTED")
+        if (
+            self.experimental_direct is not None
+            and type(self.experimental_direct) is not bool
+        ):
+            raise AFDError("AFD_DIRECT_CONFIG_INVALID")
+        if self.ffn_backend not in ("auto", "fixed", "direct"):
+            raise AFDError("AFD_FFN_BACKEND_INVALID")
+        if (
+            type(self.experimental_direct_stage_rows) is not int
+            or self.experimental_direct_stage_rows < 1
+        ):
+            raise AFDError("AFD_DIRECT_CAPACITY_INVALID")
         if self.stages != 2:
             raise AFDError(
                 "AFD_GRAPH_STAGE_COUNT_UNSUPPORTED",
@@ -121,7 +150,7 @@ class AFDConfig(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields
                 "AFD_GRAPH_FA_BACKEND_INVALID",
                 f"attention_backend={self.attention_backend!r}",
             )
-        if self.lanes < 1 or self.lanes > _max_admitted_lanes():
+        if type(self.lanes) is not int or self.lanes < 1:
             raise AFDError(
                 "AFD_GRAPH_LANE_COUNT_INVALID",
                 f"lanes={self.lanes}",
@@ -233,11 +262,17 @@ def validate_afd_server_args(server_args: Any) -> None:
         raise AFDError("AFD_TBO_UNSUPPORTED")
     if server_args.enable_single_batch_overlap:
         raise AFDError("AFD_SINGLE_BATCH_OVERLAP_UNSUPPORTED")
-    if server_args.moe_a2a_backend != "none":
+    dsv4_ffn_megamoe = (
+        mode == AFDExecutionMode.FFN
+        and config.attention_backend == "dsv4"
+        and server_args.moe_a2a_backend == "megamoe"
+        and getattr(server_args, "moe_runner_backend", None) == "deep_gemm"
+    )
+    if server_args.moe_a2a_backend != "none" and not dsv4_ffn_megamoe:
         raise AFDError(
             "AFD_INTERNAL_COLLECTIVE_UNSUPPORTED",
             f"role={mode.value} moe_a2a_backend={server_args.moe_a2a_backend!r} "
-            "expected='none'",
+            "expected='none' or the DSV4 FFN MegaMoE/DeepGEMM row adapter",
         )
     if (
         server_args.speculative_algorithm is not None

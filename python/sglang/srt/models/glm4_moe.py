@@ -49,6 +49,7 @@ from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
     declare_ffn,
+    get_attn_tp_context,
     is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -89,7 +90,9 @@ from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2ForCausalLM,
+    DeepseekV2MLP,
     DeepseekV2Model,
+    MoEGate,
 )
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
 from sglang.srt.runtime_context import (
@@ -1293,7 +1296,63 @@ class Glm4MoeForCausalLM(nn.Module):
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-def make_glm_dsa_attention_mlp(*, config, layer_id, quant_config):
+class Glm5AFDRouterShared(nn.Module):
+    """Native GLM router/shared expert on A; routed expert storage remains on F."""
+
+    def __init__(self, config, layer_id, quant_config, prefix):
+        super().__init__()
+        from sglang.srt.layers.moe import MoeRunnerBackend
+        from sglang.srt.layers.moe.topk import TopKOutputFormat
+
+        if (
+            config.hidden_size != 6144
+            or config.n_routed_experts != 256
+            or config.moe_intermediate_size != 2048
+            or config.num_experts_per_tok != 8
+            or config.n_shared_experts != 1
+            or config.routed_scaling_factor != 2.5
+            or config.hidden_act != "silu"
+        ):
+            raise RuntimeError("AFD_M2N_GLM5_ROUTER_SHARED_LAYOUT_REQUIRED")
+        self.gate = MoEGate(
+            config=config, quant_config=quant_config, prefix=add_prefix("gate", prefix)
+        )
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            layer_id=layer_id,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            topk_group=config.topk_group,
+            scoring_func=config.scoring_func,
+            correction_bias=self.gate.e_score_correction_bias,
+            quant_config=quant_config,
+            routed_scaling_factor=config.routed_scaling_factor,
+            # M2N AG applies routed scale. Shared output is added afterwards.
+            apply_routed_scaling_factor_on_output=False,
+            output_format=TopKOutputFormat.STANDARD,
+        )
+        self.topk.bind_runner_backend(
+            MoeRunnerBackend.TRITON, routing_method_type=RoutingMethodType.DeepSeekV3
+        )
+        if is_routed_scaling_factor_fused_in_topk(self.topk.topk_config):
+            raise RuntimeError("AFD_M2N_ROUTED_SCALE_MUST_REMAIN_SEPARATE")
+        self.shared_experts = DeepseekV2MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            reduce_results=False,
+            prefix=add_prefix("shared_experts", prefix),
+            swiglu_limit=getattr(config, "swiglu_limit", None),
+            parallel_group="replicated",
+        )
+
+    def route(self, hidden_states):
+        return self.topk(hidden_states, self.gate(hidden_states))
+
+
+def make_glm_dsa_attention_mlp(*, config, layer_id, quant_config, prefix=""):
     if afd_execution_mode() != AFDExecutionMode.ATTENTION:
         raise RuntimeError("AFD_GLM_DSA_ATTENTION_COMPUTE_ROLE_INVALID")
     if quant_config is not None and quant_config.get_name() != "fp8":
@@ -1335,8 +1394,7 @@ class GlmMoeDsaAFDDecoderLayer(DeepseekV2DecoderLayer):
         if mode == AFDExecutionMode.ATTENTION:
             layer.mlp = AFDProxyMLP()
         elif mode == AFDExecutionMode.FFN:
-            if hasattr(layer.layer_communicator, "qkv_latent_func"):
-                layer.layer_communicator.qkv_latent_func = None
+            layer.attn_boundary.plan.qkv_latent_func = None
             layer.self_attn = AFDProxyAttention()
         else:
             raise RuntimeError(f"AFD_GLM_DSA_ROLE_INVALID mode={mode}")
@@ -1354,14 +1412,10 @@ class GlmMoeDsaAFDDecoderLayer(DeepseekV2DecoderLayer):
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         if afd_execution_mode() != AFDExecutionMode.ATTENTION:
             raise RuntimeError("AFD_GLM_DSA_ATTENTION_COMPUTE_ROLE_INVALID")
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=None,
-                quant_format=getattr(self, "_gfx95_quant_format", ""),
-            )
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            quant_format=self._resolve_gfx95_quant_format(),
         )
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
@@ -1369,22 +1423,21 @@ class GlmMoeDsaAFDDecoderLayer(DeepseekV2DecoderLayer):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
-                input_on_attention_tp_slices=(
-                    self.layer_communicator.input_on_attention_tp_slices
-                ),
+                input_on_attn_tp_slices=self.attn_boundary.input_on_attn_tp_slices,
                 prev_topk_indices=prev_topk_indices,
             )
         if isinstance(hidden_states, tuple):
-            # Read the indices out before collapsing to the hidden state; the
-            # caller owns the shared-topk carry and cannot recover them later.
             hidden_states, topk_indices = hidden_states
         else:
             topk_indices = None
         get_attn_tp_context().clear_attn_inputs()
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        return (
+            hidden_states,
+            residual_batch.written_residual(forward_batch),
+            topk_indices,
         )
-        return hidden_states, residual, topk_indices
 
     # TP1 shared weights use one contributor to the outer F reduce-scatter.
     afd_shared_expert_partial = True
