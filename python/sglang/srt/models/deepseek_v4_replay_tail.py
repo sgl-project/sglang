@@ -174,11 +174,15 @@ class DecoderReplayTail:
 
     @staticmethod
     def _can_capture_moe_bound(forward_batch: ForwardBatch) -> bool:
-        # The row runner replaces only the local count with a graph-owned buffer.
+        # Only these two count domains have graph-owned replay buffers.
         bound = forward_batch.moe_num_token_non_padded()
-        return bound is None or (
-            bound is forward_batch.num_token_non_padded
-            and bound is not forward_batch.global_num_token_non_padded
+        return (
+            bound is None
+            or bound is forward_batch.num_token_non_padded
+            or (
+                forward_batch.attn_tp_sequence_sharded
+                and bound is forward_batch.global_num_token_non_padded
+            )
         )
 
     def plan(
@@ -376,6 +380,16 @@ class DecoderReplayTail:
             batch_scope=dp_layout,
             bucket_from=None if dp_rows is None else max(dp_rows),
             out_rows=out_rows,
+            # mHC tail inputs contain the whole attention-DP sequence before
+            # any MoE transport, including when attention TP shards its inputs.
+            global_num_rows=(
+                positions.shape[0]
+                if forward_batch.attn_tp_sequence_sharded
+                and forward_batch.global_num_token_non_padded is not None
+                and forward_batch.moe_num_token_non_padded()
+                is forward_batch.global_num_token_non_padded
+                else None
+            ),
         )
         return residual, pre, aux
 
