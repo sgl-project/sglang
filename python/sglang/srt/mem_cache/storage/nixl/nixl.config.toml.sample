@@ -1,7 +1,7 @@
 ################################################################################
 # IMPORTANT
 # 1. to enable a plugin, add "active = true" in the corresponding section
-# 2. the configs inside plugin.posix (i.e., use_aio, use_uring, use_posix_aio)
+# 2. the I/O engine configs inside plugin.posix (use_aio, use_uring)
 #    are mutually exclusive
 ################################################################################
 
@@ -28,18 +28,15 @@ l3_cleaner_low_watermark = 70.0
 [plugin.posix]
 # Configuration for the POSIX file-based backend.
 #
-# The supported backends include:
+# The documented I/O engines are:
 # 1. AIO (`use_aio = "true"`)
 # 2. io_uring (`use_uring = "true"`)
-# 3. POSIX AIO (`use_posix_aio = "true"`)
 #
-# If not specified, NIXL will automatically detect and use available backends based on the following default priority: AIO > io_uring > POSIX AIO
+# If neither is specified, NIXL automatically selects an available I/O engine,
+# preferring Linux AIO over io_uring.
 
 # Enable Linux io_uring for async I/O (recommended if supported)
 use_uring = "true"
-
-# Enable POSIX AIO (alternative async I/O mechanism)
-# use_posix_aio = "true"
 
 # Enable generic AIO
 # use_aio = "true"
