@@ -5,10 +5,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from sglang.srt import rust_extensions
+from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
+from sglang.srt.disaggregation.base.conn import BaseKVBootstrapServer
+from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
 from sglang.srt.entrypoints.engine import node_hosts_rust_server
+from sglang.srt.environ import envs
+from sglang.srt.managers import disagg_service
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.rust_server import server as rust_server
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -261,6 +268,81 @@ def test_scale_joiner_hosts_listener():
         ep_join_mode="scale",
     ):
         assert node_hosts_rust_server()
+
+
+class _HttpRegistry(CommonKVBootstrapServer):
+    def __init__(self, host, port):
+        raise AssertionError("the Rust server serves this registry")
+
+
+class _OwnBootstrapServer(BaseKVBootstrapServer):
+    def __init__(self, host, port):
+        self.address = (host, port)
+
+
+@pytest.mark.parametrize(
+    "server_class,bootstrap_port,expected",
+    [
+        (_HttpRegistry, 8998, 31000),
+        (_HttpRegistry, 31000, 31000),
+        (_HttpRegistry, 33000, ValueError),
+        (_OwnBootstrapServer, 8998, 8998),
+        (_OwnBootstrapServer, 33000, 33000),
+    ],
+    ids=[
+        "http-registry-default",
+        "http-registry-shared",
+        "http-registry-separate",
+        "backend-bootstrap-server-default",
+        "backend-bootstrap-server-separate",
+    ],
+)
+def test_rust_prefill_bootstrap_port_alias(server_class, bootstrap_port, expected):
+    args = ServerArgs(
+        model_path="dummy",
+        port=31000,
+        disaggregation_mode="prefill",
+        disaggregation_bootstrap_port=bootstrap_port,
+    )
+    with (
+        envs.SGLANG_RUST_SERVER.override(True),
+        patch.object(disagg_service, "get_kv_class", return_value=server_class),
+    ):
+        if expected is ValueError:
+            with pytest.raises(ValueError, match="conflicts with --port"):
+                handle_pd_disaggregation(args)
+            return
+        handle_pd_disaggregation(args)
+    assert resolving_view(args).disaggregation_bootstrap_port == expected
+
+
+@pytest.mark.parametrize(
+    "mode,server_class,starts",
+    [
+        ("prefill", _HttpRegistry, False),
+        ("prefill", _OwnBootstrapServer, True),
+        ("decode", _OwnBootstrapServer, False),
+    ],
+    ids=["http-registry", "backend-bootstrap-server", "decode"],
+)
+def test_rust_mode_starts_only_a_bootstrap_server_rust_cannot_serve(
+    mode, server_class, starts
+):
+    with (
+        get_context().override_server_args(
+            host="127.0.0.1",
+            disaggregation_mode=mode,
+            disaggregation_transfer_backend="nixl",
+            disaggregation_bootstrap_port=33000,
+        ),
+        patch.object(disagg_service, "get_kv_class", return_value=server_class),
+    ):
+        server = disagg_service.start_disagg_service_for_rust_server()
+
+    if starts:
+        assert server.address == ("127.0.0.1", 33000)
+    else:
+        assert server is None
 
 
 if __name__ == "__main__":

@@ -129,8 +129,8 @@ def _collect_safetensors_sources(
     ]
     | None
 ):
-    corrupted_files, duplicate_files_by_key = _scan_safetensors_files(weight_files)
-    if corrupted_files or duplicate_files_by_key:
+    unreadable_files, duplicate_files_by_key = _scan_safetensors_files(weight_files)
+    if unreadable_files or duplicate_files_by_key:
         return None
 
     sources_by_target: dict[str, list[SafetensorsSource]] = defaultdict(list)
