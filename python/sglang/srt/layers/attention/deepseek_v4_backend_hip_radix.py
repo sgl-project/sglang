@@ -22,6 +22,8 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
     expand_index_page_table,
+    expand_same_length,
+    gather_i32,
     low_ratio_compression_metadata,
     mask_indices_by_length,
     page_table_from_req_to_token,
@@ -402,6 +404,8 @@ class DSV4AttnMetadata:
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c128_topk_lengths_raw: Optional[torch.Tensor] = None
 
+    # the pool's compress ratios; the c4 / c128 fields stay None without them (V4.1)
+    present_ratios: Tuple[int, ...] = (4, 128)
     # V4.1 ratios 1 / 2: latents live at raw_out_loc // ratio of the c1 / c2 pool; None when absent
     low_ratios: Tuple[int, ...] = ()
     c1_out_loc: Optional[torch.Tensor] = None
@@ -450,6 +454,14 @@ class DSV4AttnMetadata:
         else:
             raise ValueError(f"invalid {compress_ratio=}")
 
+    @property
+    def has_c4(self) -> bool:
+        return 4 in self.present_ratios
+
+    @property
+    def has_c128(self) -> bool:
+        return 128 in self.present_ratios
+
     def sparse_page_indices(self, compress_ratio: Literal[1, 2, 4]) -> torch.Tensor:
         """Top-k slots into the ratio's extra cache, -1 padded; the indexer fills them."""
         if compress_ratio == 1:
@@ -496,6 +508,7 @@ class DSV4AttnMetadata:
                 "index_topk",
                 "page_size",
                 "cuda_int32_kwargs",
+                "present_ratios",
                 "low_ratios",
             ],
             copy_fields=[
@@ -590,33 +603,37 @@ class DSV4AttnMetadata:
             f"{self.raw_out_loc.shape=}, {num_tokens=}"
         )
 
-        (
-            self.c4_out_loc,
-            _,
-            self.c4_topk_lengths_raw,
-            self.c4_topk_lengths_clamp1,
-            self.c128_out_loc,
-            _,
-            self.c128_topk_lengths_raw,
-            self.c128_topk_lengths_clamp1,
-            self.c128_page_indices,
-        ) = _init_compression_metadata_triton(
-            self.seq_lens_casual,
-            self.positions_casual,
-            self.raw_out_loc,
-            self.page_table,
-            self.page_size,
-            compute_page_indices=True,
-        )
-
-        self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
-        self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
+        has_c4_c128 = self.has_c4 or self.has_c128
+        if has_c4_c128:
+            (
+                self.c4_out_loc,
+                _,
+                self.c4_topk_lengths_raw,
+                self.c4_topk_lengths_clamp1,
+                self.c128_out_loc,
+                _,
+                self.c128_topk_lengths_raw,
+                self.c128_topk_lengths_clamp1,
+                self.c128_page_indices,
+            ) = _init_compression_metadata_triton(
+                self.seq_lens_casual,
+                self.positions_casual,
+                self.raw_out_loc,
+                self.page_table,
+                self.page_size,
+                compute_page_indices=True,
+            )
+            self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
+        # its builders already pad it; F.pad copies even with nothing to pad
+        if self.swa_page_indices.shape[-1] % PAGE_INDEX_ALIGNED_SIZE:
+            self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
 
         if unified_swa_pages:
             if self.unified is None:
                 self.unified = UnifiedKvMetadata()
-            self.unified.c4_out_loc = self.c4_out_loc + unified_swa_pages
-            self.unified.c128_out_loc = self.c128_out_loc + unified_swa_pages
+            if has_c4_c128:
+                self.unified.c4_out_loc = self.c4_out_loc + unified_swa_pages
+                self.unified.c128_out_loc = self.c128_out_loc + unified_swa_pages
 
         # ratio 1/2 counterparts of the c4/c128 metadata, one launch for both
         for name, value in low_ratio_compression_metadata(
@@ -638,12 +655,17 @@ class DSV4AttnMetadata:
             f"unexpected index_topk={self.index_topk}; "
             "supported: 512 (small) or 1024 (large)"
         )
-        assert self.c4_topk_lengths_clamp1 is not None
-        assert self.c4_topk_lengths_raw is not None
+        if self.has_c4:
+            assert self.c4_topk_lengths_clamp1 is not None
+            assert self.c4_topk_lengths_raw is not None
+        else:
+            self.c4_sparse_topk_lengths = None
+            self.c4_sparse_topk_lengths_raw = None
+            self.c4_sparse_page_indices = None
         # the clamped lengths and the -1 filled top-k buffers of every ratio in one launch
         for name, value in sparse_buffers(
-            c4_topk_lengths_clamp1=self.c4_topk_lengths_clamp1,
-            c4_topk_lengths_raw=self.c4_topk_lengths_raw,
+            c4_topk_lengths_clamp1=self.c4_topk_lengths_clamp1 if self.has_c4 else None,
+            c4_topk_lengths_raw=self.c4_topk_lengths_raw if self.has_c4 else None,
             c1_topk_lengths_clamp1=(
                 self.c1_topk_lengths_clamp1 if 1 in self.low_ratios else None
             ),
@@ -654,22 +676,19 @@ class DSV4AttnMetadata:
             page_index_align=PAGE_INDEX_ALIGNED_SIZE,
         ).items():
             setattr(self, name, value)
-        if is_prefill:
+        if is_prefill and self.has_c4:
             self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
         self.c0_flashmla_metadata = _create_flashmla_metadata()
-        self.c4_flashmla_metadata = _create_flashmla_metadata()
-        self.c128_flashmla_metadata = _create_flashmla_metadata()
-        # -1 filled like the page indices: identity rows write only their reachable columns,
-        # and the OPUS prefill reads the raw indices without the top-k lengths
+        self.c4_flashmla_metadata = _create_flashmla_metadata() if self.has_c4 else None
+        self.c128_flashmla_metadata = (
+            _create_flashmla_metadata() if self.has_c128 else None
+        )
+        # the raw indices come -1 filled like the page indices (``sparse_buffers``):
+        # identity rows write only their reachable columns, and the OPUS prefill reads
+        # the raw indices without the top-k lengths
         if 1 in self.low_ratios:
-            self.c1_sparse_raw_indices = torch.full_like(
-                self.c1_sparse_page_indices, -1
-            )
             self.c1_flashmla_metadata = _create_flashmla_metadata()
         if 2 in self.low_ratios:
-            self.c2_sparse_raw_indices = torch.full_like(
-                self.c2_sparse_page_indices, -1
-            )
             self.c2_flashmla_metadata = _create_flashmla_metadata()
 
 
@@ -1457,12 +1476,14 @@ class DeepseekV4HipRadixBackend(
         assert out_cache_loc.shape[0] >= num_tokens, (
             f"{out_cache_loc.shape=} holds fewer than {num_tokens=} block slots"
         )
-        seq_lens_casual, req_pool_indices_repeated = (
+        seq_lens_casual, req_pool_indices_repeated, positions, _ = (
             self.expand_extend_with_same_length(
                 bs=batch_size,
                 qo_len=block_size,
-                seq_lens=seq_lens + block_size,
+                seq_lens=seq_lens,
                 req_pool_indices=req_pool_indices,
+                seq_lens_offset=block_size,
+                window=SWA_WINDOW,
             )
         )
         core_attn_metadata = self.make_core_attn_metadata(
@@ -1476,6 +1497,7 @@ class DeepseekV4HipRadixBackend(
             is_prefill=True,
             dspark_block_size=block_size,
             num_groups=batch_size,
+            positions=positions,
         )
         return DSV4Metadata(
             core_attn_metadata,
@@ -1493,23 +1515,39 @@ class DeepseekV4HipRadixBackend(
         seq_lens = raw_metadata.seq_lens
         out_cache_loc = raw_metadata.out_cache_loc
 
-        bs, num_draft_tokens = len(seq_lens), self.target_verify_num_draft_tokens
-        seq_lens = seq_lens + num_draft_tokens
-        extend_seq_lens = raw_metadata.extend_seq_lens
-        if extend_seq_lens is None or extend_seq_lens.numel() != bs:
-            extend_seq_lens = torch.full_like(seq_lens, num_draft_tokens)
-        else:
-            extend_seq_lens = extend_seq_lens.to(
-                device=seq_lens.device, dtype=seq_lens.dtype
-            )
-        extend_seq_lens = torch.minimum(extend_seq_lens, seq_lens).clamp_min_(1)
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+            is_unified_kv_triton,
+        )
 
-        seq_lens_casual, req_pool_indices_repeated = (
+        bs, num_draft_tokens = len(seq_lens), self.target_verify_num_draft_tokens
+        need_compress = self.need_compress
+        # the lengths with the block and the extend lengths feed only the unified
+        # KV's prefill meta and the c4 / c128 compressors
+        if is_unified_kv_triton() or (need_compress and (self.has_c4 or self.has_c128)):
+            seq_lens = seq_lens + num_draft_tokens
+            extend_seq_lens = raw_metadata.extend_seq_lens
+            if extend_seq_lens is None or extend_seq_lens.numel() != bs:
+                extend_seq_lens = torch.full_like(seq_lens, num_draft_tokens)
+            else:
+                extend_seq_lens = extend_seq_lens.to(
+                    device=seq_lens.device, dtype=seq_lens.dtype
+                )
+            extend_seq_lens = torch.minimum(extend_seq_lens, seq_lens).clamp_min_(1)
+            offset = 0
+        else:
+            extend_seq_lens = None
+            offset = num_draft_tokens
+
+        seq_lens_casual, req_pool_indices_repeated, positions, window_lens = (
             self.expand_extend_with_same_length(
-                bs, num_draft_tokens, seq_lens, req_pool_indices
+                bs,
+                num_draft_tokens,
+                seq_lens,
+                req_pool_indices,
+                seq_lens_offset=offset,
+                window=SWA_WINDOW,
             )
         )
-        need_compress = self.need_compress
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -1518,6 +1556,8 @@ class DeepseekV4HipRadixBackend(
             out_loc=out_cache_loc,
             need_compress=need_compress,
             num_groups=bs,
+            positions=positions,
+            window_lens=window_lens,
         )
         # extend_seq_lens is uniform here (seq_lens already carries the draft
         # block, so the minimum above cannot trim it), hence an exact token count.
@@ -1717,10 +1757,8 @@ class DeepseekV4HipRadixBackend(
                     self.topk,
                     self.speculative_num_steps,
                 )[self.speculative_step_id]
-            metadata.core_attn_metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-                    torch.int32
-                )
+            metadata.core_attn_metadata.swa_out_cache_loc = self._swa_loc_i32(
+                out_cache_loc
             )
 
         if self._fp4_workspaces_enabled(metadata):
@@ -1761,6 +1799,24 @@ class DeepseekV4HipRadixBackend(
                 metadata.low_ratio_req_indices, metadata.low_ratio_pos_i64 = (
                     widen_pair_i64(
                         forward_batch.req_pool_indices, forward_batch.positions
+                    )
+                )
+            elif (
+                forward_batch.forward_mode.is_target_verify()
+                and forward_batch.positions.is_cuda
+                and forward_batch.positions.dim() == 1
+                and forward_batch.positions.stride(0) == 1
+                and forward_batch.req_pool_indices.stride(0) == 1
+                and forward_batch.positions.shape[0]
+                == forward_batch.req_pool_indices.shape[0]
+                * int(forward_batch.spec_info.draft_token_num)
+            ):
+                # each slot repeated a draft token, and both widenings, in one launch
+                metadata.low_ratio_req_indices, metadata.low_ratio_pos_i64 = (
+                    widen_pair_i64(
+                        forward_batch.req_pool_indices,
+                        forward_batch.positions,
+                        repeat=int(forward_batch.spec_info.draft_token_num),
                     )
                 )
             else:
@@ -2279,9 +2335,7 @@ class DeepseekV4HipRadixBackend(
         swa_out_cache_loc = (
             request_layout.write_loc
             if request_layout is not None
-            else self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-                torch.int32
-            )
+            else self._swa_loc_i32(out_cache_loc)
         )
         metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         metadata.low_ratio_req_indices = torch.repeat_interleave(
@@ -3058,9 +3112,19 @@ class DeepseekV4HipRadixBackend(
         cached = core.swa_out_cache_loc if core is not None else None
         if cached is not None and cached.shape[0] == out_cache_loc.shape[0]:
             return cached
-        return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-            torch.int32
-        )
+        return self._swa_loc_i32(out_cache_loc)
+
+    def _swa_loc_i32(self, out_cache_loc: torch.Tensor) -> torch.Tensor:
+        """out_cache_loc's SWA locations, int32 as FlashMLA indexes them."""
+        pool = self.token_to_kv_pool
+        if (
+            type(pool).translate_loc_from_full_to_swa
+            is DeepSeekV4TokenToKVPool.translate_loc_from_full_to_swa
+            and out_cache_loc.is_cuda
+        ):
+            # the pool's mapping lookup and the cast in one launch
+            return gather_i32(pool.full_to_swa_index_mapping, out_cache_loc)
+        return pool.translate_loc_from_full_to_swa(out_cache_loc).to(torch.int32)
 
     def get_unified_swa_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         # Cached slots use committed positions; draft steps need live positions.
@@ -3512,16 +3576,16 @@ class DeepseekV4HipRadixBackend(
         qo_len: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        seq_lens_offset: int = 0,
+        window: Optional[int] = None,
     ):
-        seq_lens_casual = seq_lens[:, None] + torch.arange(
-            -qo_len + 1, 1, **self.cuda_int32_kwargs
+        """Each request's qo_len rows, one launch: their causal lengths (of
+        seq_lens + seq_lens_offset) and request slots; with ``window``, also
+        their int32 positions and lengths clamped to it."""
+        assert seq_lens.shape[0] == bs
+        return expand_same_length(
+            seq_lens, req_pool_indices, qo_len, offset=seq_lens_offset, window=window
         )
-        seq_lens_casual = seq_lens_casual.flatten()
-        idx_to_req_repeated = torch.arange(
-            bs, **self.cuda_int32_kwargs
-        ).repeat_interleave(qo_len)
-        req_pool_indices_repeated = req_pool_indices[idx_to_req_repeated]
-        return seq_lens_casual, req_pool_indices_repeated
 
     def make_core_attn_metadata(
         self,
@@ -3536,10 +3600,14 @@ class DeepseekV4HipRadixBackend(
         dspark_block_size: Optional[int] = None,
         swa_replay_start: Optional[torch.Tensor] = None,
         num_groups: Optional[int] = None,
+        positions: Optional[torch.Tensor] = None,
+        window_lens: Optional[torch.Tensor] = None,
     ) -> DSV4AttnMetadata:
-        """swa_replay_start floors every row's window at that absolute position."""
+        """swa_replay_start floors every row's window at that absolute position.
+        ``positions`` / ``window_lens``: the rows' int32 positions and lengths
+        clamped to SWA_WINDOW, as ``expand_same_length`` built them."""
         seq_lens_casual = seq_lens_casual.to(torch.int32)
-        raw_positions = seq_lens_casual - 1
+        raw_positions = seq_lens_casual - 1 if positions is None else positions
 
         request_layout = None
         window = self.token_to_kv_pool.request_window
@@ -3580,16 +3648,9 @@ class DeepseekV4HipRadixBackend(
                 out_loc=out_loc,
                 block_size=dspark_block_size,
             )
-        elif swa_replay_start is None:
-            swa_page_indices = self.get_swa_page_indices(
-                seq_lens_casual=seq_lens_casual,
-                req_pool_indices_repeated=req_pool_indices_repeated,
-            )
-            swa_page_indices = _pad_last_dim(
-                swa_page_indices, multiples_of=PAGE_INDEX_ALIGNED_SIZE
-            )
-            swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
         else:
+            # one launch for the window's slots, -1 where empty (the mapping's
+            # trailing -1 is what an empty slot translated to)
             swa_page_indices = BuildCausalSwaPageIndices.execute(
                 req_to_token=self.req_to_token,
                 full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
@@ -3599,11 +3660,15 @@ class DeepseekV4HipRadixBackend(
                 page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
                 swa_replay_start=swa_replay_start,
             )
-            # Slots below the floor are -1; the valid count shrinks to match.
-            floored = raw_positions - swa_replay_start.to(raw_positions.dtype) + 1
-            swa_topk_lengths = torch.minimum(
-                torch.clamp(seq_lens_casual, max=SWA_WINDOW), floored.clamp_min(0)
+            swa_topk_lengths = (
+                torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+                if window_lens is None
+                else window_lens
             )
+            if swa_replay_start is not None:
+                # Slots below the floor are -1; the valid count shrinks to match.
+                floored = raw_positions - swa_replay_start.to(raw_positions.dtype) + 1
+                swa_topk_lengths = torch.minimum(swa_topk_lengths, floored.clamp_min(0))
 
         # the gather, the floor division and the cast in one launch
         page_table = page_table_from_req_to_token(
@@ -3620,6 +3685,7 @@ class DeepseekV4HipRadixBackend(
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
             index_topk=self.index_topk,
+            present_ratios=self.present_ratios,
             low_ratios=self.low_ratios,
             request_window_layout=request_layout,
         )
@@ -3641,25 +3707,6 @@ class DeepseekV4HipRadixBackend(
             core_attn_metadata.c4_flashmla_metadata = None
             core_attn_metadata.c128_flashmla_metadata = None
         return core_attn_metadata
-
-    def get_swa_page_indices(
-        self,
-        seq_lens_casual: torch.Tensor,
-        req_pool_indices_repeated: torch.Tensor,
-    ) -> torch.Tensor:
-        pos_causal = seq_lens_casual - 1
-        num_qo_tokens = seq_lens_casual.size(0)
-        offsets = pos_causal.unsqueeze(1) - torch.arange(
-            SWA_WINDOW, **self.cuda_int32_kwargs
-        ).unsqueeze(0)
-        invalid_offset_mask = offsets < 0
-        offsets.masked_fill_(invalid_offset_mask, 0)
-        raw_indices = self.req_to_token[req_pool_indices_repeated[:, None], offsets]
-        assert raw_indices.shape == (num_qo_tokens, SWA_WINDOW)
-        raw_indices.masked_fill_(invalid_offset_mask, -1)
-        swa_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_indices)
-        # flash_mla attention requires int32 page indices.
-        return swa_indices.to(torch.int32)
 
     get_dspark_swa_page_indices = DeepseekV4AttnBackend.get_dspark_swa_page_indices
 
