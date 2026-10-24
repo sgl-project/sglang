@@ -5,6 +5,7 @@
 Community base: `de7055f59645ebe03784b0980e1f222789f468a3`.
 The [initial verification manifest](ascend_dynamic_eplb_upstream_20261024/verification.json) binds the original 17 Python files and separately records the CI fixture follow-up. The [optimization manifest](ascend_dynamic_eplb_upstream_20261024/optimization.json) identifies the later optimized source, including exact snapshot and canonical LF SHA-256 values.
 Eight production files are changed; the existing community TopK padding and shared-expert masking implementation is retained.
+The later comment and docstring cleanup leaves the executable code unchanged from the tested revision.
 
 The optimized community source passed CPU, bounded NPU graph, two-rank weight migration and fresh-process full-model AIS checks. Current-source single-node performance is reported separately from the earlier integration results. Disaggregated P/D has not been rerun on this community base.
 

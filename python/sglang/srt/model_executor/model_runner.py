@@ -1601,9 +1601,8 @@ class ModelRunner:
         return compute_attention_and_moe_layers(layer_model)
 
     def _expert_distribution_recording_context(self):
-        # The process-wide recorder describes target expert placement. Draft
-        # weights are not moved by that manager, and draft graphs must not
-        # capture writes into the target's statistics buffers.
+        # EPLB moves target weights only; draft forwards and graph captures must
+        # not write to the target's statistics.
         if self.is_draft_worker:
             return get_global_expert_distribution_recorder().disable_this_region()
         return contextlib.nullcontext()

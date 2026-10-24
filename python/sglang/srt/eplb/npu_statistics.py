@@ -25,8 +25,7 @@ class BatchedTopKStatisticsMixin:
         capacity = int(os.environ.get("SGLANG_NPU_EPLB_STATS_MAX_ROUTES", "96"))
         if not 1 <= capacity <= 65536:
             raise ValueError("Invalid batched statistics route capacity")
-        # Allocate once before capture. Every captured graph writes this same
-        # storage, regardless of its batch size or temporary tensor addresses.
+        # All captured graphs write to this shared buffer.
         self._batched_routes = torch.full(
             (self._data.shape[0], capacity),
             -1,
@@ -39,16 +38,15 @@ class BatchedTopKStatisticsMixin:
         self._routes_dirty = False
 
     def on_graph_capture_forward_start(self):
-        # Warmups bypass ModelRunner's normal recorder reset. Only Python
-        # branch state changes here; runtime reset clears the shared buffers.
+        # Capture warmups bypass the normal reset. Reset offsets without
+        # recording a buffer clear into the graph.
         self._route_offsets = [0] * len(self._route_offsets)
 
     def get_graph_capture_state(self):
         return any(self._route_offsets)
 
     def on_graph_replay_forward_start(self, has_batched_routes):
-        # Replay bypasses on_select_experts. Restore the state recorded for
-        # this graph, including when it follows an eager overflow-only pass.
+        # Graph replay does not call the Python on_select_experts hook.
         self._has_batched_routes |= has_batched_routes
         self._routes_dirty |= has_batched_routes
 
@@ -66,8 +64,7 @@ class BatchedTopKStatisticsMixin:
         start = self._route_offsets[layer_idx]
         end = start + count
         if end > self._batched_routes.shape[1]:
-            # Large eager batches and repeated layer invocations retain exact
-            # original counting. Stored earlier invocations are still added.
+            # Count overflow directly; collect() adds any earlier buffered calls.
             return super().on_select_experts(layer_idx, topk_ids)
         self._batched_routes[layer_idx, start:end].copy_(topk_ids.flatten())
         self._route_offsets[layer_idx] = end
