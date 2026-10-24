@@ -299,13 +299,21 @@ def apply_fp8_w8a16_linear(
     weight as a column-major ``[in, out]`` view; ``.t()`` recovers the
     row-major ``[out, in]`` layout ``F.linear`` wants. ``weight_scale`` is
     either the per-tensor scalar or its channelwise expansion (equal values),
-    so both broadcast correctly. ``input_scale`` is intentionally unused.
+    so both broadcast correctly against the ``[..., out]`` output instead of
+    the ``[out, in]`` weight, which keeps the scale multiply an O(M*N) pass
+    over the output instead of an O(N*K) pass over the weight. The scale is
+    applied in FP32 rather than rounded to ``x.dtype`` first, since FP8 values
+    are exact in bf16/fp16 but the scale itself is not.
+    ``input_scale`` is intentionally unused.
     """
-    weight = layer.weight.t()
-    scale = layer.weight_scale.to(x.dtype)
-    if scale.numel() > 1:
-        scale = scale.view(-1, 1)
-    return F.linear(x, weight.to(x.dtype) * scale, bias)
+    weight = layer.weight.t().to(x.dtype)
+    output = F.linear(x, weight).to(torch.float32)
+    scale = layer.weight_scale.to(torch.float32)
+    output = output * scale
+    output = output.to(x.dtype)
+    if bias is not None:
+        output = output + bias
+    return output
 
 
 class StepMixedPrecisionFp8LinearMethod(LinearMethodBase):

@@ -102,7 +102,14 @@ class ComfyFullPrecisionNvfp4LinearMethod(ModelOptFp4LinearMethod):
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         # The portable path consumes the serialized representation directly.
         # ModelOpt's inherited hook instead prepares a Blackwell-only kernel.
-        return
+        # Unswizzle the block scales once here instead of on every forward.
+        # Cached under its own name: `ComfyNvfp4LinearMethod.apply` still needs
+        # the swizzled `layer.weight_scale` to feed `scaled_mm_nvfp4` directly.
+        layer.register_buffer(
+            "_weight_scale_linear",
+            _swizzled_nvfp4_scales_to_linear(layer.weight_scale.data),
+            persistent=False,
+        )
 
     def apply(
         self,
@@ -112,10 +119,9 @@ class ComfyFullPrecisionNvfp4LinearMethod(ModelOptFp4LinearMethod):
     ) -> torch.Tensor:
         if self.has_pre_quant_scale:
             x = x * layer.pre_quant_scale
-        weight_scale = _swizzled_nvfp4_scales_to_linear(layer.weight_scale)
         weight = dequantize_nvfp4(
             layer.weight,
-            weight_scale,
+            layer._weight_scale_linear,
             layer.weight_scale_2,
             out_dtype=x.dtype,
             high_nibble_first=True,

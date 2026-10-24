@@ -132,12 +132,20 @@ class BitsAndBytesLinearMethod(LinearMethodBase):
         if x.ndim > 2:
             x = x.reshape(-1, x.size(-1))
 
-        out_dim = sum(
-            quant_state.shape[0]
-            for quant_state in layer.weight.bnb_quant_state.values()
-        )
-        out = torch.empty(x.shape[0], out_dim, dtype=torch.bfloat16, device=x.device)
-        apply_bnb_4bit(x.to(torch.bfloat16), layer.weight, out)
+        x_bf16 = x.to(torch.bfloat16)
+        quant_states = layer.weight.bnb_quant_state
+        if len(quant_states) == 1:
+            # Single (unfused) shard: write the matmul straight to the output
+            # instead of allocating and copying into an intermediate buffer.
+            from bitsandbytes import matmul_4bit
+
+            out = matmul_4bit(x_bf16, layer.weight.t(), quant_states[0])
+        else:
+            out_dim = sum(quant_state.shape[0] for quant_state in quant_states.values())
+            out = torch.empty(
+                x.shape[0], out_dim, dtype=torch.bfloat16, device=x.device
+            )
+            apply_bnb_4bit(x_bf16, layer.weight, out)
         out = out.to(original_type)
 
         if len(original_shape) > 2:

@@ -6,7 +6,7 @@ from functools import lru_cache
 from typing import Any, Optional
 
 import torch
-from safetensors.torch import load_file as safetensors_load_file
+from safetensors import safe_open
 from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase
@@ -246,36 +246,38 @@ def _patch_nunchaku_scales(
 
     from nunchaku.models.linear import SVDQW4A4Linear  # type: ignore[import]
 
-    state_dict = safetensors_load_file(safetensors_list[0])
-    if state_dict is None:
-        return
-
     num_wtscale = 0
     num_wcscales = 0
 
     from ..nunchaku_linear import NunchakuSVDQLinearMethod
 
-    for name, module in model.named_modules():
-        wt = state_dict.get(f"{name}.wtscale")
-        if wt is not None:
-            if _patch_native_svdq_linear(module, wt, SVDQW4A4Linear):
-                num_wtscale += 1
-            elif _patch_sglang_svdq_linear(module, wt, NunchakuSVDQLinearMethod):
-                num_wtscale += 1
+    # The checkpoint's int4 weights dwarf these scale tensors; read just the
+    # `wtscale`/`wcscales` keys lazily instead of materializing every tensor.
+    with safe_open(safetensors_list[0], framework="pt") as f:
+        keys = set(f.keys())
+        for name, module in model.named_modules():
+            wt_key = f"{name}.wtscale"
+            wt = f.get_tensor(wt_key) if wt_key in keys else None
+            if wt is not None:
+                if _patch_native_svdq_linear(module, wt, SVDQW4A4Linear):
+                    num_wtscale += 1
+                elif _patch_sglang_svdq_linear(module, wt, NunchakuSVDQLinearMethod):
+                    num_wtscale += 1
 
-        wc = state_dict.get(f"{name}.wcscales")
-        if wc is not None:
-            # Some modules may have wcscales as a direct attribute/Parameter.
-            existing = getattr(module, "wcscales", None)
-            if isinstance(existing, nn.Parameter):
-                with torch.no_grad():
-                    existing.data.copy_(wc.to(existing.data.dtype))
-                num_wcscales += 1
-            elif existing is not None:
-                setattr(module, "wcscales", wc)
-                num_wcscales += 1
-            elif _patch_sglang_svdq_wcscales(module, wc, NunchakuSVDQLinearMethod):
-                num_wcscales += 1
+            wc_key = f"{name}.wcscales"
+            wc = f.get_tensor(wc_key) if wc_key in keys else None
+            if wc is not None:
+                # Some modules may have wcscales as a direct attribute/Parameter.
+                existing = getattr(module, "wcscales", None)
+                if isinstance(existing, nn.Parameter):
+                    with torch.no_grad():
+                        existing.data.copy_(wc.to(existing.data.dtype))
+                    num_wcscales += 1
+                elif existing is not None:
+                    setattr(module, "wcscales", wc)
+                    num_wcscales += 1
+                elif _patch_sglang_svdq_wcscales(module, wc, NunchakuSVDQLinearMethod):
+                    num_wcscales += 1
 
     if num_wtscale > 0:
         logger.info("Patched wtscale for %d layers", num_wtscale)
