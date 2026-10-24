@@ -19,6 +19,7 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
@@ -205,8 +206,9 @@ class _StrictPeerTransport(_CopyTransport):
         released = []
         for handle in handles:
             key = self.claims.pop(handle, None)
-            if key is not None:
-                # Force a premature release to fail the continuation test.
+            if key is not None and key not in self.claims.values():
+                # A second operation can still hold the same native key.
+                # Remove its local copy only after the final claim releases.
                 self.storage.pop(key, None)
             released.append((handle, key is not None))
         return released
@@ -845,14 +847,53 @@ class TestKVCRStorage(CustomTestCase):
         self.assertEqual(
             transport.fetches[0][-1], block_key(hashes[1], reader._namespace, "mamba")
         )
+        # A rematch with the same RID must hold a separate operation-scoped
+        # claim; finishing the first delivery cannot release the second.
+        overlap, overlap_confirmed = submit(4)
+        self.assertEqual(overlap_confirmed, 8)
+        self.assertEqual(overlap.request_id, full.request_id)
+        self.assertNotEqual(overlap.storage_lookup_scope, full.storage_lookup_scope)
+        self.assertEqual(len(transport.claims), 2)
+        # A hit parked by host pressure has not been delivered yet. Releasing
+        # its source-backed checkpoint here would let source eviction turn the
+        # later retry into a KV-only continuation.
+        pipeline = object.__new__(BufferModePipeline)
+        pipeline._cache = SimpleNamespace(
+            cache_controller=controller,
+            prefetch_threshold=2,
+            evict_host=lambda _tokens: 0,
+            _log_storage_prefetch_deferred=lambda *_args: None,
+        )
+        with (
+            patch.object(
+                controller, "can_fit_prefetch_host_buffers", return_value=True
+            ),
+            patch.object(controller, "allocate_storage_hit", return_value=(None, 8)),
+            patch.object(pipeline, "release_anchor_lock"),
+        ):
+            self.assertFalse(
+                pipeline.allocate_and_queue_prefetch(
+                    full, SimpleNamespace(), hit_tokens=8, aux_hit_tokens=8
+                )
+            )
+        self.assertFalse(full.storage_transfer_enqueued)
+        self.assertEqual(len(transport.claims), 2)
         mamba_key = block_key(hashes[-1], reader._namespace, "mamba")
         source.storage.pop(mamba_key)
         full.hash_value = hashes
         full.host_indices = torch.arange(8, 16)
         controller.enqueue_prefetch_transfer(full)
         controller.release_unqueued_prefetch_claims(full)
-        self.assertEqual(len(transport.claims), 1)
+        self.assertEqual(len(transport.claims), 2)
         controller._page_transfer(full)
+        self.assertEqual(len(transport.claims), 1)
+        self.assertEqual(set(reader._lookup_claims), {overlap.storage_lookup_scope})
+        overlap.hash_value = hashes
+        overlap.host_indices = torch.arange(8, 16)
+        controller.enqueue_prefetch_transfer(overlap)
+        controller.release_unqueued_prefetch_claims(overlap)
+        self.assertEqual(len(transport.claims), 1)
+        controller._page_transfer(overlap)
         self.assertFalse(transport.claims)
         self.assertFalse(reader._lookup_claims)
         self.assertTrue(
