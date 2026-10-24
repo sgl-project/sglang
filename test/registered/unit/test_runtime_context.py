@@ -1370,6 +1370,8 @@ class TestEpBufferState(_IsolatedServerArgs):
 
     def test_deepep_dispatch_mode_transitions_and_reset(self):
         try:
+            from types import SimpleNamespace
+
             from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
         except ImportError:
             self.skipTest("deep_ep not installed")
@@ -1383,11 +1385,14 @@ class TestEpBufferState(_IsolatedServerArgs):
             def clean_low_latency_buffer(self, *args):
                 cleans.append(args)
 
-        state = DeepEPBuffer._state()
-        state.buffer = _FakeBuffer()
-        state.hidden_size = 7168
-        state.num_max_dispatch_tokens_per_rank = 128
-        state.num_experts = 256
+        reg = DeepEPBuffer._registry()
+        key = DeepEPBuffer._buffer_key(256, 7168, 128)
+        reg.by_key[key] = SimpleNamespace(
+            buffer=_FakeBuffer(),
+            hidden_size=7168,
+            num_max_dispatch_tokens_per_rank=128,
+            num_experts=256,
+        )
 
         DeepEPBuffer.set_dispatch_mode_as_normal()
         # NORMAL -> LOW_LATENCY must clean the low-latency buffer once.
@@ -1398,7 +1403,53 @@ class TestEpBufferState(_IsolatedServerArgs):
         self.assertEqual(len(cleans), 1)
 
         reset_context()
-        self.assertIsNone(DeepEPBuffer._state().buffer)
+        self.assertEqual(DeepEPBuffer._registry().by_key, {})
+
+    def test_deepep_buffers_are_keyed_by_num_experts(self):
+        """Target + DSpark draft with different expert counts need distinct
+        DeepEP Buffer entries in the same process."""
+        try:
+            from types import SimpleNamespace
+
+            from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
+        except ImportError:
+            self.skipTest("deep_ep not installed")
+
+        reset_context()
+        cleans = []
+
+        class _FakeBuffer:
+            low_latency_mode = True
+
+            def __init__(self, tag):
+                self.tag = tag
+
+            def clean_low_latency_buffer(self, *args):
+                cleans.append((self.tag, args))
+
+        reg = DeepEPBuffer._registry()
+        target_key = DeepEPBuffer._buffer_key(256, 7168, 128)
+        draft_key = DeepEPBuffer._buffer_key(64, 7168, 128)
+        reg.by_key[target_key] = SimpleNamespace(
+            buffer=_FakeBuffer("target"),
+            hidden_size=7168,
+            num_max_dispatch_tokens_per_rank=128,
+            num_experts=256,
+        )
+        reg.by_key[draft_key] = SimpleNamespace(
+            buffer=_FakeBuffer("draft"),
+            hidden_size=7168,
+            num_max_dispatch_tokens_per_rank=128,
+            num_experts=64,
+        )
+
+        self.assertIsNot(reg.by_key[target_key].buffer, reg.by_key[draft_key].buffer)
+        DeepEPBuffer.set_dispatch_mode_as_normal()
+        DeepEPBuffer.set_dispatch_mode_as_low_latency()
+        self.assertEqual(
+            set(cleans),
+            {("target", (128, 7168, 256)), ("draft", (128, 7168, 64))},
+        )
 
 
 class TestForwardFlags(_IsolatedServerArgs):
