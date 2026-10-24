@@ -255,6 +255,37 @@ class TestPrefetchCheckpoints(CustomTestCase):
         self.assertEqual(loaded_paths, paths[:1])
 
     @patch("torch.distributed.is_initialized", return_value=False)
+    def test_buffered_loader_reads_each_shard_before_mapping_it(self, _):
+        """A shard's views are created only after its file was read sequentially."""
+        events = []
+        real_safe_open = safetensors.safe_open
+
+        def record_open(path, *args, **kwargs):
+            events.append(("open", path))
+            return real_safe_open(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._create_safetensors_files(tmpdir, num_shards=3)
+
+            with (
+                patch(
+                    "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
+                    side_effect=lambda path: events.append(("read", path)),
+                ),
+                patch("safetensors.safe_open", side_effect=record_open),
+            ):
+                list(
+                    buffered_multi_thread_safetensors_weights_iterator(
+                        paths, max_workers=1
+                    )
+                )
+
+            for path in paths:
+                self.assertLess(
+                    events.index(("read", path)), events.index(("open", path))
+                )
+
+    @patch("torch.distributed.is_initialized", return_value=False)
     def test_buffered_loader_drops_cache_after_each_loaded_shard(self, _):
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = self._create_safetensors_files(tmpdir, num_shards=3)
