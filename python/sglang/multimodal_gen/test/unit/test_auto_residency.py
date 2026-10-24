@@ -2901,7 +2901,7 @@ class TestCollectResidencyTargets:
         ]
         assert layerwise
         assert all(
-            candidate.target_layerwise_residency_policies == (policy,)
+            candidate.target_layerwise_residency_policies is None
             for candidate in layerwise
         )
         assert args.layerwise_tuning_for("transformer", dit_group=True) == (
