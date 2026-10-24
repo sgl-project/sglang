@@ -8,7 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda, inputs_on_npu
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.utils import is_npu
 
 if is_npu():
@@ -244,40 +244,13 @@ class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
     the rank's padded shard ``base_logits``. Sharded, ``gather`` exchanges
     per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole.
-    ``has_sampled_rows=False`` argmaxes every row.
-
-    NPU sampling draws native exponential noise before Triton. It uses the
-    torch NPU generator's sequence, rather than the Philox key/offset/step,
-    except for non-kept sharded logits, which retain global-token-keyed Philox.
-    """
+    ``has_sampled_rows=False`` argmaxes every row."""
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
-        if inputs_on_npu(**kwargs):
-            return cls._npu(**kwargs)
         if inputs_on_cuda(**kwargs):
             return cls.triton(**kwargs)
         return cls.torch(**kwargs)
-
-    @classmethod
-    def _npu(cls, **kwargs) -> torch.Tensor:
-        from sgl_kernel_npu.sample import markov_sample_step
-
-        base = kwargs["base_logits"]
-        logits_out = kwargs.get("logits_out")
-        sharded = kwargs.get("gather") is not None
-        if kwargs.get("has_sampled_rows") is not False and (
-            not sharded or logits_out is not None
-        ):
-            # Kept sharded logits are gathered before sampling. Draw the full
-            # vocabulary there; local shards must not reuse identical noise.
-            shape = logits_out.shape if sharded else base.shape
-            kwargs["exp_noise"] = torch.empty(
-                shape, dtype=torch.float32, device=base.device
-            ).exponential_()
-        # Non-kept sampled shards retain global-token-keyed Philox. Runtime
-        # greedy shards use has_sampled_rows=False and need no random buffer.
-        return markov_sample_step(**kwargs)
 
     @staticmethod
     def _check(
