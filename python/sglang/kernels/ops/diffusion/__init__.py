@@ -280,6 +280,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.head_gate_mul",
+        KernelBackend.TRITON,
+        "modulate.head_gate_triton:head_gate_mul",
+        _CUDA,
+    ),
+    (
         "diffusion.fused_inplace_qknorm_rope",
         KernelBackend.JIT,
         "rope.qknorm_rope_jit:fused_inplace_qknorm_rope",
@@ -714,6 +720,8 @@ _EXPORTS: dict[str, str] = {
     "indexed_gate_fp32_": "modulate.indexed_modulation_triton",
     "indexed_scale_shift_fp32_": "modulate.indexed_modulation_triton",
     "ltx2_ada_values9": "modulate.ltx2_ada_values_triton",
+    "can_use_head_gate_mul": "modulate.head_gate_triton",
+    "head_gate_mul": "modulate.head_gate_triton",
     "can_use_modulate_scale_shift_cuda": "modulate.modulate_scale_shift_jit",
     "modulate_scale_shift": "modulate.modulate_scale_shift_jit",
     "modulate_scale_shift_cuda": "modulate.modulate_scale_shift_jit",

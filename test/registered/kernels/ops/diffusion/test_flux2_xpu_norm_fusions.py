@@ -1,7 +1,7 @@
 """FLUX.2 XPU LayerNorm+modulate and gated residual norm fast paths.
 
 The fusion cases need an Intel XPU; the Intel-Triton import regression runs
-on any device, so the file is also registered on the CPU suite.
+in the diffusion unit suite, which installs the model's optional dependencies.
 """
 
 import subprocess
@@ -21,10 +21,10 @@ from sglang.kernels.ops.diffusion import (
     xpu_gated_resnorm,
     xpu_layernorm_modulate,
 )
-from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
 _HIDDEN = 6144
@@ -146,6 +146,51 @@ class TestFlux2XpuNormFusions(CustomTestCase):
 
         # Rows narrower than torch-xpu's 1024-wide work-group take another dispatch.
         self.assertFalse(can_use_xpu_layernorm_modulate(torch.bfloat16, 3072))
+
+    def test_swiglu_into_out_projection_input_matches_cat(self):
+        # The single-stream block writes SwiGLU straight into the to_out input
+        # buffer (row stride 1536 + 4608); it must equal the old cat input.
+        torch.manual_seed(4)
+        attn = torch.randn(1, 64, 1536, device="xpu", dtype=torch.bfloat16)
+        mlp_proj = torch.randn(1, 64, 9216, device="xpu", dtype=torch.bfloat16)
+        expected = torch.cat([attn, flux2._flux2_swiglu(mlp_proj)], dim=-1)
+
+        gemm_input = torch.full_like(expected, float("nan"))
+        returned = flux2._flux2_swiglu(mlp_proj, out=gemm_input[..., 1536:])
+        gemm_input[..., :1536].copy_(attn)
+
+        self.assertEqual(returned.data_ptr(), gemm_input[..., 1536:].data_ptr())
+        self.assertTrue(torch.equal(gemm_input, expected))
+
+    def test_attention_reads_fused_projection_slices_in_place(self):
+        # Single-block q/k/v are row-strided slices of the fused projection
+        # output; the XPU backend must feed them to flash attention without a
+        # copy and get the same result as contiguous inputs.
+        from sglang.multimodal_gen.runtime.layers.attention.backends import (
+            xpu_backend,
+        )
+
+        torch.manual_seed(5)
+        tokens, heads, head_dim = 256, 12, 128
+        proj = torch.randn(1, tokens, 13824, device="xpu", dtype=torch.bfloat16)
+        q, k, v = (
+            proj[..., i * heads * head_dim : (i + 1) * heads * head_dim].view(
+                1, tokens, heads, head_dim
+            )
+            for i in range(3)
+        )
+        self.assertEqual(
+            xpu_backend._as_fa_input(q, tokens, heads, head_dim).data_ptr(),
+            q.data_ptr(),
+        )
+        impl = xpu_backend.XPUAttentionImpl(
+            num_heads=heads,
+            head_size=head_dim,
+            causal=False,
+            softmax_scale=head_dim**-0.5,
+        )
+        expected = impl.forward(q.contiguous(), k.contiguous(), v.contiguous())
+        self.assertTrue(torch.equal(impl.forward(q, k, v), expected))
 
     def test_launchers_reject_layouts_they_do_not_replicate(self):
         x, update, gate, scale, shift = _inputs(16, 1.0, 4)
