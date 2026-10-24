@@ -69,6 +69,7 @@ class CPAttentionBackendKind(IntEnum):
     DSA = 1
     TRTLLM_MHA = 2
     DSV4 = 3
+    ASCEND_FIA = 4
 
     @classmethod
     def from_string(cls, value: str) -> CPAttentionBackendKind:
