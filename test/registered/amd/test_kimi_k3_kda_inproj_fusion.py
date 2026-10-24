@@ -12,11 +12,13 @@ N=6144 does), so they agree to bf16 rounding, not bitwise.
 """
 
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 
 import torch
 
 from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
+from sglang.srt.models import kimi_k3
 from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
     _merge_weights_as_views,
@@ -154,6 +156,113 @@ class TestKimiK3KDAInProjFusion(CustomTestCase):
             fake_attention, x, defer_f_b=False
         )
         torch.testing.assert_close(eager_gate, expected_gate)
+
+
+class _Weight(torch.Tensor):
+    """A weight whose .data is not a plain tensor, the way a quantized one
+    that carries its scales in a subclass is not."""
+
+
+class TestKimiK3MayFuseKDAInProj(CustomTestCase):
+    """What _may_fuse_kda_inproj accepts, one test a condition.
+
+    The merge cats .weight alone. Anything that carries a separate scale must
+    stay unfused, or the scale is dropped and the layer reads wrong numbers
+    without failing. Those checks are on the three weights.
+
+    Which configurations reach them is a separate question. The fused GEMM is a
+    different kernel from the split pair, so taking the merge where it was not
+    taken before moves decode output by a bf16 rounding step. do_fuse_qkvbfg
+    keeps its say over that, and a monokernel backend overrides it, because
+    that backend reads the merged buffer as its in-projection weight.
+
+    The weights are on the meta device. The predicate reads their dtype, rank
+    and width and never their values, so these need no GPU; this file runs on
+    the AMD CI machines, where the predicate's own ROCm gate is satisfied.
+    """
+
+    @staticmethod
+    def _attention(*, dtypes=None, widths=None, cls=torch.Tensor, **over):
+        dtypes = dtypes or [torch.bfloat16] * 3
+        widths = widths or [HIDDEN] * 3
+        rows = (WIDE, HEAD_DIM, HEADS_TP)
+        mods = [
+            SimpleNamespace(
+                weight=torch.zeros(r, w, dtype=d, device="meta").as_subclass(cls)
+            )
+            for r, w, d in zip(rows, widths, dtypes)
+        ]
+        defaults = {
+            "use_full_rank_gate": True,
+            "attn_tp_size": 8,
+            "tp_size": 8,
+            # False on the Kimi-K3 checkpoint, which carries a
+            # quantization_config for its experts.
+            "do_fuse_qkvbfg": False,
+            "_bfa_uses_block_fp8": False,
+            "fused_qkvg_proj": mods[0],
+            "f_a_proj": mods[1],
+            "b_proj": mods[2],
+        }
+        return SimpleNamespace(**(defaults | over))
+
+    def _may_fuse(self, *, monokernel_backend=None, **kw) -> bool:
+        exec_ = SimpleNamespace(
+            kernel=SimpleNamespace(monokernel_backend=monokernel_backend)
+        )
+        with unittest.mock.patch.object(kimi_k3, "get_exec", lambda: exec_):
+            return KimiK3DeltaAttention._may_fuse_kda_inproj(self._attention(**kw))
+
+    def test_quantized_checkpoint_keeps_the_split_path_on_its_own(self):
+        """Main's behaviour. do_fuse_qkvbfg is False on the shipped
+        checkpoint, and nothing else asks for the merge."""
+        self.assertFalse(self._may_fuse())
+
+    def test_a_monokernel_backend_takes_the_merge(self):
+        """The served case: the backend reads the merged buffer as w_in."""
+        self.assertTrue(self._may_fuse(monokernel_backend="amd"))
+
+    def test_do_fuse_qkvbfg_still_takes_the_merge(self):
+        """An unquantized checkpoint fuses with no backend, as before."""
+        self.assertTrue(self._may_fuse(do_fuse_qkvbfg=True))
+
+    def test_quantized_attention_does_not_fuse(self):
+        """An fp8 weight carries a scale the merged buffer would not."""
+        self.assertFalse(
+            self._may_fuse(monokernel_backend="amd", dtypes=[torch.float8_e4m3fn] * 3)
+        )
+
+    def test_mixed_dtypes_do_not_fuse(self):
+        mixed = [torch.bfloat16, torch.bfloat16, torch.float8_e4m3fn]
+        self.assertFalse(self._may_fuse(monokernel_backend="amd", dtypes=mixed))
+
+    def test_mixed_widths_do_not_fuse(self):
+        """The three read the same hidden states, so a mismatch is a bug."""
+        self.assertFalse(
+            self._may_fuse(
+                monokernel_backend="amd", widths=[HIDDEN, HIDDEN, HIDDEN // 2]
+            )
+        )
+
+    def test_a_weight_that_is_not_a_plain_tensor_does_not_fuse(self):
+        self.assertFalse(self._may_fuse(monokernel_backend="amd", cls=_Weight))
+
+    def test_block_fp8_in_proj_does_not_fuse(self):
+        """Block-FP8 needs dequantized buffers; the split path keeps them."""
+        self.assertFalse(
+            self._may_fuse(monokernel_backend="amd", _bfa_uses_block_fp8=True)
+        )
+
+    def test_low_rank_gate_does_not_fuse(self):
+        """Without the full-rank gate there is no wide projection to extend."""
+        self.assertFalse(
+            self._may_fuse(monokernel_backend="amd", use_full_rank_gate=False)
+        )
+
+    def test_attention_tp_below_tp_still_fuses(self):
+        """DP attention. The three weights sit on attention-TP or are
+        replicated, and the merge reads their shapes, so TP does not enter."""
+        self.assertTrue(self._may_fuse(monokernel_backend="amd", attn_tp_size=4))
 
 
 if __name__ == "__main__":
