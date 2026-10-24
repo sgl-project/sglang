@@ -287,8 +287,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
-        # A disabled nested runner must not reset the target's gatherers or
-        # enter its non-reentrant forward-id scope.
+        # Draft forwards share this recorder but must not reset target counts.
         if self._disable_all:
             yield {}
             return
@@ -467,8 +466,8 @@ class _SinglePassGatherer(ABC):
 
         if get_exec().moe.moe_a2a_backend == "deepep":
             if _use_npu_sender_statistics():
-                # Receiver counts include graph padding on Ascend. Count the
-                # sender's valid TopK routes in every mode, then all-reduce.
+                # Ascend receiver counts include graph padding; count valid
+                # sender routes instead.
                 gatherer = _NpuBatchedSelectExpertsSinglePassGatherer(
                     expert_location_metadata, rank
                 )
@@ -850,8 +849,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Threshold-based rebalance decisions need history even when reporting
-        # is off. The default threshold keeps this extra reduction disabled.
+        # Threshold decisions need utilization history even with reporting off.
         self._enable = reports_expert_balancedness() or not math.isclose(
             get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
         )

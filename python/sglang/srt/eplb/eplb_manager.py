@@ -67,9 +67,8 @@ class EPLBManager:
             f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
         )
 
-        # Only the first period may be shorter than the recorder window:
-        # it starts at model construction with a zero buffer and one layout.
-        # Later periods retain the community interval>=window invariant.
+        # The first window starts empty and uses one layout, so it can be shorter.
+        # Later intervals must cover the full recorder window.
         self._initial_rebalance_iterations = (
             64
             if get_device().device == "npu"
@@ -113,7 +112,7 @@ class EPLBManager:
             for _ in range(initial or self._rebalance_num_iterations):
                 yield
 
-            # Consume once even if an existing disable/scale guard skips work.
+            # Do not repeat the initial period if rebalance() skips this round.
             self._initial_rebalance_iterations = None
             if initial is not None:
                 logger.info("[NPU EPLB initial learning] initial period complete")

@@ -147,8 +147,7 @@ def _update_expert_weights_raw(
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
     if get_device().device == "npu" and ElasticEPStateManager.instance() is None:
-        # Compare the full CPU maps, not this rank's destinations: an unchanged
-        # local rank may still need to send an expert to another rank.
+        # Compare full maps: an unchanged local rank may still be a sender.
         update_layer_ids = [
             layer_id
             for layer_id in update_layer_ids
@@ -171,9 +170,8 @@ def _update_expert_weights_raw(
         if any(
             torch_npu.get_npu_format(tensor) not in (0, 2) for tensor in sample_tensors
         ):
-            # Convert each whole layer once. Converting an NZ expert view can
-            # materialize its entire backing storage for every P2P send.
-            # Reuse this ND workspace across layers to bound live allocations.
+            # Converting each NZ expert view can copy the whole backing tensor.
+            # Stage one layer at a time and reuse the ND buffers.
             layer_buffers = create_temp_buffers(sample_tensors)
 
     world_size = torch.distributed.get_world_size()
@@ -221,9 +219,8 @@ def create_temp_buffers(sample_tensors):
             import torch_npu
 
             if torch_npu.get_npu_format(tensor) not in (0, 2):
-                # NZ-to-NZ copy of offset-zero expert views can copy their
-                # entire backing storage, corrupting unchanged expert slots.
-                # ND staging also lets HCCL receive directly into each view.
+                # An NZ view copy can overwrite unchanged slots in its backing
+                # tensor. Use ND buffers for slot copies and HCCL receives.
                 buffers.append(
                     torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
                 )
@@ -233,10 +230,9 @@ def create_temp_buffers(sample_tensors):
 
 
 def _stage_npu_p2p_ops(ops):
-    """HCCL cannot send/receive offset views of internal-format tensors.
+    """Stage internal-format views through ND buffers for HCCL.
 
-    Communicate their logical values through ND buffers, then copy receives
-    into the original views. Keep model weights and their formats in place.
+    Received values are copied back into the original views after completion.
     """
     staged_ops, receive_copies = [], []
     for op in ops:

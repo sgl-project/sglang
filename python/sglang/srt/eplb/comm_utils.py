@@ -12,7 +12,7 @@ _device_group = None
 
 
 def get_eplb_device_group():
-    """Keep legacy WORLD membership while isolating NPU migration transport."""
+    """Return a cached HCCL group with WORLD membership for NPU EPLB."""
     global _group_world, _device_group
     if get_device().device != "npu" or not dist.is_initialized():
         return None
@@ -22,8 +22,8 @@ def get_eplb_device_group():
         import torch_npu
 
         options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-        # Avoid sharing device-expanded graph resources with forward collectives.
-        # Explicitly bound the buffer instead of inheriting the 2600MiB MoE one.
+        # Keep migration off the forward graph's device-expanded HCCL group.
+        # EPLB needs a smaller buffer than the MoE dispatch group.
         options.hccl_config = {
             "hccl_buffer_size": 32,
             "hccl_op_expansion_mode": 1,
