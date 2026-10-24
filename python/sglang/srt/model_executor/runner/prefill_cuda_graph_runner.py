@@ -44,7 +44,15 @@ import logging
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    Optional,
+    Protocol,
+    Union,
+    runtime_checkable,
+)
 
 import torch
 import tqdm
@@ -237,6 +245,57 @@ def _slice_output_rows(output: Any, num_tokens: int) -> Any:
     raise TypeError(f"Unsupported full prefill CUDA graph output: {type(output)}")
 
 
+@runtime_checkable
+class _SupportsDeepStackReplay(Protocol):
+    def get_num_deepstack_embeddings(self) -> int: ...
+
+
+def _resolve_deepstack_replay_width(
+    *, model: Any, hidden_size: int, uses_eager_prefill_tail: bool
+) -> int:
+    # Only the eager-tail backends (BREAKABLE/FULL) bind and refresh this slot;
+    # tc_piecewise captures the outer forward and never reads it.
+    if not uses_eager_prefill_tail:
+        return 0
+    if isinstance(model, _SupportsDeepStackReplay):
+        return hidden_size * model.get_num_deepstack_embeddings()
+    return 0
+
+
+def _refresh_deepstack_replay_slot(
+    slot: torch.Tensor, deepstack_embeds: Optional[torch.Tensor]
+) -> None:
+    """Sync the captured DeepStack slot for this replay.
+
+    Absence zeroes the slot so previous rows cannot bleed through the LM's
+    ``add_``; a non-empty tensor that does not fit raises instead — replaying
+    with zeros would silently serve the request without its visual part.
+    """
+    if deepstack_embeds is None or deepstack_embeds.numel() == 0:
+        slot.zero_()
+        return
+
+    num_tokens = slot.shape[0]
+    if (
+        deepstack_embeds.ndim != slot.ndim
+        or deepstack_embeds.shape[0] > num_tokens
+        or deepstack_embeds.shape[1:] != slot.shape[1:]
+        or deepstack_embeds.dtype != slot.dtype
+        or deepstack_embeds.device != slot.device
+    ):
+        raise RuntimeError(
+            "input_deepstack_embeds does not fit the captured BCG replay slot: "
+            f"got shape={tuple(deepstack_embeds.shape)}, "
+            f"dtype={deepstack_embeds.dtype}, device={deepstack_embeds.device}; "
+            f"slot holds up to {num_tokens} rows of {tuple(slot.shape[1:])} "
+            f"{slot.dtype} on {slot.device}."
+        )
+
+    num_rows = deepstack_embeds.shape[0]
+    slot[:num_rows].copy_(deepstack_embeds)
+    slot[num_rows:].zero_()
+
+
 @dataclass(frozen=True)
 class _ChunkedPrefixCaptureBuffers:
     """Runner-owned tensors shared by every prefix and token-bucket variant.
@@ -426,6 +485,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.mamba_track_enabled = self._is_mamba_track_enabled()
 
+        deepstack_replay_width = _resolve_deepstack_replay_width(
+            model=self.model_runner.model,
+            hidden_size=self.model_runner.model_config.hidden_size,
+            uses_eager_prefill_tail=self._uses_eager_prefill_tail(),
+        )
+
         # --- buffers ---------------------------------------------------
         # `hidden_size` here sizes only the multimodal `input_embeds` buffer,
         # which `general_mm_embed_routine` copies the merged text+media
@@ -442,6 +507,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=input_embeds_hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            deepstack_replay_width=deepstack_replay_width,
             enable_input_embeds=(self.is_multimodal or self._use_draft_input_embeds),
             pp_size=self.pp_size,
             is_first_pp_rank=self.model_runner.pp_group.is_first_rank,
@@ -467,6 +533,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             is_multimodal=self.is_multimodal,
             hidden_size=input_embeds_hidden_size,
             embed_dtype=self.model_runner.dtype,
+            deepstack_replay_width=deepstack_replay_width,
             enable_mamba_track=self.mamba_track_enabled,
             # FullCG always pads to a capture bucket. Models that mask padded
             # hidden rows need the live boundary even without expert parallelism.
@@ -874,6 +941,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 kwargs = _build_layer_model_forward_kwargs(
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )
+                # DeepStack replay slot: bound by name like the other optional
+                # transformer inputs above, but sourced from the runner's
+                # capture buffer rather than the forward batch.
+                if self.buffer_registry.has_slot("input_deepstack_embeds"):
+                    kwargs["input_deepstack_embeds"] = self.buffer_registry.get_slot(
+                        "input_deepstack_embeds"
+                    ).slice_for(1, num_tokens)
                 if pp_proxy_tensors is not None:
                     input_ids = None
                     for embeds_name in ("input_embeds", "inputs_embeds"):
@@ -2200,6 +2274,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 and self.buffer_registry.has_slot("input_embeds")
             ):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
+            if self.buffer_registry.has_slot("input_deepstack_embeds"):
+                _refresh_deepstack_replay_slot(
+                    slot=self.buffer_registry.get_slot(
+                        "input_deepstack_embeds"
+                    ).slice_for(1, static_num_tokens),
+                    deepstack_embeds=layer_kwargs.get("input_deepstack_embeds"),
+                )
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             hs = self._restore_qwen_bcg_hc_output(hs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs
