@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 MXFP8_BLOCK_SIZE = 32
 # W4A8_MXFP block (group) size — fixed at 32 by the msmodelslim export format.
 MXFP4_BLOCK_SIZE = 32
+MXFP4_C7_ACTIVATION_QUANT_DEFAULTS = {"scale_alg": 2, "dst_type_max": 7.25}
 
 
 # NPU ops are reached via torch.ops.npu.* (registered when torch_npu is imported
@@ -34,12 +35,10 @@ def _get_float4_e2m1fn_x2_dtype():
     # The packed-FP4 dtype MUST come from torch_npu (an int enum, e.g. 296), not
     # from torch. The NPU ops that consume it -- npu_dynamic_mx_quant(dst_type=),
     # npu_quant_matmul(x2_dtype=), npu_format_cast(input_dtype=) -- REJECT the
-    # torch dtype object torch.float4_e2m1fn_x2 in op-plugin on recent torch_npu
-    # builds (it raises, or with None gives "output y must be same shape as input
+    # torch dtype object torch.float4_e2m1fn_x2 in op-plugin
+    # (it raises, or with None gives "output y must be same shape as input
     # x"), even though torch.float4_e2m1fn_x2 exists. This is fp4-specific: fp8 /
-    # float8_e8m0fnu is accepted from torch either way. Verified on A5 /
-    # torch_npu 2.10.0.post2.dev20260704 (see llm/probe_fp4_w4a8_chain.py: dst=296
-    # passes the full quant->format_cast->matmul chain, dst=torch dtype fails).
+    # float8_e8m0fnu is accepted from torch either way.
     #
     # Lazy import so this NPU-only path keeps the module importable on
     # CUDA/CPU/AMD/XPU CI (no top-level torch_npu; see AGENTS.md known pitfalls).
@@ -433,7 +432,7 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         BF16/FP16 activation → npu_dynamic_mx_quant(dst=float8_e4m3fn)  (A8, FP8)
         → npu_quant_matmul(x2_dtype=float4_e2m1fn_x2, group_sizes=[0, 0, block])
 
-    Hardware: A5 NPU + a recent torch_npu with the FP4 npu_quant_matmul
+    Hardware: A5 NPU with FP4 npu_quant_matmul support
     (same requirement as the offline W4A8 path — see that class's docstring).
     """
 
@@ -604,14 +603,10 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     returns a 3D ``[tokens, in//64, 2]`` block scale so the matmul needs no extra
     scale-layout normalization.
 
-    ⚠️ REQUIRES a recent torch_npu build for the FP4 ``npu_quant_matmul``. On the
-    A5 this device forces ``allow_internal_format=False`` (the NZ cast still produces
-    a ``FRACTAL_NZ_C0_16`` tensor, which is fine). Older torch_npu (e.g.
-    ``2.10.0.dev20260320``) had a broken FP4 matmul that rejected the NZ weight in
-    *prefill* with ``x2 should be in ... nz format, but it is 2``;
-    ``2.10.0.post1.dev20260624`` (and later) runs the FRACTAL_NZ path correctly.
-    If you hit ``it is 2``, update torch_npu — do NOT "fix" it by
-    switching the weight to ND.
+    On A5 (aclnn-only SoCs, soc_version >= 260) torch_npu itself forces
+    ``allow_internal_format=False`` — a request for True is reverted with a
+    warning by torch_npu's option register — and the NZ cast still produces a
+    ``FRACTAL_NZ_C0_16`` tensor, which is fine.
 
     ⚠️ A ``atb::OperationSetup`` *segfault during decode* (not prefill) is a
     DIFFERENT, unrelated issue: it is the eager-decode ``ascend`` attention
@@ -626,13 +621,13 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     difference is that it quantizes BF16/FP16 weights to FP4 at load time instead
     of loading them from a msmodelslim checkpoint. ``group_size`` is fixed at 32
     by the ``W4A8_MXFP`` export format.
+
+    Wan reuses apply with ND weights. Its kernel instance opts into BF16 [1, N] bias.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Cast the packed-FP4 weight to FRACTAL_NZ then transpose. All NPU ops go
-        # through torch.ops.npu.* (no torch_npu). A recent torch_npu build is
-        # required (see class docstring): older builds reject the NZ weight
-        # ("x2 ... it is 2").
+        # through torch.ops.npu.* (no torch_npu).
         fp4_dtype = _get_float4_e2m1fn_x2_dtype()
 
         # weight: packed-FP4 uint8 [out, in//2] -> FRACTAL_NZ (float8_e4m3fn view)
@@ -668,13 +663,17 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
 
-        # Dynamic MXFP8 activation quantisation (A8).
+        # FP8 activations use operator defaults rather than FP4 C7 arguments.
         quantized_x, dynamic_scale = torch.ops.npu.npu_dynamic_mx_quant(
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        if bias is not None and bias.dtype != torch.float32:
-            bias = bias.to(torch.float32)
+        if bias is not None:
+            # Wan W4A8 expects BF16 bias with a batch dimension; SRT uses FP32.
+            use_wan_bias = getattr(self, "use_wan_bias", False)
+            bias = bias.to(torch.bfloat16 if use_wan_bias else torch.float32)
+            if use_wan_bias and bias.ndim == 1:
+                bias = bias.unsqueeze(0)
 
         # W4(weight)A8(activation) matmul.
         output = torch.ops.npu.npu_quant_matmul(
@@ -695,26 +694,15 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
         return output.reshape(output_shape)
 
 
+# Activation quantization defaults adapted from:
+# https://gitcode.com/Ascend/MindIE-SD/blob/dev/mindiesd/quantization/layer.py
 class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
-    """NPU W4A4 online quantization: single-level MXFP4.
+    """Single-level W4A4 kernel with C7 activation quantization defaults.
 
-    True W4(weight) A4(activation): both weights and activations are quantised to
-    single-level MXFP4 (``float4_e2m1fn_x2``), unlike the W4A8 path which keeps FP8
-    activations. All NPU ops go through ``torch.ops.npu.*`` (no top-level
-    ``torch_npu``) and the fp4 dtype comes from ``_get_float4_e2m1fn_x2_dtype()``.
+    Packed ND weights are [in/2, out]; UE8M0 scales are [in/64, out, 2]."""
 
-    Weight quantization (process_weights_after_loading):
-        BF16/FP16 weight → npu_dynamic_mx_quant(dst=float4_e2m1fn_x2)
-        → (packed FP4 [out, in//2], UE8M0 block scale) → transpose [in//2, out]
-
-    Inference (apply):
-        BF16/FP16 activation → npu_dynamic_mx_quant(dst=float4_e2m1fn_x2)  (A4)
-        → npu_quant_matmul(x1_dtype = x2_dtype = float4_e2m1fn_x2,
-                           group_sizes=[1, 1, MXFP4_BLOCK_SIZE])
-
-    Triggered by ``--quantization mxfp4`` on NPU. Hardware: A5 NPU with a recent
-    torch_npu exposing ``float4_e2m1fn_x2``.
-    """
+    # Use nearest-even activation rounding.
+    activation_round_mode = "rint"
 
     def create_weights(
         self,
@@ -808,9 +796,15 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         input_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1])
 
-        # Dynamic single-level MXFP4 activation quantisation (A4 — FP4).
+        quant_kwargs = {
+            **MXFP4_C7_ACTIVATION_QUANT_DEFAULTS,
+            **getattr(layer, "mxfp4_quant_kwargs", {}),
+        }
         qx, input_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            x_2d, dst_type=fp4_dtype, round_mode="round"
+            x_2d,
+            dst_type=fp4_dtype,
+            round_mode=self.activation_round_mode,
+            **quant_kwargs,
         )
 
         # Single-level MXFP4 matmul (weight & scale already transposed at load
@@ -840,18 +834,14 @@ class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
     Kernel for the offline ``ModelSlimMXFP4Scheme`` (delegated as ``self.kernel``).
     The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
     [out, in//2] (two FP4 values per byte) plus UE8M0 block scales (``uint8``
-    [out, in//32]). The weight is transposed and the scale reshaped to 3D; it then
-    shares the online :class:`NPUSingleLevelMXFP4LinearMethod` matmul (``apply``)
-    exactly — only the weight source differs (msmodelslim checkpoint vs online RTN).
+    [out, in/32]). The weight remains ND and is transposed for matmul.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight = layer.weight.data
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
-        # The checkpoint is already packed two-FP4-per-byte. Preserve the strided
-        # transpose used by the online path.
-        layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
+        layer.weight = Parameter(weight.transpose(-1, -2), requires_grad=False)
 
         weight_scale = layer.weight_scale.data
         if not weight_scale.is_npu:

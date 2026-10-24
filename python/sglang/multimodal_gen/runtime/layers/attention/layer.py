@@ -897,6 +897,9 @@ class USPAttention(nn.Module):
             )
         )
 
+    def should_apply_qk_rot(self, query, key, value) -> bool:
+        return self.attn_impl.should_apply_qk_rot(query, key, value)
+
     def _get_usp_a2a_stream(self):
         if USPAttention._usp_a2a_stream is None:
             USPAttention._usp_a2a_stream = torch.get_device_module().Stream()

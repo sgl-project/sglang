@@ -51,6 +51,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4LinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp4_utils import (
+    uses_mxfp4_attention,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
@@ -484,6 +487,18 @@ class WanTransformerBlock(nn.Module):
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
         self_attn_backends = supported_attention_backends
+        attention_prefix = add_prefix("attn1", prefix)
+        self.use_mxfp4_attention = uses_mxfp4_attention(quant_config, attention_prefix)
+        self.attention_quant_description = (
+            getattr(quant_config, "quant_description", {}) or {}
+        )
+        if self.use_mxfp4_attention and (
+            not current_platform.is_npu() or attention_type != "original"
+        ):
+            raise NotImplementedError(
+                f"{attention_prefix}: quantized MXFP4 attention requires "
+                "dense attention on Ascend NPU"
+            )
 
         if attention_type in ("sla", "sagesla"):
             self.attn1 = MinimalA2AAttnOp(
@@ -498,35 +513,21 @@ class WanTransformerBlock(nn.Module):
                 prefix=add_prefix("attn1", prefix),
             )
         else:
-            # TODO Need to create mxfp8 attention scheme and port the code below
-            from sglang.multimodal_gen import envs
-
-            quant_description = getattr(quant_config, "quant_description", {})
-            self.use_offline_qk_rotation = (
-                quant_description.get(f"{prefix}.attn1.q_rot") == "FLOAT"
-                and quant_description.get(f"{prefix}.attn1.k_rot") == "FLOAT"
-                and envs.SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION
+            self.use_offline_qk_rotation = all(
+                any(
+                    self.attention_quant_description.get(f"{attention_prefix}.{name}")
+                    == "FLOAT"
+                    for name in names
+                )
+                for names in (("to_q_rot", "q_rot"), ("to_k_rot", "k_rot"))
             )
             if self.use_offline_qk_rotation:
-                self.register_buffer(
-                    "q_rot",
-                    torch.empty(
-                        self.dim_head,
-                        self.dim_head,
-                        dtype=torch.bfloat16,
-                    ),
-                    persistent=True,
-                )
-                self.register_buffer(
-                    "k_rot",
-                    torch.empty(
-                        self.dim_head,
-                        self.dim_head,
-                        dtype=torch.bfloat16,
-                    ),
-                    persistent=True,
-                )
-                quant_config.use_offline_qk_rotation = True
+                for name in ("q_rot", "k_rot"):
+                    self.register_buffer(
+                        name,
+                        torch.empty(self.dim_head, self.dim_head, dtype=torch.bfloat16),
+                        persistent=True,
+                    )
 
             self.attn1 = USPAttention(
                 num_heads=self.local_num_heads,
@@ -536,6 +537,9 @@ class WanTransformerBlock(nn.Module):
                 prefix=add_prefix("attn1", prefix),
                 quant_config=quant_config,
                 is_cross_attention=False,
+                required_attention_backend=(
+                    AttentionBackendEnum.FA if self.use_mxfp4_attention else None
+                ),
             )
 
         if qk_norm == "rms_norm":
@@ -739,12 +743,8 @@ class WanTransformerBlock(nn.Module):
                 _apply_rotary_emb(key, cos, sin, is_neox_style=False),
             )
 
-        if (
-            self.use_offline_qk_rotation
-            and self.attn1.backend is AttentionBackendEnum.FA
-            and query.shape[1:3] == key.shape[1:3]
-            and key.shape == value.shape
-            and (query.shape[0] * query.shape[1]) % 64 == 0
+        if self.use_offline_qk_rotation and self.attn1.should_apply_qk_rot(
+            query, key, value
         ):
             self.q_rot = self.q_rot.to(device=query.device, dtype=query.dtype)
             self.k_rot = self.k_rot.to(device=key.device, dtype=key.dtype)

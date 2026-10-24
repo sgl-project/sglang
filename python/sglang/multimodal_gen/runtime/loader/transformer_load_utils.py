@@ -1040,8 +1040,14 @@ def _resolve_quant_config(
 
         # modelslim requires a per-layer quant description file; load it from
         # the component directory rather than constructing an empty config.
+        # Scheme lookups must use checkpoint-side layer names.
         if server_args.quantization == "modelslim":
-            return get_quant_config(hf_config, component_model_path)
+            return get_quant_config(
+                hf_config,
+                component_model_path,
+                reverse_param_names_mapping=reverse_param_names_mapping_dict,
+                quant_ignore_remap=quant_ignore_remap_dict,
+            )
 
         # GGUF is selected by pointing at the file, not by this flag: the config
         # has to be built from that file's header.

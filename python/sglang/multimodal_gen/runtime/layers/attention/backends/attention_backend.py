@@ -130,6 +130,9 @@ class AttentionImpl(ABC, Generic[T]):
         """
         return qkv
 
+    def should_apply_qk_rot(self, query, key, value) -> bool:
+        return False
+
     def postprocess_output(
         self,
         output: torch.Tensor,
