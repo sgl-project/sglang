@@ -40,7 +40,7 @@ class MLUAttnBackend(AttentionBackend):
         return (
             self.req_to_token[req_pool_indices, : self.max_context_len : self.page_size]
             // self.page_size
-        ).to(torch.int32)
+        )
 
     @staticmethod
     def _cumulative(lengths):

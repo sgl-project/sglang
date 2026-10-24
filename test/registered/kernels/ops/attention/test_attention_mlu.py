@@ -27,7 +27,7 @@ class TestAttentionMLU(CustomTestCase):
                 page_size=16,
                 model_config=NS(context_len=128),
                 req_to_token_pool=NS(
-                    req_to_token=torch.zeros(8, 128, device="mlu", dtype=torch.int64)
+                    req_to_token=torch.zeros(8, 128, device="mlu", dtype=torch.int32)
                 ),
                 token_to_kv_pool=None,
                 dtype=torch.bfloat16,
@@ -79,7 +79,7 @@ class TestAttentionMLU(CustomTestCase):
             enable_memory_saver=False,
         )
 
-        req = torch.zeros(2, 128, device="mlu", dtype=torch.int64)
+        req = torch.zeros(2, 128, device="mlu", dtype=torch.int32)
         req[0, :32] = torch.cat(
             [torch.arange(16, 32, device="mlu"), torch.arange(80, 96, device="mlu")]
         )
