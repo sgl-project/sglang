@@ -2200,6 +2200,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return module_name.startswith("model.layers.")
 
     @staticmethod
+    def is_unused_checkpoint_weight(name: str) -> bool:
+        return "rotary_emb.inv_freq" in name or "mtp" in name
+
+    @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen4ExpVLModel.shared_experts_fusion_disable_reason(
             hf_config, quant_config
@@ -2461,9 +2465,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         skipped_visual_count = 0
 
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "mtp" in name:
+            if self.is_unused_checkpoint_weight(name):
                 continue
             if "visual" in name and self.language_model_only:
                 skipped_visual_count += 1
