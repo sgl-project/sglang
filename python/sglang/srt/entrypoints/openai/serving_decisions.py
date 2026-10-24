@@ -12,6 +12,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse
 from transformers import PreTrainedTokenizerBase
 
+from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentImageURL,
     DecisionAnswer,
@@ -26,9 +27,10 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import _CHAT_TEMPLATE_CLIENT_ERRORS
+from sglang.srt.layers.joint_schema_head import max_joint_prompt_tokens
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_schedule, get_spec
 from sglang.srt.utils import ImageData
 
 if TYPE_CHECKING:
@@ -74,6 +76,8 @@ class OpenAIServingDecisions(OpenAIServingBase):
 
     # Named in setup refusals, so each decision route reports itself.
     route = "/v1/decisions"
+    # Whether --enable-mis servers answer this route, as items of a shared prefix.
+    supports_mis = True
 
     def __init__(self, chat_serving: OpenAIServingChat):
         super().__init__(chat_serving.tokenizer_manager)
@@ -145,6 +149,8 @@ class OpenAIServingDecisions(OpenAIServingBase):
             return (
                 "return_prompt_token_ids cannot replay image inputs through /v1/score"
             )
+        if request.images and get_exec().features.enable_mis:
+            return f"{self.route} images are not supported with --enable-mis"
         version = request.prompt_format_version
         if version is not None and version != PROMPT_FORMAT_VERSION:
             return (
@@ -176,8 +182,14 @@ class OpenAIServingDecisions(OpenAIServingBase):
                 "this server uses the built-in chat template "
                 f"{self.template_manager.chat_template_name!r}"
             )
-        if get_exec().features.enable_mis:
+        if get_exec().features.enable_mis and not self.supports_mis:
             return f"{route} does not support --enable-mis"
+        # Speculative decoding makes no request prefill-only, which MIS scoring needs.
+        if (
+            get_exec().features.enable_mis
+            and get_spec().speculative_algorithm is not None
+        ):
+            return f"{route} does not support --enable-mis with speculative decoding"
         if get_exec().dllm.dllm_algorithm is not None:
             return (
                 f"{route} does not support diffusion language models "
@@ -402,6 +414,13 @@ class OpenAIServingDecisions(OpenAIServingBase):
     ):
         """Encode every question, then score them all in one call."""
         prompts, label_token_ids, image_data = await _encode_all(adapted_request)
+        if get_exec().features.enable_mis:
+            return await self._score_items(
+                prompts=prompts,
+                label_token_ids=label_token_ids,
+                raw_request=raw_request,
+                temperature=temperature,
+            )
         result = await self.tokenizer_manager.score_prompts(
             prompts=prompts,
             label_token_ids=label_token_ids,
@@ -412,6 +431,44 @@ class OpenAIServingDecisions(OpenAIServingBase):
             image_data=image_data if any(image_data) else None,
         )
         return prompts, label_token_ids, result
+
+    async def _score_items(
+        self,
+        prompts: List[List[int]],
+        label_token_ids: List[List[int]],
+        raw_request: Request,
+        temperature: float,
+    ):
+        """Score the questions as the items of one sequence after their shared prefix."""
+        length = _shared_prefix_length(prompts)
+        query = prompts[0][:length]
+        items = [prompt[length:] for prompt in prompts]
+        # The query, then a delimiter before each item and one after the last.
+        packed = length + sum(len(item) + 1 for item in items) + 1
+        tokenizer_manager = self.tokenizer_manager
+        limit = max_joint_prompt_tokens(
+            context_len=tokenizer_manager.context_len,
+            num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
+            max_req_input_len=tokenizer_manager.max_req_input_len,
+            max_prefill_tokens=get_schedule().max_prefill_tokens,
+        )
+        if packed > limit:
+            raise ValueError(
+                f"--enable-mis scores the questions as one sequence of {packed} "
+                f"tokens, but this server prefills at most {limit} tokens at once"
+            )
+        result = await tokenizer_manager.score_request(
+            query=query,
+            items=items,
+            label_token_ids=label_token_ids,
+            apply_softmax=True,
+            request=raw_request,
+            temperature=temperature,
+            return_token_logprobs=True,
+        )
+        # The ids each answer was read after, including the delimiter its item sees.
+        scored = [query + [MIS_DELIMITER_TOKEN_ID] + item for item in items]
+        return scored, label_token_ids, result
 
     async def _handle_non_streaming_request(
         self,
@@ -468,6 +525,17 @@ async def _encode_all(
         # Each question renders and tokenizes the whole input on the event loop.
         await asyncio.sleep(0)
     return prompts, label_token_ids, image_data
+
+
+def _shared_prefix_length(prompts: List[List[int]]) -> int:
+    """Leading ids that all prompts share, short of the last id of the shortest."""
+    length = 0
+    for ids in zip(*prompts):
+        if len(set(ids)) > 1:
+            break
+        length += 1
+    # Each item keeps a token, or its answer would be read at the delimiter before it.
+    return min(length, min(map(len, prompts)) - 1)
 
 
 def _has_media_marker(

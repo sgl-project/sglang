@@ -26,7 +26,7 @@ python -m sglang.launch_server \
   --host 127.0.0.1 --port 30000
 ```
 
-No extra flag is needed. The same server keeps serving `/v1/chat/completions` and `/generate`, and decisions can run alongside that traffic. A server launched with `--enable-mis` or `--dllm-algorithm`, or one that uses a built-in conversation template instead of the tokenizer's Jinja template, refuses decisions.
+No extra flag is needed. The same server keeps serving `/v1/chat/completions` and `/generate`, and decisions can run alongside that traffic. A server launched with `--dllm-algorithm`, or one that uses a built-in conversation template instead of the tokenizer's Jinja template, refuses decisions. A server launched with `--enable-mis` scores the questions of a request together, see [Score questions over one shared prefix](#score-questions-over-one-shared-prefix).
 
 ## Example request
 
@@ -156,7 +156,8 @@ The request fails with HTTP 400 for:
 - a prompt that does not fit the model's context length
 - a chat template that always thinks before answering or starts every answer with a reasoning block, `chat_template_kwargs` that set the thinking toggle to anything but `false`, a rendered prompt that leaves a reasoning block open, or a model whose reasoning parser expects answers to start inside a reasoning block when the rendered prompt does not close one
 - a `prompt_format_version` other than the served one, or a `model` that names a LoRA adapter
-- a server launched with `--enable-mis` or `--dllm-algorithm`, or one that uses a built-in conversation template, whether named with `--chat-template`, loaded from a JSON template file, or inferred from the model path
+- a server launched with `--dllm-algorithm`, or one that uses a built-in conversation template, whether named with `--chat-template`, loaded from a JSON template file, or inferred from the model path
+- on a server launched with `--enable-mis`, every request when speculative decoding is also enabled, images, a request whose questions do not fit one prefill together as described in [Score questions over one shared prefix](#score-questions-over-one-shared-prefix), and `/v1/systemone` requests to a generation model or a decision checkpoint
 - a model whose chat route uses a built-in encoder instead of a chat template, a tokenizer that does not encode the rendered chat text back to the same ids, or a model that is not a generation model
 - a chat template that raises an error for the question message, or a server launched with `--skip-tokenizer-init`
 - a decision checkpoint such as [PPLX-Decider-v1-27B](/cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B), or a joint schema or pointer head checkpoint such as [Clef](/cookbook/autoregressive/Cloudflare/clef) or [Kev](/cookbook/autoregressive/Kev/kev), which answer through `/v1/systemone`
@@ -195,7 +196,7 @@ replay = requests.post(
 print(answer["probabilities"], replay["scores"][0])
 ```
 
-The replayed scores equal the answer's probabilities when both requests use the same `temperature` and run in the same cache state. If the decision set `temperature`, send the same value in the `/v1/score` body. A replay right after the decision reuses its cached prefix, so it can differ slightly, as described in [Reproducibility](#reproducibility).
+The replayed scores equal the answer's probabilities when both requests use the same `temperature` and run in the same cache state. If the decision set `temperature`, send the same value in the `/v1/score` body. A replay right after the decision reuses its cached prefix, so it can differ slightly, as described in [Reproducibility](#reproducibility). On a server launched with `--enable-mis`, replay as described in [Score questions over one shared prefix](#score-questions-over-one-shared-prefix).
 
 ## Thinking models
 
@@ -204,6 +205,17 @@ Qwen3.8-27B and Qwen3.5-35B-A3B think by default. `/v1/decisions` turns thinking
 ## Reproducibility
 
 These models mix full and linear attention. Answer probabilities can move by up to several hundredths (0.07 in our checks), and `label_mass` by up to about 0.14, between cold and prefix-cached requests and across batch compositions, while the chosen option stayed the same in our checks. On Qwen3.5-35B-A3B, `--disable-radix-cache` gave identical values across sequential repeats, at the cost of prefix reuse.
+
+## Score questions over one shared prefix
+
+The prompts of a request's questions start with the same chat template header and input. Without `--enable-mis`, a cold request can compute that shared part once per question, although prompts that chunked prefill moves to a later batch can reuse it from the radix cache. A server launched with `--enable-mis` and `--attention-backend flashinfer`, plus `--linear-attn-prefill-backend triton` on hybrid models such as Qwen3.8-27B, and without speculative decoding, scores all questions of a request as one multi-item sequence instead. The sequence holds the longest token prefix that every prompt shares, then each question's remaining tokens as an item after a delimiter token, and every item keeps at least the last token of its prompt. In full-attention layers, an item's tokens see the shared prefix and their own item, but not the delimiter. The linear-attention layers of hybrid models continue each item from their state after the shared prefix and read its delimiter first. No layer lets one question see another.
+
+- Dedicate the server to scoring. `--enable-mis` turns off the radix cache, chunked prefill, and CUDA graphs for the whole server, so a repeated input is computed again. Do not send chat or `/generate` requests to it: a prefill batch that mixes them with multi-item scoring requests fails an assertion.
+- Probabilities differ from those of a server without `--enable-mis`, because each answer is read inside the packed sequence. On one Qwen3.8-27B request in BF16 with eight questions over a 3,985-token shared prefix, probabilities moved by up to 0.152 from scoring each original prompt alone, and every question kept its top-scoring label. Where an item sits in the sequence also matters: identical questions in one request, or a question after reordering, differed by up to about 0.03. These are measurements of one workload, not bounds. With `--enable-fp32-lm-head`, `/v1/score` requests that kept the same shared query and question tails moved by less than 0.013 when a tail was scored alone, reordered, or placed next to a changed tail. A `/v1/decisions` request with one question splits its prompt at a different point, so that result does not cover it.
+- `prompt_token_ids` holds the shared prefix, the delimiter, and the question's remaining tokens. To reproduce the answers exactly through `/v1/score` on the same server, send the shared prefix as `query` and the remaining tokens of every question, in request order, as `items`. Sending `prompt_token_ids` with an empty `query`, or one question alone, packs the tokens differently and can change the probabilities.
+- `usage.prompt_tokens` counts the scored sequence: the shared prefix once, the remaining tokens of every question, and one delimiter per question plus one.
+- The scored sequence must fit one prefill, below the context length minus reserved tokens, below the scheduler's input limit, and within `--max-prefill-tokens`. A longer request returns 400. Multi-item attention stores positions within an item as 16-bit values, so a question's remaining tokens must not exceed 65,535. The server does not check this separately; the limits above keep every item shorter unless `--max-prefill-tokens` is above 65,535.
+- Requests with images return 400. On `/v1/systemone`, generation models and decision checkpoints refuse the server.
 
 ## System One compatible API
 

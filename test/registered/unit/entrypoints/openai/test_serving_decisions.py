@@ -178,6 +178,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
         )
         self.is_generation = is_generation
         self.context_len = context_len
+        self.max_req_input_len = context_len
         self.num_reserved_tokens = 0
         self.request_logger = SimpleNamespace(log_requests=False)
         generator = torch.Generator().manual_seed(0)
@@ -189,9 +190,38 @@ class ScoringManager(TokenizerManagerScoreMixin):
     def config_value(self, name):
         return None
 
+    def context_logprobs(self, ids):
+        """Full-vocabulary logprobs that change with every id the answer position sees."""
+        generator = torch.Generator().manual_seed(hash(tuple(ids)) % (1 << 31))
+        logits = torch.randn(
+            len(self.tokenizer), generator=generator, dtype=torch.float64
+        )
+        return torch.log_softmax(logits * 4, dim=0)
+
     async def generate_request(self, request, raw_request):
         self.requests.append(request)
         request.normalize_batch_and_arguments()
+        if request.multi_item_delimiter_indices is not None:
+            # Each delimiter reads the position before it, which sees the query
+            # and, past the query boundary, the delimiter and tokens of its item.
+            (ids,), (delimiters,) = (
+                request.input_ids,
+                request.multi_item_delimiter_indices,
+            )
+            query = ids[: delimiters[0]]
+            contexts = [query] + [
+                query + ids[start:end] for start, end in zip(delimiters, delimiters[1:])
+            ]
+            rows = [
+                [
+                    (self.context_logprobs(context)[token].item(), token, None)
+                    for token in request.token_ids_logprob[0]
+                ]
+                for context in contexts
+            ]
+            meta = {"prompt_tokens": len(ids), "input_token_ids_logprobs": rows}
+            yield [{"meta_info": meta}]
+            return
         results = []
         for ids, labels in zip(request.input_ids, request.token_ids_logprob):
             logprobs = [(self.logprobs[token].item(), token, None) for token in labels]
@@ -591,6 +621,97 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
             scored.token_ids_logprob,
         )
 
+    async def test_enable_mis_scores_each_question_after_the_shared_prefix(self):
+        """Under --enable-mis each answer is read after the prefix all prompts share,
+        a delimiter, and the rest of its own prompt, never at a delimiter."""
+        urgent = _question("yes_no")
+        questions = {
+            "department": _question(
+                "choice", {"billing": None, "technical": None, "sales": None}
+            ),
+            "channel": _question("choice", {"email": None, "chat": None}),
+            "frustration": _question("score", ["Calm", "Civil", "Angry"]),
+            "is_urgent": urgent,
+        }
+        cases = {
+            "several": questions,
+            "one": {"is_urgent": urgent},
+            "identical": {"first": urgent, "second": urgent},
+        }
+        for case, case_questions in cases.items():
+            with self.subTest(case):
+                request = _request(
+                    "The integration keeps failing and I am losing sales.",
+                    case_questions,
+                    temperature=2.0,
+                    return_prompt_token_ids=True,
+                )
+                prompts, labels = _encoded(
+                    _handler(ScoringManager(self.tokenizer)), request
+                )
+                manager = ScoringManager(self.tokenizer, enable_mis=True)
+                response = await _handler(manager).handle_request(request, None)
+                self.assertEqual(response.status_code, 200, response.body)
+                body = json.loads(response.body)
+                (scored,) = manager.requests
+                (ids,), (delimiters,) = (
+                    scored.input_ids,
+                    scored.multi_item_delimiter_indices,
+                )
+                query = ids[: delimiters[0]]
+                self.assertEqual(body["usage"]["prompt_tokens"], len(ids))
+                # The query is as long as it can be with a token left in every item.
+                shorter = len(query) + 1 == min(map(len, prompts))
+                self.assertTrue(
+                    shorter or len({p[len(query)] for p in prompts}) > 1, case
+                )
+                for i, answer in enumerate(body["answers"].values()):
+                    item = ids[delimiters[i] + 1 : delimiters[i + 1]]
+                    self.assertTrue(item)
+                    self.assertEqual(query + item, prompts[i])
+                    self.assertEqual(
+                        answer["prompt_token_ids"], query + [ids[delimiters[i]]] + item
+                    )
+                    self.assertEqual(answer["label_token_ids"], labels[i])
+                    logprobs = manager.context_logprobs(answer["prompt_token_ids"])
+                    expected = logprobs[labels[i]]
+                    torch.testing.assert_close(
+                        torch.tensor(
+                            list(answer["probabilities"].values()),
+                            dtype=torch.float64,
+                        ),
+                        torch.softmax(expected / 2.0, dim=0),
+                    )
+                    torch.testing.assert_close(
+                        torch.tensor(answer["label_mass"], dtype=torch.float64),
+                        expected.exp().sum(),
+                        rtol=1e-9,
+                        atol=0,
+                    )
+
+    async def test_enable_mis_refuses_a_sequence_longer_than_one_prefill(self):
+        """The packed sequence, with a delimiter before each item and after the last,
+        is refused before the context check could truncate it."""
+        request = _request(
+            "s", {"a": _question("yes_no"), "b": _question("score", ["x", "y"])}
+        )
+        manager = ScoringManager(self.tokenizer, enable_mis=True)
+        await _handler(manager).handle_request(request, None)
+        packed = len(manager.requests[0].input_ids[0])
+        for context_len, status in ((packed + 1, 200), (packed, 400)):
+            with self.subTest(context_len=context_len):
+                manager = ScoringManager(
+                    self.tokenizer, context_len=context_len, enable_mis=True
+                )
+                response = await _handler(manager).handle_request(request, None)
+                self.assertEqual(response.status_code, status, response.body)
+                if status == 400:
+                    self.assertIn(
+                        f"one sequence of {packed} tokens",
+                        json.loads(response.body)["message"],
+                    )
+                    self.assertEqual(manager.requests, [])
+
     async def test_refusals_name_the_question_and_skip_scoring(self):
         request = _request("s", {"first": _question("choice", {"a": None, "b": None})})
         prompt_len = len(
@@ -775,13 +896,17 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                 lambda: _handler(ScoringManager(self.tokenizer), lossy=True),
                 {},
             ),
-            "--enable-mis": (
-                lambda: _handler(ScoringManager(self.tokenizer, enable_mis=True)),
-                {},
-            ),
             "--dllm-algorithm": (
                 lambda: _handler(
                     ScoringManager(self.tokenizer, dllm_algorithm="LowConfidence")
+                ),
+                {},
+            ),
+            "--enable-mis with speculative decoding": (
+                lambda: _handler(
+                    ScoringManager(
+                        self.tokenizer, enable_mis=True, speculative_algorithm="EAGLE"
+                    )
                 ),
                 {},
             ),
@@ -878,13 +1003,14 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                 "multimodal marker text",
             ]
             if serving_class is OpenAIServingDecisions:
-                cases.append("return_prompt_token_ids")
+                cases += ["return_prompt_token_ids", "--enable-mis"]
             for message in cases:
                 with self.subTest(route=serving_class.route, refusal=message):
                     self.tokenizer.chat_template = original_template
                     manager = ScoringManager(
                         self.tokenizer,
                         allow_auto_truncate=message == "--allow-auto-truncate",
+                        enable_mis=message == "--enable-mis",
                     )
                     if message == "--enable-multimodal":
                         manager.model_config.is_multimodal = False
@@ -1380,16 +1506,19 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 400)
                 self.assertIn(message, json.loads(response.body)["message"])
                 self.assertEqual(serving.tokenizer_manager.requests, [])
-        # The server checks of /v1/decisions apply too.
-        serving = self._serving(
-            ScoringManager(self.tokenizer, dllm_algorithm="LowConfidence")
-        )
-        response = await serving.handle_request(plain, None)
-        self.assertEqual(response.status_code, 400)
-        self.assertIn(
-            "/v1/systemone does not support diffusion",
-            json.loads(response.body)["message"],
-        )
+        # The server checks of /v1/decisions apply too, and --enable-mis stays refused.
+        for message, server_args in (
+            ("does not support diffusion", {"dllm_algorithm": "LowConfidence"}),
+            ("does not support --enable-mis", {"enable_mis": True}),
+        ):
+            with self.subTest(message):
+                serving = self._serving(ScoringManager(self.tokenizer, **server_args))
+                response = await serving.handle_request(plain, None)
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(
+                    f"/v1/systemone {message}", json.loads(response.body)["message"]
+                )
+                self.assertEqual(serving.tokenizer_manager.requests, [])
 
     async def test_non_finite_scores_are_a_server_error(self):
         manager = ScoringManager(self.tokenizer)

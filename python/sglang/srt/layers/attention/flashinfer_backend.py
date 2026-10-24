@@ -696,9 +696,18 @@ class FlashInferAttnBackend(AttentionBackend):
 
             token_pos_in_items_ptr.append(pos_within_item.to(torch.uint16))
 
-            forward_batch.positions[seq_start + first_delim : seq_end] = (
-                prefix_len + pos_within_item - 1
-            )
+            item_positions = prefix_len + pos_within_item - 1
+            if prefix_len == 0:
+                # Delimiters after an empty query attend no keys, and would sit at -1;
+                # 0 keeps their RoPE index valid.
+                item_positions = item_positions.clamp(min=0)
+            forward_batch.positions[seq_start + first_delim : seq_end] = item_positions
+            if forward_batch.mrope_positions is not None:
+                # mRoPE models rotate by these instead. Scoring requests carry no
+                # images, so all three axes hold the text position.
+                forward_batch.mrope_positions[:, seq_start + first_delim : seq_end] = (
+                    item_positions
+                )
 
             seq_start = seq_end
 

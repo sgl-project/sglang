@@ -1629,7 +1629,8 @@ class DecisionAnswer(BaseModel):
     label_mass: float
     choice: Optional[str] = None
     score: Optional[float] = None
-    # The exact /v1/score inputs, with return_prompt_token_ids.
+    # The ids the answer was read after, with return_prompt_token_ids; under
+    # --enable-mis they hold the item delimiter, not standalone /v1/score inputs.
     prompt_token_ids: Optional[List[int]] = None
     label_token_ids: Optional[List[int]] = None
 
