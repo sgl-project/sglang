@@ -49,6 +49,7 @@ _deferred_finalize_enabled: contextvars.ContextVar[bool] = contextvars.ContextVa
 )
 
 _TRTLLM_MOE_PDL_MAX_TOKENS = envs.SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS.get()
+_MXFP4_MOE_MAX_TOKENS_PER_LAUNCH = envs.SGLANG_MXFP4_MOE_MAX_TOKENS_PER_LAUNCH.get()
 
 
 def trtllm_moe_enable_pdl(num_tokens: int) -> bool:
@@ -1217,38 +1218,49 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             routed_top_k = _routing_top_k(routing)
 
             defer_finalize = _deferred_finalize_enabled.get()
-            result = trtllm_fp4_block_scale_routed_moe(
-                topk_ids=routing,
-                routing_bias=None,
-                hidden_states=x_quant,
-                hidden_states_scale=x_scale,
-                gemm1_weights=quant_info.w13_weight,
-                gemm1_weights_scale=quant_info.w13_weight_scale,
-                gemm1_bias=None,
-                gemm1_alpha=quant_info.gemm1_alpha,
-                gemm1_beta=quant_info.gemm1_clamp_limit,
-                gemm1_clamp_limit=None,
-                gemm2_weights=quant_info.w2_weight,
-                gemm2_weights_scale=quant_info.w2_weight_scale,
-                gemm2_bias=None,
-                output1_scale_scalar=None,
-                output1_scale_gate_scalar=None,
-                output2_scale_scalar=None,
-                num_experts=quant_info.global_num_experts,
-                top_k=routed_top_k,
-                n_group=None,
-                topk_group=None,
-                intermediate_size=quant_info.intermediate_size_per_partition,
-                local_expert_offset=quant_info.local_expert_offset,
-                local_num_experts=quant_info.local_num_experts,
-                routed_scaling_factor=None,
-                routing_method_type=RoutingMethodType.TopK.value,
-                activation_type=ActivationType.Situ.value,
-                tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
-                output=symm_output,
-                do_finalize=not defer_finalize,
-                enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
-            )
+            # Deferred finalize carries a global permutation and remains one-shot.
+            launch_tokens = _MXFP4_MOE_MAX_TOKENS_PER_LAUNCH
+            if defer_finalize or launch_tokens <= 0:
+                launch_tokens = max(num_tokens, 1)
+            for start in range(0, max(num_tokens, 1), launch_tokens):
+                end = min(start + launch_tokens, num_tokens)
+                chunk_routing = (
+                    tuple(item[start:end] for item in routing)
+                    if isinstance(routing, tuple)
+                    else routing[start:end]
+                )
+                result = trtllm_fp4_block_scale_routed_moe(
+                    topk_ids=chunk_routing,
+                    routing_bias=None,
+                    hidden_states=x_quant[start:end],
+                    hidden_states_scale=None if x_scale is None else x_scale[start:end],
+                    gemm1_weights=quant_info.w13_weight,
+                    gemm1_weights_scale=quant_info.w13_weight_scale,
+                    gemm1_bias=None,
+                    gemm1_alpha=quant_info.gemm1_alpha,
+                    gemm1_beta=quant_info.gemm1_clamp_limit,
+                    gemm1_clamp_limit=None,
+                    gemm2_weights=quant_info.w2_weight,
+                    gemm2_weights_scale=quant_info.w2_weight_scale,
+                    gemm2_bias=None,
+                    output1_scale_scalar=None,
+                    output1_scale_gate_scalar=None,
+                    output2_scale_scalar=None,
+                    num_experts=quant_info.global_num_experts,
+                    top_k=routed_top_k,
+                    n_group=None,
+                    topk_group=None,
+                    intermediate_size=quant_info.intermediate_size_per_partition,
+                    local_expert_offset=quant_info.local_expert_offset,
+                    local_num_experts=quant_info.local_num_experts,
+                    routed_scaling_factor=None,
+                    routing_method_type=RoutingMethodType.TopK.value,
+                    activation_type=ActivationType.Situ.value,
+                    tune_max_num_tokens=next_power_of_2(end - start),
+                    output=symm_output[start:end],
+                    do_finalize=not defer_finalize,
+                    enable_pdl=trtllm_moe_enable_pdl(end - start),
+                )
             if defer_finalize:
                 gemm2_out, topk_weights, expanded_idx = result
                 result = FlashInferTrtllmDeferredFinalizeOutput(
