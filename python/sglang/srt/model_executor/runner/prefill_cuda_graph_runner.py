@@ -154,8 +154,12 @@ logger = logging.getLogger(__name__)
 
 # A replay executes every padded token in its capture bucket. Sparse bucket
 # lists can otherwise turn the lower launch overhead into substantially more
-# model work than an exact-shape eager forward.
+# model work than an exact-shape eager forward. The exception is padding up to
+# a tiny smallest bucket: a few padded tokens are far cheaper than an eager
+# forward, whose per-layer kernel launches dominate tiny extends (e.g. a single
+# new token after a full prefix-cache hit). Sparse large buckets keep the cap.
 _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
+_MAX_PREFILL_CUDA_GRAPH_TINY_BUCKET = 16
 # Prefix attention adds one loop body per chunk to the captured topology, so
 # capture a small geometric set and round each replay up to the nearest one.
 _CHUNKED_PREFIX_VARIANTS = (1, 2, 4, 8, 16)
@@ -1410,9 +1414,26 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # No exact-shape check: load_batch bucket-pads; only reject
         # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
-        if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
-            return False
-        return True
+        return self._padding_within_budget(
+            num_tokens, padded_num_tokens, self.capture_num_tokens
+        )
+
+    @staticmethod
+    def _padding_within_budget(
+        num_tokens: int, padded_num_tokens: int, capture_num_tokens: Sequence[int]
+    ) -> bool:
+        """Whether replaying ``num_tokens`` in a ``padded_num_tokens`` bucket is
+        worth it versus an eager forward."""
+        if padded_num_tokens <= num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
+            return True
+        # Below a tiny smallest bucket the ratio is meaningless (1 -> 4 tokens
+        # is 4x but only 3 extra tokens of work), and eager launch overhead
+        # wins. A large smallest bucket (e.g. 2816) still keeps the 2x cap.
+        smallest = min(capture_num_tokens)
+        return (
+            padded_num_tokens <= smallest
+            and smallest <= _MAX_PREFILL_CUDA_GRAPH_TINY_BUCKET
+        )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         # DP check: group verdict from the schedule-time all-gather

@@ -21,6 +21,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,6 +72,21 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner = self._make_runner()
 
         self.assertTrue(runner.can_run_graph(self._make_forward_batch(8)))
+
+    def test_accepts_single_token_padding_to_tiny_smallest_bucket(self):
+        # A full prefix-cache hit leaves a 1-token extend; 1 -> 4 is cheaper
+        # than an eager forward.
+        runner = self._make_runner()
+
+        self.assertTrue(runner.can_run_graph(self._make_forward_batch(1)))
+
+    def test_rejects_tiny_extend_into_large_smallest_bucket(self):
+        runner = self._make_runner()
+        runner.capture_num_tokens = [2816, 3072, 8192]
+        runner.max_num_tokens = 8192
+
+        self.assertFalse(runner.can_run_graph(self._make_forward_batch(1)))
+        self.assertFalse(runner.can_run_graph(self._make_forward_batch(100)))
 
     def test_mixed_batch_uses_scoped_runner_policy(self):
         runner = self._make_runner()
@@ -233,6 +249,65 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                     SimpleNamespace(global_num_tokens_cpu=[8, 0])
                 )
             )
+
+    def _decode_conversion_vote(self, runner, batch_size):
+        # Under DP attention a decode rank votes with its 1-token-per-request
+        # extend view (num_tokens = batch_size).
+        decode = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=lambda: batch_size,
+            return_logprob=False,
+            has_grammar=False,
+            multimodal_inputs=None,
+            reqs=[SimpleNamespace(beam_group=None) for _ in range(batch_size)],
+            seq_lens_cpu=torch.full((batch_size,), 32, dtype=torch.int64),
+        )
+        dp = "sglang.srt.managers.scheduler_components.dp_attn"
+        with (
+            mock.patch(
+                f"{dp}.get_moe_a2a_backend",
+                return_value=mock.Mock(is_none=lambda: True),
+            ),
+            mock.patch(f"{dp}.uses_ssm_state", return_value=False),
+            mock.patch(
+                f"{dp}.get_memory",
+                return_value=SimpleNamespace(enable_hisparse=False),
+            ),
+            mock.patch(
+                f"{dp}.get_exec",
+                return_value=SimpleNamespace(
+                    overlap=SimpleNamespace(enable_two_batch_overlap=False)
+                ),
+            ),
+            mock.patch(f"{dp}.get_cp_strategy", return_value=None),
+        ):
+            return _local_prefill_cuda_graph_vote(
+                local_batch=decode,
+                num_tokens=batch_size,
+                prefill_graph_runner=runner,
+                coordinated_prefill=True,
+                breakable_prefill=True,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                model_config=None,
+            )
+
+    def test_single_request_decode_rank_joins_graph_replay(self):
+        # A bs=1 decode rank now pads 1 -> 4 like bs=2/3 ranks already did,
+        # instead of voting the whole DP group eager.
+        runner = self._make_runner()
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner._backend_vote_prefill_cuda_graph = None
+        for batch_size in (1, 2, 3):
+            with self.subTest(batch_size=batch_size):
+                self.assertTrue(self._decode_conversion_vote(runner, batch_size))
+
+    def test_single_request_decode_rank_keeps_eager_for_large_buckets(self):
+        runner = self._make_runner()
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner._backend_vote_prefill_cuda_graph = None
+        runner.capture_num_tokens = [2816, 3072, 8192]
+        runner.max_num_tokens = 8192
+        self.assertFalse(self._decode_conversion_vote(runner, 1))
 
     def test_rejects_context_above_fixed_maximum(self):
         runner = self._make_runner()

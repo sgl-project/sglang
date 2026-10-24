@@ -120,6 +120,27 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             self.assertEqual(buckets, [8, 16, 32])
             self.assertEqual(PrefillCudaGraphRunner._pad_to_bucket(28, buckets), 32)
 
+    def test_padding_budget_allows_tiny_extends_below_smallest_bucket(self):
+        # Same shape as the default prefill buckets (cuda_graph_hook.py).
+        buckets = list(range(4, 33, 4)) + list(range(48, 257, 16))
+        smallest = min(buckets)
+        within = PrefillCudaGraphRunner._padding_within_budget
+        # A full prefix-cache hit leaves a single new token; padding it to the
+        # smallest bucket must not force an eager forward.
+        for num_tokens in range(1, smallest + 1):
+            padded = PrefillCudaGraphRunner._pad_to_bucket(num_tokens, buckets)
+            self.assertEqual(padded, smallest)
+            self.assertTrue(within(num_tokens, padded, buckets), num_tokens)
+        # Above the smallest bucket the 2x padding cap still applies.
+        self.assertTrue(within(9, 16, [4, 16]))
+        self.assertFalse(within(5, 16, [4, 16]))
+        self.assertFalse(within(100, 512, [4, 512]))
+        # Sparse large buckets keep the cap even below the smallest bucket
+        # (the case the 2x cap was added for).
+        self.assertFalse(within(1, 2816, [2816, 3072, 8192]))
+        self.assertFalse(within(100, 2816, [2816, 3072, 8192]))
+        self.assertTrue(within(1500, 2816, [2816, 3072, 8192]))
+
     def test_qwen_hc_restore_round_trip(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._qwen_bcg_hc_sidechannel = True
