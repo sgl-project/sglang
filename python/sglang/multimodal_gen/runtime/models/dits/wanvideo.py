@@ -18,7 +18,9 @@ from sglang.kernels.ops.diffusion import (
     can_use_linear_gelu,
     fused_linear_gelu_tanh,
     fused_rmsnorm_interleaved_rope_,
+    fused_rmsnorm_interleaved_rope_into_blocks,
     fused_temb_table_slices,
+    rmsnorm_interleaved_rope_block_cols,
     tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
@@ -630,6 +632,8 @@ class WanTransformerBlock(nn.Module):
         # [3 * dim, dim] weight / [3 * dim] bias whose row blocks back to_q, to_k, to_v
         self.qkv_weight: torch.Tensor | None = None
         self.qkv_bias: torch.Tensor | None = None
+        # exchange-block addresses -> (q, k) destination tables of _attend_qk_filled
+        self._qk_tables: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def fuse_qkv_weights(self) -> None:
         """Back to_q / to_k / to_v with one weight and one bias, so a single GEMM
@@ -681,17 +685,30 @@ class WanTransformerBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
         """q, k, v as [B, S, heads, head_dim], and whether q and k already carry the
         RoPE of rope_cos_sin_cache (applied in the q/k norm pass)"""
+        return self._norm_qk(
+            *self._project_qkv(norm_hidden_states), local_heads, rope_cos_sin_cache
+        )
+
+    def _project_qkv(
+        self, norm_hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._qkv_fused(norm_hidden_states):
             qkv = apply_unquantized_linear(
                 norm_hidden_states, self.qkv_weight, self.qkv_bias
             )
-            query, key, value = qkv.split(self.to_q.weight.shape[0], dim=-1)
-        else:
-            query, _ = self.to_q(norm_hidden_states)
-            key, _ = self.to_k(norm_hidden_states)
-            value, _ = self.to_v(norm_hidden_states)
-        qk_norms = ((query, self.norm_q), (key, self.norm_k))
-        roped = (
+            return qkv.split(self.to_q.weight.shape[0], dim=-1)
+        query, _ = self.to_q(norm_hidden_states)
+        key, _ = self.to_k(norm_hidden_states)
+        value, _ = self.to_v(norm_hidden_states)
+        return query, key, value
+
+    def _fuses_qk_norm_rope(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None,
+    ) -> bool:
+        return (
             rope_cos_sin_cache is not None
             and self.fuse_qk_norm_rope
             and not torch.compiler.is_compiling()
@@ -702,9 +719,106 @@ class WanTransformerBlock(nn.Module):
                     rope_cos_sin_cache,
                     self.dim_head,
                 )
-                for x, norm in qk_norms
+                for x, norm in ((query, self.norm_q), (key, self.norm_k))
             )
         )
+
+    def _attend_qk_filled(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Self-attention whose q/k norm-RoPE pass writes straight into the Ulysses
+        exchange blocks (this rank's own slot rows and the peers' send blocks), so no
+        own-row copy of q and k runs; None, with q/k untouched, when it cannot."""
+        if (
+            type(self.attn1) is not USPAttention
+            or self.use_offline_qk_rotation
+            or not self._fuses_qk_norm_rope(query, key, rope_cos_sin_cache)
+        ):
+            return None
+        q2d, k2d = (x.view(-1, x.shape[-1]) for x in (query, key))
+        block_cols = rmsnorm_interleaved_rope_block_cols(q2d.shape[-1])
+
+        def fill_all(blocks) -> None:
+            tables = self._qk_block_tables(blocks, block_cols, q2d.shape[-1])
+            if tables is None:
+                # blocks the kernel cannot address: norm in place, then copy them
+                for x, norm in ((q2d, self.norm_q), (k2d, self.norm_k)):
+                    fused_rmsnorm_interleaved_rope_(
+                        x,
+                        norm.weight,
+                        rope_cos_sin_cache,
+                        norm.variance_epsilon,
+                        self.dim_head,
+                    )
+                for head_start, head_count, q_dst, k_dst in blocks:
+                    cols = slice(
+                        head_start * self.dim_head,
+                        (head_start + head_count) * self.dim_head,
+                    )
+                    q_dst.copy_(q2d[:, cols].view_as(q_dst))
+                    k_dst.copy_(k2d[:, cols].view_as(k_dst))
+                return
+            for x, norm, table in zip((q2d, k2d), (self.norm_q, self.norm_k), tables):
+                fused_rmsnorm_interleaved_rope_into_blocks(
+                    x,
+                    norm.weight,
+                    rope_cos_sin_cache,
+                    norm.variance_epsilon,
+                    self.dim_head,
+                    table,
+                )
+
+        return self.attn1.forward_qk_filled(
+            *(
+                x.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+                for x in (query, key, value)
+            ),
+            fill_all,
+        )
+
+    def _qk_block_tables(
+        self, blocks, block_cols: int, hidden: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        # destination address of every block_cols-wide column run, for q and for k;
+        # the exchange blocks keep their addresses, so the tables are built once
+        if (
+            any(
+                head_count * self.dim_head != block_cols
+                or (head_start * self.dim_head) % block_cols
+                or not (q_dst.is_contiguous() and k_dst.is_contiguous())
+                for head_start, head_count, q_dst, k_dst in blocks
+            )
+            or len(blocks) * block_cols != hidden
+        ):
+            return None
+        ordered = sorted(blocks, key=lambda block: block[0])
+        key = tuple((q.data_ptr(), k.data_ptr()) for _, _, q, k in ordered)
+        tables = self._qk_tables.get(key)
+        if tables is None:
+            tables = self._qk_tables[key] = tuple(
+                torch.tensor(
+                    [block[i].data_ptr() for block in ordered],
+                    dtype=torch.int64,
+                    device=ordered[0][2].device,
+                )
+                for i in (2, 3)
+            )
+        return tables
+
+    def _norm_qk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        local_heads: int,
+        rope_cos_sin_cache: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+        qk_norms = ((query, self.norm_q), (key, self.norm_k))
+        roped = self._fuses_qk_norm_rope(query, key, rope_cos_sin_cache)
         if roped:
             for x, norm in qk_norms:
                 fused_rmsnorm_interleaved_rope_(
@@ -836,8 +950,36 @@ class WanTransformerBlock(nn.Module):
             norm_hidden_states, hidden_states = self.ffn_residual_norm1(
                 hidden_states, ff_output, ff_gate, shift_msa, scale_msa
             )
-        query, key, value, roped = self._qkv_rope(
-            norm_hidden_states, self.local_num_heads, rope_cos_sin_cache
+        query, key, value = self._project_qkv(norm_hidden_states)
+        attn_output = self._attend_qk_filled(query, key, value, rope_cos_sin_cache)
+        if attn_output is None:
+            attn_output = self._self_attention(
+                query, key, value, freqs_cis, rope_cos_sin_cache
+            )
+        attn_output = attn_output.flatten(2)
+        return self._cross_and_ffn(
+            hidden_states,
+            attn_output,
+            encoder_hidden_states,
+            gate_msa,
+            c_shift_msa,
+            c_scale_msa,
+            c_gate_msa,
+            orig_dtype,
+            defer_ffn_residual,
+            text_kv,
+        )
+
+    def _self_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        rope_cos_sin_cache: torch.Tensor | None,
+    ) -> torch.Tensor:
+        query, key, value, roped = self._norm_qk(
+            query, key, value, self.local_num_heads, rope_cos_sin_cache
         )
 
         # Apply rotary embeddings
@@ -896,20 +1038,7 @@ class WanTransformerBlock(nn.Module):
             query = torch.matmul(query, self.q_rot)
             key = torch.matmul(key, self.k_rot)
 
-        attn_output = self.attn1(query, key, value)
-        attn_output = attn_output.flatten(2)
-        return self._cross_and_ffn(
-            hidden_states,
-            attn_output,
-            encoder_hidden_states,
-            gate_msa,
-            c_shift_msa,
-            c_scale_msa,
-            c_gate_msa,
-            orig_dtype,
-            defer_ffn_residual,
-            text_kv,
-        )
+        return self.attn1(query, key, value)
 
 
 class WanTransformerBlock_VSA(nn.Module):
