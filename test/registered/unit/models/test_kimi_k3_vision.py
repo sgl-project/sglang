@@ -326,6 +326,22 @@ def test_kimi_k3_vit_graph_runner_rejects_invalid_limits(
         )
 
 
+def test_kimi_k3_temporal_position_follows_spatial_weight_device():
+    # Selective parameter placement can leave the non-persistent time buffer
+    # on CPU. A temporal grid must still follow the spatial weight device.
+    position = kimi_k3_vl.Learnable2DInterpPosEmbDividedFixed(2, 2, 2, 8)
+    position.weight = torch.nn.Parameter(torch.empty(2, 2, 8, device="meta"))
+    assert position.time_weight.device.type == "cpu"
+
+    result = position.position_embeddings(
+        torch.tensor([[2, 2, 2]]), grid_thw_list=((2, 2, 2),)
+    )
+
+    assert result.device.type == "meta"
+    assert result.shape == (8, 8)
+    assert position.time_weight.device.type == "cpu"
+
+
 def test_kimi_k3_position_interpolation_uses_contiguous_chw(monkeypatch):
     weight = torch.randn(4, 5, 8)
     output_size = (3, 7)
