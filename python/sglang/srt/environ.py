@@ -1346,6 +1346,11 @@ class Envs:
     # colliding pad top-ks also inflate the DeepGEMM masked-GEMM workspace to
     # OOM at saturation.  Capture-safe (reads only global_num_tokens_gpu).
     SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
+    # Latent MoE (Nemotron-H, Kimi K3) under DP attention with
+    # --moe-a2a-backend none: exchange latent-width rows plus top-k ids and
+    # weights across EP instead of hidden-width rows. Unsupported setups log
+    # why and keep the default path.
+    SGLANG_OPT_LATENT_MOE_COMM = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)

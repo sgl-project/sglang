@@ -50,6 +50,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.latent_moe_comm import latent_moe_forward
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -86,7 +87,11 @@ from sglang.srt.model_loader.weight_utils import (
     replace_prefix,
     replace_substrings,
 )
-from sglang.srt.models.nemotron_h_utils import make_stage_boundary, stage_facts
+from sglang.srt.models.nemotron_h_utils import (
+    make_stage_boundary,
+    stage_facts,
+    uses_latent_moe_comm,
+)
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_schedule
 from sglang.srt.utils import (
@@ -246,11 +251,14 @@ class NemotronHMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         is_nextn: bool = False,
+        latent_moe_comm: bool = False,
     ) -> None:
         super().__init__()
 
         self.layer_id = layer_idx
         self.is_nextn = is_nextn
+        # Exchange latent rows across EP (SGLANG_OPT_LATENT_MOE_COMM).
+        self.latent_moe_comm = latent_moe_comm
         self.routed_scaling_factor = config.routed_scaling_factor
         self.device_module = torch.get_device_module()
 
@@ -301,6 +309,8 @@ class NemotronHMoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+            # The latent exchange captures the gathered ids itself.
+            allow_routed_experts_capture=not latent_moe_comm,
         )
         self.topk.bind_runner_backend(
             self.experts.runner_backend,
@@ -314,7 +324,11 @@ class NemotronHMoE(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 **(
-                    dict(parallel_group="replicated")
+                    # Sharded over attention TP; the latent exchange's
+                    # attention-TP all-reduce completes it.
+                    dict(parallel_group="attn_tp")
+                    if latent_moe_comm
+                    else dict(parallel_group="replicated")
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_flashinfer()
                     or get_moe_a2a_backend().is_flashinfer_megamoe()
@@ -490,6 +504,23 @@ class NemotronHMoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch | None = None,
     ) -> torch.Tensor:
+        if self.latent_moe_comm:
+            return latent_moe_forward(
+                hidden_states,
+                layer_id=self.layer_id,
+                # bf16 gemm with fp32 accumulation/output for sigmoid/topk.
+                gate=lambda x: torch.mm(
+                    x, self.gate.weight.t(), out_dtype=torch.float32
+                ),
+                topk=self.topk,
+                down_proj=self._apply_fc1_latent_proj,
+                experts=self.experts,
+                up_proj=self._apply_latent_projection,
+                shared_experts=self.shared_experts,
+                alt_stream=(
+                    _get_or_create_alt_stream(self.device_module) if _is_cuda else None
+                ),
+            )
         num_tokens, hidden_dim = hidden_states.shape
         # routed_scaling_factor is fused into the experts call (applied by the
         # MoE runner / topk), so final_hidden_states is already scaled.
@@ -513,9 +544,14 @@ class NemotronHMLPLikeDecoderLayer(nn.Module):
     mixer's attention partial sum, or a value that is complete or carries the
     sum an FFN before it left."""
 
-    def _init_stage_boundary(self, config: NemotronHConfig, layer_idx: int):
+    def _init_stage_boundary(
+        self, config: NemotronHConfig, layer_idx: int, latent_moe_comm: bool = False
+    ):
         self.boundary = make_stage_boundary(
-            self.norm, pattern=config.hybrid_override_pattern, layer_idx=layer_idx
+            self.norm,
+            pattern=config.hybrid_override_pattern,
+            layer_idx=layer_idx,
+            latent_moe_comm=latent_moe_comm,
         )
 
     def forward(
@@ -577,16 +613,18 @@ class NemotronHMoEDecoderLayer(NemotronHMLPLikeDecoderLayer):
         layer_config = config.get_nemotron_h_config_for_layer(layer_idx)
 
         self.layer_idx = layer_idx
+        latent_moe_comm = not is_nextn and uses_latent_moe_comm(config, layer_idx)
         self.mixer = NemotronHMoE(
             layer_config,
             layer_idx=layer_idx,
             quant_config=quant_config,
             prefix=f"{prefix}.mixer",
             is_nextn=is_nextn,
+            latent_moe_comm=latent_moe_comm,
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
-        self._init_stage_boundary(config, layer_idx)
+        self._init_stage_boundary(config, layer_idx, latent_moe_comm)
 
     def forward(
         self,
@@ -844,7 +882,15 @@ class NemotronHModel(nn.Module):
             len(config.hybrid_override_pattern),
             get_layer,
             prefix=f"{prefix}.layers",
-            stage_facts=partial(stage_facts, config.hybrid_override_pattern),
+            stage_facts=partial(
+                stage_facts,
+                config.hybrid_override_pattern,
+                latent_moe_layers=frozenset(
+                    idx
+                    for idx in range(len(config.hybrid_override_pattern))
+                    if uses_latent_moe_comm(config, idx)
+                ),
+            ),
         )
         if self.pp_group.is_last_rank:
             self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)

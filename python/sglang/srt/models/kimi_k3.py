@@ -78,6 +78,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import route_quant_handoff
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.latent_moe_comm import (
+    latent_moe_forward,
+    use_latent_moe_comm,
+)
 from sglang.srt.layers.moe.topk import (
     TopK,
     TopKOutputFormat,
@@ -456,10 +460,13 @@ class KimiK3MoE(nn.Module):
         prefix: str = "",
         layer_idx: int = 0,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        latent_moe_comm: bool = False,
     ):
         super().__init__()
         hidden_size = config.hidden_size
         moe_intermediate_size = config.moe_intermediate_size
+        # Exchange latent rows across EP (SGLANG_OPT_LATENT_MOE_COMM).
+        self.latent_moe_comm = latent_moe_comm
         moe_renormalize = config.moe_renormalize
         self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
@@ -550,6 +557,8 @@ class KimiK3MoE(nn.Module):
                 or get_moe_a2a_backend().is_flashinfer_megamoe()
                 else None
             ),
+            # The latent exchange captures the gathered ids itself.
+            allow_routed_experts_capture=not latent_moe_comm,
         )
         self.topk.bind_runner_backend(
             self.experts.runner_backend,
@@ -602,7 +611,11 @@ class KimiK3MoE(nn.Module):
         )
         self._shared_experts_tp_group = None
         shared_experts_parallel_group = None
-        if self._shared_experts_tp1:
+        if latent_moe_comm:
+            # Sharded over attention TP; the latent exchange's attention-TP
+            # all-reduce completes it.
+            shared_experts_parallel_group = "attn_tp"
+        elif self._shared_experts_tp1:
             shared_experts_parallel_group = "replicated"
         elif self._shared_experts_tp_comm:
             group = (
@@ -720,7 +733,7 @@ class KimiK3MoE(nn.Module):
         cuda graph capture); only plain bf16/fp16 dense weights are merged —
         quantized or mixed-dtype checkpoints keep the unfused path.
         """
-        if not self.use_latent_moe:
+        if not self.use_latent_moe or self.latent_moe_comm:
             return
         # These merged layouts feed CUDA and ROCm fused front kernels. Keeping the
         # regular parameters on other devices avoids a large transient copy
@@ -882,6 +895,18 @@ class KimiK3MoE(nn.Module):
         if self.routed_expert_norm is None:
             return latent
         return self.routed_expert_norm(latent)
+
+    def _latent_down_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states.new_empty((0, self.moe_hidden_size))
+        return self.routed_expert_down_proj(hidden_states)[0]
+
+    def _latent_up_proj(self, latent: torch.Tensor, addend: torch.Tensor):
+        # The reduce-scatter leaves complete rows, so the latent norm reads
+        # whole sums as on the default path.
+        if latent.shape[0] > 0:
+            addend.add_(self.routed_expert_up_proj(self._latent_norm(latent))[0])
+        return addend
 
     @cached_property
     def _routing_contract_ok(self) -> bool:
@@ -1490,6 +1515,21 @@ class KimiK3MoE(nn.Module):
         residual add to its stage boundary and takes none."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        if self.latent_moe_comm:
+            # Under DP attention without an EP a2a backend the stage boundary
+            # owns the residual add, so no prefix_sum reaches this layer.
+            assert prefix_sum is None
+            return latent_moe_forward(
+                hidden_states,
+                layer_id=self.layer_idx,
+                gate=self.gate,
+                topk=self.topk,
+                down_proj=self._latent_down_proj,
+                experts=self.experts,
+                up_proj=self._latent_up_proj,
+                shared_experts=self.shared_experts,
+                alt_stream=self.alt_stream,
+            )
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
@@ -2434,6 +2474,14 @@ def _latent_moe_writes_stream(config: KimiLinearConfig, layer_idx: int) -> bool:
     )
 
 
+def _uses_latent_moe_comm(config: KimiLinearConfig, layer_idx: int) -> bool:
+    """Whether a MoE layer exchanges latent rows across EP instead of
+    hidden-width rows (SGLANG_OPT_LATENT_MOE_COMM)."""
+    return _is_moe_layer(config, layer_idx) and use_latent_moe_comm(
+        is_latent_moe=_uses_latent_moe(config)
+    )
+
+
 def _stage_facts(
     config: KimiLinearConfig,
     layer_idx: int,
@@ -2480,15 +2528,20 @@ def _stage_facts(
                 else bank.ffn_update
             ),
         )
+    # A latent-exchange MoE runs on its DP group's rows like an attention-TP
+    # dense FFN and owns the exchange across DP ranks.
+    latent_moe_comm = _uses_latent_moe_comm(config, layer_idx)
     return (
         declare_attn(**attn_ops),
         declare_ffn(
             **ffn_ops,
-            sparse=is_moe,
+            sparse=is_moe and not latent_moe_comm,
             next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
-            # The TP width the dense MLP is built with.
+            # The TP width the dense MLP (or a latent-exchange MoE) runs with.
             dense_tp_size=(
-                None
+                get_parallel().attn_tp_size
+                if latent_moe_comm
+                else None
                 if is_moe
                 else resolve_linear_parallel_group(_dense_mlp_parallel_group())[1]
             ),
@@ -2559,6 +2612,7 @@ class KimiK3DecoderLayer(nn.Module):
                 layer_idx=layer_idx,
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_streams[0] if alt_streams is not None else None,
+                latent_moe_comm=_uses_latent_moe_comm(config, layer_idx),
             )
         else:
             self.mlp = KimiK3MLP(
