@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.prefetch_traffic import (
+    collective_prefetch_guard,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.common import torch_release
 
@@ -146,7 +149,8 @@ def _usp_all_to_all_single(x: torch.Tensor, role: str | None = None) -> torch.Te
     ):
         torch.ops.sgl_kernel.shm_alltoall(output, x, sp_group.ulysses_shm_handle)
     else:
-        torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
+        with collective_prefetch_guard(x.device):
+            torch.distributed.all_to_all_single(output, x, group=ulysses_pg)
 
     return output.reshape(x_shape)
 
@@ -174,13 +178,14 @@ def _usp_all_to_all_single_varlen(
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x = x.flatten().contiguous()
     output = torch.empty(sum(output_split_sizes), dtype=x.dtype, device=x.device)
-    dist.all_to_all_single(
-        output,
-        x,
-        output_split_sizes=output_split_sizes,
-        input_split_sizes=input_split_sizes,
-        group=ulysses_pg,
-    )
+    with collective_prefetch_guard(x.device):
+        dist.all_to_all_single(
+            output,
+            x,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=ulysses_pg,
+        )
     return output
 
 
