@@ -46,6 +46,8 @@ def _run_residual_accuracy_check():
         tensor_model_parallel_fused_allreduce_rmsnorm,
     )
     from sglang.srt.distributed.parallel_state import (
+        _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES,
+        _FUSED_AR_RMS_1STAGE_MAX_TOKENS,
         destroy_distributed_environment,
         destroy_model_parallel,
         init_distributed_environment,
@@ -130,7 +132,12 @@ def _run_residual_accuracy_check():
         frac_nonzero = (diff > 0).float().mean().item()
 
         nbytes = m * n * dtype.itemsize
-        stage = "1-stage" if nbytes <= 128 * 1024 else "2-stage"
+        stage = (
+            "1-stage"
+            if m <= _FUSED_AR_RMS_1STAGE_MAX_TOKENS
+            and nbytes * world_size <= _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES
+            else "2-stage"
+        )
         passed = max_diff <= ATOL
 
         if not passed:
