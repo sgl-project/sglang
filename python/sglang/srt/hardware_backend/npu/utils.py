@@ -170,6 +170,13 @@ def set_default_server_args(args: "ServerArgs"):
         disable_custom_all_reduce=True,
     )
 
+    # Pre-warm HCCL for trans
+    declare_resolution(
+        args,
+        "set_default_server_args",
+        pre_warm_nccl=True,
+    )
+
     # Backup-only decode retraction also builds a HiCache host pool. The
     # inferred backend is resolved later, once the device KV pool exists.
     if (
