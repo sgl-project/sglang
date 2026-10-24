@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from queue import Empty, Queue
 
 import torch
@@ -35,6 +37,9 @@ from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
+
+DEFAULT_LOAD_LAYER_GROUP = 8
+DEFAULT_LOAD_THREADS = 4
 
 
 def _storage_suffix(
@@ -79,6 +84,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
+        )
+        self.load_layer_group = max(
+            1,
+            int(extra_config.get("linker_load_layer_group", DEFAULT_LOAD_LAYER_GROUP)),
+        )
+        self.load_threads = max(
+            1, int(extra_config.get("linker_load_threads", DEFAULT_LOAD_THREADS))
         )
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
@@ -153,6 +165,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
+        self.load_io_executor = ThreadPoolExecutor(
+            self.load_threads, thread_name_prefix=f"mooncake-load-io-tp{tp_rank}"
+        )
         self.load_thread = threading.Thread(
             target=self.load_thread_func,
             daemon=True,
@@ -316,6 +331,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
         started = []
+        futures: list[list[Future]] = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
@@ -339,33 +355,29 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                 started.append(keys)
 
-            for layer in range(self.num_layers):
+            groups = [
+                range(start, min(start + self.load_layer_group, self.num_layers))
+                for start in range(0, self.num_layers, self.load_layer_group)
+            ]
+            for group in groups:
+                group_futures = []
+                futures.append(group_futures)
                 for name, (keys, locations) in batches.items():
-                    meta = self.pools[name].get_prepared_layer_range_meta(
-                        locations, layer
-                    )
-                    if meta is None:
-                        continue
-                    ptrs, sizes, offsets = meta
-                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                        keys,
-                        ptrs,
-                        sizes,
-                        offsets,
-                    )
-                    expected = [sum(item) for item in sizes]
-                    if (
-                        result is None
-                        or isinstance(result, int)
-                        or list(result) != expected
-                    ):
-                        raise RuntimeError(
-                            f"Mooncake range get failed for pool={name}, "
-                            f"layer={layer}: transferred={result}, "
-                            f"expected={expected}"
-                        )
-                self.layer_done_counter.complete(counter_index, layer)
+                    meta = self._group_range_meta(name, locations, group)
+                    if meta is not None:
+                        group_futures.extend(self._submit_range_gets(name, keys, *meta))
+            for group, group_futures in zip(groups, futures):
+                for future in group_futures:
+                    future.result()
+                for layer in group:
+                    self.layer_done_counter.complete(counter_index, layer)
         except BaseException as error:
+            # Failure wakes consumers, which may release the destination rows.
+            # Stop every submitted write before publishing it.
+            pending = [future for group_futures in futures for future in group_futures]
+            for future in pending:
+                future.cancel()
+            wait(pending)
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
@@ -375,6 +387,48 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
+
+    def _group_range_meta(self, name: PoolName, locations: list[int], group: range):
+        merged = None
+        for layer in group:
+            meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
+            if meta is None:
+                continue
+            if merged is None:
+                merged = meta
+                continue
+            for merged_rows, rows in zip(merged, meta):
+                for merged_row, row in zip(merged_rows, rows):
+                    merged_row.extend(row)
+        return merged
+
+    def _submit_range_gets(
+        self, name: PoolName, keys: list[str], ptrs, sizes, offsets
+    ) -> Iterator[Future]:
+        if not keys:
+            return
+        step = -(-len(keys) // self.load_threads)
+        # Yield each future so the caller retains it even if a later submit fails.
+        for start in range(0, len(keys), step):
+            yield self.load_io_executor.submit(
+                self._range_get,
+                name,
+                keys[start : start + step],
+                ptrs[start : start + step],
+                sizes[start : start + step],
+                offsets[start : start + step],
+            )
+
+    def _range_get(self, name: PoolName, keys, ptrs, sizes, offsets) -> None:
+        result = self.storage.store.batch_get_into_multi_buffer_ranges(
+            keys, ptrs, sizes, offsets
+        )
+        expected = [sum(item) for item in sizes]
+        if result is None or isinstance(result, int) or list(result) != expected:
+            raise RuntimeError(
+                f"Mooncake range get failed for pool={name}: "
+                f"transferred={result}, expected={expected}"
+            )
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
@@ -436,6 +490,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_queue.put(None)
         self.load_thread.join()
         self.offload_thread.join()
+        self.load_io_executor.shutdown()
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()
         if self.mla_broadcaster is not None:
