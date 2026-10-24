@@ -906,45 +906,27 @@ class GenerateReqInput:
 
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
-        # Normalize bootstrap_host
-        if self.bootstrap_host is None:
-            self.bootstrap_host = [None] * num
-        elif not isinstance(self.bootstrap_host, list):
-            self.bootstrap_host = [self.bootstrap_host] * num
-        elif isinstance(self.bootstrap_host, list):
-            self.bootstrap_host = self.bootstrap_host * self.parallel_sample_num
-
-        # Normalize bootstrap_port
-        if self.bootstrap_port is None:
-            self.bootstrap_port = [None] * num
-        elif not isinstance(self.bootstrap_port, list):
-            self.bootstrap_port = [self.bootstrap_port] * num
-        elif isinstance(self.bootstrap_port, list):
-            self.bootstrap_port = self.bootstrap_port * self.parallel_sample_num
-
-        # Normalize bootstrap_room
-        if self.bootstrap_room is None:
-            self.bootstrap_room = [None] * num
-        elif not isinstance(self.bootstrap_room, list):
-            self.bootstrap_room = [self.bootstrap_room + i for i in range(num)]
-        elif isinstance(self.bootstrap_room, list):
-            self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
-
-        # Normalize bootstrap_pair_key
-        if self.bootstrap_pair_key is None:
-            self.bootstrap_pair_key = [None] * num
-        elif not isinstance(self.bootstrap_pair_key, list):
-            self.bootstrap_pair_key = [self.bootstrap_pair_key] * num
-        elif isinstance(self.bootstrap_pair_key, list):
-            self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
-
-        # Normalize decode_tp_size
-        if self.decode_tp_size is None:
-            self.decode_tp_size = [None] * num
-        elif not isinstance(self.decode_tp_size, list):
-            self.decode_tp_size = [self.decode_tp_size] * num
-        elif isinstance(self.decode_tp_size, list):
-            self.decode_tp_size = self.decode_tp_size * self.parallel_sample_num
+        for field_name in (
+            "bootstrap_host",
+            "bootstrap_port",
+            "bootstrap_room",
+            "bootstrap_pair_key",
+            "decode_tp_size",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, list):
+                if len(value) == self.batch_size:
+                    value = value * self.parallel_sample_num
+                elif len(value) != num:
+                    raise ValueError(
+                        f"The length of {field_name} should be equal to the batch "
+                        "size or the expanded batch size."
+                    )
+            elif field_name == "bootstrap_room" and value is not None:
+                value = [value + i for i in range(num)]
+            else:
+                value = [value] * num
+            setattr(self, field_name, value)
 
     def _get_positional_embed_overrides_item(
         self, i: int
