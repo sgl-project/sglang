@@ -61,7 +61,7 @@ class DllmAlgorithm:
         supported_keys = ("block_size",) + cls.config_keys
         if cls.capture_input_preparation:
             supported_keys += ("capture_input_preparation",)
-        cls._validate_config_keys(config, supported_keys)
+        cls._validate_config_keys(config=config, supported_keys=supported_keys)
 
     @classmethod
     def _validate_config_keys(

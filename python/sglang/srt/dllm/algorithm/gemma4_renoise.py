@@ -101,7 +101,9 @@ class Gemma4Renoise(DllmAlgorithm):
             section = config.get(name) or {}
             if not isinstance(section, dict):
                 raise ValueError(f"{name} must be a mapping")
-            cls._validate_config_keys(section, keys, prefix=f"{name}.")
+            cls._validate_config_keys(
+                config=section, supported_keys=keys, prefix=f"{name}."
+            )
 
     @classmethod
     def configure_server_args(cls, server_args: ServerArgs) -> None:
