@@ -14,8 +14,10 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -23,7 +25,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1400, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=2300, stage="extra-b", runner_config="4-gpu-h100")
 
 # topk=1 chains and a topk=2 tree: the relayed topology is constant for the
 # former and data-dependent for the latter, so both shapes are covered.
@@ -125,6 +127,32 @@ class TestPPSpecConsistency(CustomTestCase):
 
     def test_pp_matches_non_pp_tree(self):
         self._assert_matches("tree")
+
+
+class TestPPSpecEagle3Consistency(TestPPSpecConsistency):
+    """EAGLE3 reads aux hidden states from layers spread over every stage; a
+    stage that drops its captures narrows the draft's feature, which crashes
+    the draft fc or, at width == hidden_size, skips it and only lowers acceptance."""
+
+    model = DEFAULT_TARGET_MODEL_EAGLE3
+
+    def _spec_args(self, shape: str):
+        num_steps, topk, num_draft_tokens = SPEC_SHAPES[shape]
+        return [
+            # Canonical EAGLE3 config; the draft checkpoint is fp16.
+            "--dtype",
+            "float16",
+            "--speculative-algorithm",
+            "EAGLE3",
+            "--speculative-draft-model-path",
+            DEFAULT_DRAFT_MODEL_EAGLE3,
+            "--speculative-num-steps",
+            num_steps,
+            "--speculative-eagle-topk",
+            topk,
+            "--speculative-num-draft-tokens",
+            num_draft_tokens,
+        ]
 
 
 class TestPPSpecHybridConsistency(TestPPSpecConsistency):

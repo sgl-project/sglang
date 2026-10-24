@@ -2870,8 +2870,8 @@ class KimiK3LinearModel(nn.Module):
             self.dspark_layers_to_capture is not None
             and not self.pp_group.is_first_rank
         ):
-            if "dspark_hidden_states" in pp_proxy_tensors.tensors:
-                aux_hidden_states.append(pp_proxy_tensors["dspark_hidden_states"])
+            if "aux_hidden_states" in pp_proxy_tensors.tensors:
+                aux_hidden_states.append(pp_proxy_tensors["aux_hidden_states"])
             if self.start_layer - 1 in captures and not captures_at_input:
                 aux_hidden_states.append(
                     self._dspark_capture_stream(
@@ -2911,7 +2911,7 @@ class KimiK3LinearModel(nn.Module):
                 )
                 self.attn_bank.close()
             if aux_hidden_states:
-                proxy_tensors.tensors["dspark_hidden_states"] = torch.cat(
+                proxy_tensors.tensors["aux_hidden_states"] = torch.cat(
                     aux_hidden_states, dim=-1
                 )
             return proxy_tensors
@@ -3031,7 +3031,7 @@ class KimiK3LinearForCausalLM(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
-    def get_pp_proxy_dspark_hidden_size(self) -> int:
+    def get_pp_proxy_aux_hidden_size(self) -> int:
         layers = self.model.dspark_layers_to_capture or []
         return self.config.hidden_size * sum(
             layer < self.model.start_layer - 1 for layer in layers
@@ -3544,10 +3544,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
             raise AttributeError("lm_head is not available in encoder-only mode")
         return self.language_model.lm_head
 
-    def get_pp_proxy_dspark_hidden_size(self) -> int:
+    def get_pp_proxy_aux_hidden_size(self) -> int:
         if self.language_model is None:
             return 0
-        return self.language_model.get_pp_proxy_dspark_hidden_size()
+        return self.language_model.get_pp_proxy_aux_hidden_size()
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         if self.language_model is None:
