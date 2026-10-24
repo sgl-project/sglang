@@ -413,8 +413,11 @@ with `--locked`, so rendered bytes cannot change without a reviewed diff.
 Router tokenization sits on the TTFT path for every chat it renders. Two opt-in
 flags make it cheaper:
 
-- `--tokenizer-backend fast` encodes with fastokens (decoding stays on HF). It
-  needs a `tokenizer.json` and falls back to `hf` when fastokens cannot load it.
+- `--tokenizer-backend fast` encodes with fastokens (decoding stays on HF for a
+  `tokenizer.json`). It falls back to `hf` when fastokens cannot load a
+  `tokenizer.json`, and to `tiktoken` when it cannot load a `tiktoken.model`. On a
+  `tiktoken.model`, text containing U+017F right after an apostrophe still encodes
+  on tiktoken-rs, the one input fastokens tokenizes differently from the engine.
 - `--tokenizer-l1-cache-mb N` caches prefix tokenizations at special-token
   boundaries, so a multi-turn chat encodes only the turns added since the
   previous request. Boundaries are unconditional, non-normalized, non-stripping
@@ -576,6 +579,8 @@ through `/generate`; thinking follows the template's `enable_thinking` (on by de
 Kimi-K3 renders through `rust/sglang-processor` (dynamo-render's XTML formatter
 with SGLang's request semantics) and is tokenized with the checkpoint's chunked
 tiktoken encoding; shapes the formatter renders differently go to the worker.
+`--tokenizer-backend fast` applies to its `tiktoken.model` and encodes about 15x
+faster than the default tiktoken-rs backend.
 `--tokenizer-path` accepts a
 local `tiktoken.model` or an HF repo id, whose `tiktoken.model`, `config.json`
 and `tokenizer_config.json` are downloaded when it has no `tokenizer.json`.
