@@ -105,13 +105,14 @@ Enable memory saver support when launching the server:
 
 ## Open-To-Use Refit Functionality
 
-After training completes each step, rollout engines must be refit with new weights. SGLang supports three refit strategies so you can match your infrastructure style (co-located vs disaggregated) and scaling needs. Each strategy maps to a concrete API with clear request schemas. For a deeper dive into SGLang's weight update utilities, see [RL System Deep Thinking: Weight Update Mechanisms](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/sys-design/readme-1-EN.md).
+After training completes each step, rollout engines must be refit with new weights. SGLang supports four refit strategies so you can match your infrastructure style (co-located vs disaggregated) and scaling needs. Each strategy maps to a concrete API with clear request schemas. For a deeper dive into SGLang's weight update utilities, see [RL System Deep Thinking: Weight Update Mechanisms](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/rlhf/sys-design/readme-1-EN.md).
 
 **How to choose:**
 
 - **From disk** is simplest and best for elastic rollout scaling and checkpointing.
 - **From tensor** is best for co-located training/rollout when you can pass in-memory tensors.
 - **From distributed** is best for disaggregated training/rollout with dedicated communication groups (NCCL/IB).
+- **From ModelExpress** lets disaggregated trainers publish S3 deltas and full checkpoints for rollout engines to install by version ID.
 
 ### Update Weights from Disk
 
@@ -327,6 +328,64 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 </table>
 
 > **Note:** The diffusion engine (SGLang-Diffusion) does not currently support hot refit (updating weights while inference is in progress). The diffusion scheduler processes one request at a time and completes the entire inference before handling the next request, so weight updates and inference never run concurrently.
+
+### Update weights from ModelExpress
+
+Use ModelExpress (MX) to refit from a published S3 delta or full checkpoint. MX reconstructs the checkpoint locally and installs it through SGLang's model loader.
+
+**Prerequisites:**
+
+- Install an MX Python client build with the SGLang refit support from [ModelExpress #826](https://github.com/ai-dynamo/modelexpress/pull/826) in each worker environment.
+- Give the workers access to the MX server, S3 credentials, and a writable checkpoint cache directory.
+- Use the same seed checkpoint as the trainer. The configured model name and initial base version must match the MX catalog.
+
+This example uses Linux with NVIDIA CUDA, a local Hugging Face checkpoint for `Qwen/Qwen3-30B-A3B`, and tensor parallelism across four GPUs:
+
+```bash
+export MX_GENERATOR_SOURCE_ORDER=OBJECT_STORAGE
+
+python -m sglang.launch_server \
+  --model-path /models/Qwen3-30B-A3B \
+  --tp-size 4 \
+  --modelexpress-config '{
+    "model_name": "Qwen/Qwen3-30B-A3B",
+    "server_url": "modelexpress:8001",
+    "initial_base_version_id": "v0",
+    "seed_checkpoint_path": "/models/Qwen3-30B-A3B",
+    "refit_checkpoint_dir": "/var/cache/modelexpress",
+    "object_storage_region_name": "us-west-2"
+  }'
+```
+
+For an S3-compatible service, also set `object_storage_endpoint_url` in this JSON configuration. S3 credentials use the standard AWS credential chain.
+
+**Endpoint:** `POST /update_weights_from_modelexpress`
+
+| Field | Description | Default |
+|---|---|---|
+| `weight_version` | Opaque ID of the published MX version to install. | Required |
+| `flush_cache` | Flush serving caches after a successful update. | `true` |
+| `torch_empty_cache` | Also release unused CUDA allocator memory when flushing caches. | `false` |
+
+After the trainer publishes a READY version, pause generation, flush caches, refit, and resume. Replace `v1` with the published version ID:
+
+```python
+import requests
+
+server_url = "http://127.0.0.1:30000"
+for endpoint, payload in (
+    ("pause_generation", {"mode": "abort"}),
+    ("flush_cache", {}),
+    ("update_weights_from_modelexpress", {"weight_version": "v1", "flush_cache": False}),
+    ("continue_generation", {}),
+):
+    response = requests.post(f"{server_url}/{endpoint}", json=payload, timeout=900)
+    response.raise_for_status()
+```
+
+The explicit cache flush runs while generation is paused; `flush_cache=False` avoids flushing twice. The refit response contains `success` and `message`. The server records the installed version after all tensor-parallel workers succeed. Speculative draft models and incompatible shared or derived weight-cache modes are rejected.
+
+For trainer publication, cache settings, and Miles integration, see the [ModelExpress S3 refit guide](https://github.com/ai-dynamo/modelexpress/blob/0af7e9e4438394588710b8b213cafec5e78db8de/docs/S3_DELTA_WEIGHT_REFIT.md#sglang-backend).
 
 ### Weight Update Session
 
