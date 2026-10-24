@@ -4,15 +4,19 @@ import asyncio
 import base64
 import io
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 import torch
+from fastapi import FastAPI
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints import http_server
 from sglang.multimodal_gen.runtime.entrypoints.http_server import forward_to_scheduler
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
@@ -30,6 +34,11 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    MemorySnapshot,
+    RequestMetrics,
+)
+from sglang.srt.utils.json_response import orjson_response
 
 
 @pytest.mark.parametrize(
@@ -73,22 +82,82 @@ def test_generation_rejects_errors_before_publishing_partial_output(
 
 
 @pytest.mark.parametrize("error", [None, "output save failed"])
-def test_vertex_response_does_not_publish_failed_output(monkeypatch, tmp_path, error):
+@pytest.mark.parametrize("file_state", ["valid", "missing", "empty"])
+def test_vertex_response_does_not_publish_failed_output(
+    monkeypatch, tmp_path, error, file_state
+):
     path = tmp_path / "out.mp4"
-    path.write_bytes(b"encoded video")
+    if file_state != "missing":
+        path.write_bytes(b"encoded video" if file_state == "valid" else b"")
+    metrics = RequestMetrics("test")
+    metrics.denoising_stages.add("denoising")
+    metrics.record_step(0.1)
+    metrics.record_memory_snapshot("peak", MemorySnapshot(1, 2, 3, 4))
     monkeypatch.setattr(
         async_scheduler_client,
         "forward",
-        AsyncMock(return_value=OutputBatch(output_file_paths=[str(path)], error=error)),
+        AsyncMock(
+            return_value=OutputBatch(
+                output_file_paths=[str(path)],
+                error=error,
+                metrics=metrics,
+                metrics_list=[metrics, None],
+            )
+        ),
     )
     sampling = SamplingParams(prompt="test")
     response = asyncio.run(
         forward_to_scheduler(Req(sampling_params=sampling), sampling)
     )
+    response = json.loads(orjson_response(response).body)
     if error:
         assert response == {"error": error}
+    elif file_state != "valid":
+        assert set(response) == {"error"}
+        assert str(path) in response["error"]
     else:
         assert base64.b64decode(response["output"]) == path.read_bytes()
+        assert response["metrics"] == metrics.to_dict()
+        assert response["metrics_list"] == [metrics.to_dict(), None]
+
+
+def test_vertex_slow_output_read_does_not_block_liveness(monkeypatch, tmp_path):
+    path = tmp_path / "out.mp4"
+    path.write_bytes(b"encoded video")
+    started, release = threading.Event(), threading.Event()
+
+    def slow_open(*args, **kwargs):
+        started.set()
+        assert release.wait(3), "HTTP loop could not release the output reader"
+        return open(*args, **kwargs)
+
+    monkeypatch.setattr(http_server, "open", slow_open, raising=False)
+    monkeypatch.setattr(
+        async_scheduler_client,
+        "forward",
+        AsyncMock(return_value=OutputBatch(output_file_paths=[str(path)])),
+    )
+    app = FastAPI()
+    app.include_router(http_server.health_router)
+
+    async def run():
+        sampling = SamplingParams(prompt="test")
+        task = asyncio.create_task(
+            forward_to_scheduler(Req(sampling_params=sampling), sampling)
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 3)
+            assert not task.done(), "output read blocked the HTTP event loop"
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app), base_url="http://test"
+            ) as client:
+                assert (await client.get("/liveness")).status_code == 200
+        finally:
+            release.set()
+            response = await task
+        assert base64.b64decode(response["output"]) == path.read_bytes()
+
+    asyncio.run(run())
 
 
 def test_request_fields_preserve_falsy_values_and_extra_precedence():

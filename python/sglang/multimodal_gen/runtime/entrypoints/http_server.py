@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.srt.observability.http_request_metrics import (
     add_http_request_metrics_middleware,
     init_http_request_metrics,
@@ -320,9 +321,11 @@ async def stats_endpoint(request: Request):
 
 
 def make_serializable(obj):
-    """Recursively converts Tensors to None for JSON serialization."""
+    """Serialize output metadata without copying tensors back to the CPU."""
     if isinstance(obj, torch.Tensor):
         return None
+    if isinstance(obj, RequestMetrics):
+        return obj.to_dict()
     if isinstance(obj, dict):
         return {k: make_serializable(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -331,10 +334,11 @@ def make_serializable(obj):
 
 
 def encode_video_to_base64(file_path: str):
-    if not os.path.exists(file_path):
-        return None
     with open(file_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+        content = f.read()
+    if not content:
+        raise ValueError(f"Empty model output file: {file_path}")
+    return base64.b64encode(content).decode("utf-8")
 
 
 async def forward_to_scheduler(
@@ -372,19 +376,10 @@ async def forward_to_scheduler(
                 upscaling_scale=sp.upscaling_scale,
             )
 
-        if hasattr(response, "model_dump"):
-            data = response.model_dump()
-        else:
-            data = response if isinstance(response, dict) else vars(response)
-
-        if output_file_path:
-            logger.info("Processing output file: %s", output_file_path)
-            b64_video = encode_video_to_base64(output_file_path)
-
-            if b64_video:
-                data["output"] = b64_video
-                data.pop("video_data", None)
-                data.pop("video_tensor", None)
+        data = vars(response).copy()
+        data["output"] = await asyncio.to_thread(
+            encode_video_to_base64, output_file_path
+        )
 
         return make_serializable(data)
 
