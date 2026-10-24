@@ -1341,7 +1341,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             )
 
     @staticmethod
-    def _cfg_active_at(t: torch.Tensor, interval: tuple[float, float] | None) -> bool:
+    def _cfg_active_at(t: float, interval: tuple[float, float] | None) -> bool:
         """Return True iff CFG should be applied at timestep ``t``.
 
         T2I uses a CFG window (e.g. ``[400, 1000]``) to skip guidance at low
@@ -1350,9 +1350,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         """
         if interval is None:
             return True
-        t_scalar = float(t.item()) if torch.is_tensor(t) else float(t)
         lo, hi = interval
-        return lo <= t_scalar <= hi
+        return lo <= t <= hi
 
     def _normalize_transfer_video(
         self, video: torch.Tensor, device: torch.device, dtype: torch.dtype
@@ -1688,6 +1687,9 @@ class Cosmos3DenoisingStage(PipelineStage):
             desc="Denoising",
             batch=batch,
         )
+        # host copy for the per-step CFG window checks: a device read per step
+        # would stall the host on every step's kernels
+        timestep_values = timesteps.tolist()
 
         for i, t in progress_bar:
             # Precision is chosen once per step, before any transformer call,
@@ -1698,7 +1700,9 @@ class Cosmos3DenoisingStage(PipelineStage):
             # Outside the CFG window the effective scale collapses to 1.0,
             # which reduces CFG to the cond branch (cfg-parallel safe).
             effective_scale = (
-                guidance_scale if self._cfg_active_at(t, guidance_interval) else 1.0
+                guidance_scale
+                if self._cfg_active_at(timestep_values[i], guidance_interval)
+                else 1.0
             )
             # Transfer control-CFG: active only when a control video is present,
             # ``control_guidance != 1.0``, and the step is inside the (optional)
@@ -1707,7 +1711,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             control_cfg_active = (
                 control_latents is not None
                 and control_guidance != 1.0
-                and self._cfg_active_at(t, control_guidance_interval)
+                and self._cfg_active_at(timestep_values[i], control_guidance_interval)
             )
 
             if control_cfg_active:

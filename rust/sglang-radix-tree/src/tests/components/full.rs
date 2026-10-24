@@ -1,4 +1,5 @@
 use super::*;
+use crate::cache_action::UpdatePendingBackupOnNodeSplit;
 use crate::components::{ComponentSet, FULL};
 use crate::node::NodeAccessError;
 use crate::test_utils::accumulate_step;
@@ -496,7 +497,7 @@ fn host_reclaim_orders_pending_internal_split_fragments_by_ack() {
     // asynchronously under write_back; matching can split it before the ack.
     let (prefix_idx, action) = tc.split_node_(tc.arena.resolve(a).unwrap(), 2);
     let published_a = match action {
-        Some(CacheAction::UpdatePendingBackupOnNodeSplit {
+        Some(UpdatePendingBackupOnNodeSplit {
             ack_id,
             old_node_id,
             new_node_id,
