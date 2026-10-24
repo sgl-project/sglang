@@ -3488,7 +3488,7 @@ class DeepseekV4AttnBackend(
                     table = None
                     if layer.indexer.is_candidate_source:
                         table = self.prefill_candidates.prefill_graph_table(
-                            layer.layer_id, x.shape[0], x.device
+                            layer.layer_id, layer.compress_ratio, x.shape[0], x.device
                         )
                     _bcg_prefill_graph_full_topk(layer, x, q_lora, pos, table)
                     if table is not None:
