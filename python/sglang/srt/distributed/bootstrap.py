@@ -140,7 +140,6 @@ def init_parallel_runtime(
             get_parallel().tp_rank,
         )
         raise
-    maybe_init_shared_mooncake_transfer_engine(gpu_id=get_device().gpu_id)
 
     parallel = get_parallel()
     if device == "cpu":
@@ -163,6 +162,8 @@ def init_parallel_runtime(
     ):
         _prewarm_nccl()
 
+    # NPU requires an HCCL warmup before the transfer.
+    maybe_init_shared_mooncake_transfer_engine(gpu_id=get_device().gpu_id)
     # CUDA graph capture enables the PyNCCL communicator for TP LM-head
     # all-to-all. Exercise that exact send/recv path before measuring
     # pre_model_load_memory so its persistent transport allocations are
