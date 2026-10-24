@@ -159,10 +159,10 @@ mod tests {
     use super::super::{ChatFormatterOptions, select_chat_formatter};
     use super::{ChatFormatter, load_chat_formatter};
 
-    /// A valid request the parity renderer declines is `EngineOnly`, for the
+    /// A valid request the parity renderer declines is `NeedsRenderFallback`, for the
     /// host to render another way rather than reject.
     #[test]
-    fn declined_requests_are_engine_only() {
+    fn declined_requests_need_render_fallback() {
         let body = serde_json::json!({"model": "m", "messages": [
             {"role": "developer", "content": "Be brief."},
             {"role": "user", "content": "Hi"}
@@ -172,7 +172,7 @@ mod tests {
         assert!(
             matches!(
                 rendered,
-                Err(super::super::TemplateError::EngineOnly { .. })
+                Err(super::super::TemplateError::NeedsRenderFallback { .. })
             ),
             "{rendered:?}"
         );
