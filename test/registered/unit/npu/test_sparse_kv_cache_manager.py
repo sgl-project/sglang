@@ -1,0 +1,635 @@
+"""CPU coverage of cache policies and PD lifecycle; NPU kernels are mocked."""
+
+import importlib.util
+import os
+import sys
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
+
+import numpy as np
+import torch
+
+from sglang.srt.disaggregation.ascend.conn import AscendKVManager
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import config
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
+from sglang.srt.runtime_context import get_context
+from sglang.srt.utils import common
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+
+
+def _copy_rows(src, dst, src_index, dst_index, mask, src_ndims, dst_ndims, **kwargs):
+    src_rows = src.flatten(0, src_ndims - 1)
+    dst_rows = dst.flatten(0, dst_ndims - 1)
+    dst_rows[dst_index[mask]] = src_rows[src_index[mask]]
+
+
+def _lookup(slot_map, reqs, topk, pos_mask_size=None):
+    valid = (topk >= 0) & (topk < slot_map.shape[1])
+    positions = slot_map[reqs.long().unsqueeze(1), topk.clamp(0).long()]
+    positions = torch.where(valid, positions, -1)
+    hits = positions >= 0
+    if pos_mask_size is None:
+        return hits.int(), positions
+    hit_mask = torch.zeros((len(reqs), pos_mask_size), dtype=torch.int32)
+    for row in range(len(reqs)):
+        hit_mask[row, positions[row, hits[row]].long()] = 1
+    return hits.int(), positions, hit_mask
+
+
+def _host_buffer(shape, dtype, **kwargs):
+    tensor = torch.zeros(shape, dtype=dtype)
+    return tensor, tensor.data_ptr(), tensor.data_ptr()
+
+
+class _RequestKV:
+    req_pool_idx = None
+    kv_allocated_len = 1
+
+    @property
+    def holds_kv(self):
+        return self.req_pool_idx is not None
+
+
+class TestSparseKVCacheManager(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # Load a private module instance so the fake kernels do not leak into
+        # other tests or require an installed sgl-kernel-npu on CPU workers.
+        self.kernels = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload")
+        self.kernels.create_shm_tensor = _host_buffer
+        self.kernels.slot_map_lookup = _lookup
+        self.kernels.unidex_copy_inplace = _copy_rows
+        self.kernel_modules = {
+            "sgl_kernel_npu": ModuleType("sgl_kernel_npu"),
+            "sgl_kernel_npu.sparsity_driven_kv_offload": self.kernels,
+        }
+        spec = importlib.util.spec_from_file_location(
+            "_sparse_kv_manager_under_test",
+            Path(config.__file__).with_name("manager.py"),
+        )
+        self.module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, self.kernel_modules):
+            spec.loader.exec_module(self.module)
+        self.npu = SimpleNamespace(
+            Stream=Mock(side_effect=lambda: Mock()),
+            Event=Mock(side_effect=lambda: Mock()),
+            stream=lambda stream: nullcontext(),
+            current_device=lambda: 0,
+        )
+        patcher = patch.object(torch, "npu", self.npu, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(torch.Tensor, "record_stream")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name, value in (
+            ("get_cuda_graph_batch_size_alignment", 1),
+            ("require_mlp_sync", False),
+        ):
+            patcher = patch.object(common, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def make_manager(
+        self,
+        topk=1536,
+        enable_lru=False,
+        factor=2,
+        pool_device="cpu",
+        max_context_len=4096,
+        dtype=torch.float32,
+    ):
+        pool = ReqToTokenPool(2, max_context_len, pool_device, False)
+        kv = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        kv.start_layer = 0
+        kv.layer_num = 2
+        kv.kv_lora_rank = 2
+        kv.qk_rope_head_dim = 2
+        kv.store_dtype = dtype
+        kv.page_size = 128
+        allocator = SimpleNamespace(get_kvcache=lambda: kv)
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_NPU_SPARSE_KV_ENABLE_LRU": str(int(enable_lru)),
+                    "SGLANG_NPU_SPARSE_KV_DEVICE_CACHE_FACTOR": str(factor),
+                },
+            ),
+            patch.dict(sys.modules, self.kernel_modules),
+        ):
+            manager = self.module.SparseKVCacheManager(pool, allocator, topk)
+        for buf in manager.host_kv_buffer:
+            buf.copy_(torch.arange(buf.numel()).reshape(buf.shape))
+        return manager, pool
+
+    def materialize(self, manager, tokens, reqs=(2, 0), lengths=(32, 0)):
+        topk = torch.full(
+            (len(reqs), manager.sparse_context_len), -1, dtype=torch.int32
+        )
+        topk[0, : len(tokens)] = torch.tensor(tokens)
+        batch = SimpleNamespace(
+            req_pool_indices=torch.tensor(reqs), seq_lens=torch.tensor(lengths)
+        )
+        selected = torch.zeros((len(reqs), manager.sparse_context_len, 1, 4))
+        stream = Mock()
+        ready = Mock()
+        plan, valid_mask, valid_counts = manager.materialize_selected_kv(
+            SimpleNamespace(layer_id=0),
+            batch,
+            topk,
+            selected,
+            stream,
+            host_kv_ready_event=ready,
+        )
+        manager.refill_selected_kv(
+            layer=SimpleNamespace(layer_id=0),
+            selected_kv_buffer=selected,
+            plan=plan,
+            stream=stream,
+        )
+        manager._materialize_h2d_miss_stream.wait_event.assert_called_with(ready)
+        return selected, plan, valid_mask, valid_counts
+
+    def test_dynamic_window_reorders_hits_and_refills_misses(self):
+        for topk in (3, 1536, 3072):
+            with self.subTest(topk=topk):
+                manager, _ = self.make_manager(topk)
+                # The mock module deliberately has no LRU exports.
+                self.assertFalse(hasattr(manager, "device_lru_slots"))
+                self.assertEqual(manager.device_cache_capacity, topk)
+                self.materialize(manager, [10, 11, 12])
+                selected, _, _, valid_counts = self.materialize(manager, [12, 10, 13])
+                torch.testing.assert_close(
+                    selected[0, :3], manager.host_kv_buffer[0][2, [12, 10, 13]]
+                )
+                torch.testing.assert_close(
+                    manager.device_kv_buffer[0][2, :3], selected[0, :3]
+                )
+                self.assertEqual(manager.device_slot_map[0][2, 11].item(), -1)
+                self.assertEqual(manager.device_slot_map[0][2, 12].item(), 0)
+                self.assertEqual(valid_counts.tolist(), [3, 0])
+                self.assertEqual(selected[1].count_nonzero().item(), 0)
+
+    def test_lru_keeps_hit_slots_and_only_refills_misses(self):
+        self.kernels.fused_timestamp_lru_metadata_update_with_probation = Mock()
+        self.kernels.parallel_lru_metadata_write = Mock()
+        manager, _ = self.make_manager(2048, enable_lru=True)
+        manager.device_slot_map[0][2, 10] = 3500
+        manager.device_kv_buffer[0][2, 3500] = manager.host_kv_buffer[0][2, 10]
+        victims = torch.full((2, 2048), -1, dtype=torch.int32)
+        victims[0, 1] = 777
+        manager._lru_metadata_update.return_value = (
+            victims,
+            torch.tensor([1, 0], dtype=torch.int32),
+        )
+        selected, plan, _, _ = self.materialize(manager, [10, 11])
+        torch.testing.assert_close(
+            selected[0, :2], manager.host_kv_buffer[0][2, [10, 11]]
+        )
+        torch.testing.assert_close(manager.device_kv_buffer[0][2, 777], selected[0, 1])
+        torch.testing.assert_close(manager.device_kv_buffer[0][2, 3500], selected[0, 0])
+        self.assertEqual(plan.valid_mask.sum().item(), 1)
+        manager._lru_metadata_update.assert_called_once()
+        manager._lru_metadata_write.assert_called_once()
+
+    def test_lru_rejects_dynamic_topk_before_allocating_buffers(self):
+        with self.assertRaisesRegex(ValueError, "index_topk=2048"):
+            self.make_manager(1536, enable_lru=True)
+        self.npu.Stream.assert_not_called()
+
+    def test_refill_waits_for_victims_and_finishes_metadata_after_copy(self):
+        manager, _ = self.make_manager(topk=3)
+        selected = torch.arange(12, dtype=torch.float32).reshape(1, 3, 1, 4)
+        victims = torch.full((1, 3), -1, dtype=torch.int32)
+        plan = self.module.KVRefillPlan(
+            victim_slots=victims,
+            src_indices=torch.arange(3),
+            request_offsets=torch.tensor([[3]]),
+            valid_mask=torch.tensor([True, False, False]),
+        )
+
+        # Publish asynchronous results only when their event is waited on.
+        def wait_event(event):
+            if event is manager._materialize_victim_slot_select_done:
+                victims[0, 0] = 2
+            elif event is manager._materialize_metadata_update_done:
+                torch.testing.assert_close(
+                    manager.device_kv_buffer[0][1, 2], selected[0, 0]
+                )
+                manager.device_slot_map[0][1, 10] = 2
+
+        stream = Mock(wait_event=Mock(side_effect=wait_event))
+        manager.refill_selected_kv(
+            layer=SimpleNamespace(layer_id=0),
+            selected_kv_buffer=selected,
+            plan=plan,
+            stream=stream,
+        )
+        self.assertEqual(manager.device_slot_map[0][1, 10].item(), 2)
+        torch.testing.assert_close(manager.device_kv_buffer[0][1, 2], selected[0, 0])
+
+    def test_padded_batch_can_exceed_request_pool_rows(self):
+        self.kernels.fused_timestamp_lru_metadata_update_with_probation = Mock()
+        self.kernels.parallel_lru_metadata_write = Mock()
+        for enable_lru in (False, True):
+            for runner in ("graph", "eager"):
+                with (
+                    self.subTest(enable_lru=enable_lru, runner=runner),
+                    patch.object(
+                        common,
+                        "get_cuda_graph_batch_size_alignment",
+                        return_value=16 if runner == "graph" else 1,
+                    ),
+                    patch.object(
+                        common, "require_mlp_sync", return_value=runner == "eager"
+                    ),
+                    patch.object(
+                        common,
+                        "get_parallel",
+                        return_value=SimpleNamespace(attn_tp_size=16),
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                        return_value=1,
+                    ),
+                ):
+                    manager, pool = self.make_manager(2048, enable_lru=enable_lru)
+                    if enable_lru:
+                        victims = torch.full((16, 2048), -1, dtype=torch.int32)
+                        victims[0, :2] = torch.tensor([777, 888])
+                        manager._lru_metadata_update.return_value = (
+                            victims,
+                            torch.tensor([2] + [0] * 15, dtype=torch.int32),
+                        )
+                    selected, _, valid_mask, valid_counts = self.materialize(
+                        manager,
+                        [10, 11],
+                        reqs=(2,) + (0,) * 15,
+                        lengths=(32,) + (0,) * 15,
+                    )
+                    torch.testing.assert_close(
+                        selected[0, :2], manager.host_kv_buffer[0][2, [10, 11]]
+                    )
+                    self.assertEqual(selected[1:].count_nonzero().item(), 0)
+                    self.assertEqual(valid_counts.tolist(), [2] + [0] * 15)
+                    self.assertFalse(valid_mask[1:].any().item())
+                    slots = [777, 888] if enable_lru else [0, 1]
+                    torch.testing.assert_close(
+                        manager.device_kv_buffer[0][2, slots], selected[0, :2]
+                    )
+                    self.assertEqual(pool.req_to_token.shape[0], 3)
+                    self.assertEqual(manager.device_kv_buffer[0].shape[0], 3)
+                    self.assertEqual(manager._decode_query_seq_lengths[:16].numel(), 16)
+                    self.assertEqual(manager._zero_sparse_index[:16].shape[0], 16)
+
+    def test_pd_fixed_budget_matches_allocated_kv_and_staging(self):
+        """Late PD staging allocation must fit the bytes reserved during sizing."""
+        self.kernels.fused_timestamp_lru_metadata_update_with_probation = Mock()
+        self.kernels.parallel_lru_metadata_write = Mock()
+        for context_len, request_context_len, page_size, enable_lru, dtype, draft in (
+            (252, 256, 128, False, torch.float32, None),
+            (253, 257, 128, True, torch.bfloat16, None),
+            (252, 256, 1, False, torch.bfloat16, None),
+            # Speculative reserve is 2 * 4 + (128 - 1) = 135 extra tokens.
+            (252, 387, 128, True, torch.float32, 4),
+        ):
+            topk = 2048 if enable_lru else 3
+            hf_config = SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"], index_topk=topk
+            )
+            hf_config.get_text_config = lambda: hf_config
+            model_config = SimpleNamespace(
+                hf_config=hf_config,
+                context_len=context_len,
+                kv_lora_rank=2,
+                qk_rope_head_dim=2,
+            )
+            with (
+                self.subTest(context_len=context_len, page_size=page_size, draft=draft),
+                get_context().override_server_args(
+                    attention_backend="ascend",
+                    disaggregation_mode="decode",
+                    disaggregation_transfer_backend="ascend",
+                    disaggregation_decode_extra_slots=0,
+                    max_running_requests=2,
+                    page_size=page_size,
+                    speculative_algorithm="EAGLE" if draft else None,
+                    speculative_num_draft_tokens=draft,
+                    speculative_num_steps=3 if draft else None,
+                    speculative_eagle_topk=1 if draft else None,
+                ),
+                patch.object(config, "is_npu", return_value=True),
+                patch.dict(
+                    os.environ,
+                    {
+                        "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD": "1",
+                        "SGLANG_NPU_SPARSE_KV_ENABLE_LRU": str(int(enable_lru)),
+                        "SGLANG_NPU_SPARSE_KV_DEVICE_CACHE_FACTOR": "2",
+                    },
+                ),
+            ):
+                manager, _ = self.make_manager(
+                    topk=topk,
+                    enable_lru=enable_lru,
+                    max_context_len=request_context_len,
+                    dtype=dtype,
+                )
+                manager.ensure_pd_decode_staging_buffers(page_size=page_size)
+                allocated_bytes = sum(
+                    buf.nbytes
+                    for buf in (
+                        manager.device_kv_buffer
+                        + manager.pd_decode_k_staging
+                        + manager.pd_decode_v_staging
+                    )
+                )
+                budget = config.get_sparsity_driven_kv_offload_fixed_memory_size(
+                    model_config=model_config,
+                    use_mla_backend=True,
+                    num_layers=manager.layer_num,
+                    element_size=torch.tensor([], dtype=dtype).element_size(),
+                    max_running_requests_per_worker=2,
+                )
+                self.assertEqual(budget, allocated_bytes)
+
+    def test_pd_registration_preserves_native_and_staging_buffer_layouts(self):
+        for mode in (
+            config.SparseKVOffloadMode.PD_PREFILL_NATIVE,
+            config.SparseKVOffloadMode.PD_DECODE_OFFLOAD,
+        ):
+            with self.subTest(mode=mode):
+                manager, _ = self.make_manager(topk=3)
+                pool = object.__new__(NPUMLATokenToKVPool)
+                pool.start_layer = 0
+                pool.layer_num = 2
+                pool.page_size = 128
+                pool.dcp_size = 1
+                pool.is_draft_worker = False
+                pool.dsa_kv_cache_store_fp8 = False
+                pool.index_head_dim = 2
+                pool.indexer_layer_ids = (1,)
+                pool.index_k_buffer = [torch.zeros(4, 128, 1, 2)]
+                pool.index_k_scale_buffer = None
+                pool.k_buffer = pool.v_buffer = None
+                if mode is config.SparseKVOffloadMode.PD_PREFILL_NATIVE:
+                    pool.k_buffer = [torch.zeros(4, 128, 1, 2) for _ in range(2)]
+                    pool.v_buffer = [torch.zeros(4, 128, 1, 2) for _ in range(2)]
+                manager.paged_kv_cache = pool
+                self.module.register_sparse_kv_manager(manager)
+
+                with (
+                    patch.dict(
+                        sys.modules,
+                        {
+                            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager": self.module
+                        },
+                    ),
+                    patch(
+                        "sglang.srt.hardware_backend.npu.memory_pool_npu.resolve_sparse_kv_offload_mode",
+                        return_value=mode,
+                    ),
+                    patch(
+                        "sglang.srt.disaggregation.ascend.sparse_pd.resolve_sparse_kv_offload_mode",
+                        return_value=mode,
+                    ),
+                    # Skip transport startup; exercise Ascend registration itself.
+                    patch.object(MooncakeKVManager, "__init__", return_value=None),
+                ):
+                    ptrs, lens, item_lens = pool.get_contiguous_buf_infos()
+                    args = SimpleNamespace(
+                        kv_data_ptrs=ptrs,
+                        kv_data_lens=lens,
+                        kv_item_lens=item_lens,
+                        page_size=pool.page_size,
+                        kv_buf_groups=3,
+                    )
+                    layout = (
+                        None
+                        if mode.uses_pd_decode_staging
+                        else pool.get_dcp_remote_decode_layout()
+                    )
+                    conn = AscendKVManager(
+                        args,
+                        DisaggregationMode.DECODE
+                        if mode.uses_pd_decode_staging
+                        else DisaggregationMode.PREFILL,
+                        SimpleNamespace(),
+                        is_mla_backend=True,
+                        dcp_remote_decode_layout=layout,
+                    )
+
+                if mode.uses_pd_decode_staging:
+                    buffers = manager.pd_decode_k_staging + manager.pd_decode_v_staging
+                    expected_item_lens = [128 * 2 * 4] * 4
+                    self.assertEqual(conn.sparse_pd_decode_staging.available_slots(), 1)
+                    self.assertEqual(args.kv_layer_ids, [0, 1, 0, 1, 1])
+                    self.assertEqual(args.kv_buf_groups, 2)
+                else:
+                    buffers = pool.k_buffer + pool.v_buffer
+                    expected_item_lens = [buffer[0].nbytes for buffer in buffers]
+                    self.assertIsNone(conn.sparse_pd_decode_staging)
+                    self.assertEqual(
+                        conn._dcp_remote_decode_layout, [False] * 4 + [True]
+                    )
+                buffers += pool.index_k_buffer
+                expected_item_lens.append(pool.index_k_buffer[0][0].nbytes)
+                self.assertEqual(ptrs, [buffer.data_ptr() for buffer in buffers])
+                self.assertEqual(lens, [buffer.nbytes for buffer in buffers])
+                self.assertEqual(item_lens, expected_item_lens)
+
+    def test_pd_pp_transfer_uses_staging_pages_and_native_index_pages(self):
+        conn = object.__new__(AscendKVManager)
+        conn.kv_args = SimpleNamespace(
+            kv_data_ptrs=[1_000, 2_000, 3_000, 4_000, 5_000],
+            kv_item_lens=[32, 32, 16, 16, 8],
+            prefill_start_layer=1,
+            prefill_end_layer=3,
+            num_draft_entries=0,
+        )
+        conn.is_mla_backend = True
+        conn.is_hybrid_mla_backend = False
+        conn.pp_size = 2
+        conn.enable_custom_mem_pool = False
+        conn.max_transfer_batch_indices = 0
+        conn._transfer_data = Mock(return_value=0)
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.get_memory",
+            return_value=SimpleNamespace(enable_unified_memory=False),
+        ):
+            result = conn.send_kvcache(
+                "decode",
+                np.array([3], dtype=np.int32),
+                list(range(10_000, 18_000, 1_000)),
+                np.array([0], dtype=np.int32),
+                executor=None,
+                dst_layer_ids=[0, 1, 2, 0, 1, 2, 0, 2],
+                dst_device_kv_indices=np.array([5], dtype=np.int32),
+            )
+        self.assertEqual(result, 0)
+        conn._transfer_data.assert_called_once_with(
+            "decode",
+            [
+                (1_096, 11_000, 32),
+                (2_096, 12_000, 32),
+                (3_048, 14_000, 16),
+                (4_048, 15_000, 16),
+                (5_024, 17_040, 8),
+            ],
+        )
+
+    def test_pd_request_release_resets_lru_and_removes_room(self):
+        self.kernels.fused_timestamp_lru_metadata_update_with_probation = Mock()
+        self.kernels.parallel_lru_metadata_write = Mock()
+        manager, pool = self.make_manager(2048, enable_lru=True)
+        req = SimpleNamespace(
+            kv=_RequestKV(),
+            bootstrap_room=42,
+            origin_input_ids=[1, 2, 3],
+        )
+        row = pool.alloc([req])[0]
+        self.assertEqual(manager.get_pd_copy_metadata(42), (row, 3))
+        manager.device_slot_map[0][row, 1] = 7
+        manager.device_slot_tokens[0][row, 7] = 1
+        manager.device_lru_slot_stamps[0][row].fill_(9)
+        pool.free(req)
+        self.assertEqual(pool.available_size(), 2)
+        self.assertIsNone(req.kv.req_pool_idx)
+        self.assertTrue((manager.device_slot_map[0][row] == -1).all())
+        self.assertTrue((manager.device_slot_tokens[0][row] == -1).all())
+        self.assertEqual(manager.device_lru_slot_stamps[0][row].sum().item(), 0)
+        with self.assertRaisesRegex(RuntimeError, "not recorded"):
+            manager.get_pd_copy_metadata(42)
+        pool.alloc([req])
+        pool.clear()
+        self.assertEqual(manager._pd_room_to_req_pool_idx, {})
+
+    def test_reset_failure_still_frees_request_and_pd_metadata(self):
+        manager, pool = self.make_manager()
+        req = SimpleNamespace(
+            kv=_RequestKV(),
+            bootstrap_room=42,
+            origin_input_ids=[1],
+        )
+        pool.alloc([req])
+        manager.reset_requests = Mock(side_effect=RuntimeError("reset failed"))
+        with self.assertRaisesRegex(RuntimeError, "reset failed"):
+            pool.free(req)
+        self.assertEqual(pool.available_size(), 2)
+        self.assertEqual(manager._pd_room_to_req_pool_idx, {})
+
+    def test_pd_staging_resets_cache_before_copying_new_request(self):
+        manager, _ = self.make_manager()
+        manager.ensure_pd_decode_staging_buffers()
+        manager.pd_decode_k_staging[0][0, :3].fill_(7)
+        manager.pd_decode_v_staging[0][0, :3].fill_(8)
+        manager.device_slot_map[0][2, 0] = 1
+        manager.offload_pd_decode_staging_to_host(0, 2, 3)
+        self.assertTrue((manager.device_slot_map[0][2] == -1).all())
+        self.assertTrue((manager.host_kv_buffer[0][2, :3, :, :2] == 7).all())
+        self.assertTrue((manager.host_kv_buffer[0][2, :3, :, 2:] == 8).all())
+
+    def test_pd_worker_uses_allocated_device_after_default_device_changes(self):
+        self.kernels.fused_timestamp_lru_metadata_update_with_probation = Mock()
+        self.kernels.parallel_lru_metadata_write = Mock()
+        for enable_lru in (False, True):
+            with self.subTest(enable_lru=enable_lru):
+                # None resolves to CPU at allocation, then meta in the worker.
+                # This reproduces late device resolution without NPU hardware:
+                # bare "npu" can resolve to a different card in the PD thread.
+                manager, _ = self.make_manager(
+                    2048, enable_lru=enable_lru, pool_device=None
+                )
+                manager.ensure_pd_decode_staging_buffers()
+                for layer in range(manager.layer_num):
+                    manager.device_slot_map[layer][2].fill_(7)
+                    manager.pd_decode_k_staging[layer][0, :3].fill_(7)
+                    manager.pd_decode_v_staging[layer][0, :3].fill_(8)
+                    if enable_lru:
+                        manager.device_slot_tokens[layer][2].fill_(7)
+                        manager.device_lru_slots[layer][2].fill_(0)
+                        manager.device_lru_slot_stamps[layer][2].fill_(9)
+
+                def offload_in_worker():
+                    with torch.device("meta"):
+                        manager.offload_pd_decode_staging_to_host(0, 2, 3)
+
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    executor.submit(offload_in_worker).result()
+
+                for layer in range(manager.layer_num):
+                    self.assertTrue((manager.device_slot_map[layer][2] == -1).all())
+                    self.assertTrue(
+                        (manager.host_kv_buffer[layer][2, :3, :, :2] == 7).all()
+                    )
+                    self.assertTrue(
+                        (manager.host_kv_buffer[layer][2, :3, :, 2:] == 8).all()
+                    )
+                    if enable_lru:
+                        self.assertTrue(
+                            (manager.device_slot_tokens[layer][2] == -1).all()
+                        )
+                        torch.testing.assert_close(
+                            manager.device_lru_slots[layer][2],
+                            manager._initial_lru_slot_order[0],
+                        )
+                        self.assertEqual(
+                            manager.device_lru_slot_stamps[layer][2].sum().item(), 0
+                        )
+
+    def test_pd_reset_and_copy_complete_on_same_stream(self):
+        for token_count in (0, 3):
+            for use_custom_stream in (False, True):
+                with self.subTest(
+                    token_count=token_count, use_custom_stream=use_custom_stream
+                ):
+                    manager, _ = self.make_manager()
+                    manager.ensure_pd_decode_staging_buffers()
+                    stream = (
+                        Mock() if use_custom_stream else manager._pd_decode_copy_stream
+                    )
+                    active_stream = None
+                    reset_requests = manager.reset_requests
+
+                    @contextmanager
+                    def stream_context(selected_stream):
+                        nonlocal active_stream
+                        active_stream = selected_stream
+                        try:
+                            yield
+                        finally:
+                            active_stream = None
+
+                    def reset_on_copy_stream(req_ids):
+                        self.assertIs(active_stream, stream)
+                        stream.synchronize.assert_not_called()
+                        reset_requests(req_ids)
+
+                    with (
+                        patch.object(self.npu, "stream", stream_context),
+                        patch.object(
+                            manager, "reset_requests", side_effect=reset_on_copy_stream
+                        ) as reset,
+                    ):
+                        manager.offload_pd_decode_staging_to_host(
+                            0,
+                            2,
+                            token_count,
+                            stream=stream if use_custom_stream else None,
+                        )
+                    reset.assert_called_once_with([2])
+                    stream.synchronize.assert_called_once_with()
+
+
+if __name__ == "__main__":
+    unittest.main()
