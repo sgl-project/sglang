@@ -99,6 +99,26 @@ impl ChatModel {
             None => self.always_thinks || config.default_thinking(kwargs),
         })
     }
+
+    /// [`Self::thinking`] for a raw chat `body` under the server's `defaults`,
+    /// its kwargs filled as `_process_messages` fills them.
+    #[cfg(feature = "render")]
+    pub fn request_thinking(
+        &self,
+        reasoning_parser: Option<&str>,
+        body: &Value,
+        defaults: &HashMap<String, Value>,
+    ) -> Option<bool> {
+        let kwargs = template_kwargs(
+            body["chat_template_kwargs"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+            crate::requested_thinking(body).map(Value::from),
+            defaults,
+        );
+        self.thinking(reasoning_parser, &kwargs)
+    }
 }
 
 /// `_process_messages`' template kwargs: the request's, then the thinking toggle
@@ -1287,6 +1307,15 @@ mod tests {
         assert_eq!(k3.thinking(Some("kimi_k3"), &Map::new()), Some(true));
         assert_eq!(k3.thinking(Some("deepseek-r1"), &Map::new()), None);
         assert_eq!(k3.thinking(None, &Map::new()), None);
+        #[cfg(feature = "render")]
+        {
+            let body = json!({"messages": [], "reasoning_effort": "none"});
+            let defaults = HashMap::new();
+            assert_eq!(
+                k3.request_thinking(Some("kimi_k3"), &body, &defaults),
+                Some(false)
+            );
+        }
 
         // An undetected template falls back to the parser's `reasoning_default`.
         let custom = ChatModel::default();
