@@ -92,6 +92,26 @@ class TestQueuedLimitAbort(CustomTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_zero_queue_limit_rejects_priority_requests_without_a_candidate(self):
+        for low_priority_values_first in (False, True):
+            with self.subTest(low_priority_values_first=low_priority_values_first):
+                incoming = _req("incoming")
+                incoming.priority = 1
+                s = _scheduler([])
+                s.max_queued_requests = 0
+                s.enable_priority_scheduling = True
+                s.schedule_low_priority_values_first = low_priority_values_first
+
+                self.assertTrue(s._abort_on_queued_limit(incoming))
+
+                sender = s.ipc_channels.send_to_tokenizer.send_output
+                sender.assert_called_once()
+                abort, req = sender.call_args.args
+                self.assertEqual(abort.rid, incoming.rid)
+                self.assertEqual(abort.finished_reason["status_code"], 503)
+                self.assertIs(req, incoming)
+                self.assertEqual(s.waiting_queue, [])
+
     def test_hicache_without_storage_uses_common_abort_cleanup(self):
         candidate = _req("candidate", wait_entry=1.0)
         candidate.priority = 0
