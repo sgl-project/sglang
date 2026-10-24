@@ -497,9 +497,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             MetadataGlueGraph(self.device) if enable_metadata_glue else None
         )
 
-        # Bind resources only after static inputs have been allocated.
-        self.backend.bind_decode_runner(self)
-
         # --- capture --------------------------------------------------
         try:
             with model_capture_mode():
@@ -1538,10 +1535,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._replay_attn_backend(), forward_batch.forward_mode
             )
         with self.model_context(), timer_ctx, self.backend.replay_session():
-            if self.backend.prepare_replay(forward_batch):
-                # Preserve the legacy NPU pre-planned replay key and inputs.
-                self._replay_graph_key = self._make_graph_key(self.bs)
-            else:
+            if not self.backend.prepare_replay(forward_batch):
                 self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(

@@ -16,7 +16,8 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 def make_backend(*, dflash=False, width=1, bs=4, raw_bs=2):
     backend = mod.NPUCudaGraphBackend.__new__(mod.NPUCudaGraphBackend)
     attention = SimpleNamespace(forward_metadata=None)
-    runner = SimpleNamespace(
+    runner = runner_mod.DecodeCudaGraphRunner.__new__(runner_mod.DecodeCudaGraphRunner)
+    runner.__dict__.update(
         raw_bs=raw_bs,
         bs=bs,
         captured_req_width=width,
@@ -30,8 +31,9 @@ def make_backend(*, dflash=False, width=1, bs=4, raw_bs=2):
             ),
         ),
         _replay_attn_backend=lambda: attention,
+        _make_graph_key=lambda bs: runner_mod.ShapeKey(size=bs),
     )
-    backend.bind_decode_runner(runner)
+    backend._decode_runner = runner
     return backend, runner, attention
 
 
@@ -75,7 +77,7 @@ def test_dsa_replay_does_not_request_host_lengths():
     graph.replay.assert_called_once_with()
 
 
-def test_common_replay_builds_host_payload_but_legacy_mtp_stays_explicit():
+def test_common_replay_builds_host_payload_but_dsa_skips_host_update():
     backend, _, _ = make_backend()
     received = []
 
@@ -104,11 +106,11 @@ def test_common_replay_builds_host_payload_but_legacy_mtp_stays_explicit():
             "attr_type": [],
         },
     )
-    backend._decode_runner = None
     graph = SimpleNamespace(replay=mock.Mock())
     backend._graphs = {"draft-key": graph}
     backend._outputs = {"draft-key": "legacy-output"}
-    assert backend.replay("draft-key", object()) == "legacy-output"
+    with mock.patch.object(mod, "is_deepseek_dsa", return_value=True):
+        assert backend.replay("draft-key", object()) == "legacy-output"
     assert len(received) == 1
 
 
@@ -160,6 +162,7 @@ def test_dflash_preparation_refreshes_lengths_and_cache_slots():
         torch.tensor([20, 21, 0, 0], dtype=torch.int32),
     )
     assert (runner.raw_bs, runner.bs, runner.raw_num_token) == (2, 4, 2)
+    assert runner._replay_graph_key == runner_mod.ShapeKey(size=4)
 
 
 if __name__ == "__main__":

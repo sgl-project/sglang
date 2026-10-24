@@ -58,7 +58,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         *,
         enable_memory_saver: bool = False,
     ) -> None:
-        self._decode_runner = None
+        self._decode_runner = cuda_graph_runner
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
@@ -93,8 +93,37 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     def cache_loc_dtype(self):
         return torch.int32
 
-    def bind_decode_runner(self, runner):
-        self._decode_runner = runner
+    def get_update_attr_name(self):
+        """Preserve each runner's existing captured attention update protocol."""
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+        from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+            EAGLEDraftCudaGraphRunner,
+        )
+        from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+            EAGLEDraftExtendCudaGraphRunner,
+        )
+        from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
+            MultiLayerEagleDraftExtendCudaGraphRunner,
+        )
+
+        # FIA V1 uses actual_seq_lengths_kv; FIA V2 uses actual_seq_kvlen.
+        # Check specialized runners before their common decode base class.
+        runner_update_attrs = (
+            (MultiLayerEagleDraftExtendCudaGraphRunner, "actual_seq_kvlen"),
+            (EAGLEDraftExtendCudaGraphRunner, "actual_seq_lengths_kv"),
+            (EAGLEDraftCudaGraphRunner, "actual_seq_lengths_kv"),
+        )
+        for runner_type, attr_name in runner_update_attrs:
+            if isinstance(self._decode_runner, runner_type):
+                return attr_name
+        if isinstance(self._decode_runner, DecodeCudaGraphRunner):
+            return self._decode_update_attr_name()
+        raise TypeError(
+            "Unsupported NPU graph update runner: "
+            f"{type(self._decode_runner).__name__}"
+        )
 
     def _decode_update_attr_name(self):
         runner = self._decode_runner
@@ -289,6 +318,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 is_encoder_decoder=runner.is_encoder_decoder,
             )
             runner._replay_attn_backend().init_forward_metadata_out_graph(fb_view)
+        # Preserve the legacy NPU pre-planned replay key.
+        runner._replay_graph_key = runner._make_graph_key(runner.bs)
         return True
 
     @contextmanager
@@ -422,32 +453,28 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 )
 
                 if isinstance(runner, EAGLEDraftCudaGraphRunner):
-                    cpu_update_input = self._eagle_draft_update_lengths(
-                        runner, static_forward_batch
+                    cpu_update_input = self._build_eagle_draft_update_payload(
+                        static_forward_batch
                     )
-                else:
-                    # Same payload the legacy seq_lens/attr_name/attr_type
-                    # convention would build for attr_type=[].
-                    cpu_update_input = [
-                        {
-                            self._decode_update_attr_name(): self._decode_update_lengths(
-                                static_forward_batch
-                            )
-                        }
-                    ]
+                    return self.replay_with_input_update(
+                        shape_key, seq_lens=None, cpu_update_input=cpu_update_input
+                    )
                 return self.replay_with_input_update(
-                    shape_key, seq_lens=None, cpu_update_input=cpu_update_input
+                    shape_key,
+                    seq_lens=self._decode_update_lengths(static_forward_batch),
+                    attr_name=self.get_update_attr_name(),
+                    attr_type=[],
                 )
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
-    @staticmethod
-    def _eagle_draft_update_lengths(runner, forward_batch):
+    def _build_eagle_draft_update_payload(self, forward_batch):
+        runner = self._decode_runner
         # One {attr_name: seq_lens} dict per speculative draft step: the
         # kth draft forward reads KV lengths seq_len + 1 + k (one draft token
         # is written to KV per step); padding rows carry 0 so attention
         # skips them.
-        attr_name = "actual_seq_lengths_kv"
+        attr_name = self.get_update_attr_name()
         cpu_update_input = []
         for step in range(runner.speculative_num_steps - 1):
             seq_lens_cpu = forward_batch.seq_lens_cpu[: runner.raw_bs] + step + 1

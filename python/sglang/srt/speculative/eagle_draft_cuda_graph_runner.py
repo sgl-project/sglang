@@ -281,9 +281,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.buffers.share_buffers()
 
-        # Bind buffers after static inputs have been allocated.
-        self.backend.bind_decode_runner(self)
-
         # Capture
         try:
             with model_capture_mode():
