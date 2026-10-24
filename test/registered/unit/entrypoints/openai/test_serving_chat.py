@@ -3732,6 +3732,196 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(finish["finish_reason"], "stop")
         self.assertEqual(finish["matched_stop"], "CUSTOM_STOP")
 
+    def test_streaming_keeps_one_id_and_one_created(self):
+        """Text, finish, usage, and extension chunks share the stream metadata."""
+
+        def _chunk(index, text, finish_reason):
+            return {
+                "text": text,
+                "prompt_token_ids": [1, 2],
+                "output_ids": [3, 4],
+                "meta_info": {
+                    "id": f"rid-candidate-{index}",
+                    "prompt_tokens": 2,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "cached_tokens_details": {"device": 0, "host": 0},
+                    "hidden_states": [[0.5, 1.0]],
+                    "finish_reason": finish_reason,
+                },
+                "index": index,
+            }
+
+        for indices in ((0,), (0, 1), (1, 0)):
+            for framed in (False, True):
+                with self.subTest(indices=indices, framed=framed):
+                    engine_chunks = [
+                        _chunk(index, text, finish)
+                        for text, finish in (
+                            ("Hello", None),
+                            ("Hello there", {"type": "stop"}),
+                        )
+                        for index in indices
+                    ]
+
+                    async def _mock_generate():
+                        for content in engine_chunks:
+                            yield content
+
+                    self.tm.generate_request.return_value = _mock_generate()
+                    self.fastapi_request.headers = (
+                        {"x-sglext-ids-framed": "1"} if framed else {}
+                    )
+                    req = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "Hi?"}],
+                        n=len(indices),
+                        stream=True,
+                        stream_options={"include_usage": True},
+                        return_hidden_states="last",
+                        return_cached_tokens_details=True,
+                        return_input_ids_in_sglext=True,
+                        return_output_ids_in_sglext=True,
+                    )
+                    with patch(
+                        "sglang.srt.entrypoints.openai.serving_chat.time"
+                    ) as clock:
+                        # Each clock read crosses a second boundary.
+                        clock.time.side_effect = range(1_700_000_000, 1_700_000_200)
+                        chunks = self._run_chat_stream(Mock(), req)
+
+                    self.assertEqual(
+                        [c["meta_info"]["id"] for c in engine_chunks],
+                        [f"rid-candidate-{index}" for index in indices] * 2,
+                    )
+                    # Include both plain data chunks and named sglext_ids events.
+                    parsed = [
+                        json.loads(line[len("data: ") :])
+                        for chunk in chunks[:-1]
+                        for line in chunk.splitlines()
+                        if line.startswith("data: ")
+                    ]
+                    self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+                    self._assert_stream_metadata(parsed, f"rid-candidate-{indices[0]}")
+                    choices = [choice for c in parsed for choice in c["choices"]]
+                    self.assertEqual({c["index"] for c in choices}, set(indices))
+                    self.assertEqual(
+                        sum(c.get("finish_reason") == "stop" for c in choices),
+                        len(indices),
+                    )
+                    self.assertEqual(
+                        sum(
+                            c["delta"].get("hidden_states") is not None for c in choices
+                        ),
+                        len(indices),
+                    )
+                    for index in indices:
+                        self.assertEqual(
+                            sum(
+                                c["delta"].get("role") == "assistant"
+                                for c in choices
+                                if c["index"] == index
+                            ),
+                            1,
+                        )
+                        self.assertEqual(
+                            "".join(
+                                c["delta"].get("content") or ""
+                                for c in choices
+                                if c["index"] == index
+                            ),
+                            "Hello there",
+                        )
+                    self.assertIsNotNone(parsed[-1]["usage"])
+                    self.assertEqual(
+                        sum("sglext" in c for c in parsed), 2 if framed else 1
+                    )
+
+    def test_streaming_tool_chunks_keep_stream_metadata(self):
+        """Tool text, calls, and final argument deltas share the stream metadata."""
+        self.chat.tool_call_parser = "hermes"
+        partial_args = '{"location": "Paris"'
+        expected_args = {"location": "Paris", "unit": "celsius"}
+        call = Mock(tool_index=0, parameters=partial_args)
+        call.name = "get_weather"
+
+        plain_parser = Mock()
+        plain_parser.parse_stream_chunk.return_value = ("", [])
+        plain_parser.parse_stream_end.return_value = ("", [])
+        plain_parser.detector.prev_tool_call_arr = []
+        plain_parser.detector.incomplete_tool_call_indices = set()
+        tool_parser = Mock()
+        tool_parser.parse_stream_chunk.return_value = ("Let me check.", [call])
+        tool_parser.parse_stream_end.return_value = ("", [])
+        tool_parser.detector.prev_tool_call_arr = [
+            {"name": "get_weather", "arguments": expected_args}
+        ]
+        tool_parser.detector.streamed_args_for_tool = [partial_args]
+        tool_parser.detector.incomplete_tool_call_indices = set()
+
+        async def _mock_generate():
+            for index in (0, 1):
+                yield {
+                    "text": "tool response",
+                    "index": index,
+                    "meta_info": {
+                        "id": f"rid-candidate-{index}",
+                        "prompt_tokens": 2,
+                        "completion_tokens": 2,
+                        "finish_reason": {"type": "stop"},
+                    },
+                }
+
+        self.tm.generate_request.return_value = _mock_generate()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather in Paris?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            n=2,
+            stream=True,
+        )
+        with (
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser",
+                side_effect=[plain_parser, tool_parser],
+            ),
+            patch("sglang.srt.entrypoints.openai.serving_chat.time") as clock,
+        ):
+            clock.time.side_effect = range(1_700_000_000, 1_700_000_200)
+            chunks = self._run_chat_stream(Mock(), req)
+
+        parsed = self._parse_chunks(chunks)
+        self._assert_stream_metadata(parsed, "rid-candidate-0")
+        choices = [choice for chunk in parsed for choice in chunk["choices"]]
+        tool_choices = [choice for choice in choices if choice["index"] == 1]
+        self.assertEqual(
+            [c["delta"]["content"] for c in tool_choices if c["delta"].get("content")],
+            ["Let me check."],
+        )
+        calls = [
+            call
+            for choice in tool_choices
+            for call in choice["delta"].get("tool_calls") or []
+        ]
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(calls[0]["id"])
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(calls[0]["function"]["arguments"], partial_args)
+        self.assertIsNone(calls[1]["id"])
+        self.assertIsNone(calls[1]["function"]["name"])
+        self.assertEqual(calls[1]["function"]["arguments"], ', "unit": "celsius"}')
+        self.assertEqual(
+            json.loads("".join(call["function"]["arguments"] for call in calls)),
+            expected_args,
+        )
+        self.assertEqual(tool_choices[-1]["finish_reason"], "tool_calls")
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+    def _assert_stream_metadata(self, chunks, response_id):
+        self.assertTrue(chunks)
+        self.assertEqual({c["id"] for c in chunks}, {response_id})
+        self.assertEqual({c["created"] for c in chunks}, {1_700_000_000})
+
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():
             chunks = []
@@ -3757,7 +3947,38 @@ class ServingChatTestCase(CustomTestCase):
                     self._stream_inkling_output_in_two_chunks()
                 self._assert_streaming_created_is_stable()
 
-    def _stream_inkling_output_in_two_chunks(self):
+    def test_streaming_encoded_candidates_share_one_id(self):
+        self._stream_inkling_output_in_two_chunks(indices=(1, 0))
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            n=2,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.time.time",
+            side_effect=range(1_700_000_000, 1_700_000_200),
+        ):
+            chunks = self._run_chat_stream(Mock(), request)
+
+        parsed = self._parse_chunks(chunks)
+        self._assert_stream_metadata(parsed, "chatcmpl-inkling-1")
+        choices = [choice for chunk in parsed for choice in chunk["choices"]]
+        self.assertEqual({choice["index"] for choice in choices}, {0, 1})
+        for index in (0, 1):
+            self.assertEqual(
+                "".join(
+                    choice["delta"].get("content") or ""
+                    for choice in choices
+                    if choice["index"] == index
+                ),
+                "Hello there",
+            )
+        self.assertIsNotNone(parsed[-1]["usage"])
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
+    def _stream_inkling_output_in_two_chunks(self, indices=(0,)):
         from sglang.srt.parser.inkling_renderer import load_tml_renderers
 
         tokenizer = load_tml_renderers().tokenizer
@@ -3773,18 +3994,19 @@ class ServingChatTestCase(CustomTestCase):
                 (len(output_ids) - 1, None),
                 (len(output_ids), {"type": "stop", "matched": None}),
             ):
-                yield {
-                    "text": "",
-                    "output_ids": output_ids[:count],
-                    "index": 0,
-                    "meta_info": {
-                        "id": "chatcmpl-inkling",
-                        "prompt_tokens": 2,
-                        "completion_tokens": count,
-                        "cached_tokens": 0,
-                        "finish_reason": finish,
-                    },
-                }
+                for index in indices:
+                    yield {
+                        "text": "",
+                        "output_ids": output_ids[:count],
+                        "index": index,
+                        "meta_info": {
+                            "id": f"chatcmpl-inkling-{index}",
+                            "prompt_tokens": 2,
+                            "completion_tokens": count,
+                            "cached_tokens": 0,
+                            "finish_reason": finish,
+                        },
+                    }
 
         self.chat.chat_encoding_spec = "inkling"
         self.chat.reasoning_parser = "inkling"

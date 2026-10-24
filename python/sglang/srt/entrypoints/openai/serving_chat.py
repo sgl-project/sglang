@@ -2074,6 +2074,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
         created = int(time.time())
+        response_id: str | None = None
 
         # Parsers for tool calls and reasoning
         parser_dict = {}
@@ -2120,6 +2121,13 @@ class OpenAIServingChat(OpenAIServingBase):
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
+                if response_id is None:
+                    response_id = content["meta_info"]["id"]
+                elif content["meta_info"]["id"] != response_id:
+                    content = {
+                        **content,
+                        "meta_info": {**content["meta_info"], "id": response_id},
+                    }
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
