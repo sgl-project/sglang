@@ -93,16 +93,11 @@ impl ChatModel {
         kwargs: &Map<String, Value>,
     ) -> Option<bool> {
         let config = think_config(reasoning_parser?)?;
-        Some(
-            config
-                .default_thinking(kwargs)
-                .unwrap_or_else(|| match &self.reasoning_toggle {
-                    Some(toggle) => toggle.enabled(kwargs),
-                    None => {
-                        self.always_thinks || kwargs.get("thinking") == Some(&Value::Bool(true))
-                    }
-                }),
-        )
+        Some(match &self.reasoning_toggle {
+            Some(toggle) => toggle.enabled(kwargs),
+            // Without a detected template config, the parser's own default.
+            None => self.always_thinks || config.default_thinking(kwargs),
+        })
     }
 }
 
@@ -1292,6 +1287,16 @@ mod tests {
         assert_eq!(k3.thinking(Some("kimi_k3"), &Map::new()), Some(true));
         assert_eq!(k3.thinking(Some("deepseek-r1"), &Map::new()), None);
         assert_eq!(k3.thinking(None, &Map::new()), None);
+
+        // An undetected template falls back to the parser's `reasoning_default`.
+        let custom = ChatModel::default();
+        assert_eq!(custom.thinking(Some("qwen3"), &Map::new()), Some(true));
+        let off = Map::from_iter([("enable_thinking".to_owned(), Value::Bool(false))]);
+        assert_eq!(custom.thinking(Some("qwen3"), &off), Some(false));
+        assert_eq!(
+            custom.thinking(Some("deepseek-v4"), &Map::new()),
+            Some(false)
+        );
     }
 
     /// The reason `messages` is not lowered, with a renderer that accepts anything.
