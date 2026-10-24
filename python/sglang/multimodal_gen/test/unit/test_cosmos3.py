@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for Cosmos3 config, weight mapping, and sampling params."""
 
+import contextlib
 import dataclasses
 import importlib.util
 import json
@@ -1144,6 +1145,136 @@ class TestCosmos3Guardrails(unittest.TestCase):
     @mock.patch("importlib.util.find_spec", return_value=None)
     def test_missing_guardrail_package_reports_unavailable(self, _):
         self.assertFalse(is_cosmos_guardrail_available())
+
+
+_COSMOS3_STAGES = (
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3"
+)
+
+
+class _FrameVAE(torch.nn.Module):
+    """Decodes one latent frame at a time and hands each to ``on_frames``."""
+
+    supports_decode_on_frames = True
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1))
+        self.config = types.SimpleNamespace(scaling_factor=1.0)
+
+    def decode(self, z, on_frames=None):
+        out = torch.tanh(3 * z[:, :3])
+        if on_frames is not None:
+            for t in range(out.shape[2]):
+                on_frames(out[:, :, t : t + 1].clone())
+        return out.clone()
+
+
+class _RecordingStream:
+    def __init__(self, save_file_path, batch, finish_frames=None):
+        self.save_file_path = save_file_path
+        self.finish_frames = finish_frames
+        self.frames = []
+
+    def __call__(self, frames):
+        self.frames.append(self.finish_frames(frames))
+
+    def finish(self):
+        return [self.save_file_path]
+
+    def abort(self):
+        raise AssertionError("the decode must not fail")
+
+
+class TestCosmos3EncodeWhileDecoding(unittest.TestCase):
+    """The plain video decode feeds the MP4 encoder the frames it would save."""
+
+    @staticmethod
+    def _stage():
+        stage = Cosmos3DecodingStage.__new__(Cosmos3DecodingStage)
+        stage.vae = _FrameVAE()
+        stage.sound_tokenizer = None
+        stage._guardrails = False
+        stage._latents_mean = stage._latents_std = None
+        stage.log_info = stage.log_debug = lambda *_args, **_kwargs: None
+        stage.use_declared_component = lambda **_kwargs: contextlib.nullcontext()
+        return stage
+
+    @staticmethod
+    def _batch(**overrides):
+        fields = dict(
+            data_type=DataType.VIDEO,
+            latents=torch.randn(
+                1, 4, 5, 6, 8, generator=torch.Generator().manual_seed(0)
+            ),
+            extra={},
+            sampling_params=Cosmos3SamplingParams(prompt="a robot"),
+            action_latents=None,
+            audio_latents=None,
+            use_guardrails=None,
+            metrics=None,
+            rollout_trajectory_data=None,
+        )
+        fields.update(overrides)
+        return types.SimpleNamespace(**fields)
+
+    def test_streamed_frames_equal_the_saved_output(self):
+        stage = self._stage()
+        with mock.patch(
+            f"{_COSMOS3_STAGES}.streamed_video_output_path", return_value=None
+        ):
+            reference = stage.forward(self._batch(), types.SimpleNamespace())
+        streams = []
+
+        def open_stream(*args, **kwargs):
+            streams.append(_RecordingStream(*args, **kwargs))
+            return streams[-1]
+
+        with (
+            mock.patch(
+                f"{_COSMOS3_STAGES}.streamed_video_output_path",
+                return_value="/tmp/cosmos3.mp4",
+            ),
+            mock.patch(
+                f"{_COSMOS3_STAGES}.EncodeWhileDecoding", side_effect=open_stream
+            ),
+        ):
+            streamed = stage.forward(self._batch(), types.SimpleNamespace())
+
+        self.assertIsNone(streamed.output)
+        self.assertEqual(streamed.output_file_paths, ["/tmp/cosmos3.mp4"])
+        self.assertIsNone(reference.output_file_paths)
+        self.assertTrue(
+            torch.equal(torch.cat(streams[0].frames, dim=2), reference.output)
+        )
+
+    def test_outputs_that_need_the_frames_are_not_streamed(self):
+        stage = self._stage()
+        cases = {
+            "guardrails": (dict(_guardrails=True), {}),
+            "audio": (
+                dict(sound_tokenizer=object()),
+                dict(audio_latents=torch.zeros(1)),
+            ),
+            "action": ({}, dict(action_latents=torch.zeros(1, 2, 3))),
+            "transfer": ({}, dict(extra={"transfer_plan": {"total_frames": 5}})),
+        }
+        with mock.patch(
+            f"{_COSMOS3_STAGES}.streamed_video_output_path",
+            return_value="/tmp/cosmos3.mp4",
+        ):
+            self.assertIsNotNone(
+                stage._encode_while_decoding(self._batch(), types.SimpleNamespace())
+            )
+            for name, (stage_fields, batch_fields) in cases.items():
+                with self.subTest(name):
+                    case_stage = self._stage()
+                    vars(case_stage).update(stage_fields)
+                    self.assertIsNone(
+                        case_stage._encode_while_decoding(
+                            self._batch(**batch_fields), types.SimpleNamespace()
+                        )
+                    )
 
 
 class TestCosmos3MRoPE(unittest.TestCase):

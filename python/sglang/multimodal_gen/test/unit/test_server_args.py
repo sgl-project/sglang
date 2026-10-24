@@ -3389,6 +3389,12 @@ class TestBreakableCudaGraphDefault(_CudaPlatformTestCase):
         )
         self.assertFalse(original.enable_breakable_cuda_graph)
 
+    def test_ltx25_distilled_two_stage_serving_turns_bcg_on(self):
+        args = self._resolve(
+            model_path="Lightricks/LTX-2.5-Diffusers", enable_cfg_parallel=False
+        )
+        self.assertTrue(args.enable_breakable_cuda_graph)
+
     def test_gates_keep_unset_bcg_off(self):
         cases = {
             "explicit off": {"enable_breakable_cuda_graph": False},

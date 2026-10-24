@@ -1337,33 +1337,42 @@ class Scheduler(
         tensors on NCCL so per-step latents do not pickle onto the gloo group.
         """
         if self.receiver is not None:
-            try:
-                recv_reqs: list[tuple[bytes, Any]] = []
-                received: list[list[bytes]] = []
-                with self._socket_lock:
-                    while len(received) < _MAX_RECV_REQS_PER_POLL:
-                        try:
-                            received.append(self.receiver.recv_multipart(zmq.NOBLOCK))
-                        except zmq.Again:
-                            break
-                for parts in received:
-                    # Accept valid REQ envelopes only, ignore malformed/probe frames.
+            recv_reqs: list[tuple[bytes, Any]] = []
+            received: list[list[bytes]] = []
+            with self._socket_lock:
+                while len(received) < _MAX_RECV_REQS_PER_POLL:
                     try:
-                        identity, payload = parts[0], parts[-1]
-                        reqs = pickle.loads(payload) if len(parts) > 2 else []
-                    except (pickle.UnpicklingError, IndexError, EOFError):
-                        continue
-
-                    recv_reqs.extend(self._normalize_received_payload(identity, reqs))
-            except zmq.ZMQError:
-                # re-raise or handle appropriately to let the outer loop continue
-                raise
+                        received.append(self.receiver.recv_multipart(zmq.NOBLOCK))
+                    except zmq.Again:
+                        break
+            for parts in received:
+                # ignore probes without a complete REQ envelope
+                if len(parts) != 3 or parts[1] != b"":
+                    continue
+                identity, _, payload = parts
+                try:
+                    items = self._normalize_received_payload(
+                        identity, pickle.loads(payload)
+                    )
+                    if not items:
+                        raise ValueError("request list cannot be empty")
+                    # isolate decoding/IPC failures before broadcasting to other ranks
+                    items = materialize_cuda_refs(items)
+                except Exception as exc:
+                    error = f"Invalid scheduler request: {type(exc).__name__}: {exc}"
+                    logger.warning(error)
+                    try:
+                        with self._socket_lock:
+                            self.receiver.send_multipart(
+                                [identity, b"", pickle.dumps(OutputBatch(error=error))],
+                                zmq.NOBLOCK,
+                            )
+                    except zmq.ZMQError:
+                        logger.warning("Could not reply to invalid scheduler request")
+                    continue
+                recv_reqs.extend(items)
         else:
             recv_reqs = None
-
-        # Rebuild CUDA IPC handles on rank 0 (no-op when the payload has none).
-        if recv_reqs is not None:
-            recv_reqs = materialize_cuda_refs(recv_reqs)
 
         if self.server_args.comfyui_mode and self._is_multi_rank():
             recv_reqs = self._broadcast_recv_reqs(recv_reqs)
