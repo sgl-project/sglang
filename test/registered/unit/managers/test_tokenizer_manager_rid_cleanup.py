@@ -28,6 +28,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX  # noqa: E402
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
@@ -911,6 +912,316 @@ def _make_generate_obj(rid, is_single):
     return obj
 
 
+class TestAbortBeforeDispatch(unittest.IsolatedAsyncioTestCase):
+    def _manager(self, enable_lora=False):
+        tm = _make_tm_for_generate(self, enable_lora=enable_lora)
+        tm._dispatch_to_scheduler = Mock()
+        tm.mm_processor = Mock()
+        tm.cuda_vmm_feature_transport = Mock()
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = AsyncMock(
+            return_value=[]
+        )
+        tm.positional_embeds_transport = Mock()
+        return tm
+
+    @staticmethod
+    def _tokenized(tm, obj):
+        return SimpleNamespace(
+            rid=obj.rid,
+            input_ids=[1],
+            mm_inputs=None,
+            time_stats=tm.rid_to_state[obj.rid].time_stats,
+            sampling_params=SimpleNamespace(max_new_tokens=4),
+            wrap_pickle_fields=Mock(),
+        )
+
+    def _start_response(self, tm, obj):
+        generator = tm.generate_request(obj)
+        response = asyncio.create_task(generator.__anext__())
+
+        async def cleanup():
+            response.cancel()
+            await asyncio.gather(response, return_exceptions=True)
+            await generator.aclose()
+
+        self.addAsyncCleanup(cleanup)
+        return response
+
+    async def _start_blocked_preprocessing(self, tm, obj):
+        started = asyncio.Event()
+
+        async def tokenize(_):
+            started.set()
+            await asyncio.Event().wait()
+
+        tm._tokenize_one_request = AsyncMock(side_effect=tokenize)
+        response = self._start_response(tm, obj)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        return response
+
+    def _assert_aborted(self, result, count=1):
+        outputs = result if isinstance(result, list) else [result]
+        self.assertEqual(
+            [out["meta_info"]["finish_reason"]["type"] for out in outputs],
+            ["abort"] * count,
+        )
+
+    async def test_preprocessing_cancellation(self):
+        for mode in ("rid", "all", "sequential_batch", "disconnect"):
+            with self.subTest(mode=mode):
+                tm = self._manager()
+                batch = mode == "sequential_batch"
+                obj = GenerateReqInput(text=["a", "b"] if batch else "prompt")
+                tm._should_use_batch_tokenization = Mock(return_value=False)
+                response = await self._start_blocked_preprocessing(tm, obj)
+                state = tm.rid_to_state[obj.rid[0] if batch else obj.rid]
+                child = state.tokenize_task
+                if mode == "disconnect":
+                    response.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await response
+                    await asyncio.sleep(0)
+                    tm._dispatch_to_scheduler.assert_not_called()
+                else:
+                    tm.abort_request(
+                        "" if batch else obj.rid, abort_all=batch or mode == "all"
+                    )
+                    self._assert_aborted(
+                        await asyncio.wait_for(response, timeout=1), 2 if batch else 1
+                    )
+                    tm._dispatch_to_scheduler.assert_called_once()
+                    self.assertIsInstance(
+                        tm._dispatch_to_scheduler.call_args.args[0], AbortReq
+                    )
+                self.assertTrue(child.cancelled())
+                self.assertIsNone(state.tokenize_task)
+                self.assertFalse(tm.rid_to_state)
+                tm._tokenize_one_request.assert_awaited_once()
+
+    @patch(
+        "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+        side_effect=lambda obj: obj,
+    )
+    async def test_abort_all_does_not_swallow_health_check(self, _wrap_shm):
+        for stage in ("tokenization", "publication"):
+            with self.subTest(stage=stage):
+                tm = self._manager()
+                obj = GenerateReqInput(
+                    text="health", rid=f"{HEALTH_CHECK_RID_PREFIX}_test"
+                )
+                started, resume = asyncio.Event(), asyncio.Event()
+                sent = asyncio.Queue()
+                tm._dispatch_to_scheduler.side_effect = sent.put_nowait
+
+                async def tokenize(req):
+                    if stage == "tokenization":
+                        started.set()
+                        await resume.wait()
+                    return self._tokenized(tm, req)
+
+                async def publish(_):
+                    if stage == "publication":
+                        started.set()
+                        await resume.wait()
+                    return []
+
+                tm._tokenize_one_request = tokenize
+                tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = publish
+                response = self._start_response(tm, obj)
+                await asyncio.wait_for(started.wait(), timeout=1)
+                tm.abort_request(abort_all=True)
+                self.assertFalse(tm.rid_to_state[obj.rid].abort_requested)
+                self.assertIsInstance(sent.get_nowait(), AbortReq)
+                resume.set()
+                self.assertEqual(
+                    (await asyncio.wait_for(sent.get(), timeout=1)).rid, obj.rid
+                )
+                await tm._handle_batch_output(_make_batch_str_output(obj.rid))
+                self.assertEqual(
+                    (await asyncio.wait_for(response, timeout=1))["text"], "hello"
+                )
+                self.assertFalse(tm.rid_to_state)
+
+    def test_exact_rid_abort_also_marks_matching_prefixes(self):
+        tm = self._manager()
+        for rid in ("request", "request-child", "other"):
+            tm.rid_to_state[rid] = _make_req_state(rid)
+        tm.abort_request("request")
+        self.assertEqual(
+            [state.abort_requested for state in tm.rid_to_state.values()],
+            [True, True, False],
+        )
+
+    async def test_abort_after_tokenization_releases_ipc(self):
+        tm = self._manager()
+        obj = GenerateReqInput(text="prompt")
+        mm_inputs = SimpleNamespace(mm_items=[object()])
+
+        async def tokenize(req):
+            result = self._tokenized(tm, req)
+            result.mm_inputs = mm_inputs
+            asyncio.get_running_loop().call_soon(tm.abort_request, req.rid)
+            return result
+
+        tm._tokenize_one_request = tokenize
+        self._assert_aborted(await self._start_response(tm, obj))
+        tm.mm_processor.cancel_cuda_ipc_features.assert_called_once_with(
+            mm_inputs.mm_items
+        )
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async.assert_not_awaited()
+        self.assertFalse(tm.rid_to_state)
+
+    async def test_abort_during_publication_cancels_vmm(self):
+        tm = self._manager()
+        obj = GenerateReqInput(text="prompt")
+        items = [object()]
+        started, finish = asyncio.Event(), asyncio.Event()
+        tm._tokenize_one_request = AsyncMock(
+            side_effect=lambda req: self._tokenized(tm, req)
+        )
+
+        async def publish(_):
+            started.set()
+            await finish.wait()
+            return items
+
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = publish
+        response = self._start_response(tm, obj)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        tm.abort_request(obj.rid)
+        finish.set()
+        self._assert_aborted(await asyncio.wait_for(response, timeout=1))
+        tm.cuda_vmm_feature_transport.cancel_for_dispatch.assert_called_once_with(items)
+        self.assertEqual(tm._dispatch_to_scheduler.call_count, 1)
+        self.assertFalse(tm.rid_to_state)
+
+    async def test_batch_filters_abort_before_and_after_publication(self):
+        tm = self._manager()
+        reqs = [
+            GenerateReqInput(text="prompt", rid=rid)
+            for rid in ("early", "late", "live")
+        ]
+        tokenized = []
+        for req in reqs:
+            req.normalize_batch_and_arguments()
+            tm._init_req_state(req)
+            result = self._tokenized(tm, req)
+            result.mm_inputs = SimpleNamespace(mm_items=[object()])
+            tokenized.append(result)
+        tm.abort_request("early")
+
+        async def publish(inputs):
+            self.assertEqual(list(inputs), [obj.mm_inputs for obj in tokenized[1:]])
+            tm.abort_request("late")
+            return []
+
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = publish
+        await tm._send_batch_request(tokenized)
+        self.assertEqual(
+            tm._dispatch_to_scheduler.call_args.args[0].batch, [tokenized[2]]
+        )
+        self.assertEqual(tm.mm_processor.cancel_cuda_ipc_features.call_count, 2)
+        for req in reqs[:2]:
+            self._assert_aborted(await tm._wait_one_response(req).__anext__())
+        self.assertEqual(list(tm.rid_to_state), ["live"])
+
+    async def test_parallel_children_inherit_abort_and_release_shared_ipc_once(self):
+        tm = self._manager()
+        obj = GenerateReqInput(text="prompt", sampling_params={"n": 2})
+        mm_inputs = SimpleNamespace(mm_items=[])
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        async def tokenize(req):
+            started.set()
+            await resume.wait()
+            result = self._tokenized(tm, req)
+            result.mm_inputs = mm_inputs
+            return result
+
+        tm._tokenize_one_request = tokenize
+        response = self._start_response(tm, obj)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        tm.abort_request(abort_all=True)
+        await asyncio.sleep(0)
+        # Parallel preprocessing completes normally; dispatch is still blocked.
+        self.assertFalse(response.done())
+        resume.set()
+        self._assert_aborted(await asyncio.wait_for(response, timeout=1), count=2)
+        tm.mm_processor.cancel_cuda_ipc_features.assert_called_once_with(
+            mm_inputs.mm_items
+        )
+        self.assertFalse(tm.rid_to_state)
+        tm._dispatch_to_scheduler.assert_called_once()
+        self.assertIsInstance(tm._dispatch_to_scheduler.call_args.args[0], AbortReq)
+
+    @patch(
+        "sglang.srt.managers.tokenizer_manager.wrap_shm_features",
+        side_effect=lambda obj: obj,
+    )
+    async def test_abort_all_during_parallel_expansion_reaches_future_children(
+        self, _wrap_shm
+    ):
+        tm = self._manager()
+        obj = GenerateReqInput(text="prompt", sampling_params={"n": 2})
+        tm._tokenize_one_request = AsyncMock(
+            side_effect=lambda req: self._tokenized(tm, req)
+        )
+        sent = asyncio.Queue()
+        tm._dispatch_to_scheduler.side_effect = sent.put_nowait
+        publications = 0
+
+        async def publish(_):
+            nonlocal publications
+            publications += 1
+            if publications == 2:
+                tm.abort_request(abort_all=True)
+            return []
+
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async = publish
+        response = self._start_response(tm, obj)
+        warmup = await asyncio.wait_for(sent.get(), timeout=1)
+        await tm._handle_batch_output(_make_batch_str_output(warmup.rid))
+        self._assert_aborted(await asyncio.wait_for(response, timeout=1), count=2)
+        self.assertEqual(publications, 2)
+        self.assertIsInstance(sent.get_nowait(), AbortReq)
+        self.assertTrue(sent.empty())
+        self.assertFalse(tm.rid_to_state)
+
+    async def test_batch_dispatch_without_registered_states(self):
+        tm = self._manager()
+        obj = GenerateReqInput(text="prompt", rid="untracked")
+        obj.normalize_batch_and_arguments()
+        tm._init_req_state(obj)
+        tokenized = self._tokenized(tm, obj)
+        tm.rid_to_state.clear()
+        await tm._send_batch_request([tokenized])
+        self.assertEqual(tm._dispatch_to_scheduler.call_args.args[0].batch, [tokenized])
+        self.assertFalse(tm.rid_to_state)
+
+    def test_unknown_rid_still_forwards_with_multiple_workers(self):
+        tm = self._manager()
+        for workers in (1, 2):
+            with get_context().override_server_args(tokenizer_worker_num=workers):
+                tm.abort_request("remote-request")
+        self.assertEqual(tm._dispatch_to_scheduler.call_count, 1)
+
+    async def test_local_abort_releases_lora_once_and_allows_rid_reuse(self):
+        tm = self._manager(enable_lora=True)
+        obj = GenerateReqInput(text="prompt", rid="reuse", lora_path="adapter")
+        response = await self._start_blocked_preprocessing(tm, obj)
+        tm.abort_request(obj.rid)
+        tm.abort_request(obj.rid)
+        self._assert_aborted(await asyncio.wait_for(response, timeout=1))
+        await asyncio.gather(*tm._lora_release_tasks)
+        self.assertEqual(tm.lora_registry._counters["adapter"].value(), 0)
+        self.assertFalse(tm.rid_to_state)
+        replacement = GenerateReqInput(text="new", rid=obj.rid)
+        replacement.normalize_batch_and_arguments()
+        tm._init_req_state(replacement)
+        self.assertFalse(tm.rid_to_state[obj.rid].abort_requested)
+        self.assertEqual(tm._dispatch_to_scheduler.call_count, 1)
+
+
 class TestReleaseReqStatesOnFailure(CustomTestCase):
     """Direct tests for _release_req_states_on_failure."""
 
@@ -1331,7 +1642,7 @@ class TestLoRARequestLifecycle(CustomTestCase):
         )
         sent = asyncio.Queue()
 
-        async def send(tokenized):
+        async def send(tokenized, **kwargs):
             tm._mark_state_dispatched(tokenized.rid)
             sent.put_nowait(tokenized)
 

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import threading
 import unittest
@@ -517,6 +518,64 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
 
 
 class TestCudaIpcProcessorRollback(CustomTestCase):
+    def test_cancel_undispatched_features_once(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+        from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+
+        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+            processor = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
+        processor.use_cuda_ipc = True
+        processor.cudaipc_mmfeature_pool = MagicMock()
+        proxy = object.__new__(CudaIpcTensorTransportProxy)
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE, feature=proxy, precomputed_embeddings=proxy
+        )
+        processor.cancel_cuda_ipc_features([item])
+        processor.cancel_cuda_ipc_features([item])
+        processor.cudaipc_mmfeature_pool.cancel_proxy.assert_called_once_with(proxy)
+        self.assertIsNone(item.feature)
+        self.assertIsNone(item.precomputed_embeddings)
+
+    def test_cancel_lease_waits_for_producer_before_acknowledging(self):
+        from contextlib import nullcontext
+
+        from sglang.srt.multimodal.transport import memory_pool
+
+        pool = object.__new__(memory_pool.StreamOrderedMmFeaturePool)
+        pool._available_ranges = [(256, 4096)]
+        pool._available_slots = [0]
+        pool._slot_generations = [0]
+        pool._occupied = {}
+        pool.control_words_per_slot = 3
+        pool.consumer_count = 2
+        pool.transport_name = "test"
+        pool.device_id = 0
+        pool.base_address = 1000
+        pool._lock = threading.Lock()
+        lease = pool._allocate_locked(512)
+        ordered = MagicMock()
+        with (
+            patch.object(torch.cuda, "device", return_value=nullcontext()),
+            patch.object(memory_pool, "stream_wait_value32", ordered.wait),
+            patch.object(memory_pool, "stream_write_value32", ordered.write),
+        ):
+            pool.cancel_lease(
+                ready_byte_offset=lease.ready_byte_offset,
+                ack_byte_offset=lease.ack_byte_offset,
+                generation=lease.generation,
+            )
+        self.assertEqual(
+            [call[0] for call in ordered.mock_calls], ["wait", "write", "write"]
+        )
+        self.assertEqual(
+            [call.args[1] for call in ordered.mock_calls], [1000, 1004, 1008]
+        )
+        self.assertEqual(pool.active_lease_count, 1)
+        self.assertFalse(pool._available_slots)
+
     def test_partial_wrap_failure_restores_items_and_cancels_proxy(self):
         from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
         from sglang.srt.multimodal.processors.base_processor import (
@@ -592,6 +651,50 @@ class TestPrecomputeHashBeforeCpuTransfer(CustomTestCase):
 
 
 class TestMultimodalProcessorConcurrency(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_processor_releases_late_ipc_result(self):
+        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+        from sglang.srt.multimodal.processors.executor import (
+            MultimodalProcessorExecutor,
+        )
+        from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+
+        with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
+            processor = BaseMultimodalProcessor.__new__(BaseMultimodalProcessor)
+        processor.use_cuda_ipc = True
+        processor.cudaipc_mmfeature_pool = MagicMock()
+        processor.mm_processor_executor = MultimodalProcessorExecutor(
+            lambda: SimpleNamespace(), max_workers=1
+        )
+        started, release = threading.Event(), threading.Event()
+        proxy = object.__new__(CudaIpcTensorTransportProxy)
+        item = MultimodalDataItem(modality=Modality.IMAGE, feature=proxy)
+
+        def process(*args, **kwargs):
+            started.set()
+            self.assertTrue(release.wait(timeout=5))
+            return [item], None, None
+
+        processor.process_and_combine_mm_data = process
+        task = asyncio.create_task(
+            processor.process_and_combine_mm_data_async(None, None)
+        )
+        try:
+            while not started.is_set():
+                await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            processor.cudaipc_mmfeature_pool.cancel_proxy.assert_not_called()
+            task.cancel()
+        finally:
+            release.set()
+            processor.mm_processor_executor.shutdown()
+        processor.cudaipc_mmfeature_pool.cancel_proxy.assert_called_once_with(proxy)
+        self.assertIsNone(item.feature)
+
     async def test_dedicated_executor_runs_processor_off_event_loop(self):
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,

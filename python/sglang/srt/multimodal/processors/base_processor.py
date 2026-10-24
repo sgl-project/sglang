@@ -2036,6 +2036,31 @@ class BaseMultimodalProcessor(ABC):
             raise
         return mm_items
 
+    def cancel_cuda_ipc_features(self, mm_items: List[MultimodalDataItem]) -> None:
+        """Return producer-owned IPC leases that will never reach the scheduler."""
+        if not self.use_cuda_ipc:
+            return
+        cancelled = set()
+        errors = []
+        for item in mm_items:
+            for field in ("feature", "precomputed_embeddings"):
+                proxy = getattr(item, field)
+                # VMM proxies subclass IPC proxies but belong to a different pool.
+                if type(proxy) is not CudaIpcTensorTransportProxy:
+                    continue
+                try:
+                    if id(proxy) not in cancelled:
+                        cancelled.add(id(proxy))
+                        self.cudaipc_mmfeature_pool.cancel_proxy(proxy)
+                except Exception as error:
+                    errors.append(error)
+                finally:
+                    setattr(item, field, None)
+        if errors:
+            raise RuntimeError(
+                f"Failed to cancel {len(errors)} CUDA IPC transport slice(s)"
+            ) from errors[0]
+
     async def process_and_combine_mm_data_async(
         self,
         base_output: BaseMultiModalProcessorOutput,
@@ -2050,5 +2075,6 @@ class BaseMultimodalProcessor(ABC):
             self.process_and_combine_mm_data,
             base_output,
             mm_tokens,
+            on_cancel=lambda result: self.cancel_cuda_ipc_features(result[0]),
             **kwargs,
         )
