@@ -26,6 +26,8 @@ class DWDPWeightManager:
         dwdp_rank: int,
         dwdp_size: int,
         transport=None,
+        *,
+        device_module=torch.cuda,
     ) -> None:
         self._weight_buffer = weight_buffer
         self._peer_views = peer_views
@@ -38,18 +40,15 @@ class DWDPWeightManager:
         # transport handles underpin the VA mappings; must outlive this manager
         self._transport = transport
 
-        device = torch.device("cuda", weight_buffer.device_id)
-        self._copy_stream = torch.cuda.Stream(device=device)
+        self._device_module = device_module
+        device = weight_buffer.device
+        self._copy_stream = device_module.Stream(device=device)
 
-        self._prefetch_events: List[torch.cuda.Event] = [
-            torch.cuda.Event() for _ in range(2)
-        ]
-        self._consume_events: List[torch.cuda.Event] = [
-            torch.cuda.Event() for _ in range(2)
-        ]
+        self._prefetch_events = [device_module.Event() for _ in range(2)]
+        self._consume_events = [device_module.Event() for _ in range(2)]
 
         # pre-record consume events so the first prefetch doesn't stall
-        current = torch.cuda.current_stream(device)
+        current = self._device_module.current_stream(device)
         for ev in self._consume_events:
             ev.record(current)
 
@@ -77,7 +76,7 @@ class DWDPWeightManager:
     def prefetch_layer(self, layer_idx: int) -> None:
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
 
-        with torch.cuda.stream(self._copy_stream):
+        with self._device_module.stream(self._copy_stream):
             # WAR: wait for compute to finish reading this slot before overwriting
             self._copy_stream.wait_event(self._consume_events[buf_idx])
 
@@ -108,14 +107,14 @@ class DWDPWeightManager:
 
     def wait_prefetch(self, layer_idx: int) -> None:
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
-        device = torch.device("cuda", self._weight_buffer.device_id)
-        compute_stream = torch.cuda.current_stream(device)
+        device = self._weight_buffer.device
+        compute_stream = self._device_module.current_stream(device)
         compute_stream.wait_event(self._prefetch_events[buf_idx])
 
     def record_compute_and_prefetch_next(self, layer_idx: int) -> None:
         buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
-        device = torch.device("cuda", self._weight_buffer.device_id)
-        compute_stream = torch.cuda.current_stream(device)
+        device = self._weight_buffer.device
+        compute_stream = self._device_module.current_stream(device)
 
         self._consume_events[buf_idx].record(compute_stream)
 
@@ -133,6 +132,10 @@ class DWDPWeightManager:
             self.prefetch_layer(self._moe_layer_indices[1])
 
     def release(self) -> None:
+        if self._transport is not None and self._transport.backend is not None:
+            self._transport.backend.prepare_release(
+                self._weight_buffer, self._peer_views
+            )
         if self._weight_buffer is not None:
             self._weight_buffer.release()
             self._weight_buffer = None
