@@ -276,6 +276,13 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
+        if self.stop_token_ids is not None:
+            for token_id in self.stop_token_ids:
+                if not 0 <= int(token_id) < vocab_size:
+                    raise ValueError(
+                        f"stop_token_ids must be in [0, {vocab_size - 1}], got "
+                        f"{token_id}."
+                    )
         if self.sampling_seed is not None:
             if not isinstance(self.sampling_seed, int):
                 raise ValueError(
