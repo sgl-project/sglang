@@ -597,6 +597,8 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
+    if _is_hip and batch == 0:
+        return mixed_qkv, z, b, a
 
     block_size = 256
     grid = (batch, triton.cdiv(qkv_dim, block_size))

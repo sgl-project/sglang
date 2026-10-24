@@ -689,8 +689,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         global _fused_decode_proj_conv_layers_logged
         global _fused_decode_real_tensor_verified_layers
 
-        if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
-            return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
+        if _is_hip:
+            # The fused path passes (projected_qkvz, projected_ba), not a tensor.
+            probe = mixed_qkv[0] if isinstance(mixed_qkv, tuple) else mixed_qkv
+            if isinstance(probe, torch.Tensor) and probe.shape[0] == 0:
+                return probe.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
