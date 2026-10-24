@@ -51,6 +51,10 @@ from sglang.srt.observability.http_request_metrics import (
     init_http_request_metrics,
 )
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
+from sglang.srt.utils.auth import (
+    add_api_key_middleware,
+    app_has_admin_force_endpoints,
+)
 from sglang.srt.utils.common import add_prometheus_middleware
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
@@ -473,6 +477,17 @@ def create_app(server_args: ServerArgs):
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
     app.include_router(rollout_api.router)
+
+    if (
+        server_args.api_key
+        or server_args.admin_api_key
+        or app_has_admin_force_endpoints(app)
+    ):
+        add_api_key_middleware(
+            app,
+            api_key=server_args.api_key,
+            admin_api_key=server_args.admin_api_key,
+        )
 
     app.state.server_args = server_args
     app.state.prompt_enhancer = None
