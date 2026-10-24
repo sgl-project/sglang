@@ -18,7 +18,7 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.runtime_context import get_exec, get_model, get_parallel
+from sglang.srt.runtime_context import get_device, get_exec, get_model, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -67,6 +67,27 @@ class EPLBManager:
             f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
         )
 
+        # Only the first period may be shorter than the recorder window:
+        # it starts at model construction with a zero buffer and one layout.
+        # Later periods retain the community interval>=window invariant.
+        self._initial_rebalance_iterations = (
+            64
+            if get_device().device == "npu"
+            and get_parallel().nnodes == 1
+            and get_exec().moe.ep_dispatch_algorithm == "static"
+            and get_exec().moe.init_expert_location == "trivial"
+            and get_exec().moe.elastic_ep_backend is None
+            and self._rebalance_num_iterations > 64
+            else None
+        )
+        if self._initial_rebalance_iterations is not None:
+            logger.info(
+                "[NPU EPLB initial learning] first=%d steady=%d window=%d",
+                self._initial_rebalance_iterations,
+                self._rebalance_num_iterations,
+                get_exec().moe.expert_distribution_recorder_buffer_size,
+            )
+
         self._main_generator = self._entrypoint()
 
     def on_forward_pass_end(self):
@@ -88,9 +109,14 @@ class EPLBManager:
     # can be more complex if needed
     def _entrypoint(self):
         while True:
-            for _ in range(self._rebalance_num_iterations):
+            initial = self._initial_rebalance_iterations
+            for _ in range(initial or self._rebalance_num_iterations):
                 yield
 
+            # Consume once even if an existing disable/scale guard skips work.
+            self._initial_rebalance_iterations = None
+            if initial is not None:
+                logger.info("[NPU EPLB initial learning] initial period complete")
             yield from self.rebalance()
 
     def rebalance(self):
