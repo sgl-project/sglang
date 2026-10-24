@@ -4,6 +4,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.memory.small_copy import _small_copy_kernel, try_small_copy
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -110,6 +111,40 @@ class TestSmallCopy(CustomTestCase):
         self.assertTrue(torch.equal(destinations[0], expanded))
         self.assertTrue(torch.equal(destinations[1], source))
         self.assertFalse(try_small_copy(destinations, [expanded, source._neg_view()]))
+
+    def test_grouped_copy_fast_path_matches_the_copies(self):
+        """With the fill fast path, one dense integer dtype pair takes one foreach
+        launch; every group shape still writes exactly the copies."""
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            _grouped_foreach_copy_,
+        )
+
+        cuda = dict(device="cuda")
+        backing = torch.full((64,), -1, dtype=torch.int64, **cuda)
+        mrope = torch.full((3, 16), -1, dtype=torch.int64, **cuda)
+        mask = torch.zeros(4, dtype=torch.bool, **cuda)
+        cases = (
+            (
+                [backing[:4], backing[8:13]],
+                [torch.arange(4, **cuda), torch.arange(5, **cuda) + 9],
+            ),
+            ([backing[16:20]], [torch.arange(4, dtype=torch.int32, **cuda)]),
+            (
+                [backing[24:28], mask],
+                [torch.arange(4, **cuda), torch.ones(4, dtype=torch.bool, **cuda)],
+            ),
+            (
+                [backing[32:36], mrope[:, :4]],
+                [torch.arange(4, **cuda), torch.arange(12, **cuda).view(3, 4)],
+            ),
+        )
+        with envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.override(True):
+            for dsts, srcs in cases:
+                _grouped_foreach_copy_(dsts, srcs)
+                for dst, src in zip(dsts, srcs):
+                    self.assertTrue(torch.equal(dst, src.to(dst.dtype)))
+        self.assertTrue(bool((backing[13:16] == -1).all()))
+        self.assertTrue(bool((mrope[:, 4:] == -1).all()))
 
     def test_dynamic_metadata_has_bounded_specializations(self):
         kernel_cache = _small_copy_kernel.device_caches[torch.cuda.current_device()][0]

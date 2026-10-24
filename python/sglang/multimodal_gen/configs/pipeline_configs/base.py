@@ -1198,10 +1198,6 @@ class PipelineConfig:
     def check_pipeline_config(self) -> None:
         self.task_type = ModelTaskType.parse(self.task_type)
         self.get_supported_task_types()
-        if self.vae_sp and not self.vae_tiling:
-            raise ValueError(
-                "Currently enabling vae_sp requires enabling vae_tiling, please set --vae-tiling to True."
-            )
 
         if len(self.text_encoder_configs) != len(self.text_encoder_precisions):
             raise ValueError(
