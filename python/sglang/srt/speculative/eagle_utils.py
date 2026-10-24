@@ -742,21 +742,19 @@ def eagle_sample(
             )
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = (
-            verify_input.draft_probs
-            if use_rejection_sampling
-            else torch.zeros_like(target_probs)
-        )
-        # Defense-in-depth behind the spec_hook startup allowlist: validate
-        # the actual kernel inputs before the Triton kernel.
-        if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
-        ):
-            raise ValueError(
-                "Rejection sampling requires a target-vocab draft proposal "
-                "distribution; the current speculative algorithm/draft worker "
-                "does not produce one (draft_probs missing or vocab-mismatched)."
-            )
+        if use_rejection_sampling:
+            draft_probs = verify_input.draft_probs
+            # Defense-in-depth behind the spec_hook startup allowlist: validate
+            # the actual kernel inputs before the Triton kernel.
+            if draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]:
+                raise ValueError(
+                    "Rejection sampling requires a target-vocab draft proposal "
+                    "distribution; the current speculative algorithm/draft worker "
+                    "does not produce one (draft_probs missing or vocab-mismatched)."
+                )
+            # Only the rejection sampler reads a draft distribution; the
+            # target-only tree kernel masks the rejected tokens itself.
+            sampling_fn = partial(sampling_fn, draft_probs=draft_probs)
 
         coins, coins_for_final_sampling = _verify_coins(
             sampling_info=sampling_info,
@@ -777,7 +775,6 @@ def eagle_sample(
             uniform_samples=coins,
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
-            draft_probs=draft_probs,
             threshold_single=get_spec().speculative_accept_threshold_single,
             threshold_acc=get_spec().speculative_accept_threshold_acc,
             deterministic=True,
@@ -785,7 +782,6 @@ def eagle_sample(
         del (
             expanded_temperature,
             target_probs,
-            draft_probs,
             coins,
             coins_for_final_sampling,
         )

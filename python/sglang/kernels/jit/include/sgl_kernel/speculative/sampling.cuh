@@ -47,7 +47,6 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
     DType* uniform_samples,
     DType* uniform_samples_for_final_sampling,
     DType* target_probs,
-    DType* draft_probs,
     uint32_t batch_size,
     uint32_t num_speculative_tokens,
     uint32_t num_draft_tokens,
@@ -60,6 +59,12 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
       uint8_t smem_sampling[];
   auto& temp_storage =
       reinterpret_cast<SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem_sampling);
+  // Tokens rejected at the last accepted node, which the residual excludes. A node has
+  // at most num_draft_tokens - 1 children; the host sizes the dynamic smem for
+  // num_draft_tokens entries.
+  IdType* rejected_tokens = reinterpret_cast<IdType*>(
+      smem_sampling + sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>));
+  uint32_t num_rejected_tokens = 0;
 
   DType prob_acc = 0.0;
   uint32_t cur_prob_offset = bx * num_draft_tokens * d;
@@ -87,37 +92,68 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
         ++num_accepted_tokens;
         accept_index[bx * num_speculative_tokens + num_accepted_tokens] = draft_index;
         last_accepted_retrive_idx = draft_index;
+        // The residual now comes from this node's row; rejections at its parent do not apply.
+        num_rejected_tokens = 0;
         break;
       } else {
-        // FIXME: leverage draft probs
-        draft_probs[cur_prob_offset + draft_token_id] = target_probs[cur_prob_offset + draft_token_id];
+        // Every thread walks the same path, so all keep the same count and thread 0 alone
+        // stores the id. The bound only matters for a malformed sibling list.
+        if (num_rejected_tokens < num_draft_tokens) {
+          if (tx == 0) {
+            rejected_tokens[num_rejected_tokens] = static_cast<IdType>(draft_token_id);
+          }
+          ++num_rejected_tokens;
+        }
         cur_index = retrive_next_sibling[bx * num_draft_tokens + cur_index];
       }
     }
     if (cur_index == -1) break;
   }
   accept_token_num[bx] = num_accepted_tokens;
+  // Publish thread 0's rejected ids to the whole block.
+  __syncthreads();
 
   // we need a different coin for the final sampling
   coin = uniform_samples_for_final_sampling[bx];
 
-  // sample from relu(target_probs - draft_probs)
+  // Sample from relu(q - p), where q is the target row of the last accepted node and p
+  // equals q at the tokens rejected there and 0 elsewhere. That is 0 at a rejected token
+  // and max(q, 0) everywhere else, so p is never materialized. When every draft level
+  // was accepted (the bonus token), nothing is rejected and the residual is relu(q).
+  //
+  // Iteration i below gives thread tx the tokens [(i * BLOCK_THREADS + tx) * VEC_SIZE,
+  // + VEC_SIZE). Only the few threads that own a rejected token read the list again.
+  bool owns_rejected_token = false;
+  for (uint32_t r = 0; r < num_rejected_tokens; ++r) {
+    owns_rejected_token |= (static_cast<uint32_t>(rejected_tokens[r]) / VEC_SIZE) % BLOCK_THREADS == tx;
+  }
+  // Bit j is set when token (i * BLOCK_THREADS + tx) * VEC_SIZE + j was rejected.
+  auto rejected_lanes = [&](uint32_t i) -> uint32_t {
+    uint32_t lanes = 0;
+    if (owns_rejected_token) {
+      const uint32_t first_token = (i * BLOCK_THREADS + tx) * VEC_SIZE;
+      for (uint32_t r = 0; r < num_rejected_tokens; ++r) {
+        const uint32_t lane = static_cast<uint32_t>(rejected_tokens[r]) - first_token;
+        if (lane < VEC_SIZE) {
+          lanes |= 1u << lane;
+        }
+      }
+    }
+    return lanes;
+  };
+
   DType sum_relu_q_minus_p(0);
-  vec_t<DType, VEC_SIZE> q_vec, p_vec;
+  vec_t<DType, VEC_SIZE> q_vec;
   DType relu_q_minus_p[VEC_SIZE];
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     q_vec.fill(DType(0));
-    p_vec.fill(DType(0));
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       q_vec.load(target_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-      if (num_accepted_tokens != num_speculative_tokens - 1) {
-        // there is no draft_probs for the bonus token
-        p_vec.load(draft_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-      }
     }
+    const uint32_t rejected = rejected_lanes(i);
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      relu_q_minus_p[j] = max(q_vec[j] - p_vec[j], DType(0));
+      relu_q_minus_p[j] = (rejected >> j) & 1u ? DType(0) : max(q_vec[j], DType(0));
     }
     sum_relu_q_minus_p += BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
                               .Sum<VEC_SIZE>(relu_q_minus_p);
@@ -136,19 +172,15 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
   DType aggregate_relu_q_minus_p(0);
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     q_vec.fill(DType(0));
-    p_vec.fill(DType(0));
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       q_vec.load(target_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-      if (num_accepted_tokens != num_speculative_tokens - 1) {
-        // there is no draft_probs for the bonus token
-        p_vec.load(draft_probs + cur_prob_offset + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
-      }
     }
 
+    const uint32_t rejected = rejected_lanes(i);
     vec_t<DType, VEC_SIZE> relu_q_minus_p_vec;
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      relu_q_minus_p_vec[j] = max(q_vec[j] - p_vec[j], DType(0));
+      relu_q_minus_p_vec[j] = (rejected >> j) & 1u ? DType(0) : max(q_vec[j], DType(0));
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC>(

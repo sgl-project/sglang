@@ -374,7 +374,6 @@ void tree_speculative_sampling_target_only(
     at::Tensor uniform_samples,
     at::Tensor uniform_samples_for_final_sampling,
     at::Tensor target_probs,
-    at::Tensor draft_probs,
     double threshold_single = 1,
     double threshold_acc = 1,
     bool deterministic = true);
