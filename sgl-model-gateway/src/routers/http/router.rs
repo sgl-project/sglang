@@ -786,6 +786,16 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_responses_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::responses::ResponsesRequestBody,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/responses", model_id)
+            .await
+    }
+
     async fn get_response(
         &self,
         headers: Option<&HeaderMap>,
