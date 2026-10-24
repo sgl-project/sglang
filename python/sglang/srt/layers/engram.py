@@ -14,7 +14,6 @@ import logging
 import mmap
 import os
 import re
-import socket
 import time
 from typing import Optional
 
@@ -799,6 +798,14 @@ class _HostTable:
             logger.info(msg)
 
 
+@functools.cache
+def _warn_host_table_ignored() -> None:
+    logger.warning(
+        "SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS takes precedence: the engram tables "
+        "stay in device memory and SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE is ignored"
+    )
+
+
 class _PeerShards:
     """One rank's engram row shard in exportable device memory (CUDA VMM), with
     every TP peer's shard mapped into this process after `connect`.
@@ -825,14 +832,14 @@ class _PeerShards:
         self.s_bytes = rows * (dim // FP8_BLOCK_SIZE)
         gran = get_device_granularity(self.device_id)
         self.size = align_up(max(1, self.w_bytes + self.s_bytes), gran)
-        self._prop = make_device_allocation_prop(self.device_id)
-        self._gran = gran
         self.local = VmmReservation(
-            self.size, self._prop, self.device_id, alignment=gran
+            self.size,
+            make_device_allocation_prop(self.device_id),
+            self.device_id,
+            alignment=gran,
         )
         self.handle = self.local.map(0, self.size, retain_handle=True)
         self.base = self.local.base
-        self._peers = []
         self.w_bias: Optional[torch.Tensor] = None
         self.s_bias: Optional[torch.Tensor] = None
         self.starts: Optional[torch.Tensor] = None
@@ -858,69 +865,45 @@ class _PeerShards:
         if self.ready:
             return
         import torch.distributed as dist
-        from cuda.bindings import driver as drv
 
         from sglang.srt.utils.cuda_vmm_utils import (
-            VmmReservation,
-            check_drv,
-            exchange_posix_fds,
-            export_shareable_handles,
-            import_peer_handle,
+            exchange_shareable_handles,
+            import_and_map_alloc,
         )
 
         t0 = time.perf_counter()
         torch.cuda.synchronize()
         cpu_group = self.group.cpu_group
         rank, world = self.group.rank_in_group, self.group.world_size
-        fabric, fds, use_fabric = export_shareable_handles(
-            [self.handle], cpu_group, rank
+        use_fabric, peer_handles = exchange_shareable_handles(
+            [self.handle], cpu_group, rank, world
         )
         meta = [None] * world
-        dist.all_gather_object(
-            meta,
-            (
-                row_start,
-                self.rows,
-                self.size,
-                fabric[0] if use_fabric else None,
-                socket.gethostname(),
-            ),
-            group=cpu_group,
-        )
-        peer_fds = {}
-        if not use_fabric:
-            if len({host for *_, host in meta}) > 1:
-                raise RuntimeError(
-                    "SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS needs CUDA FABRIC handles "
-                    "(one NVLink domain with IMEX) when the TP group spans hosts"
-                )
-            peer_fds = exchange_posix_fds(cpu_group, rank, world, fds, [1] * world)
+        dist.all_gather_object(meta, (row_start, self.rows, self.size), group=cpu_group)
         bases = []
         try:
-            for r, (_, _, size, fabric_handle, _) in enumerate(meta):
+            for r, (_, _, size) in enumerate(meta):
                 if r == rank:
                     bases.append(self.base)
                     continue
-                imported = import_peer_handle(
-                    fabric_handle,
-                    peer_fds.get((r, 0)),
-                    use_fabric=use_fabric,
-                    peer_rank=r,
+                handle = peer_handles[(r, 0)]
+                bases.append(
+                    import_and_map_alloc(
+                        handle if use_fabric else None,
+                        None if use_fabric else handle,
+                        size,
+                        self.device_id,
+                        use_fabric=use_fabric,
+                        peer_rank=r,
+                    )
                 )
-                view = VmmReservation(
-                    size, self._prop, self.device_id, alignment=self._gran
-                )
-                view.map_existing(0, size, imported)
-                # The mapping keeps the physical allocation alive.
-                check_drv(drv.cuMemRelease(imported), "cuMemRelease(peer)")
-                self._peers.append(view)
-                bases.append(view.base)
         finally:
-            for fd in list(fds) + list(peer_fds.values()):
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+            if not use_fabric:
+                for fd in peer_handles.values():
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
         padded = 1 << max(0, (world - 1).bit_length())
         int64_max = torch.iinfo(torch.int64).max
         starts, w_bias, s_bias = [], [], []
@@ -1029,6 +1012,8 @@ class EngramEmbedding(nn.Module):
             and self.tp_size > 1
             and is_cuda()
         ):
+            if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get() and tp_rank == 0:
+                _warn_host_table_ignored()
             self.peer = _PeerShards(self.rows, dim, get_parallel().tp_group)
             weight, scale = self.peer.views()
             self.weight = nn.Parameter(weight, requires_grad=False)
@@ -1113,7 +1098,8 @@ class EngramEmbedding(nn.Module):
         *,
         cp_all_tokens: bool = False,
     ) -> torch.Tensor:
-        if self.peer is not None and self.peer.ready:
+        if self.peer is not None:
+            assert self.peer.ready, "engram peer shards are mapped in finish_load"
             # Every shard is mapped here: read this rank's own tokens only, which
             # also covers the prefill CP and DP paths below without a collective.
             return self.peer.lookup(indices)
