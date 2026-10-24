@@ -54,6 +54,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
+from sglang.srt.layers.compact_decision_head import CompactDecisionPooler
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -2384,7 +2385,22 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         prefix: str = "",
         language_model_cls=Qwen3_5ForCausalLM,
     ):
-        super().__init__(config, quant_config, prefix, language_model_cls)
+        compact_readout = getattr(config, "sglang_pplx_compact_readout", False)
+        super().__init__(
+            config,
+            quant_config,
+            prefix,
+            language_model_cls,
+            build_lm_head=not compact_readout,
+        )
+        if compact_readout:
+            model = get_model()
+            decision = load_decision_config(model.model_path, model.revision)
+            if decision is None:
+                raise ValueError("Compact readout requires decision_config.json")
+            self.pooler = CompactDecisionPooler(
+                self.config.hidden_size, len(decision["token_ids"])
+            )
 
         rope_config = getattr(self.config, "rope_parameters", None) or getattr(
             self.config, "rope_scaling", {}
@@ -2546,7 +2562,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_params.add(name)
         if bare_backbone and self.pp_group.is_last_rank:
             self._load_decision_readout()
-            loaded_params.add("lm_head.weight")
+            loaded_params.add(
+                "pooler.readout.weight"
+                if isinstance(self.pooler, CompactDecisionPooler)
+                else "lm_head.weight"
+            )
         if isinstance(self.pooler, JointSchemaPooler):
             self._load_joint_head()
             loaded_params.update(
@@ -2578,6 +2598,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 model.model_path, "readout.safetensors", revision=model.revision
             )
         )["weight"]
+        if isinstance(self.pooler, CompactDecisionPooler):
+            self.pooler.readout.load_state_dict({"weight": readout}, strict=True)
+            return
         head = readout.new_zeros(self.lm_head.org_vocab_size, readout.shape[1])
         head[config["token_ids"]] = readout
         self.lm_head.weight_loader(self.lm_head.weight, head)

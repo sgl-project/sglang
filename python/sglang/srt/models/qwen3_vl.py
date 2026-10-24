@@ -1318,6 +1318,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         language_model_cls=Qwen3LLMModel,
+        build_lm_head: bool = True,
     ) -> None:
         super().__init__()
         self.pp_group = get_parallel().pp_group
@@ -1359,7 +1360,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("model.language_model", prefix),
             )
-            if self.pp_group.is_last_rank:
+            if not build_lm_head:
+                # A task-specific pooler owns the output head.
+                self.lm_head = None
+            elif self.pp_group.is_last_rank:
                 if (
                     self.pp_group.world_size == 1
                     and self.config.tie_word_embeddings
@@ -1384,7 +1388,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             not self.language_model_only and "mrope_section" in self.config.rope_scaling
         )
 
-        self.logits_processor = LogitsProcessor(self.config)
+        self.logits_processor = LogitsProcessor(self.config) if build_lm_head else None
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.capture_aux_hidden_states = False
         # like {8:0, 16:1, 24:2}, which stands for the captured deepstack features on

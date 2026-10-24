@@ -942,6 +942,20 @@ class TokenizerManagerScoreMixin:
         """
         is_generation = self.is_generation
 
+        compact_readout = getattr(
+            getattr(self, "model_config", None), "compact_decision_readout", False
+        )
+        if compact_readout and (
+            label_token_ids is not None
+            or apply_softmax
+            or return_token_logprobs
+            or score_extraction_token_id is not None
+        ):
+            raise ValueError(
+                "Compact PPLX scoring returns raw logits in checkpoint code order: "
+                "omit label_token_ids and use apply_softmax=False; "
+                "use /v1/systemone for candidate probabilities"
+            )
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be finite and greater than zero")
         if temperature != 1.0 and not apply_softmax:

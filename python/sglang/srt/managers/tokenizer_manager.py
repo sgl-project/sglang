@@ -1452,7 +1452,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_joint_schema_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
-        """A Clef or Kev checkpoint scores the spans of a decision layout, and nothing else."""
+        """Validate task-specific readouts before scheduling model execution."""
+        if getattr(self.model_config, "compact_decision_readout", False):
+            if isinstance(obj, GenerateReqInput):
+                raise ValueError(
+                    "Compact PPLX checkpoints do not generate text; use /v1/systemone"
+                )
+            if (
+                obj.token_indices_to_pool is not None
+                or obj.multi_item_delimiter_indices is not None
+                or obj.decision_layout is not None
+            ):
+                raise ValueError("Compact PPLX checkpoints use last-token pooling only")
         if (
             self.model_config.joint_head_config is None
             and self.model_config.pointer_head is None

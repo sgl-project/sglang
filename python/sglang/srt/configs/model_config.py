@@ -634,6 +634,15 @@ class ModelConfig:
                 ):
                     # Full attention sees the whole prompt, while linear attention stays causal.
                     self.hf_text_config.is_causal = False
+        self.compact_decision_readout = getattr(
+            self.hf_config, "sglang_pplx_compact_readout", False
+        )
+        if type(self.compact_decision_readout) is not bool:
+            raise ValueError("sglang_pplx_compact_readout must be a JSON boolean")
+        if self.compact_decision_readout and self.decision_config is None:
+            raise ValueError(
+                "sglang_pplx_compact_readout requires a PPLX decision checkpoint"
+            )
         self.joint_head_config = None
         if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
             self.joint_head_config = load_joint_head_config(self.model_path, revision)
@@ -642,6 +651,8 @@ class ModelConfig:
             if self.pointer_head is not None:
                 # A Kev backbone without an LM head, served by the text-only class.
                 self.hf_config.architectures = ["Qwen3_5ForCausalLM"]
+        if self.compact_decision_readout and self.joint_head_config is not None:
+            raise ValueError("Compact PPLX readout cannot replace a joint schema head")
         self.requires_mm_token_modalities = requires_mm_token_modalities(
             self.hf_config.architectures, self.hf_text_config
         )
@@ -786,8 +797,10 @@ class ModelConfig:
             self.hf_text_config, "attention_chunk_size", None
         )
         self.sliding_window_size = self._get_sliding_window_size()
-        self.is_generation = not self.is_embedding_gemma and is_generation_model(
-            self.hf_config.architectures, is_embedding
+        self.is_generation = (
+            not self.compact_decision_readout
+            and not self.is_embedding_gemma
+            and is_generation_model(self.hf_config.architectures, is_embedding)
         )
         # The vision_config/audio_config attribute heuristic is only applied when
         # the transformers backend is explicitly requested. Some text-only models

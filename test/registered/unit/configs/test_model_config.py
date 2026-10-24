@@ -248,6 +248,47 @@ class TestDecisionCheckpointConfig(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "is not supported"):
                     load_decision_config(checkpoint, None)
 
+    def test_compact_opt_in_preserves_architecture_and_multimodal_config(self):
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(checkpoint, attention_mode="noncausal_full_attention")
+            baseline = ModelConfig(model_path=checkpoint, enable_multimodal=True)
+            compact = ModelConfig(
+                model_path=checkpoint,
+                enable_multimodal=True,
+                model_override_args='{"sglang_pplx_compact_readout":true}',
+            )
+            again = ModelConfig(model_path=checkpoint, enable_multimodal=True)
+            self.assertTrue(baseline.is_generation)
+            self.assertFalse(compact.is_generation)
+            self.assertTrue(again.is_generation)
+            self.assertFalse(again.compact_decision_readout)
+            for config in (baseline, compact, again):
+                self.assertEqual(
+                    config.hf_config.architectures,
+                    ["Qwen3_5ForConditionalGeneration"],
+                )
+                self.assertTrue(config.is_multimodal)
+                self.assertIs(config.hf_text_config.is_causal, False)
+                self.assertEqual(config.model_is_mrope, baseline.model_is_mrope)
+
+    def test_compact_override_is_a_boolean_and_requires_a_decision_checkpoint(self):
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(checkpoint)
+            with self.assertRaisesRegex(ValueError, "JSON boolean"):
+                ModelConfig(
+                    model_path=checkpoint,
+                    model_override_args='{"sglang_pplx_compact_readout":"false"}',
+                )
+        with TemporaryDirectory() as checkpoint:
+            Qwen3_5Config(
+                architectures=["Qwen3_5ForConditionalGeneration"]
+            ).save_pretrained(checkpoint)
+            with self.assertRaisesRegex(ValueError, "PPLX decision checkpoint"):
+                ModelConfig(
+                    model_path=checkpoint,
+                    model_override_args='{"sglang_pplx_compact_readout":true}',
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

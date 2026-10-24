@@ -141,6 +141,7 @@ def handle_model_specific_adjustments(server_args: Any):
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
         NONCAUSAL_FULL_ATTENTION,
+        ModelImpl,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
     )
@@ -204,6 +205,27 @@ def handle_model_specific_adjustments(server_args: Any):
             )
 
     decision_config = model_config.decision_config
+    if getattr(model_config, "compact_decision_readout", False):
+        if cfg.tp_size != 1 or cfg.pp_size != 1:
+            raise ValueError("Compact PPLX readout currently requires TP=1 and PP=1")
+        if model_config.quantization is not None or model_config.model_impl not in (
+            ModelImpl.AUTO,
+            ModelImpl.SGLANG,
+        ):
+            raise ValueError(
+                "Compact PPLX readout requires the native unquantized model"
+            )
+        if cfg.enable_lora or cfg.speculative_algorithm is not None or cfg.enable_mis:
+            raise ValueError(
+                "Compact PPLX readout does not support LoRA, speculation or MIS"
+            )
+        declare_resolution(
+            server_args,
+            "_handle_model_specific_adjustments",
+            is_embedding=True,
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+        )
     if (
         decision_config is not None
         and decision_config.get("attention_mode") == NONCAUSAL_FULL_ATTENTION
