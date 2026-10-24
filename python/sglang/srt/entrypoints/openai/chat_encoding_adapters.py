@@ -8,7 +8,11 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Protocol
 import msgspec
 
 if TYPE_CHECKING:
-    from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest, ToolCall
+    from sglang.srt.entrypoints.openai.protocol import (
+        ChatCompletionRequest,
+        ResponsesRequest,
+        ToolCall,
+    )
     from sglang.srt.function_call.core_types import ToolCallItem
 
 EncodingBackend = Literal["builtin", "recipe"]
@@ -17,6 +21,7 @@ EncodingBackend = Literal["builtin", "recipe"]
 class ChatOutputHooks(msgspec.Struct, frozen=True, kw_only=True):
     """Chat-handler policies an output adapter needs, bound to one handler."""
 
+    thinking_requested: Callable[[ChatCompletionRequest], bool]
     tool_call_parsing_active: Callable[[ChatCompletionRequest], bool]
     history_tool_calls_count: Callable[[ChatCompletionRequest], int]
     tool_call_id: Callable[[ToolCallItem, int], str]
@@ -54,6 +59,8 @@ class ChatEncodingOutputAdapter(Protocol):
     def parse_responses_output(
         self,
         *,
+        request: ResponsesRequest,
+        require_reasoning: bool,
         output_ids: list[int],
         finish_reason: Optional[dict[str, Any]],
         separate_reasoning: bool,
@@ -61,7 +68,12 @@ class ChatEncodingOutputAdapter(Protocol):
     ) -> tuple[str, str, list[ToolCallItem]]: ...
 
     def new_responses_stream(
-        self, *, separate_reasoning: bool, parse_tool_calls: bool
+        self,
+        *,
+        request: ResponsesRequest,
+        require_reasoning: bool,
+        separate_reasoning: bool,
+        parse_tool_calls: bool,
     ) -> ResponsesOutputStream: ...
 
 
@@ -92,6 +104,77 @@ class ChatEncodingAdapter(Protocol):
         encoding that collects media itself appends the prompt's images to
         ``image_data`` in placeholder order."""
         ...
+
+
+def select_new_output_ids(
+    *,
+    output_ids: list[int],
+    num_consumed_tokens: int,
+    completion_tokens: int,
+    finish_reason_type: Optional[str],
+    incremental: bool,
+) -> list[int]:
+    if not incremental:
+        # Intermediate chunks share the live output list; completion_tokens is
+        # this chunk's snapshot, so later tokens wait for their own chunk.
+        return output_ids[num_consumed_tokens:completion_tokens]
+    if finish_reason_type == "abort":
+        # The abort chunk re-sends already-streamed tokens.
+        return output_ids[: max(completion_tokens - num_consumed_tokens, 0)]
+    return output_ids
+
+
+def token_output_sse_chunks(
+    *,
+    chunk_id: str,
+    created: int,
+    model: str,
+    index: int,
+    usage: Optional[dict[str, Any]],
+    logprobs: Optional[dict],
+    reasoning: str,
+    content: str,
+    tool_calls: list[ToolCall],
+) -> list[str]:
+    """One streamed step of a token-level output parser: a reasoning chunk, a content
+    chunk, then one chunk per tool call; the step's logprobs ride on the first."""
+    from sglang.srt.entrypoints.openai.protocol import (
+        ChatCompletionResponseStreamChoice,
+        ChatCompletionStreamResponse,
+        DeltaMessage,
+    )
+    from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
+
+    fields = dict(
+        chunk_id=chunk_id, created=created, model=model, index=index, usage=usage
+    )
+    chunks = []
+    if reasoning:
+        chunks.append(
+            build_sse_content(reasoning_content=reasoning, logprobs=logprobs, **fields)
+        )
+        logprobs = None
+    if content:
+        chunks.append(build_sse_content(content=content, logprobs=logprobs, **fields))
+        logprobs = None
+    for tool_call in tool_calls:
+        chunk = ChatCompletionStreamResponse(
+            id=chunk_id,
+            created=created,
+            choices=[
+                ChatCompletionResponseStreamChoice(
+                    index=index,
+                    delta=DeltaMessage(tool_calls=[tool_call]),
+                    finish_reason=None,
+                )
+            ],
+            model=model,
+            usage=usage,
+        )
+        chunks.append(f"data: {chunk.model_dump_json()}\n\n")
+    if logprobs is not None:
+        chunks.append(build_sse_content(logprobs=logprobs, **fields))
+    return chunks
 
 
 class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
@@ -151,6 +234,9 @@ def _build_deepseek_recipe(
     return DeepSeekRecipeChatEncodingAdapter(
         chat_encoding_spec=ctx.chat_encoding_spec,
         tokenizer=ctx.tokenizer,
+        reasoning_parser=ctx.reasoning_parser,
+        tool_call_parser=ctx.tool_call_parser,
+        chat_hooks=ctx.chat_hooks,
         default_chat_template_kwargs=ctx.default_chat_template_kwargs,
     )
 

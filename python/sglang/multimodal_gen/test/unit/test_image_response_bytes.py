@@ -57,7 +57,7 @@ def _encode(frame: np.ndarray, path: str, **kwargs) -> bytes:
 
 
 # channels 0 is a 2-D grayscale frame, 1 a single-channel HWC frame
-@pytest.mark.parametrize("channels", [0, 1, 3, 4])
+@pytest.mark.parametrize("channels", [0, 1, 2, 3, 4])
 @pytest.mark.parametrize("output_compression", [None, 75, 100])
 def test_returned_png_holds_the_source_pixels_and_writes_nothing(
     tmp_path, channels, output_compression

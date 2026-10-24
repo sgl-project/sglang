@@ -511,10 +511,10 @@ class ServerArgs(DisaggServerArgsMixin):
     # values so the exact tier's speed is unchanged.
     allow_cudnn_tf32: bool = True
     allow_bf16_reduced_precision_reduction: bool = True
-    # BCG graphs are resolution-specific, so --warmup-resolutions is required
-    # when BCG is enabled: every requested resolution is captured at warmup so
-    # serving never triggers a fresh capture.
-    enable_breakable_cuda_graph: bool = False
+    # BCG graphs are resolution-specific: every warmup resolution is captured at
+    # warmup so serving never triggers a fresh capture. None resolves in
+    # _adjust_breakable_cuda_graph_support (on for opted-in pipelines).
+    enable_breakable_cuda_graph: bool | None = None
     # Text/prompt sequence-length padding budget for BCG. Prompt-conditioning
     # inputs are padded up to the smallest bucket that fits, so prompts of
     # different lengths reuse one captured graph. Warmup captures one graph per
@@ -818,6 +818,8 @@ class ServerArgs(DisaggServerArgsMixin):
             return None
 
     def _adjust_breakable_cuda_graph_support(self):
+        if self.enable_breakable_cuda_graph is None:
+            self.enable_breakable_cuda_graph = self._breakable_cuda_graph_default()
         if not self.enable_breakable_cuda_graph:
             return
 
@@ -851,6 +853,52 @@ class ServerArgs(DisaggServerArgsMixin):
         # cannot build; the ComfyUI step stage captures on its first real step.
         if not self.warmup_resolutions and not self.comfyui_mode:
             self._default_bcg_warmup_resolution()
+
+    def _breakable_cuda_graph_default(self) -> bool:
+        """Whether unset BCG turns on: an opted-in pipeline on a validated checkpoint,
+        captured by the startup warmup over DiT weights that never move."""
+        deployment_config = self.pipeline_config.get_model_deployment_config()
+        if (
+            self.pipeline_class_name
+            not in deployment_config.bcg_default_pipeline_class_names
+        ):
+            return False
+        enabled = (
+            self.performance_mode in ("auto", "speed")
+            and current_platform.is_cuda()
+            and not current_platform.device_shares_host_memory()
+            # offline runs have no startup warmup; capturing would add a generation
+            and self.warmup_mode == "server"
+            and self.disagg_role == RoleType.MONOLITHIC
+            and not self.comfyui_mode
+            and self._is_breakable_cuda_graph_supported_model()
+            and not self.enable_torch_compile
+            and not envs.SGLANG_CACHE_DIT_ENABLED
+            and self.batching_max_size == 1
+            and self.lora_path is None
+            # measured with both stage DiTs resident on >=130 GiB cards; capture
+            # holds ~7 GB more on Hopper, past an 80 GB card's speed-mode headroom
+            and current_platform.get_device_total_memory() / BYTES_PER_GB
+            >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
+            and (
+                self.ltx2_two_stage_device_mode == "resident"
+                or not self._is_ltx23_two_stage_pipeline()
+            )
+            # graphs replay fixed weight addresses
+            and not self.dit_layerwise_offload
+            and not self.use_fsdp_inference
+            and all(
+                self.residency_mode(name) == RESIDENT
+                for name in ("transformer", "transformer_2")
+            )
+        )
+        if enabled:
+            logger.info(
+                "[Diffusion BCG] enabled by default for %s; pass "
+                "--enable-breakable-cuda-graph false to run eager.",
+                self.pipeline_class_name,
+            )
+        return enabled
 
     def _is_breakable_cuda_graph_supported_model(self) -> bool:
         refs = _normalized_bcg_model_refs(self.model_id)
@@ -1048,7 +1096,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 )
 
     def _adjust_ltx2_two_stage_device_mode(self):
-        if not self._is_ltx23_two_stage_pipeline():
+        if not self._is_ltx2_distilled_lora_two_stage_pipeline():
             return
 
         mode = self.ltx2_two_stage_device_mode
@@ -1122,6 +1170,13 @@ class ServerArgs(DisaggServerArgsMixin):
             device_total_memory_gb,
         )
         return "original"
+
+    def _is_ltx2_distilled_lora_two_stage_pipeline(self) -> bool:
+        # LTX-2 and LTX-2.3 refine with a distilled LoRA; LTX-2.5 ships a distilled DiT
+        return (
+            is_ltx2_two_stage_pipeline_name(self.pipeline_class_name)
+            and not self.pipeline_config.default_sigmas
+        )
 
     def _is_ltx23_two_stage_pipeline(self) -> bool:
         return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
@@ -2595,7 +2650,9 @@ class ServerArgs(DisaggServerArgsMixin):
             "(split at attention; SP all-to-all / dynamic attention stay "
             "eager) to cut per-kernel launch overhead. Mutually exclusive "
             "with --enable-torch-compile and Cache-DiT (BCG takes priority). "
-            "Requires --warmup-resolutions; all of them are captured at warmup.",
+            "Graphs are captured at warmup for --warmup-resolutions (default: "
+            "the model default shape). Unset, it is on for LTX-2/LTX-2.3 "
+            "LTX2TwoStagePipeline serving with resident DiTs on >=130 GiB GPUs.",
         )
         parser.add_argument(
             "--bcg-text-buckets",
@@ -2869,9 +2926,10 @@ class ServerArgs(DisaggServerArgsMixin):
             choices=LTX2_TWO_STAGE_DEVICE_MODE_CHOICES,
             default=ServerArgs.ltx2_two_stage_device_mode,
             help=(
-                "LTX-2.3 two-stage device residency mode: "
+                "LTX-2 / LTX-2.3 two-stage device residency mode: "
                 "'original' keeps official two-stage semantics without premerged stage2, "
-                "'resident' keeps both transformers resident on GPU. "
+                "'resident' keeps both transformers resident on GPU and runs stage 2 "
+                "on the one with the distilled LoRA merged in. "
                 "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
             ),
         )
