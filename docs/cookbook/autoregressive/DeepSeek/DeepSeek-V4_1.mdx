@@ -231,7 +231,7 @@ TP2 covers concurrency 1 to 32 and TP4 covers 1 to 16; at 32 and 64 the same two
 - TP2 raises `--mem-fraction-static` at concurrency 16; TP4 stops at 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare.
 - A longer `--prefill-decode-interval` runs more decode rounds between prefill batches, trading TTFT for P90 inter-token latency.
 - Up to concurrency 8 it pairs with `--schedule-policy lpm`, which admits the requests with the longest cached prefix first.
-- These points set `--monokernel-backend amd`. Do not set `SGLANG_HIP_DSV41_INDEX_K_PAGE8`: the monokernel refuses that layout.
+- These points set `--enable-amd-monokernel`. Do not set `SGLANG_HIP_DSV41_INDEX_K_PAGE8`: the monokernel refuses that layout.
 
 The braced values in the command follow concurrency:
 
@@ -266,7 +266,7 @@ sglang serve \
   --ep-size 1 \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 5 \
-  --monokernel-backend amd \
+  --enable-amd-monokernel \
   --enforce-shared-experts-fusion \
   --fp8-gemm-backend aiter \
   --enable-decoder-swa-bounded-replay \
@@ -283,7 +283,7 @@ sglang serve \
   --watchdog-timeout 3600
 ```
 
-**TP2, concurrency 32:** the command above with the concurrency-32 column, without `--monokernel-backend amd`, and with `SGLANG_HIP_DSV41_INDEX_K_PAGE8=1`.
+**TP2, concurrency 32:** the command above with the concurrency-32 column, without `--enable-amd-monokernel`, and with `SGLANG_HIP_DSV41_INDEX_K_PAGE8=1`.
 
 **DP2, concurrency 32–64:** two DP attention ranks, one per GPU, with the MoE still tensor parallel across both. The braced values follow concurrency:
 

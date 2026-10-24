@@ -77,6 +77,8 @@ class LTX2DenoisingContext(DenoisingContext):
     # fp32 copies of scheduler.sigmas taken once per loop, so steps never sync on them
     sigmas_host: torch.Tensor | None = None
     sigmas_device: torch.Tensor | None = None
+    # key of the prompt K/V the DiT projected for this loop (prepare_prompt_kv)
+    prompt_kv_key: tuple[int, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -1475,6 +1477,36 @@ class LTX2DenoisingStage(DenoisingStage):
             ):
                 yield
 
+    def _use_cached_ltx2_prompt_kv(
+        self,
+        ctx: LTX2DenoisingContext,
+        step: DenoisingStepState,
+        model_kwargs: dict[str, object],
+    ) -> dict[str, object]:
+        """Project the prompt K/V on the loop's first step and have every step read them.
+
+        The text and the DiT weights are fixed for one loop (the LoRA phase switches
+        before it), so the K/V each step would project are the same tensors.
+        """
+        model = step.current_model
+        if (
+            not model.caches_prompt_kv
+            or model.layerwise_offload_managers
+            or self._cache_dit_enabled
+        ):
+            return model_kwargs
+        if ctx.prompt_kv_key is None:
+            ctx.prompt_kv_key = model.prepare_prompt_kv(
+                model_kwargs["encoder_hidden_states"],
+                model_kwargs["audio_encoder_hidden_states"],
+            )
+        return {
+            **model_kwargs,
+            "encoder_hidden_states": None,
+            "audio_encoder_hidden_states": None,
+            "cached_prompt_kv": ctx.prompt_kv_key,
+        }
+
     def _ltx2_call_current_model(
         self,
         ctx: "LTX2DenoisingContext",
@@ -1783,6 +1815,7 @@ class LTX2DenoisingStage(DenoisingStage):
                         model_kwargs["audio_encoder_attention_mask"] = (
                             repeated_attention_mask
                         )
+            model_kwargs = self._use_cached_ltx2_prompt_kv(ctx, step, model_kwargs)
 
             with self._ltx2_model_forward_context(ctx, step):
                 model_video, model_audio = self._ltx2_call_current_model(
