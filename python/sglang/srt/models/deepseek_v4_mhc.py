@@ -677,6 +677,7 @@ def _post_fusion(
         and next.hc is not None
         and _can_use_mega_mhc(cfg)
         and y.shape[0] > 0
+        and y.shape[0] >= envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL_MIN_ROWS.get()
     ):
         next_hc = next.hc
         y_fp8 = y_sf = moe_input = None
