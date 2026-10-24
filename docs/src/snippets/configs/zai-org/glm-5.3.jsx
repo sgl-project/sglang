@@ -40,7 +40,7 @@ export const config = {
     "a3|default|w8a8": "glm-5",
     "default|fp8": "zai-org/GLM-5.3",
     "default|bf16": "zai-org/GLM-5.3-BF16",
-    "default|nvfp4": "RadixArk/GLM-5.3-NVFP4",
+    "default|nvfp4": "nvidia/GLM-5.3-NVFP4",
   },
 
   placeholders: {
@@ -945,7 +945,7 @@ sgl-eval run aime25 \\
 
 
     // ====================================================================
-    // NVFP4 — RadixArk/GLM-5.3-NVFP4 (Model Optimizer, experts-only W4A4).
+    // NVFP4 — nvidia/GLM-5.3-NVFP4 (Model Optimizer, experts-only W4A4).
     // Same runtime contract as nvidia/GLM-5.2-NVFP4 (experts-only NVFP4, KV FP8,
     // no per-tensor k/v scale tensors), so the GLM-5.2 NVFP4 recipes carry over:
     // TP8 on B200/B300, TP4 on GB300; low-latency MTP 5-1-6, balanced MTP 2-1-3.
