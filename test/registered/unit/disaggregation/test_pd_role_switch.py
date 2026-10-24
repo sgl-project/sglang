@@ -768,6 +768,7 @@ class TestStartupDecodeGraphReuse(unittest.TestCase):
                 try:
                     rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
                     runner = mr.ModelRunner.__new__(mr.ModelRunner)
+                    runner.is_draft_worker = False
                     runner.model = MagicMock()
                     runner.decode_cuda_graph_captured = False
                     runner.decode_cuda_graph_capture_bs = []

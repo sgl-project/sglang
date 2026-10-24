@@ -39,6 +39,8 @@ import torch
 import torch.distributed
 
 from sglang.srt.environ import envs
+from sglang.srt.eplb.comm_utils import get_eplb_device_group
+from sglang.srt.eplb.npu_statistics import BatchedTopKStatisticsMixin
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
@@ -117,6 +119,13 @@ _OutputMode = Literal["file", "object"]
 EPLB_BALANCEDNESS_WINDOW_SIZES = (10, 100, 1000)
 
 
+def _use_npu_sender_statistics():
+    return (
+        get_device_namespace().device == "npu"
+        and get_exec().moe.moe_a2a_backend == "deepep"
+    )
+
+
 @dataclass
 class ExpertDistributionMetrics:
     forward_pass_id: int
@@ -149,6 +158,15 @@ class ExpertDistributionRecorder(ABC):
             return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
+
+    def on_graph_capture_forward_start(self):
+        pass
+
+    def get_graph_capture_state(self):
+        return {}
+
+    def on_graph_replay_forward_start(self, state):
+        pass
 
     @contextmanager
     def with_current_layer(self, layer_idx):
@@ -236,6 +254,31 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
             self.start_record()
 
+    def on_graph_capture_forward_start(self):
+        if self._disable_all:
+            return
+        for gatherer in self._single_pass_gatherers.values():
+            prepare = getattr(gatherer, "on_graph_capture_forward_start", None)
+            if prepare is not None:
+                prepare()
+
+    def get_graph_capture_state(self):
+        if self._disable_all:
+            return {}
+        return {
+            key: gatherer.get_graph_capture_state()
+            for key, gatherer in self._single_pass_gatherers.items()
+            if hasattr(gatherer, "get_graph_capture_state")
+        }
+
+    def on_graph_replay_forward_start(self, state):
+        if self._disable_all:
+            return
+        for key, has_batched_routes in state.items():
+            self._single_pass_gatherers[key].on_graph_replay_forward_start(
+                has_batched_routes
+            )
+
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
 
@@ -244,6 +287,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
+        # Draft forwards share this recorder but must not reset target counts.
+        if self._disable_all:
+            yield {}
+            return
         outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)
@@ -263,6 +310,8 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._disable_all = previous_disable_all
 
     def _on_forward_pass_start(self, forward_batch: ForwardBatch):
+        if self._disable_all:
+            return
         if not self._recording:
             self._record_current_pass = False
             return
@@ -274,7 +323,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             gatherer.on_forward_pass_start(forward_batch)
 
     def _on_forward_pass_end(self, forward_pass_id: int, outputs: Dict[str, Any]):
-        if not self._recording or not self._record_current_pass:
+        if self._disable_all or not self._recording or not self._record_current_pass:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             single_pass_data = gatherer.collect()
@@ -283,10 +332,16 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
 
     def on_select_experts(self, topk_ids: torch.Tensor):
+        if self._disable_all or not (
+            self._recording or torch.get_device_module().is_current_stream_capturing()
+        ):
+            return
+        if megamoe_prefill_only_recorder_enabled() and not self._record_current_pass:
+            return
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
     def get_current_pass_count_buffer(self, layer_idx: int):
-        if not self._recording or not self._record_current_pass:
+        if self._disable_all or not self._recording or not self._record_current_pass:
             return None
         gatherer = self._single_pass_gatherers.get(_SINGLE_PASS_GATHERER_KEY_PRIMARY)
         if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):
@@ -410,6 +465,17 @@ class _SinglePassGatherer(ABC):
                 raise NotImplementedError
 
         if get_exec().moe.moe_a2a_backend == "deepep":
+            if _use_npu_sender_statistics():
+                # Ascend receiver counts include graph padding; count valid
+                # sender routes instead.
+                gatherer = _NpuBatchedSelectExpertsSinglePassGatherer(
+                    expert_location_metadata, rank
+                )
+                logger.info(
+                    "[NPU EPLB batch statistics] capacity=%d routes/layer",
+                    gatherer._batched_routes.shape[1],
+                )
+                return gatherer
             if get_exec().moe.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif get_exec().moe.deepep_mode == "low_latency":
@@ -626,6 +692,12 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         )
 
 
+class _NpuBatchedSelectExpertsSinglePassGatherer(
+    BatchedTopKStatisticsMixin, _SelectExpertsSinglePassGatherer
+):
+    pass
+
+
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -777,20 +849,24 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self._enable = reports_expert_balancedness()
+        # Threshold decisions need utilization history even with reporting off.
+        self._enable = reports_expert_balancedness() or not math.isclose(
+            get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
+        )
 
         if self._enable:
             self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._reset_server_log_history = True
             self._rank = torch.distributed.get_rank()
-            expert_dispatch_cls = resolve_collector_class(
-                STAT_LOGGER_ROLE_EXPERT_DISPATCH,
-                ExpertDispatchCollector,
-            )
-            self._expert_dispatch_collector = expert_dispatch_cls(
-                self._expert_location_metadata.ep_size
-            )
+            if reports_expert_balancedness():
+                expert_dispatch_cls = resolve_collector_class(
+                    STAT_LOGGER_ROLE_EXPERT_DISPATCH,
+                    ExpertDispatchCollector,
+                )
+                self._expert_dispatch_collector = expert_dispatch_cls(
+                    self._expert_location_metadata.ep_size
+                )
             self._metric_heatmap_collection_counter = 0
 
     def append(
@@ -824,11 +900,15 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            gpu_physical_count,
+            dst=0,
+            op=torch.distributed.ReduceOp.SUM,
+            group=get_eplb_device_group(),
         )
 
         if self._rank == 0:
-            self._handle_metric_eplb_heatmap(gpu_physical_count)
+            if reports_expert_balancedness():
+                self._handle_metric_eplb_heatmap(gpu_physical_count)
 
             utilization_rate_gpu = torch.mean(
                 compute_utilization_rate(gpu_physical_count)
@@ -837,16 +917,17 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
             )
 
-            should_log = logs_expert_balancedness_to_server_log()
-            outputs["metrics"] = ExpertDistributionMetrics(
-                forward_pass_id=forward_pass_id,
-                eplb_balancedness=utilization_rate_gpu,
-                gpu_physical_count_sum=(
-                    gpu_physical_count.sum() if should_log else None
-                ),
-                reset_server_log_history=self._reset_server_log_history,
-            )
-            self._reset_server_log_history = False
+            if reports_expert_balancedness():
+                should_log = logs_expert_balancedness_to_server_log()
+                outputs["metrics"] = ExpertDistributionMetrics(
+                    forward_pass_id=forward_pass_id,
+                    eplb_balancedness=utilization_rate_gpu,
+                    gpu_physical_count_sum=(
+                        gpu_physical_count.sum() if should_log else None
+                    ),
+                    reset_server_log_history=self._reset_server_log_history,
+                )
+                self._reset_server_log_history = False
 
             if should_track_history:
                 self._history.append(utilization_rate_gpu.item())
@@ -992,7 +1073,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            logical_count_of_buffered_step,
+            op=torch.distributed.ReduceOp.SUM,
+            group=get_eplb_device_group(),
         )
 
         output = dict(
@@ -1027,11 +1110,15 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             avg_rate_tensor = torch.tensor(
                 [average_utilization_rate_over_window],
                 dtype=torch.float32,
-                device="cuda",
+                device=get_device_namespace().device,
             )
         else:
-            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
+            avg_rate_tensor = torch.empty(
+                1, dtype=torch.float32, device=get_device_namespace().device
+            )
+        torch.distributed.broadcast(
+            avg_rate_tensor, src=0, group=get_eplb_device_group()
+        )
         return avg_rate_tensor.item()
 
 

@@ -1,0 +1,165 @@
+{
+  "base": "de7055f59645ebe03784b0980e1f222789f468a3",
+  "files": {
+    "python/sglang/srt/eplb/comm_utils.py": "9973d3a94a6a7ae25b19f321340e8233f573543184e53f6ee8021c1b71b0f910",
+    "python/sglang/srt/eplb/eplb_manager.py": "32a9d818efff09fab5885260750fc60871e5749309f2c8ccf70fb732e8e35720",
+    "python/sglang/srt/eplb/expert_distribution.py": "c7cdfc07f6e90a96c9bc7c26e10b96be407a68798352cb37070ed71870ad1e87",
+    "python/sglang/srt/eplb/expert_location_updater.py": "e751a58061ccf9d1eabf98575cc47c653691ca3d623ad4d5b1d192920faf422e",
+    "python/sglang/srt/eplb/npu_statistics.py": "9ba2bae75f9b5307822cac1da8ac73a6e0e985cd37c2392a1d8ba1caecd6b712",
+    "python/sglang/srt/model_executor/model_runner.py": "346135ec8faad6849eb12a81f4a8a72ab0031196b788a4d8e62ca3c42e7f6a30",
+    "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py": "3303db05d4a5e6e8ce544b00eec2b632826452dea67e8863a6ac18b23a177fc1",
+    "test/manual/ep/test_eplb_online_loop.py": "d6a83a54dd580b45452ece1185faa643acded869ab9a360d9f532cb6f5c0c7ed",
+    "test/manual/ep/test_eplb_weight_migration.py": "46d72af3b7c99ce6f9b19c7882af47920812d04289be5a080779529026df72ad",
+    "test/registered/unit/eplb/test_draft_distribution_isolation.py": "1ddc6d9e55391ec017b84cdf91ea2187c8ef1db0f54e3024dc6a30c8fa34b697",
+    "test/registered/unit/eplb/test_eplb_threshold.py": "93dbc9cb747d6e490d40958ef2a7ec9d045d8d6298820189c2b58bc3c72ffca4",
+    "test/registered/unit/eplb/test_npu_batched_statistics.py": "f1907c328b71e65a2cc4d86b58768866330077084c0203898fbe4394df81ef3e",
+    "test/registered/unit/eplb/test_npu_eplb_group.py": "9de76e3ff194807e6960acb8810c80cfe38dd884da1acfcb9bd818441521551f",
+    "test/registered/unit/eplb/test_npu_expert_distribution.py": "b6fa81989f9ef0f88d0941f7c9a74d2cfd434e5e62f2934acb3cae6f0a902825",
+    "test/registered/unit/eplb/test_npu_initial_rebalance.py": "234fe91952592ff7016a3245d22c22b49338df5622285242327db97edba918d9",
+    "test/registered/unit/eplb/test_npu_topk_padding.py": "3907ce75063b3939cdeeff8c3ed87531512bc3d19c64d49f63073779e9e60b8a",
+    "test/registered/unit/eplb/test_npu_w8a8_registration.py": "6ef76fe2a0c9e5551d50ce4c4077b64f1720f5fc04b3b909c26a328505e8f1e3"
+  },
+  "environment": {
+    "hardware": "Ascend 910C",
+    "CANN": "9.1.0",
+    "torch": "2.10.0+cpu",
+    "torch_npu": "2.10.0.post6"
+  },
+  "cpu": {
+    "status": "UPSTREAM_PORT_CPU_PASSED",
+    "tests": 39,
+    "npu_initialized": false,
+    "suites": [
+      {
+        "path": "test/registered/unit/eplb/test_draft_distribution_isolation.py",
+        "passed": 4
+      },
+      {
+        "path": "test/registered/unit/eplb/test_eplb_threshold.py",
+        "passed": 5
+      },
+      {
+        "path": "test/registered/unit/eplb/test_npu_batched_statistics.py",
+        "passed": 6
+      },
+      {
+        "path": "test/registered/unit/eplb/test_npu_eplb_group.py",
+        "passed": 5
+      },
+      {
+        "path": "test/registered/unit/eplb/test_npu_expert_distribution.py",
+        "passed": 8
+      },
+      {
+        "path": "test/registered/unit/eplb/test_npu_initial_rebalance.py",
+        "passed": 3
+      },
+      {
+        "path": "test/registered/unit/eplb/test_npu_topk_padding.py",
+        "passed": 6
+      },
+      {
+        "path": "test/registered/unit/eplb/test_npu_w8a8_registration.py",
+        "passed": 2
+      }
+    ]
+  },
+  "npu_graph": {
+    "status": "ACTUAL_NPU_CAPTURE_LIFECYCLE_PASSED",
+    "capture_fallbacks": {
+      "fixed_lifecycle_BS16": 0,
+      "fixed_lifecycle_BS8": 0,
+      "fixed_lifecycle_BS1": 0
+    },
+    "cases": [
+      {
+        "tokens": 16,
+        "valid": 16,
+        "physical_exact": true,
+        "logical_exact": true
+      },
+      {
+        "tokens": 8,
+        "valid": 7,
+        "physical_exact": true,
+        "logical_exact": true
+      },
+      {
+        "tokens": 1,
+        "valid": 0,
+        "physical_exact": true,
+        "logical_exact": true
+      },
+      {
+        "tokens": 16,
+        "valid": 13,
+        "physical_exact": true,
+        "logical_exact": true
+      },
+      {
+        "tokens": 1,
+        "valid": 1,
+        "physical_exact": true,
+        "logical_exact": true
+      },
+      {
+        "tokens": 8,
+        "valid": 8,
+        "physical_exact": true,
+        "logical_exact": true
+      },
+      {
+        "tokens": 16,
+        "valid": 0,
+        "physical_exact": true,
+        "logical_exact": true
+      },
+      {
+        "tokens": 8,
+        "valid": 2,
+        "physical_exact": true,
+        "logical_exact": true
+      },
+      {
+        "tokens": 8,
+        "repeats": 3,
+        "overflow_exact": true,
+        "fallbacks": 43
+      },
+      {
+        "tokens": 97,
+        "repeats": 1,
+        "overflow_exact": true,
+        "fallbacks": 43
+      }
+    ],
+    "no_reset_between_warmups_and_capture": true,
+    "actual_run_once_AST": true,
+    "shared_storage": true,
+    "routes_unchanged": true,
+    "full_model_test": false,
+    "model_requests_sent": 0,
+    "scope": "Exact statistics and capture branches only; not full model or performance proof"
+  },
+  "formatting": {
+    "pre_commit": "PASS for changed files",
+    "system_hooks": "3 unchanged hooks PASS using installed Python"
+  },
+  "scope": "Community-port CPU tests and bounded NPU graph checks only. Earlier integration model/PD/performance results are separately identified in the report.",
+  "ci_followup": {
+    "files": {
+      "test/registered/unit/disaggregation/test_pd_role_switch.py": "12e326010f7653ed41a90b5c32cfc1183456755e780f40b577ded48a01f46393"
+    },
+    "pd_role_switch_tests": 38,
+    "draft_isolation_tests_repeated": 4,
+    "exit": 0,
+    "npu_initialized": false,
+    "production_code_changed": false,
+    "reason": "Initialize is_draft_worker in the constructor-bypassing PD role-switch test fixture"
+  },
+  "initial_port_revision": "1c2a94228a52d82cc047693d2de50dd60fe84694",
+  "optimization_followup": {
+    "manifest": "optimization.json",
+    "scope": "The top-level files/cpu/npu_graph sections describe the initial port. optimization.json identifies the optimized source snapshot and its follow-up validation."
+  }
+}
