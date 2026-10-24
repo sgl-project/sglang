@@ -112,6 +112,14 @@ class JointThreshold(DllmAlgorithm):
     budget + prompt mask), carried across FDFO rounds via ``dllm_algo_state``.
     """
 
+    config_keys = (
+        "threshold",
+        "edit_threshold",
+        "max_post_edit_steps",
+        "penalty_lambda",
+        "vectorized_decoding",
+    )
+
     def __init__(self, config: DllmConfig):
         super().__init__(config)
         self.threshold = config.algorithm_config.get("threshold", 0.5)

@@ -77,6 +77,33 @@ class Gemma4Renoise(DllmAlgorithm):
     reuse_forward_metadata = True
     supported_attention_backends = ("triton", "fa4")
     capture_input_preparation = True
+    config_keys = (
+        "max_denoising_steps",
+        "sampler_config",
+        "temperature_schedule",
+        "stopping_config",
+        "t_min",
+        "t_max",
+        "confidence_threshold",
+        "stability_threshold",
+        "seed",
+        "use_temperature_table",
+    )
+
+    @classmethod
+    def validate_config(cls, config: dict[str, Any]) -> None:
+        super().validate_config(config)
+        for name, keys in (
+            ("sampler_config", ("entropy_bound",)),
+            ("temperature_schedule", ("t_min", "t_max")),
+            ("stopping_config", ("confidence_threshold", "stability_threshold")),
+        ):
+            section = config.get(name) or {}
+            if not isinstance(section, dict):
+                raise ValueError(f"{name} must be a mapping")
+            cls._validate_config_keys(
+                config=section, supported_keys=keys, prefix=f"{name}."
+            )
 
     @classmethod
     def configure_server_args(cls, server_args: ServerArgs) -> None:
