@@ -134,6 +134,7 @@ class SparseTableBackend:
         self._retired_cached_row_ids: list = []
         # per layer: the table tensors every captured prefill bucket reads
         self._graph_table_bufs: dict = {}
+        self._retired_graph_tables: list = []
 
     def publish_prefill(self, inputs: PrefillInputs):
         inputs.reset_outputs()
@@ -218,21 +219,63 @@ class SparseTableBackend:
             transform(published.phys_blocks, inputs.out_page_indices)
         transform(published.blocks, inputs.out_raw_indices)
 
-    def publish_prefill_graph(
-        self, inputs: PrefillInputs, num_rows: int, *, shared: bool
+    def prefill_graph_table(
+        self, layer_id: int, num_rows: int, device: torch.device
     ) -> tuple:
-        """The candidate source's table over the graph's ``num_rows`` rows. Buckets may
-        share one buffer: graphs replay one at a time, and the shapes, DeepGEMM's
-        schedule included, depend only on the row and block counts."""
+        """The candidate source's table over the graph's ``num_rows`` rows, as views
+        of the layer's buffers that `publish_prefill_graph` writes. Buckets share
+        them, sized by the largest: graphs replay one at a time, and DeepGEMM reads
+        the schedule by pointer, laid out by the row and block counts."""
+        bufs = self._graph_table_bufs.get(layer_id)
+        if bufs is None or bufs[0].shape[0] < num_rows:
+            if bufs is not None:
+                # Graphs captured on the smaller buffers keep reading them.
+                self._retired_graph_tables.append(bufs)
+            blocks = torch.zeros(
+                (num_rows, self.topk_blocks), dtype=torch.int32, device=device
+            )
+            zeros = torch.zeros(num_rows, dtype=torch.int32, device=device)
+            # Sized by DeepGEMM itself on an empty table; int8 is the packed FP4
+            # of quantize_index_q.
+            schedule = build_sparse_indexer_schedule(
+                blocks,
+                zeros,
+                zeros[:, None],
+                CANDIDATE_BLOCK_SIZE,
+                torch.int8,
+                torch.arange(num_rows, dtype=torch.int32, device=device),
+            )
+            bufs = self._graph_table_bufs[layer_id] = (
+                blocks,
+                schedule,
+                torch.empty_like(blocks),
+                torch.empty_like(zeros),
+            )
+        blocks, schedule, phys_blocks, valid_lens = bufs
+        return (
+            blocks[:num_rows],
+            schedule,
+            phys_blocks[:num_rows],
+            valid_lens[:num_rows],
+        )
+
+    def publish_prefill_graph(self, inputs: PrefillInputs, table: tuple) -> None:
+        """Writes the candidate source's table into ``table`` (from
+        `prefill_graph_table`), its rows past the live ones repeating the last."""
         published = self.publish_prefill(inputs)
         assert published is not None, "candidate source published no sparse table"
+        blocks, schedule, phys_blocks, valid_lens = table
         live = published.blocks.shape[0]
-        rows = torch.arange(num_rows, device=published.blocks.device).clamp_max(
-            live - 1
+        rows = torch.arange(blocks.shape[0], device=blocks.device).clamp_max(live - 1)
+        out = published.gather_rows(rows)
+        assert out.schedule.numel() <= schedule.numel(), (
+            out.schedule.numel(),
+            schedule.numel(),
         )
-        table = published.gather_rows(rows)
-        out = (table.blocks, table.schedule, table.phys_blocks, table.valid_lens)
-        return self._shared_graph_table(inputs.layer_id, out) if shared else out
+        blocks.copy_(out.blocks)
+        schedule[: out.schedule.numel()].copy_(out.schedule)
+        phys_blocks.copy_(out.phys_blocks)
+        valid_lens.copy_(out.valid_lens)
 
     def bind_prefill_graph_table(self, tensors: tuple) -> _SparseTable:
         """Capture time: the table the captured consumers read, over the tensors the
@@ -247,17 +290,6 @@ class SparseTableBackend:
             valid_lens=valid_lens,
             ready=ready,
         )
-
-    def _shared_graph_table(self, layer_id: int, tensors: tuple) -> tuple:
-        bufs = self._graph_table_bufs.setdefault(layer_id, [None] * len(tensors))
-        views = []
-        for i, t in enumerate(tensors):
-            buf = bufs[i]
-            if buf is None or buf.dtype != t.dtype or buf.numel() < t.numel():
-                # Graphs captured on a smaller buffer keep it alive themselves.
-                buf = bufs[i] = torch.empty(t.numel(), dtype=t.dtype, device=t.device)
-            views.append(buf[: t.numel()].view(t.shape).copy_(t))
-        return tuple(views)
 
     def publish_decode(self, inputs: DecodeInputs):
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
