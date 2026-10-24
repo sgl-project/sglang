@@ -169,6 +169,7 @@ def build_fixture(
             cache_params=mamba2_cache_params,
             mamba_layer_ids=cfg.non_full_layer_ids,
             enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
+            enable_linear_replayssm=cfg.enable_linear_replayssm,
             speculative_num_draft_tokens=3,
         )
     else:
