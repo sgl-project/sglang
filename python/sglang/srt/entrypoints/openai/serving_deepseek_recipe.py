@@ -7,15 +7,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
 
-from sglang.srt.entrypoints.openai.chat_encoding_adapters import select_new_output_ids
+from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+    select_new_output_ids,
+    token_output_sse_chunks,
+)
 from sglang.srt.entrypoints.openai.protocol import (
-    ChatCompletionResponseStreamChoice,
-    ChatCompletionStreamResponse,
-    DeltaMessage,
     FunctionResponse,
     ToolCall,
 )
-from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.deepseek_recipe_output import (
@@ -232,69 +231,37 @@ class DeepSeekRecipeChatEncodingAdapter:
                 keep_matched_stop=request.no_stop_trim,
             )
 
-        chunk_fields = dict(
+        history_tool_calls_cnt = self._hooks.history_tool_calls_count(request)
+        if delta.tool_calls:
+            has_tool_calls[index] = True
+        return token_output_sse_chunks(
             chunk_id=content["meta_info"]["id"],
             created=created,
             model=request.model,
             index=index,
             usage=usage,
+            logprobs=choice_logprobs,
+            reasoning=delta.reasoning,
+            content=delta.content,
+            tool_calls=[
+                ToolCall(
+                    # The first piece of a call names it; later pieces extend its
+                    # arguments.
+                    id=(
+                        self._tool_call_id(
+                            piece.index, piece.name, history_tool_calls_cnt
+                        )
+                        if piece.name is not None
+                        else None
+                    ),
+                    index=piece.index,
+                    function=FunctionResponse(
+                        name=piece.name, arguments=piece.arguments
+                    ),
+                )
+                for piece in delta.tool_calls
+            ],
         )
-        chunks = []
-        remaining_logprobs = choice_logprobs
-        if delta.reasoning:
-            chunks.append(
-                build_sse_content(
-                    reasoning_content=delta.reasoning,
-                    logprobs=remaining_logprobs,
-                    **chunk_fields,
-                )
-            )
-            remaining_logprobs = None
-        if delta.content:
-            chunks.append(
-                build_sse_content(
-                    content=delta.content, logprobs=remaining_logprobs, **chunk_fields
-                )
-            )
-            remaining_logprobs = None
-        history_tool_calls_cnt = self._hooks.history_tool_calls_count(request)
-        for piece in delta.tool_calls:
-            has_tool_calls[index] = True
-            # The first piece of a call names it; later pieces extend its arguments.
-            call_id = (
-                self._tool_call_id(piece.index, piece.name, history_tool_calls_cnt)
-                if piece.name is not None
-                else None
-            )
-            tool_call_chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=created,
-                choices=[
-                    ChatCompletionResponseStreamChoice(
-                        index=index,
-                        delta=DeltaMessage(
-                            tool_calls=[
-                                ToolCall(
-                                    id=call_id,
-                                    index=piece.index,
-                                    function=FunctionResponse(
-                                        name=piece.name, arguments=piece.arguments
-                                    ),
-                                )
-                            ]
-                        ),
-                        finish_reason=None,
-                    )
-                ],
-                model=request.model,
-                usage=usage,
-            )
-            chunks.append(f"data: {tool_call_chunk.model_dump_json()}\n\n")
-        if remaining_logprobs is not None:
-            chunks.append(
-                build_sse_content(logprobs=remaining_logprobs, **chunk_fields)
-            )
-        return chunks
 
     def parse_responses_output(
         self,

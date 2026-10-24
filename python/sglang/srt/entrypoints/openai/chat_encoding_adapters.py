@@ -124,6 +124,59 @@ def select_new_output_ids(
     return output_ids
 
 
+def token_output_sse_chunks(
+    *,
+    chunk_id: str,
+    created: int,
+    model: str,
+    index: int,
+    usage: Optional[dict[str, Any]],
+    logprobs: Optional[dict],
+    reasoning: str,
+    content: str,
+    tool_calls: list[ToolCall],
+) -> list[str]:
+    """One streamed step of a token-level output parser: a reasoning chunk, a content
+    chunk, then one chunk per tool call; the step's logprobs ride on the first."""
+    from sglang.srt.entrypoints.openai.protocol import (
+        ChatCompletionResponseStreamChoice,
+        ChatCompletionStreamResponse,
+        DeltaMessage,
+    )
+    from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
+
+    fields = dict(
+        chunk_id=chunk_id, created=created, model=model, index=index, usage=usage
+    )
+    chunks = []
+    if reasoning:
+        chunks.append(
+            build_sse_content(reasoning_content=reasoning, logprobs=logprobs, **fields)
+        )
+        logprobs = None
+    if content:
+        chunks.append(build_sse_content(content=content, logprobs=logprobs, **fields))
+        logprobs = None
+    for tool_call in tool_calls:
+        chunk = ChatCompletionStreamResponse(
+            id=chunk_id,
+            created=created,
+            choices=[
+                ChatCompletionResponseStreamChoice(
+                    index=index,
+                    delta=DeltaMessage(tool_calls=[tool_call]),
+                    finish_reason=None,
+                )
+            ],
+            model=model,
+            usage=usage,
+        )
+        chunks.append(f"data: {chunk.model_dump_json()}\n\n")
+    if logprobs is not None:
+        chunks.append(build_sse_content(logprobs=logprobs, **fields))
+    return chunks
+
+
 class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
     """Everything a builder may read; a builder takes only what its encoding needs.
 
