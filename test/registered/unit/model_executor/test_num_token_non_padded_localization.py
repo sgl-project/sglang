@@ -577,7 +577,7 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
                     ),
                     run=Mock(return_value=(output, None, [])),
                     _run_layers_eagerly=Mock(return_value=(output, None, [])),
-                    _bridge_outputs=lambda rows, outputs: tuple(outputs),
+                    _write_bridge=Mock(),
                 )
                 backend = SimpleNamespace(
                     forward_metadata=SimpleNamespace(late_layer_tail=tail),
@@ -597,18 +597,21 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
                     ),
                     get_flags().dp.override(capturing_prefill_graph=False),
                 ):
-                    outputs = replay_tail._tail_layers_in_prefill_graph(
+                    replay_tail._tail_layers_in_prefill_graph(
                         tail_layers,
                         lambda tensors: tensors,
                         False,
                         4,
                         None,
                         False,
+                        (False, False),
+                        None,
                         [torch.zeros(4, 1)],
                         torch.arange(4),
                         batch.input_ids,
                         batch.input_ids,
                     )
+                outputs = tail_layers._write_bridge.call_args.args[3]
                 self.assertIs(outputs[0], output)
                 self.assertEqual(tail_layers.run.call_count, expected)
                 self.assertEqual(
