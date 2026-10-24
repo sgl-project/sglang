@@ -476,16 +476,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _forward_extend_uses_native_fp4(self, forward_batch: ForwardBatch) -> bool:
         """Whether this extend-family call must consume physical NVFP4.
 
-        A hybrid backend can route TARGET_VERIFY to its decode child. That
-        child's normal extend role belongs to FlashInfer, so its prefill flag
-        is false even though this particular verify call must use the native
-        GenMHA decode layout.
+        A hybrid backend can route TARGET_VERIFY and the draft-extend-v2
+        (spec-v1 draft-prefill) role to its decode child. That child's normal
+        extend role belongs to FlashInfer, so its prefill flag is false even
+        though these batches must use the native GenMHA decode layout. The
+        sibling batch-metadata dispatch already groups both modes as decode
+        (``is_decode_mode``); this gate must match, otherwise draft-prefill
+        batches fall into the BF16 dequant workspace with a ``None``
+        ``extend_prefix_lens_cpu`` (see #36010).
         """
         return self.uses_trtllm_gen_native_fp4 and (
             self.prefill_uses_native_fp4
             or (
                 self.decode_uses_native_fp4
-                and forward_batch.forward_mode.is_target_verify()
+                and (
+                    forward_batch.forward_mode.is_target_verify()
+                    or forward_batch.forward_mode.is_draft_extend_v2()
+                )
             )
         )
 
