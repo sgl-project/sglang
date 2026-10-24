@@ -148,6 +148,39 @@ def parse_arguments(
         return json_value, False
 
 
+_ARG_VALUE_HEAD_REGEX = re.compile(r"(?:\\n|\s)*<arg_value>")
+
+
+# Same pairs as `<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>`
+# findall (DOTALL), but linear: that regex rescans from every unpaired `<arg_key>`.
+def _find_arg_pairs(text: str) -> List[Tuple[str, str]]:
+    # A key ends at the first `</arg_key>` that is followed by a value opener.
+    heads = []
+    close = text.find("</arg_key>")
+    while close != -1:
+        head = _ARG_VALUE_HEAD_REGEX.match(text, close + len("</arg_key>"))
+        if head is not None:
+            heads.append((close, head.end()))
+        close = text.find("</arg_key>", close + 1)
+
+    pairs = []
+    head_idx = 0
+    start = text.find("<arg_key>")
+    while start != -1:
+        key_start = start + len("<arg_key>")
+        while head_idx < len(heads) and heads[head_idx][0] < key_start:
+            head_idx += 1
+        if head_idx == len(heads):
+            break
+        key_end, value_start = heads[head_idx]
+        value_end = text.find("</arg_value>", value_start)
+        if value_end == -1:
+            break
+        pairs.append((text[key_start:key_end], text[value_start:value_end]))
+        start = text.find("<arg_key>", value_end + len("</arg_value>"))
+    return pairs
+
+
 class Glm4MoeDetector(BaseFormatDetector):
     """
     Detector for GLM-4.5 and GLM-4.6 models.
@@ -173,13 +206,8 @@ class Glm4MoeDetector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
-        self.func_call_regex = r"<tool_call>.*?</tool_call>"
         self.func_detail_regex = re.compile(
             r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
-        )
-        self.func_arg_regex = re.compile(
-            r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
-            re.DOTALL,
         )
         self._last_arguments = ""
         self.current_tool_id = -1
@@ -199,6 +227,18 @@ class Glm4MoeDetector(BaseFormatDetector):
             None  # Cache the value type for consistency
         )
 
+    def _iter_tool_call_blocks(self, text: str):
+        # Linear scan on purpose: a `<tool_call>.*?</tool_call>` findall rescans
+        # to the end from every opening tag when the end tag never arrives.
+        start = text.find(self.bot_token)
+        while start != -1:
+            end = text.find(self.eot_token, start + len(self.bot_token))
+            if end == -1:
+                return
+            end += len(self.eot_token)
+            yield text[start:end]
+            start = text.find(self.bot_token, end)
+
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
         return self.bot_token in text
@@ -215,7 +255,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
-        match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
+        match_result_list = list(self._iter_tool_call_blocks(text))
         calls = []
         try:
             for match_result in match_result_list:
@@ -225,7 +265,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                     continue
                 func_name = func_detail.group(1) if func_detail.group(1) else ""
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
-                pairs = self.func_arg_regex.findall(func_args)
+                pairs = _find_arg_pairs(func_args)
 
                 # Parse arguments using shared method
                 arguments = self._parse_argument_pairs(pairs, func_name, tools)
@@ -481,7 +521,11 @@ class Glm4MoeDetector(BaseFormatDetector):
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
-            partial_match = self._STREAMING_PARTIAL_PATTERN.search(current_text)
+            # Anchored at the first tag: if a later tag could match, so does the
+            # first, and `search` would retry the failing scan from every tag.
+            partial_match = self._STREAMING_PARTIAL_PATTERN.match(
+                current_text, current_text.find(self.bot_token)
+            )
             if partial_match:
                 func_name_raw = partial_match.group(1)
                 func_args_raw = partial_match.group(2)
@@ -592,7 +636,7 @@ class Glm4MoeDetector(BaseFormatDetector):
                             )
 
                         try:
-                            pairs = self.func_arg_regex.findall(func_args_raw)
+                            pairs = _find_arg_pairs(func_args_raw)
                             if pairs:
                                 arguments = self._parse_argument_pairs(
                                     pairs, func_name, tools
