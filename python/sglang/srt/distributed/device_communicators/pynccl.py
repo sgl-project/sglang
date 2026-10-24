@@ -414,6 +414,8 @@ class PyNcclCommunicator:
         if enable is None:
             # guess a default value when not specified
             enable = self.available
+        elif enable and not self.available:
+            raise RuntimeError("Cannot enable an unavailable PyNccl communicator.")
 
         old_disable = self.disabled
         self.disabled = not enable

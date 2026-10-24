@@ -132,6 +132,10 @@ class PageInterleaveKVPoolMixin:
         self.kv_gather_comm: PyNcclCommunicator = PyNcclCommunicator(
             group=shard_group.cpu_group, device=shard_group.device
         )
+        if not self.kv_gather_comm.available:
+            raise RuntimeError(
+                "Page-interleave KV cache requires an available PyNccl communicator."
+            )
         self.kv_gather_stream = self.device_module.Stream()
 
         # Scratch: [prefix | chunk | trash page], double-buffered.
