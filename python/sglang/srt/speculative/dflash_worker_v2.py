@@ -425,6 +425,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 nccl_port=nccl_port,
                 target_model_config=target_worker.model_runner.model_config,
                 algo_label="DFLASH",
+                random_seed=target_worker.random_seed,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
@@ -2327,6 +2328,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
         pp_proxy_tensors=None,
+        _draft_only=False,
     ) -> GenerationBatchResult:
         self._validate_phase1_sampling_support(batch)
 
@@ -2413,6 +2415,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
 
+        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+
+        pp_relayed_block = None
+        if isinstance(batch.spec_info, PPSpecRelayInput):
+            pp_relayed_block = batch.spec_info.tokens.to(
+                device=self.device, dtype=torch.int64
+            )
+            batch.spec_info = make_draft_input_v2(
+                bonus_tokens=pp_relayed_block[:, 0].contiguous(),
+                new_seq_lens=batch.seq_lens,
+            )
         draft_input = batch.spec_info
         if not isinstance(draft_input, DFlashDraftInputV2):
             raise RuntimeError(
@@ -2624,179 +2637,203 @@ class DFlashWorkerV2(BaseSpecWorker):
                     seq_lens_cpu[i] = req.kv.kv_allocated_len
                 draft_seq_lens_sum = int(seq_lens_cpu.sum())
 
-        forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            batch_size=bs,
-            input_ids=block_ids.flatten(),
-            req_pool_indices=batch.req_pool_indices,
-            seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
-            seq_lens_sum=draft_seq_lens_sum,
-            seq_lens_cpu=seq_lens_cpu,
-            positions=positions,
-            input_embeds=input_embeds,
-            spec_algorithm=SpeculativeAlgorithm.DFLASH,
-            spec_info=self._draft_block_spec_info,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            num_token_non_padded=(
-                torch.full((), bs * block_size, dtype=torch.int32, device=device)
-                if enable_num_token_non_padded()
-                else None
-            ),
-            global_num_token_non_padded_cpu=bs * block_size,
+        # Under PP the previous round's tail draft already drafted the relayed
+        # block from this same state, so verify it without drafting it again.
+        # Selector heads still draft: their accept reads the draft's samples.
+        reuse_relayed = (
+            pp_relayed_block is not None
+            and self.selector is None
+            and self.lilicorr is None
         )
-        # The draft block writes the whole window. A compact draft reads its
-        # own `req_to_token` rows over its own lengths.
-        draft_translator = self.draft_model_runner.kv_index_translator
-        draft_plan = (
-            kv_loc_plan.reads_from(
-                draft_translator,
-                seq_lens=draft_seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                read_extent=block_size,
-            )
-            if self.use_compact_draft_cache
-            else kv_loc_plan
-        )
-        draft_plan.bind(forward_batch, draft_translator)
-
-        if self.selector is not None or self.lilicorr is not None:
-            self._selector_sample = None
-            if self._draft_sampler is not None:
-                # Consumed by the in-graph sample; must be staged before the replay.
-                self._draft_sampler.stage_sampling_params(
-                    bs=bs, sampling_info=batch.sampling_info
-                )
-
-        with (
-            torch.inference_mode(),
-            draft_tp_context(self.draft_owns_attention),
-        ):
-            draft_out = self.draft_model_runner.forward(forward_batch)
-        draft_logits_output = draft_out.logits_output
-
-        if (
-            self._is_domino
-            and self._draft_sampler is not None
-            and draft_out.can_run_graph
-        ):
-            draft_next = self._draft_sampler.out[
-                : bs * (int(self.block_size) - 1)
-            ].view(bs, int(self.block_size) - 1)
-        elif self._is_domino:
-            draft_hidden = draft_logits_output.hidden_states
-            if draft_hidden is None:
-                raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            prefix_gru = self.draft_model.prefix_gru
-            embed_proj = self.draft_model.embed_proj
-            if prefix_gru is None or embed_proj is None:
-                raise RuntimeError("DFLASH Domino projector modules are unavailable.")
-            tp_group = get_parallel().tp_group
-            shard = getattr(lm_head, "shard_indices", None)
-            draft_next = domino_greedy_rollout(
-                draft_hidden=draft_hidden,
-                bonus_tokens=block_ids[:, 0],
-                target_embedding=embed_module,
-                lm_head_weight=lm_head.weight,
-                prefix_gru=prefix_gru,
-                embed_proj=embed_proj,
-                vocab_size=int(self.model_runner.model_config.vocab_size),
-                shift_label=bool(self.draft_model.shift_label),
-                candidate_pool_size=self.domino_candidate_pool_size,
-                tp_group=tp_group,
-                lm_head_org_vocab_start=(
-                    int(shard.org_vocab_start_index) if shard is not None else 0
-                ),
-                lm_head_num_org=(
-                    int(shard.num_org_elements) if shard is not None else None
-                ),
-                lm_head_num_org_padded=(
-                    int(shard.num_org_elements_padded) if shard is not None else None
-                ),
-                in_cuda_graph=False,
-            )
-        elif self._draft_sampler is not None and draft_out.can_run_graph:
-            draft_next = self._draft_sampler.out[
-                : bs * (int(self.block_size) - 1)
-            ].view(bs, int(self.block_size) - 1)
-            if (
-                self.selector is not None
-                and not _is_all_greedy(batch.sampling_info)
-                and self._selector_sampling_enabled
-            ):
-                self._selector_sample = (
-                    self._draft_sampler.candidate_out[:bs],
-                    self._draft_sampler.q_out[:bs],
-                )
-            elif (
-                self.lilicorr is not None
-                and self._lilicorr_sampling_enabled
-                and not _is_all_greedy(batch.sampling_info)
-            ):
-                self._selector_sample = (
-                    self._draft_sampler.candidate_out[:bs],
-                    self._draft_sampler.q_out[:bs],
-                )
-        elif self.selector is not None:
-            with draft_tp_context(self.draft_owns_attention):
-                draft_next = self._propose_selector_block(
-                    draft_logits_output=draft_logits_output,
-                    bs=bs,
-                    lm_head=lm_head,
-                    anchor_token_ids=block_ids[:, 0],
-                    sampling_info=batch.sampling_info,
-                )
-        elif self.lilicorr is not None:
-            if (
-                self._lilicorr_sampling_enabled
-                and not self._warned_lilicorr_eager
-                and get_parallel().tp_rank == 0
-            ):
-                logger.warning(
-                    "LiLiCorr sampled draft ran the eager head on a decode step "
-                    "(draft cuda graph unavailable for batch size %d; captured "
-                    "buckets do not cover it, or graphs are disabled). Acceptance is "
-                    "unaffected but expect a large throughput regression, and do not "
-                    "compare tokens/s from this run against a folded one.",
-                    bs,
-                )
-                self._warned_lilicorr_eager = True
-            draft_hidden = draft_logits_output.hidden_states
-            if draft_hidden is None:
-                raise RuntimeError("DFLASH draft model returned no hidden states.")
-            with draft_tp_context(self.draft_owns_attention):
-                draft_next, lilicorr_candidate_ids, lilicorr_q_rows = (
-                    propose_lilicorr_block(
-                        head=self.lilicorr,
-                        draft_hidden=draft_hidden.view(bs, int(self.block_size), -1),
-                        lm_head=lm_head,
-                        embed_tokens=target_input_embeddings(
-                            self.target_worker.model_runner.model
-                        ),
-                        anchor=self._lilicorr_anchor,
-                        sampling_info=batch.sampling_info,
-                        sampling_enabled=self._lilicorr_sampling_enabled,
-                    )
-                )
-            if lilicorr_q_rows is not None and not _is_all_greedy(batch.sampling_info):
-                self._selector_sample = (lilicorr_candidate_ids, lilicorr_q_rows)
+        if reuse_relayed:
+            draft_next = pp_relayed_block[:, 1:]
         else:
-            draft_hidden = draft_logits_output.hidden_states
-            if draft_hidden is None:
-                raise RuntimeError("DFLASH draft model returned no hidden states.")
-            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            with draft_tp_context(self.draft_owns_attention):
-                draft_next = self._greedy_sample_from_vocab_parallel_head(
-                    hidden_states=draft_hidden[:, 1:, :].reshape(
-                        -1, draft_hidden.shape[-1]
+            forward_batch = ForwardBatch(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=bs,
+                input_ids=block_ids.flatten(),
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=draft_seq_lens,
+                out_cache_loc=verify_out_cache_loc,
+                seq_lens_sum=draft_seq_lens_sum,
+                seq_lens_cpu=seq_lens_cpu,
+                positions=positions,
+                input_embeds=input_embeds,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                spec_info=self._draft_block_spec_info,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                num_token_non_padded=(
+                    torch.full((), bs * block_size, dtype=torch.int32, device=device)
+                    if enable_num_token_non_padded()
+                    else None
+                ),
+                global_num_token_non_padded_cpu=bs * block_size,
+            )
+            # The draft block writes the whole window. A compact draft reads its
+            # own `req_to_token` rows over its own lengths.
+            draft_translator = self.draft_model_runner.kv_index_translator
+            draft_plan = (
+                kv_loc_plan.reads_from(
+                    draft_translator,
+                    seq_lens=draft_seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    read_extent=block_size,
+                )
+                if self.use_compact_draft_cache
+                else kv_loc_plan
+            )
+            draft_plan.bind(forward_batch, draft_translator)
+
+            if self.selector is not None or self.lilicorr is not None:
+                self._selector_sample = None
+                if self._draft_sampler is not None:
+                    # Consumed by the in-graph sample; must be staged before the replay.
+                    self._draft_sampler.stage_sampling_params(
+                        bs=bs, sampling_info=batch.sampling_info
+                    )
+
+            with (
+                torch.inference_mode(),
+                draft_tp_context(self.draft_owns_attention),
+            ):
+                draft_out = self.draft_model_runner.forward(forward_batch)
+            draft_logits_output = draft_out.logits_output
+
+            if (
+                self._is_domino
+                and self._draft_sampler is not None
+                and draft_out.can_run_graph
+            ):
+                draft_next = self._draft_sampler.out[
+                    : bs * (int(self.block_size) - 1)
+                ].view(bs, int(self.block_size) - 1)
+            elif self._is_domino:
+                draft_hidden = draft_logits_output.hidden_states
+                if draft_hidden is None:
+                    raise RuntimeError("DFLASH draft model returned no hidden states.")
+                draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+                prefix_gru = self.draft_model.prefix_gru
+                embed_proj = self.draft_model.embed_proj
+                if prefix_gru is None or embed_proj is None:
+                    raise RuntimeError(
+                        "DFLASH Domino projector modules are unavailable."
+                    )
+                tp_group = get_parallel().tp_group
+                shard = getattr(lm_head, "shard_indices", None)
+                draft_next = domino_greedy_rollout(
+                    draft_hidden=draft_hidden,
+                    bonus_tokens=block_ids[:, 0],
+                    target_embedding=embed_module,
+                    lm_head_weight=lm_head.weight,
+                    prefix_gru=prefix_gru,
+                    embed_proj=embed_proj,
+                    vocab_size=int(self.model_runner.model_config.vocab_size),
+                    shift_label=bool(self.draft_model.shift_label),
+                    candidate_pool_size=self.domino_candidate_pool_size,
+                    tp_group=tp_group,
+                    lm_head_org_vocab_start=(
+                        int(shard.org_vocab_start_index) if shard is not None else 0
                     ),
-                    lm_head=lm_head,
-                ).view(bs, int(self.block_size) - 1)
+                    lm_head_num_org=(
+                        int(shard.num_org_elements) if shard is not None else None
+                    ),
+                    lm_head_num_org_padded=(
+                        int(shard.num_org_elements_padded)
+                        if shard is not None
+                        else None
+                    ),
+                    in_cuda_graph=False,
+                )
+            elif self._draft_sampler is not None and draft_out.can_run_graph:
+                draft_next = self._draft_sampler.out[
+                    : bs * (int(self.block_size) - 1)
+                ].view(bs, int(self.block_size) - 1)
+                if (
+                    self.selector is not None
+                    and not _is_all_greedy(batch.sampling_info)
+                    and self._selector_sampling_enabled
+                ):
+                    self._selector_sample = (
+                        self._draft_sampler.candidate_out[:bs],
+                        self._draft_sampler.q_out[:bs],
+                    )
+                elif (
+                    self.lilicorr is not None
+                    and self._lilicorr_sampling_enabled
+                    and not _is_all_greedy(batch.sampling_info)
+                ):
+                    self._selector_sample = (
+                        self._draft_sampler.candidate_out[:bs],
+                        self._draft_sampler.q_out[:bs],
+                    )
+            elif self.selector is not None:
+                with draft_tp_context(self.draft_owns_attention):
+                    draft_next = self._propose_selector_block(
+                        draft_logits_output=draft_logits_output,
+                        bs=bs,
+                        lm_head=lm_head,
+                        anchor_token_ids=block_ids[:, 0],
+                        sampling_info=batch.sampling_info,
+                    )
+            elif self.lilicorr is not None:
+                if (
+                    self._lilicorr_sampling_enabled
+                    and not self._warned_lilicorr_eager
+                    and get_parallel().tp_rank == 0
+                ):
+                    logger.warning(
+                        "LiLiCorr sampled draft ran the eager head on a decode step "
+                        "(draft cuda graph unavailable for batch size %d; captured "
+                        "buckets do not cover it, or graphs are disabled). Acceptance is "
+                        "unaffected but expect a large throughput regression, and do not "
+                        "compare tokens/s from this run against a folded one.",
+                        bs,
+                    )
+                    self._warned_lilicorr_eager = True
+                draft_hidden = draft_logits_output.hidden_states
+                if draft_hidden is None:
+                    raise RuntimeError("DFLASH draft model returned no hidden states.")
+                with draft_tp_context(self.draft_owns_attention):
+                    draft_next, lilicorr_candidate_ids, lilicorr_q_rows = (
+                        propose_lilicorr_block(
+                            head=self.lilicorr,
+                            draft_hidden=draft_hidden.view(
+                                bs, int(self.block_size), -1
+                            ),
+                            lm_head=lm_head,
+                            embed_tokens=target_input_embeddings(
+                                self.target_worker.model_runner.model
+                            ),
+                            anchor=self._lilicorr_anchor,
+                            sampling_info=batch.sampling_info,
+                            sampling_enabled=self._lilicorr_sampling_enabled,
+                        )
+                    )
+                if lilicorr_q_rows is not None and not _is_all_greedy(
+                    batch.sampling_info
+                ):
+                    self._selector_sample = (lilicorr_candidate_ids, lilicorr_q_rows)
+            else:
+                draft_hidden = draft_logits_output.hidden_states
+                if draft_hidden is None:
+                    raise RuntimeError("DFLASH draft model returned no hidden states.")
+                draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+                with draft_tp_context(self.draft_owns_attention):
+                    draft_next = self._greedy_sample_from_vocab_parallel_head(
+                        hidden_states=draft_hidden[:, 1:, :].reshape(
+                            -1, draft_hidden.shape[-1]
+                        ),
+                        lm_head=lm_head,
+                    ).view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+        if _draft_only:
+            return draft_tokens.clone()
+        if pp_relayed_block is not None and not reuse_relayed:
+            # Verify the block the earlier stages already ran.
+            draft_tokens[:, 1:].copy_(pp_relayed_block[:, 1:])
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -2860,6 +2897,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
         )
@@ -2982,7 +3020,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
         )
 
-        return GenerationBatchResult(
+        # PP tail draft: earlier stages need the next block before their
+        # half of the next verify, so draft it now from the state the
+        # next round would start from.
+        pp_next_chain = (
+            self._pp_tail_draft(batch, next_draft_input)
+            if get_parallel().pp_size > 1
+            else None
+        )
+        result = GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
             accept_lens=commit_lens,
@@ -2995,3 +3041,42 @@ class DFlashWorkerV2(BaseSpecWorker):
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
         )
+        result.next_verify_chain = pp_next_chain
+        return result
+
+    def _pp_tail_draft(self, batch, next_draft_input) -> torch.Tensor:
+        """Draft the next round's block from the post-accept state.
+
+        Under PP the earlier stages verify the next block before this stage sees
+        it again, so the block is drafted at the end of this round instead of the
+        start of the next one. Returns the flattened ``[bs * block_size]`` block,
+        column 0 the bonus token.
+        """
+        saved = (
+            batch.spec_info,
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            batch.seq_lens_sum,
+            batch.out_cache_loc,
+            batch.input_ids,
+            batch.forward_mode,
+        )
+        try:
+            batch.spec_info = next_draft_input
+            batch.seq_lens = next_draft_input.new_seq_lens.to(saved[1].dtype)
+            batch.seq_lens_cpu = batch.seq_lens.to("cpu")
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            batch.forward_mode = ForwardMode.DECODE
+            batch.input_ids = None
+            tokens = self.forward_batch_generation(batch, _draft_only=True)
+        finally:
+            (
+                batch.spec_info,
+                batch.seq_lens,
+                batch.seq_lens_cpu,
+                batch.seq_lens_sum,
+                batch.out_cache_loc,
+                batch.input_ids,
+                batch.forward_mode,
+            ) = saved
+        return tokens.reshape(-1)

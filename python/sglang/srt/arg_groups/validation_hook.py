@@ -131,13 +131,17 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
         assert (
             cfg.speculative_algorithm.upper() == "EAGLE"
             and not cfg.enable_multi_layer_eagle
+        ) or (
+            cfg.speculative_algorithm.upper() == "DFLASH"
+            and envs.SGLANG_ENABLE_PP_SPEC.get()
         ), (
             "Pipeline parallelism currently only supports EAGLE "
-            "(non-multi-layer) speculative decoding"
+            "(non-multi-layer) speculative decoding, or DFLASH with "
+            "SGLANG_ENABLE_PP_SPEC=1"
         )
         if envs.SGLANG_ENABLE_PP_SPEC.get():
-            # The aggregate relay carries an EAGLE-shaped tree and only
-            # EAGLEWorkerV2 tail-drafts. PD prefill relays topk_p /
+            # The aggregate relay carries the drafted block, which
+            # EAGLEWorkerV2 and DFlashWorkerV2 tail-draft. PD prefill relays topk_p /
             # topk_index / hidden states through RelayPayload; the gated
             # flow replaces that relay with its own and does not carry
             # those fields.

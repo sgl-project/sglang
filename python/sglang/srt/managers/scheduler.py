@@ -4729,7 +4729,14 @@ class Scheduler(
                 # the rebuild below swaps it for this round's verify input, so
                 # hold on to it and put it back once the forward is done.
                 relay_input = batch.spec_info if is_verify_round else None
-                if is_verify_round:
+                if is_verify_round and batch.spec_algorithm.is_dflash_family():
+                    # DFLASH verifies the relayed block directly; label its
+                    # rows for the live composition.
+                    live_rids = [req.rid for req in batch.reqs]
+                    relay_rids = getattr(batch.spec_info, "rids", None)
+                    if relay_rids is not None and relay_rids != live_rids:
+                        batch.spec_info = batch.spec_info.reindex(live_rids)
+                elif is_verify_round:
                     # PP+spec decode: every stage rebuilds the same verify
                     # input from relayed per-req state (draft lives on the
                     # last stage only).
@@ -4740,7 +4747,17 @@ class Scheduler(
                     # live on the last stage. The plain tp_worker path already
                     # returns pp_hidden_states_proxy_tensors for relay.
                     resolve_forward_inputs(batch, self.future_map)
-                    if is_verify_round:
+                    if is_verify_round and batch.spec_algorithm.is_dflash_family():
+                        from sglang.srt.speculative.dflash_pp import (
+                            run_relayed_verify,
+                        )
+
+                        with self._forward_isolation(batch, overlap=False):
+                            batch_result, verify_out_cache_loc = run_relayed_verify(
+                                batch, self.tp_worker, pp_proxy_tensors
+                            )
+                        batch_result.spec_verify_out_cache_loc = verify_out_cache_loc
+                    elif is_verify_round:
                         from sglang.srt.speculative.eagle_utils import (
                             eagle_prepare_for_verify,
                         )

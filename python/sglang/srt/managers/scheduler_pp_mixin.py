@@ -808,10 +808,11 @@ class SchedulerPPMixin:
                 # Tail-drafted tree for the next verify round (root = bonus),
                 # with the topology its tokens were arranged by.
                 tensor_dict["spec_next_chain"] = result.next_verify_chain
-                tensor_dict["spec_next_parents"] = result.next_verify_parent_list
-                tensor_dict["spec_next_top_scores"] = (
-                    result.next_verify_top_scores_index
-                )
+                if result.next_verify_parent_list is not None:
+                    tensor_dict["spec_next_parents"] = result.next_verify_parent_list
+                    tensor_dict["spec_next_top_scores"] = (
+                        result.next_verify_top_scores_index
+                    )
 
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
@@ -819,6 +820,7 @@ class SchedulerPPMixin:
         if (
             draft_input is not None
             and not batch.spec_algorithm.is_dspark()
+            and not batch.spec_algorithm.is_dflash_family()
             and draft_input.topk_p is not None
         ):
             tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()

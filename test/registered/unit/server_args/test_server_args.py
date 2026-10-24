@@ -2943,6 +2943,25 @@ class TestPipelineParallelCompat(CustomTestCase):
             with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
                 check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE"))
 
+    def test_dflash_requires_pp_spec_env_gate(self):
+        with self.assertRaisesRegex(
+            AssertionError, "DFLASH with SGLANG_ENABLE_PP_SPEC"
+        ):
+            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DFLASH"))
+
+    def test_dflash_pp_spec_env_gate_allows_aggregate(self):
+        cfg = self._cfg(
+            speculative_algorithm="DFLASH",
+            disaggregation_mode="null",
+            speculative_adaptive=False,
+            attn_dp_size=1,
+            ep_join_mode=None,
+        )
+        with patch.object(
+            validation_hook.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True
+        ):
+            check_pipeline_parallel_compat(cfg)
+
     def test_nextn_resolves_to_eagle_and_is_allowed(self):
         """`--speculative-algorithm NEXTN` has collapsed to EAGLE by the time the
         validation hook runs, so the check only ever sees the resolved name."""
