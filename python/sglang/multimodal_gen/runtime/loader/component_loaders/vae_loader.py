@@ -146,8 +146,7 @@ def _should_use_channels_last_3d(
     ):
         return False
 
-    override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)
-    if override is not None and override.strip().lower() != "auto":
+    if _channels_last_3d_overridden():
         return get_bool_env_var(VAE_CHANNELS_LAST_3D_ENV)
 
     if server_args is None:
@@ -167,12 +166,19 @@ def _should_use_channels_last_3d(
     return False
 
 
+def _channels_last_3d_overridden() -> bool:
+    override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)
+    return override is not None and override.strip().lower() != "auto"
+
+
 def _channels_last_3d_prefix(server_args: ServerArgs | None) -> str:
     """Module-name prefix of the Conv3d weights to convert to channels_last_3d."""
-    # multi-GPU Wan converts only its decoder: channels_last_3d convs round
-    # differently, and the encode output seeds I2V sampling
+    # by default multi-GPU Wan converts only its decoder: channels_last_3d convs
+    # round differently, and the encode output seeds I2V sampling; an explicit
+    # override converts the whole VAE
     if (
-        server_args is not None
+        not _channels_last_3d_overridden()
+        and server_args is not None
         and server_args.num_gpus > 1
         and isinstance(server_args.pipeline_config, WanT2V480PConfig)
     ):
