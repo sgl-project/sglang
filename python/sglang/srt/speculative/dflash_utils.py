@@ -22,12 +22,13 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 logger = logging.getLogger(__name__)
 
+_DFLASH_FUSED_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
@@ -41,6 +42,32 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     }
 )
 
+
+if tree_speculative_sampling_target_only is None and is_hip():
+    # The general tree verifier has no ROCm kernel (the CUDA one is built on
+    # FlashInfer), so temperature > 0 DFlash requests would silently fall back
+    # to greedy argmax verification. DFlash proposals are a linear chain, so the
+    # chain-specialised Triton verifier is used instead; it keeps the operator's
+    # keyword signature. It is DFlash-only: it does not walk sibling branches.
+    from sglang.kernels.ops.speculative.dflash_chain_sampling import (
+        chain_speculative_sampling_target_only as tree_speculative_sampling_target_only,
+    )
+
+    # Fused fast path. The chain verifier above is correct but pays for a
+    # vocab-sized dense target_probs/draft_probs pair and three host syncs per
+    # step; the fused kernel does the same work on the k-sized top-k support
+    # with no sync. It declines batches it does not cover (no top-k, top_k too
+    # large), which then fall through to the path above.
+    try:
+        from sglang.kernels.ops.speculative.dflash_fused_sampling import (
+            can_use_fused,
+            fused_dflash_sampling_verify,
+        )
+
+        _DFLASH_FUSED_AVAILABLE = True
+    except Exception as _e:  # pragma: no cover
+        logger.warning("DFLASH fused verify unavailable: %s", _e)
+        _DFLASH_FUSED_AVAILABLE = False
 
 # DFlash does not run sampling verify on NPU, even where the op exists.
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = (
@@ -958,6 +985,34 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         raise ValueError(
             "uniform_samples_for_final_sampling shape mismatch. "
             f"Expected {(bs,)}, got {tuple(uniform_samples_for_final_sampling.shape)}."
+        )
+
+    if _DFLASH_FUSED_AVAILABLE and can_use_fused(
+        sampling_info=sampling_info,
+        max_top_k=max_top_k,
+        vocab_size=int(next_token_logits.shape[-1]),
+        draft_token_num=draft_token_num,
+        use_sparse_topk=use_sparse_topk,
+    ):
+        if uniform_samples is None:
+            uniform_samples = torch.rand(
+                (bs, draft_token_num), dtype=torch.float32, device=device
+            )
+        if uniform_samples_for_final_sampling is None:
+            uniform_samples_for_final_sampling = torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            )
+        return fused_dflash_sampling_verify(
+            candidates=candidates,
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            max_top_k=int(max_top_k),
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            uniform_samples=uniform_samples.to(device=device, dtype=torch.float32),
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling.to(
+                device=device, dtype=torch.float32
+            ),
         )
 
     # Cached across steps, and `correct_len` below aliases `accept_token_num`,
