@@ -488,21 +488,16 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         with (
             patch.object(gdn_backend, "_use_aiter", True),
             patch.object(gdn_backend, "is_gfx95_supported", return_value=True),
-            patch(
-                "sglang.srt.layers.attention.linear.kernels.gdn_flydsl.FlyDSLGDNKernel",
-                return_value=flydsl_kernel,
-            ),
+            patch.object(gdn_backend, "FlyDSLGDNKernel", return_value=flydsl_kernel),
         ):
             self.assertIs(GDNKernelDispatcher(*backends).extend_kernel, flydsl_kernel)
 
     def test_flydsl_schedule_flows_from_metadata_to_kernel(self):
-        extend = MagicMock(return_value=(sentinel.output, None, None))
-        build = MagicMock(return_value=sentinel.schedule)
+        extend_kernel = MagicMock(spec=FlyDSLGDNKernel)
+        extend_kernel.extend.return_value = (sentinel.output, None, None)
+        extend_kernel.build_prefill_metadata.return_value = sentinel.schedule
         dispatcher = object.__new__(GDNKernelDispatcher)
-        dispatcher.extend_kernel = SimpleNamespace(
-            build_prefill_metadata=build,
-            extend=extend,
-        )
+        dispatcher.extend_kernel = extend_kernel
         backend = object.__new__(GDNAttnBackend)
         backend.kernel_dispatcher = dispatcher
         backend._convolve_prefill = lambda layer, batch, qkv, *_: qkv
@@ -546,8 +541,13 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             backend.init_forward_metadata(batch)
             backend.forward_extend(layer, batch, torch.zeros(4, 6), None, None)
 
-        build.assert_called_once_with([2, 2], cu_seqlens=metadata.query_start_loc)
-        self.assertIs(extend.call_args.kwargs["prefill_metadata"], sentinel.schedule)
+        extend_kernel.build_prefill_metadata.assert_called_once_with(
+            [2, 2], cu_seqlens=metadata.query_start_loc
+        )
+        self.assertIs(
+            extend_kernel.extend.call_args.kwargs["prefill_metadata"],
+            sentinel.schedule,
+        )
 
     def test_flydsl_wrapper_returns_chunk_states(self):
         kernel = object.__new__(FlyDSLGDNKernel)
@@ -560,33 +560,8 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         indices = torch.tensor([-1], dtype=torch.int64)
         cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
 
-        output, final_state, chunk_states = kernel.extend(
-            q,
-            q,
-            v,
-            g,
-            g,
-            ssm_states=state,
-            cache_indices=indices,
-            query_start_loc=cu_seqlens,
-            prefill_metadata=sentinel.metadata,
-            output=sentinel.output_buffer,
-        )
-
-        self.assertIs(output, sentinel.output)
-        self.assertIsNone(final_state)
-        self.assertIs(chunk_states, sentinel.h)
-        call = kernel._prefill_fn.call_args.kwargs
-        self.assertIs(call["ssm_states"], state)
-        torch.testing.assert_close(
-            call["cache_indices"], torch.tensor([2], dtype=torch.int32)
-        )
-        self.assertIs(call["cu_seqlens"], cu_seqlens)
-        self.assertIs(call["prefill_metadata"], sentinel.metadata)
-        self.assertIs(call["o"], sentinel.output_buffer)
-
-        def run_layer(metadata):
-            kernel.extend(
+        def run_layer(metadata, **extra):
+            result = kernel.extend(
                 q,
                 q,
                 v,
@@ -596,12 +571,31 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
                 cache_indices=indices,
                 query_start_loc=cu_seqlens,
                 prefill_metadata=metadata,
+                **extra,
             )
-            return kernel._prefill_fn.call_args.kwargs["cache_indices"]
+            return result, kernel._prefill_fn.call_args.kwargs
+
+        (output, final_state, chunk_states), call = run_layer(
+            sentinel.metadata, output=sentinel.output_buffer
+        )
+
+        self.assertIs(output, sentinel.output)
+        self.assertIsNone(final_state)
+        self.assertIs(chunk_states, sentinel.h)
+        self.assertIs(call["ssm_states"], state)
+        torch.testing.assert_close(
+            call["cache_indices"], torch.tensor([2], dtype=torch.int32)
+        )
+        self.assertIs(call["cu_seqlens"], cu_seqlens)
+        self.assertIs(call["prefill_metadata"], sentinel.metadata)
+        self.assertIs(call["o"], sentinel.output_buffer)
 
         # Later layers of the same batch reuse the remapped indices.
-        self.assertIs(run_layer(sentinel.metadata), call["cache_indices"])
-        self.assertIsNot(run_layer(sentinel.next_metadata), call["cache_indices"])
+        indices_used = call["cache_indices"]
+        self.assertIs(run_layer(sentinel.metadata)[1]["cache_indices"], indices_used)
+        self.assertIsNot(
+            run_layer(sentinel.next_metadata)[1]["cache_indices"], indices_used
+        )
 
     def test_flydsl_without_metadata_falls_back_to_triton(self):
         kernel = object.__new__(FlyDSLGDNKernel)

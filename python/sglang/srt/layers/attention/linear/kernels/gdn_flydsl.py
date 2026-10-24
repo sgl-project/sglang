@@ -76,7 +76,7 @@ def _load_aiter_flydsl_gdn():
             use_exp2=True,
             prefill_metadata=prefill_metadata,
         )
-        return o.to(q.dtype), h
+        return o, h
 
     return (
         prefill,
@@ -87,6 +87,9 @@ def _load_aiter_flydsl_gdn():
 
 class FlyDSLGDNKernel(TritonGDNKernel):
     """GDN prefill via AITER FlyDSL. Decode and verify stay on Triton."""
+
+    _logged_triton_fallback = False
+    _indices_batch = None
 
     def __init__(self):
         (
@@ -141,15 +144,13 @@ class FlyDSLGDNKernel(TritonGDNKernel):
             or not inplace_update
             or not self._supports_inputs(q, k, v, ssm_states)
         ):
-            if not getattr(self, "_logged_triton_fallback", False):
+            if not self._logged_triton_fallback:
                 self._logged_triton_fallback = True
-                if prefill_metadata is None:
-                    reason = "no prefill schedule"
-                elif not inplace_update:
-                    reason = "inplace_update is false"
-                else:
-                    reason = "unsupported input or state shape"
-                rank0_log(f"FlyDSL GDN prefill fell back to Triton ({reason}).")
+                rank0_log(
+                    "FlyDSL GDN prefill fell back to Triton "
+                    f"(schedule={prefill_metadata is not None}, "
+                    f"inplace={inplace_update})."
+                )
             return super().extend(
                 q,
                 k,
@@ -167,7 +168,7 @@ class FlyDSLGDNKernel(TritonGDNKernel):
         # indexed K5 path expects an in-bounds slot, so send those ignored rows
         # to the pool's reserved sentinel slot. The indices are fixed within a
         # batch, so remap once per batch rather than once per layer.
-        if getattr(self, "_indices_batch", None) is not prefill_metadata:
+        if self._indices_batch is not prefill_metadata:
             self._indices_batch = prefill_metadata
             self._ssm_cache_indices = torch.where(
                 cache_indices >= 0,

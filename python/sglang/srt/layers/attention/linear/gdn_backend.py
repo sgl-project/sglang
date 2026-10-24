@@ -12,6 +12,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import FlyDSLGDNKernel
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
@@ -362,10 +363,6 @@ class GDNKernelDispatcher:
                     "The FlyDSL GDN prefill backend requires AMD gfx95 and "
                     "SGLANG_USE_AITER=1"
                 )
-            from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
-                FlyDSLGDNKernel,
-            )
-
             self.extend_kernel = FlyDSLGDNKernel()
         elif prefill_backend.is_helion():
             raise ValueError(
@@ -555,7 +552,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         super().__init__(model_runner)
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
-        self.kernel_prefill_metadata = None
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
@@ -594,17 +590,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._init_target_verify_qkv_routing(forward_batch)
         self.mis_metadata = None
         self.kernel_prefill_metadata = None
-        build = getattr(
-            self.kernel_dispatcher.extend_kernel, "build_prefill_metadata", None
-        )
+        extend_kernel = self.kernel_dispatcher.extend_kernel
         if (
-            build is not None
+            isinstance(extend_kernel, FlyDSLGDNKernel)
             and forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_mixed()
             and forward_batch.extend_seq_lens_cpu is not None
         ):
-            self.kernel_prefill_metadata = build(
+            self.kernel_prefill_metadata = extend_kernel.build_prefill_metadata(
                 forward_batch.extend_seq_lens_cpu,
                 cu_seqlens=self.forward_metadata.query_start_loc,
             )
