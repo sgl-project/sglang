@@ -146,3 +146,233 @@ void get_cutlass_w4a8_moe_mm_data_caller(
       3,
       1);
 }
+
+__global__ void compute_expert_offsets_and_starts_w4a8_kernel(
+    const int32_t* __restrict__ problem_sizes1,
+    int32_t* __restrict__ expert_offsets,
+    int32_t* __restrict__ atomic_buffer,
+    const int64_t num_experts) {
+  int32_t tot_offset = 0;
+  expert_offsets[0] = 0;
+  for (int i = 0; i < num_experts; ++i) {
+    atomic_buffer[i] = tot_offset;
+    tot_offset += problem_sizes1[i * 3 + 1];
+    expert_offsets[i + 1] = tot_offset;
+  }
+}
+
+__global__ void compute_arg_sorts_w4a8(
+    const int32_t* __restrict__ topk_ids,
+    int32_t* input_permutation,
+    int32_t* output_permutation,
+    int32_t* atomic_buffer,
+    const int64_t topk_length,
+    const int64_t topk) {
+  int expert_id = blockIdx.x;
+
+  for (int i = threadIdx.x; i < topk_length; i += blockDim.x) {
+    if (topk_ids[i] == expert_id) {
+      int start = atomicAdd(&atomic_buffer[expert_id], 1);
+      input_permutation[start] = i / topk;
+      output_permutation[i] = start;
+    }
+  }
+}
+
+template <int BLOCK_SIZE, int MAX_EXPERTS>
+__global__ void compute_tiny_moe_data_w4a8(
+    const int32_t* __restrict__ topk_ids,
+    int32_t* __restrict__ expert_offsets,
+    int32_t* __restrict__ problem_sizes1,
+    int32_t* __restrict__ problem_sizes2,
+    int32_t* __restrict__ input_permutation,
+    int32_t* __restrict__ output_permutation,
+    const int topk_length,
+    const int topk,
+    const int num_experts,
+    const int n,
+    const int k) {
+  using BlockScan = cub::BlockScan<int32_t, BLOCK_SIZE>;
+  __shared__ typename BlockScan::TempStorage scan_storage;
+  __shared__ int32_t routed_experts[384];
+  __shared__ int32_t write_offsets[MAX_EXPERTS];
+
+  if (threadIdx.x < MAX_EXPERTS) {
+    write_offsets[threadIdx.x] = 0;
+  }
+  __syncthreads();
+
+  for (int index = threadIdx.x; index < topk_length; index += BLOCK_SIZE) {
+    int const expert = topk_ids[index];
+    routed_experts[index] = expert;
+    atomicAdd(write_offsets + expert, 1);
+  }
+  __syncthreads();
+
+  int32_t const count = threadIdx.x < num_experts ? write_offsets[threadIdx.x] : 0;
+  int32_t offset = 0;
+  BlockScan(scan_storage).ExclusiveSum(count, offset);
+
+  if (threadIdx.x < num_experts) {
+    int const expert = threadIdx.x;
+    expert_offsets[expert] = offset;
+    problem_sizes1[expert * 3] = 2 * n;
+    problem_sizes1[expert * 3 + 1] = count;
+    problem_sizes1[expert * 3 + 2] = k;
+    problem_sizes2[expert * 3] = k;
+    problem_sizes2[expert * 3 + 1] = count;
+    problem_sizes2[expert * 3 + 2] = n;
+    write_offsets[expert] = offset;
+    if (expert + 1 == num_experts) {
+      expert_offsets[num_experts] = offset + count;
+    }
+  }
+  __syncthreads();
+
+  for (int index = threadIdx.x; index < topk_length; index += BLOCK_SIZE) {
+    int const expert = routed_experts[index];
+    int const position = atomicAdd(write_offsets + expert, 1);
+    input_permutation[position] = index / topk;
+    output_permutation[index] = position;
+  }
+}
+
+void get_cutlass_w4a8_moe_mm_data_with_permutation(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k) {
+  TORCH_CHECK(topk_ids.dtype() == torch::kInt32);
+  auto stream = at::cuda::getCurrentCUDAStream(topk_ids.device().index());
+
+  constexpr uint64_t BLOCK_SIZE = 512;
+  constexpr int TINY_BLOCK_SIZE = 256;
+  constexpr int TINY_MAX_EXPERTS = 256;
+  constexpr int TINY_MAX_ROUTES = 384;
+  if (num_experts <= TINY_MAX_EXPERTS && topk_ids.numel() <= TINY_MAX_ROUTES) {
+    compute_tiny_moe_data_w4a8<TINY_BLOCK_SIZE, TINY_MAX_EXPERTS><<<1, TINY_BLOCK_SIZE, 0, stream>>>(
+        static_cast<const int32_t*>(topk_ids.data_ptr()),
+        static_cast<int32_t*>(expert_offsets.data_ptr()),
+        static_cast<int32_t*>(problem_sizes1.data_ptr()),
+        static_cast<int32_t*>(problem_sizes2.data_ptr()),
+        static_cast<int32_t*>(input_permutation.data_ptr()),
+        static_cast<int32_t*>(output_permutation.data_ptr()),
+        topk_ids.numel(),
+        topk_ids.size(1),
+        num_experts,
+        n,
+        k);
+    return;
+  }
+
+  auto options_int32 = torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device());
+  torch::Tensor atomic_buffer = torch::empty(num_experts, options_int32);
+  compute_problem_sizes_w4a8<BLOCK_SIZE><<<num_experts, BLOCK_SIZE, 0, stream>>>(
+      static_cast<const int32_t*>(topk_ids.data_ptr()),
+      static_cast<int32_t*>(problem_sizes1.data_ptr()),
+      static_cast<int32_t*>(problem_sizes2.data_ptr()),
+      topk_ids.numel(),
+      n,
+      k);
+  compute_expert_offsets_and_starts_w4a8_kernel<<<1, 1, 0, stream>>>(
+      static_cast<const int32_t*>(problem_sizes1.data_ptr()),
+      static_cast<int32_t*>(expert_offsets.data_ptr()),
+      static_cast<int32_t*>(atomic_buffer.data_ptr()),
+      num_experts);
+  compute_arg_sorts_w4a8<<<num_experts, BLOCK_SIZE, 0, stream>>>(
+      static_cast<const int32_t*>(topk_ids.data_ptr()),
+      static_cast<int32_t*>(input_permutation.data_ptr()),
+      static_cast<int32_t*>(output_permutation.data_ptr()),
+      static_cast<int32_t*>(atomic_buffer.data_ptr()),
+      topk_ids.numel(),
+      topk_ids.size(1));
+}
+
+__global__ void compact_cutlass_w4a8_moe_mm_data_kernel(
+    const int32_t* __restrict__ expert_offsets,
+    const int32_t* __restrict__ problem_sizes1,
+    const int32_t* __restrict__ problem_sizes2,
+    int32_t* __restrict__ compact_expert_offsets,
+    int32_t* __restrict__ compact_problem_sizes1,
+    int32_t* __restrict__ compact_problem_sizes2,
+    int32_t* __restrict__ compact_expert_ids,
+    const int64_t num_experts,
+    const int64_t max_groups) {
+  int32_t out = 0;
+  int32_t total = expert_offsets[num_experts];
+
+  for (int32_t e = 0; e < num_experts; ++e) {
+    if (out >= max_groups) {
+      break;
+    }
+    int32_t m = problem_sizes1[e * 3 + 1];
+    if (m <= 0) {
+      continue;
+    }
+
+    compact_expert_offsets[out] = expert_offsets[e];
+    compact_problem_sizes1[out * 3] = problem_sizes1[e * 3];
+    compact_problem_sizes1[out * 3 + 1] = problem_sizes1[e * 3 + 1];
+    compact_problem_sizes1[out * 3 + 2] = problem_sizes1[e * 3 + 2];
+    compact_problem_sizes2[out * 3] = problem_sizes2[e * 3];
+    compact_problem_sizes2[out * 3 + 1] = problem_sizes2[e * 3 + 1];
+    compact_problem_sizes2[out * 3 + 2] = problem_sizes2[e * 3 + 2];
+    compact_expert_ids[out] = e;
+    ++out;
+  }
+
+  for (int32_t i = out; i < max_groups; ++i) {
+    compact_expert_offsets[i] = total;
+    compact_problem_sizes1[i * 3] = 0;
+    compact_problem_sizes1[i * 3 + 1] = 0;
+    compact_problem_sizes1[i * 3 + 2] = 0;
+    compact_problem_sizes2[i * 3] = 0;
+    compact_problem_sizes2[i * 3 + 1] = 0;
+    compact_problem_sizes2[i * 3 + 2] = 0;
+    compact_expert_ids[i] = 0;
+  }
+}
+
+void compact_cutlass_w4a8_moe_mm_data(
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& problem_sizes1,
+    const torch::Tensor& problem_sizes2,
+    torch::Tensor& compact_expert_offsets,
+    torch::Tensor& compact_problem_sizes1,
+    torch::Tensor& compact_problem_sizes2,
+    torch::Tensor& compact_expert_ids,
+    const int64_t num_experts,
+    const int64_t max_groups) {
+  TORCH_CHECK(expert_offsets.dtype() == torch::kInt32, "expert_offsets must be int32");
+  TORCH_CHECK(problem_sizes1.dtype() == torch::kInt32, "problem_sizes1 must be int32");
+  TORCH_CHECK(problem_sizes2.dtype() == torch::kInt32, "problem_sizes2 must be int32");
+  TORCH_CHECK(compact_expert_offsets.dtype() == torch::kInt32, "compact_expert_offsets must be int32");
+  TORCH_CHECK(compact_problem_sizes1.dtype() == torch::kInt32, "compact_problem_sizes1 must be int32");
+  TORCH_CHECK(compact_problem_sizes2.dtype() == torch::kInt32, "compact_problem_sizes2 must be int32");
+  TORCH_CHECK(compact_expert_ids.dtype() == torch::kInt32, "compact_expert_ids must be int32");
+  TORCH_CHECK(expert_offsets.numel() >= num_experts + 1, "expert_offsets must have num_experts + 1 entries");
+  TORCH_CHECK(problem_sizes1.numel() >= num_experts * 3, "problem_sizes1 must have num_experts rows");
+  TORCH_CHECK(problem_sizes2.numel() >= num_experts * 3, "problem_sizes2 must have num_experts rows");
+  TORCH_CHECK(max_groups > 0 && max_groups <= num_experts, "max_groups must be in (0, num_experts]");
+  TORCH_CHECK(compact_expert_offsets.numel() >= max_groups, "compact_expert_offsets must have max_groups entries");
+  TORCH_CHECK(compact_problem_sizes1.numel() >= max_groups * 3, "compact_problem_sizes1 must have max_groups rows");
+  TORCH_CHECK(compact_problem_sizes2.numel() >= max_groups * 3, "compact_problem_sizes2 must have max_groups rows");
+  TORCH_CHECK(compact_expert_ids.numel() >= max_groups, "compact_expert_ids must have max_groups entries");
+
+  auto stream = at::cuda::getCurrentCUDAStream(expert_offsets.device().index());
+  compact_cutlass_w4a8_moe_mm_data_kernel<<<1, 1, 0, stream>>>(
+      static_cast<const int32_t*>(expert_offsets.data_ptr()),
+      static_cast<const int32_t*>(problem_sizes1.data_ptr()),
+      static_cast<const int32_t*>(problem_sizes2.data_ptr()),
+      static_cast<int32_t*>(compact_expert_offsets.data_ptr()),
+      static_cast<int32_t*>(compact_problem_sizes1.data_ptr()),
+      static_cast<int32_t*>(compact_problem_sizes2.data_ptr()),
+      static_cast<int32_t*>(compact_expert_ids.data_ptr()),
+      num_experts,
+      max_groups);
+}
