@@ -1043,7 +1043,11 @@ class AscendAttnBackend(AttentionBackend):
             # verify adds the draft block except for DFlash, whose seq_lens_cpu already
             # includes it; speculative decode adds tokens through the current draft step.
             attention_kv_lens_cpu = seq_lens_cpu[:bs].int()
-            if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
+            # MLA capture instead receives a CPU copy of the device prefix lengths.
+            if forward_mode.is_target_verify() and (
+                not _is_dflash_verify(spec_info)
+                or (self.dense_mla_dcp_target and in_capture)
+            ):
                 attention_kv_lens_cpu = (
                     attention_kv_lens_cpu + self.speculative_num_draft_tokens
                 )
@@ -1113,13 +1117,15 @@ class AscendAttnBackend(AttentionBackend):
 
         if self.dense_mla_dcp_target:
             # Use the existing Host lengths for table bounds without a device readback.
-            _, block_tables = self._get_kv_lens_and_block_tables(
+            local_seq_lens_cpu, block_tables = self._get_kv_lens_and_block_tables(
                 attention_kv_lens_cpu,
                 req_pool_indices[:bs],
             )
             num_pages = block_tables.shape[1]
             metadata.block_tables[:bs, :num_pages].copy_(block_tables)
             metadata.block_tables[:bs, num_pages:].fill_(0)
+            if in_capture:
+                metadata.seq_lens_cpu_list = local_seq_lens_cpu.tolist()
 
         if self.dsa_dcp_target:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
@@ -1180,15 +1186,6 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens = seq_lens + self.speculative_step_offset_npu
 
         if self.dense_mla_dcp_target:
-            # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
-            if in_capture:
-                local_seq_lens = get_dcp_lens(
-                    seq_lens[:bs],
-                    self.dcp_size,
-                    self.dcp_rank,
-                    interleave_size=self.page_size,
-                ).int()
-                metadata.seq_lens_cpu_list = local_seq_lens.cpu().tolist()
             if forward_mode.is_target_verify():
                 query_len = self.speculative_num_draft_tokens
                 local_query_lens = get_dcp_chain_spec_lens(
