@@ -320,10 +320,12 @@ class UnoWorkerV2(BaseSpecWorker):
         forward_batch: ForwardBatch,
         *,
         need_top1: bool = True,
+        pp_proxy_tensors=None,
     ) -> tuple:
         result = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
             is_verify=True,
         )
 
@@ -413,8 +415,11 @@ class UnoWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
-        result = self.target_worker.forward_batch_generation(batch)
+        result = self.target_worker.forward_batch_generation(
+            batch, pp_proxy_tensors=pp_proxy_tensors
+        )
         if not isinstance(result.next_token_ids, torch.Tensor):
             raise RuntimeError("UNO target prefill returned no sampled seed tensor.")
 
@@ -440,6 +445,7 @@ class UnoWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         """Run UNO's F-wide proposal pass, then native EAGLE Q-node verify."""
 
@@ -503,6 +509,7 @@ class UnoWorkerV2(BaseSpecWorker):
         draft_result, _ = self._run_draft_block(
             draft_forward_batch,
             need_top1=False,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         draft_logits = draft_result.logits_output.next_token_logits.reshape(
             batch_size,
@@ -621,9 +628,12 @@ class UnoWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         if self.tree_mode:
-            return self._forward_decode_tree(batch, on_publish)
+            return self._forward_decode_tree(
+                batch, on_publish, pp_proxy_tensors=pp_proxy_tensors
+            )
 
         draft_state = batch.spec_info
 
@@ -695,6 +705,7 @@ class UnoWorkerV2(BaseSpecWorker):
         draft_result, candidates = self._run_draft_block(
             draft_forward_batch,
             need_top1=all_greedy,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         if not all_greedy:
             draft_logits = draft_result.logits_output.next_token_logits.reshape(
@@ -723,6 +734,7 @@ class UnoWorkerV2(BaseSpecWorker):
         verify_result, target_top1 = self._run_target_block(
             verify_forward_batch,
             need_top1=all_greedy,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         if all_greedy:
@@ -774,15 +786,20 @@ class UnoWorkerV2(BaseSpecWorker):
         batch: ScheduleBatch,
         on_publish=None,
         grammar_barrier=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         del grammar_barrier
         self._validate_batch(batch)
 
         if batch.forward_mode == ForwardMode.EXTEND:
-            return self._forward_prefill(batch, on_publish)
+            return self._forward_prefill(
+                batch, on_publish, pp_proxy_tensors=pp_proxy_tensors
+            )
 
         if batch.forward_mode == ForwardMode.DECODE:
-            return self._forward_decode(batch, on_publish)
+            return self._forward_decode(
+                batch, on_publish, pp_proxy_tensors=pp_proxy_tensors
+            )
 
         raise RuntimeError(
             f"UNO expected an EXTEND or DECODE batch, got {batch.forward_mode}."
@@ -805,6 +822,7 @@ class UnoWorkerV2(BaseSpecWorker):
         forward_batch: ForwardBatch,
         *,
         need_top1: bool = True,
+        pp_proxy_tensors=None,
     ):
         batch_size = forward_batch.batch_size
         self.lora_manager.reset_lora_batch()
@@ -829,6 +847,7 @@ class UnoWorkerV2(BaseSpecWorker):
                 return self._run_target_block(
                     forward_batch,
                     need_top1=need_top1,
+                    pp_proxy_tensors=pp_proxy_tensors,
                 )
 
             graph_runner = getattr(
@@ -851,6 +870,7 @@ class UnoWorkerV2(BaseSpecWorker):
             result = self._run_target_block(
                 forward_batch,
                 need_top1=need_top1,
+                pp_proxy_tensors=pp_proxy_tensors,
             )
             # Clear LoRA routing before verification
             self.lora_manager.reset_lora_batch()

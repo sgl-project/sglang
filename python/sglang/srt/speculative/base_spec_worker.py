@@ -14,7 +14,9 @@ from sglang.srt.model_executor.graph_memory_usage import (
 from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.model_executor.model_runner import (
         ModelRunner,
         SamplingPrewarmResult,
@@ -154,6 +156,23 @@ class BaseSpecWorker(ABC):
     def __init__(self) -> None:
         self._additional_graph_memory_usage: dict[str, float] = {}
         self._additional_graph_time_usage: dict[str, float] = {}
+
+    @abstractmethod
+    def forward_batch_generation(
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors=None,
+    ) -> GenerationBatchResult:
+        """Run one generation step for a schedule batch.
+
+        Every spec-v2 worker must accept the same keyword arguments the
+        scheduler dispatches through (in particular ``pp_proxy_tensors``).
+        Declaring the interface here turns a future signature divergence
+        into a loud failure instead of a first-request ``TypeError``.
+        """
+        ...
 
     @property
     def hicache_draft_plan(self) -> HiCacheDraftPlan:
