@@ -935,6 +935,25 @@ class FullResponseUsageTestCase(CustomTestCase):
         self.assertEqual(metadata.final_usage_info, response.usage)
 
 
+class RequestChatTemplateTrustTestCase(CustomTestCase):
+    def test_create_responses_rejects_request_chat_template_by_default(self):
+        serving = make_serving()
+        serving._make_request = AsyncMock()
+        request = ResponsesRequest(
+            model="x",
+            input="hi",
+            chat_template_kwargs={"chat_template": "{{ messages }}"},
+            store=False,
+        )
+
+        response = asyncio.run(serving.create_responses(request))
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"--trust-request-chat-template", response.body)
+        serving._make_request.assert_not_called()
+        serving.tokenizer_manager.generate_request.assert_not_called()
+
+
 class MultimodalRequestTestCase(CustomTestCase):
     def test_text_only_create_responses_rejects_media_before_generation(self):
         serving = make_serving()

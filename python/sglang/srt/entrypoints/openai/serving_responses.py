@@ -316,6 +316,12 @@ class OpenAIServingResponses(OpenAIServingChat):
         if model_error is not None:
             return model_error
 
+        template_error = self._request_chat_template_error(request.chat_template_kwargs)
+        if template_error is not None:
+            return self.create_error_response(
+                template_error, param="chat_template_kwargs"
+            )
+
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
 
