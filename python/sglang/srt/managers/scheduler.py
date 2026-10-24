@@ -44,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    mamba_cache_chunk_size,
     publish,
     spawn_world_rank,
 )
@@ -1728,7 +1729,7 @@ class Scheduler(
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
 
     def init_deterministic_inference_config(self):
-        """Initialize deterministic inference configuration for different attention backends."""
+        """Align deterministic prefill chunks for attention and recurrent state updates."""
         if not get_exec().deterministic.enable_deterministic_inference:
             self.truncation_align_size = None
             return
@@ -1743,6 +1744,12 @@ class Scheduler(
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
         )
+        if self.is_hybrid_ssm:
+            # Splitting a linear-attention chunk changes its recurrent update
+            # and floating-point rounding, even with batch-invariant GEMMs.
+            self.truncation_align_size = math.lcm(
+                self.truncation_align_size or 1, mamba_cache_chunk_size()
+            )
 
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.
@@ -4145,7 +4152,9 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self.chunked_req = adder.add_chunked_req(
+                self.chunked_req, truncation_align_size=self.truncation_align_size
+            )
 
         if self.enable_lora:
             running_loras = {
