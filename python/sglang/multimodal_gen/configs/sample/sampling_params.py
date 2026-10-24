@@ -293,6 +293,11 @@ class SamplingParams:
     image_path: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )
+    # Audio conditioning stays in the signature: S2V output follows the audio,
+    # so two requests with different audio must not share a batch.
+    audio_path: str | None = None
+    pose_video_path: str | None = None
+    num_clip: int | None = None
 
     # Video inputs (video-to-video conditioning)
     video_path: str | list[str] | None = None
@@ -825,6 +830,11 @@ class SamplingParams:
             )
 
         RLRolloutArgs.validate_sampling_params(self)
+        if self.num_clip is not None:
+            if not isinstance(self.num_clip, int) or self.num_clip <= 0:
+                raise ValueError(
+                    f"num_clip must be a positive int, got {self.num_clip!r}"
+                )
 
     def _validate_with_pipeline_config(self, pipeline_config):
         """
@@ -864,6 +874,26 @@ class SamplingParams:
             and not task_type.accepts_video_input()
         ):
             raise ValueError(f"video_path is not supported for task {task_type.name}")
+
+        if pipeline_config.task_type.requires_audio_input():
+            if self.audio_path is None:
+                raise ValueError(
+                    f"Served model with task type '{pipeline_config.task_type.name}' requires an 'audio_path' input, but none was provided"
+                )
+
+        if not pipeline_config.task_type.accepts_audio_input():
+            if self.audio_path is not None:
+                raise ValueError(
+                    f"audio_path is not supported for {pipeline_config.task_type.name} models."
+                )
+
+        if (
+            self.pose_video_path is not None
+            and not pipeline_config.task_type.accepts_audio_input()
+        ):
+            raise ValueError(
+                f"pose_video_path is not supported for {pipeline_config.task_type.name} models."
+            )
 
     def resolve_task_type(self, pipeline_config) -> ModelTaskType:
         resolver = getattr(pipeline_config, "resolve_task_type", None)
@@ -985,7 +1015,10 @@ class SamplingParams:
         else:
             self.enable_sequence_shard = False
 
-        if self.enable_sequence_shard:
+        if (
+            self.enable_sequence_shard
+            and pipeline_config.task_type != ModelTaskType.S2V
+        ):
             self.adjust_frames = False
             logger.info(
                 "Sequence dimension shard is enabled, disabling frame adjustment for better performance"
@@ -1011,7 +1044,9 @@ class SamplingParams:
                 self.num_frames,
             )
 
-            if self.adjust_frames:
+            # Wan S2V trims one frame and shards its own padded sequence, so the
+            # generic per-GPU latent-frame alignment does not apply to it.
+            if self.adjust_frames and pipeline_config.task_type != ModelTaskType.S2V:
                 new_num_frames = align_num_frames_for_num_gpus(
                     self.num_frames,
                     num_gpus=server_args.num_gpus,
@@ -1606,6 +1641,21 @@ class SamplingParams:
                 "Frame rate used for action token temporal mRoPE positions. "
                 "Defaults to the video fps when not set."
             ),
+        )
+        add_argument(
+            "--audio-path",
+            type=str,
+            help="Path to the input audio file for speech-driven video generation.",
+        )
+        add_argument(
+            "--pose-video-path",
+            type=str,
+            help="Optional pose guidance video for speech-driven video generation.",
+        )
+        add_argument(
+            "--num-clip",
+            type=int,
+            help="Optional clip repeat/count override for speech-driven video generation.",
         )
         add_argument(
             "--moba-config-path",
