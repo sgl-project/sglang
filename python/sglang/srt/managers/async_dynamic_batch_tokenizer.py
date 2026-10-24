@@ -119,6 +119,17 @@ class AsyncDynamicbatchTokenizer:
         result_futures: List[asyncio.Future],
     ) -> None:
         """Process a dynamic batch of encode requests for single string prompts."""
+        # Callers may cancel while waiting behind an active tokenization batch.
+        # Remove them before choosing the batch kwargs or scheduling CPU work.
+        pending = [
+            (prompt, kw, fut)
+            for prompt, kw, fut in zip(prompts, kwargs_list, result_futures)
+            if not fut.cancelled()
+        ]
+        if not pending:
+            return
+        prompts, kwargs_list, result_futures = map(list, zip(*pending))
+
         # Check if all kwargs are identical for efficient batch processing
         first_kw = kwargs_list[0]
         can_batch = all(kw == first_kw for kw in kwargs_list[1:])
