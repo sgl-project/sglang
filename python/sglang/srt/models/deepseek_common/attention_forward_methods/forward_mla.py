@@ -16,8 +16,10 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
 from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
-from sglang.srt.layers.cp.indexer_overlap import DSAInterleaveCPIndexerOverlap
-from sglang.srt.layers.cp.interleave import is_interleave_extend
+from sglang.srt.layers.cp.interleave import (
+    DSAInterleaveCPIndexerOverlap,
+    is_interleave_extend,
+)
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
