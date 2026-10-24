@@ -1097,7 +1097,7 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def add_chunked_req(self, req: Req, truncation_align_size: Optional[int] = None):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
@@ -1140,6 +1140,16 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if truncated and truncation_align_size is not None:
+            # Same absolute grid as the first chunk; a continuation too short to
+            # reach it keeps its length so the request still makes progress.
+            aligned_end = (
+                (req.prefix_len + new_len)
+                // truncation_align_size
+                * truncation_align_size
+            )
+            if aligned_end > req.prefix_len:
+                new_len = aligned_end - req.prefix_len
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )
@@ -1593,16 +1603,15 @@ class PrefillAdder:
                 # capped.
                 extend_len = chunk_tokens_limit
                 if truncation_align_size is not None:
-                    extend_len = (
-                        extend_len // truncation_align_size * truncation_align_size
-                    )
+                    # Align the absolute end: a cached prefix can end off the grid.
+                    end = (prefix_len + extend_len) // truncation_align_size
+                    extend_len = end * truncation_align_size - prefix_len
             else:
                 extend_len = chunk_tokens_limit // self.page_size * self.page_size
-                if truncation_align_size is not None:
-                    extend_len = (
-                        extend_len // truncation_align_size * truncation_align_size
-                    )
                 end = (prefix_len + extend_len) // self.page_size * self.page_size
+                if truncation_align_size is not None:
+                    # Align the absolute end: a cached prefix can end off the grid.
+                    end = end // truncation_align_size * truncation_align_size
                 extend_len = end - prefix_len
             if extend_len <= 0:
                 return AddReqResult.OTHER

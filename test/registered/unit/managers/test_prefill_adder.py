@@ -348,6 +348,40 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_len, 4096)
 
+    def test_continuation_chunk_ends_on_the_alignment_grid(self):
+        # Deterministic chunk alignment is on absolute positions: a continuation
+        # that starts off the grid still ends on it.
+        adder = self.create_shortest_prefill_adder()
+        req = self.create_shared_req("continuation")
+        req.full_untruncated_fill_ids = list(range(8192))
+        req.prefix_len = 1000
+        self.assertIs(adder.add_chunked_req(req, truncation_align_size=64), req)
+        self.assertEqual(req.prefix_len + req.extend_len, 5056)
+
+    def test_new_request_chunk_ends_on_the_alignment_grid(self):
+        # A cached prefix can end off the alignment grid; the first chunk must
+        # still end on it (aligning only the chunk length would end at 292).
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = True
+        self.mock_token_allocator.available_size.return_value = 32768
+        for exact_chunk_fill in (False, True):
+            with (
+                self.subTest(exact_chunk_fill=exact_chunk_fill),
+                patch.object(
+                    schedule_policy,
+                    "_use_exact_chunk_fill",
+                    return_value=exact_chunk_fill,
+                ),
+            ):
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=1, rem_chunk_tokens=200
+                )
+                req = self.create_shared_req("cached-prefix")
+                req.full_untruncated_fill_ids = list(range(1000))
+                req.prefix_len = 100
+                adder.add_one_req(req, has_chunked_req=False, truncation_align_size=64)
+                self.assertEqual(req.prefix_len + req.extend_len, 256)
+
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
         # off-grid chunk leaves the rest of the prompt uncacheable. Without
