@@ -282,6 +282,60 @@ class TestDraftFactoryStamping(CustomTestCase):
             product.attn_backends[0].decode_attention_backend_str, "triton"
         )
 
+    def test_a_registered_backend_serves_both_draft_phases(self):
+        # An out-of-tree backend opts into EAGLE drafts by registering a draft
+        # factory; draft extend reuses its regular factory of the same name.
+        from types import SimpleNamespace
+        from unittest import mock
+
+        from sglang.srt.layers.attention import attention_registry
+
+        self._publish(attention_backend="triton")
+        factory = self._factory(draft_backend="oot_attn")
+        children = [SimpleNamespace(), SimpleNamespace()]
+        container = SimpleNamespace(attn_backends=children)
+        extend_backend = SimpleNamespace()
+        draft_fn = mock.Mock(return_value=container)
+        with (
+            mock.patch.dict(
+                attention_registry.DRAFT_ATTENTION_BACKENDS, oot_attn=draft_fn
+            ),
+            mock.patch.dict(
+                attention_registry.ATTENTION_BACKENDS,
+                oot_attn=lambda runner: extend_backend,
+            ),
+        ):
+            decode = factory._create_backend(
+                "decode_attention_backend",
+                {},
+                "unsupported {backend_type}",
+                stamps_children=True,
+            )
+            extend = factory._create_backend(
+                "prefill_attention_backend", {}, "unsupported {backend_type}"
+            )
+        draft_fn.assert_called_once_with(
+            runner=factory.draft_model_runner, topk=1, speculative_num_steps=2
+        )
+        self.assertIs(extend, extend_backend)
+        for obj in [decode, *children, extend]:
+            self.assertEqual(obj.prefill_attention_backend_str, "oot_attn")
+            self.assertEqual(obj.decode_attention_backend_str, "oot_attn")
+
+    def test_a_backend_without_a_draft_factory_keeps_the_error(self):
+        from unittest import mock
+
+        from sglang.srt.layers.attention import attention_registry
+
+        self._publish(attention_backend="triton")
+        with mock.patch.dict(
+            attention_registry.ATTENTION_BACKENDS, oot_attn=lambda runner: None
+        ):
+            with self.assertRaisesRegex(ValueError, "unsupported oot_attn"):
+                self._factory(draft_backend="oot_attn")._create_backend(
+                    "prefill_attention_backend", {}, "unsupported {backend_type}"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

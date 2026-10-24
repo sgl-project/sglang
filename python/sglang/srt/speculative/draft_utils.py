@@ -60,10 +60,19 @@ class DraftBackendFactory:
         )
         backend_type = self.draft_attn_backend or configured
 
-        if backend_type not in backend_map:
-            raise ValueError(error_template.format(backend_type=backend_type))
+        from sglang.srt.layers.attention.attention_registry import (
+            DRAFT_ATTENTION_BACKENDS,
+        )
 
-        stamp, backend = backend_map[backend_type]()
+        if backend_type in backend_map:
+            stamp, backend = backend_map[backend_type]()
+        elif backend_type in DRAFT_ATTENTION_BACKENDS:
+            stamp = backend_type
+            backend = self._create_registered_backend(
+                backend_type=backend_type, multi_step=stamps_children
+            )
+        else:
+            raise ValueError(error_template.format(backend_type=backend_type))
         if backend is not None:
             if stamps_children:
                 from sglang.srt.layers.attention.attention_registry import (
@@ -80,6 +89,20 @@ class DraftBackendFactory:
                     child.prefill_attention_backend_str = stamp
                     child.decode_attention_backend_str = stamp
         return backend
+
+    def _create_registered_backend(self, *, backend_type: str, multi_step: bool):
+        from sglang.srt.layers.attention.attention_registry import (
+            ATTENTION_BACKENDS,
+            DRAFT_ATTENTION_BACKENDS,
+        )
+
+        if multi_step:
+            return DRAFT_ATTENTION_BACKENDS[backend_type](
+                runner=self.draft_model_runner,
+                topk=self.topk,
+                speculative_num_steps=self.speculative_num_steps,
+            )
+        return ATTENTION_BACKENDS[backend_type](self.draft_model_runner)
 
     def create_decode_backend(self):
         # No multi-step draft backend for steps=0 (nospec) or steps=1.

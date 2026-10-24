@@ -41,12 +41,29 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
+DRAFT_ATTENTION_BACKENDS = {}
 HYBRID_GDN_SM100_BACKENDS = {"triton", "trtllm_mha", "fa4", "flashinfer"}
 
 
 def register_attention_backend(name):
     def decorator(fn):
         ATTENTION_BACKENDS[name] = fn
+        return fn
+
+    return decorator
+
+
+def register_draft_attention_backend(name):
+    """Register the multi-step draft decode backend for attention backend ``name``.
+
+    The factory is called as ``fn(runner=, topk=, speculative_num_steps=)`` and
+    returns a container exposing ``attn_backends`` (one per draft step). The
+    draft extend backend comes from the ``register_attention_backend`` factory
+    of the same name.
+    """
+
+    def decorator(fn):
+        DRAFT_ATTENTION_BACKENDS[name] = fn
         return fn
 
     return decorator
