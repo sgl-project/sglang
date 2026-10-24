@@ -669,16 +669,20 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                     latents=lat,
                 )
             )
-            # Step i records the timestep value i, so the timesteps name the steps kept.
             for i in range(4):
                 current_rollout_controller.record_trajectory_step(
                     latents=lat, timestep_value=torch.tensor(float(i)), step_index=i
                 )
+            # Timesteps cover every step; only latents follow the filter.
+            self.assertEqual(
+                [int(t) for t in current_rollout_controller.step_timesteps],
+                [0, 1, 2, 3],
+            )
             self.assertEqual(
                 len(current_rollout_controller.step_latents),
-                len(current_rollout_controller.step_timesteps),
+                len(current_rollout_controller.step_latent_indices),
             )
-            return [int(t) for t in current_rollout_controller.step_timesteps]
+            return current_rollout_controller.step_latent_indices
 
         # Filter [0, 2] over steps 0,1,2 -> steps 0 and 2 appended, step 1 skipped.
         self.assertEqual(_recorded_steps([0, 2]), [0, 2])

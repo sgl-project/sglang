@@ -199,6 +199,9 @@ def finalize_rollout_if_enabled(
                 current_rollout_controller.step_timesteps, dim=0
             ).cpu(),
             sigmas=current_rollout_controller.sigmas.detach().cpu().clone(),
+            latent_step_indices=torch.tensor(
+                current_rollout_controller.step_latent_indices, dtype=torch.long
+            ),
         )
 
     state = batch._rollout_denoising_env_state

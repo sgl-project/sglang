@@ -72,6 +72,7 @@ class FlowRolloutController:
         self.local_model_outputs: list[torch.Tensor] = []
 
         self.step_latents: list[torch.Tensor] = []
+        self.step_latent_indices: list[int] = []
         self.step_timesteps: list[torch.Tensor] = []
 
     def _reset_rollout_debug_tensors(self) -> None:
@@ -400,6 +401,7 @@ class FlowRolloutController:
         if not self.return_dit_trajectory:
             return
 
+        self.step_timesteps.append(timestep_value.detach())
         if (
             self.return_step_indices is not None
             and step_index not in self.return_step_indices
@@ -407,4 +409,4 @@ class FlowRolloutController:
             return
 
         self.step_latents.append(latents.detach())
-        self.step_timesteps.append(timestep_value.detach())
+        self.step_latent_indices.append(step_index)

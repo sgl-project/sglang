@@ -30,9 +30,12 @@ class RolloutDitTrajectory:
     # [B, T+1, ...]: per-step noisy latents x_{t_0..t_{T-1}} followed by the
     # final denoised latent x_{t_T} (last scheduler.step output).
     latents: torch.Tensor | None = None
-    timesteps: torch.Tensor | None = None  # [T]
+    timesteps: torch.Tensor | None = None  # [T+1], includes the terminal timestep
     # [T+1] scheduler.sigmas snapshot (post-shift, includes terminal 0).
     sigmas: torch.Tensor | None = None
+    # [K] original step index (0..T) of each latent in ``latents``; K < T+1 when
+    # rollout_return_step_indices filtered the trajectory.
+    latent_step_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -87,6 +90,7 @@ def concat_rollout_trajectory_data(
             ),
             timesteps=first.dit_trajectory.timesteps,
             sigmas=first.dit_trajectory.sigmas,
+            latent_step_indices=first.dit_trajectory.latent_step_indices,
         )
 
     return RolloutTrajectoryData(
@@ -139,6 +143,7 @@ def select_output_rollout_trajectory(
             latents=_slice_output_dim(dit_trajectory.latents, output_index),
             timesteps=dit_trajectory.timesteps,
             sigmas=dit_trajectory.sigmas,
+            latent_step_indices=dit_trajectory.latent_step_indices,
         )
 
     return RolloutTrajectoryData(

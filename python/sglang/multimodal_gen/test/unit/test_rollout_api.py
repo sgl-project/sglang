@@ -205,8 +205,9 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
             ),
             dit_trajectory=RolloutDitTrajectory(
                 latents=torch.randn(1, 5, 4, 2, 2, 2),
-                timesteps=torch.tensor([1.0, 0.75, 0.5, 0.25]),
+                timesteps=torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
                 sigmas=torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
+                latent_step_indices=torch.arange(5),
             ),
         )
         _, _, env, dit_traj = _serialize_rollout_trajectory(
@@ -224,6 +225,11 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
         self.assertTrue(dit_traj["latents"]["__tensor__"])
         self.assertTrue(dit_traj["timesteps"]["__tensor__"])
         self.assertTrue(dit_traj["sigmas"]["__tensor__"])
+        self.assertTrue(
+            torch.equal(
+                _maybe_deserialize(dit_traj["latent_step_indices"]), torch.arange(5)
+            )
+        )
 
 
 class TestBuildResponse(unittest.TestCase):
