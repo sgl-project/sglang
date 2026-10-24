@@ -2481,12 +2481,21 @@ def apply_fp8_linear_bmm_flashinfer(
     weight_scale: torch.Tensor,
     input_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
+    pre_quant_output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM90 and newer)."""
+    """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM90 and newer).
+
+    An fp8 ``input`` is taken as already quantized with ``input_scale``; the
+    output is then ``pre_quant_output_dtype`` (bf16 if omitted)."""
     output_shape = [*input.shape[:-1], weight.shape[1]]
     input_2d = input.view(-1, input.shape[-1])
-    qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
-    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, input.dtype)
+    if input_2d.dtype == torch.float8_e4m3fn:
+        qinput, x_scale = input_2d, input_scale
+        out_dtype = pre_quant_output_dtype or torch.bfloat16
+    else:
+        qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
+        out_dtype = input.dtype
+    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, out_dtype)
     if bias is not None:
         output = output + bias
     return output.view(*output_shape)

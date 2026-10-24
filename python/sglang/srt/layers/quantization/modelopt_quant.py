@@ -11,6 +11,7 @@ import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.gemm import try_sm120_fp8_linear
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import (
@@ -658,13 +659,16 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
-        if self.use_sm120_fp8:
-            from sglang.kernels.ops.gemm import try_sm120_fp8_linear
-
+        # A fused RMSNorm+FP8 quant hands down (fp8_input, input_scale, orig_dtype).
+        out_dtype = None
+        input_scale = layer.input_scale
+        if isinstance(x, tuple):
+            x, input_scale, out_dtype = x
+        if self.use_sm120_fp8 and out_dtype in (None, torch.bfloat16):
             output = try_sm120_fp8_linear(
                 x,
                 layer.weight,
-                layer.input_scale,
+                input_scale,
                 getattr(layer, "sm120_fp8_alpha", None),
                 bias,
             )
@@ -675,16 +679,18 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
-                input_scale=layer.input_scale,
+                input_scale=input_scale,
                 bias=bias,
+                pre_quant_output_dtype=out_dtype,
             )
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
+            input_scale=input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            pre_quant_output_dtype=out_dtype,
         )
 
 
