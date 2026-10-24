@@ -9,7 +9,8 @@ use serde_json::Value;
 use sglang_processor::dynamo_protocols::types::{
     ChatCompletionRequestMessage, CreateChatCompletionRequest,
 };
-use sglang_processor::dynamo_renderer::{OAIChatLikeRequest, TextInput};
+use sglang_processor::dynamo_renderer::{OAIChatLikeRequest, RenderedPrompt, TextInput};
+use sglang_processor::minijinja;
 
 pub use sglang_processor::ChatFormatter;
 use sglang_processor::TemplateError;
@@ -27,11 +28,17 @@ pub(super) fn render_chat(
     formatter: &ChatFormatter,
     body: Value,
     request: &CreateChatCompletionRequest,
-    kwargs: Option<&ChatTemplateKwargs>,
     defaults: &ChatTemplateKwargs,
 ) -> Result<RenderedChat, TemplateError> {
+    let args = TemplateArgs::new(&body, defaults);
+    let through_template = || {
+        render_template(formatter, request, &args).map(|prompt| RenderedChat {
+            prompt,
+            continuation: String::new(),
+        })
+    };
     if !formatter.renders_requests() {
-        return render_template(formatter, request, kwargs, defaults);
+        return through_template();
     }
     match formatter.render_request(body, defaults) {
         Ok((prompt, continuation)) => Ok(RenderedChat {
@@ -41,72 +48,86 @@ pub(super) fn render_chat(
         // The SGLang path declines some valid requests only the engine renders;
         // with no engine here, the formatter's template renders them (one
         // with no other path declines them again).
-        Err(TemplateError::NeedsRenderFallback { .. }) => {
-            render_template(formatter, request, kwargs, defaults)
-        }
+        Err(TemplateError::NeedsRenderFallback { .. }) => through_template(),
         Err(error) => Err(error),
     }
 }
 
-/// Render `request` through the formatter's template (Jinja, Dynamo's
-/// encoder, or the legacy conversation).
+/// What SGLang's chat layer reads off a raw chat body for its template. The
+/// body must be one SGLang's `ChatCompletionRequest` accepts; it is not
+/// re-validated.
+#[derive(Debug, Clone, Default)]
+pub struct TemplateArgs {
+    kwargs: HashMap<String, Value>,
+}
+
+impl TemplateArgs {
+    /// Python's template kwargs (`_process_messages`): the server `defaults`
+    /// under the request's own `chat_template_kwargs`.
+    pub fn new(body: &Value, defaults: &HashMap<String, Value>) -> Self {
+        let mut kwargs = defaults.clone();
+        let own = body["chat_template_kwargs"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        kwargs.extend(own);
+        Self { kwargs }
+    }
+}
+
+/// Render `request` through the formatter's own template (Jinja, Dynamo's
+/// encoder, or the legacy conversation) as SGLang's chat layer does.
 fn render_template(
     formatter: &ChatFormatter,
     request: &CreateChatCompletionRequest,
-    kwargs: Option<&ChatTemplateKwargs>,
-    defaults: &ChatTemplateKwargs,
-) -> Result<RenderedChat, TemplateError> {
-    // Python's `_process_messages`: the defaults under the request's own.
-    let mut merged = defaults.clone();
-    merged.extend(kwargs.cloned().unwrap_or_default());
-    let kwargs = (!merged.is_empty()).then_some(&merged);
-    formatter
-        .render_prompt(&TemplateRequest { request, kwargs })
-        .map(|prompt| RenderedChat {
-            prompt,
-            continuation: String::new(),
-        })
+    args: &TemplateArgs,
+) -> Result<RenderedPrompt, TemplateError> {
+    let request = TemplateRequest {
+        request,
+        kwargs: (!args.kwargs.is_empty()).then_some(&args.kwargs),
+    };
+    formatter.render_prompt(&request)
 }
 
 /// The wire request plus its `chat_template_kwargs`, which the protocol type
 /// does not carry.
 struct TemplateRequest<'a> {
     request: &'a CreateChatCompletionRequest,
-    kwargs: Option<&'a ChatTemplateKwargs>,
+    kwargs: Option<&'a HashMap<String, Value>>,
 }
 
 impl OAIChatLikeRequest for TemplateRequest<'_> {
     fn model(&self) -> String {
         self.request.model()
     }
-    fn messages(&self) -> sglang_processor::minijinja::Value {
+    fn messages(&self) -> minijinja::Value {
         self.request.messages()
     }
     fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
         self.request.typed_messages()
     }
-    fn tools(&self) -> Option<sglang_processor::minijinja::Value> {
+    fn tools(&self) -> Option<minijinja::Value> {
         self.request.tools()
     }
-    fn tool_choice(&self) -> Option<sglang_processor::minijinja::Value> {
+    fn tool_choice(&self) -> Option<minijinja::Value> {
         self.request.tool_choice()
     }
-    fn response_format(&self) -> Option<sglang_processor::minijinja::Value> {
+    fn response_format(&self) -> Option<minijinja::Value> {
         self.request.response_format()
     }
-    fn reasoning_effort(&self) -> Option<sglang_processor::minijinja::Value> {
+    fn reasoning_effort(&self) -> Option<minijinja::Value> {
         self.request.reasoning_effort()
     }
     fn should_add_generation_prompt(&self) -> bool {
         self.request.should_add_generation_prompt()
     }
-    fn chat_template_args(&self) -> Option<&ChatTemplateKwargs> {
+    fn chat_template_args(&self) -> Option<&HashMap<String, Value>> {
         self.kwargs
     }
     fn extract_text(&self) -> Option<TextInput> {
         self.request.extract_text()
     }
-    fn mm_processor_kwargs(&self) -> Option<&serde_json::Value> {
+    fn mm_processor_kwargs(&self) -> Option<&Value> {
         self.request.mm_processor_kwargs()
     }
 }
@@ -155,7 +176,7 @@ mod tests {
             ));
             let request: CreateChatCompletionRequest =
                 serde_json::from_value(body.clone()).unwrap();
-            let rendered = render_chat(&formatter, body, &request, None, &HashMap::new())
+            let rendered = render_chat(&formatter, body, &request, &HashMap::new())
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
             let prompt = rendered.prompt.as_str();
             assert!(
