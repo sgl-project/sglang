@@ -114,13 +114,10 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.mm_utils import apply_caller_mm_hashes, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    get_request_return_hidden_states_mode,
-)
+from sglang.srt.managers.schedule_batch import get_request_return_hidden_states_mode
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
@@ -1243,37 +1240,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
                     token_type_ids = token_type_ids.flatten().tolist()
-            # Caller-supplied per-image hashes (external KV routers, e.g.
-            # routing-aware orchestrators that compute a content-addressed
-            # hash before dispatch). Setting MultimodalDataItem.hash here
-            # short-circuits the internal hash_feature() recompute inside
-            # set_pad_value(), making the derived pad_value deterministic
-            # from the caller's hash. That alignment lets the router's
-            # routing decision agree with sglang's prefix-cache key for
-            # the same image. On any per-item parse error or list-length
-            # mismatch we fall back to the internal recompute so a
-            # malformed mm_hashes never blocks a request.
-            caller_mm_hashes = getattr(obj, "mm_hashes", None)
-            if caller_mm_hashes and mm_inputs and mm_inputs.mm_items:
-                if len(caller_mm_hashes) != len(mm_inputs.mm_items):
-                    logger.warning(
-                        "mm_hashes length (%d) != mm_items length (%d); "
-                        "ignoring caller hashes for this request.",
-                        len(caller_mm_hashes),
-                        len(mm_inputs.mm_items),
-                    )
-                else:
-                    for item, hex_hash in zip(mm_inputs.mm_items, caller_mm_hashes):
-                        if not isinstance(item, MultimodalDataItem):
-                            continue
-                        try:
-                            item.set_hash(int(hex_hash, 16))
-                        except (TypeError, ValueError):
-                            logger.warning(
-                                "Ignoring malformed mm_hashes entry %r; "
-                                "this item will fall back to hash_feature().",
-                                hex_hash,
-                            )
+            if mm_inputs and isinstance(obj, GenerateReqInput):
+                apply_caller_mm_hashes(mm_inputs=mm_inputs, mm_hashes=obj.mm_hashes)
             if (
                 envs.SGLANG_MM_PRECOMPUTE_HASH.get()
                 and mm_inputs
@@ -1639,6 +1607,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
                 token_indices_to_pool=obj.token_indices_to_pool,
                 encoder_urls=obj.encoder_urls,
+                mm_hashes=obj.mm_hashes,
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
