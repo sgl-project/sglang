@@ -1211,10 +1211,17 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
             raise ValueError(
                 "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100/SM12x). Please use a different backend."
             )
-        if view.kv_cache_dtype not in ["fp8_e4m3", "bf16", "auto"]:
+        if view.kv_cache_dtype not in ["fp8_e4m3", "bf16", "bfloat16", "auto"]:
             raise ValueError(
                 "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto."
             )
+    prefill_backend, _ = attention_backends_of(view)
+    if prefill_backend == "trtllm_mla" and not get_platform().is_sm100:
+        raise ValueError(
+            "TRTLLM MLA prefill requires SM10x (datacenter Blackwell). "
+            "Please use a different prefill backend, such as "
+            "--prefill-attention-backend flashinfer."
+        )
     return {}
 
 
