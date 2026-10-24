@@ -56,6 +56,7 @@ class TestTransferStartLayer(CustomTestCase):
 class _RecordingKVManager:
     get_mha_kv_ptrs_with_pp = CommonKVManager.get_mha_kv_ptrs_with_pp
     get_mla_kv_ptrs_with_pp = CommonKVManager.get_mla_kv_ptrs_with_pp
+    _get_kvcache_layer_params = MooncakeKVManager._get_kvcache_layer_params
 
     def __init__(self, *, prefill_start_layer: int, pp_size: int):
         self.is_mla_backend = False

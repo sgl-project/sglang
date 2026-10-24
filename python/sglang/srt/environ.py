@@ -855,6 +855,11 @@ class Envs:
     # synchronous all-layer Mooncake batch. Set to a positive value to split
     # larger transfers; 0 preserves the legacy single-batch behavior.
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
+    # Cross-request KV batches drain already queued chunks without waiting.
+    # A size of 1 disables batching; oversized chunks keep the single-request path.
+    SGLANG_MOONCAKE_MAX_REQUEST_BATCH_SIZE = EnvInt(1)
+    SGLANG_MOONCAKE_MAX_REQUEST_BATCH_BYTES = EnvInt(64 * 1024 * 1024)
+    SGLANG_MOONCAKE_MAX_REQUEST_BATCH_DESCRIPTORS = EnvInt(4096)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)

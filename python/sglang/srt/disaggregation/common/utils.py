@@ -88,6 +88,16 @@ class FastQueue:
                 self._cond.wait()
             return self._buf.popleft()
 
+    def drain(self, max_items):
+        """Drain an available FIFO prefix without consuming a stop sentinel."""
+        items = []
+        with self._cond:
+            while self._buf and len(items) < max_items:
+                if self._buf[0] is None:
+                    break
+                items.append(self._buf.popleft())
+        return items
+
 
 class AuxDataCodec:
     """Handles serialization and deserialization of auxiliary data buffers."""

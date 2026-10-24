@@ -3,7 +3,7 @@ import ctypes
 import unittest
 from collections import defaultdict
 from queue import SimpleQueue
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
-from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.common.utils import FastQueue, TransferKVChunk
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -48,6 +48,9 @@ class TestMooncakeTransferBatching(unittest.TestCase):
         )
         manager._await_transfer_futures = lambda futures: (
             MooncakeKVManager._await_transfer_futures(manager, futures)
+        )
+        manager._get_kvcache_layer_params = (
+            MooncakeKVManager._get_kvcache_layer_params.__get__(manager)
         )
         return manager
 
@@ -516,6 +519,9 @@ class TestMooncakeEarlySend(CustomTestCase):
             bootstrap_port=8998,
         )
         manager.check_status = lambda room: manager.request_status[room]
+        manager._request_batching_enabled = (
+            MooncakeKVManager._request_batching_enabled.__get__(manager)
+        )
         return manager, queue
 
     def test_worker_waits_before_reading_kv(self):
@@ -630,6 +636,431 @@ class TestMooncakeStagingDeviceType(unittest.TestCase):
             MooncakeKVManager._init_staging_allocator(manager)
 
         self.assertEqual(init_allocator.call_args.kwargs["device_type"], "xpu")
+
+
+class TestMooncakeRequestBatching(CustomTestCase):
+    """Protect request page mappings and completion/abort ordering across a batch."""
+
+    def setUp(self):
+        memory = patch(
+            "sglang.srt.disaggregation.mooncake.conn.get_memory",
+            return_value=SimpleNamespace(enable_unified_memory=False),
+        )
+        memory.start()
+        self.addCleanup(memory.stop)
+        self.sources = [np.arange(48, dtype=np.int32) + i * 100 for i in range(2)]
+        self.state_source = np.arange(48, dtype=np.int32) + 1000
+        self.aux_source = np.arange(48, dtype=np.int32) + 2000
+        self.destinations = {}
+        self.state_destinations = {}
+        self.aux_destinations = {}
+        self.calls = []
+        self.notifications = []
+        self.before_transfer = None
+        self.failed_session = None
+        self.failed_submission = None
+
+    def _manager(self, batch_size=8, sessions=("peer",)):
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.attn_tp_size = manager.attn_cp_size = manager.pp_size = 1
+        manager.attn_tp_rank = manager.attn_cp_rank = manager.pp_rank = 0
+        manager.enable_trace = manager.enable_staging = False
+        manager.enable_custom_mem_pool = False
+        manager.custom_mem_pool_type = None
+        manager.enable_deferred_decode_kv_release = True
+        manager.defer_decode_allocation = False
+        manager.deferred_bootstrap = None
+        manager.max_transfer_batch_indices = 0
+        manager.max_request_batch_size = batch_size
+        manager.max_request_batch_bytes = 1024
+        manager.max_request_batch_descriptors = 32
+        manager._request_batch_lock = Lock()
+        manager.session_lock = Lock()
+        manager.failure_lock = Lock()
+        manager._staging_outstanding = defaultdict(int)
+        manager._deferred_ack_targets = {}
+        manager._deferred_ack_poisoned_rooms = set()
+        manager.failed_sessions = set()
+        manager.failed_session_probes = {}
+        manager.session_failures = defaultdict(int)
+        manager.state_layout_rejections = {}
+        manager.state_strides_validated = set(sessions)
+        manager.request_status = {}
+        manager.failure_records = {}
+        manager.transfer_infos = {}
+        manager.req_to_decode_prefix_len = {}
+        manager.decode_kv_args_table = {}
+        manager.bootstrap_port = 8998
+        manager.kv_args = SimpleNamespace(
+            prefill_start_layer=0,
+            kv_data_ptrs=[source.ctypes.data for source in self.sources],
+            kv_item_lens=[4, 4],
+            kv_layer_ids=[],
+            aux_data_ptrs=[self.aux_source.ctypes.data],
+            aux_item_lens=[4],
+            state_types=[StateType.SWA],
+            state_data_ptrs=[[self.state_source.ctypes.data]],
+            state_item_lens=[[4]],
+            state_dim_per_tensor=[[]],
+            state_layer_ids=[[]],
+        )
+
+        def transfer(session, sources, destinations, lengths):
+            self.calls.append((session, sources, destinations, lengths))
+            if self.before_transfer is not None:
+                self.before_transfer(manager)
+            if (
+                session == self.failed_session
+                or len(self.calls) == self.failed_submission
+            ):
+                return -1
+            for src, dst, length in zip(sources, destinations, lengths, strict=True):
+                ctypes.memmove(dst, src, length)
+            return 0
+
+        manager.engine = SimpleNamespace(batch_transfer_sync=transfer)
+        manager._send_multipart_locked = lambda endpoint, parts, **kwargs: (
+            self.notifications.append((endpoint, parts))
+        )
+        for session in sessions:
+            buffers = [np.full(64, -1, dtype=np.int32) for _ in self.sources]
+            state = np.full(64, -1, dtype=np.int32)
+            aux = np.full(64, -1, dtype=np.int32)
+            self.destinations[session] = buffers
+            self.state_destinations[session] = state
+            self.aux_destinations[session] = aux
+            manager.decode_kv_args_table[session] = SimpleNamespace(
+                requires_dcp_relayout=False,
+                dst_attn_tp_size=1,
+                dst_kv_ptrs=[buf.ctypes.data for buf in buffers],
+                dst_kv_item_len=4,
+                dst_kv_layer_ids=[],
+                dst_aux_ptrs=[aux.ctypes.data],
+                dst_state_data_ptrs=[[state.ctypes.data]],
+                dst_state_item_lens=[[4]],
+                dst_state_dim_per_tensor=[[]],
+                dst_state_layer_ids=[[]],
+            )
+        return manager
+
+    def _chunk(self, manager, room, src, dst, *, last=False, sessions=("peer",)):
+        manager.request_status[room] = KVPoll.WaitingForInput
+        manager.transfer_infos[room] = {
+            session: SimpleNamespace(
+                room=room,
+                is_dummy=False,
+                mooncake_session_id=session,
+                dst_kv_indices=np.array(dst, dtype=np.int32),
+                dst_device_kv_indices=None,
+                dst_aux_index=room + 10,
+                dst_state_indices=[[room + 5]],
+                endpoint="127.0.0.1",
+                dst_port=6000 + i,
+                required_dst_info_num=len(sessions),
+            )
+            for i, session in enumerate(sessions)
+        }
+        return TransferKVChunk(
+            room=room,
+            prefill_kv_indices=np.array(src, dtype=np.int32),
+            index_slice=slice(0, len(src)),
+            is_last_chunk=last,
+            prefill_aux_index=room if last else None,
+            state_indices=[[room]] if last else None,
+        )
+
+    def _run(self, manager, chunks):
+        queue = FastQueue()
+        for chunk in chunks:
+            queue.put(chunk)
+        queue.put(None)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            manager.transfer_worker(queue, executor)
+
+    def _assert_pages(self, session, src, dst):
+        for source, destination in zip(self.sources, self.destinations[session]):
+            np.testing.assert_array_equal(destination[dst], source[src])
+            untouched = np.ones(destination.size, dtype=bool)
+            untouched[dst] = False
+            np.testing.assert_array_equal(destination[untouched], -1)
+
+    def test_merges_requests_without_changing_fragmented_page_mapping(self):
+        for mla, tensor_indices in (
+            (False, False), (True, False), (False, True), (True, True)
+        ):
+            with self.subTest(mla=mla, tensor_indices=tensor_indices):
+                self.calls.clear()
+                manager = self._manager()
+                manager.is_mla_backend = mla
+                chunks = [
+                    self._chunk(manager, 1, [1, 2, 5], [11, 12, 15]),
+                    self._chunk(manager, 2, [7, 9], [21, 24]),
+                ]
+
+                if tensor_indices:
+                    for chunk in chunks:
+                        chunk.prefill_kv_indices = torch.from_numpy(
+                            chunk.prefill_kv_indices
+                        )
+                        chunk.indices_event = MagicMock()
+                        chunk.indices_event.query.return_value = True
+
+                def assert_inflight(manager):
+                    self.assertEqual(dict(manager._staging_outstanding), {1: 1, 2: 1})
+                    self.assertEqual(self.notifications, [])
+
+                self.before_transfer = assert_inflight
+                self._run(manager, chunks)
+                self._assert_pages("peer", [1, 2, 5, 7, 9], [11, 12, 15, 21, 24])
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual(
+                    set(manager.request_status.values()), {KVPoll.WaitingForInput}
+                )
+
+    def test_groups_each_destination_session_and_keeps_room_notifications(self):
+        manager = self._manager(sessions=("peer", "other"))
+        chunks = [
+            self._chunk(manager, 1, [1], [11], last=True, sessions=("peer", "other")),
+            self._chunk(manager, 2, [2], [12], last=True, sessions=("peer", "other")),
+        ]
+        self._run(manager, chunks)
+        for session in ("peer", "other"):
+            self._assert_pages(session, [1, 2], [11, 12])
+            np.testing.assert_array_equal(
+                self.state_destinations[session][[6, 7]], self.state_source[[1, 2]]
+            )
+            np.testing.assert_array_equal(
+                self.aux_destinations[session][[11, 12]], self.aux_source[[1, 2]]
+            )
+        # One main-KV call per session, followed by each room's state and aux.
+        self.assertEqual([call[0] for call in self.calls[:2]], ["peer", "other"])
+        self.assertEqual(len(self.calls), 10)
+        self.assertEqual(set(manager.request_status.values()), {KVPoll.Success})
+        self.assertCountEqual(
+            [(int(parts[0]), int(parts[1])) for _, parts in self.notifications],
+            [(1, KVPoll.Success)] * 2 + [(2, KVPoll.Success)] * 2,
+        )
+        self.assertEqual(dict(manager._staging_outstanding), {})
+
+    def test_limits_and_default_path_preserve_data(self):
+        for limit in ("disabled", "bytes", "descriptors", "oversized", "singleton"):
+            with self.subTest(limit=limit):
+                self.calls.clear()
+                manager = self._manager(batch_size=1 if limit == "disabled" else 8)
+                if limit == "bytes":
+                    manager.max_request_batch_bytes = 8
+                elif limit == "descriptors":
+                    manager.max_request_batch_descriptors = 2
+                elif limit == "oversized":
+                    manager.max_request_batch_bytes = 4
+                chunks = [
+                    self._chunk(manager, 1, [1], [11]),
+                    self._chunk(manager, 2, [2], [12]),
+                ]
+                if limit == "singleton":
+                    chunks = chunks[:1]
+                self._run(manager, chunks)
+                if limit == "singleton":
+                    self._assert_pages("peer", [1], [11])
+                    self.assertEqual(len(self.calls), 1)
+                else:
+                    self._assert_pages("peer", [1, 2], [11, 12])
+                    self.assertEqual(len(self.calls), 2)
+
+    def test_bounded_batches_split_without_losing_member_results(self):
+        manager = self._manager()
+        manager.max_request_batch_bytes = 16
+        chunks = [self._chunk(manager, i, [i], [i + 10]) for i in range(1, 5)]
+        self._run(manager, chunks)
+        self._assert_pages("peer", [1, 2, 3, 4], [11, 12, 13, 14])
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue(all(sum(call[3]) == 16 for call in self.calls))
+        self.assertEqual(set(manager.request_status.values()), {KVPoll.WaitingForInput})
+
+    def test_later_chunk_of_same_room_is_a_fifo_barrier(self):
+        manager = self._manager()
+        first = self._chunk(manager, 1, [1], [11, 12], last=False)
+        first.index_slice = slice(0, 1)
+        last = TransferKVChunk(1, np.array([2], np.int32), slice(1, 2), True, 1, [[1]])
+        other = self._chunk(manager, 2, [3], [13])
+        self._run(manager, [first, last, other])
+        self._assert_pages("peer", [1, 2, 3], [11, 12, 13])
+        # Two room-1 KV chunks, then its state and aux, then room 2.
+        self.assertEqual(len(self.calls), 5)
+        self.assertEqual(manager.request_status[1], KVPoll.Success)
+        self.assertEqual(manager.request_status[2], KVPoll.WaitingForInput)
+        self.assertEqual(len(self.notifications), 1)
+
+    def test_failed_session_does_not_fail_other_batch_members(self):
+        manager = self._manager(sessions=("peer", "other"))
+        self.failed_session = "peer"
+        chunks = [
+            self._chunk(manager, 1, [1], [11], sessions=("peer",)),
+            self._chunk(manager, 2, [2], [12], sessions=("peer",)),
+            self._chunk(manager, 3, [3], [13], last=True, sessions=("other",)),
+        ]
+        self._run(manager, chunks)
+        self.assertEqual(manager.request_status[1], KVPoll.Failed)
+        self.assertEqual(manager.request_status[2], KVPoll.Failed)
+        self.assertEqual(manager.request_status[3], KVPoll.Success)
+        self._assert_pages("other", [3], [13])
+        self.assertTrue(all(np.all(buf == -1) for buf in self.destinations["peer"]))
+        self.assertEqual(manager._deferred_ack_poisoned_rooms, {1, 2})
+
+    def test_next_session_cohort_waits_for_earlier_room_completion(self):
+        manager = self._manager(sessions=("peer", "other"))
+        chunks = [
+            self._chunk(manager, 1, [1], [11], last=True),
+            self._chunk(manager, 2, [2], [12], last=True),
+            self._chunk(manager, 3, [3], [13], last=True, sessions=("other",)),
+            self._chunk(manager, 4, [4], [14], last=True, sessions=("other",)),
+        ]
+
+        def check_previous_cohort(manager):
+            if self.calls[-1][0] == "other":
+                self.assertEqual(manager.request_status[1], KVPoll.Success)
+                self.assertEqual(manager.request_status[2], KVPoll.Success)
+
+        self.before_transfer = check_previous_cohort
+        self._run(manager, chunks)
+        self._assert_pages("peer", [1, 2], [11, 12])
+        self._assert_pages("other", [3, 4], [13, 14])
+        self.assertEqual(set(manager.request_status.values()), {KVPoll.Success})
+
+    def test_aux_failure_after_merged_kv_preserves_other_room_completion(self):
+        manager = self._manager()
+        chunks = [
+            self._chunk(manager, 1, [1], [11], last=True),
+            self._chunk(manager, 2, [2], [12], last=True),
+        ]
+        # Main KV succeeds, then room 1's state succeeds but its aux fails.
+        self.failed_submission = 3
+        self._run(manager, chunks)
+        self._assert_pages("peer", [1, 2], [11, 12])
+        self.assertEqual(manager.request_status[1], KVPoll.Failed)
+        self.assertEqual(manager.request_status[2], KVPoll.Success)
+        self.assertEqual(self.aux_destinations["peer"][11], -1)
+        self.assertEqual(self.aux_destinations["peer"][12], self.aux_source[2])
+        self.assertCountEqual(
+            [(int(parts[0]), int(parts[1])) for _, parts in self.notifications],
+            [(1, KVPoll.Failed), (2, KVPoll.Success)],
+        )
+        self.assertEqual(dict(manager._staging_outstanding), {})
+
+    def test_abort_during_batch_holds_all_chunks_until_write_returns(self):
+        manager = self._manager()
+        chunks = [
+            self._chunk(manager, 1, [1], [11]),
+            self._chunk(manager, 2, [2], [12]),
+        ]
+        acks = []
+        manager._deferred_ack_targets[2] = {("127.0.0.1", 6000): object()}
+        manager._send_abort_ack = lambda room, target: acks.append(room)
+
+        started, finish = Event(), Event()
+        errors = []
+
+        def hold_transfer(manager):
+            started.set()
+            if not finish.wait(5):
+                raise TimeoutError("test did not release the in-flight transfer")
+
+        def worker():
+            try:
+                self._run(manager, chunks)
+            except Exception as exc:
+                errors.append(exc)
+
+        self.before_transfer = hold_transfer
+        thread = Thread(target=worker)
+        thread.start()
+        try:
+            self.assertTrue(started.wait(5))
+            manager.update_status(2, KVPoll.Failed)
+            manager._maybe_ack_drained_abort(2)
+            self.assertEqual(acks, [])
+            self.assertEqual(dict(manager._staging_outstanding), {1: 1, 2: 1})
+        finally:
+            finish.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self._assert_pages("peer", [1, 2], [11, 12])
+        self.assertEqual(acks, [2])
+        self.assertEqual(manager.request_status[2], KVPoll.Failed)
+
+    def test_skipping_one_aborted_chunk_does_not_ack_its_remaining_chunk(self):
+        manager = self._manager()
+        first = self._chunk(manager, 1, [1], [11, 12])
+        first.index_slice = slice(0, 1)
+        other = self._chunk(manager, 2, [3], [13])
+        last = TransferKVChunk(
+            1, np.array([2], np.int32), slice(1, 2), False, None, None
+        )
+        acks = []
+        manager._deferred_ack_targets[1] = {("127.0.0.1", 6000): object()}
+        manager._send_abort_ack = lambda room, target: acks.append(room)
+
+        def abort(manager):
+            self.assertEqual(manager._staging_outstanding[1], 2)
+            manager.update_status(1, KVPoll.Failed)
+            manager._maybe_ack_drained_abort(1)
+            self.assertEqual(acks, [])
+
+        self.before_transfer = abort
+        self._run(manager, [first, other, last])
+        self._assert_pages("peer", [1, 3], [11, 13])
+        self.assertEqual(acks, [1])
+        self.assertNotIn(1, manager._staging_outstanding)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_fallback_event_and_dcp_do_not_overtake_earlier_chunks(self):
+        for special in ("event", "dcp", "pending_indices"):
+            with self.subTest(special=special):
+                manager = self._manager()
+                first = self._chunk(manager, 1, [1], [11])
+                second = self._chunk(manager, 2, [2], [12])
+                if special == "event":
+                    first.wait_event = object()
+                elif special == "dcp":
+                    manager.decode_kv_args_table["peer"].requires_dcp_relayout = True
+                else:
+                    first.indices_event = MagicMock()
+                    first.indices_event.query.return_value = False
+                results = manager._send_request_batch([first, second])
+                self.assertEqual(results, {})
+                self.assertEqual(self.calls, [])
+                self.assertTrue(
+                    all(np.all(buf == -1) for buf in self.destinations["peer"])
+                )
+
+    def test_queue_drain_preserves_shutdown_sentinel_and_fifo(self):
+        queue = FastQueue()
+        for item in (1, 2, None, 3):
+            queue.put(item)
+        self.assertEqual(queue.drain(8), [1, 2])
+        self.assertIsNone(queue.get())
+        self.assertEqual(queue.get(), 3)
+        self.assertEqual(queue.drain(8), [])
+
+    def test_special_submission_paths_keep_legacy_worker(self):
+        for settings in (
+            {"enable_staging": True},
+            {"enable_trace": True},
+            {"max_transfer_batch_indices": 1},
+            {"enable_custom_mem_pool": True, "custom_mem_pool_type": "NVLINK"},
+            {"enable_custom_mem_pool": True, "custom_mem_pool_type": "BAREX"},
+        ):
+            with self.subTest(settings=settings):
+                manager = self._manager()
+                manager.__dict__.update(settings)
+                self.assertFalse(manager._request_batching_enabled())
+        manager = self._manager()
+        manager.enable_custom_mem_pool = True
+        manager.custom_mem_pool_type = "INTRA_NODE_NVLINK"
+        self.assertTrue(manager._request_batching_enabled())
 
 
 if __name__ == "__main__":
