@@ -560,6 +560,20 @@ pub struct RenderedChat {
 }
 
 impl RenderedChat {
+    /// Python's chat encode, through the processor's tokenizer.
+    pub fn encode(
+        &self,
+        tokenizer: &dyn sglang_processor::TextTokenizer,
+    ) -> Result<Vec<i32>, sglang_processor::ProcessorError> {
+        let segments = self.prompt.encode_segments().unwrap_or_else(|| {
+            vec![sglang_processor::dynamo_tokenizers::EncodeSegment::new(
+                self.prompt.as_str(),
+                true,
+            )]
+        });
+        tokenizer.encode_chat(&segments, &self.continuation)
+    }
+
     #[cfg(test)]
     pub fn into_text(self) -> String {
         self.prompt.into_text() + &self.continuation

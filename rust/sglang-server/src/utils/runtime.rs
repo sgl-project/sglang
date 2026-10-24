@@ -180,9 +180,10 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     // tokenizer is loaded, and the server emits raw `output_ids` (no decode).
     let skip_tokenizer_init = cfg.server_args.skip_tokenizer_init;
 
-    // The same instance is shared by the tokenizer pool (encode) and the detok
-    // shards (decode); `None` only under `skip_tokenizer_init`.
-    let dyn_tokenizer = tokenizer::load_tokenizer(
+    // The tokenizer pool encodes through the processor's tokenizer, and the
+    // detok shards decode with its handle; `None` only under
+    // `skip_tokenizer_init`.
+    let text_tokenizer = tokenizer::load_tokenizer(
         // Empty only in standalone (test) configs (the Python handoff always
         // resolves it); empty → no tokenizer, allowed only under
         // `skip_tokenizer_init`.
@@ -190,14 +191,11 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         cfg.server_args.revision.as_deref(),
         skip_tokenizer_init,
     )?;
-    // The `TextTokenizer` view of it, for the tokenizer pool. The MM workers
-    // never tokenize: a multimodal text prompt passes through the pool first.
-    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> =
-        dyn_tokenizer.as_ref().map(|t| {
-            let path = &cfg.server_args.tokenizer_path;
-            let revision = cfg.server_args.revision.as_deref();
-            Arc::new(tokenizer::DynamoTokenizer::new(t.clone(), path, revision)) as _
-        });
+    let dyn_tokenizer = text_tokenizer.as_ref().map(|t| t.tokenizer().clone());
+    // The MM workers never tokenize: a multimodal text prompt passes through
+    // the pool first.
+    let text_tokenizer: Option<Arc<dyn sglang_processor::TextTokenizer>> =
+        text_tokenizer.map(|t| Arc::new(t) as _);
 
     // The potentially slow/fallible tokenizer load above happens before the
     // ports become visible. Own both sockets before starting any worker or
