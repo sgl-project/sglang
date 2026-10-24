@@ -1,3 +1,6 @@
+import json
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -19,6 +22,18 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+_MINI_CONFIG = {
+    "architectures": ["LlamaForCausalLM"],
+    "model_type": "llama",
+    "hidden_size": 16,
+    "intermediate_size": 32,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 8,
+    "num_hidden_layers": 2,
+    "vocab_size": 128,
+    "max_position_embeddings": 2048,
+}
 
 
 def _args(allocation_index: int, **kwargs) -> ServerArgs:
@@ -60,6 +75,69 @@ def _topology(
     return_value=4,
 )
 class TestElasticEPAutoBootstrap(CustomTestCase):
+    def _resolve_with_eplb(self, allocation_index, topology=None):
+        # A real model config reaches the full pipeline, unlike model_path="dummy".
+        with (
+            tempfile.TemporaryDirectory() as model_path,
+            patch.dict("os.environ"),
+            patch(
+                "sglang.srt.elastic_ep.runtime_topology.probe_runtime_topology",
+                return_value=topology,
+            ),
+        ):
+            Path(model_path, "config.json").write_text(json.dumps(_MINI_CONFIG))
+            server_args = _args(
+                allocation_index,
+                model_path=model_path,
+                enable_eplb=True,
+                device="cuda",
+                random_seed=42,
+            )
+            server_args.resolve_once()
+        return server_args
+
+    def test_full_pipeline_resolves_initial_geometry_before_eplb(self, _device_count):
+        for index in (0, 1):
+            with self.subTest(index=index):
+                server_args = self._resolve_with_eplb(index)
+
+                cfg = resolved_view(server_args)
+                self.assertTrue(server_args._resolution_finished)
+                self.assertTrue(cfg.enable_eplb)
+                self.assertEqual(cfg.eplb_algorithm, "elasticity_aware")
+                self.assertEqual(cfg.expert_distribution_recorder_mode, "stat")
+                self.assertEqual(cfg.moe_a2a_backend, "nixl")
+                self.assertIsNone(cfg.ep_join_mode)
+                self.assertEqual(cfg.tp_size, 8)
+                self.assertEqual(cfg.ep_size, 8)
+                self.assertEqual(cfg.attn_dp_size, 8)
+                self.assertEqual(cfg.dp_size, 1)
+                self.assertTrue(cfg.enable_dp_lm_head)
+                self.assertEqual(cfg.node_rank, index)
+                self.assertEqual(cfg.nnodes, 2)
+                self.assertEqual(cfg.elastic_ep_allocation_width, 4)
+
+    def test_full_pipeline_resolves_append_geometry_before_eplb(self, _device_count):
+        server_args = self._resolve_with_eplb(2, _topology())
+
+        cfg = resolved_view(server_args)
+        self.assertTrue(server_args._resolution_finished)
+        self.assertTrue(cfg.enable_eplb)
+        self.assertEqual(cfg.eplb_algorithm, "elasticity_aware")
+        self.assertEqual(cfg.expert_distribution_recorder_mode, "stat")
+        self.assertEqual(cfg.moe_a2a_backend, "nixl")
+        self.assertEqual(cfg.ep_join_mode, "scale")
+        self.assertEqual(cfg.tp_size, 4)
+        self.assertEqual(cfg.ep_size, 4)
+        self.assertEqual(cfg.attn_dp_size, 4)
+        self.assertEqual(cfg.dp_size, 1)
+        self.assertTrue(cfg.enable_dp_lm_head)
+        self.assertEqual(cfg.ep_join_rank_offset, 8)
+        self.assertEqual(cfg.node_rank, 1)
+        self.assertEqual(cfg.nnodes, 2)
+        self.assertEqual(cfg.elastic_ep_allocation_width, 4)
+        self.assertEqual(cfg.elastic_ep_runtime_instance_id, "runtime-1")
+
     def test_initial_allocations_form_one_world(self, _device_count):
         for index in (0, 1):
             with (

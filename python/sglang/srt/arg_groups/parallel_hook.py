@@ -547,9 +547,8 @@ def handle_dwdp(server_args: Any):
     )
 
 
-def handle_elastic_ep(server_args: Any):
-    from sglang.srt.arg_groups.validation_hook import validate_ib_devices
-
+def handle_elastic_ep_auto_bootstrap(server_args: Any):
+    """Resolve automatic geometry before topology-dependent defaults and checks."""
     cfg = resolving_view(server_args)
     if cfg.ep_join_mode == "auto":
         from sglang.srt.elastic_ep.runtime_topology import (
@@ -664,8 +663,19 @@ def handle_elastic_ep(server_args: Any):
                 nnodes=2,
                 elastic_ep_runtime_instance_id=existing.runtime_instance_id,
             )
+
+
+def handle_elastic_ep(server_args: Any):
+    from sglang.srt.arg_groups.validation_hook import validate_ib_devices
+
+    cfg = resolving_view(server_args)
+    if cfg.ep_join_mode == "auto":
+        run_hook(handle_elastic_ep_auto_bootstrap, server_args)
         cfg = resolving_view(server_args)
-    elif cfg.elastic_ep_allocation_index is not None:
+    elif (
+        cfg.elastic_ep_allocation_index is not None
+        and _elastic_ep_raw_input(server_args, "ep_join_mode") != "auto"
+    ):
         raise AssertionError(
             "--elastic-ep-allocation-index is only valid with "
             "--elastic-ep-join-mode auto."
