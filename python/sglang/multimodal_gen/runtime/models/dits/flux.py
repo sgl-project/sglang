@@ -1206,7 +1206,13 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             module, (FluxTransformerBlock, FluxSingleTransformerBlock)
         )
     ]
-    param_names_mapping = FluxConfig().arch_config.param_names_mapping
+    param_names_mapping = {
+        **FluxConfig().arch_config.param_names_mapping,
+        # FLUX.1 single blocks keep attention and MLP projections separate; the
+        # shared mapping targets FLUX.2's fused to_qkv_mlp_proj.
+        r"^single_transformer_blocks\.(\d+)\.qkv_proj\.(.*)$": r"single_transformer_blocks.\1.attn.to_qkv.\2",
+        r"^single_transformer_blocks\.(\d+)\.out_proj\.(.*)$": r"single_transformer_blocks.\1.attn.to_out.0.\2",
+    }
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
