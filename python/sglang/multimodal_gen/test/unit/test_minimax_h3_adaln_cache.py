@@ -201,15 +201,18 @@ def test_slot_gathers_never_read_the_slot_on_host(tmp_path):
     with forbid_host_syncs():
         stacked = cache.block_all(cache_plan_index=slot, num_timesteps=2)
         final = cache.final(slot, 2)
-    for index in range(_ARCH.num_layers):
-        expected = _reference_block(cache, index, int(slot), 2)
-        for got, want in zip(stacked[index], expected, strict=True):
-            assert torch.equal(got, want)
-            assert got.stride() == want.stride()
+    expected = [
+        _reference_block(cache, index, int(slot), 2)
+        for index in range(_ARCH.num_layers)
+    ]
     expected_final = cache.final_params[int(slot), :2].reshape(-1, 2, _ARCH.hidden_size)
-    for got, want in zip(final, expected_final.unbind(dim=1), strict=True):
-        assert torch.equal(got, want)
-        assert got.stride() == want.stride()
+    torch.testing.assert_close(
+        (stacked, final),
+        (expected, expected_final.unbind(dim=1)),
+        rtol=0,
+        atol=0,
+        check_stride=True,
+    )
 
 
 def test_online_cache_resolve_slots_after_build(tmp_path):

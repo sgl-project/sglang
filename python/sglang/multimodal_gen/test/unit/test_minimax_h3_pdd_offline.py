@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
     minimax_h3_time_shift_sigmas,
 )
+from sglang.multimodal_gen.test.unit.host_sync_guard import CountedUploads
 from sglang.multimodal_gen.tools import build_minimax_h3_pdd_weights as build
 from sglang.test.test_utils import CustomTestCase
 
@@ -36,14 +37,6 @@ def _make_heads() -> dict[str, torch.Tensor]:
             torch.arange(8 * width, dtype=torch.float32).reshape(8, width) / 100
         )
     return heads
-
-
-class _CountedUploads(torch.Tensor):
-    uploads = 0
-
-    def to(self, *args, **kwargs):
-        _CountedUploads.uploads += 1
-        return super().to(*args, **kwargs)
 
 
 class TestMiniMaxH3PDDOffline(CustomTestCase):
@@ -101,23 +94,23 @@ class TestMiniMaxH3PDDOffline(CustomTestCase):
             layer.load_pdd_fused_heads(str(path))
             # the loaded heads stay on the host; count their copies to the device
             layer._pdd_heads = {
-                key: value.as_subclass(_CountedUploads)
+                key: value.as_subclass(CountedUploads)
                 for key, value in layer._pdd_heads.items()
             }
-            _CountedUploads.uploads = 0
+            CountedUploads.uploads = 0
             h = torch.arange(15, dtype=torch.float32).reshape(3, 5)
             for step in range(8):
                 with set_forward_context(step, None):
                     outputs = layer._project(h)
-                for output, name in zip(outputs, ("video_out", "audio_out")):
-                    expected = torch.nn.functional.linear(
+                expected = [
+                    torch.nn.functional.linear(
                         h, heads[f"{name}.weight"][step], heads[f"{name}.bias"][step]
                     )
-                    self.assertTrue(
-                        torch.equal(output.as_subclass(torch.Tensor), expected)
-                    )
+                    for name in ("video_out", "audio_out")
+                ]
+                torch.testing.assert_close(outputs, expected, rtol=0, atol=0)
             # one weight and one bias stack per head for the whole loop
-            self.assertEqual(_CountedUploads.uploads, 4)
+            self.assertEqual(CountedUploads.uploads, 4)
 
     def test_schedule_validation_and_warmup(self):
         apply_schedule = partial(
