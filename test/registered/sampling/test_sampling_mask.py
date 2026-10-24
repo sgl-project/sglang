@@ -91,6 +91,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             top_ks=torch.full((batch_size,), top_k, dtype=torch.int32, device="cuda"),
             top_ps=torch.full((batch_size,), top_p, device="cuda"),
             min_ps=torch.full((batch_size,), min_p, device="cuda"),
+            max_top_k=top_k,
             sampling_mask_batch_indices=torch.tensor(requested_rows, device="cuda"),
         )
         with patch.object(

@@ -40,8 +40,8 @@ from transformers.models.whisper.modeling_whisper import (
 
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
@@ -1532,11 +1532,13 @@ class MiniCPMO(MiniCPMBaseModel):
             (mm_input.audio_start_id, mm_input.audio_end_id),
         ]
         data_start_token_ids = [im_start_id, mm_input.audio_start_id]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(
-            data_token_pairs=data_token_pairs, data_start_token_ids=data_start_token_ids
-        )
 
-        return pattern.pad_input_tokens(input_ids, mm_input)
+        return pad_mm_token_pairs(
+            input_ids,
+            mm_input,
+            data_token_pairs=data_token_pairs,
+            data_start_token_ids=data_start_token_ids,
+        )
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         """

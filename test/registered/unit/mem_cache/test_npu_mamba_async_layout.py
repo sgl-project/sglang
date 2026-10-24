@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -6,9 +5,9 @@ from unittest.mock import MagicMock, patch
 import torch
 
 import sglang.srt.mem_cache.pool_host.mamba as mamba_pool_host
+from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.pool_host.mamba import (
     MambaPoolHost,
-    _npu_hicache_mamba_io_mode,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -16,21 +15,6 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestNPUMambaAsyncConfig(unittest.TestCase):
-    def test_accepts_explicit_sync_and_async_modes(self):
-        for mode in ("sync", "async"):
-            with (
-                self.subTest(mode=mode),
-                patch.dict(os.environ, {"SGLANG_NPU_HICACHE_MAMBA_IO": mode}),
-            ):
-                self.assertEqual(_npu_hicache_mamba_io_mode(), mode)
-
-    def test_rejects_auto_mode(self):
-        with (
-            patch.dict(os.environ, {"SGLANG_NPU_HICACHE_MAMBA_IO": "auto"}),
-            self.assertRaisesRegex(ValueError, "must be one of"),
-        ):
-            _npu_hicache_mamba_io_mode()
-
     @patch.object(mamba_pool_host, "_is_npu", True)
     @patch.object(
         mamba_pool_host,
@@ -173,6 +157,10 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
             )
         )
 
+        pool.buffer_info = MambaStateBufferInfo(
+            temporal=device_pool.mamba_cache.temporal,
+            conv=tuple(device_pool.mamba_cache.conv),
+        )
         pool.load_to_device_per_layer(
             device_pool=device_pool,
             host_indices=torch.tensor([1]),

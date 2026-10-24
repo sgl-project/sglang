@@ -11,6 +11,9 @@ import subprocess
 import tempfile
 import time
 import unittest
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -565,6 +568,64 @@ class TestNixlUnified(CustomTestCase):
 
         self.assertEqual(self.hicache.batch_exists(["key1", "key2"]), 1)
 
+    def test_dsa_indexer_bounce_round_trip_preserves_every_byte(self):
+        """Index pages must survive copy fallback when the main KV dtype is bf16."""
+        from sglang.srt.mem_cache.pool_host.dsa import (
+            DSAIndexerPoolHost,
+            make_dsa_indexer_pool_decl,
+        )
+
+        pool = SimpleNamespace(
+            layer_num=2,
+            device="cpu",
+            layer_shard_enabled=False,
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            end_layer=2,
+            index_head_dim=128,
+            quant_block_size=128,
+            page_size=64,
+            index_page_size=64,
+            skip_topk_layers=[False, False],
+            index_k_with_scale_buffer=[
+                torch.empty((4, 64 * 132), dtype=torch.uint8) for _ in range(2)
+            ],
+        )
+        anchor = SimpleNamespace(
+            page_size=64, layout="page_first", size=256, page_num=4
+        )
+        host = DSAIndexerPoolHost(
+            make_dsa_indexer_pool_decl(pool), anchor, pin_memory=False
+        )
+        self.addCleanup(host.destroy)
+        with mock.patch.object(
+            self.hicache, "_hybrid_pool_supports_zero_copy", return_value=False
+        ):
+            self.hicache.register_mem_host_pool_v2(host, PoolName.INDEXER)
+        self.addCleanup(self.hicache.close)
+        ctx = self.hicache._hybrid_pool_ctx[PoolName.INDEXER]
+        self.assertFalse(ctx.is_zero_copy)
+        expected = (
+            torch.arange(host.get_dummy_flat_data_page().numel())
+            .remainder(251)
+            .to(torch.uint8)
+        )
+        host.set_from_flat_data_page(64, expected)
+        transfer = PoolTransfer(
+            name=PoolName.INDEXER,
+            keys=["dsa-index-bytes"],
+            host_indices=torch.arange(64, 128),
+        )
+        self.assertEqual(
+            self.hicache.batch_set_v2([transfer]), {PoolName.INDEXER: [True]}
+        )
+        host.set_from_flat_data_page(64, torch.zeros_like(expected))
+        ctx.bounce_get.zero_()
+        self.assertEqual(
+            self.hicache.batch_get_v2([transfer]), {PoolName.INDEXER: [True]}
+        )
+        self.assertTrue(torch.equal(host.get_data_page(64), expected))
+
     def test_register_mem_host_pool_v2_uses_zero_copy_when_supported(self):
         pool = MockHybridPool(expose_zero_copy=True)
         self.hicache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
@@ -572,6 +633,41 @@ class TestNixlUnified(CustomTestCase):
         ctx = self.hicache._hybrid_pool_ctx[PoolName.MAMBA]
         self.assertTrue(ctx.is_zero_copy)
         self.assertIs(ctx.host_pool, pool)
+
+    def test_mla_mamba_round_trip_keeps_each_tp_rank(self):
+        """MLA shares KV keys, but Mamba checkpoints must not overwrite another rank."""
+        for zero_copy in (False, True):
+            with self.subTest(zero_copy=zero_copy):
+                caches, pools, expected = [], [], []
+                transfer = PoolTransfer(
+                    name=PoolName.MAMBA,
+                    keys=[f"same_prefix_{zero_copy}"],
+                    host_indices=torch.tensor([0]),
+                )
+                for rank in range(2):
+                    config = replace(
+                        self.storage_config, tp_rank=rank, is_mla_model=True
+                    )
+                    cache = HiCacheNixl(storage_config=config, file_path=self.test_dir)
+                    self.addCleanup(cache.close)
+                    pool = MockHybridPool(expose_zero_copy=zero_copy)
+                    cache.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+                    pool.temporal_buffer[0].fill_(rank + 11)
+                    pool.conv_buffer[0][0].fill_(rank + 21)
+                    expected.append(pool.get_data_page(0).clone())
+                    caches.append(cache)
+                    pools.append(pool)
+                    self.assertEqual(
+                        cache.batch_set_v2([transfer])[PoolName.MAMBA], [True]
+                    )
+
+                for cache, pool, page in zip(caches, pools, expected):
+                    pool.temporal_buffer.zero_()
+                    pool.conv_buffer[0].zero_()
+                    self.assertEqual(
+                        cache.batch_get_v2([transfer])[PoolName.MAMBA], [True]
+                    )
+                    self.assertTrue(torch.equal(pool.get_data_page(0), page))
 
     def test_register_mem_host_pool_v2_uses_persistent_bounce_otherwise(self):
         pool = MockHybridPool(expose_zero_copy=False)

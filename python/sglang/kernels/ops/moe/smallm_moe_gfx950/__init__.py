@@ -1,4 +1,4 @@
-"""gfx950 small-M MXFP4 fused-MoE kernel for the ROCm aiter MoE path (Qwen3.5-397B-A17B TP4 shape: hidden 4096, per-rank intermediate 256).
+"""gfx950 small-M MXFP4/FP8 fused-MoE kernel for the ROCm aiter MoE path (Qwen3.5-397B-A17B TP4 shape: hidden 4096, per-rank intermediate 256).
 
 Two HIP kernels (source `smallm_moe.hip` next to this file, compiled with hipcc at first use) replace
 aiter.fused_moe for small token counts:
@@ -16,32 +16,38 @@ On by default; SGLANG_ROCM_SMALLM_MOE=0 turns it off. Any build/load failure dis
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import subprocess
 import tempfile
 
 import torch
 
-from sglang.srt.distributed.device_communicators.cuda_wrapper import (
-    find_loaded_library,
+from sglang.kernels.jit.utils.hipcc import (
+    HipKernel,
+    check_hip,
+    hip_lib,
+    hip_version,
+    hipcc_path,
 )
+from sglang.srt.environ import envs
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_DIR, "smallm_moe.hip")
-_ENV = "SGLANG_ROCM_SMALLM_MOE"
 DIM = 4096
 MAX_TOK = 64  # kernel list capacity (tokens per expert) and workspace size
 # Dispatch cap: above this token count aiter's flydsl path is faster (crossover ~44
 # tokens at per-rank intermediate 256 / TP4). Only that shape is dispatched here; the
 # TP2 shape (intermediate 512) has a lower crossover and is left to a follow-up.
 MAX_TOK_DISPATCH = {256: 40}
+MAX_TOK_DISPATCH_FP8 = {256: 20, 128: 48}  # crossover vs aiter's per_128x128 asm/CK
 
-_hip = None
 _kernels: dict = {}
 _available = None
 _disabled_reason = None
 _build_dir = None
 _ws: dict = {}
+logger = logging.getLogger(__name__)
 
 
 class SmallMMoeUnavailable(RuntimeError):
@@ -78,94 +84,17 @@ assert ctypes.sizeof(Args) == 104, ctypes.sizeof(
 )  # must match static_assert(sizeof(Args) == 104) in smallm_moe.hip
 
 
-def _hip_lib():
-    global _hip
-    if _hip is None:
-        # Bind to the HIP runtime torch already mapped. ROCm 10 ships a second
-        # libamdhip64 in _rocm_sdk_devel; an unversioned CDLL("libamdhip64.so")
-        # picks that one, and every launch on a torch stream then fails with
-        # hipErrorContextIsDestroyed (709).
-        torch.cuda.current_device()
-        _hip = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
-        _hip.hipModuleLoad.restype = ctypes.c_int
-        _hip.hipModuleLoad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        _hip.hipModuleGetFunction.restype = ctypes.c_int
-        _hip.hipModuleGetFunction.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_char_p,
-        ]
-        _hip.hipModuleLaunchKernel.restype = ctypes.c_int
-        _hip.hipModuleLaunchKernel.argtypes = (
-            [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-        )
-        _hip.hipGetErrorString.restype = ctypes.c_char_p
-    return _hip
-
-
-def _check(rc, what):
-    if rc != 0:
-        raise RuntimeError(
-            f"smallm_moe: {what} failed: {rc} ({_hip_lib().hipGetErrorString(rc).decode()})"
-        )
-
-
-class _Kernel:
-    def __init__(self, mod, name):
-        self.fn = ctypes.c_void_p()
-        _check(
-            _hip_lib().hipModuleGetFunction(ctypes.byref(self.fn), mod, name.encode()),
-            f"hipModuleGetFunction {name}",
-        )
-
-    def launch(self, grid, args, stream):
-        size = ctypes.c_size_t(ctypes.sizeof(args))
-        extra = (ctypes.c_void_p * 5)(
-            1,
-            ctypes.cast(ctypes.byref(args), ctypes.c_void_p).value,
-            2,
-            ctypes.cast(ctypes.byref(size), ctypes.c_void_p).value,
-            3,
-        )
-        _check(
-            _hip_lib().hipModuleLaunchKernel(
-                self.fn,
-                grid,
-                1,
-                1,
-                256,
-                1,
-                1,
-                0,
-                ctypes.c_void_p(stream),
-                None,
-                ctypes.cast(extra, ctypes.c_void_p),
-            ),
-            "hipModuleLaunchKernel",
-        )
-
-
-def _hipcc():
-    return os.path.join(os.environ.get("ROCM_PATH", "/opt/rocm"), "bin", "hipcc")
-
-
-def _hip_version():
-    if torch.version.hip:
-        return tuple(int(x) for x in torch.version.hip.split("-")[0].split(".")[:3])
-    return (0, 0, 0)
-
-
 def smallm_moe_enabled() -> bool:
     """True unless SGLANG_ROCM_SMALLM_MOE=0, when the device is exactly gfx950 on ROCm >= 7.2 (the kernel uses
     v_cvt_scalef32_pk_bf16_fp4 / v_dot2_f32_bf16 and needs that toolchain), hipcc is present, and no build/load
     failure has disabled the kernel in this process. Numerics differ slightly from the aiter path (bf16 activations
     instead of MXFP4 a4w4); GSM8K matches within run-to-run noise.
 
-    Model coverage: the kernel is compiled for one shape only, Qwen3.5-397B-A17B MXFP4 at TP4 (hidden 4096,
-    per-rank intermediate 256, top-10 plus the optional fused shared expert). There is no model-name check;
+    Model coverage: the kernel is compiled for Qwen3.5-397B-A17B only, MXFP4 at TP4 and FP8 block-scale at TP4/TP8
+    (hidden 4096, top-10 plus the optional fused shared expert). There is no model-name check;
     smallm_moe_supported() enforces the shape, and every other model or parallel layout keeps aiter fused_moe."""
     global _available
-    if os.environ.get(_ENV, "1") == "0":
+    if not envs.SGLANG_ROCM_SMALLM_MOE.get():
         return False
     if _available is None:
         arch = ""
@@ -173,13 +102,15 @@ def smallm_moe_enabled() -> bool:
             arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
         _available = (
             arch == "gfx950"
-            and _hip_version() >= (7, 2, 0)
-            and os.path.exists(_hipcc())
+            and hip_version() >= (7, 2, 0)
+            and os.path.exists(hipcc_path())
         )
         if not _available:
-            print(
-                f"[smallm_moe] not enabled (arch={arch!r}, hip={_hip_version()}, hipcc={os.path.exists(_hipcc())}); aiter fused_moe stays in use",
-                flush=True,
+            logger.info(
+                "smallm_moe not enabled (arch=%r, hip=%s, hipcc=%s); aiter fused_moe stays in use",
+                arch,
+                hip_version(),
+                os.path.exists(hipcc_path()),
             )
     return _available and _disabled_reason is None
 
@@ -187,15 +118,15 @@ def smallm_moe_enabled() -> bool:
 def _disable(reason):
     global _disabled_reason
     _disabled_reason = reason
-    print(
-        f"[smallm_moe] disabling the gfx950 small-M MoE kernel, falling back to aiter fused_moe: {reason}",
-        flush=True,
+    logger.warning(
+        "smallm_moe: disabling the gfx950 small-M MoE kernel, falling back to aiter fused_moe: %s",
+        reason,
     )
     raise SmallMMoeUnavailable(reason)
 
 
-def _get_kernels(inter: int):
-    kk = _kernels.get(inter)
+def _get_kernels(inter: int, pre: str):
+    kk = _kernels.get((pre, inter))
     if kk is None:
         global _build_dir
         if _build_dir is None:
@@ -204,7 +135,7 @@ def _get_kernels(inter: int):
             try:
                 subprocess.run(
                     [
-                        _hipcc(),
+                        hipcc_path(),
                         "--genco",
                         "--offload-arch=gfx950",
                         "-O3",
@@ -221,28 +152,26 @@ def _get_kernels(inter: int):
                 _disable(f"hipcc failed: {detail.strip()[-400:]}")
             mod = ctypes.c_void_p()
             try:
-                _check(
-                    _hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()),
+                check_hip(
+                    hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()),
                     "hipModuleLoad",
                 )
             except RuntimeError as e:
                 _disable(str(e))
             _kernels["_mod"] = mod
-            print(
-                f"[smallm_moe] gfx950 small-M MoE kernels active (built {co})",
-                flush=True,
-            )
+            logger.info("smallm_moe: gfx950 small-M MoE kernels active (built %s)", co)
         mod = _kernels["_mod"]
         try:
             kk = {
-                "p1": _Kernel(mod, f"smallm_p1_i{inter}_c16"),
+                "p1": HipKernel(mod, f"smallm{pre}_p1_i{inter}_c16"),
                 "p2": {
-                    sl: _Kernel(mod, f"smallm_p2_i{inter}_s{sl}") for sl in (10, 11)
+                    sl: HipKernel(mod, f"smallm{pre}_p2_i{inter}_s{sl}")
+                    for sl in (10, 11)
                 },
             }
         except RuntimeError as e:
             _disable(str(e))
-        _kernels[inter] = kk
+        _kernels[(pre, inter)] = kk
     return kk
 
 
@@ -271,6 +200,8 @@ def smallm_moe_supported(
     activation_is_silu,
     has_bias,
     a1_scale,
+    w13_scale=None,
+    w2_scale=None,
 ) -> bool:
     if not smallm_moe_enabled():
         return False
@@ -288,15 +219,30 @@ def smallm_moe_supported(
         or w2.element_size() != 1
     ):
         return False
-    inter = w2.shape[2] * 2
+    fp8 = w13.dtype == torch.float8_e4m3fn
+    caps = MAX_TOK_DISPATCH_FP8 if fp8 else MAX_TOK_DISPATCH
+    inter = w2.shape[2] * (1 if fp8 else 2)
     if (
-        inter not in MAX_TOK_DISPATCH
+        inter not in caps
         or w13.shape[1] != 2 * inter
-        or w13.shape[2] != DIM // 2
+        or w13.shape[2] != (DIM if fp8 else DIM // 2)
         or w2.shape[1] != DIM
     ):
         return False
-    if tok > min(MAX_TOK, MAX_TOK_DISPATCH[inter]):
+    if tok > min(MAX_TOK, caps[inter]):
+        return False
+    # FP8 is block-scale only: per-tensor/per-channel FP8 scales have other shapes
+    if fp8 and (
+        not getattr(w13, "is_shuffled", False)
+        or not getattr(w2, "is_shuffled", False)
+        or getattr(w13_scale, "shape", None)
+        != (w13.shape[0], 2 * inter // 128, DIM // 128)
+        or getattr(w2_scale, "shape", None) != (w13.shape[0], DIM // 128, inter // 128)
+        or w13_scale.dtype != torch.float32
+        or w2_scale.dtype != torch.float32
+        or not w13_scale.is_contiguous()
+        or not w2_scale.is_contiguous()
+    ):
         return False
     # 704 = MAX_TOK (64) * 11 slots: the kernels stage the whole topk_ids table in a
     # fixed-size LDS array (MAX_NSLOT in smallm_moe.hip); larger tables would overrun it.
@@ -316,14 +262,16 @@ def smallm_moe_supported(
 def smallm_moe_fwd(hidden_states, w13, w2, topk_weights, topk_ids, w13_scale, w2_scale):
     """out[tok, 4096] (bf16) = sum_j w_tj * down_e(silu(gate_e(x_t)) * up_e(x_t)); e = topk_ids[t, j].
     w13/w2: fp4x2 [E, 2*inter, 2048] / [E, 4096, inter/2] in aiter shuffle_weight((16,16)) layout;
-    w13_scale/w2_scale: e8m0 in e8m0_shuffle layout. Returns None if the workspace cannot be allocated (capture)."""
+    w13_scale/w2_scale: e8m0 in e8m0_shuffle layout. Returns None if the workspace cannot be allocated (capture).
+    FP8 block-scale: e4m3fn [E, 2*inter, 4096] / [E, 4096, inter], fp32 [E, 2*inter/128, 32] / [E, 32, inter/128]."""
     tok, slots = topk_ids.shape
     E = w13.shape[0]
-    inter = w2.shape[2] * 2
+    fp8 = w13.dtype == torch.float8_e4m3fn
+    inter = w2.shape[2] * (1 if fp8 else 2)
     ws = _workspace(hidden_states.device, slots, inter)
     if ws is None:
         return None
-    kk = _get_kernels(inter)
+    kk = _get_kernels(inter, "_f8" if fp8 else "")
     hbuf, acc, cnt = ws
     ids = (
         topk_ids

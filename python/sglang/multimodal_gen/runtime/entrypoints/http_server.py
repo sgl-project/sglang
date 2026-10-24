@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 import torch
-from fastapi import APIRouter, FastAPI, Request, Response
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
@@ -46,10 +46,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
-from sglang.srt.utils.common import (
-    add_prometheus_middleware,
-    add_prometheus_track_response_middleware,
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
+from sglang.srt.observability.http_request_metrics import (
+    add_http_request_metrics_middleware,
+    init_http_request_metrics,
 )
+from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
+from sglang.srt.utils.common import add_prometheus_middleware
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 
@@ -112,6 +115,15 @@ async def _run_server_warmup_after_http_live(
         os.kill(os.getpid(), signal.SIGTERM)
 
 
+def build_route_request_models(app: FastAPI) -> None:
+    """Build the routes' pydantic models now; FastAPI otherwise builds them on the
+    first matching request (~17 ms). The OpenAPI schema resolves the same models."""
+    try:
+        app.openapi()
+    except Exception:
+        logger.debug("Route model prebuild failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
@@ -124,6 +136,7 @@ async def lifespan(app: FastAPI):
 
     # 1. Initialize the singleton client that connects to the backend Scheduler
     server_args = app.state.server_args
+    build_route_request_models(app)
     async_scheduler_client.initialize(server_args)
     warmup_done = asyncio.Event()
     app.state.server_warmup_done = warmup_done
@@ -308,9 +321,11 @@ async def stats_endpoint(request: Request):
 
 
 def make_serializable(obj):
-    """Recursively converts Tensors to None for JSON serialization."""
+    """Serialize output metadata without copying tensors back to the CPU."""
     if isinstance(obj, torch.Tensor):
         return None
+    if isinstance(obj, RequestMetrics):
+        return obj.to_dict()
     if isinstance(obj, dict):
         return {k: make_serializable(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -319,10 +334,11 @@ def make_serializable(obj):
 
 
 def encode_video_to_base64(file_path: str):
-    if not os.path.exists(file_path):
-        return None
     with open(file_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+        content = f.read()
+    if not content:
+        raise ValueError(f"Empty model output file: {file_path}")
+    return base64.b64encode(content).decode("utf-8")
 
 
 async def forward_to_scheduler(
@@ -332,6 +348,8 @@ async def forward_to_scheduler(
     """Forwards request to scheduler and processes the result."""
     try:
         response = await async_scheduler_client.forward(req_obj)
+        if response.error:
+            raise RuntimeError(response.error)
         if response.output is None and response.output_file_paths is None:
             raise RuntimeError("Model generation returned no output.")
 
@@ -347,6 +365,8 @@ async def forward_to_scheduler(
                 lambda _idx: output_file_path,
                 audio=response.audio,
                 audio_sample_rate=response.audio_sample_rate,
+                output_compression=sp.output_compression,
+                x264_preset=sp.x264_preset,
                 enable_frame_interpolation=sp.enable_frame_interpolation,
                 frame_interpolation_exp=sp.frame_interpolation_exp,
                 frame_interpolation_scale=sp.frame_interpolation_scale,
@@ -356,19 +376,10 @@ async def forward_to_scheduler(
                 upscaling_scale=sp.upscaling_scale,
             )
 
-        if hasattr(response, "model_dump"):
-            data = response.model_dump()
-        else:
-            data = response if isinstance(response, dict) else vars(response)
-
-        if output_file_path:
-            logger.info("Processing output file: %s", output_file_path)
-            b64_video = encode_video_to_base64(output_file_path)
-
-            if b64_video:
-                data["output"] = b64_video
-                data.pop("video_data", None)
-                data.pop("video_tensor", None)
+        data = vars(response).copy()
+        data["output"] = await asyncio.to_thread(
+            encode_video_to_base64, output_file_path
+        )
 
         return make_serializable(data)
 
@@ -388,27 +399,31 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
     server_args = get_global_server_args()
     params = vertex_req.parameters or {}
 
-    futures = []
+    requests = []
 
     for inst in vertex_req.instances:
         rid = f"vertex_{uuid.uuid4()}"
 
-        sp = build_sampling_params(
-            rid,
-            prompt=inst.get("prompt") or inst.get("text"),
-            image_path=inst.get("image") or inst.get("image_url"),
-            num_frames=params.get("num_frames"),
-            fps=params.get("fps"),
-            width=params.get("width"),
-            height=params.get("height"),
-            guidance_scale=params.get("guidance_scale"),
-            save_output=params.get("save_output"),
-        )
+        try:
+            sp = build_sampling_params(
+                rid,
+                prompt=inst.get("prompt") or inst.get("text"),
+                image_path=inst.get("image") or inst.get("image_url"),
+                num_frames=params.get("num_frames"),
+                fps=params.get("fps"),
+                width=params.get("width"),
+                height=params.get("height"),
+                guidance_scale=params.get("guidance_scale"),
+                save_output=params.get("save_output"),
+            )
+            requests.append(prepare_request(server_args, sampling_params=sp))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        backend_req = prepare_request(server_args, sampling_params=sp)
-        futures.append(forward_to_scheduler(backend_req, sp))
-
-    results = await asyncio.gather(*futures)
+    # validate every instance before creating coroutines or dispatching work
+    results = await asyncio.gather(
+        *(forward_to_scheduler(req, req.sampling_params) for req in requests)
+    )
 
     return orjson_response({"predictions": results})
 
@@ -418,11 +433,12 @@ def create_app(server_args: ServerArgs):
     Create and configure the FastAPI application instance.
     """
     globally_suppress_loggers()
-    app = FastAPI(lifespan=lifespan)
+    app = FastAPI(lifespan=lifespan, **fastapi_telemetry_disabled_kwargs())
     if server_args.enable_metrics:
         configure_metrics()
         add_prometheus_middleware(app)
-        add_prometheus_track_response_middleware(app)
+        add_http_request_metrics_middleware(app)
+        init_http_request_metrics()
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

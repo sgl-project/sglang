@@ -1,5 +1,7 @@
 """Fused QSA indexer-prep kernels must match the eager indexer path bit-for-bit,
-up to rare last-ulp RMSNorm flips (see assert_bit_comparable)."""
+up to rare last-ulp RMSNorm flips (see assert_bit_comparable). With an fp8
+indexer cache the same rows are cast to e4m3 at the store, so a bf16 last-ulp
+flip may move the e4m3 code by one step (see assert_fp8_within_one_ulp)."""
 
 from types import SimpleNamespace
 
@@ -17,19 +19,23 @@ from sglang.srt.layers.attention.qsa.kernel import (
 )
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
-
-# MRotaryEmbedding reads the exec config bag at init; publish a minimal
-# process context for the bare pytest process.
-from sglang.srt.runtime_context import publish
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
-
-publish(ServerArgs(model_path="dummy"), role="test")
 
 HEAD_DIM = 128
 NUM_Q_HEADS = 4
 RATIO = 4
 HIDDEN = 2560
 EPS = 1e-6
+
+
+@pytest.fixture(autouse=True)
+def runtime_context():
+    publish(ServerArgs(model_path="dummy"), role="test")
+    try:
+        yield
+    finally:
+        reset_context()
 
 
 def _make_config():
@@ -85,13 +91,22 @@ class FakePool:
 
     index_state_dtype = torch.bfloat16
 
-    def __init__(self, num_slots, num_compressed, device, dtype=torch.bfloat16):
+    def __init__(
+        self,
+        num_slots,
+        num_compressed,
+        device,
+        dtype=torch.bfloat16,
+        compressed_dtype=None,
+    ):
+        # Ring in the compute dtype, compressed cache and index Q in the storage dtype.
+        self.qsa_compressed_dtype = compressed_dtype or dtype
         self.key_state = torch.zeros(num_slots, 1, HEAD_DIM, dtype=dtype, device=device)
         self.qsa_rope_position_buffer = torch.zeros(
             num_slots, 3, dtype=torch.int64, device=device
         )
         self.compressed = torch.zeros(
-            num_compressed, 1, HEAD_DIM, dtype=dtype, device=device
+            num_compressed, 1, HEAD_DIM, dtype=self.qsa_compressed_dtype, device=device
         )
 
     def get_qsa_key_state_buffer(self, layer_id):
@@ -128,6 +143,17 @@ def assert_bit_comparable(actual, expected, max_frac=1e-5, max_abs=0.02):
         assert peak <= max_abs, f"largest deviation {peak} exceeds {max_abs}"
 
 
+def assert_fp8_within_one_ulp(actual, expected):
+    """One e4m3 code step, or 2^-8 absolute for subnormals and sign crossings."""
+    assert actual.dtype == expected.dtype == torch.float8_e4m3fn
+    code_diff = (
+        actual.view(torch.uint8).int() - expected.view(torch.uint8).int()
+    ).abs()
+    abs_diff = (actual.float() - expected.float()).abs()
+    bad = int((~((code_diff <= 1) | (abs_diff <= 2**-8))).sum())
+    assert bad == 0, f"{bad} fp8 elements differ by more than one ulp"
+
+
 def _eager_compress_reference(indexer, pool, group_locs, write_locs):
     """The pre-fusion compression chain, via the indexer's own helpers."""
     key_groups = pool.get_qsa_key_state_buffer(0)[group_locs.long()]
@@ -144,15 +170,18 @@ def _eager_compress_reference(indexer, pool, group_locs, write_locs):
     "mrope_section, mrope_interleaved",
     [([24, 20, 20], True), ([24, 20, 20], False), (None, False)],
 )
-def test_fused_compress_matches_eager(num_groups, mrope_section, mrope_interleaved):
+@pytest.mark.parametrize("compressed_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_fused_compress_matches_eager(
+    num_groups, mrope_section, mrope_interleaved, compressed_dtype
+):
     device = torch.device("cuda")
     dtype = torch.bfloat16
     torch.manual_seed(num_groups)
     rotary = _make_rotary(mrope_section, mrope_interleaved, device, dtype)
     indexer = _make_indexer(rotary, device, dtype)
 
-    pool_ref = FakePool(8192, 4096, device, dtype)
-    pool_new = FakePool(8192, 4096, device, dtype)
+    pool_ref = FakePool(8192, 4096, device, dtype, compressed_dtype)
+    pool_new = FakePool(8192, 4096, device, dtype, compressed_dtype)
     pool_new.key_state.copy_(
         pool_ref.key_state.copy_(
             torch.randn(8192, 1, HEAD_DIM, device=device, dtype=dtype)
@@ -172,7 +201,206 @@ def test_fused_compress_matches_eager(num_groups, mrope_section, mrope_interleav
     _eager_compress_reference(indexer, pool_ref, group_locs, write_locs)
     indexer._fused_compress_store(pool_new, group_locs, write_locs)
 
-    assert_bit_comparable(pool_new.compressed, pool_ref.compressed)
+    if compressed_dtype == torch.float8_e4m3fn:
+        assert_fp8_within_one_ulp(pool_new.compressed, pool_ref.compressed)
+    else:
+        assert_bit_comparable(pool_new.compressed, pool_ref.compressed)
+
+
+def test_fused_q_prep_fp8_matches_eager_cast():
+    """fp8 Q from the fused prep must match the eager Q cast at the end (one ulp)."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(11)
+    rotary = _make_rotary([24, 20, 20], True, device, dtype)
+    indexer = _make_indexer(rotary, device, dtype)
+    tokens = 300
+    hidden = torch.randn(tokens, HIDDEN, device=device, dtype=dtype)
+    positions = (
+        torch.arange(5000, 5000 + tokens, device=device)
+        .unsqueeze(0)
+        .expand(3, -1)
+        .contiguous()
+    )
+    qk, _ = indexer.index_qk_proj(hidden)
+    q_ref = indexer.q_layernorm(qk[:, : NUM_Q_HEADS * HEAD_DIM].reshape(-1, HEAD_DIM))
+    q_ref = indexer.apply_rope(positions, q_ref.reshape(tokens, NUM_Q_HEADS, HEAD_DIM))
+    pool = FakePool(4096, 4096, device, dtype, torch.float8_e4m3fn)
+    cache_loc = torch.arange(1, tokens + 1, device=device)
+    q_new, _, stored = indexer.project_qk(
+        hidden, positions, pool=pool, cache_loc=cache_loc
+    )
+    assert stored
+    assert q_new.dtype == torch.float8_e4m3fn
+    assert_fp8_within_one_ulp(q_new, q_ref.to(torch.float8_e4m3fn))
+
+
+def _selected_score_multisets(logits, block_indices):
+    """Sorted logits of the selected blocks per row, so tied blocks compare equal."""
+    out = []
+    for row in range(block_indices.shape[0]):
+        picked = block_indices[row][block_indices[row] >= 0].long()
+        out.append(logits[row, picked].sort().values)
+    return out
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_tilelang_mqa_matches_torch_reference(dtype):
+    """TileLang scoring vs the fp32 torch reference on the same operands. The
+    selected blocks are compared as score multisets because fp8 ties at the
+    top-k boundary."""
+    from sglang.srt.layers.attention.qsa.kernel import qsa_fast_topk
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_decode,
+        tilelang_qsa_mqa_prefill,
+        torch_qsa_mqa_decode,
+        torch_qsa_mqa_prefill,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    device = torch.device("cuda")
+    torch.manual_seed(3)
+    # Decode: paged compressed cache. qsa_fast_topk only supports the production
+    # block budget (512).
+    batch, max_pages, page_size, block_topk = 6, 256, 16, 512
+    q = torch.randn(batch, NUM_Q_HEADS, HEAD_DIM, device=device).to(dtype)
+    cache = torch.randn(512, page_size, 1, HEAD_DIM, device=device).to(dtype)
+    page_table = torch.stack(
+        [torch.randperm(512, device=device)[:max_pages] for _ in range(batch)]
+    ).to(torch.int32)
+    context_lens = torch.randint(
+        600, max_pages * page_size + 1, (batch,), device=device
+    ).to(torch.int32)
+    max_model_len = max_pages * page_size
+    ref = torch_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
+    out = tilelang_qsa_mqa_decode(q, cache, page_table, context_lens, max_model_len)
+    finite = torch.isfinite(ref)
+    assert torch.equal(finite, torch.isfinite(out))
+    torch.testing.assert_close(out[finite], ref[finite], rtol=2e-3, atol=2e-3)
+    row_starts = torch.zeros_like(context_lens)
+    sel_ref = _selected_score_multisets(
+        ref, qsa_fast_topk(ref, row_starts, context_lens, topk=block_topk)
+    )
+    sel_out = _selected_score_multisets(
+        ref, qsa_fast_topk(out, row_starts, context_lens, topk=block_topk)
+    )
+    for a, b in zip(sel_ref, sel_out):
+        torch.testing.assert_close(a, b, rtol=2e-3, atol=2e-3)
+    # Prefill: packed keys with ragged causal ranges.
+    rows, keys = 70, 512
+    qp = torch.randn(rows, NUM_Q_HEADS, HEAD_DIM, device=device).to(dtype)
+    kp = torch.randn(keys, 1, HEAD_DIM, device=device).to(dtype)
+    row_starts = torch.zeros(rows, dtype=torch.int32, device=device)
+    row_ends = torch.randint(1, keys + 1, (rows,), device=device).to(torch.int32)
+    ref_p = torch_qsa_mqa_prefill(qp, kp, row_starts, row_ends)
+    out_p = tilelang_qsa_mqa_prefill(qp, kp, row_starts, row_ends)
+    finite = torch.isfinite(ref_p)
+    assert torch.equal(finite, torch.isfinite(out_p))
+    torch.testing.assert_close(out_p[finite], ref_p[finite], rtol=2e-3, atol=2e-3)
+
+
+def test_tilelang_mqa_rejects_mixed_operand_dtypes():
+    """Mixed fp8/bf16 operands must fail instead of dequantizing the cache."""
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_decode,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    device = torch.device("cuda")
+    q = torch.randn(2, NUM_Q_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    cache = torch.randn(8, 16, 1, HEAD_DIM, device=device).to(torch.float8_e4m3fn)
+    page_table = torch.zeros(2, 4, dtype=torch.int32, device=device)
+    context_lens = torch.full((2,), 32, dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="same dtype"):
+        tilelang_qsa_mqa_decode(q, cache, page_table, context_lens, 64)
+
+
+def _decode_operands(rows, max_pages, page_size, context_lens, device):
+    q = torch.randn(rows, NUM_Q_HEADS, HEAD_DIM, device=device).to(torch.bfloat16)
+    cache = torch.randn(1024, page_size, 1, HEAD_DIM, device=device).to(torch.bfloat16)
+    page_table = torch.randint(
+        0, 1024, (rows, max_pages), device=device, dtype=torch.int32
+    )
+    return q, cache, page_table, context_lens.to(device=device, dtype=torch.int32)
+
+
+@pytest.mark.parametrize("rows", [6, 100, 700])
+def test_tilelang_mqa_decode_grid_covers_every_group(rows):
+    """The decode kernel strides 256, 16 or 1 CTAs per row (by row count) over the
+    row's 64-token groups. Every group of every row must be scored, and nothing
+    is written past a row's context length."""
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_decode,
+        torch_qsa_mqa_decode,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    device = torch.device("cuda")
+    torch.manual_seed(rows)
+    max_pages, page_size = 128, 16
+    max_model_len = max_pages * page_size
+    lens = torch.randint(1, max_model_len + 1, (rows,))
+    lens[0] = max_model_len
+    q, cache, page_table, lens = _decode_operands(
+        rows, max_pages, page_size, lens, device
+    )
+    ref = torch_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)
+    out = tilelang_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)
+    finite = torch.isfinite(ref)
+    assert torch.equal(finite, torch.isfinite(out))
+    torch.testing.assert_close(out[finite], ref[finite], rtol=2e-3, atol=2e-3)
+
+
+def test_tilelang_mqa_decode_skips_rows_that_fit_topk():
+    """With min_scored_len = k the kernel leaves rows that fit k unscored and
+    nothing past a row's length is set; fast_topk(k) must still select exactly
+    what it selects on fully scored logits (every block of a row that fits k)."""
+    from sglang.kernels.ops.attention.fast_topk import fast_topk
+    from sglang.srt.layers.attention.qsa.mqa import (
+        HAS_TILELANG,
+        tilelang_qsa_mqa_decode,
+        torch_qsa_mqa_decode,
+    )
+
+    if not HAS_TILELANG:
+        pytest.skip("tilelang unavailable")
+    device = torch.device("cuda")
+    torch.manual_seed(5)
+    max_pages, page_size, block_topk = 128, 16, 512
+    max_model_len = max_pages * page_size
+    lens = torch.tensor([1, 300, 511, 512, 513, 1000, 2047, 2048] * 4)
+    rows = lens.numel()
+    q, cache, page_table, lens = _decode_operands(
+        rows, max_pages, page_size, lens, device
+    )
+    ref = torch_qsa_mqa_decode(q, cache, page_table, lens, max_model_len)
+    # The caching allocator hands the NaN block to the unset logits, so a top-k
+    # that read an unscored row or a column past a length would show it.
+    poison = torch.full((rows, max_model_len), float("nan"), device=device)
+    del poison
+    out = tilelang_qsa_mqa_decode(
+        q, cache, page_table, lens, max_model_len, min_scored_len=block_topk
+    )
+    sel_ref = fast_topk(ref, lens, topk=block_topk)
+    sel_out = fast_topk(out, lens, topk=block_topk)
+    for row in range(rows):
+        length = int(lens[row])
+        if length <= block_topk:
+            assert torch.equal(sel_out[row], sel_ref[row])
+            continue
+        torch.testing.assert_close(
+            out[row, :length], ref[row, :length], rtol=2e-3, atol=2e-3
+        )
+    for a, b in zip(
+        _selected_score_multisets(ref, sel_ref), _selected_score_multisets(ref, sel_out)
+    ):
+        torch.testing.assert_close(a, b, rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])

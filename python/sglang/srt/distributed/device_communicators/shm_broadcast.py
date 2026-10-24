@@ -239,9 +239,12 @@ class MessageQueue:
             na = NetworkAddress(connect_ip, remote_subscribe_port)
             if na.is_ipv6:
                 self.remote_socket.setsockopt(IPV6, 1)
-            address = na.to_tcp()
-            logger.debug(f"class MessageQueue: Binding remote socket to {address=}")
-            self.remote_socket.bind(address)
+            # get_open_port() only probes; bind atomically in a window from that port.
+            remote_subscribe_port = self.remote_socket.bind_to_random_port(
+                na.to_tcp().rsplit(":", 1)[0],  # address without the port
+                min_port=remote_subscribe_port,
+                max_port=remote_subscribe_port + 32,
+            )
 
         else:
             remote_subscribe_port = None

@@ -14,7 +14,7 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 
 | Model | Hardware | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 254k+1k | 16.1ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in254k-out1k) |
+| Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 254k+1k | 16.1ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in254k-out1k-16-1ms) |
 
 ### High Throughput
 
@@ -27,7 +27,7 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 | Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 3.5k+1.5k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in3k5-out1k5-50ms) |
 | Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 64k+1k | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-50ms) |
 | Qwen3.6-35B-A3B | Ascend A3 Series Products | 1 | PD Mixed | 64k+1k (90% prefix cache hit rate) | 50ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-1p-in64k-out1k-prefix90-50ms) |
-| Qwen3.6-35B-A3B | Ascend A3 Series Products | 2 | PD Mixed | 984k+1k | 40.91ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-2p-in984k-out1k) |
+| Qwen3.6-35B-A3B | Ascend A3 Series Products | 2 | PD Mixed | 984k+1k | 40.91ms | BF16 | [Optimal Configuration](#qwen3-6-35b-a3b-2p-in984k-out1k-40-91ms) |
 
 ## Optimal Configuration
 
@@ -57,8 +57,6 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -77,11 +75,12 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 export STREAMS_PER_DEVICE=32
@@ -159,8 +158,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -179,11 +176,12 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 export STREAMS_PER_DEVICE=32
@@ -260,8 +258,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -282,9 +278,9 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export ASCEND_USE_FIA=1
 export DEEPEP_HCCL_BUFFSIZE=1600
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=20
@@ -330,7 +326,6 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 3 \
-    --warmup-requests 3 \
     --num-prompts 3 \
     --random-input-len 128000 \
     --random-output-len 1000 \
@@ -360,8 +355,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -380,9 +373,9 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
@@ -440,7 +433,7 @@ python -m sglang.bench_serving \
     --request-rate inf
 ```
 
-### Qwen3.6-35B-A3B 1P IN254K OUT1K
+### Qwen3.6-35B-A3B 1P IN254K OUT1K 16.1ms
 
 **Model**: Qwen3.6-35B-A3B
 
@@ -462,8 +455,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -482,11 +473,12 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -558,8 +550,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -578,10 +568,10 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_BUFFSIZE=100
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
 export SGLANG_SET_CPU_AFFINITY=1
@@ -627,7 +617,6 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 122 \
-    --warmup-requests 122 \
     --num-prompts 122 \
     --random-input-len 3500 \
     --random-output-len 1500 \
@@ -657,8 +646,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -677,9 +664,9 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=1
@@ -726,7 +713,6 @@ python -m sglang.bench_serving \
     --host 127.0.0.1 \
     --port 6688 \
     --max-concurrency 10 \
-    --warmup-requests 10 \
     --num-prompts 40 \
     --random-input-len 64000 \
     --random-output-len 1000 \
@@ -756,8 +742,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -778,9 +762,9 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 export ASCEND_USE_FIA=1
 export DEEPEP_HCCL_BUFFSIZE=300
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
 export SGLANG_SET_CPU_AFFINITY=1
@@ -837,7 +821,7 @@ python -m sglang.bench_serving \
     --request-rate inf
 ```
 
-### Qwen3.6-35B-A3B 2P IN984K OUT1K
+### Qwen3.6-35B-A3B 2P IN984K OUT1K 40.91ms
 
 **Model**: Qwen3.6-35B-A3B
 
@@ -859,8 +843,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -879,12 +861,13 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 

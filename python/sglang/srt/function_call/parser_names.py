@@ -50,4 +50,5 @@ TOOL_CALL_PARSER_NAMES = [
     "gemma4",
     "inkling",
     "iquest_q1",
+    "response_template",
 ]

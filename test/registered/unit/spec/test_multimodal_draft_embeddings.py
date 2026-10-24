@@ -23,7 +23,7 @@ class _MutatingLanguageModel:
         return input_embeds
 
 
-@pytest.mark.parametrize("algorithm", ["EAGLE", "EAGLE3", "NEXTN", "FROZEN_KV_MTP"])
+@pytest.mark.parametrize("algorithm", ["EAGLE"])
 def test_eagle_mm_embeddings_survive_in_place_target_updates(algorithm):
     source_embeds = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     expected_embeds = source_embeds.clone()

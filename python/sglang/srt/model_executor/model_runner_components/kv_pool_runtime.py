@@ -17,32 +17,42 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
     get_parallel,
+    get_schedule,
     pre_capture_activation_reserve_mb,
 )
 from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
 
 def is_post_capture_kv_active(
-    *, server_args: ServerArgs, is_draft_worker: bool
+    *,
+    server_args: ServerArgs,
+    is_draft_worker: bool,
+    spec_algorithm: SpeculativeAlgorithm,
+    token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
 ) -> bool:
-
-    return (
-        post_capture_kv_sizing_planned(server_args)
-        and current_platform.is_cuda()
-        and not is_draft_worker
-    )
+    if is_draft_worker:
+        # A dflash-family draft pool is indexed by the target's token ids, so it
+        # follows the target pool's post-capture backing.
+        return (
+            spec_algorithm.is_dflash_family()
+            and token_to_kv_pool_allocator.get_kvcache().post_capture_active
+        )
+    return post_capture_kv_sizing_planned(server_args) and current_platform.is_cuda()
 
 
 class PostCaptureKVResize(msgspec.Struct, frozen=True, kw_only=True):
     max_total_num_tokens: int
     full_max_total_num_tokens: Optional[int]
     swa_max_total_num_tokens: Optional[int]
+    unified_memory_pool_bytes: Optional[int]
     capped_max_running_requests: Optional[int]
 
 
@@ -81,13 +91,26 @@ def compute_post_capture_kv_resize(
             running_requests,
         )
     if eager_decode_gap or mambaish_config(model_runner.model_config) is not None:
-        headroom_gb = max(
-            headroom_gb,
-            pre_capture_activation_reserve_mb(
-                get_device_memory_capacity(model_runner.device)
-            )
-            / 1024,
+        prefill_max_requests = get_schedule().prefill_max_requests
+        request_slots = get_exec().graph.cuda_graph_config.prefill.full_prefill_max_req
+        # Every prefill batch fits a captured bucket when batches are capped at the
+        # request slots; the configured headroom then covers the eager tail.
+        capped_full_prefill_role = (
+            get_disagg().disaggregation_mode == "prefill"
+            and get_exec().graph.cuda_graph_config.prefill.backend == Backend.FULL
+            and get_schedule().max_mamba_cache_size is not None
+            and prefill_max_requests is not None
+            and request_slots is not None
+            and prefill_max_requests <= request_slots
         )
+        if not capped_full_prefill_role:
+            headroom_gb = max(
+                headroom_gb,
+                pre_capture_activation_reserve_mb(
+                    get_device_memory_capacity(model_runner.device)
+                )
+                / 1024,
+            )
     if not graph_pool_borrow_enabled():
         # Borrowing serves the sampling temporaries out of idle graph storage;
         # without it they need real headroom the KV pool must not claim.
@@ -108,15 +131,26 @@ def compute_post_capture_kv_resize(
         ),
         default=0,
     )
+    # Drafts take the target's token count; the target cell already charges their
+    # bytes. A draft that aliases the target pool is finalized once, as the target.
+    draft_pools = tuple(
+        runner.token_to_kv_pool
+        for runner in draft_runners
+        if runner.token_to_kv_pool is not pool
+        and runner.token_to_kv_pool.post_capture_active
+    )
     budget_bytes = (
         int(max(0.0, free_gb - headroom_gb - mm_reservation_gb) * (1 << 30))
         + pool.post_capture_backed_bytes
+        + sum(draft_pool.post_capture_backed_bytes for draft_pool in draft_pools)
         - canary_workspace_bytes
     )
     config = model_runner.kv_cache_configurator.config_from_budget(
         budget_bytes, cap_tokens=model_runner.max_total_num_tokens
     )
     pool.finalize_backing(config)
+    for draft_pool in draft_pools:
+        draft_pool.finalize_backing(config)
     model_runner.token_to_kv_pool_allocator.resize(config)
     model_runner.req_to_token_pool.reset_aux_cache_allocator()
     if canary_workspace_bytes:
@@ -165,9 +199,18 @@ def compute_post_capture_kv_resize(
         pool.post_capture_backed_bytes / (1 << 30),
         get_available_gpu_memory(model_runner.device, model_runner.gpu_id),
     )
+    for draft_pool in draft_pools:
+        logger.info(
+            "Post-capture KV sizing: draft KV cache allocated. dtype: %s, "
+            "#tokens: %d, KV size: %.2f GB",
+            draft_pool.dtype,
+            draft_pool.size,
+            draft_pool.post_capture_backed_bytes / (1 << 30),
+        )
     return PostCaptureKVResize(
         max_total_num_tokens=config.max_total_num_tokens,
         full_max_total_num_tokens=config.full_max_total_num_tokens,
         swa_max_total_num_tokens=config.swa_max_total_num_tokens,
+        unified_memory_pool_bytes=config.unified_memory_pool_bytes,
         capped_max_running_requests=capped_max_running_requests,
     )

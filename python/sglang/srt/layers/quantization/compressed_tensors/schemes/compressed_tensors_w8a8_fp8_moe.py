@@ -26,7 +26,6 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     swap_w13_to_w31,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -98,7 +97,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         if self.block_quant:
             assert self.weight_block_size is not None
             layer.weight_block_size = self.weight_block_size
-            tp_size = get_parallel().tp_size
+            tp_size = layer.moe_tp_size
             block_n, block_k = (
                 self.weight_block_size[0],
                 self.weight_block_size[1],

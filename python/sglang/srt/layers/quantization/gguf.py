@@ -18,6 +18,9 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+    moe_align_block_size,
+)
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -39,29 +42,33 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_musa_apply_gguf_moe_weights = None
 
 if _is_cuda:
-    from sgl_kernel import moe_align_block_size, moe_sum
+    from sgl_kernel import moe_sum
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
-        ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
 
     from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.moe.gguf_moe_vec import gguf_moe_a8_vec as ggml_moe_a8_vec
+    from sglang.kernels.ops.moe.gguf_moe_weights import apply_gguf_moe_weights
 elif _is_musa:
-    from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
         ggml_moe_a8_vec,
-        ggml_moe_get_block_size,
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
+
+    from sglang.kernels.ops.moe.gguf_moe_weights_aot import resolve_gguf_moe_weights
+
+    _musa_apply_gguf_moe_weights = resolve_gguf_moe_weights("musa")
 elif _is_npu:
     from gguf import dequantize as gguf_dequantize
 else:
@@ -180,6 +187,16 @@ MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
 
+def ggml_moe_get_block_size(qweight_type: int) -> int:
+    # MOE_X in the CUDA/MUSA GGUF MMQ kernels is 4. The released wheel's
+    # Tensor-free metadata operator has no catch-all dispatch registration.
+    return (
+        (8 if _is_hip else 4)
+        if qweight_type in MMQ_QUANT_TYPES and qweight_type != WeightType.Q8_1
+        else 0
+    )
+
+
 def dequantize_gguf_weight(
     qweight: torch.Tensor, qweight_type: int, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -232,13 +249,31 @@ def fused_moe_gguf(
     qweight_type2: int,
     activation: str,
 ) -> torch.Tensor:
-    def act(x: torch.Tensor):
+    def act(x: torch.Tensor, *, routed: bool = False):
         if activation == "silu":
-            return silu_and_mul(x)
+            activation_fn = silu_and_mul
         elif activation == "gelu":
-            return gelu_and_mul(x)
-        raise ValueError(f"Unsupported activation: {activation}")
+            activation_fn = gelu_and_mul
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+        if routed and _is_musa and not native_musa:
+            x.masked_fill_(inactive.reshape(-1, 1), 0.0)
+        return activation_fn(x)
 
+    def sum_expert_outputs(out: torch.Tensor):
+        if _is_cuda:
+            apply_gguf_moe_weights(out, topk_weights, topk_ids)
+        elif native_musa:
+            _musa_apply_gguf_moe_weights(out, topk_weights, topk_ids)
+        else:
+            out.masked_fill_(inactive.reshape(-1, 1), 0.0)
+            valid_weights = topk_weights.masked_fill(inactive, 0.0)
+            out.view(*topk_ids.shape, -1).mul_(valid_weights.unsqueeze(-1))
+        moe_sum(out.view(*topk_ids.shape, -1), out_hidden_states)
+
+    native_musa = _is_musa and _musa_apply_gguf_moe_weights is not None
+    if _is_musa and not native_musa:
+        inactive = topk_ids < 0
     out_hidden_states = torch.empty_like(x)
     # unless we decent expert reuse we are better off running moe_vec kernel
     if (
@@ -252,8 +287,14 @@ def fused_moe_gguf(
         BLOCK_SIZE = ggml_moe_get_block_size(qweight_type)
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, BLOCK_SIZE, E
+            topk_ids, BLOCK_SIZE, E, pad_expert_ids=_is_cuda
         )
+        if _is_musa and not native_musa:
+            # Released MMQ kernels inspect a slack block before their bound check.
+            block_starts = (
+                torch.arange(expert_ids.numel(), device=expert_ids.device) * BLOCK_SIZE
+            )
+            expert_ids.masked_fill_(block_starts >= num_tokens_post_padded, -1)
         out = ggml_moe_a8(
             x,
             w1,
@@ -265,7 +306,7 @@ def fused_moe_gguf(
             top_k,
             num_tokens,
         )
-        out = act(out)
+        out = act(out, routed=True)
         out = ggml_moe_a8(
             out,
             w2,
@@ -277,26 +318,31 @@ def fused_moe_gguf(
             1,
             num_tokens * top_k,
         )
-        out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
-            topk_weights.view(num_tokens, top_k, 1)
-        )
         # TODO(FlamingoPg): maybe we can use moe_sum_reduce here?
-        moe_sum(out, out_hidden_states)
+        sum_expert_outputs(out)
     elif qweight_type2 in MMVQ_QUANT_TYPES and qweight_type in MMVQ_QUANT_TYPES:
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
 
-        out = ggml_moe_a8_vec(x, w1, topk_ids, top_k, qweight_type, N, num_tokens)
-        out = act(out)
+        if _is_cuda or native_musa:
+            # The vector ABI reads compact int32 IDs. Normal routes keep their
+            # storage; exceptional int64 routes canonicalize negative IDs.
+            safe_ids = (
+                topk_ids.contiguous()
+                if topk_ids.dtype == torch.int32
+                else topk_ids.clamp_min(-1).to(torch.int32).contiguous()
+            )
+        else:
+            # Older vector kernels form weight addresses before checking -1.
+            safe_ids = topk_ids.clamp_min(0)
+        out = ggml_moe_a8_vec(x, w1, safe_ids, top_k, qweight_type, N, num_tokens)
+        out = act(out, routed=True)
 
         out = ggml_moe_a8_vec(
-            out, w2, topk_ids, 1, qweight_type2, w2.shape[1], num_tokens * top_k
+            out, w2, safe_ids, 1, qweight_type2, w2.shape[1], num_tokens * top_k
         )
-        out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
-            topk_weights.view(num_tokens, top_k, 1)
-        )
-        moe_sum(out, out_hidden_states)
+        sum_expert_outputs(out)
     else:
         logger.warning_once(
             "There is no support for fast MoE kernel "
@@ -307,6 +353,8 @@ def fused_moe_gguf(
             inp = x[tok].reshape((1,) + x.shape[1:])
             current_hidden_state = None
             for ww, ii in zip(w, idx):
+                if ii < 0:
+                    continue
                 expert_up = w1[ii]
 
                 out = fused_mul_mat_gguf(inp, expert_up, qweight_type)
@@ -320,7 +368,10 @@ def fused_moe_gguf(
                     current_hidden_state = current_state
                 else:
                     current_hidden_state.add_(current_state)
-            out_hidden_states[tok] = current_hidden_state
+            if current_hidden_state is None:
+                out_hidden_states[tok].zero_()
+            else:
+                out_hidden_states[tok] = current_hidden_state
     return out_hidden_states
 
 
@@ -565,8 +616,6 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        assert self.fused_experts is None
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert self.moe_runner_config.activation == "silu", (

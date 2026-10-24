@@ -78,7 +78,8 @@ class PatchEmbed(nn.Module):
         )
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x, tokens: bool = False):
+        """``tokens`` returns ``[B, T'*H'*W', C]`` even when ``flatten`` is off."""
         if x.dim() == 5:
             B, C, T, H, W = x.shape
             pt, ph, pw = self.patch_size
@@ -95,7 +96,7 @@ class PatchEmbed(nn.Module):
                 w = self.proj.weight.reshape(self.proj.weight.shape[0], -1)
                 x = F.linear(x, w, self.proj.bias)  # [B, T'*H'*W', embed_dim]
 
-                if not self.flatten:
+                if not (self.flatten or tokens):
                     x = x.reshape(B, T_, H_, W_, -1).permute(0, 4, 1, 2, 3).contiguous()
 
                 x = self.norm(x)
@@ -103,7 +104,7 @@ class PatchEmbed(nn.Module):
 
         # Fallback to Conv3d for non-5D input or indivisible spatial dims.
         x = self.proj(x)
-        if self.flatten:
+        if self.flatten or tokens:
             x = x.flatten(2).transpose(1, 2)
         x = self.norm(x)
         return x

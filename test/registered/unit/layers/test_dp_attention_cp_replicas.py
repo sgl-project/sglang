@@ -32,6 +32,99 @@ PAD_VALUE = 99.0
 
 
 class TestDpGatherCpReplicas(CustomTestCase):
+    def test_reduce_scatter_restores_every_cp_and_tp_replica(self):
+        # TP reduce-scatter leaves DP x CP x attention-TP shards. Decode needs
+        # the complete DP slot on every CP and attention-TP rank, not just the
+        # attention-TP gather (which is an identity for DSA CP).
+        for cp_size, attn_tp_size, rows in (
+            (1, 1, 3),
+            (1, 2, 6),
+            (2, 1, 6),
+            (2, 2, 12),
+            (2, 1, 0),
+            (2, 2, 0),
+            (2, 1, 1),
+            (2, 1, 3),
+            (4, 1, 1),
+            (4, 1, 3),
+            (2, 2, 2),
+            (2, 2, 6),
+            (4, 2, 2),
+            (4, 2, 6),
+        ):
+            tp_size = DP_SIZE * cp_size * attn_tp_size
+            summed = torch.arange(DP_SIZE * rows * HIDDEN).reshape(-1, HIDDEN).float()
+            for rank in range(tp_size):
+                dp = rank // (cp_size * attn_tp_size)
+                cp = rank // attn_tp_size % cp_size
+                with self.subTest(
+                    cp_size=cp_size, attn_tp_size=attn_tp_size, rank=rank, rows=rows
+                ):
+                    calls = []
+                    local_contribution = summed / tp_size
+                    dp_rows = summed[dp * rows : (dp + 1) * rows]
+                    cp_rows = dp_rows.tensor_split(cp_size)[cp]
+
+                    def all_reduce(value):
+                        calls.append("all_reduce")
+                        torch.testing.assert_close(value, local_contribution)
+                        return summed.clone()
+
+                    def reduce_scatter(output, value):
+                        calls.append("reduce_scatter")
+                        torch.testing.assert_close(value, local_contribution)
+                        output.copy_(summed.tensor_split(tp_size)[rank])
+
+                    def tp_gather(output, value):
+                        calls.append("attn_tp_gather")
+                        self.assertEqual(output.shape[0], value.shape[0] * attn_tp_size)
+                        torch.testing.assert_close(
+                            value, summed.tensor_split(tp_size)[rank]
+                        )
+                        output.copy_(cp_rows)
+
+                    def cp_gather(output, value):
+                        calls.append("attn_cp_gather")
+                        self.assertEqual(output.shape[0], value.shape[0] * cp_size)
+                        torch.testing.assert_close(value, cp_rows)
+                        output.copy_(dp_rows)
+
+                    parallel = SimpleNamespace(
+                        tp_size=tp_size,
+                        tp_rank=rank,
+                        attn_dp_size=DP_SIZE,
+                        attn_dp_rank=dp,
+                        attn_cp_size=cp_size,
+                        attn_cp_rank=cp,
+                        attn_tp_size=attn_tp_size,
+                        tp_group=SimpleNamespace(
+                            reduce_scatter_tensor=reduce_scatter, all_reduce=all_reduce
+                        ),
+                        attn_tp_group=SimpleNamespace(all_gather_into_tensor=tp_gather),
+                        attn_cp_group=SimpleNamespace(all_gather_into_tensor=cp_gather),
+                    )
+                    output = torch.empty_like(dp_rows)
+                    with (
+                        patch.object(
+                            dp_attention, "get_parallel", return_value=parallel
+                        ),
+                        patch.object(dp_attention, "_note_dp_gather_in_prefill_graph"),
+                        patch.object(
+                            dp_attention, "is_dp_gatherv_active", return_value=False
+                        ),
+                    ):
+                        dp_attention.dp_reduce_scatter_tensor(
+                            output, local_contribution.clone()
+                        )
+                    torch.testing.assert_close(output, dp_rows)
+                    if rows % (cp_size * attn_tp_size):
+                        self.assertEqual(calls, ["all_reduce"])
+                    else:
+                        self.assertEqual(calls[0], "reduce_scatter")
+                        self.assertEqual(
+                            calls.count("attn_cp_gather"), int(cp_size > 1)
+                        )
+
     def run_ranks(self, token_rows, padding, is_partial):
         """Gather on every rank and check each DP slot holds its group's rows
         once, then scatter the result back and check every rank's rows."""

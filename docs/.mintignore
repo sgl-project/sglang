@@ -5,3 +5,6 @@
 # Draft content
 drafts/
 *.draft.mdx
+
+# Data read by test_server_args_docs_coverage.py, not a page
+advanced_features/server_arguments_undocumented.txt

@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
     _vision_window_index,
 )
 from sglang.multimodal_gen.runtime.pipelines.longcat_image import LongCatImagePipeline
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -75,7 +76,6 @@ def test_text_mlp_uses_single_rank_when_intermediate_size_is_not_tp_divisible(
 ):
     monkeypatch.setattr(qwen2_5vl, "Qwen2_5_VLAttention", lambda *_args: nn.Identity())
     monkeypatch.setattr(qwen2_5vl, "_tp_world_size", lambda: 3)
-    monkeypatch.setattr(qwen2_5vl, "_tp_rank", lambda: 2)
     config = SimpleNamespace(
         hidden_size=16,
         intermediate_size=25,
@@ -88,11 +88,14 @@ def test_text_mlp_uses_single_rank_when_intermediate_size_is_not_tp_divisible(
 
     layer = qwen2_5vl.Qwen2_5_VLDecoderLayer(config, layer_idx=0)
 
-    assert layer.mlp.tp_size == 1
-    assert layer.mlp.tp_rank == 0
+    assert get_group_rank_size(layer.mlp.tp_group) == (0, 1)
     assert isinstance(layer.mlp.gate_proj, ColumnParallelLinear)
     assert isinstance(layer.mlp.up_proj, ColumnParallelLinear)
-    assert layer.mlp.gate_proj.tp_rank == layer.mlp.up_proj.tp_rank == 0
+    assert (
+        get_group_rank_size(layer.mlp.gate_proj.tp_group)[0]
+        == get_group_rank_size(layer.mlp.up_proj.tp_group)[0]
+        == 0
+    )
     assert isinstance(layer.mlp.down_proj, ReplicatedLinear)
 
 

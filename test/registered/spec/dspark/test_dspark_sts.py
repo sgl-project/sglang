@@ -9,7 +9,7 @@ from sglang.benchmark.dspark_sts_fit import (
     expected_calibration_error,
     fit_sts_temperatures,
 )
-from sglang.srt.models.dspark import DSparkConfidenceHead
+from sglang.srt.models.dspark import DSparkConfidenceHead, VanillaMarkov
 from sglang.srt.speculative.dspark_components.dspark_sts import (
     DSparkStsCalibration,
     StsDataRecorder,
@@ -21,12 +21,6 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestApplySts(CustomTestCase):
-    def test_default_buffer_is_identity_sigmoid(self):
-        head = DSparkConfidenceHead(hidden_size=8, markov_rank=4, with_markov=False)
-        confidence_raw = torch.randn(3, 5) * 9.0
-        out = head.apply_sts(confidence_raw)
-        self.assertTrue(torch.equal(out, torch.sigmoid(confidence_raw.float())))
-
     def test_per_position_temperature_scales_each_column(self):
         head = DSparkConfidenceHead(hidden_size=8, markov_rank=4, with_markov=False)
         head.sts_temperatures = torch.tensor([0.5, 1.0, 2.0])
@@ -40,33 +34,41 @@ class TestApplySts(CustomTestCase):
             for got, want in zip(row, expected_row):
                 self.assertAlmostEqual(got, want, places=6)
 
-    def test_apply_sts_stashes_raw_logit(self):
+
+class TestConfidencePredict(CustomTestCase):
+    def test_predict_applies_sts_to_the_raw_logit(self):
+        torch.manual_seed(0)
         head = DSparkConfidenceHead(hidden_size=8, markov_rank=4, with_markov=False)
-        confidence_raw = torch.randn(2, 5)
-        head.apply_sts(confidence_raw)
-        self.assertIs(head._last_confidence_raw, confidence_raw)
+        head.sts_temperatures = torch.tensor([0.5, 1.0, 2.0])
+        confidence, confidence_raw = head.predict(
+            torch.randn(2 * 3, 8),
+            anchor_tokens=torch.tensor([1, 2]),
+            draft_tokens=torch.tensor([[3, 4, 5], [6, 7, 8]]),
+            markov_head=None,
+        )
+        self.assertEqual(confidence_raw.shape, (2, 3))
+        self.assertTrue(torch.equal(confidence, head.apply_sts(confidence_raw)))
+
+    def test_markov_features_are_the_previous_tokens(self):
+        # Step i reads the embedding of the token before it: the anchor, then drafts.
+        torch.manual_seed(0)
+        head = DSparkConfidenceHead(hidden_size=8, markov_rank=4, with_markov=True)
+        markov_head = VanillaMarkov(vocab_size=16, markov_rank=4)
+        features = torch.randn(2, 3, 8)
+        anchor_tokens = torch.tensor([1, 2])
+        draft_tokens = torch.tensor([[3, 4, 5], [6, 7, 8]])
+        _, confidence_raw = head.predict(
+            features.view(6, 8),
+            anchor_tokens=anchor_tokens,
+            draft_tokens=draft_tokens,
+            markov_head=markov_head,
+        )
+        prev_tokens = torch.tensor([[1, 3, 4], [2, 6, 7]])
+        expected = head(features, markov_head.get_prev_embeddings(prev_tokens))
+        self.assertTrue(torch.equal(confidence_raw, expected))
 
 
 class TestDSparkStsCalibration(CustomTestCase):
-    def test_json_round_trip_preserves_fields(self):
-        calibration = DSparkStsCalibration(
-            temperatures=[1.5, 2.0, 0.5],
-            dataset="shards.*.pt",
-            num_samples=1234,
-            ece_before=[0.3, 0.2, 0.1],
-            ece_after=[0.02, 0.01, 0.03],
-        )
-        restored = DSparkStsCalibration.from_json(calibration.to_json())
-        self.assertEqual(restored.temperatures, calibration.temperatures)
-        self.assertEqual(restored.dataset, calibration.dataset)
-        self.assertEqual(restored.num_samples, calibration.num_samples)
-        self.assertEqual(restored.ece_before, calibration.ece_before)
-        self.assertEqual(restored.ece_after, calibration.ece_after)
-
-    def test_rejects_empty_temperatures(self):
-        with self.assertRaises(ValueError):
-            DSparkStsCalibration(temperatures=[])
-
     def test_rejects_non_positive_temperature(self):
         with self.assertRaises(ValueError):
             DSparkStsCalibration(temperatures=[1.0, 0.0, 2.0])

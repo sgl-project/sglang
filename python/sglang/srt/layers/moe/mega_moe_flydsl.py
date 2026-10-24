@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import functools
+import logging
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -12,9 +14,11 @@ import torch
 
 from sglang.kernels.ops.moe.fill_padded_rows import _fill_padded_rows
 from sglang.srt.environ import envs
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.dp_attention import (
+    get_dp_global_num_tokens,
+    get_is_extend_in_batch,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_parallel
@@ -23,6 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
+logger = logging.getLogger(__name__)
 
 _MORI_SHMEM_READY = False
 _MEGA_MOE_INSTANCE: dict = {}
@@ -52,6 +57,66 @@ def _mtpr() -> int:
             f"SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR={mtpr} must be a positive power of two"
         )
     return mtpr
+
+
+def _decode_mtpr() -> int:
+    decode_mtpr = int(envs.SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR.get())
+    if decode_mtpr == 0:
+        return 0
+    mtpr = _mtpr()
+    if decode_mtpr < 0 or decode_mtpr > mtpr or decode_mtpr & (decode_mtpr - 1):
+        raise ValueError(
+            f"SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR={decode_mtpr} must be 0 (off) "
+            "or a power of two no larger than "
+            f"SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR={mtpr}"
+        )
+    if decode_mtpr == mtpr:
+        _warn_decode_mtpr_merged(mtpr)
+        return 0
+    return decode_mtpr
+
+
+@functools.cache
+def _warn_decode_mtpr_merged(mtpr: int) -> None:
+    logger.warning(
+        "SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR equals "
+        "SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=%d; running one MegaMoE capacity",
+        mtpr,
+    )
+
+
+def _capacities() -> tuple[int, ...]:
+    decode_mtpr = _decode_mtpr()
+    return (decode_mtpr, _mtpr()) if decode_mtpr else (_mtpr(),)
+
+
+def _is_decode_step_mode(forward_batch: ForwardBatch | None) -> bool:
+    # IDLE also runs in prefill steps; _select_mtpr tells the two apart.
+    if forward_batch is None:
+        return False
+    mode = forward_batch.forward_mode
+    return (
+        mode.is_decode_or_idle() or mode.is_target_verify() or mode.is_draft_extend_v2()
+    )
+
+
+def _select_mtpr(forward_batch: ForwardBatch | None) -> int:
+    """The capacity this forward runs with; every EP rank must pick the same one.
+
+    Local token counts, graph buckets and graph-vs-eager can differ across
+    ranks (DP counts are gathered only under require_mlp_tp_gather), so only
+    the step kind decides.
+    """
+    mtpr = _mtpr()
+    decode_mtpr = _decode_mtpr()
+    if not decode_mtpr or not _is_decode_step_mode(forward_batch):
+        return mtpr
+    if get_is_capture_mode():
+        # Decode-step graphs replay only when no DP rank extends
+        # (can_run_decode_cuda_graph is min-reduced over the group).
+        return decode_mtpr
+    # is_extend_in_batch is max-reduced over the DP group.
+    return mtpr if get_is_extend_in_batch() else decode_mtpr
 
 
 def _ep_rank_world():
@@ -130,23 +195,21 @@ def _get_or_build_mega_moe(
     swiglu_limit: float,
     mtpr: int,
 ):
+    rank, world = _ep_rank_world()
+    shape_key = (rank, world, model_dim, inter_dim, experts, topk, quant, swiglu_limit)
+    mega = _MEGA_MOE_INSTANCE.get((*shape_key, mtpr))
+    if mega is not None:
+        return mega
     _ensure_mori_shmem()
     backend = _import_aiter_megamoe()
-    rank, world = _ep_rank_world()
-    key = (
-        rank,
-        world,
-        model_dim,
-        inter_dim,
-        experts,
-        topk,
-        quant,
-        swiglu_limit,
-        mtpr,
-    )
-    mega = _MEGA_MOE_INSTANCE.get(key)
-    if mega is None:
-        mega = backend.op(
+    # Construction synchronizes the device and barriers every EP rank, so all
+    # capacities are built together on the first (eager) call, in the same order
+    # on every rank: a capacity first used later could be inside graph capture.
+    for capacity in _capacities():
+        key = (*shape_key, capacity)
+        if key in _MEGA_MOE_INSTANCE:
+            continue
+        _MEGA_MOE_INSTANCE[key] = backend.op(
             rank=rank,
             world_size=world,
             model_dim=model_dim,
@@ -158,11 +221,11 @@ def _get_or_build_mega_moe(
             w1_scale=layer._mega_w1_scale,
             w2=layer._mega_w2,
             w2_scale=layer._mega_w2_scale,
-            max_tok_per_rank=mtpr,
+            max_tok_per_rank=capacity,
             swiglu_limit=swiglu_limit,
         )
-        _MEGA_MOE_INSTANCE[key] = mega
-    return mega
+        logger.info("Aiter MegaMoE: built capacity max_tok_per_rank=%d", capacity)
+    return _MEGA_MOE_INSTANCE[(*shape_key, mtpr)]
 
 
 def _swap_layer_weights(mega, layer) -> None:
@@ -243,23 +306,16 @@ def _run_mega_routed(
         topk_output = moe.topk(
             hidden_states,
             router_logits,
-            num_token_non_padded=(
-                forward_batch.num_token_non_padded
-                if forward_batch is not None
-                else None
-            ),
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=moe.layer_id
-            ),
             **topk_kwargs,
         )
         x_in = hidden_states
         topk_ids = topk_output.topk_ids.to(torch.int32)
         topk_weights = topk_output.topk_weights.to(torch.float32)
-        if forward_batch is not None and forward_batch.num_token_non_padded is not None:
+        num_token_non_padded, _ = moe.topk.routing_inputs()
+        if num_token_non_padded is not None:
             _fill_padded_rows(
                 topk_ids,
-                forward_batch.num_token_non_padded,
+                num_token_non_padded,
                 experts,
             )
     else:
@@ -288,7 +344,7 @@ def _run_mega_routed(
             )
             topk_weights = hidden_states.new_zeros((1, topk), dtype=torch.float32)
 
-    selected_mtpr = _mtpr()
+    selected_mtpr = _select_mtpr(forward_batch)
     x_in = x_in.contiguous()
     topk_ids = topk_ids.contiguous()
     topk_weights = topk_weights.contiguous()
@@ -309,8 +365,6 @@ def _run_mega_routed(
 
     output = mega.forward(x_in, topk_weights, topk_ids, slice_output=False)[:num_tokens]
 
-    from sglang.srt.models.deepseek_common.utils import _use_aiter
-
-    if not (moe.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter):
+    if not moe.routed_scaling_factor_fused_in_topk:
         output.mul_(moe.routed_scaling_factor)
     return output

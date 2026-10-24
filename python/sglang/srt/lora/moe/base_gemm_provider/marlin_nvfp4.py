@@ -1,0 +1,216 @@
+"""Marlin W4A16 GEMMs with BF16 activations in raw pair order."""
+
+from __future__ import annotations
+
+import msgspec
+import torch
+
+from sglang.srt.lora.moe.base_gemm_provider.base import (
+    MoeBaseProviderContract,
+    prepare_buffer,
+)
+from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
+    ContiguousRowDomainProvider,
+)
+from sglang.srt.lora.moe.quant_info import MoeLoraNvFp4MarlinQuantInfo
+
+
+class MarlinNvFp4RowState(msgspec.Struct, kw_only=True):
+    hidden_states: torch.Tensor  # [num_tokens, hidden] bf16, borrowed
+    sorted_token_ids: torch.Tensor
+    expert_ids: torch.Tensor
+    num_tokens_post_padded: torch.Tensor
+    # Per-forward locks prevent aliasing across CUDA graph pools.
+    lock_workspace: torch.Tensor
+    pair_to_row: torch.Tensor  # [num_pairs] int32 identity
+    num_pairs: int
+    top_k: int
+    block_size_m: int
+    padded_intermediate: torch.Tensor | None = None
+
+
+class MarlinNvFp4ContiguousProvider(ContiguousRowDomainProvider):
+    contract = MoeBaseProviderContract(
+        key="marlin_nvfp4_contiguous",
+        quant_info_cls=MoeLoraNvFp4MarlinQuantInfo,
+        gate_first=True,
+        interleaved=False,
+        gate_up_output_dtype=torch.bfloat16,
+        lora_delta_dtype=torch.bfloat16,
+        lora_activation_dtype=torch.bfloat16,
+    )
+
+    def __init__(self, quant_info: MoeLoraNvFp4MarlinQuantInfo):
+        # Packed weights use explicit logical sizes instead of shape admission.
+        self.quant_info = quant_info
+        self._gate_up_slices = quant_info.gate_up_slices
+        self._padded_intermediate_size = quant_info.w2_qweight.shape[1] * 16
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            get_scalar_type,
+        )
+
+        self._scalar_type_w13 = get_scalar_type(
+            4, False, quant_info.w13_scales, quant_info.w13_global_scale
+        )
+        self._scalar_type_w2 = get_scalar_type(
+            4, False, quant_info.w2_scales, quant_info.w2_global_scale
+        )
+        # Finalize owns router weights; the dummy is unread when mul_topk_weights=False.
+        self._unused_topk_weights = torch.zeros(
+            (1, 1), dtype=torch.float32, device=quant_info.w13_qweight.device
+        )
+
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        top_k: int,
+        workspace=None,
+    ) -> MarlinNvFp4RowState:
+        from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+        from sglang.srt.lora.moe.base_gemm_provider.input_alignment import align_rows
+
+        num_tokens = hidden_states.shape[0]
+        num_experts = self.quant_info.num_local_experts
+        # fused_marlin_moe's M block size rule.
+        for block_size_m in (8, 16, 32, 48, 64):
+            if num_tokens * top_k / num_experts / block_size_m < 0.9:
+                break
+        num_pairs = topk_ids.numel()
+        device = hidden_states.device
+        pair_to_row = prepare_buffer(
+            workspace, "pair_to_row", (num_pairs,), dtype=torch.int32, device=device
+        )
+        # Finalize uses pair_to_row, with -1 for pairs without an expert.
+        sorted_token_ids, expert_ids, num_tokens_post_padded = align_rows(
+            topk_ids, block_size_m, num_experts, pair_to_row_out=pair_to_row
+        )
+        return MarlinNvFp4RowState(
+            hidden_states=hidden_states,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_post_padded,
+            lock_workspace=marlin_make_workspace(device, max_blocks_per_sm=4),
+            pair_to_row=pair_to_row,
+            num_pairs=num_pairs,
+            top_k=top_k,
+            block_size_m=block_size_m,
+            padded_intermediate=(
+                prepare_buffer(
+                    workspace,
+                    "marlin:padded_intermediate",
+                    (num_pairs, self._padded_intermediate_size),
+                    dtype=hidden_states.dtype,
+                    device=device,
+                )
+                if self._padded_intermediate_size != self.intermediate_size
+                else None
+            ),
+        )
+
+    def release_prepared_inputs(self, row_state: MarlinNvFp4RowState) -> None:
+        pass
+
+    def _invoke(
+        self,
+        a: torch.Tensor,
+        out: torch.Tensor,
+        row_state: MarlinNvFp4RowState,
+        *,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        global_scale: torch.Tensor,
+        scalar_type,
+        top_k: int,
+        size_m: int,
+        size_n: int,
+        size_k: int,
+    ) -> None:
+        from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+
+        moe_wna16_marlin_gemm(
+            a,
+            out,
+            qweight,
+            None,
+            scales,
+            global_scale,
+            None,
+            None,
+            None,
+            row_state.lock_workspace,
+            row_state.sorted_token_ids,
+            row_state.expert_ids,
+            row_state.num_tokens_post_padded,
+            self._unused_topk_weights,
+            moe_block_size=row_state.block_size_m,
+            top_k=top_k,
+            mul_topk_weights=False,
+            is_ep=False,
+            b_q_type=scalar_type,
+            size_m=size_m,
+            size_n=size_n,
+            size_k=size_k,
+            is_k_full=True,  # NVFP4 has no GPTQ act-order; K is never permuted
+            use_atomic_add=True,
+            use_fp32_reduce=True,
+            is_zp_float=False,
+        )
+
+    def gateup(self, row_state: MarlinNvFp4RowState, out: torch.Tensor) -> None:
+        qi = self.quant_info
+        padded = row_state.padded_intermediate
+        self._invoke(
+            row_state.hidden_states,
+            out if padded is None else padded,
+            row_state,
+            qweight=qi.w13_qweight,
+            scales=qi.w13_scales,
+            global_scale=qi.w13_global_scale,
+            scalar_type=self._scalar_type_w13,
+            top_k=row_state.top_k,
+            size_m=row_state.hidden_states.shape[0],
+            size_n=self._gate_up_slices * self._padded_intermediate_size,
+            size_k=qi.hidden_size,
+        )
+        if padded is not None:
+            out.copy_(padded[:, : qi.intermediate_size])
+
+    def down(
+        self,
+        row_state: MarlinNvFp4RowState,
+        act_out: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        qi = self.quant_info
+        padded = row_state.padded_intermediate
+        if padded is not None:
+            padded[:, : qi.intermediate_size].copy_(act_out)
+            # Gateup reused this buffer; clear its tail on every replay.
+            padded[:, qi.intermediate_size :].zero_()
+            act_out = padded
+        self._invoke(
+            act_out,
+            out,
+            row_state,
+            qweight=qi.w2_qweight,
+            scales=qi.w2_scales,
+            global_scale=qi.w2_global_scale,
+            scalar_type=self._scalar_type_w2,
+            top_k=1,
+            size_m=row_state.num_pairs,
+            size_n=qi.hidden_size,
+            size_k=self._padded_intermediate_size,
+        )
+
+    def gateup_out_shape(self, row_state: MarlinNvFp4RowState) -> tuple[int, ...]:
+        return (
+            row_state.num_pairs,
+            self._gate_up_slices * self.quant_info.intermediate_size,
+        )
+
+    def act_out_shape(self, row_state: MarlinNvFp4RowState) -> tuple[int, ...]:
+        return (row_state.num_pairs, self.quant_info.intermediate_size)
+
+    def down_out_shape(self, row_state: MarlinNvFp4RowState) -> tuple[int, ...]:
+        return (row_state.num_pairs, self.quant_info.hidden_size)

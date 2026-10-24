@@ -38,9 +38,8 @@ class TestMiMoV25W8A8GraphWithMTP(GSM8KAscendMixin, CustomTestCase):
         "modelslim",
         "--speculative-draft-model-quantization",
         "unquant",
-        "--dp-size",
+        "--attn-dp-size",
         "2",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
     ]
 

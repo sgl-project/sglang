@@ -57,7 +57,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=30, stage="nightly", runner_config="2-gpu-large")
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
-register_xpu_ci(est_time=400, suite="nightly-xpu-2-gpu", nightly=True)
+register_xpu_ci(est_time=400, suite="nightly-xpu-kernel-main-2-gpu", nightly=True)
 
 
 @contextmanager
@@ -2423,7 +2423,7 @@ class TestDumperE2E:
                 "moe_tp_size",
                 "moe_dp_rank",
                 "moe_dp_size",
-                "enable_dp_attention",
+                "attn_dp_enabled",
                 "attn_tp_rank",
                 "attn_tp_size",
                 "attn_dp_rank",

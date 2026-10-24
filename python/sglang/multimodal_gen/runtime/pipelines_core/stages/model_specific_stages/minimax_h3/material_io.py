@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import re
 import shutil
 import subprocess
 import tempfile
@@ -33,6 +34,9 @@ MINIMAX_H3_TAR_HEADER_MAX_ENCODED_CHARS = 64 * 1024
 _BASE64_ALPHABET = frozenset(
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-"
 )
+# The alphabet, then at most two padding characters. Payloads with percent escapes
+# or whitespace, which material URIs may also carry, take the per-character path.
+_PLAIN_BASE64_PAYLOAD = re.compile(r"[A-Za-z0-9+/_-]*={0,2}")
 
 _DEFAULT_SUFFIX_BY_TYPE = {
     "image": ".png",
@@ -586,6 +590,67 @@ def _decode_base64_chunk(encoded: bytes | bytearray) -> bytes:
         raise ValueError("material URI has an invalid base64 payload") from exc
 
 
+def _check_base64_size(encoded_size: int, padding: int) -> None:
+    if encoded_size == 0:
+        raise ValueError("material URI base64 payload is empty")
+    if encoded_size % 4 == 1 or (padding and encoded_size % 4):
+        raise ValueError("material URI has an invalid base64 payload length")
+
+
+def _write_plain_base64(
+    uri: str, payload_start: int, output: Any
+) -> tuple[int, int, int]:
+    """Decode a ``_PLAIN_BASE64_PAYLOAD`` payload in the per-character path's windows.
+
+    One interpreter step per window instead of per character: the per-character
+    loop spent 3.5 s of the HTTP path on a 14.5 MB PNG reference (B300 host).
+    """
+    encoded_size = len(uri) - payload_start
+    padding = 2 if uri.endswith("==") else int(uri.endswith("="))
+    _check_base64_size(encoded_size, padding)
+    total = 0
+    for start in range(payload_start, len(uri), MINIMAX_H3_BASE64_DECODE_CHUNK_CHARS):
+        chunk = uri[start : start + MINIMAX_H3_BASE64_DECODE_CHUNK_CHARS].encode(
+            "ascii"
+        )
+        decoded_chunk = _decode_base64_chunk(chunk + b"=" * (-len(chunk) % 4))
+        total += len(decoded_chunk)
+        output.write(decoded_chunk)
+    return total, encoded_size, padding
+
+
+def _write_escaped_base64(
+    uri: str, payload_start: int, output: Any
+) -> tuple[int, int, int]:
+    total = 0
+    encoded_size = 0
+    padding = 0
+    saw_padding = False
+    encoded_chunk = bytearray()
+    for value in _iter_base64_payload_bytes(uri, payload_start):
+        encoded_size += 1
+        if value == ord("="):
+            saw_padding = True
+            padding += 1
+            if padding > 2:
+                raise ValueError("material URI has invalid base64 padding")
+        elif saw_padding:
+            raise ValueError("material URI has data after base64 padding")
+        encoded_chunk.append(value)
+        if len(encoded_chunk) == MINIMAX_H3_BASE64_DECODE_CHUNK_CHARS:
+            decoded_chunk = _decode_base64_chunk(encoded_chunk)
+            total += len(decoded_chunk)
+            output.write(decoded_chunk)
+            encoded_chunk.clear()
+    _check_base64_size(encoded_size, padding)
+    if encoded_chunk:
+        encoded_chunk.extend(b"=" * (-len(encoded_chunk) % 4))
+        decoded_chunk = _decode_base64_chunk(encoded_chunk)
+        total += len(decoded_chunk)
+        output.write(decoded_chunk)
+    return total, encoded_size, padding
+
+
 def _stream_base64_material(
     batch: Any,
     uri: str,
@@ -601,37 +666,14 @@ def _stream_base64_material(
         condition_index=condition_index,
         media_type=media_type,
     )
-    total = 0
-    encoded_size = 0
-    padding = 0
-    saw_padding = False
-    encoded_chunk = bytearray()
+    write_payload = (
+        _write_plain_base64
+        if _PLAIN_BASE64_PAYLOAD.fullmatch(uri, payload_start)
+        else _write_escaped_base64
+    )
     try:
         with partial_path.open("wb") as output:
-            for value in _iter_base64_payload_bytes(uri, payload_start):
-                encoded_size += 1
-                if value == ord("="):
-                    saw_padding = True
-                    padding += 1
-                    if padding > 2:
-                        raise ValueError("material URI has invalid base64 padding")
-                elif saw_padding:
-                    raise ValueError("material URI has data after base64 padding")
-                encoded_chunk.append(value)
-                if len(encoded_chunk) == MINIMAX_H3_BASE64_DECODE_CHUNK_CHARS:
-                    decoded_chunk = _decode_base64_chunk(encoded_chunk)
-                    total += len(decoded_chunk)
-                    output.write(decoded_chunk)
-                    encoded_chunk.clear()
-            if encoded_size == 0:
-                raise ValueError("material URI base64 payload is empty")
-            if encoded_size % 4 == 1 or (padding and encoded_size % 4):
-                raise ValueError("material URI has an invalid base64 payload length")
-            if encoded_chunk:
-                encoded_chunk.extend(b"=" * (-len(encoded_chunk) % 4))
-                decoded_chunk = _decode_base64_chunk(encoded_chunk)
-                total += len(decoded_chunk)
-                output.write(decoded_chunk)
+            total, encoded_size, padding = write_payload(uri, payload_start, output)
         decoded_size = (encoded_size * 3) // 4 - padding
         if decoded_size <= 0:
             raise ValueError("material URI decoded payload is empty")

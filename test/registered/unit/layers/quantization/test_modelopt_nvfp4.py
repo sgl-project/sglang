@@ -23,8 +23,7 @@ class TestModelOptNvfp4(CustomTestCase):
             input_size=16,
             output_sizes=[16, 16],
             bias=False,
-            tp_rank=0,
-            tp_size=1,
+            parallel_group="replicated",
         )
 
     def _make_qkv_layer(self):
@@ -34,8 +33,7 @@ class TestModelOptNvfp4(CustomTestCase):
             total_num_heads=2,
             total_num_kv_heads=2,
             bias=False,
-            tp_rank=0,
-            tp_size=1,
+            parallel_group="replicated",
         )
 
     def test_fused_scalar_scale_load_fills_all_logical_slots(self):

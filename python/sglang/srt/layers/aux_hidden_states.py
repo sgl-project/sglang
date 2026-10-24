@@ -1,8 +1,13 @@
 """Aux hidden states captured for Eagle3/DFlash draft models."""
 
-from typing import List, Optional, Union
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Iterable, List, Optional, Union
 
 import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 # Two representations coexist: models migrated to AuxHiddenStatePacker pass one
 # packed [tokens, K * hidden] tensor, the rest still pass a list of K tensors.
@@ -27,24 +32,47 @@ class AuxHiddenStatePacker:
     Each ``.append()`` writes into one preallocated ``[tokens, K * hidden]``
     buffer, avoiding the list path's transient ~2x HBM at ``torch.cat``.
     Assumes all captures share leading shape and feature size.
+
+    ``for_batch`` writes into a decode graph runner's buffer when the batch
+    carries one, so every graph size aliases it instead of pinning its own.
     """
 
-    def __init__(self, num_captures: int) -> None:
+    def __init__(self, num_captures: int, out: Optional[torch.Tensor] = None) -> None:
         self._num_captures = int(num_captures)
-        self._buffer: Optional[torch.Tensor] = None
+        self._buffer = out
         self._feature_size: Optional[int] = None
         self._idx = 0
 
-    def append(self, hidden: torch.Tensor) -> None:
-        feature_size = int(hidden.shape[-1])
-        if self._buffer is None:
+    @classmethod
+    def for_batch(
+        cls, forward_batch: ForwardBatch, num_captures: int
+    ) -> AuxHiddenStatePacker:
+        return cls(num_captures, out=forward_batch.aux_hidden_states_buffer)
+
+    def slot(self, like: torch.Tensor) -> torch.Tensor:
+        """Take the next capture's view of the packed buffer, shaped like ``like``,
+        for a producer that writes it in place."""
+        feature_size = int(like.shape[-1])
+        if self._feature_size is None:
             self._feature_size = feature_size
-            self._buffer = hidden.new_empty(
-                (*hidden.shape[:-1], feature_size * self._num_captures)
-            )
+            shape = (*like.shape[:-1], feature_size * self._num_captures)
+            if self._buffer is None:
+                self._buffer = like.new_empty(shape)
+            elif self._buffer.shape != shape or self._buffer.dtype != like.dtype:
+                raise ValueError(
+                    f"aux hidden output buffer is {tuple(self._buffer.shape)} "
+                    f"{self._buffer.dtype}, captures need {shape} {like.dtype}"
+                )
         start = self._idx * self._feature_size
-        self._buffer[..., start : start + self._feature_size].copy_(hidden)
         self._idx += 1
+        return self._buffer[..., start : start + self._feature_size]
+
+    def append(self, hidden: torch.Tensor) -> None:
+        self.slot(hidden).copy_(hidden)
+
+    def extend(self, hiddens: Iterable[torch.Tensor]) -> None:
+        for hidden in hiddens:
+            self.append(hidden)
 
     def capture(self, hidden: torch.Tensor, *, owned: bool = False) -> None:
         """Write directly to the final packed buffer, without an intermediate copy."""
@@ -55,7 +83,7 @@ class AuxHiddenStatePacker:
 
     def finalize(self) -> torch.Tensor:
         """Return the packed buffer; callers guard the empty case on ``len()``."""
-        if self._buffer is None or self._idx != self._num_captures:
+        if self._feature_size is None or self._idx != self._num_captures:
             raise RuntimeError(
                 f"captured {self._idx} of {self._num_captures} aux hidden states"
             )

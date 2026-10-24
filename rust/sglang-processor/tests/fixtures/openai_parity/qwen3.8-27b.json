@@ -1,0 +1,1284 @@
+{
+  "model": "Qwen/Qwen3.8-27B",
+  "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "settings": {"reasoning_parser": "qwen3", "tool_call_parser": "qwen3_coder"},
+  "cases": [
+    {
+      "name": "chat",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "What is 2+3? Answer in one word."}],
+        "max_tokens": 400
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "The user asks for the result of 2+3 and wants a one-word answer.\n</think>\n\nFive",
+          "output_ids": [
+            760, 1156, 16561, 364, 279, 1067, 314, 220, 17, 10, 18, 321, 6587, 264, 799, 36093,
+            4087, 13, 198, 248069, 271, 35792, 248046
+          ],
+          "meta_info": {
+            "id": "2aead69bed7645aab5f37ba857afcb3a",
+            "finish_reason": {"type": "stop", "matched": 248046},
+            "prompt_tokens": 64,
+            "weight_version": "default",
+            "reasoning_tokens": 20,
+            "completion_tokens": 23,
+            "cached_tokens": 0,
+            "weight_versions": [{"version": "default", "start": 0, "end": 23}],
+            "cached_tokens_details": null
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [
+          248045, 8678, 198, 24342, 286, 4879, 369, 716, 310, 830, 11553, 13, 5044, 1683, 15060,
+          1472, 279, 3274, 11, 9307, 1328, 30800, 11, 2814, 47675, 25605, 11, 321, 60445, 55404, 11,
+          27224, 11, 321, 30246, 303, 279, 1534, 4087, 13, 248046, 198, 248045, 846, 198, 3710, 369,
+          220, 17, 10, 18, 30, 21134, 303, 799, 3299, 13, 248046, 198, 248045, 74455, 198, 248068,
+          198
+        ],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 400},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "2aead69bed7645aab5f37ba857afcb3a",
+          "object": "chat.completion",
+          "created": 1791978408,
+          "model": "Qwen/Qwen3.8-27B",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "\n\nFive",
+                "reasoning_content": "The user asks for the result of 2+3 and wants a one-word answer.\n"
+              },
+              "logprobs": null,
+              "finish_reason": "stop",
+              "matched_stop": 248046
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 64,
+            "total_tokens": 87,
+            "completion_tokens": 23,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 20
+          },
+          "metadata": {
+            "weight_version": "default",
+            "weight_versions": [{"version": "default", "start": 0, "end": 23}]
+          }
+        }
+      }
+    },
+    {
+      "name": "chat_stream_usage",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "Say hi."}],
+        "max_tokens": 40,
+        "stream": true,
+        "stream_options": {"include_usage": true, "continuous_usage_stats": true}
+      },
+      "engine": {
+        "status": 200,
+        "frames": [
+          {"text": "We", "output_ids": [1596], "meta_info": {"id": "f471675dd8ea4a4cb67b95509c57124d", "finish_reason": null, "prompt_tokens": 55, "weight_version": "default", "reasoning_tokens": 1, "completion_tokens": 1, "cached_tokens": 0, "cached_tokens_details": null}},
+          {"text": " need", "output_ids": [1144], "meta_info": {"reasoning_tokens": 2, "completion_tokens": 2}},
+          {"text": " to", "output_ids": [310], "meta_info": {"reasoning_tokens": 3, "completion_tokens": 3}},
+          {"text": " respond", "output_ids": [5707], "meta_info": {"reasoning_tokens": 4, "completion_tokens": 4}},
+          {"text": " to", "output_ids": [310], "meta_info": {"reasoning_tokens": 5, "completion_tokens": 5}},
+          {"text": " user", "output_ids": [1156], "meta_info": {"reasoning_tokens": 6, "completion_tokens": 6}},
+          {"text": ":", "output_ids": [25], "meta_info": {"reasoning_tokens": 7, "completion_tokens": 7}},
+          {"text": " \"", "output_ids": [328], "meta_info": {"reasoning_tokens": 8, "completion_tokens": 8}},
+          {"text": "Say", "output_ids": [44240], "meta_info": {"reasoning_tokens": 9, "completion_tokens": 9}},
+          {"text": " hi", "output_ids": [15131], "meta_info": {"reasoning_tokens": 10, "completion_tokens": 10}},
+          {"text": ".\"", "output_ids": [1149], "meta_info": {"reasoning_tokens": 11, "completion_tokens": 11}},
+          {"text": " Simple", "output_ids": [8722], "meta_info": {"reasoning_tokens": 12, "completion_tokens": 12}},
+          {"text": ".", "output_ids": [13], "meta_info": {"reasoning_tokens": 13, "completion_tokens": 13}},
+          {"text": " Just", "output_ids": [4450], "meta_info": {"reasoning_tokens": 14, "completion_tokens": 14}},
+          {"text": " output", "output_ids": [2468], "meta_info": {"reasoning_tokens": 15, "completion_tokens": 15}},
+          {"text": " hi", "output_ids": [15131], "meta_info": {"reasoning_tokens": 16, "completion_tokens": 16}},
+          {"text": ".", "output_ids": [13], "meta_info": {"reasoning_tokens": 17, "completion_tokens": 17}},
+          {"text": " Final", "output_ids": [12650], "meta_info": {"reasoning_tokens": 18, "completion_tokens": 18}},
+          {"text": " only", "output_ids": [1132], "meta_info": {"reasoning_tokens": 19, "completion_tokens": 19}},
+          {"text": " hi", "output_ids": [15131], "meta_info": {"reasoning_tokens": 20, "completion_tokens": 20}},
+          {"text": ".", "output_ids": [13], "meta_info": {"reasoning_tokens": 21, "completion_tokens": 21}},
+          {"text": "\n", "output_ids": [198], "meta_info": {"reasoning_tokens": 22, "completion_tokens": 22}},
+          {"text": "</think>", "output_ids": [248069], "meta_info": {"reasoning_tokens": 23, "completion_tokens": 23}},
+          {"text": "\n\n", "output_ids": [271], "meta_info": {"completion_tokens": 24}},
+          {"text": "hi", "output_ids": [5834], "meta_info": {"completion_tokens": 25}},
+          {"text": "", "output_ids": [248046], "meta_info": {"finish_reason": {"type": "stop", "matched": 248046}, "completion_tokens": 26, "weight_versions": [{"version": "default", "start": 0, "end": 26}]}}
+        ]
+      },
+      "generate": {
+        "input_ids": [
+          248045, 8678, 198, 24342, 286, 4879, 369, 716, 310, 830, 11553, 13, 5044, 1683, 15060,
+          1472, 279, 3274, 11, 9307, 1328, 30800, 11, 2814, 47675, 25605, 11, 321, 60445, 55404, 11,
+          27224, 11, 321, 30246, 303, 279, 1534, 4087, 13, 248046, 198, 248045, 846, 198, 44240,
+          15131, 13, 248046, 198, 248045, 74455, 198, 248068, 198
+        ],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 40},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "stream": true,
+        "modalities": [],
+        "require_reasoning": true
+      },
+      "openai": {
+        "events": [
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": "We"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 56, "completion_tokens": 1, "prompt_tokens_details": null, "reasoning_tokens": 1}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " need"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 57, "completion_tokens": 2, "prompt_tokens_details": null, "reasoning_tokens": 2}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " to"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 58, "completion_tokens": 3, "prompt_tokens_details": null, "reasoning_tokens": 3}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " respond"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 59, "completion_tokens": 4, "prompt_tokens_details": null, "reasoning_tokens": 4}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " to"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 60, "completion_tokens": 5, "prompt_tokens_details": null, "reasoning_tokens": 5}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " user"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 61, "completion_tokens": 6, "prompt_tokens_details": null, "reasoning_tokens": 6}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": ":"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 62, "completion_tokens": 7, "prompt_tokens_details": null, "reasoning_tokens": 7}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " \""}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 63, "completion_tokens": 8, "prompt_tokens_details": null, "reasoning_tokens": 8}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": "Say"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 64, "completion_tokens": 9, "prompt_tokens_details": null, "reasoning_tokens": 9}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " hi"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 65, "completion_tokens": 10, "prompt_tokens_details": null, "reasoning_tokens": 10}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": ".\""}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 66, "completion_tokens": 11, "prompt_tokens_details": null, "reasoning_tokens": 11}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " Simple"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 67, "completion_tokens": 12, "prompt_tokens_details": null, "reasoning_tokens": 12}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 68, "completion_tokens": 13, "prompt_tokens_details": null, "reasoning_tokens": 13}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " Just"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 69, "completion_tokens": 14, "prompt_tokens_details": null, "reasoning_tokens": 14}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " output"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 70, "completion_tokens": 15, "prompt_tokens_details": null, "reasoning_tokens": 15}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " hi"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 71, "completion_tokens": 16, "prompt_tokens_details": null, "reasoning_tokens": 16}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 72, "completion_tokens": 17, "prompt_tokens_details": null, "reasoning_tokens": 17}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " Final"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 73, "completion_tokens": 18, "prompt_tokens_details": null, "reasoning_tokens": 18}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " only"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 74, "completion_tokens": 19, "prompt_tokens_details": null, "reasoning_tokens": 19}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": " hi"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 75, "completion_tokens": 20, "prompt_tokens_details": null, "reasoning_tokens": 20}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": "."}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 76, "completion_tokens": 21, "prompt_tokens_details": null, "reasoning_tokens": 21}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": "\n"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 77, "completion_tokens": 22, "prompt_tokens_details": null, "reasoning_tokens": 22}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "\n\n"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 79, "completion_tokens": 24, "prompt_tokens_details": null, "reasoning_tokens": 23}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": null, "content": "hi"}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": {"prompt_tokens": 55, "total_tokens": 80, "completion_tokens": 25, "prompt_tokens_details": null, "reasoning_tokens": 23}},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "stop", "matched_stop": 248046}]},
+          {"id": "f471675dd8ea4a4cb67b95509c57124d", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [], "usage": {"prompt_tokens": 55, "total_tokens": 81, "completion_tokens": 26, "prompt_tokens_details": null, "reasoning_tokens": 23}},
+          "[DONE]"
+        ]
+      }
+    },
+    {
+      "name": "thinking_off",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "What is 2+3? Answer in one word."}],
+        "max_tokens": 20,
+        "chat_template_kwargs": {"enable_thinking": false}
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "Five",
+          "output_ids": [35792, 248046],
+          "meta_info": {
+            "id": "3424db30ba824638b6affc99a16f4e6f",
+            "finish_reason": {"type": "stop", "matched": 248046},
+            "prompt_tokens": 24,
+            "weight_version": "default",
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0,
+            "weight_versions": [{"version": "default", "start": 0, "end": 2}],
+            "cached_tokens_details": null
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [
+          248045, 846, 198, 3710, 369, 220, 17, 10, 18, 30, 21134, 303, 799, 3299, 13, 248046, 198,
+          248045, 74455, 198, 248068, 271, 248069, 271
+        ],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 20},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": []
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "3424db30ba824638b6affc99a16f4e6f",
+          "object": "chat.completion",
+          "created": 1791978408,
+          "model": "Qwen/Qwen3.8-27B",
+          "choices": [
+            {
+              "index": 0,
+              "message": {"role": "assistant", "content": "Five", "reasoning_content": null},
+              "logprobs": null,
+              "finish_reason": "stop",
+              "matched_stop": 248046
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 24,
+            "total_tokens": 26,
+            "completion_tokens": 2,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 0
+          },
+          "metadata": {
+            "weight_version": "default",
+            "weight_versions": [{"version": "default", "start": 0, "end": 2}]
+          }
+        }
+      }
+    },
+    {
+      "name": "effort_none",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "Name a fruit."}],
+        "max_tokens": 20,
+        "reasoning_effort": "none"
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "Apple",
+          "output_ids": [25719, 248046],
+          "meta_info": {
+            "id": "8d27dd72e61a42d5985732b5facc7adb",
+            "finish_reason": {"type": "stop", "matched": 248046},
+            "prompt_tokens": 16,
+            "weight_version": "default",
+            "reasoning_tokens": 0,
+            "completion_tokens": 2,
+            "cached_tokens": 0,
+            "weight_versions": [{"version": "default", "start": 0, "end": 2}],
+            "cached_tokens_details": null
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [
+          248045, 846, 198, 657, 264, 13383, 13, 248046, 198, 248045, 74455, 198, 248068, 271,
+          248069, 271
+        ],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 20},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": []
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "8d27dd72e61a42d5985732b5facc7adb",
+          "object": "chat.completion",
+          "created": 1791978408,
+          "model": "Qwen/Qwen3.8-27B",
+          "choices": [
+            {
+              "index": 0,
+              "message": {"role": "assistant", "content": "Apple", "reasoning_content": null},
+              "logprobs": null,
+              "finish_reason": "stop",
+              "matched_stop": 248046
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 16,
+            "total_tokens": 18,
+            "completion_tokens": 2,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 0
+          },
+          "metadata": {
+            "weight_version": "default",
+            "weight_versions": [{"version": "default", "start": 0, "end": 2}]
+          }
+        }
+      }
+    },
+    {
+      "name": "effort_low",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "What is 7*6?"}],
+        "max_tokens": 300,
+        "reasoning_effort": "low"
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "The user is asking a simple multiplication question: 7 times 6.\n\n7 × 6 = 42\n</think>\n\n7 × 6 = **42**",
+          "output_ids": [
+            760, 1156, 369, 9859, 264, 4145, 44896, 3296, 25, 220, 22, 2942, 220, 21, 13, 271, 22,
+            23985, 220, 21, 283, 220, 19, 17, 198, 248069, 271, 22, 23985, 220, 21, 283, 2972, 19,
+            17, 332, 248046
+          ],
+          "meta_info": {
+            "id": "97b996d9a425458b866f2724e82f7b19",
+            "finish_reason": {"type": "stop", "matched": 248046},
+            "prompt_tokens": 47,
+            "weight_version": "default",
+            "reasoning_tokens": 26,
+            "completion_tokens": 37,
+            "cached_tokens": 0,
+            "weight_versions": [{"version": "default", "start": 0, "end": 37}],
+            "cached_tokens_details": null
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [
+          248045, 8678, 198, 24342, 286, 4879, 369, 716, 310, 3238, 13, 13262, 678, 7047, 9522, 321,
+          10419, 11, 6992, 5774, 310, 279, 16198, 1973, 24366, 24150, 362, 13, 248046, 198, 248045,
+          846, 198, 3710, 369, 220, 22, 9, 21, 30, 248046, 198, 248045, 74455, 198, 248068, 198
+        ],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 300},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "97b996d9a425458b866f2724e82f7b19",
+          "object": "chat.completion",
+          "created": 1791978408,
+          "model": "Qwen/Qwen3.8-27B",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "\n\n7 × 6 = **42**",
+                "reasoning_content": "The user is asking a simple multiplication question: 7 times 6.\n\n7 × 6 = 42\n"
+              },
+              "logprobs": null,
+              "finish_reason": "stop",
+              "matched_stop": 248046
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 47,
+            "total_tokens": 84,
+            "completion_tokens": 37,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 26
+          },
+          "metadata": {
+            "weight_version": "default",
+            "weight_versions": [{"version": "default", "start": 0, "end": 37}]
+          }
+        }
+      }
+    },
+    {
+      "name": "truncated",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "Explain gravity."}],
+        "max_tokens": 12
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "We need answer user: \"Explain gravity.\" Need produce",
+          "output_ids": [1596, 1144, 4087, 1156, 25, 328, 814, 20139, 22525, 1149, 14235, 7936],
+          "meta_info": {
+            "id": "26cba16c483048b2b649da0cc504c8b5",
+            "finish_reason": {"type": "length", "length": 12},
+            "prompt_tokens": 56,
+            "weight_version": "default",
+            "reasoning_tokens": 12,
+            "completion_tokens": 12,
+            "cached_tokens": 0,
+            "weight_versions": [{"version": "default", "start": 0, "end": 12}],
+            "cached_tokens_details": null
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [
+          248045, 8678, 198, 24342, 286, 4879, 369, 716, 310, 830, 11553, 13, 5044, 1683, 15060,
+          1472, 279, 3274, 11, 9307, 1328, 30800, 11, 2814, 47675, 25605, 11, 321, 60445, 55404, 11,
+          27224, 11, 321, 30246, 303, 279, 1534, 4087, 13, 248046, 198, 248045, 846, 198, 814,
+          20139, 22525, 13, 248046, 198, 248045, 74455, 198, 248068, 198
+        ],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 12},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "26cba16c483048b2b649da0cc504c8b5",
+          "object": "chat.completion",
+          "created": 1791978408,
+          "model": "Qwen/Qwen3.8-27B",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "We need answer user: \"Explain gravity.\" Need produce"
+              },
+              "logprobs": null,
+              "finish_reason": "length",
+              "matched_stop": null
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 56,
+            "total_tokens": 68,
+            "completion_tokens": 12,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 12
+          },
+          "metadata": {
+            "weight_version": "default",
+            "weight_versions": [{"version": "default", "start": 0, "end": 12}]
+          }
+        }
+      }
+    },
+    {
+      "name": "continue_final",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [
+          {"role": "user", "content": "What is the capital of France?"},
+          {"role": "assistant", "content": "The capital of France is"}
+        ],
+        "max_tokens": 10,
+        "continue_final_message": true,
+        "chat_template_kwargs": {"enable_thinking": false}
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": " **Paris**.",
+          "output_ids": [2972, 57590, 159034, 248046],
+          "meta_info": {
+            "id": "8b60cc1e9d894d3ebf1ca38f595ba33b",
+            "finish_reason": {"type": "stop", "matched": 248046},
+            "prompt_tokens": 24,
+            "weight_version": "default",
+            "reasoning_tokens": 0,
+            "completion_tokens": 4,
+            "cached_tokens": 0,
+            "weight_versions": [{"version": "default", "start": 0, "end": 4}],
+            "cached_tokens_details": null
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [
+          248045, 846, 198, 3710, 369, 279, 6511, 314, 9338, 30, 248046, 198, 248045, 74455, 198,
+          248068, 271, 248069, 271, 760, 6511, 314, 9338, 369
+        ],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 10},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": []
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "8b60cc1e9d894d3ebf1ca38f595ba33b",
+          "object": "chat.completion",
+          "created": 1791978408,
+          "model": "Qwen/Qwen3.8-27B",
+          "choices": [
+            {
+              "index": 0,
+              "message": {"role": "assistant", "content": " **Paris**.", "reasoning_content": null},
+              "logprobs": null,
+              "finish_reason": "stop",
+              "matched_stop": 248046
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 24,
+            "total_tokens": 28,
+            "completion_tokens": 4,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 0
+          },
+          "metadata": {
+            "weight_version": "default",
+            "weight_versions": [{"version": "default", "start": 0, "end": 4}]
+          }
+        }
+      }
+    },
+    {
+      "name": "tools",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "What's the weather in Paris?"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather in a city",
+              "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+                "required": ["city"]
+              }
+            }
+          }
+        ],
+        "max_tokens": 200,
+        "chat_template_kwargs": {"enable_thinking": false}
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+          "output_ids": [
+            248058, 198, 27, 1628, 27362, 67017, 29, 198, 27, 15704, 28, 8656, 29, 198, 57590, 198,
+            510, 15704, 29, 198, 510, 1628, 29, 198, 248059, 248046
+          ],
+          "meta_info": {
+            "id": "d44021af83824cdab8a553eab5644575",
+            "finish_reason": {"type": "stop", "matched": 248046},
+            "prompt_tokens": 296,
+            "weight_version": "default",
+            "reasoning_tokens": 0,
+            "completion_tokens": 26,
+            "cached_tokens": 0,
+            "weight_versions": [{"version": "default", "start": 0, "end": 26}],
+            "cached_tokens_details": null
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [
+          248045, 8678, 198, 2, 13455, 271, 2523, 599, 2528, 310, 279, 2614, 5568, 25, 271, 27,
+          15449, 29, 198, 4754, 1267, 763, 328, 1628, 487, 328, 1628, 763, 5046, 4532, 763, 328,
+          5237, 8831, 303, 264, 3177, 487, 328, 591, 763, 328, 447, 67017, 487, 328, 13390, 763,
+          5046, 1267, 763, 328, 1640, 487, 328, 12811, 763, 5046, 8656, 763, 5046, 1267, 763, 328,
+          889, 13933, 328, 13382, 763, 5046, 1267, 763, 328, 11326, 8934, 2069, 328, 6081, 763,
+          4241, 8656, 1293, 2069, 328, 6418, 763, 867, 2069, 328, 60003, 55791, 763, 819, 92, 198,
+          510, 15449, 29, 271, 2592, 488, 4992, 310, 1562, 264, 709, 25835, 9559, 303, 279, 2614,
+          3443, 440, 5486, 19900, 25, 271, 248058, 198, 27, 1628, 28, 8422, 8901, 1224, 29, 198, 27,
+          15704, 28, 8422, 24109, 62, 16, 29, 198, 927, 62, 16, 198, 510, 15704, 29, 198, 27, 15704,
+          28, 8422, 24109, 62, 17, 29, 198, 1919, 369, 279, 869, 364, 279, 2018, 5555, 198, 8761,
+          628, 9111, 198, 34493, 4965, 198, 510, 15704, 29, 198, 510, 1628, 29, 198, 248059, 271,
+          27, 95328, 29, 198, 92065, 25, 198, 12, 5534, 6526, 26834, 1732, 279, 5024, 3443, 25, 449,
+          8906, 361, 1628, 28, 1076, 1419, 1628, 29, 2424, 1902, 381, 23283, 2785, 220, 248058,
+          248059, 11535, 9212, 198, 12, 12296, 4868, 26834, 381, 5024, 198, 12, 1394, 1189, 3300,
+          9801, 31626, 364, 678, 709, 1562, 303, 5629, 3992, 54588, 279, 709, 1562, 11, 694, 4045,
+          1238, 198, 12, 1368, 1017, 369, 874, 709, 1562, 2420, 11, 4087, 279, 3296, 1040, 4472,
+          440, 678, 1428, 6337, 321, 635, 524, 3184, 279, 1156, 883, 709, 6526, 198, 510, 95328, 29,
+          248046, 198, 248045, 846, 198, 3710, 579, 279, 8831, 303, 11751, 30, 248046, 198, 248045,
+          74455, 198, 248068, 271, 248069, 271
+        ],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 200, "skip_special_tokens": false},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": []
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "d44021af83824cdab8a553eab5644575",
+          "object": "chat.completion",
+          "created": 1791978408,
+          "model": "Qwen/Qwen3.8-27B",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": null,
+                "tool_calls": [
+                  {
+                    "id": "call_9a972710b8024726b1f29ee8",
+                    "index": 0,
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls",
+              "matched_stop": null
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 296,
+            "total_tokens": 322,
+            "completion_tokens": 26,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 0
+          },
+          "metadata": {
+            "weight_version": "default",
+            "weight_versions": [{"version": "default", "start": 0, "end": 26}]
+          }
+        }
+      }
+    },
+    {
+      "name": "tools_stream",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "What's the weather in Paris?"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather in a city",
+              "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+                "required": ["city"]
+              }
+            }
+          }
+        ],
+        "max_tokens": 200,
+        "chat_template_kwargs": {"enable_thinking": false},
+        "stream": true
+      },
+      "engine": {
+        "status": 200,
+        "frames": [
+          {"text": "<tool_call>", "output_ids": [248058], "meta_info": {"id": "bfa8d88ef74547df8d101fd062142f3f", "finish_reason": null, "prompt_tokens": 296, "weight_version": "default", "reasoning_tokens": 0, "completion_tokens": 1, "cached_tokens": 256, "cached_tokens_details": {"device": 256, "host": 0}}},
+          {"text": "\n", "output_ids": [198], "meta_info": {"completion_tokens": 2}},
+          {"text": "<", "output_ids": [27], "meta_info": {"completion_tokens": 3}},
+          {"text": "function", "output_ids": [1628], "meta_info": {"completion_tokens": 4}},
+          {"text": "=get", "output_ids": [27362], "meta_info": {"completion_tokens": 5}},
+          {"text": "_weather", "output_ids": [67017], "meta_info": {"completion_tokens": 6}},
+          {"text": ">", "output_ids": [29], "meta_info": {"completion_tokens": 7}},
+          {"text": "\n", "output_ids": [198], "meta_info": {"completion_tokens": 8}},
+          {"text": "<", "output_ids": [27], "meta_info": {"completion_tokens": 9}},
+          {"text": "parameter", "output_ids": [15704], "meta_info": {"completion_tokens": 10}},
+          {"text": "=", "output_ids": [28], "meta_info": {"completion_tokens": 11}},
+          {"text": "city", "output_ids": [8656], "meta_info": {"completion_tokens": 12}},
+          {"text": ">", "output_ids": [29], "meta_info": {"completion_tokens": 13}},
+          {"text": "\n", "output_ids": [198], "meta_info": {"completion_tokens": 14}},
+          {"text": "Paris", "output_ids": [57590], "meta_info": {"completion_tokens": 15}},
+          {"text": "\n", "output_ids": [198], "meta_info": {"completion_tokens": 16}},
+          {"text": "</", "output_ids": [510], "meta_info": {"completion_tokens": 17}},
+          {"text": "parameter", "output_ids": [15704], "meta_info": {"completion_tokens": 18}},
+          {"text": ">", "output_ids": [29], "meta_info": {"completion_tokens": 19}},
+          {"text": "\n", "output_ids": [198], "meta_info": {"completion_tokens": 20}},
+          {"text": "</", "output_ids": [510], "meta_info": {"completion_tokens": 21}},
+          {"text": "function", "output_ids": [1628], "meta_info": {"completion_tokens": 22}},
+          {"text": ">", "output_ids": [29], "meta_info": {"completion_tokens": 23}},
+          {"text": "\n", "output_ids": [198], "meta_info": {"completion_tokens": 24}},
+          {"text": "</tool_call>", "output_ids": [248059], "meta_info": {"completion_tokens": 25}},
+          {"text": "", "output_ids": [248046], "meta_info": {"finish_reason": {"type": "stop", "matched": 248046}, "completion_tokens": 26, "weight_versions": [{"version": "default", "start": 0, "end": 26}]}}
+        ]
+      },
+      "generate": {
+        "input_ids": [
+          248045, 8678, 198, 2, 13455, 271, 2523, 599, 2528, 310, 279, 2614, 5568, 25, 271, 27,
+          15449, 29, 198, 4754, 1267, 763, 328, 1628, 487, 328, 1628, 763, 5046, 4532, 763, 328,
+          5237, 8831, 303, 264, 3177, 487, 328, 591, 763, 328, 447, 67017, 487, 328, 13390, 763,
+          5046, 1267, 763, 328, 1640, 487, 328, 12811, 763, 5046, 8656, 763, 5046, 1267, 763, 328,
+          889, 13933, 328, 13382, 763, 5046, 1267, 763, 328, 11326, 8934, 2069, 328, 6081, 763,
+          4241, 8656, 1293, 2069, 328, 6418, 763, 867, 2069, 328, 60003, 55791, 763, 819, 92, 198,
+          510, 15449, 29, 271, 2592, 488, 4992, 310, 1562, 264, 709, 25835, 9559, 303, 279, 2614,
+          3443, 440, 5486, 19900, 25, 271, 248058, 198, 27, 1628, 28, 8422, 8901, 1224, 29, 198, 27,
+          15704, 28, 8422, 24109, 62, 16, 29, 198, 927, 62, 16, 198, 510, 15704, 29, 198, 27, 15704,
+          28, 8422, 24109, 62, 17, 29, 198, 1919, 369, 279, 869, 364, 279, 2018, 5555, 198, 8761,
+          628, 9111, 198, 34493, 4965, 198, 510, 15704, 29, 198, 510, 1628, 29, 198, 248059, 271,
+          27, 95328, 29, 198, 92065, 25, 198, 12, 5534, 6526, 26834, 1732, 279, 5024, 3443, 25, 449,
+          8906, 361, 1628, 28, 1076, 1419, 1628, 29, 2424, 1902, 381, 23283, 2785, 220, 248058,
+          248059, 11535, 9212, 198, 12, 12296, 4868, 26834, 381, 5024, 198, 12, 1394, 1189, 3300,
+          9801, 31626, 364, 678, 709, 1562, 303, 5629, 3992, 54588, 279, 709, 1562, 11, 694, 4045,
+          1238, 198, 12, 1368, 1017, 369, 874, 709, 1562, 2420, 11, 4087, 279, 3296, 1040, 4472,
+          440, 678, 1428, 6337, 321, 635, 524, 3184, 279, 1156, 883, 709, 6526, 198, 510, 95328, 29,
+          248046, 198, 248045, 846, 198, 3710, 579, 279, 8831, 303, 11751, 30, 248046, 198, 248045,
+          74455, 198, 248068, 271, 248069, 271
+        ],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 200, "skip_special_tokens": false},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "stream": true,
+        "modalities": []
+      },
+      "openai": {
+        "events": [
+          {"id": "bfa8d88ef74547df8d101fd062142f3f", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
+          {"id": "bfa8d88ef74547df8d101fd062142f3f", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_8a9abece34de4f36b2a0c8c1", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": ""}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "bfa8d88ef74547df8d101fd062142f3f", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "{"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "bfa8d88ef74547df8d101fd062142f3f", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "\"city\": \"Paris\""}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "bfa8d88ef74547df8d101fd062142f3f", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "bfa8d88ef74547df8d101fd062142f3f", "object": "chat.completion.chunk", "created": 1791978408, "model": "Qwen/Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": 248046}]},
+          "[DONE]"
+        ]
+      }
+    },
+    {
+      "name": "tools_thinking",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "What's the weather in Tokyo for the next 3 days?"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather in a city",
+              "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+                "required": ["city"]
+              }
+            }
+          }
+        ],
+        "max_tokens": 800,
+        "reasoning_effort": "low"
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "The user wants the weather in Tokyo for the next 3 days. I have a get_weather function that takes a city and an optional days parameter. Let me call it with city=\"Tokyo\" and days=3.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+          "output_ids": [
+            760, 1156, 6587, 279, 8831, 303, 25358, 364, 279, 1727, 220, 18, 2756, 13, 353, 599,
+            264, 615, 67017, 709, 421, 4829, 264, 3177, 321, 449, 9801, 2756, 5555, 13, 6558, 728,
+            1562, 424, 440, 3177, 420, 51076, 15560, 1, 321, 2756, 28, 18, 13, 198, 248069, 271,
+            248058, 198, 27, 1628, 27362, 67017, 29, 198, 27, 15704, 28, 8656, 29, 198, 51076,
+            15560, 198, 510, 15704, 29, 198, 27, 15704, 28, 13382, 29, 198, 18, 198, 510, 15704, 29,
+            198, 510, 1628, 29, 198, 248059, 248046
+          ],
+          "meta_info": {
+            "id": "4e3f051c234d4c2083f8fe412ed5fedc",
+            "finish_reason": {"type": "stop", "matched": 248046},
+            "prompt_tokens": 326,
+            "weight_version": "default",
+            "reasoning_tokens": 47,
+            "completion_tokens": 87,
+            "cached_tokens": 0,
+            "weight_versions": [{"version": "default", "start": 0, "end": 87}],
+            "cached_tokens_details": null
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [
+          248045, 8678, 198, 24342, 286, 4879, 369, 716, 310, 3238, 13, 13262, 678, 7047, 9522, 321,
+          10419, 11, 6992, 5774, 310, 279, 16198, 1973, 24366, 24150, 362, 13, 271, 2, 13455, 271,
+          2523, 599, 2528, 310, 279, 2614, 5568, 25, 271, 27, 15449, 29, 198, 4754, 1267, 763, 328,
+          1628, 487, 328, 1628, 763, 5046, 4532, 763, 328, 5237, 8831, 303, 264, 3177, 487, 328,
+          591, 763, 328, 447, 67017, 487, 328, 13390, 763, 5046, 1267, 763, 328, 1640, 487, 328,
+          12811, 763, 5046, 8656, 763, 5046, 1267, 763, 328, 889, 13933, 328, 13382, 763, 5046,
+          1267, 763, 328, 11326, 8934, 2069, 328, 6081, 763, 4241, 8656, 1293, 2069, 328, 6418, 763,
+          867, 2069, 328, 60003, 55791, 763, 819, 92, 198, 510, 15449, 29, 271, 2592, 488, 4992,
+          310, 1562, 264, 709, 25835, 9559, 303, 279, 2614, 3443, 440, 5486, 19900, 25, 271, 248058,
+          198, 27, 1628, 28, 8422, 8901, 1224, 29, 198, 27, 15704, 28, 8422, 24109, 62, 16, 29, 198,
+          927, 62, 16, 198, 510, 15704, 29, 198, 27, 15704, 28, 8422, 24109, 62, 17, 29, 198, 1919,
+          369, 279, 869, 364, 279, 2018, 5555, 198, 8761, 628, 9111, 198, 34493, 4965, 198, 510,
+          15704, 29, 198, 510, 1628, 29, 198, 248059, 271, 27, 95328, 29, 198, 92065, 25, 198, 12,
+          5534, 6526, 26834, 1732, 279, 5024, 3443, 25, 449, 8906, 361, 1628, 28, 1076, 1419, 1628,
+          29, 2424, 1902, 381, 23283, 2785, 220, 248058, 248059, 11535, 9212, 198, 12, 12296, 4868,
+          26834, 381, 5024, 198, 12, 1394, 1189, 3300, 9801, 31626, 364, 678, 709, 1562, 303, 5629,
+          3992, 54588, 279, 709, 1562, 11, 694, 4045, 1238, 198, 12, 1368, 1017, 369, 874, 709,
+          1562, 2420, 11, 4087, 279, 3296, 1040, 4472, 440, 678, 1428, 6337, 321, 635, 524, 3184,
+          279, 1156, 883, 709, 6526, 198, 510, 95328, 29, 248046, 198, 248045, 846, 198, 3710, 579,
+          279, 8831, 303, 25358, 364, 279, 1727, 220, 18, 2756, 30, 248046, 198, 248045, 74455, 198,
+          248068, 198
+        ],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 800, "skip_special_tokens": false},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "4e3f051c234d4c2083f8fe412ed5fedc",
+          "object": "chat.completion",
+          "created": 1791978408,
+          "model": "Qwen/Qwen3.8-27B",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "\n\n",
+                "reasoning_content": "The user wants the weather in Tokyo for the next 3 days. I have a get_weather function that takes a city and an optional days parameter. Let me call it with city=\"Tokyo\" and days=3.\n",
+                "tool_calls": [
+                  {
+                    "id": "call_085b5ebeab4540f4915e9017",
+                    "index": 0,
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\", \"days\": 3}"}
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls",
+              "matched_stop": null
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 326,
+            "total_tokens": 413,
+            "completion_tokens": 87,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 47
+          },
+          "metadata": {
+            "weight_version": "default",
+            "weight_versions": [{"version": "default", "start": 0, "end": 87}]
+          }
+        }
+      }
+    },
+    {
+      "name": "tools_typed",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [
+          {
+            "role": "user",
+            "content": "Book 2 rooms in Berlin with breakfast for Ann and Bob, budget 199.5, options {\"late_checkout\": true}."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "book_hotel",
+              "description": "Book hotel rooms",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "city": {"type": "string"},
+                  "rooms": {"type": "integer"},
+                  "breakfast": {"type": "boolean"},
+                  "budget": {"type": "number"},
+                  "guests": {"type": "array", "items": {"type": "string"}},
+                  "options": {"type": "object"}
+                },
+                "required": ["city", "rooms"]
+              }
+            }
+          }
+        ],
+        "max_tokens": 300,
+        "chat_template_kwargs": {"enable_thinking": false}
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "<tool_call>\n<function=book_hotel>\n<parameter=city>\nBerlin\n</parameter>\n<parameter=rooms>\n2\n</parameter>\n<parameter=breakfast>\nTrue\n</parameter>\n<parameter=guests>\n[\"Ann\", \"Bob\"]\n</parameter>\n<parameter=budget>\n199.5\n</parameter>\n<parameter=options>\n{\"late_checkout\": true}\n</parameter>\n</function>\n</tool_call>",
+          "output_ids": [
+            248058, 198, 27, 1628, 28, 2121, 32325, 300, 29, 198, 27, 15704, 28, 8656, 29, 198,
+            91149, 198, 510, 15704, 29, 198, 27, 15704, 28, 9459, 29, 198, 17, 198, 510, 15704, 29,
+            198, 27, 15704, 28, 8689, 9071, 29, 198, 2434, 198, 510, 15704, 29, 198, 27, 15704, 28,
+            29192, 82, 29, 198, 1143, 26223, 487, 328, 31318, 1293, 198, 510, 15704, 29, 198, 27,
+            15704, 21402, 6114, 29, 198, 16, 24, 24, 13, 20, 198, 510, 15704, 29, 198, 27, 15704,
+            91750, 29, 198, 4754, 4913, 65881, 763, 804, 92, 198, 510, 15704, 29, 198, 510, 1628,
+            29, 198, 248059, 248046
+          ],
+          "meta_info": {
+            "id": "0534e1ac69f2446f883408c8502b622e",
+            "finish_reason": {"type": "stop", "matched": 248046},
+            "prompt_tokens": 367,
+            "weight_version": "default",
+            "reasoning_tokens": 0,
+            "completion_tokens": 103,
+            "cached_tokens": 0,
+            "weight_versions": [{"version": "default", "start": 0, "end": 103}],
+            "cached_tokens_details": null
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [
+          248045, 8678, 198, 2, 13455, 271, 2523, 599, 2528, 310, 279, 2614, 5568, 25, 271, 27,
+          15449, 29, 198, 4754, 1267, 763, 328, 1628, 487, 328, 1628, 763, 5046, 4532, 763, 328,
+          6911, 9220, 11683, 487, 328, 591, 763, 328, 2121, 32325, 300, 487, 328, 13390, 763, 5046,
+          1267, 763, 328, 1640, 487, 328, 12811, 763, 5046, 8656, 763, 5046, 1267, 763, 328, 889,
+          13933, 328, 9459, 763, 5046, 1267, 763, 328, 11326, 13933, 328, 8689, 9071, 763, 5046,
+          1267, 763, 328, 5925, 13933, 328, 46793, 763, 5046, 1267, 763, 328, 3946, 13933, 328,
+          29192, 82, 763, 5046, 1267, 763, 328, 1595, 487, 328, 3494, 763, 5046, 1267, 763, 328,
+          889, 8934, 2069, 328, 2782, 763, 5046, 1267, 763, 328, 1640, 8934, 2069, 328, 6081, 763,
+          4241, 8656, 487, 328, 9459, 1293, 2069, 328, 6418, 763, 867, 2069, 328, 60003, 55791, 763,
+          819, 92, 198, 510, 15449, 29, 271, 2592, 488, 4992, 310, 1562, 264, 709, 25835, 9559, 303,
+          279, 2614, 3443, 440, 5486, 19900, 25, 271, 248058, 198, 27, 1628, 28, 8422, 8901, 1224,
+          29, 198, 27, 15704, 28, 8422, 24109, 62, 16, 29, 198, 927, 62, 16, 198, 510, 15704, 29,
+          198, 27, 15704, 28, 8422, 24109, 62, 17, 29, 198, 1919, 369, 279, 869, 364, 279, 2018,
+          5555, 198, 8761, 628, 9111, 198, 34493, 4965, 198, 510, 15704, 29, 198, 510, 1628, 29,
+          198, 248059, 271, 27, 95328, 29, 198, 92065, 25, 198, 12, 5534, 6526, 26834, 1732, 279,
+          5024, 3443, 25, 449, 8906, 361, 1628, 28, 1076, 1419, 1628, 29, 2424, 1902, 381, 23283,
+          2785, 220, 248058, 248059, 11535, 9212, 198, 12, 12296, 4868, 26834, 381, 5024, 198, 12,
+          1394, 1189, 3300, 9801, 31626, 364, 678, 709, 1562, 303, 5629, 3992, 54588, 279, 709,
+          1562, 11, 694, 4045, 1238, 198, 12, 1368, 1017, 369, 874, 709, 1562, 2420, 11, 4087, 279,
+          3296, 1040, 4472, 440, 678, 1428, 6337, 321, 635, 524, 3184, 279, 1156, 883, 709, 6526,
+          198, 510, 95328, 29, 248046, 198, 248045, 846, 198, 6911, 220, 17, 11683, 303, 19241, 440,
+          16976, 364, 9029, 321, 13853, 11, 7786, 220, 16, 24, 24, 13, 20, 11, 2519, 5046, 4913,
+          65881, 763, 804, 7563, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271
+        ],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 300, "skip_special_tokens": false},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": []
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "0534e1ac69f2446f883408c8502b622e",
+          "object": "chat.completion",
+          "created": 1791978408,
+          "model": "Qwen/Qwen3.8-27B",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": null,
+                "tool_calls": [
+                  {
+                    "id": "call_78f5f4c8fa0c455bb0be17b7",
+                    "index": 0,
+                    "type": "function",
+                    "function": {
+                      "name": "book_hotel",
+                      "arguments": "{\"city\": \"Berlin\", \"rooms\": 2, \"breakfast\": true, \"guests\": [\"Ann\", \"Bob\"], \"budget\": 199.5, \"options\": {\"late_checkout\": true}}"
+                    }
+                  }
+                ]
+              },
+              "logprobs": null,
+              "finish_reason": "tool_calls",
+              "matched_stop": null
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 367,
+            "total_tokens": 470,
+            "completion_tokens": 103,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 0
+          },
+          "metadata": {
+            "weight_version": "default",
+            "weight_versions": [{"version": "default", "start": 0, "end": 103}]
+          }
+        }
+      }
+    },
+    {
+      "name": "tools_none",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "What's the weather in Paris?"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather in a city",
+              "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+                "required": ["city"]
+              }
+            }
+          }
+        ],
+        "tool_choice": "none",
+        "max_tokens": 30,
+        "chat_template_kwargs": {"enable_thinking": false}
+      },
+      "engine": {
+        "status": 200,
+        "body": {
+          "text": "I do not have access to real-time data, so I cannot provide the current weather conditions in Paris.\n\nTo get the most accurate and up-to",
+          "output_ids": [
+            40, 635, 524, 599, 2528, 310, 1865, 7019, 795, 11, 748, 353, 4021, 3300, 279, 1428,
+            8831, 4530, 303, 11751, 13, 271, 1206, 615, 279, 1379, 12995, 321, 685, 4534
+          ],
+          "meta_info": {
+            "id": "6ad87a7d73cf445187da419d60a2de91",
+            "finish_reason": {"type": "length", "length": 30},
+            "prompt_tokens": 19,
+            "weight_version": "default",
+            "reasoning_tokens": 0,
+            "completion_tokens": 30,
+            "cached_tokens": 0,
+            "weight_versions": [{"version": "default", "start": 0, "end": 30}],
+            "cached_tokens_details": null
+          }
+        }
+      },
+      "generate": {
+        "input_ids": [
+          248045, 846, 198, 3710, 579, 279, 8831, 303, 11751, 30, 248046, 198, 248045, 74455, 198,
+          248068, 271, 248069, 271
+        ],
+        "sampling_params": {"temperature": 0.0, "max_new_tokens": 30},
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": []
+      },
+      "openai": {
+        "status": 200,
+        "body": {
+          "id": "6ad87a7d73cf445187da419d60a2de91",
+          "object": "chat.completion",
+          "created": 1791978408,
+          "model": "Qwen/Qwen3.8-27B",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "I do not have access to real-time data, so I cannot provide the current weather conditions in Paris.\n\nTo get the most accurate and up-to",
+                "reasoning_content": null
+              },
+              "logprobs": null,
+              "finish_reason": "length",
+              "matched_stop": null
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 19,
+            "total_tokens": 49,
+            "completion_tokens": 30,
+            "prompt_tokens_details": null,
+            "reasoning_tokens": 0
+          },
+          "metadata": {
+            "weight_version": "default",
+            "weight_versions": [{"version": "default", "start": 0, "end": 30}]
+          }
+        }
+      }
+    },
+    {
+      "name": "tools_required",
+      "endpoint": "chat",
+      "request": {
+        "model": "Qwen/Qwen3.8-27B",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "Weather?"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Current weather in a city",
+              "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
+                "required": ["city"]
+              }
+            }
+          }
+        ],
+        "tool_choice": "required",
+        "max_tokens": 50
+      },
+      "unsupported": true
+    }
+  ],
+  "chat_model": {
+    "context_length": 262144,
+    "generation_config": {"temperature": 1.0, "top_k": 20, "top_p": 0.95},
+    "reasoning_toggle": {"toggle_param": "enable_thinking", "default_enabled": true}
+  },
+  "generate_defaults": {
+    "rid": null,
+    "session_id": null,
+    "text": null,
+    "input_ids": null,
+    "input_embeds": null,
+    "image_data": null,
+    "video_data": null,
+    "audio_data": null,
+    "mm_hashes": null,
+    "mm_content_hashes": null,
+    "use_audio_in_video": false,
+    "video_config": null,
+    "sampling_params": null,
+    "watermark": null,
+    "return_logprob": null,
+    "logprob_start_len": null,
+    "top_logprobs_num": null,
+    "token_ids_logprob": null,
+    "return_sampling_mask": null,
+    "sampling_logprobs_mode": null,
+    "return_text_in_logprobs": false,
+    "return_flat_raw_top_logprobs": false,
+    "return_flat_raw_output_top_logprobs": false,
+    "return_flat_raw_top_logprobs_b64": false,
+    "stream": false,
+    "log_metrics": true,
+    "return_hidden_states": false,
+    "return_routed_experts": false,
+    "routed_experts_start_len": 0,
+    "return_indexer_topk": false,
+    "modalities": null,
+    "session_params": null,
+    "lora_path": null,
+    "lora_id": null,
+    "custom_logit_processor": null,
+    "positional_embed_overrides": null,
+    "bootstrap_host": null,
+    "bootstrap_port": null,
+    "bootstrap_room": null,
+    "bootstrap_pair_key": null,
+    "decode_tp_size": null,
+    "routed_dp_rank": null,
+    "data_parallel_rank": null,
+    "disagg_prefill_dp_rank": null,
+    "routing_key": null,
+    "conversation_id": null,
+    "http_worker_ipc": null,
+    "background": false,
+    "require_reasoning": false,
+    "max_thinking_tokens": null,
+    "priority": null,
+    "extra_key": null,
+    "no_logs": false,
+    "custom_labels": null,
+    "return_bytes": false,
+    "return_entropy": false,
+    "return_prompt_token_ids": false,
+    "external_trace_header": null,
+    "need_wait_for_mm_inputs": null,
+    "num_items_assigned": null,
+    "encoder_urls": null,
+    "max_dynamic_patch": null,
+    "min_dynamic_patch": null,
+    "image_max_dynamic_patch": null,
+    "video_max_dynamic_patch": null,
+    "images_config": null,
+    "multi_item_delimiter_indices": null,
+    "token_indices_to_pool": null,
+    "cache_salt": null,
+    "kv_hints": null
+  },
+  "sampling_defaults": {
+    "completions": {
+      "temperature": 1.0,
+      "max_new_tokens": 16,
+      "min_new_tokens": 0,
+      "stop": null,
+      "stop_token_ids": null,
+      "stop_regex": null,
+      "top_p": 1.0,
+      "top_k": -1,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "frequency_penalty": 0.0,
+      "repetition_penalty": 1.0,
+      "regex": null,
+      "json_schema": null,
+      "ebnf": null,
+      "n": 1,
+      "no_stop_trim": false,
+      "ignore_eos": false,
+      "skip_special_tokens": true,
+      "logit_bias": null,
+      "custom_params": null,
+      "sampling_seed": null,
+      "watermark": null
+    },
+    "chat": {
+      "temperature": 1.0,
+      "max_new_tokens": null,
+      "min_new_tokens": 0,
+      "stop": null,
+      "stop_token_ids": null,
+      "stop_regex": null,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.0,
+      "presence_penalty": 0.0,
+      "frequency_penalty": 0.0,
+      "repetition_penalty": 1.0,
+      "regex": null,
+      "ebnf": null,
+      "n": 1,
+      "no_stop_trim": false,
+      "ignore_eos": false,
+      "skip_special_tokens": true,
+      "logit_bias": null,
+      "custom_params": null,
+      "sampling_seed": null,
+      "spaces_between_special_tokens": true,
+      "watermark": null
+    }
+  }
+}

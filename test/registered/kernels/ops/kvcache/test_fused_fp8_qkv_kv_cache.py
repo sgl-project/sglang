@@ -23,9 +23,9 @@ def _bytes(t: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize(
     "hq,hkv,head_dim", [(8, 1, 128), (8, 8, 128), (4, 2, 64), (64, 2, 128)]
 )
-@pytest.mark.parametrize(
-    "num_tokens", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-)
+# One block per token and no branch on the token count: 1 keeps q contiguous in
+# the fused layout, 7 is odd, 4096 is a large grid.
+@pytest.mark.parametrize("num_tokens", [1, 7, 4096])
 @pytest.mark.parametrize("scale", [None, 0.5, 2.0])
 @pytest.mark.parametrize("fused_qkv", [False, True])
 @pytest.mark.parametrize("quantize_q", [True, False])
@@ -83,6 +83,49 @@ def test_fused_fp8_qkv_kv_cache(
     torch.testing.assert_close(
         _bytes(v_cache.reshape(total_slots, kv_dim)[loc]), _bytes(v_ref), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "hkv,head_dim,extra", [(8, 128, 1024), (2, 64, 128), (1, 128, 32)]
+)
+@pytest.mark.parametrize("num_tokens", [1, 7, 64])
+def test_fused_fp8_qkv_kv_cache_strided_cache(num_tokens, dtype, hkv, head_dim, extra):
+    """Caches that are strided views (slot stride > kv_dim), like the unified
+    pool's per-layer views: rows land at ``slot * stride(0)`` and bytes outside
+    the view are never touched."""
+    torch.manual_seed(0)
+    device = "cuda"
+    kv_dim = hkv * head_dim
+    total_slots = num_tokens + 4
+    slot_stride = kv_dim + extra  # fp8: elements == bytes
+    backing_k = torch.zeros(total_slots, slot_stride, dtype=FP8, device=device)
+    backing_v = torch.zeros_like(backing_k)
+    k_cache = backing_k[:, :kv_dim].view(total_slots, hkv, head_dim)
+    v_cache = backing_v[:, extra:].view(total_slots, hkv, head_dim)
+    assert not k_cache.is_contiguous() and k_cache.stride(0) == slot_stride
+
+    k = torch.randn(num_tokens, hkv, head_dim, dtype=dtype, device=device)
+    v = torch.randn(num_tokens, hkv, head_dim, dtype=dtype, device=device)
+    cache_loc = torch.randperm(total_slots, device=device)[:num_tokens]
+
+    assert fused_fp8_qkv_kv_cache(None, k, v, k_cache, v_cache, cache_loc) is None
+
+    loc = cache_loc.long()
+    k_ref = _ref_quant(k.reshape(num_tokens, kv_dim).float(), 1.0)
+    v_ref = _ref_quant(v.reshape(num_tokens, kv_dim).float(), 1.0)
+    torch.testing.assert_close(
+        _bytes(k_cache.reshape(total_slots, kv_dim)[loc]), _bytes(k_ref), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        _bytes(v_cache.reshape(total_slots, kv_dim)[loc]), _bytes(v_ref), rtol=0, atol=0
+    )
+    untouched = torch.ones(total_slots, dtype=torch.bool, device=device)
+    untouched[loc] = False
+    assert (backing_k[:, kv_dim:].view(torch.uint8) == 0).all()
+    assert (backing_v[:, :extra].view(torch.uint8) == 0).all()
+    assert (backing_k[untouched].view(torch.uint8) == 0).all()
+    assert (backing_v[untouched].view(torch.uint8) == 0).all()
 
 
 if __name__ == "__main__":

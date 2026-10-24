@@ -64,7 +64,7 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
         foreach_copy(group_dsts, group_srcs)
 
 
-def _allocate_pp_proxy_tensors(
+def allocate_pp_proxy_tensors(
     *,
     max_num_tokens: int,
     max_hidden_tokens: int,
@@ -81,15 +81,17 @@ def _allocate_pp_proxy_tensors(
     pp_proxy_tensors = {
         "hidden_states": torch.zeros((max_hidden_tokens, pp_hidden_size), dtype=dtype),
     }
-    if not is_mhc:
-        # Only Kimi K3 supplies num_blocks: its PP bank is token-major
-        # [T, blocks, H]. Other models use the phase-specific hidden-token bound.
-        residual_shape = (
-            (max_num_tokens, pp_proxy_residual_num_blocks, hidden_size)
-            if pp_proxy_residual_num_blocks is not None
-            else (max_hidden_tokens, hidden_size)
+    if pp_proxy_residual_num_blocks is not None:
+        # Only Kimi K3 supplies num_blocks: its attention-residual bank is
+        # token-major [T, blocks, H] and takes the residual's place.
+        pp_proxy_tensors["attn_res_bank"] = torch.zeros(
+            (max_num_tokens, pp_proxy_residual_num_blocks, hidden_size), dtype=dtype
         )
-        pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
+    elif not is_mhc:
+        # Sized by the phase-specific hidden-token bound, like hidden_states.
+        pp_proxy_tensors["residual"] = torch.zeros(
+            (max_hidden_tokens, hidden_size), dtype=dtype
+        )
     if pp_proxy_topk_size is not None:
         pp_proxy_tensors["topk_indices"] = torch.zeros(
             (max_num_tokens, pp_proxy_topk_size), dtype=torch.int32
@@ -114,6 +116,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
     num_token_non_padded: Optional[torch.Tensor]
     custom_mask: torch.Tensor
     next_token_logits_buffer: torch.Tensor
+    # Packed aux hidden-state output shared by every captured graph size.
+    aux_hidden_states: Optional[torch.Tensor]
     mamba_track_indices: Optional[torch.Tensor]
     mamba_track_mask: Optional[torch.Tensor]
     global_num_tokens_gpu: torch.Tensor
@@ -134,7 +138,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         next_token_logits_buffer: torch.Tensor,
         dtype: torch.dtype,
-        dp_size: int,
+        num_dp_ranks: int,
         pp_size: int,
         is_encoder_decoder: bool,
         require_mlp_tp_gather: bool,
@@ -148,6 +152,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
         pp_proxy_dspark_hidden_size: int = 0,
+        aux_hidden_states_width: int = 0,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -175,9 +180,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
             mamba_track_mask = (
                 torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
             )
+            aux_hidden_states = (
+                torch.zeros((max_num_token, aux_hidden_states_width), dtype=dtype)
+                if aux_hidden_states_width
+                else None
+            )
 
             pp_proxy_tensors = (
-                _allocate_pp_proxy_tensors(
+                allocate_pp_proxy_tensors(
                     max_num_tokens=max_num_token,
                     max_hidden_tokens=max_num_token,
                     hidden_size=hidden_size,
@@ -199,9 +209,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 encoder_lens = None
 
             if require_mlp_tp_gather:
-                global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
+                global_num_tokens_gpu = torch.zeros((num_dp_ranks,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros(
-                    (dp_size,), dtype=torch.int32
+                    (num_dp_ranks,), dtype=torch.int32
                 )
             else:
                 global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
@@ -246,6 +256,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             num_token_non_padded=num_token_non_padded,
             custom_mask=custom_mask,
             next_token_logits_buffer=next_token_logits_buffer,
+            aux_hidden_states=aux_hidden_states,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
             encoder_lens=encoder_lens,
@@ -283,6 +294,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         hidden_size: int,
         dtype: torch.dtype,
         enable_mamba_track: bool,
+        enable_input_embeds: Optional[bool] = None,
         pp_size: int = 1,
         is_first_pp_rank: bool = False,
         hc_hidden_size: Optional[int] = None,
@@ -309,15 +321,21 @@ class PrefillInputBuffers(ForwardInputBuffers):
             )
             positions = torch.zeros((max_num_tokens,), dtype=torch.int64)
 
-            if is_multimodal:
+            if enable_input_embeds is None:
+                enable_input_embeds = is_multimodal
+
+            if enable_input_embeds:
                 input_embeds = torch.zeros((max_num_tokens, hidden_size), dtype=dtype)
-                mrope_positions = torch.zeros((3, max_num_tokens), dtype=torch.int64)
             else:
                 input_embeds = None
+
+            if is_multimodal:
+                mrope_positions = torch.zeros((3, max_num_tokens), dtype=torch.int64)
+            else:
                 mrope_positions = None
 
             pp_proxy_tensors = (
-                _allocate_pp_proxy_tensors(
+                allocate_pp_proxy_tensors(
                     max_num_tokens=max_num_tokens,
                     max_hidden_tokens=max_num_tokens,
                     hidden_size=hidden_size,

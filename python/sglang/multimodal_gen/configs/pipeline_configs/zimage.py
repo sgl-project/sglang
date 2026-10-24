@@ -23,11 +23,31 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     ZImageRolloutPipelineMixin,
 )
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
+    CFGPolicy,
+    _apply_cfg_postprocess,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
 )
+
+
+@dataclass
+class ZImageCFGPolicy(CFGPolicy):
+    parallel_uses_serial_arithmetic: bool = True
+
+    def combine(
+        self, predictions, batch, cfg_scale, pipeline_config, *, cfg_parallel=False
+    ):
+        if len(predictions) == 1:
+            return predictions[0]
+        # the DiT already negates its output; match diffusers' fp32 CFG arithmetic
+        pos = predictions[0].float()
+        neg = predictions[1].float()
+        noise_pred = pos + cfg_scale * (pos - neg)
+        return _apply_cfg_postprocess(noise_pred, pos, batch, pipeline_config)
 
 
 def zimage_preprocess_text(prompt: str):
@@ -59,6 +79,7 @@ def zimage_postprocess_text(
 
 @dataclass
 class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
+    cfg_policy: CFGPolicy = field(default_factory=ZImageCFGPolicy)
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)

@@ -153,8 +153,7 @@ class TestLoadPublisherGating(CustomTestCase):
     def test_dp_attention_keys_the_load_port_by_attn_dp_rank(self):
         _, open_sock = self._build(
             tp_size=4,
-            dp_size=4,
-            enable_dp_attention=True,
+            attn_dp_size=4,
             ranks={"world_rank": 3, "dp_rank": 0},
         )
         open_sock.assert_called_once_with("tcp://*:5564")

@@ -708,7 +708,7 @@
             "stages_ms": {
                 "InputValidationStage": 0.1,
                 "MiniMaxH3PartitionAdmissionStage": 0.06,
-                "MiniMaxH3TextEncodingStage": 134.59,
+                "MiniMaxH3TextEncodingStage": 421.11,
                 "MiniMaxH3VisualEncodingStage": 0.06,
                 "MiniMaxH3AudioEncodingStage": 0.11,
                 "MiniMaxH3LatentPreparationStage": 41.31,

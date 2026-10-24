@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import msgspec
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.utils import optional_positive_finite_float
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_REFERENCE_RESIZE_MODES,
+)
 
 _MINIMAX_H3_MAX_SIGNED_SEED = (1 << 63) - 1
 
@@ -23,19 +26,13 @@ def _optional_unit_float(value: Any, field_name: str) -> float | None:
     return out
 
 
-def _optional_positive_finite_float(value: Any, field_name: str) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{field_name} must be a number")
-    out = float(value)
-    if not math.isfinite(out) or out <= 0.0:
-        raise ValueError(f"{field_name} must be a positive finite number")
-    return out
-
-
 @dataclass
 class MiniMaxH3SamplingParams(SamplingParams):
+    min_num_inference_steps: ClassVar[int] = 1
+    # Single-partition releases name their partition; None infers it from
+    # --model-variant or the model path.
+    release_partition: ClassVar[str | None] = None
+
     height: int = 512
     width: int = 896
     num_inference_steps: int = 50
@@ -57,6 +54,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
         default=None,
         metadata={"batch_sig_exclude": True},
     )
+    reference_resize_mode: str = field(default="diffusers")
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
@@ -71,6 +69,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "output_mode",
                 "imgvid_cond_noise_aug_for_inference",
                 "audio_cond_noise_aug_for_inference",
+                "reference_resize_mode",
             }
         )
 
@@ -114,7 +113,9 @@ class MiniMaxH3SamplingParams(SamplingParams):
         file delivery, while the public H3 contract correctly requires it.
         """
         selected_variant = getattr(server_args, "model_variant", None)
-        if selected_variant is not None:
+        if self.release_partition is not None:
+            selected_partition = self.release_partition
+        elif selected_variant is not None:
             selected_partition = str(selected_variant).strip().lower()
         else:
             selected_path = server_args.model_subfolder or server_args.model_path
@@ -223,8 +224,8 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 if field_name in self.target
             }
         super()._validate()
-        _optional_positive_finite_float(self.flow_shift, "flow_shift")
-        _optional_positive_finite_float(self.audio_flow_shift, "audio_flow_shift")
+        optional_positive_finite_float(self.flow_shift, "flow_shift")
+        optional_positive_finite_float(self.audio_flow_shift, "audio_flow_shift")
         if self.enable_frame_interpolation:
             raise ValueError(
                 "MiniMax H3 does not support enable_frame_interpolation: the "
@@ -262,14 +263,15 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 self.spectrum_params = SpectrumParams()
             apply_h3_spectrum_param_defaults(self.spectrum_params)
         if self.rollout:
-            raise ValueError(
-                "MiniMax H3 does not support rollout: its coupled video/audio "
-                "scheduler has no SchedulerRLMixin contract"
-            )
+            task = str(self.task or "t2va").lower()
+            if task not in ("t2va",):
+                raise ValueError(
+                    f"MiniMax H3 rollout currently supports task=t2va only, got {task!r}"
+                )
         if self.return_trajectory_latents or self.return_trajectory_decoded:
             raise ValueError(
-                "MiniMax H3 does not support trajectory output for its coupled "
-                "video/audio denoise state"
+                "MiniMax H3 does not support return_trajectory_latents/decoded; "
+                "use rollout=True with rollout_return_dit_trajectory instead"
             )
         seeds = self.seed if isinstance(self.seed, list) else [self.seed]
         for seed in seeds:
@@ -286,6 +288,12 @@ class MiniMaxH3SamplingParams(SamplingParams):
             raise ValueError(
                 "MiniMax H3 scalar seed plus output index must fit the "
                 "signed int64 upper bound"
+            )
+        self.reference_resize_mode = str(self.reference_resize_mode).strip().lower()
+        if self.reference_resize_mode not in MINIMAX_H3_REFERENCE_RESIZE_MODES:
+            raise ValueError(
+                "reference_resize_mode must be one of {'match', 'max', 'diffusers'}, "
+                f"got {self.reference_resize_mode!r}"
             )
 
     def build_request_extra(self, *, _seed_override: int | None = None) -> dict:
@@ -353,15 +361,17 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
 @dataclass
 class FastH3SamplingParams(MiniMaxH3SamplingParams):
-    """FastH3: five sigma grid points, i.e. the four distilled DiT forwards."""
+    """FastH3 8-Step V2: nine sigma points, i.e. eight DiT forwards on the trained rungs."""
 
-    num_inference_steps: int = 5
+    num_inference_steps: int = 8
+    quality: str = "lossless"
 
     def _validate(self) -> None:
         super()._validate()
-        if self.num_inference_steps != 5:
+        if self.num_inference_steps != 8:
             raise ValueError(
-                "FastH3 is distilled for exactly five sigma grid points (four DiT "
+                "FastH3 is distilled for exactly eight inference steps (nine sigma "
+                "grid points, eight DiT "
                 f"forwards); got num_inference_steps={self.num_inference_steps}. "
                 "Use MiniMaxAI/MiniMax-H3 for other schedules."
             )
@@ -373,4 +383,33 @@ class FastH3SamplingParams(MiniMaxH3SamplingParams):
             )
 
 
-__all__ = ["FastH3SamplingParams", "MiniMaxH3SamplingParams"]
+@dataclass
+class FastH3OmniSamplingParams(MiniMaxH3SamplingParams):
+    """FastH3 Omni 8-Step V1: eight PDD forwards over ordered references."""
+
+    release_partition: ClassVar[str | None] = "ref2va"
+    num_inference_steps: int = 8
+    task: str | None = "ref2va"
+    quality: str = "lossless"
+    # Trained with target-only flow: references stay clean.
+    imgvid_cond_noise_aug_for_inference: float | None = 1.0
+    audio_cond_noise_aug_for_inference: float | None = 1.0
+
+    def _validate(self) -> None:
+        super()._validate()
+        if self.num_inference_steps != 8:
+            raise ValueError(
+                "FastH3 Omni is distilled for exactly eight PDD forwards; got "
+                f"num_inference_steps={self.num_inference_steps}."
+            )
+        if self.task is not None and self.task.strip().lower() != "ref2va":
+            raise ValueError(
+                f"FastH3 Omni is distilled for ref2va only (got task={self.task!r})."
+            )
+
+
+__all__ = [
+    "FastH3OmniSamplingParams",
+    "FastH3SamplingParams",
+    "MiniMaxH3SamplingParams",
+]

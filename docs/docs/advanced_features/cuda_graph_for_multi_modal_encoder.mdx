@@ -69,7 +69,7 @@ it; naming a backend locks the choice and skips that rule:
 SGLANG_VIT_ENABLE_CUDA_GRAPH=1 \
 python3 -m sglang.launch_server \
   --model Qwen/Qwen3-VL-8B-Instruct \
-  --cuda-graph-backend-prefill tc_piecewise \
+  --cuda-graph-backend-prefill breakable \
   --cuda-graph-max-bs-prefill 4096 \
   --cuda-graph-tc-compiler eager
 ```

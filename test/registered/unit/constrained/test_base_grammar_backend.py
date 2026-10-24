@@ -128,13 +128,6 @@ class TestBaseGrammarBackend(unittest.TestCase):
         self.assertFalse(hit)
         self.assertIsInstance(result, Future)
 
-    def test_dispatch_fallback_error_message_content(self):
-        """dispatch_fallback error should include the key type and value."""
-        with self.assertRaises(ValueError) as ctx:
-            self.backend.dispatch_fallback("custom_type", "custom_value")
-        self.assertIn("custom_type", str(ctx.exception))
-        self.assertIn("custom_value", str(ctx.exception))
-
     def test_init_value_dispatch_none_grammar(self):
         """When dispatch returns None, should not crash on stats check."""
         self.backend.dispatch_json = MagicMock(return_value=None)

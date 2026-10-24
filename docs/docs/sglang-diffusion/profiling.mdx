@@ -43,6 +43,32 @@ sglang generate \
 **Parameters:**
 - `--profile-all-stages`: Used with `--profile`, profile all pipeline stages instead of just denoising
 
+### Image API requests
+
+For an already running image server, enable profiling on an individual request.
+The JSON generations endpoint accepts the same controls with underscores:
+
+```bash
+curl -sS http://127.0.0.1:30000/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "prompt": "A mountain lake at sunrise",
+    "seed": 0,
+    "profile": true,
+    "num_profiled_timesteps": 5,
+    "profile_all_stages": false
+  }'
+```
+
+For `/v1/images/edits`, pass these controls as multipart form fields alongside
+the image and prompt: `-F profile=true -F num_profiled_timesteps=5`.
+Add `-F profile_all_stages=true` to profile the full pipeline instead.
+
+Traces are written on the server, not returned as image-response attachments.
+Use `perf_dump_path` for a lightweight timing report instead of a profiler trace.
+Run latency benchmarks separately with profiling disabled, since collecting a
+trace adds overhead.
+
 ### Output Location
 
 By default, trace files are saved in the ./logs/ directory.

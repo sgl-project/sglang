@@ -11,6 +11,7 @@ from .utils import (
     _apply_rotary_emb,
     _apply_rotary_emb_complex,
     apply_flashinfer_rope_qk_inplace,
+    rope_positions,
 )
 
 if current_platform.is_npu():
@@ -84,6 +85,35 @@ class RotaryEmbedding(CustomOp):
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
         return cache
+
+    def _apply_cos_sin(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """rotate Q/K in the caller's layout, preserving broadcast and unrotated tails"""
+        q_rot = query[..., : self.rotary_dim]
+        q_pass = query[..., self.rotary_dim :]
+        k_rot = key[..., : self.rotary_dim]
+        k_pass = key[..., self.rotary_dim :]
+
+        q_rotated = _apply_rotary_emb(
+            q_rot,
+            cos,
+            sin,
+            is_neox_style=self.is_neox_style,
+            interleaved=not self.is_neox_style,
+        )
+        k_rotated = _apply_rotary_emb(
+            k_rot,
+            cos,
+            sin,
+            is_neox_style=self.is_neox_style,
+            interleaved=not self.is_neox_style,
+        )
+        return self._combine_rotated_and_pass(q_rotated, k_rotated, q_pass, k_pass)
 
     def _combine_rotated_and_pass(
         self,
@@ -216,27 +246,7 @@ class RotaryEmbedding(CustomOp):
             # No [batch*seq, ...] flatten: cos/sin are [seq_len,
             # rotary_dim // 2], shared across the batch, and only
             # broadcast correctly this way for batch_size > 1.
-            q_rot = query[..., : self.rotary_dim]
-            q_pass = query[..., self.rotary_dim :]
-
-            k_rot = key[..., : self.rotary_dim]
-            k_pass = key[..., self.rotary_dim :]
-
-            q_rotated = _apply_rotary_emb(
-                q_rot,
-                cos,
-                sin,
-                is_neox_style=self.is_neox_style,
-                interleaved=not self.is_neox_style,
-            )
-            k_rotated = _apply_rotary_emb(
-                k_rot,
-                cos,
-                sin,
-                is_neox_style=self.is_neox_style,
-                interleaved=not self.is_neox_style,
-            )
-            return self._combine_rotated_and_pass(q_rotated, k_rotated, q_pass, k_pass)
+            return self._apply_cos_sin(query, key, cos, sin)
 
         if cos_sin_cache is not None:
             return self.forward_native(
@@ -302,13 +312,9 @@ class RotaryEmbedding(CustomOp):
         batch_size, seq_len, _, head_dim = query.shape
 
         if positions is None:
-            pos_1d = torch.arange(
-                position_offset,
-                position_offset + seq_len,
-                device=query.device,
-                dtype=torch.int64,
+            positions = rope_positions(
+                position_offset, seq_len, batch_size, query.device
             )
-            positions = pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
         else:
             positions = positions.to(device=query.device, dtype=torch.long)
 
@@ -384,55 +390,14 @@ class RotaryEmbedding(CustomOp):
                 # num_tokens = batch*seq row-for-row.
                 q_shape = query.shape
                 q_flat = query.reshape(num_tokens, -1, self.head_size)
-                q_rot = q_flat[..., : self.rotary_dim]
-                q_pass = q_flat[..., self.rotary_dim :]
-
                 k_shape = key.shape
                 k_flat = key.reshape(num_tokens, -1, self.head_size)
-                k_rot = k_flat[..., : self.rotary_dim]
-                k_pass = k_flat[..., self.rotary_dim :]
-
-                q_rotated = _apply_rotary_emb(
-                    q_rot,
-                    cos,
-                    sin,
-                    is_neox_style=self.is_neox_style,
-                    interleaved=not self.is_neox_style,
-                )
-                k_rotated = _apply_rotary_emb(
-                    k_rot,
-                    cos,
-                    sin,
-                    is_neox_style=self.is_neox_style,
-                    interleaved=not self.is_neox_style,
-                )
-                q, k = self._combine_rotated_and_pass(
-                    q_rotated, k_rotated, q_pass, k_pass
-                )
+                q, k = self._apply_cos_sin(q_flat, k_flat, cos, sin)
                 return q.reshape(q_shape), k.reshape(k_shape)
 
             # Direct DiT-style call: same batch/seq broadcast reasoning as
             # forward_npu's cos/sin path.
-            q_rot = query[..., : self.rotary_dim]
-            q_pass = query[..., self.rotary_dim :]
-            k_rot = key[..., : self.rotary_dim]
-            k_pass = key[..., self.rotary_dim :]
-
-            q_rotated = _apply_rotary_emb(
-                q_rot,
-                cos,
-                sin,
-                is_neox_style=self.is_neox_style,
-                interleaved=not self.is_neox_style,
-            )
-            k_rotated = _apply_rotary_emb(
-                k_rot,
-                cos,
-                sin,
-                is_neox_style=self.is_neox_style,
-                interleaved=not self.is_neox_style,
-            )
-            return self._combine_rotated_and_pass(q_rotated, k_rotated, q_pass, k_pass)
+            return self._apply_cos_sin(query, key, cos, sin)
 
         if query.dim() != 4 or key.dim() != 4:
             raise ValueError(
@@ -462,13 +427,9 @@ class RotaryEmbedding(CustomOp):
             num_tokens = batch_size * seq_len
 
             if positions is None:
-                pos_1d = torch.arange(
-                    position_offset,
-                    position_offset + seq_len,
-                    device=query.device,
-                    dtype=torch.int64,
+                positions = rope_positions(
+                    position_offset, seq_len, batch_size, query.device
                 )
-                positions = pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
             else:
                 if positions.dim() != 1 or positions.numel() != num_tokens:
                     raise ValueError(

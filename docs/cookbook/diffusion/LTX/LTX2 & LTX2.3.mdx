@@ -6,11 +6,23 @@ metatags:
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { LTXDeployment } from '/src/snippets/diffusion/ltx-deployment.jsx';
 
 <DiffusionModelTags tags={["video", "text-to-video", "image-to-video", "one/two-stage", "1088p HQ"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Lightricks/ltx2.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [LTX-2](https://huggingface.co/Lightricks/LTX-2) and [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) are Lightricks video models for text-to-video and image-conditioned generation. Their defining deployment choice is the pipeline: one-stage minimizes latency, standard two-stage refines quality, and LTX-2.3 adds a 1920×1088 HQ path.
 
@@ -22,16 +34,6 @@ Use `Lightricks/LTX-2` or `Lightricks/LTX-2.3` as `--model-path`. SGLang loads t
 **License notice:** LTX-2 and LTX-2.3 are released under the LTX-2 Community License Agreement, not Apache 2.0. The license includes commercial-use restrictions for some entities. Review the [official Lightricks license](https://huggingface.co/Lightricks/LTX-2.3/blob/main/LICENSE) before production or commercial use; SGLang support does not grant additional model usage rights.
 </Warning>
 
-## 2. SGLang-diffusion Installation
-
-Install SGLang with diffusion dependencies:
-
-```bash
-uv pip install "sglang[diffusion]" --prerelease=allow
-```
-
-For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
-
 ## 3. Model Deployment
 
 This section provides deployment configurations optimized for different LTX pipelines and hardware targets.
@@ -40,9 +42,7 @@ This section provides deployment configurations optimized for different LTX pipe
 
 The LTX series supports one-stage and two-stage pipelines. LTX-2.3 also supports the HQ two-stage pipeline. The recommended launch configuration depends on whether the target GPU can keep both two-stage DiTs resident.
 
-**Interactive Command Generator**: Use the configuration selector below to generate a deployment command. The default selection targets a single NVIDIA H200 with `resident` two-stage mode. For multi-GPU serving, start from the 2-GPU or 4-GPU presets and only change parallelism if you need more memory headroom.
-
-<LTXDeployment />
+Use the [command builder](#1-quick-start) above.
 
 ### 3.2 Configuration Tips
 
@@ -75,7 +75,7 @@ Other deployment flags:
 - `--lora-weight-name`: Select the exact safetensors file when the LoRA repository contains multiple weight files.
 
 <Note>
-For native LTX-2.3 two-stage serving without a user LoRA, `resident` is the fastest high-VRAM path. LTX-2 still applies the distilled LoRA during the stage switch, so `--ltx2-two-stage-device-mode` is mainly an LTX-2.3 optimization. When you pass `--lora-path`, SGLang still applies the user LoRA during the two-stage switch, so use `resident` on H200-class GPUs for enough VRAM, but do not expect the same premerged-stage2 benefit as the no-user-LoRA path.
+For LTX-2 and LTX-2.3 two-stage serving without a user LoRA, `resident` is the fastest high-VRAM path: stage 2 runs a second DiT with the distilled LoRA merged in, and it is the default on GPUs with at least 130 GiB. When you pass `--lora-path`, SGLang still applies the user LoRA during the two-stage switch, so use `resident` on H200-class GPUs for enough VRAM, but do not expect the same premerged-stage2 benefit as the no-user-LoRA path.
 </Note>
 
 ### 3.3 Fast multi-GPU presets
@@ -94,6 +94,8 @@ For latency-oriented LTX serving, prefer CFG parallel over sequence parallelism.
 Use `--enable-cfg-parallel` for degree-2 CFG parallel. Use `--cfg-parallel-size` only when you explicitly need a different CFG branch count. If `resident` exceeds available VRAM, keep the same parallelism preset and switch only the device mode to `original`.
 
 On high-VRAM GPUs, add `--text-encoder-cpu-offload false` if text encoding latency matters and you have enough memory.
+
+On GPUs with at least 130 GiB (H200, B200, B300), `LTX2TwoStagePipeline` serving turns on breakable CUDA graphs by default when the DiTs stay resident (LTX-2.3: `resident` mode). Warmup captures the default 768x512, 121-frame request; other resolutions or frame counts run eager, so pass `--warmup-resolutions` and `--warmup-num-frames` for the shape you serve (the OpenAI video API defaults to 4 seconds, which LTX rounds to 89 frames). Pass `--enable-breakable-cuda-graph false` to run eager.
 
 #### 3.3.1 Two GPUs
 

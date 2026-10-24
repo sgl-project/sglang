@@ -11,7 +11,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunnerConfig
-from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    RoutingMethodType,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
@@ -71,7 +75,6 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
         assert not config.actorder, (
             "Actorder is not supported by flashinfer_trtllm backend"
         )
-        self.moe_ep_rank = get_parallel().moe_ep_rank
 
         if self.quant_config.quant_format != CompressionFormat.pack_quantized.value:
             raise ValueError(
@@ -293,6 +296,9 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
     ):
         self.moe_runner_config = moe_runner_config
 
+    def get_moe_runner_backend(self, layer):
+        return MoeRunnerBackend.FLASHINFER_TRTLLM
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -348,7 +354,7 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
             n_group=topk_config.num_expert_group,
             topk_group=topk_config.topk_group,
             intermediate_size=self.moe_runner_config.intermediate_size_per_partition,
-            local_expert_offset=self.moe_ep_rank * local_num_experts,
+            local_expert_offset=self.moe_runner_config.moe_ep_rank * local_num_experts,
             local_num_experts=local_num_experts,
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=routing_method_type,

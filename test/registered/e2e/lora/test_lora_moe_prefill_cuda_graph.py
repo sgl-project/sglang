@@ -43,14 +43,21 @@ class TestMoELoRAPrefillCudaGraph(CustomTestCase):
         prompts = (MOE_LORA_TEST_PROMPTS * 4)[:64]
         lora_paths = [None if i % 3 == 1 else "moe_lora" for i in range(len(prompts))]
         results = {}
-        for lora_backend, backend in (
-            ("triton", "disabled"),
-            ("triton", "breakable"),
-            ("triton", "full"),
-            ("csgmv", "breakable"),
-            ("csgmv", "full"),
+        # (lora_backend, prefill graph backend, moe_runner_backend): the legacy
+        # MoE LoRA path on two dense backends, and the LoRA MoE runner with the
+        # dense engine (triton_v2), which must replay under both graph backends.
+        for lora_backend, backend, moe_runner_backend in (
+            ("triton", "disabled", None),
+            ("triton", "breakable", None),
+            ("triton", "full", None),
+            ("csgmv", "breakable", None),
+            ("csgmv", "full", None),
+            ("triton_v2", "breakable", "lora_cutedsl"),
+            ("triton_v2", "full", "lora_cutedsl"),
         ):
             label = f"{lora_backend}/{backend}"
+            if moe_runner_backend is not None:
+                label += f"/{moe_runner_backend}"
             prefill_graph = backend != "disabled"
             if prefill_graph:
                 # Isolate replay counts between engines.
@@ -78,6 +85,8 @@ class TestMoELoRAPrefillCudaGraph(CustomTestCase):
                 kwargs["cuda_graph_config"] = {
                     "prefill": {"full_prefill_max_req": len(prompts)}
                 }
+            if moe_runner_backend is not None:
+                kwargs["moe_runner_backend"] = moe_runner_backend
 
             collectors_before = set(REGISTRY._collector_to_names)
             engine = None

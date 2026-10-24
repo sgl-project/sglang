@@ -9,19 +9,71 @@ from torch import nn
 
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_sample_path
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import LinearBase, ReplicatedLinear
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4LinearMethod,
+    ModelOptNvFp4A16LinearMethod,
+)
 from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.lilicorr_utils import (
     LiLiCorrConfig,
     parse_lilicorr_draft_config,
 )
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_2d(layer: ReplicatedLinear, x: torch.Tensor) -> torch.Tensor:
+    # Quantized linear methods take [tokens, features] input.
+    out, _ = layer(x.reshape(-1, x.shape[-1]))
+    return out.view(*x.shape[:-1], -1)
+
+
+def _is_nvfp4_a16(module: nn.Module) -> bool:
+    return isinstance(module, LinearBase) and isinstance(
+        module.quant_method, ModelOptNvFp4A16LinearMethod
+    )
+
+
+def _runs_fp4_marlin(module: nn.Module) -> bool:
+    return _is_nvfp4_a16(module) or (
+        isinstance(module, LinearBase)
+        and isinstance(module.quant_method, ModelOptFp4LinearMethod)
+        and get_fp4_gemm_runner_backend().is_marlin()
+    )
+
+
+class LiLiCorrMLP(nn.Module):
+    def __init__(
+        self, in_size: int, mid_size: int, out_size: int, quant_config, prefix: str
+    ) -> None:
+        super().__init__()
+        self.up_proj = ReplicatedLinear(
+            in_size,
+            mid_size,
+            quant_config=quant_config,
+            prefix=add_prefix("up_proj", prefix),
+        )
+        self.down_proj = ReplicatedLinear(
+            mid_size,
+            out_size,
+            quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return _apply_2d(self.down_proj, F.silu(_apply_2d(self.up_proj, x)))
 
 
 class LiLiCorrLatticeAttention(nn.Module):
     # nn.MultiheadAttention's parameter layout, run via SDPA since that module is not capturable.
 
-    def __init__(self, hidden_size: int, num_heads: int) -> None:
+    def __init__(
+        self, hidden_size: int, num_heads: int, quant_config=None, prefix: str = ""
+    ) -> None:
         super().__init__()
         if hidden_size % num_heads != 0:
             raise ValueError(
@@ -33,7 +85,12 @@ class LiLiCorrLatticeAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         self.in_proj_weight = nn.Parameter(torch.zeros(3 * hidden_size, hidden_size))
         self.in_proj_bias = nn.Parameter(torch.zeros(3 * hidden_size))
-        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = ReplicatedLinear(
+            hidden_size,
+            hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("out_proj", prefix),
+        )
 
     def forward(
         self, hidden_states: torch.Tensor, attention_bias: torch.Tensor
@@ -47,9 +104,8 @@ class LiLiCorrLatticeAttention(nn.Module):
         v = v.view(shape).transpose(1, 2)
         # attention_bias is [1, heads, L, L]; SDPA broadcasts it over the batch.
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_bias)
-        return self.out_proj(
-            out.transpose(1, 2).reshape(bsz, seq_len, self.hidden_size)
-        )
+        out, _ = self.out_proj(out.transpose(1, 2).reshape(-1, self.hidden_size))
+        return out.view(bsz, seq_len, self.hidden_size)
 
 
 class LiLiCorrLayer(nn.Module):
@@ -59,16 +115,21 @@ class LiLiCorrLayer(nn.Module):
         num_heads: int,
         mlp_ratio: float,
         rms_norm_eps: float,
+        quant_config=None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.attn_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.attn = LiLiCorrLatticeAttention(hidden_size, num_heads)
+        self.attn = LiLiCorrLatticeAttention(
+            hidden_size, num_heads, quant_config, add_prefix("attn", prefix)
+        )
         self.mlp_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        mlp_hidden_size = int(hidden_size * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden_size),
-            nn.SiLU(),
-            nn.Linear(mlp_hidden_size, hidden_size),
+        self.mlp = LiLiCorrMLP(
+            hidden_size,
+            int(hidden_size * mlp_ratio),
+            hidden_size,
+            quant_config,
+            add_prefix("mlp", prefix),
         )
 
     def forward(
@@ -91,6 +152,8 @@ class LiLiCorrHead(nn.Module):
         block_size: int,
         rms_norm_eps: float,
         config: LiLiCorrConfig,
+        quant_config=None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         hidden_size = config.resolve_hidden_size(model_hidden_size=model_hidden_size)
@@ -106,16 +169,29 @@ class LiLiCorrHead(nn.Module):
         self.logit_scale = float(config.logit_scale)
 
         self.token_proj = (
-            nn.Identity()
+            None
             if model_hidden_size == hidden_size
-            else nn.Linear(model_hidden_size, hidden_size)
+            else ReplicatedLinear(
+                model_hidden_size,
+                hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("token_proj", prefix),
+            )
         )
-        self.pass_hidden_proj = nn.Linear(model_hidden_size, hidden_size)
-        self.feature_mlp = nn.Sequential(
-            nn.LayerNorm(self.num_candidate_features),
-            nn.Linear(self.num_candidate_features, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
+        self.pass_hidden_proj = ReplicatedLinear(
+            model_hidden_size,
+            hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("pass_hidden_proj", prefix),
+        )
+        self.feature_norm = nn.LayerNorm(self.num_candidate_features)
+        # Five input features fit no quantized GEMM kernel.
+        self.feature_mlp = LiLiCorrMLP(
+            self.num_candidate_features,
+            hidden_size,
+            hidden_size,
+            None,
+            add_prefix("feature_mlp", prefix),
         )
         self.slot_embedding = nn.Parameter(
             torch.zeros(1, 1, self.num_candidate_slots, 1, hidden_size)
@@ -127,7 +203,12 @@ class LiLiCorrHead(nn.Module):
             torch.zeros(self.num_heads, 2 * self.block_size - 1)
         )
         self.same_slot_bias = nn.Parameter(torch.zeros(self.num_heads))
-        self.context_proj = nn.Linear(model_hidden_size, hidden_size)
+        self.context_proj = ReplicatedLinear(
+            model_hidden_size,
+            hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("context_proj", prefix),
+        )
         self.layers = nn.ModuleList(
             [
                 LiLiCorrLayer(
@@ -135,16 +216,24 @@ class LiLiCorrHead(nn.Module):
                     num_heads=self.num_heads,
                     mlp_ratio=self.mlp_ratio,
                     rms_norm_eps=rms_norm_eps,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
-                for _ in range(int(config.num_layers))
+                for i in range(int(config.num_layers))
             ]
         )
         self.output_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.anchor_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        # Read as raw weights by materialize_inference_buffers, so never quantized.
         self.factor_input_proj = nn.Linear(hidden_size * 3, hidden_size)
         self.out_head = nn.Linear(hidden_size, self.factor_dim)
         self.in_head = nn.Linear(hidden_size, self.factor_dim)
-        self.anchor_out_head = nn.Linear(hidden_size, self.factor_dim)
+        self.anchor_out_head = ReplicatedLinear(
+            hidden_size,
+            self.factor_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("anchor_out_head", prefix),
+        )
 
         self._attn_bias: Optional[torch.Tensor] = None
         self._fused_edge_weight: Optional[torch.Tensor] = None
@@ -231,7 +320,7 @@ class LiLiCorrHead(nn.Module):
         self, anchor_hidden: torch.Tensor, anchor_valid: torch.Tensor
     ) -> torch.Tensor:
         # Branch-free so there is no host sync inside the captured region.
-        anchor = self.context_proj(anchor_hidden)
+        anchor = _apply_2d(self.context_proj, anchor_hidden)
         return anchor * anchor_valid.unsqueeze(-1).to(anchor.dtype)
 
     def score(
@@ -252,16 +341,16 @@ class LiLiCorrHead(nn.Module):
                 f"lattice carries {topk}; both are sized for the trained width."
             )
 
-        proj_dtype = self.pass_hidden_proj.weight.dtype
+        proj_dtype = self.slot_embedding.dtype
         if token_embeddings.dtype != proj_dtype:
             token_embeddings = token_embeddings.to(proj_dtype)
         if pass_hidden.dtype != proj_dtype:
             pass_hidden = pass_hidden.to(proj_dtype)
 
-        token_states = (
-            token_embeddings if already_projected else self.token_proj(token_embeddings)
-        )
-        pass_states = self.pass_hidden_proj(pass_hidden).unsqueeze(-2)
+        token_states = token_embeddings
+        if not already_projected and self.token_proj is not None:
+            token_states = _apply_2d(self.token_proj, token_embeddings)
+        pass_states = _apply_2d(self.pass_hidden_proj, pass_hidden).unsqueeze(-2)
 
         log_probs = candidate_log_probs.float()
         features = torch.stack(
@@ -276,7 +365,7 @@ class LiLiCorrHead(nn.Module):
         )
         hidden_states = token_states + pass_states
         hidden_states = hidden_states + self.feature_mlp(
-            features.to(dtype=token_states.dtype)
+            self.feature_norm(features.to(dtype=token_states.dtype))
         )
         hidden_states = hidden_states + self.slot_embedding[:, :, :n_slots]
         hidden_states = hidden_states + self.rank_embedding
@@ -307,7 +396,7 @@ class LiLiCorrHead(nn.Module):
             eps=self.vector_eps,
         ).unbind(-2)
         anchor_out = F.normalize(
-            self.anchor_out_head(anchor_state), dim=-1, eps=self.vector_eps
+            _apply_2d(self.anchor_out_head, anchor_state), dim=-1, eps=self.vector_eps
         )
 
         start_scores = (anchor_out[:, :, None, :] * in_vec[:, :, 0, :, :]).sum(dim=-1)
@@ -358,23 +447,26 @@ class LiLiCorrHead(nn.Module):
 
     @torch.no_grad()
     def build_token_table(self, embed_tokens: nn.Module) -> Optional[torch.Tensor]:
-        if isinstance(self.token_proj, nn.Identity):
+        if self.token_proj is None:
             return None
         weight = embed_tokens.weight
-        if int(self.token_proj.weight.shape[1]) != int(weight.shape[1]):
+        if self.token_proj.input_size != int(weight.shape[1]):
             return None
-        return F.linear(
-            weight.to(self.token_proj.weight.dtype),
-            self.token_proj.weight,
-            self.token_proj.bias,
-        ).contiguous()
+        table, _ = self.token_proj(weight.to(self.slot_embedding.dtype))
+        return table.contiguous()
 
 
 def check_head_weight_coverage(head: LiLiCorrHead, seen: set) -> None:
     # The base loader silently drops unresolved weights, which would only show
     # up as a lower acceptance length.
     expected = {f"lilicorr.{name}" for name, _ in head.named_parameters()}
-    missing = sorted(expected - seen)
+    # NVFP4 W4A16 registers an input_scale it never reads; checkpoints omit it.
+    optional = {
+        f"lilicorr.{name}.input_scale"
+        for name, module in head.named_modules()
+        if _is_nvfp4_a16(module)
+    }
+    missing = sorted(expected - optional - seen)
     if missing:
         raise ValueError(
             f"LiLiCorr checkpoint is missing {len(missing)} head parameters "
@@ -435,6 +527,8 @@ def check_conv_weight_coverage(model: DFlashDraftModel, seen: set) -> None:
 
 
 class LiLiCorrDraftModel(DFlashDraftModel):
+    supports_quantization = True
+
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         self.lilicorr = LiLiCorrHead(
@@ -442,7 +536,15 @@ class LiLiCorrDraftModel(DFlashDraftModel):
             block_size=int(self.block_size),
             rms_norm_eps=self.rms_norm_eps,
             config=parse_lilicorr_draft_config(draft_hf_config=config),
+            quant_config=quant_config,
+            prefix=add_prefix("lilicorr", prefix),
         )
+        # Every TP rank runs the replicated head, so its draft must match bit for bit.
+        # Marlin's atomic-add reduce at the head's shapes does not.
+        if get_parallel().tp_size > 1 and any(
+            _runs_fp4_marlin(m) for m in self.lilicorr.modules()
+        ):
+            raise ValueError("A LiLiCorr head on NVFP4 Marlin requires tp_size 1.")
 
     def set_block_size(self, block_size: int) -> None:
         super().set_block_size(block_size)
@@ -466,7 +568,7 @@ class LiLiCorrDraftModel(DFlashDraftModel):
         check_head_weight_coverage(self.lilicorr, seen)
         check_conv_weight_coverage(self, seen_conv)
 
-        parameter = next(self.lilicorr.parameters())
+        parameter = self.lilicorr.slot_embedding
         self.lilicorr.materialize_inference_buffers(parameter.device, parameter.dtype)
 
 

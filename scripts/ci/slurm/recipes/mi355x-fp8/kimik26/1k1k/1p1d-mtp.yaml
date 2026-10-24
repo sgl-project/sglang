@@ -66,6 +66,16 @@ runtime:
   decode_bootstrap_port: 9001
   lb_port: 8000
   mem_fraction_static: 0.90
+  # Decode-side headroom for MTP. With the draft head the decode server ends
+  # startup with 12.9 GB free per GPU (draft weights + a 4.6 GB draft-decode
+  # graph + a 9.8 GB target-verify graph, against 2.8 GB for the non-MTP target
+  # graph); the non-MTP sibling leaves 24.2 GB at the identical 0.90. At
+  # concurrency 256 the draft-extend path overruns that margin and ROCr aborts
+  # the queues with HSA_STATUS_ERROR_OUT_OF_RESOURCES ("Available Free mem :
+  # 0 MB"), killing a scheduler process. 0.85 buys back ~19 GB on decode only;
+  # prefill and every other emitted value are unchanged.
+  wide_ep:
+    decode_mem_fraction_static: 0.85
   page_size: 256
   max_running_requests: 256
   chunked_prefill_size: 8192

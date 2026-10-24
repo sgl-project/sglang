@@ -68,6 +68,7 @@ class InklingModelConfig(PretrainedConfig):
         unpadded_vocab_size: Optional[int] = None,
         padded_vocab_size: Optional[int] = None,
         logits_mup_width_multiplier: Optional[float] = None,
+        enable_lm_head_output_fp32: bool = True,
         final_logit_softcapping: Optional[float] = None,
         num_nextn_predict_layers: int = 8,
         tie_word_embeddings: bool = False,
@@ -184,6 +185,8 @@ class InklingModelConfig(PretrainedConfig):
         self.log_scaling_alpha = log_scaling_alpha
         self.unpadded_vocab_size = self.vocab_size
         self.logits_mup_width_multiplier = logits_mup_width_multiplier
+        # Preserve CUDA projection scores without promoting the inputs or weights.
+        self.enable_lm_head_output_fp32 = enable_lm_head_output_fp32
         self.final_logit_softcapping = final_logit_softcapping
         self.num_nextn_predict_layers = num_nextn_predict_layers
 
@@ -328,6 +331,9 @@ class InklingMMConfig(PretrainedConfig):
             if isinstance(text_config, InklingModelConfig)
             else InklingModelConfig(**(text_config or {}))
         )
+        if isinstance(mtp_config, dict) and "n_layers" in mtp_config:
+            # HiCache reads the draft depth through the text config.
+            self.text_config.num_nextn_predict_layers = mtp_config["n_layers"]
         if isinstance(mtp_config, dict) and mtp_config.get("local_layer_ids"):
             # Banded MTP head: the checkpoint declares its sliding-window draft
             # depths on mtp_config. Canonicalize onto text_config so every

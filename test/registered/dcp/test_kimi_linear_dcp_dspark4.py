@@ -1,4 +1,4 @@
-"""Four-Blackwell Kimi Linear TokenSpeed DCP + DSpark static acceptance test."""
+"""Four-Blackwell Kimi Linear CuteDSL MLA DCP + DSpark static acceptance test."""
 
 import json
 import socket
@@ -96,7 +96,7 @@ def _wait_for_port_release(base_url: str, timeout: float = 30.0) -> None:
 
 @unittest.skipUnless(
     _has_four_blackwell_gpus(),
-    "Kimi Linear TokenSpeed DCP + DSpark requires four Blackwell GPUs",
+    "Kimi Linear CuteDSL MLA DCP + DSpark requires four Blackwell GPUs",
 )
 class TestKimiLinearDCPDSpark4(CustomTestCase):
     base_url = DEFAULT_URL_FOR_TEST
@@ -132,7 +132,7 @@ class TestKimiLinearDCPDSpark4(CustomTestCase):
             "--max-running-requests",
             str(MAX_RUNNING_REQUESTS),
             "--attention-backend",
-            "tokenspeed_mla",
+            "cutedsl_mla",
             "--kv-cache-dtype",
             "fp8_e4m3",
             "--dcp-comm-backend",

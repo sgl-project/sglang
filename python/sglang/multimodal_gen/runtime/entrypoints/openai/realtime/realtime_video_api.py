@@ -222,12 +222,12 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
             )
             break
         except Exception as e:
-            if pending_send_task is not None:
-                pending_send_task.cancel()
-                await _await_realtime_task(pending_send_task)
             err_msg = str(e).splitlines()[0]
             logger.error("error during generate loop: %s", err_msg)
             try:
+                # finish any frame header/payload pair before reporting a generation error
+                if pending_send_task is not None:
+                    await pending_send_task
                 await write_error_msg(f"error during generate loop: {err_msg}", ws)
             except Exception as send_error:
                 logger.error(
@@ -258,12 +258,14 @@ async def _send_output_and_log(
     if session.adapter is None:
         raise ValueError("realtime adapter is not initialized")
     pace_wait_ms = await _wait_for_realtime_output_slot(session, batch, result)
-    send_stats = await session.adapter.send_output(
-        ws,
-        session,
-        result,
-        batch,
-    )
+    # frame headers and raw payloads must stay adjacent on the websocket
+    async with session.output_lock:
+        send_stats = await session.adapter.send_output(
+            ws,
+            session,
+            result,
+            batch,
+        )
     send_stats["pace_wait_ms"] = pace_wait_ms
     chunk_total_ms = (time.perf_counter() - chunk_started) * 1000
     _log_realtime_chunk_timing(
@@ -368,7 +370,8 @@ async def _listen_events(ws: WebSocket, session: GenerateSession):
         except Exception as e:
             event_kind = data.get("kind") if isinstance(data, dict) else None
             logger.warning("invalid event, kind=%s, error=%s", event_kind, e)
-            await write_error_msg("invalid event", ws)
+            async with session.output_lock:
+                await write_error_msg("invalid event", ws)
             continue
 
 

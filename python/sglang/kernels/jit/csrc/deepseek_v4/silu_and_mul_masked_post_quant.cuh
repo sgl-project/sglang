@@ -2,6 +2,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -11,6 +12,7 @@
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cuda_fp8.h>
 #include <type_traits>
@@ -29,15 +31,10 @@ struct SiluMulQuantVarlenParams {
   int64_t hidden_dim;
   uint32_t num_tokens;
   uint32_t num_experts;
+  uint32_t max_rows;  // num_tokens * topk; rows past it are left unwritten
 };
 
 constexpr uint32_t kMaxExperts = 256;
-
-struct alignas(16) CTAWork {
-  uint32_t expert_id;
-  uint32_t expert_token_id;
-  bool valid;
-};
 
 template <bool kApplySwigluLimit, bool kPrecise = true, typename DType2>
 SGL_DEVICE fp32x2_t silu_and_mul(DType2 gate, DType2 up, float limit) {
@@ -63,18 +60,14 @@ SGL_DEVICE fp32x2_t silu_and_mul(DType2 gate, DType2 up, float limit) {
   }
 }
 
-[[maybe_unused]]
-SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {
-  // Preconditions:
-  // 1. blockDim.x >= params.num_experts
-  // 2. params.num_experts <= kMaxExperts
+// Writes the inclusive prefix sum of `masked_m` to `s_row_end` and returns the total row count.
+// Expert e owns rows [s_row_end[e - 1], s_row_end[e]) of the flattened real-row index.
+// Requires blockDim.x >= params.num_experts and params.num_experts <= kMaxExperts.
+SGL_DEVICE uint32_t scan_masked_m(const SiluMulQuantVarlenParams& params, uint32_t* s_row_end) {
   using namespace device;
   static_assert(kWarpThreads == 32);
 
   static __shared__ uint32_t s_warp_sum[32];
-  static __shared__ CTAWork result;
-
-  result.valid = false;
 
   const uint32_t tx = threadIdx.x;
   const uint32_t lane_id = tx % kWarpThreads;
@@ -84,24 +77,34 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {
 
   // Per-warp inclusive scan of masked_m.
   const uint32_t warp_inclusive = warp::inclusive_sum(val, lane_id);
-  const uint32_t warp_exclusive = warp_inclusive - val;
 
   // Write each warp total.
   if (lane_id == kWarpThreads - 1) s_warp_sum[warp_id] = warp_inclusive;
   __syncthreads();
   const auto tmp_val = lane_id < warp_id ? s_warp_sum[lane_id] : 0u;
-  const auto prefix_exclusive = warp::reduce_sum(tmp_val) + warp_exclusive;
-  const auto bx = blockIdx.x;
-  if (prefix_exclusive <= bx && bx < prefix_exclusive + val) {
-    result = {tx, bx - prefix_exclusive, true};
-  }
+  const auto prefix_inclusive = warp::reduce_sum(tmp_val) + warp_inclusive;
+  if (tx < params.num_experts) s_row_end[tx] = prefix_inclusive;
   __syncthreads();
-  return result;
+  return params.num_experts == 0 ? 0u : s_row_end[params.num_experts - 1];
+}
+
+// Returns the expert that owns flattened real row `row`, which must be below s_row_end[num_experts - 1].
+SGL_DEVICE uint32_t find_expert(const uint32_t* s_row_end, uint32_t num_experts, uint32_t row) {
+  uint32_t lo = 0, hi = num_experts - 1;
+  while (lo < hi) {
+    const uint32_t mid = (lo + hi) / 2;
+    if (s_row_end[mid] > row) {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return lo;
 }
 
 template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
-__global__ __launch_bounds__(1024, 2) void  // maximize occupancy
-    silu_mul_quant_varlen_kernel(const SiluMulQuantVarlenParams __grid_constant__ params) {
+SGL_DEVICE void
+silu_mul_quant_varlen_row(const SiluMulQuantVarlenParams& params, const uint32_t expert_id, const uint32_t token_id) {
   using namespace device;
 
   constexpr uint32_t kWorkThreads = kGroupSize / 8u;
@@ -110,10 +113,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   using OutputVec = AlignedVector<fp8x2_e4m3_t, 4>;
   static_assert(kGroupSize == 32 || kGroupSize == 128, "unsupported group_size");
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
-
-  const auto [expert_id, token_id, valid] = get_work(params);
-
-  if (!valid) return;
 
   const auto work_id = threadIdx.x / kWorkThreads;
 
@@ -134,8 +133,6 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
       return params.output_scale + offset * num_groups + work_id;
     }
   }();
-
-  PDLWaitPrimary<kUsePDL>();
 
   InputVec gate_vec, up_vec;
   if constexpr (kSwizzle) {
@@ -191,6 +188,27 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     *output_scale = ue8m0_exp;
   } else {
     *output_scale = scale;
+  }
+}
+
+// Persistent: the host sizes the grid to the resident CTAs, not to num_tokens * topk,
+// because masked_m lives on the device and most of the padded capacity is empty.
+template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+__global__ __launch_bounds__(1024, 2) void  // maximize occupancy
+    silu_mul_quant_varlen_kernel(const SiluMulQuantVarlenParams __grid_constant__ params) {
+  using namespace device;
+
+  __shared__ uint32_t s_row_end[kMaxExperts];
+  const uint32_t num_rows = min(scan_masked_m(params, s_row_end), params.max_rows);
+  if (blockIdx.x >= num_rows) return;
+
+  PDLWaitPrimary<kUsePDL>();
+
+  for (uint32_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
+    const uint32_t expert_id = find_expert(s_row_end, params.num_experts, row);
+    const uint32_t row_begin = expert_id == 0 ? 0u : s_row_end[expert_id - 1];
+    silu_mul_quant_varlen_row<kGroupSize, kScaleUE8M0, kTransposed, kSwizzle, kUsePDL, kApplySwigluLimit>(
+        params, expert_id, row - row_begin);
   }
 }
 
@@ -319,14 +337,37 @@ struct SiluAndMulMaskedPostQuantKernel {
         .hidden_dim = hidden_dim,
         .num_tokens = num_tokens,
         .num_experts = num_experts,
+        .max_rows = num_tokens * topk,
     };
 
-    const auto num_threads = hidden_dim / 8;
+    const auto num_threads = static_cast<uint32_t>(hidden_dim / 8);
     RuntimeCheck(num_threads % device::kWarpThreads == 0);
+    RuntimeCheck(num_threads <= kMaxThreads, "hidden_dim / 8 exceeds 1024 threads");
     RuntimeCheck(num_threads >= num_experts);
+    const auto num_sm = runtime::get_sm_count(device.unwrap().device_id);
+    const auto num_blocks = transposed ? num_sm * blocks_per_sm<kernel_transposed>(num_threads)
+                                       : num_sm * blocks_per_sm<kernel_normal>(num_threads);
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
-    LaunchKernel(num_tokens * topk, num_threads, device.unwrap())  //
+    LaunchKernel(std::min(num_blocks, params.max_rows), num_threads, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
+  }
+
+ private:
+  static constexpr uint32_t kMaxThreads = 1024;
+
+  // Occupancy depends on the kernel and the block size only; a JIT module targets one arch,
+  // so one slot per block size serves every device.
+  template <auto kernel>
+  static uint32_t blocks_per_sm(const uint32_t num_threads) {
+    static std::atomic_uint32_t s_cache[kMaxThreads / device::kWarpThreads + 1]{};
+    auto& slot = s_cache[num_threads / device::kWarpThreads];
+    auto value = slot.load(std::memory_order_relaxed);
+    if (value == 0) {
+      value = host::runtime::get_blocks_per_sm(kernel, num_threads);
+      host::RuntimeCheck(value > 0, "silu_mul_quant_varlen_kernel cannot run with ", num_threads, " threads");
+      slot.store(value, std::memory_order_relaxed);
+    }
+    return value;
   }
 };
 

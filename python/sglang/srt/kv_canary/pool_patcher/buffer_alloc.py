@@ -67,11 +67,10 @@ def make_row_source(
     layer_buffer: torch.Tensor,
     read_bytes: int,
 ) -> Tuple[RealKvSource, ...]:
-    contiguous = layer_buffer.contiguous()
-    num_slots = int(contiguous.shape[0])
+    num_slots = int(layer_buffer.shape[0])
     if num_slots == 0 or read_bytes == 0:
         return ()
-    flat = contiguous.view(torch.uint8).reshape(num_slots, -1)
+    flat = layer_buffer.view(torch.uint8).view(num_slots, -1)
     num_bytes_per_token = int(flat.shape[1])
     clipped = _clip_read_bytes_aligned(
         requested=read_bytes, num_bytes_per_token=num_bytes_per_token

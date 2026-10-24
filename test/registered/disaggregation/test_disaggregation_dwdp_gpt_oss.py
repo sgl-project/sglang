@@ -35,9 +35,8 @@ class TestDisaggregationDWDPGptOss(PDDisaggregationServerBase):
         "0.85",
     ]
     extra_decode_args = [
-        "--dp",
+        "--attn-dp-size",
         str(NUM_DECODE_GPUS),
-        "--enable-dp-attention",
         "--disable-flashinfer-autotune",
         "--mem-fraction-static",
         "0.85",

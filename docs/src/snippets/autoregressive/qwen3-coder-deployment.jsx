@@ -119,11 +119,6 @@ export const Qwen3CoderDeployment = () => {
       cmd += ` \\\n  --ep 2`;
     }
 
-    // DP attention setting
-    if (quantization === 'nvfp4') {
-      cmd += ` \\\n  --enable-dp-attention`;
-    }
-
     // MOE runner backend for NVIDIA
     if (isNvidia) {
       if (quantization === 'nvfp4') {

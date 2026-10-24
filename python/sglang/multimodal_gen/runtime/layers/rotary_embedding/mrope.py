@@ -5,6 +5,7 @@ import functools
 import torch
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 def _to_tuple(x: int | tuple[int, ...], dim: int = 2) -> tuple[int, ...]:
@@ -247,28 +248,12 @@ class OneDRotaryEmbedding(torch.nn.Module):
         return freqs_cos, freqs_sin
 
     def forward(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Calculates 1D rotary embeddings for the given positions.
+        """Calculates 1D rotary embeddings for the given positions.
 
-        This method converts the input tensor to a hashable representation
-        and calls a cached helper method to perform the computation.
+        Not cached by value: building the key reads the positions back to the
+        host, which waits for the device.
         """
-        pos_tuple = tuple(pos.tolist())
-        device_str = str(pos.device)
-        return self._forward_cached(pos_tuple, device_str)
-
-    @functools.lru_cache(maxsize=16)
-    def _forward_cached(
-        self, pos_tuple: tuple, device_str: str
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        The core implementation that computes 1D rotary embeddings.
-        This method is wrapped by an LRU cache.
-        """
-        device = torch.device(device_str)
-        pos = torch.as_tensor(pos_tuple, dtype=self.dtype, device=device)
-        freqs_cos, freqs_sin = self.build_freqs_outer(pos, device)
-        return freqs_cos, freqs_sin
+        return self.build_freqs_outer(pos.to(self.dtype), pos.device)
 
 
 class NDRotaryEmbedding(torch.nn.Module):
@@ -365,6 +350,26 @@ class NDRotaryEmbedding(torch.nn.Module):
         device = torch.device(device_str)
         positions = torch.tensor(pos_tuple, dtype=torch.long, device=device)
         return self.forward_uncached(pos=positions)
+
+    def forward_3d_sequence_shard(
+        self,
+        local_len: int,
+        rank: int,
+        frame_stride_local: int,
+        width_local: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed a contiguous shard of a flattened (time, height, width) grid."""
+        token_start = rank * local_len
+        token_indices = torch.arange(
+            token_start, token_start + local_len, device=device, dtype=torch.long
+        )
+        t_idx = token_indices // frame_stride_local
+        rem = token_indices % frame_stride_local
+        h_idx = rem // width_local
+        w_idx = rem % width_local
+        positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
+        return self.forward_uncached(positions)
 
     def forward_uncached(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -500,3 +505,27 @@ class NDRotaryEmbedding(torch.nn.Module):
             col_offset += dim_i_half
 
         return cos.float(), sin.float()
+
+
+class FluxPosEmbed(torch.nn.Module):
+    """uncached FLUX-family RoPE with contiguous float32 outputs"""
+
+    # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
+    def __init__(self, theta: int, axes_dim: list[int]):
+        super().__init__()
+        self.rope = NDRotaryEmbedding(
+            rope_dim_list=axes_dim,
+            rope_theta=theta,
+            use_real=False,
+            repeat_interleave_real=False,
+            dtype=(
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
+            ),
+        )
+
+    def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pos = ids.float()
+        freqs_cos, freqs_sin = self.rope.forward_uncached(pos=pos)
+        return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()

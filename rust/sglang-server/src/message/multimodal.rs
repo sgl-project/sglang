@@ -1,12 +1,6 @@
 //! Typed multimodal inputs of the `/generate` body — the Rust form of Python
 //! `MultimodalDataInputFormat` (`io_struct.py`) — and their per-request fan-out.
 
-use std::fmt;
-
-use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
-use serde::de::{MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
-
 use super::request::{HeapBytes, check_broadcast_budget};
 use crate::utils::error::Error;
 
@@ -17,24 +11,25 @@ use crate::utils::error::Error;
 pub enum MmItem {
     /// URL, `file://` / absolute path, `data:` URI, or bare base64 (Python `str`).
     Source(String),
-    /// Python `ImageData` / `VideoData` (`{"url": …, …}`). Only `url` is kept:
-    /// the hint keys (`detail`, `max_dynamic_patch`, `preprocess_kwargs`, ...)
-    /// are read by model families this pipeline does not run, and Python's
-    /// `load_image` itself reduces the item to `.url`.
-    Ref { url: String },
-    /// A preprocessed item (`{"format": "processor_output" | "precomputed_embedding", …}`).
-    /// Parsed only far enough to be rejected by name at the MM stage; Python
-    /// ignores it the same way on a text-only model.
-    Preprocessed { format: String },
+    /// Python `ImageData` / `VideoData` (`{"url": …, …}`): the source plus the
+    /// hints a processor may read.
+    Ref { url: String, hints: MediaHints },
+}
+
+/// The `MediaRef` hints a processor may read, grown as processors need them;
+/// the rest serve Python-side model families the Rust pipeline does not run.
+/// A bare source carries none, and the built-in families ignore them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MediaHints {
+    /// Video: the requested frame sampling rate.
+    pub fps: Option<f64>,
 }
 
 impl MmItem {
-    /// The raw source string for the modality pipeline, `None` for a
-    /// preprocessed item.
+    /// The raw source string for the modality pipeline.
     pub fn source(&self) -> Option<&str> {
         match self {
-            MmItem::Source(source) | MmItem::Ref { url: source } => Some(source),
-            MmItem::Preprocessed { .. } => None,
+            MmItem::Source(source) | MmItem::Ref { url: source, .. } => Some(source),
         }
     }
 }
@@ -42,65 +37,8 @@ impl MmItem {
 impl HeapBytes for MmItem {
     fn heap_bytes(&self) -> usize {
         match self {
-            MmItem::Source(s) | MmItem::Ref { url: s } | MmItem::Preprocessed { format: s } => {
-                s.len()
-            }
+            MmItem::Source(s) | MmItem::Ref { url: s, .. } => s.len(),
         }
-    }
-}
-
-/// The object form of an item, as Python's `Dict[str, Any]`: `format` marks a
-/// preprocessed item (checked first, as `glm4v` does), `url` an `ImageData`.
-#[derive(Deserialize)]
-struct ItemObject {
-    #[serde(default)]
-    url: Option<String>,
-    #[serde(default)]
-    format: Option<String>,
-}
-
-impl TryFrom<ItemObject> for MmItem {
-    type Error = &'static str;
-
-    fn try_from(object: ItemObject) -> Result<Self, Self::Error> {
-        match (object.format, object.url) {
-            (Some(format), _) => Ok(MmItem::Preprocessed { format }),
-            (None, Some(url)) => Ok(MmItem::Ref { url }),
-            (None, None) => Err("a multimodal item object needs a `url` or a `format` key"),
-        }
-    }
-}
-
-/// Hand-written rather than `#[serde(untagged)]` so a bad item is reported as
-/// what it is ("expected a source string or an item object"), not as "did not
-/// match any variant".
-impl<'de> Deserialize<'de> for MmItem {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct ItemVisitor;
-
-        impl<'de> Visitor<'de> for ItemVisitor {
-            type Value = MmItem;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a media source string or a multimodal item object")
-            }
-
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                Ok(MmItem::Source(value.to_owned()))
-            }
-
-            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
-                Ok(MmItem::Source(value))
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                ItemObject::deserialize(MapAccessDeserializer::new(map))?
-                    .try_into()
-                    .map_err(serde::de::Error::custom)
-            }
-        }
-
-        deserializer.deserialize_any(ItemVisitor)
     }
 }
 
@@ -117,119 +55,6 @@ pub enum MmDataInput {
     Nested(Vec<Option<Vec<Option<MmItem>>>>),
 }
 
-/// One element of a list-form field, before the list is known to be flat or nested.
-enum ListElement {
-    Null,
-    Item(MmItem),
-    List(Vec<Option<MmItem>>),
-}
-
-impl<'de> Deserialize<'de> for ListElement {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct ElementVisitor;
-
-        impl<'de> Visitor<'de> for ElementVisitor {
-            type Value = ListElement;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("null, a media source string, an item object, or a list of items")
-            }
-
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(ListElement::Null)
-            }
-
-            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-                Ok(ListElement::Null)
-            }
-
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                Ok(ListElement::Item(MmItem::Source(value.to_owned())))
-            }
-
-            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
-                Ok(ListElement::Item(MmItem::Source(value)))
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                ItemObject::deserialize(MapAccessDeserializer::new(map))?
-                    .try_into()
-                    .map(ListElement::Item)
-                    .map_err(serde::de::Error::custom)
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-                Vec::<Option<MmItem>>::deserialize(SeqAccessDeserializer::new(seq))
-                    .map(ListElement::List)
-            }
-        }
-
-        deserializer.deserialize_any(ElementVisitor)
-    }
-}
-
-impl<'de> Deserialize<'de> for MmDataInput {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct InputVisitor;
-
-        impl<'de> Visitor<'de> for InputVisitor {
-            type Value = MmDataInput;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a media item, a list of items, or a list of item lists")
-            }
-
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                Ok(MmDataInput::One(MmItem::Source(value.to_owned())))
-            }
-
-            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
-                Ok(MmDataInput::One(MmItem::Source(value)))
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-                ItemObject::deserialize(MapAccessDeserializer::new(map))?
-                    .try_into()
-                    .map(MmDataInput::One)
-                    .map_err(serde::de::Error::custom)
-            }
-
-            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
-                let elements = Vec::<ListElement>::deserialize(SeqAccessDeserializer::new(seq))?;
-                let nested = elements
-                    .iter()
-                    .any(|element| matches!(element, ListElement::List(_)));
-                if !nested {
-                    return Ok(MmDataInput::Many(
-                        elements
-                            .into_iter()
-                            .map(|element| match element {
-                                ListElement::Item(item) => Some(item),
-                                ListElement::Null => None,
-                                ListElement::List(_) => unreachable!("checked above"),
-                            })
-                            .collect(),
-                    ));
-                }
-                elements
-                    .into_iter()
-                    .map(|element| match element {
-                        ListElement::List(items) => Ok(Some(items)),
-                        ListElement::Null => Ok(None),
-                        ListElement::Item(_) => Err(serde::de::Error::custom(
-                            "a nested list cannot mix bare items with item lists",
-                        )),
-                    })
-                    .collect::<Result<_, _>>()
-                    .map(MmDataInput::Nested)
-            }
-        }
-
-        deserializer.deserialize_any(InputVisitor)
-    }
-}
-
-/// The items of one modality for one request, `null` entries dropped.
 fn present(items: Vec<Option<MmItem>>) -> Vec<MmItem> {
     items.into_iter().flatten().collect()
 }
@@ -300,8 +125,12 @@ fn check_len(len: usize, n: usize, name: &str) -> Result<(), Error> {
 mod tests {
     use super::*;
 
-    fn parse(json: &str) -> Result<MmDataInput, serde_json::Error> {
-        serde_json::from_str(json)
+    /// Parsed as the wire type (the schema's `MediaInput`), then converted;
+    /// either step's rejection is an `Err`.
+    fn parse(json: &str) -> Result<MmDataInput, String> {
+        let wire: sglang_api_types::api::v1::MediaInput =
+            serde_json::from_str(json).map_err(|e| e.to_string())?;
+        crate::message::wire::media_input(wire).map_err(|e| e.to_string())
     }
 
     fn src(s: &str) -> MmItem {
@@ -324,39 +153,32 @@ mod tests {
         );
     }
 
-    /// Object items: `format` wins over `url` (a preprocessed item may carry
-    /// both), and an object with neither is named in the error.
+    /// Object items are typed `MediaRef`s: the `url` and the hints a processor
+    /// reads ride along (`detail` does not), a hint the schema does not name is
+    /// an error, and a preprocessed-input dict is not a wire shape at all (its
+    /// values are tensors; Engine-only).
     #[test]
     fn parses_item_objects() {
         assert_eq!(
             parse(r#"{"url": "u", "detail": "high"}"#).unwrap(),
-            MmDataInput::One(MmItem::Ref { url: "u".into() })
+            MmDataInput::One(MmItem::Ref {
+                url: "u".into(),
+                hints: MediaHints::default(),
+            })
         );
-        assert_eq!(
-            parse(r#"[{"format": "processor_output", "url": "u", "pixel_values": [1]}]"#).unwrap(),
-            MmDataInput::Many(vec![Some(MmItem::Preprocessed {
-                format: "processor_output".into()
-            })])
-        );
-        let err = parse(r#"{"detail": "high"}"#).unwrap_err().to_string();
-        assert!(err.contains("`url` or a `format`"), "{err}");
+        let err = parse(r#"{"url": "u", "detai": "high"}"#)
+            .unwrap_err()
+            .to_string(); // codespell:ignore detai
+        assert!(err.contains("unknown field"), "{err}");
+        assert!(parse(r#"[{"format": "processor_output", "url": "u"}]"#).is_err());
+        assert!(parse(r#"{"detail": "high"}"#).is_err(), "a ref needs a url");
     }
 
-    /// Anything Python's item union does not cover is rejected up front, with
-    /// the expected shape in the message.
+    /// Anything Python's item union does not cover is rejected up front.
     #[test]
     fn rejects_non_items() {
-        for (json, expect) in [
-            ("5", "expected a media item, a list of items"),
-            (r#"["a", 5]"#, "expected null, a media source string"),
-            (r#"["a", ["b"]]"#, "cannot mix"),
-            (
-                r#"[[["a"]]]"#,
-                "expected a media source string or a multimodal item object",
-            ),
-        ] {
-            let err = parse(json).unwrap_err().to_string();
-            assert!(err.contains(expect), "{json}: {err}");
+        for json in ["5", r#"["a", 5]"#, r#"["a", ["b"]]"#, r#"[[["a"]]]"#] {
+            assert!(parse(json).is_err(), "{json}");
         }
     }
 

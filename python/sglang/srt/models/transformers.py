@@ -58,9 +58,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-)
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -238,6 +235,9 @@ def _normalize_tp_style(style: str) -> Style:
         "packed_rowwise": "rowwise",
         "local_rowwise": "rowwise",
         "local_packed_rowwise": "rowwise",
+        # transformers' tied-embedding `base_model_tp_plan`s give the embedding this
+        # style; `replace_vocab_embed_class` shards it instead.
+        "embedding_rowwise": "replicate",
         "isolated": "replicate",
         "local": "replicate",
         "replicated_with_grad_allreduce": "replicate",
@@ -1344,7 +1344,6 @@ class MultiModalMixin:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._mm_padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
         # transformers v5 flattened SigLIP/CLIP (dropped the "vision_model"
         # wrapper); older checkpoints still ship "vision_tower.vision_model.*"

@@ -1,12 +1,14 @@
 import asyncio
 import json
 import unittest
+from http import HTTPStatus
 from types import SimpleNamespace
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
+from fastapi import HTTPException  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from jinja2 import Environment  # noqa: E402
 
@@ -36,6 +38,7 @@ class _FakeOpenAIServingChat:
         self.tokenizer_manager = SimpleNamespace(
             tokenizer=SimpleNamespace(chat_template=chat_template)
         )
+        self.supports_inline_system = detect_inline_system_support(chat_template)
 
     def supports_native_reasoning_history(self):
         return self.native_reasoning_history
@@ -55,12 +58,15 @@ class _FakeOpenAIServingChat:
 
 
 class _FakeNonStreamingErrorOpenAI:
-    """Returns a configurable error response from the OpenAI handler."""
+    """Returns an error response or raises an exception from the OpenAI handler."""
 
-    def __init__(self, status_code=400, body=None, content=None):
+    supports_inline_system = False
+
+    def __init__(self, status_code=400, body=None, content=None, exception=None):
         self._status_code = status_code
         self._body = body
         self._content = content
+        self._exception = exception
 
     def _validate_request(self, chat_request):
         return None
@@ -71,6 +77,8 @@ class _FakeNonStreamingErrorOpenAI:
     async def _handle_non_streaming_request(
         self, adapted_request, processed_request, raw_request
     ):
+        if self._exception is not None:
+            raise self._exception
         if self._body is not None:
             # Build a response object exposing raw bytes via `.body`.
             return SimpleNamespace(status_code=self._status_code, body=self._body)
@@ -84,24 +92,6 @@ class _FakeNonStreamingErrorOpenAI:
                 }
             },
         )
-
-
-class _FakeNonStreamingOpenAI:
-    """Returns a configurable ChatCompletionResponse from the OpenAI handler."""
-
-    def __init__(self, response):
-        self._response = response
-
-    def _validate_request(self, chat_request):
-        return None
-
-    def _convert_to_internal_request(self, chat_request, raw_request):
-        return SimpleNamespace(), chat_request
-
-    async def _handle_non_streaming_request(
-        self, adapted_request, processed_request, raw_request
-    ):
-        return self._response
 
 
 def _chunk(choices=None, usage=None):
@@ -176,6 +166,12 @@ class TestAnthropicServing(unittest.TestCase):
         data.update(overrides)
         return AnthropicMessagesRequest.model_validate(data)
 
+    def _non_streaming_exception_response(self, exception):
+        serving = AnthropicServing(_FakeNonStreamingErrorOpenAI(exception=exception))
+        return asyncio.run(
+            serving.handle_messages(self._anthropic_request(stream=False), object())
+        )
+
     def _tool_result_request(self, content, tools=None):
         overrides = {
             "stream": False,
@@ -195,6 +191,23 @@ class TestAnthropicServing(unittest.TestCase):
         if tools is not None:
             overrides["tools"] = tools
         return self._anthropic_request(**overrides)
+
+    def test_messages_preserves_pd_rendezvous_through_native_conversion(self):
+        """PD routers inject bootstrap fields into /v1/messages bodies; dropping
+        them in the Chat Completions conversion strands the decode request."""
+        request = self._anthropic_request(
+            bootstrap_host="prefill.internal",
+            bootstrap_port=8998,
+            bootstrap_room=2**62 + 17,
+            routed_dp_rank=3,
+            disagg_prefill_dp_rank=2,
+        )
+        converted = self._serving()._convert_to_chat_completion_request(request)
+        self.assertEqual(converted.bootstrap_host, "prefill.internal")
+        self.assertEqual(converted.bootstrap_port, 8998)
+        self.assertEqual(converted.bootstrap_room, 2**62 + 17)
+        self.assertEqual(converted.routed_dp_rank, 3)
+        self.assertEqual(converted.disagg_prefill_dp_rank, 2)
 
     def test_stream_closes_tool_block_before_text_delta(self):
         serving = self._serving(
@@ -530,6 +543,83 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
         self.assertEqual(payload["error"]["message"], "context length exceeded")
+
+    def test_non_streaming_queue_full_http_exception_preserves_503(self):
+        for status_code in (503, HTTPStatus.SERVICE_UNAVAILABLE):
+            with self.subTest(status_code=status_code, code_type=type(status_code)):
+                response = self._non_streaming_exception_response(
+                    HTTPException(
+                        status_code=status_code,
+                        detail="The request queue is full: sensitive internals /opt/secret",
+                    )
+                )
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(
+                    json.loads(response.body),
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "overloaded_error",
+                            "message": "Internal server error",
+                        },
+                    },
+                )
+
+    def test_non_streaming_http_exception_4xx_preserves_status_and_message(self):
+        for status_code, expected_type in [
+            (400, "invalid_request_error"),
+            (418, "api_error"),
+        ]:
+            with self.subTest(status_code=status_code):
+                response = self._non_streaming_exception_response(
+                    HTTPException(status_code=status_code, detail="Request rejected")
+                )
+                self.assertEqual(response.status_code, status_code)
+                self.assertEqual(
+                    json.loads(response.body)["error"],
+                    {"type": expected_type, "message": "Request rejected"},
+                )
+
+    def test_non_streaming_http_exception_non_str_detail_is_stringified(self):
+        response = self._non_streaming_exception_response(
+            HTTPException(status_code=400, detail={"message": "Bad request"})
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.body)["error"],
+            {
+                "type": "invalid_request_error",
+                "message": "{'message': 'Bad request'}",
+            },
+        )
+
+    def test_non_streaming_http_exception_logs_original_detail(self):
+        detail = "worker rejected request: sensitive internals /opt/secret"
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level="WARNING"
+        ) as captured:
+            response = self._non_streaming_exception_response(
+                HTTPException(status_code=503, detail=detail)
+            )
+        self.assertEqual(len(captured.records), 1)
+        message = captured.records[0].getMessage()
+        self.assertIn(detail, message)
+        self.assertIn("503", message)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            json.loads(response.body)["error"],
+            {"type": "overloaded_error", "message": "Internal server error"},
+        )
+
+    def test_non_streaming_unexpected_exception_returns_generic_500(self):
+        response = self._non_streaming_exception_response(
+            RuntimeError("sensitive internals: /opt/secret")
+        )
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            json.loads(response.body)["error"],
+            {"type": "api_error", "message": "Internal server error"},
+        )
 
     # ------------------------------------------------------------------
     # Edge-case coverage added in the review-fix pass
@@ -1348,18 +1438,6 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(anthropic_response.content[0].type, "text")
         self.assertEqual(anthropic_response.content[0].text, "")
 
-    def test_error_response_does_not_leak_exception_name(self):
-        """``error.type`` must stay in Anthropic's documented literal set."""
-        serving = self._serving()
-        response = serving._error_response(
-            status_code=500,
-            error_type="api_error",
-            message="Internal server error",
-            exception_name="KeyError",
-        )
-        body = json.loads(bytes(response.body).decode())
-        self.assertEqual(body["error"]["type"], "api_error")
-
     def test_user_message_text_tool_text_preserves_order(self):
         """User message [text, tool_result, text] must stay user→tool→user on the wire."""
         serving = self._serving()
@@ -1474,6 +1552,28 @@ class TestAnthropicServing(unittest.TestCase):
         )
         self.assertEqual(chat_request.messages[0].content, "You are terse.")
         self.assertEqual(chat_request.messages[2].content, "Reply with exactly: OK")
+
+    def test_inline_system_support_comes_from_the_prompt_renderer(self):
+        """Native encoders have no Jinja template to probe, so Messages must use
+        the serving chat's renderer decision instead of hoisting inline system."""
+        chat = _FakeOpenAIServingChat(chat_template=None)
+        chat.supports_inline_system = True
+        serving = AnthropicServing(chat)
+        request = self._anthropic_request(
+            stream=False,
+            system="Stable instructions",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "New instruction"},
+                {"role": "user", "content": "go"},
+            ],
+        )
+        converted = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(
+            [m.role for m in converted.messages],
+            ["system", "user", "system", "user"],
+        )
+        self.assertEqual(converted.messages[0].content, "Stable instructions")
 
     def test_top_level_system_only_is_unchanged(self):
         """A request with only the top-level ``system`` field (no in-messages

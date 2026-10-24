@@ -1,9 +1,10 @@
 """Nothing under layers/attention may translate KV ids for itself.
 
-Ownership is exactly two places: `KVIndexTranslator` for READS and the
-ForwardBatch rebind (`rebind_write_loc`) for WRITES. Virtual and physical ids
-share a value range, so a backend that forgets a translate -- or does one
-twice -- reads the wrong rows and nothing crashes.
+Ownership is exactly one place: the iteration's `KVLocPlan`, built through
+`KVIndexTranslator`, translates the WRITE window and the READ table once, and
+backends read the result. Virtual and physical ids share a value range, so a
+backend that forgets a translate -- or does one twice -- reads the wrong rows
+and nothing crashes.
 
 Deliberately out of scope: the allocator-internal implementations
 (`allocator/unified_*`, `unified_memory_pool`), which ARE the mechanism the
@@ -164,7 +165,7 @@ def _build_wrappers(translator):
 class TestWrapperBackendsForwardTranslator(CustomTestCase):
     """Bug regression: `AttentionBackend.kv_index_translator` defaults to None,
     so a wrapper that does not re-expose its inner's copy makes producers skip
-    the virtual->kernel-facing translation instead of failing."""
+    the virtual->physical translation instead of failing."""
 
     def test_every_wrapper_is_constructed_here(self):
         self.assertEqual(

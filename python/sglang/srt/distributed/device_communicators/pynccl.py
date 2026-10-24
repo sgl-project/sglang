@@ -34,6 +34,7 @@ class PyNcclCommunicator:
         device: Union[int, str, torch.device],
         library_path: Optional[str] = None,
         is_symmetric_memory_enabled: bool = False,
+        cta_policy: Optional[int] = None,
     ):
         """
         Args:
@@ -44,6 +45,9 @@ class PyNcclCommunicator:
             library_path: the path to the NCCL library. If None, it will
                 use the default library path.
             is_symmetric_memory_enabled: whether symmetric memory is enabled.
+            cta_policy: ncclConfig_t.CTAPolicy for this communicator, e.g.
+                NCCL_CTA_POLICY_ZERO; None keeps the NCCL default.
+                The global NCCL_CTA_POLICY environment variable overrides it.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device.
         """
@@ -110,11 +114,14 @@ class PyNcclCommunicator:
         # `torch.cuda.device` is a context manager that changes the
         # current cuda device to the specified one
         with torch.cuda.device(device):
-            if is_symmetric_memory_enabled:
-                # When symmetric memory is enabled, disable internal
-                # NCCL cuda event synchronizations to improve performance.
+            if is_symmetric_memory_enabled or cta_policy is not None:
                 config = ncclConfig_t.create()
-                config.graphUsageMode = 1
+                if is_symmetric_memory_enabled:
+                    # When symmetric memory is enabled, disable internal
+                    # NCCL cuda event synchronizations to improve performance.
+                    config.graphUsageMode = 1
+                if cta_policy is not None:
+                    config.CTAPolicy = cta_policy
                 self.comm: ncclComm_t = self.nccl.ncclCommInitRankConfig(
                     self.world_size, self.unique_id, self.rank, config
                 )

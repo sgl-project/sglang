@@ -15,6 +15,9 @@ class DllmConfig:
         max_running_requests: int,
         first_done_first_out_mode: bool = False,
         requires_separate_context_encoding: bool = False,
+        capture_input_preparation: bool = False,
+        delete_token_id: int | None = None,
+        split_token_id: int | None = None,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
@@ -23,6 +26,9 @@ class DllmConfig:
         self.max_running_requests = max_running_requests
         self.first_done_first_out_mode = first_done_first_out_mode
         self.requires_separate_context_encoding = requires_separate_context_encoding
+        self.capture_input_preparation = capture_input_preparation
+        self.delete_token_id = delete_token_id
+        self.split_token_id = split_token_id
 
     def validate_request(self, req) -> str | None:
         from sglang.srt.dllm.algorithm import get_algorithm_cls
@@ -81,6 +87,50 @@ class DllmConfig:
                 f"{cfg.dllm_algorithm} does not support model architecture {arch}"
             )
 
+        delete_token_id = None
+        split_token_id = None
+        if cfg.dllm_algorithm == "JointThresholdInDel":
+            delete_token_id = getattr(model_config.hf_config, "delete_token_id", None)
+            split_token_id = getattr(model_config.hf_config, "split_token_id", None)
+
+            if delete_token_id is None or split_token_id is None:
+                override_example = (
+                    '{"delete_token_id": 156930, "split_token_id": 156931}'
+                )
+                raise RuntimeError(
+                    "JointThresholdInDel is not supported for checkpoint "
+                    f"{cfg.model_path!r}: the checkpoint must declare both "
+                    "delete_token_id and split_token_id. Use a checkpoint with "
+                    "explicit Insert/Delete support. If you are certain this "
+                    "checkpoint was trained for Insert/Delete decoding, declare the "
+                    "correct token IDs in config.json or pass them with "
+                    "`--json-model-override-args "
+                    f"'{override_example}'`. "
+                    "Use the token IDs defined by your checkpoint."
+                )
+
+            vocab_size = model_config.vocab_size
+            for token_name, token_id in (
+                ("delete_token_id", delete_token_id),
+                ("split_token_id", split_token_id),
+            ):
+                if isinstance(token_id, bool) or not isinstance(token_id, int):
+                    raise ValueError(
+                        f"{token_name} must be an integer token ID, got {token_id!r}"
+                    )
+                if not 0 <= token_id < vocab_size:
+                    raise ValueError(
+                        f"{token_name} must be within the model vocabulary "
+                        f"[0, {vocab_size}), got {token_id}"
+                    )
+
+            if len({mask_id, delete_token_id, split_token_id}) != 3:
+                raise ValueError(
+                    "JointThresholdInDel token IDs must be distinct, got "
+                    f"mask_id={mask_id}, delete_token_id={delete_token_id}, "
+                    f"split_token_id={split_token_id}"
+                )
+
         max_running_requests = (
             1 if cfg.max_running_requests is None else cfg.max_running_requests
         )
@@ -103,6 +153,18 @@ class DllmConfig:
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
 
+        checkpoint_block_size = getattr(model_config.hf_config, "block_size", None)
+        if (
+            getattr(model_config.hf_config, "expert_capacity", None) is not None
+            and block_size != checkpoint_block_size
+        ):
+            raise ValueError(
+                "LLaDA2 block routing requires the dLLM block size to match the "
+                f"checkpoint block_size ({checkpoint_block_size}), got {block_size}. "
+                "Remove the block_size override from --dllm-algorithm-config or "
+                "set it to the checkpoint value."
+            )
+
         return DllmConfig(
             algorithm=cfg.dllm_algorithm,
             algorithm_config=algorithm_config,
@@ -113,4 +175,10 @@ class DllmConfig:
             requires_separate_context_encoding=(
                 algorithm_cls.requires_separate_context_encoding
             ),
+            capture_input_preparation=(
+                algorithm_cls.capture_input_preparation
+                and algorithm_config.get("capture_input_preparation", True)
+            ),
+            delete_token_id=delete_token_id,
+            split_token_id=split_token_id,
         )

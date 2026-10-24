@@ -3,7 +3,9 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
+from sglang.kernels.ops.quantization.fp4_indexer_quant import (
+    quantize_fp4_indexer_tensor,
+)
 from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks, scoring
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -81,7 +83,17 @@ def run_dense(inputs, *, publish_candidates, candidates):
             block_size=inputs["candidate_block_size"],
         )
         return selected, None
-    return scoring.dense_prefill_topk(data, inputs["kv"], topk=inputs["topk"]), None
+    # The plain top-k writes request-local positions into a -1 filled buffer;
+    # the checks compare flattened-K columns, as the CP paths return.
+    local = torch.full(
+        (data.compress_lens.shape[0], inputs["topk"]),
+        -1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    scoring.dense_prefill_topk(data, inputs["kv"], out=local)
+    starts = data.request_starts[:, None]
+    return torch.where(local >= 0, local + starts, local), None
 
 
 def request_blocks(inputs, candidates):
@@ -99,16 +111,23 @@ def request_blocks(inputs, candidates):
 def dense_scores(inputs):
     from deep_gemm import fp8_fp4_mqa_logits
 
+    from sglang.kernels.ops.attention.dsv4.index_logits import (
+        index_logits_dtype,
+        index_weights_dtype,
+    )
+
     width = (max(n for _, n in inputs["request_lengths"]) + 3) // 4 * 4
+    # Score in the dtypes the indexer uses on this GPU, so the reference matches.
     scores = fp8_fp4_mqa_logits(
         inputs["q"],
         inputs["kv"],
-        inputs["weights"],
+        inputs["weights"].to(index_weights_dtype()),
         inputs["starts"],
         inputs["starts"] + inputs["lengths"],
         False,
         width,
-    )
+        logits_dtype=index_logits_dtype(),
+    ).float()
     return scores.masked_fill_(
         torch.arange(width, device="cuda")[None, :] >= inputs["lengths"][:, None],
         -torch.inf,

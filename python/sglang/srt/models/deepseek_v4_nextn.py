@@ -1,4 +1,5 @@
 import logging
+from contextlib import nullcontext
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -18,10 +19,15 @@ from sglang.srt.layers.dp_attention import (
     get_global_dp_buffer_len,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.layer_boundary import layer_stack
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    get_num_fused_shared_experts,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -30,12 +36,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
+    _is_cuda,
     _is_npu,
     wo_a_fp8_gemm_enabled,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -94,15 +103,20 @@ class DeepseekV4ModelNextN(nn.Module):
         else:
             prefix = add_prefix("decoder", prefix)
 
-        self.decoder = DeepseekV4DecoderLayer(
-            config,
-            layer_id=0,
-            quant_config=quant_config,
-            is_nextn=True,
-            prefix=prefix,
-            alt_streams=None,
-            compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER,
-        )
+        with (
+            layer_stack(final_read=hc_boundary.FinalRead())
+            if _is_cuda
+            else nullcontext()
+        ):
+            self.decoder = DeepseekV4DecoderLayer(
+                config,
+                layer_id=0,
+                quant_config=quant_config,
+                is_nextn=True,
+                prefix=prefix,
+                alt_streams=None,
+                compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER,
+            )
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -186,17 +200,35 @@ class DeepseekV4ModelNextN(nn.Module):
             # decoder layer reads the memoized gather instead of re-gathering.
             prime_rope_cos_sin([self.decoder.self_attn], forward_batch, positions)
 
-        hidden_states, residual, post, comb = self.decoder(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            input_ids=input_ids,
-            input_ids_global=input_ids_global,
-        )
-        if residual is not None:
-            # NextN has a single decoder layer, so no later layer can consume a
-            # deferred fused hc_post state.
-            hidden_states = self.decoder.hc_post(hidden_states, residual, post, comb)
+        if _is_cuda:
+            residual_batch.start(forward_batch)
+            try:
+                hidden_states = self.decoder(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                )
+                hidden_states = residual_batch.read_output(
+                    hidden_states, forward_batch, hc_boundary.FinalRead(), None
+                )
+            finally:
+                residual_batch.clear(forward_batch)
+        else:
+            hidden_states, residual, post, comb = self.decoder(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+            )
+            if residual is not None:
+                # NextN has a single decoder layer, so no later layer can consume a
+                # deferred fused hc_post state.
+                hidden_states = self.decoder.hc_post(
+                    hidden_states, residual, post, comb
+                )
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -209,6 +241,20 @@ class DeepseekV4ModelNextN(nn.Module):
 
 
 class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
+    @classmethod
+    def get_hf_to_sglang_mapper(cls, config) -> Optional[WeightsMapper]:
+        mapper = super().get_hf_to_sglang_mapper(config)
+        if mapper is None:
+            return None
+        # The draft builds mtp.0 as model.decoder, with e_proj/h_proj beside it.
+        return mapper | WeightsMapper(
+            orig_to_new_prefix={
+                "mtp.0.e_proj": "model.e_proj",
+                "mtp.0.h_proj": "model.h_proj",
+                "mtp.0.": "model.decoder.",
+            }
+        )
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -221,7 +267,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
-        self.determine_num_fused_shared_experts()
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         self.model = DeepseekV4ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)

@@ -41,6 +41,8 @@ struct PrefillServerInfo {
     page_size: Option<i64>,
     kv_cache_dtype: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    kv_layout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     dsv41_spec_layout: Option<serde_json::Value>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
@@ -108,6 +110,7 @@ struct Topology {
     pp_size: Option<i64>,
     page_size: Option<i64>,
     kv_cache_dtype: Option<String>,
+    kv_layout: Option<String>,
     dsv41_spec_layout: Option<serde_json::Value>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
@@ -157,6 +160,8 @@ struct Route {
     #[serde(default)]
     kv_cache_dtype: Option<String>,
     #[serde(default)]
+    kv_layout: Option<String>,
+    #[serde(default)]
     dsv41_spec_layout: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "parse_int_opt")]
     prefill_http_port: Option<i64>,
@@ -197,6 +202,9 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         topo.page_size.get_or_insert(body.page_size);
         if topo.kv_cache_dtype.is_none() {
             topo.kv_cache_dtype = body.kv_cache_dtype.clone();
+        }
+        if topo.kv_layout.is_none() {
+            topo.kv_layout = body.kv_layout.clone();
         }
         if topo.prefill_http_port.is_none() {
             topo.prefill_http_port = body.prefill_http_port;
@@ -281,6 +289,7 @@ async fn route_get(
             pp_size: topo.pp_size.unwrap(),
             page_size: topo.page_size,
             kv_cache_dtype: topo.kv_cache_dtype.clone(),
+            kv_layout: topo.kv_layout.clone(),
             dsv41_spec_layout: topo.dsv41_spec_layout.clone(),
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
@@ -471,7 +480,10 @@ mod tests {
             },
             server_args: Arc::new(server_args),
         };
-        (crate::runtime::start(cfg).expect("start runtime"), addr)
+        (
+            crate::runtime::start(cfg, None).expect("start runtime"),
+            addr,
+        )
     }
 
     /// The full wire contract the Python decode side / PD router depends on:

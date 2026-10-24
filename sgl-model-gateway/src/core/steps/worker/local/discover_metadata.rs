@@ -33,6 +33,7 @@ pub struct ServerInfo {
     pub served_model_name: Option<String>,
     pub tp_size: Option<usize>,
     pub dp_size: Option<usize>,
+    pub attn_dp_size: Option<usize>,
     pub load_balance_method: Option<String>,
     pub disaggregation_mode: Option<String>,
     pub version: Option<String>,
@@ -41,6 +42,16 @@ pub struct ServerInfo {
     pub max_prefill_tokens: Option<usize>,
     pub max_running_requests: Option<usize>,
     pub max_num_reqs: Option<usize>,
+}
+
+impl ServerInfo {
+    /// How many DP ranks the server runs, one scheduler each: its replicas
+    /// times its attention-DP groups. A server that predates `attn_dp_size`
+    /// counts attention-DP groups in `dp_size` and reports no `attn_dp_size`.
+    pub fn num_dp_ranks(&self) -> Option<usize> {
+        self.dp_size
+            .map(|dp_size| dp_size * self.attn_dp_size.unwrap_or(1))
+    }
 }
 
 /// Model information returned from /model_info endpoint.
@@ -328,8 +339,8 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
                     if let Some(tp_size) = server_info.tp_size {
                         labels.insert("tp_size".to_string(), tp_size.to_string());
                     }
-                    if let Some(dp_size) = server_info.dp_size {
-                        labels.insert("dp_size".to_string(), dp_size.to_string());
+                    if let Some(num_dp_ranks) = server_info.num_dp_ranks() {
+                        labels.insert("dp_size".to_string(), num_dp_ranks.to_string());
                     }
                     if let Some(load_balance_method) = server_info.load_balance_method {
                         labels.insert("load_balance_method".to_string(), load_balance_method);
@@ -398,5 +409,32 @@ impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod server_info_tests {
+    use super::ServerInfo;
+
+    fn parse(json: &str) -> ServerInfo {
+        serde_json::from_str(json).expect("valid server info")
+    }
+
+    #[test]
+    fn dp_ranks_multiply_replicas_by_attention_dp_groups() {
+        let info = parse(r#"{"dp_size": 1, "attn_dp_size": 8}"#);
+        assert_eq!(info.num_dp_ranks(), Some(8));
+    }
+
+    #[test]
+    fn a_server_without_attention_dp_size_counts_dp_size() {
+        let info = parse(r#"{"dp_size": 4}"#);
+        assert_eq!(info.num_dp_ranks(), Some(4));
+    }
+
+    #[test]
+    fn no_dp_size_means_no_rank_count() {
+        let info = parse(r#"{"attn_dp_size": 2}"#);
+        assert_eq!(info.num_dp_ranks(), None);
     }
 }

@@ -1,0 +1,1710 @@
+{
+  "parser": "kimi_k3",
+  "inputs": [
+    {
+      "chunks": [
+        "Let me think.<|c", "lose|>think<|sep", "|><|open|>respon", "se<|sep|>The ans",
+        "wer is 4.<|close", "|>response<|sep|", "><|close|>messag", "e<|sep|>"
+      ],
+      "force_nonempty_content": true
+    },
+    {
+      "chunks": [
+        "<|open|>think<|s", "ep|>Reasoning.<|", "close|>think<|se", "p|><|open|>respo",
+        "nse<|sep|>Hello!", "<|close|>respons", "e<|sep|><|close|", ">message<|sep|>"
+      ]
+    },
+    {
+      "chunks": [
+        "Need the weather", ".<|close|>think<", "|sep|><|open|>to", "ols<|sep|><|open",
+        "|>call tool=\"get", "_weather\" index=", "\"1\"<|sep|><|open", "|>argument key=\"",
+        "city\" type=\"stri", "ng\"<|sep|>Paris<", "|close|>argument", "<|sep|><|close|>",
+        "call<|sep|><|clo", "se|>tools<|sep|>", "<|close|>message", "<|sep|>"
+      ]
+    },
+    {
+      "chunks": [
+        "Need the weather", ".<|open|>tools<|", "sep|><|open|>cal", "l tool=\"get_weat",
+        "her\" index=\"1\"<|", "sep|><|open|>arg", "ument key=\"city\"", " type=\"string\"<|",
+        "sep|>Paris<|clos", "e|>argument<|sep", "|><|close|>call<", "|sep|><|close|>t",
+        "ools<|sep|>"
+      ]
+    },
+    {
+      "chunks": [
+        "Thinking<|close|", ">think<|sep|><|o", "pen|>response<|s", "ep|>Sure.<|close",
+        "|>response<|sep|", "><|open|>tools<|", "sep|><|open|>cal", "l tool=\"get_weat",
+        "her\" index=\"1\"<|", "sep|><|open|>arg", "ument key=\"city\"", " type=\"string\"<|",
+        "sep|>Paris<|clos", "e|>argument<|sep", "|><|close|>call<", "|sep|><|close|>t",
+        "ools<|sep|><|clo", "se|>message<|sep", "|>"
+      ]
+    },
+    {
+      "chunks": ["The reply direct", "ly<|close|>respo", "nse<|sep|><|clos", "e|>message<|sep|", ">"],
+      "force_nonempty_content": true
+    },
+    {
+      "chunks": [
+        "Skipped answer<|", "close|>response<", "|sep|><|close|>m", "essage<|sep|><|c",
+        "lose|>think<|sep", "|>"
+      ],
+      "force_nonempty_content": true
+    },
+    {"chunks": ["Cut off mid reas", "oning <|close|>t", "hink"]},
+    {"chunks": ["Cut off <|close|", ">"], "force_nonempty_content": true},
+    {
+      "chunks": [
+        "<|close|>think<|", "sep|><|open|>res", "ponse<|sep|>Empt", "y reasoning.<|cl",
+        "ose|>response<|s", "ep|><|close|>mes", "sage<|sep|>"
+      ]
+    },
+    {"chunks": ["Plain text witho", "ut markers"], "force_nonempty_content": true},
+    {
+      "chunks": [
+        "more<|close|>thi", "nk<|sep|><|open|", ">response<|sep|>", "partial answer <",
+        "|close|>resp"
+      ]
+    },
+    {
+      "chunks": ["reason<|close|>t", "hink<|sep|>Bare ", "content after cl", "ose<|close|>mess", "age<|sep|>"]
+    },
+    {
+      "chunks": [
+        "reason<|open|>re", "sponse<|sep|>ans", "wer without thin", "k close<|close|>",
+        "response<|sep|><", "|close|>message<", "|sep|>"
+      ]
+    },
+    {"chunks": ["a <|open|>thi"]},
+    {
+      "chunks": [
+        "unicode 思考 🙂<|cl", "ose|>think<|sep|", "><|open|>respons", "e<|sep|>答案 ✓<|cl",
+        "ose|>response<|s", "ep|><|close|>mes", "sage<|sep|>"
+      ]
+    },
+    {
+      "chunks": [
+        "<|close|>think<|", "sep|><|open|>too", "ls<|sep|><|open|", ">call tool=\"get_",
+        "weather\" index=\"", "1\"<|sep|><|open|", ">argument key=\"c", "ity\" type=\"strin",
+        "g\"<|sep|>Paris<|", "close|>argument<", "|sep|><|close|>c", "all<|sep|><|clos",
+        "e|>tools<|sep|>"
+      ]
+    },
+    {
+      "chunks": [
+        "Let me think.<|close|>think<|sep|><|open|>response<|sep|>The answer is 4.<|close|>response<|sep|><|close|>message<|sep|>"
+      ]
+    },
+    {
+      "chunks": [
+        "T", "h", "e", " ", "r", "e", "p", "l", "y", " ", "d", "i", "r", "e", "c", "t", "l", "y",
+        "<", "|", "c", "l", "o", "s", "e", "|", ">", "r", "e", "s", "p", "o", "n", "s", "e", "<",
+        "|", "s", "e", "p", "|", ">", "<", "|", "c", "l", "o", "s", "e", "|", ">", "m", "e", "s",
+        "s", "a", "g", "e", "<", "|", "s", "e", "p", "|", ">"
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "input": 0,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["Let me think.", ""],
+        ["", ""],
+        ["", ""],
+        ["", "The ans"],
+        ["", "wer is 4."],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["Let me think.", "The answer is 4."]
+    },
+    {
+      "input": 0,
+      "force": true,
+      "stream": true,
+      "nonempty": true,
+      "steps": [
+        ["Let me think.", ""],
+        ["", ""],
+        ["", ""],
+        ["", "The ans"],
+        ["", "wer is 4."],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["Let me think.", "The answer is 4."]
+    },
+    {
+      "input": 0,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["Let me think.", ""],
+        ["", "The ans"],
+        ["", "wer is 4."],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["Let me think.", "The answer is 4."]
+    },
+    {
+      "input": 0,
+      "force": true,
+      "stream": false,
+      "nonempty": true,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["Let me think.", ""],
+        ["", "The ans"],
+        ["", "wer is 4."],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["Let me think.", "The answer is 4."]
+    },
+    {
+      "input": 0,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "Let me think."],
+        ["", "<|close|>think<|sep"],
+        ["", "|>"],
+        ["", "The ans"],
+        ["", "wer is 4."],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["Let me think.", "The answer is 4."]
+    },
+    {
+      "input": 0,
+      "force": false,
+      "stream": true,
+      "nonempty": true,
+      "steps": [
+        ["", "Let me think."],
+        ["", "<|close|>think<|sep"],
+        ["", "|>"],
+        ["", "The ans"],
+        ["", "wer is 4."],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["Let me think.", "The answer is 4."]
+    },
+    {
+      "input": 0,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "Let me think."],
+        ["", "<|close|>think<|sep"],
+        ["", "|>"],
+        ["", "The ans"],
+        ["", "wer is 4."],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["Let me think.", "The answer is 4."]
+    },
+    {
+      "input": 0,
+      "force": false,
+      "stream": false,
+      "nonempty": true,
+      "steps": [
+        ["", "Let me think."],
+        ["", "<|close|>think<|sep"],
+        ["", "|>"],
+        ["", "The ans"],
+        ["", "wer is 4."],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["Let me think.", "The answer is 4."]
+    },
+    {
+      "input": 1,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["", ""],
+        ["Reasoning.", ""],
+        ["", ""],
+        ["", ""],
+        ["", "Hello!"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["Reasoning.", "Hello!"]
+    },
+    {
+      "input": 1,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["Reasoning.", ""],
+        ["", "Hello!"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["Reasoning.", "Hello!"]
+    },
+    {
+      "input": 1,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", ""],
+        ["Reasoning.", ""],
+        ["", ""],
+        ["", ""],
+        ["", "Hello!"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["Reasoning.", "Hello!"]
+    },
+    {
+      "input": 1,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["Reasoning.", ""],
+        ["", "Hello!"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["Reasoning.", "Hello!"]
+    },
+    {
+      "input": 2,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["Need the weather", ""],
+        [".", ""],
+        ["", ""],
+        ["", "<|open|>tools<|sep|><|open"],
+        ["", "|>call tool=\"get"],
+        ["", "_weather\" index="],
+        ["", "\"1\"<|sep|><|open"],
+        ["", "|>argument key=\""],
+        ["", "city\" type=\"stri"],
+        ["", "ng\"<|sep|>Paris<"],
+        ["", "|close|>argument"],
+        ["", "<|sep|><|close|>"],
+        ["", "call<|sep|><|clo"],
+        ["", "se|>tools<|sep|>"],
+        ["", "<|close|>message"],
+        ["", "<|sep|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "Need the weather.",
+        "<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+      ]
+    },
+    {
+      "input": 2,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["Need the weather.", ""],
+        ["", "<|open|>tools<|sep|><|open"],
+        ["", "|>call tool=\"get"],
+        ["", "_weather\" index="],
+        ["", "\"1\"<|sep|><|open"],
+        ["", "|>argument key=\""],
+        ["", "city\" type=\"stri"],
+        ["", "ng\"<|sep|>Paris<"],
+        ["", "|close|>argument"],
+        ["", "<|sep|><|close|>"],
+        ["", "call<|sep|><|clo"],
+        ["", "se|>tools<|sep|>"],
+        ["", "<|close|>message"],
+        ["", "<|sep|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "Need the weather.",
+        "<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+      ]
+    },
+    {
+      "input": 2,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "Need the weather"],
+        ["", ".<|close|>think"],
+        ["", "<|sep|>"],
+        ["", "<|open|>tools<|sep|><|open"],
+        ["", "|>call tool=\"get"],
+        ["", "_weather\" index="],
+        ["", "\"1\"<|sep|><|open"],
+        ["", "|>argument key=\""],
+        ["", "city\" type=\"stri"],
+        ["", "ng\"<|sep|>Paris<"],
+        ["", "|close|>argument"],
+        ["", "<|sep|><|close|>"],
+        ["", "call<|sep|><|clo"],
+        ["", "se|>tools<|sep|>"],
+        ["", "<|close|>message"],
+        ["", "<|sep|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "Need the weather.",
+        "<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+      ]
+    },
+    {
+      "input": 2,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "Need the weather"],
+        ["", ".<|close|>think"],
+        ["", "<|sep|>"],
+        ["", "<|open|>tools<|sep|><|open"],
+        ["", "|>call tool=\"get"],
+        ["", "_weather\" index="],
+        ["", "\"1\"<|sep|><|open"],
+        ["", "|>argument key=\""],
+        ["", "city\" type=\"stri"],
+        ["", "ng\"<|sep|>Paris<"],
+        ["", "|close|>argument"],
+        ["", "<|sep|><|close|>"],
+        ["", "call<|sep|><|clo"],
+        ["", "se|>tools<|sep|>"],
+        ["", "<|close|>message"],
+        ["", "<|sep|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "Need the weather.",
+        "<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+      ]
+    },
+    {
+      "input": 3,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["Need the weather", ""],
+        [".", ""],
+        ["", "<|open|>tools<|sep|><|open|>cal"],
+        ["", "l tool=\"get_weat"],
+        ["", "her\" index=\"1\"<|"],
+        ["", "sep|><|open|>arg"],
+        ["", "ument key=\"city\""],
+        ["", " type=\"string\"<|"],
+        ["", "sep|>Paris<|clos"],
+        ["", "e|>argument<|sep"],
+        ["", "|><|close|>call<"],
+        ["", "|sep|><|close|>t"],
+        ["", "ools<|sep|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "Need the weather.",
+        "<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
+      ]
+    },
+    {
+      "input": 3,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["Need the weather.", "<|open|>tools<|sep|><|open|>cal"],
+        ["", "l tool=\"get_weat"],
+        ["", "her\" index=\"1\"<|"],
+        ["", "sep|><|open|>arg"],
+        ["", "ument key=\"city\""],
+        ["", " type=\"string\"<|"],
+        ["", "sep|>Paris<|clos"],
+        ["", "e|>argument<|sep"],
+        ["", "|><|close|>call<"],
+        ["", "|sep|><|close|>t"],
+        ["", "ools<|sep|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "Need the weather.",
+        "<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
+      ]
+    },
+    {
+      "input": 3,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "Need the weather"],
+        ["", "."],
+        ["", "<|open|>tools<|sep|><|open|>cal"],
+        ["", "l tool=\"get_weat"],
+        ["", "her\" index=\"1\"<|"],
+        ["", "sep|><|open|>arg"],
+        ["", "ument key=\"city\""],
+        ["", " type=\"string\"<|"],
+        ["", "sep|>Paris<|clos"],
+        ["", "e|>argument<|sep"],
+        ["", "|><|close|>call<"],
+        ["", "|sep|><|close|>t"],
+        ["", "ools<|sep|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "",
+        "Need the weather.<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
+      ]
+    },
+    {
+      "input": 3,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "Need the weather"],
+        ["", "."],
+        ["", "<|open|>tools<|sep|><|open|>cal"],
+        ["", "l tool=\"get_weat"],
+        ["", "her\" index=\"1\"<|"],
+        ["", "sep|><|open|>arg"],
+        ["", "ument key=\"city\""],
+        ["", " type=\"string\"<|"],
+        ["", "sep|>Paris<|clos"],
+        ["", "e|>argument<|sep"],
+        ["", "|><|close|>call<"],
+        ["", "|sep|><|close|>t"],
+        ["", "ools<|sep|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "",
+        "Need the weather.<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
+      ]
+    },
+    {
+      "input": 4,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["Thinking", ""],
+        ["", ""],
+        ["", ""],
+        ["", "Sure."],
+        ["", ""],
+        ["", ""],
+        ["", "<|open|>tools<|sep|><|open|>cal"],
+        ["", "l tool=\"get_weat"],
+        ["", "her\" index=\"1\"<|"],
+        ["", "sep|><|open|>arg"],
+        ["", "ument key=\"city\""],
+        ["", " type=\"string\"<|"],
+        ["", "sep|>Paris<|clos"],
+        ["", "e|>argument<|sep"],
+        ["", "|><|close|>call<"],
+        ["", "|sep|><|close|>t"],
+        ["", "ools<|sep|><|clo"],
+        ["", "se|>message<|sep"],
+        ["", "|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "Thinking",
+        "Sure.<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+      ]
+    },
+    {
+      "input": 4,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["Thinking", ""],
+        ["", ""],
+        ["", "Sure."],
+        ["", ""],
+        ["", ""],
+        ["", "<|open|>tools<|sep|><|open|>cal"],
+        ["", "l tool=\"get_weat"],
+        ["", "her\" index=\"1\"<|"],
+        ["", "sep|><|open|>arg"],
+        ["", "ument key=\"city\""],
+        ["", " type=\"string\"<|"],
+        ["", "sep|>Paris<|clos"],
+        ["", "e|>argument<|sep"],
+        ["", "|><|close|>call<"],
+        ["", "|sep|><|close|>t"],
+        ["", "ools<|sep|><|clo"],
+        ["", "se|>message<|sep"],
+        ["", "|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "Thinking",
+        "Sure.<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+      ]
+    },
+    {
+      "input": 4,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "Thinking"],
+        ["", "<|close|>think<|sep|>"],
+        ["", ""],
+        ["", "Sure."],
+        ["", ""],
+        ["", ""],
+        ["", "<|open|>tools<|sep|><|open|>cal"],
+        ["", "l tool=\"get_weat"],
+        ["", "her\" index=\"1\"<|"],
+        ["", "sep|><|open|>arg"],
+        ["", "ument key=\"city\""],
+        ["", " type=\"string\"<|"],
+        ["", "sep|>Paris<|clos"],
+        ["", "e|>argument<|sep"],
+        ["", "|><|close|>call<"],
+        ["", "|sep|><|close|>t"],
+        ["", "ools<|sep|><|clo"],
+        ["", "se|>message<|sep"],
+        ["", "|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "Thinking",
+        "Sure.<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+      ]
+    },
+    {
+      "input": 4,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "Thinking"],
+        ["", "<|close|>think<|sep|>"],
+        ["", ""],
+        ["", "Sure."],
+        ["", ""],
+        ["", ""],
+        ["", "<|open|>tools<|sep|><|open|>cal"],
+        ["", "l tool=\"get_weat"],
+        ["", "her\" index=\"1\"<|"],
+        ["", "sep|><|open|>arg"],
+        ["", "ument key=\"city\""],
+        ["", " type=\"string\"<|"],
+        ["", "sep|>Paris<|clos"],
+        ["", "e|>argument<|sep"],
+        ["", "|><|close|>call<"],
+        ["", "|sep|><|close|>t"],
+        ["", "ools<|sep|><|clo"],
+        ["", "se|>message<|sep"],
+        ["", "|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "Thinking",
+        "Sure.<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+      ]
+    },
+    {
+      "input": 5,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["The reply direct", ""],
+        ["ly", ""],
+        ["", "The reply directly"],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "The reply directly"]
+    },
+    {
+      "input": 5,
+      "force": true,
+      "stream": true,
+      "nonempty": true,
+      "steps": [
+        ["The reply direct", ""],
+        ["ly", ""],
+        ["", "The reply directly"],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "The reply directly"]
+    },
+    {
+      "input": 5,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["", "The reply directly"], ["", ""], ["", ""], ["", ""]],
+      "unary": ["", "The reply directly"]
+    },
+    {
+      "input": 5,
+      "force": true,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", ""], ["", ""], ["", "The reply directly"], ["", ""], ["", ""], ["", ""]],
+      "unary": ["", "The reply directly"]
+    },
+    {
+      "input": 5,
+      "force": false,
+      "stream": true,
+      "steps": [["", "The reply direct"], ["", "ly"], ["", ""], ["", ""], ["", ""], ["", ""]],
+      "unary": ["", "The reply directly"]
+    },
+    {
+      "input": 5,
+      "force": false,
+      "stream": true,
+      "nonempty": true,
+      "steps": [["", "The reply direct"], ["", "ly"], ["", ""], ["", ""], ["", ""], ["", ""]],
+      "unary": ["", "The reply directly"]
+    },
+    {
+      "input": 5,
+      "force": false,
+      "stream": false,
+      "steps": [["", "The reply direct"], ["", "ly"], ["", ""], ["", ""], ["", ""], ["", ""]],
+      "unary": ["", "The reply directly"]
+    },
+    {
+      "input": 5,
+      "force": false,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", "The reply direct"], ["", "ly"], ["", ""], ["", ""], ["", ""], ["", ""]],
+      "unary": ["", "The reply directly"]
+    },
+    {
+      "input": 6,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["Skipped answer", ""],
+        ["", ""],
+        ["", "Skipped answer"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "Skipped answer"]
+    },
+    {
+      "input": 6,
+      "force": true,
+      "stream": true,
+      "nonempty": true,
+      "steps": [
+        ["Skipped answer", ""],
+        ["", ""],
+        ["", "Skipped answer"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "Skipped answer"]
+    },
+    {
+      "input": 6,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["", "Skipped answer"], ["", ""], ["", ""], ["", ""], ["", ""]],
+      "unary": ["", "Skipped answer"]
+    },
+    {
+      "input": 6,
+      "force": true,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", ""], ["", ""], ["", "Skipped answer"], ["", ""], ["", ""], ["", ""], ["", ""]],
+      "unary": ["", "Skipped answer"]
+    },
+    {
+      "input": 6,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "Skipped answer"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", "<|close|>think<|sep"],
+        ["", "|>"],
+        ["", ""]
+      ],
+      "unary": ["", "Skipped answer"]
+    },
+    {
+      "input": 6,
+      "force": false,
+      "stream": true,
+      "nonempty": true,
+      "steps": [
+        ["", "Skipped answer"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", "<|close|>think<|sep"],
+        ["", "|>"],
+        ["", ""]
+      ],
+      "unary": ["", "Skipped answer"]
+    },
+    {
+      "input": 6,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "Skipped answer"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", "<|close|>think<|sep"],
+        ["", "|>"],
+        ["", ""]
+      ],
+      "unary": ["", "Skipped answer"]
+    },
+    {
+      "input": 6,
+      "force": false,
+      "stream": false,
+      "nonempty": true,
+      "steps": [
+        ["", "Skipped answer"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", "<|close|>think<|sep"],
+        ["", "|>"],
+        ["", ""]
+      ],
+      "unary": ["", "Skipped answer"]
+    },
+    {
+      "input": 7,
+      "force": true,
+      "stream": true,
+      "steps": [["Cut off mid reas", ""], ["oning ", ""], ["", ""], ["<|close|>think", ""]],
+      "unary": ["Cut off mid reasoning ", ""]
+    },
+    {
+      "input": 7,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["", ""], ["Cut off mid reasoning <|close|>think", ""]],
+      "unary": ["Cut off mid reasoning ", ""]
+    },
+    {
+      "input": 7,
+      "force": false,
+      "stream": true,
+      "steps": [["", "Cut off mid reas"], ["", "oning <|close|>t"], ["", "hink"], ["", ""]],
+      "unary": ["", "Cut off mid reasoning "]
+    },
+    {
+      "input": 7,
+      "force": false,
+      "stream": false,
+      "steps": [["", "Cut off mid reas"], ["", "oning <|close|>t"], ["", "hink"], ["", ""]],
+      "unary": ["", "Cut off mid reasoning "]
+    },
+    {
+      "input": 8,
+      "force": true,
+      "stream": true,
+      "steps": [["Cut off ", ""], ["", ""], ["<|close|>", ""]],
+      "unary": ["Cut off ", ""]
+    },
+    {
+      "input": 8,
+      "force": true,
+      "stream": true,
+      "nonempty": true,
+      "steps": [["Cut off ", ""], ["", ""], ["", ""]],
+      "unary": ["Cut off ", ""]
+    },
+    {
+      "input": 8,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["Cut off <|close|>", ""]],
+      "unary": ["Cut off ", ""]
+    },
+    {
+      "input": 8,
+      "force": true,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", ""], ["", ""], ["Cut off <|close|>", ""]],
+      "unary": ["Cut off ", ""]
+    },
+    {
+      "input": 8,
+      "force": false,
+      "stream": true,
+      "steps": [["", "Cut off "], ["", ""], ["", "<|close|>"]],
+      "unary": ["", "Cut off "]
+    },
+    {
+      "input": 8,
+      "force": false,
+      "stream": true,
+      "nonempty": true,
+      "steps": [["", "Cut off "], ["", ""], ["", ""]],
+      "unary": ["", "Cut off "]
+    },
+    {
+      "input": 8,
+      "force": false,
+      "stream": false,
+      "steps": [["", "Cut off "], ["", ""], ["", "<|close|>"]],
+      "unary": ["", "Cut off "]
+    },
+    {
+      "input": 8,
+      "force": false,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", "Cut off "], ["", ""], ["", ""]],
+      "unary": ["", "Cut off "]
+    },
+    {
+      "input": 9,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["", "Empt"],
+        ["", "y reasoning."],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "Empty reasoning."]
+    },
+    {
+      "input": 9,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["", "Empt"],
+        ["", "y reasoning."],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "Empty reasoning."]
+    },
+    {
+      "input": 9,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "<|close|>think"],
+        ["", "<|sep|>"],
+        ["", "Empt"],
+        ["", "y reasoning."],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "Empty reasoning."]
+    },
+    {
+      "input": 9,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "<|close|>think"],
+        ["", "<|sep|>"],
+        ["", "Empt"],
+        ["", "y reasoning."],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "Empty reasoning."]
+    },
+    {
+      "input": 10,
+      "force": true,
+      "stream": true,
+      "steps": [["Plain text witho", ""], ["ut markers", ""], ["", ""]],
+      "unary": ["Plain text without markers", ""]
+    },
+    {
+      "input": 10,
+      "force": true,
+      "stream": true,
+      "nonempty": true,
+      "steps": [["Plain text witho", ""], ["ut markers", ""], ["", ""]],
+      "unary": ["Plain text without markers", ""]
+    },
+    {
+      "input": 10,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["", ""], ["Plain text without markers", ""]],
+      "unary": ["Plain text without markers", ""]
+    },
+    {
+      "input": 10,
+      "force": true,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", ""], ["", ""], ["Plain text without markers", ""]],
+      "unary": ["Plain text without markers", ""]
+    },
+    {
+      "input": 10,
+      "force": false,
+      "stream": true,
+      "steps": [["", "Plain text witho"], ["", "ut markers"], ["", ""]],
+      "unary": ["", "Plain text without markers"]
+    },
+    {
+      "input": 10,
+      "force": false,
+      "stream": true,
+      "nonempty": true,
+      "steps": [["", "Plain text witho"], ["", "ut markers"], ["", ""]],
+      "unary": ["", "Plain text without markers"]
+    },
+    {
+      "input": 10,
+      "force": false,
+      "stream": false,
+      "steps": [["", "Plain text witho"], ["", "ut markers"], ["", ""]],
+      "unary": ["", "Plain text without markers"]
+    },
+    {
+      "input": 10,
+      "force": false,
+      "stream": false,
+      "nonempty": true,
+      "steps": [["", "Plain text witho"], ["", "ut markers"], ["", ""]],
+      "unary": ["", "Plain text without markers"]
+    },
+    {
+      "input": 11,
+      "force": true,
+      "stream": true,
+      "steps": [["more", ""], ["", ""], ["", ""], ["", "partial answer "], ["", ""], ["", "<|close|>resp"]],
+      "unary": ["more", "partial answer <|close|>resp"]
+    },
+    {
+      "input": 11,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["more", ""], ["", ""], ["", "partial answer "], ["", ""], ["", "<|close|>resp"]],
+      "unary": ["more", "partial answer <|close|>resp"]
+    },
+    {
+      "input": 11,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "more<|close|>thi"],
+        ["", "nk<|sep|>"],
+        ["", ""],
+        ["", "partial answer "],
+        ["", ""],
+        ["", "<|close|>resp"]
+      ],
+      "unary": ["more", "partial answer <|close|>resp"]
+    },
+    {
+      "input": 11,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "more<|close|>thi"],
+        ["", "nk<|sep|>"],
+        ["", ""],
+        ["", "partial answer "],
+        ["", ""],
+        ["", "<|close|>resp"]
+      ],
+      "unary": ["more", "partial answer <|close|>resp"]
+    },
+    {
+      "input": 12,
+      "force": true,
+      "stream": true,
+      "steps": [["reason", ""], ["", "Bare "], ["", "content after cl"], ["", "ose"], ["", ""], ["", ""]],
+      "unary": ["reason", "Bare content after close"]
+    },
+    {
+      "input": 12,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["reason", "Bare "], ["", "content after cl"], ["", "ose"], ["", ""], ["", ""]],
+      "unary": ["reason", "Bare content after close"]
+    },
+    {
+      "input": 12,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "reason<|close|>t"],
+        ["", "hink<|sep|>Bare "],
+        ["", "content after cl"],
+        ["", "ose"],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["reason", "Bare content after close"]
+    },
+    {
+      "input": 12,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "reason<|close|>t"],
+        ["", "hink<|sep|>Bare "],
+        ["", "content after cl"],
+        ["", "ose"],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["reason", "Bare content after close"]
+    },
+    {
+      "input": 13,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["reason", ""],
+        ["", "ans"],
+        ["", "wer without thin"],
+        ["", "k close"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["reason", "answer without think close"]
+    },
+    {
+      "input": 13,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["reason", "ans"],
+        ["", "wer without thin"],
+        ["", "k close"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["reason", "answer without think close"]
+    },
+    {
+      "input": 13,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "reason"],
+        ["", "ans"],
+        ["", "wer without thin"],
+        ["", "k close"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "answer without think close"]
+    },
+    {
+      "input": 13,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "reason"],
+        ["", "ans"],
+        ["", "wer without thin"],
+        ["", "k close"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "answer without think close"]
+    },
+    {
+      "input": 14,
+      "force": true,
+      "stream": true,
+      "steps": [["a ", ""], ["<|open|>thi", ""]],
+      "unary": ["a <|open|>thi", ""]
+    },
+    {
+      "input": 14,
+      "force": true,
+      "stream": false,
+      "steps": [["", ""], ["a <|open|>thi", ""]],
+      "unary": ["a <|open|>thi", ""]
+    },
+    {
+      "input": 14,
+      "force": false,
+      "stream": true,
+      "steps": [["", "a <|open|>thi"], ["", ""]],
+      "unary": ["", "a <|open|>thi"]
+    },
+    {
+      "input": 14,
+      "force": false,
+      "stream": false,
+      "steps": [["", "a <|open|>thi"], ["", ""]],
+      "unary": ["", "a <|open|>thi"]
+    },
+    {
+      "input": 15,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["unicode 思考 🙂", ""],
+        ["", ""],
+        ["", ""],
+        ["", "答案 ✓"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["unicode 思考 🙂", "答案 ✓"]
+    },
+    {
+      "input": 15,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["unicode 思考 🙂", ""],
+        ["", "答案 ✓"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["unicode 思考 🙂", "答案 ✓"]
+    },
+    {
+      "input": 15,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "unicode 思考 🙂"],
+        ["", "<|close|>think<|sep|"],
+        ["", ">"],
+        ["", "答案 ✓"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["unicode 思考 🙂", "答案 ✓"]
+    },
+    {
+      "input": 15,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "unicode 思考 🙂"],
+        ["", "<|close|>think<|sep|"],
+        ["", ">"],
+        ["", "答案 ✓"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["unicode 思考 🙂", "答案 ✓"]
+    },
+    {
+      "input": 16,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["", "<|open|>tools<|sep|><|open|"],
+        ["", ">call tool=\"get_"],
+        ["", "weather\" index=\""],
+        ["", "1\"<|sep|><|open|"],
+        ["", ">argument key=\"c"],
+        ["", "ity\" type=\"strin"],
+        ["", "g\"<|sep|>Paris<|"],
+        ["", "close|>argument<"],
+        ["", "|sep|><|close|>c"],
+        ["", "all<|sep|><|clos"],
+        ["", "e|>tools<|sep|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "",
+        "<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
+      ]
+    },
+    {
+      "input": 16,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["", "<|open|>tools<|sep|><|open|"],
+        ["", ">call tool=\"get_"],
+        ["", "weather\" index=\""],
+        ["", "1\"<|sep|><|open|"],
+        ["", ">argument key=\"c"],
+        ["", "ity\" type=\"strin"],
+        ["", "g\"<|sep|>Paris<|"],
+        ["", "close|>argument<"],
+        ["", "|sep|><|close|>c"],
+        ["", "all<|sep|><|clos"],
+        ["", "e|>tools<|sep|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "",
+        "<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
+      ]
+    },
+    {
+      "input": 16,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "<|close|>think"],
+        ["", "<|sep|>"],
+        ["", "<|open|>tools<|sep|><|open|"],
+        ["", ">call tool=\"get_"],
+        ["", "weather\" index=\""],
+        ["", "1\"<|sep|><|open|"],
+        ["", ">argument key=\"c"],
+        ["", "ity\" type=\"strin"],
+        ["", "g\"<|sep|>Paris<|"],
+        ["", "close|>argument<"],
+        ["", "|sep|><|close|>c"],
+        ["", "all<|sep|><|clos"],
+        ["", "e|>tools<|sep|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "",
+        "<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
+      ]
+    },
+    {
+      "input": 16,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "<|close|>think"],
+        ["", "<|sep|>"],
+        ["", "<|open|>tools<|sep|><|open|"],
+        ["", ">call tool=\"get_"],
+        ["", "weather\" index=\""],
+        ["", "1\"<|sep|><|open|"],
+        ["", ">argument key=\"c"],
+        ["", "ity\" type=\"strin"],
+        ["", "g\"<|sep|>Paris<|"],
+        ["", "close|>argument<"],
+        ["", "|sep|><|close|>c"],
+        ["", "all<|sep|><|clos"],
+        ["", "e|>tools<|sep|>"],
+        ["", ""]
+      ],
+      "unary": [
+        "",
+        "<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>"
+      ]
+    },
+    {
+      "input": 17,
+      "force": true,
+      "stream": true,
+      "steps": [["Let me think.", "The answer is 4."], ["", ""]],
+      "unary": ["Let me think.", "The answer is 4."]
+    },
+    {
+      "input": 17,
+      "force": true,
+      "stream": false,
+      "steps": [["Let me think.", "The answer is 4."], ["", ""]],
+      "unary": ["Let me think.", "The answer is 4."]
+    },
+    {
+      "input": 17,
+      "force": false,
+      "stream": true,
+      "steps": [["", "Let me think.<|close|>think<|sep|>The answer is 4."], ["", ""]],
+      "unary": ["Let me think.", "The answer is 4."]
+    },
+    {
+      "input": 17,
+      "force": false,
+      "stream": false,
+      "steps": [["", "Let me think.<|close|>think<|sep|>The answer is 4."], ["", ""]],
+      "unary": ["Let me think.", "The answer is 4."]
+    },
+    {
+      "input": 18,
+      "force": true,
+      "stream": true,
+      "steps": [
+        ["T", ""],
+        ["h", ""],
+        ["e", ""],
+        [" ", ""],
+        ["r", ""],
+        ["e", ""],
+        ["p", ""],
+        ["l", ""],
+        ["y", ""],
+        [" ", ""],
+        ["d", ""],
+        ["i", ""],
+        ["r", ""],
+        ["e", ""],
+        ["c", ""],
+        ["t", ""],
+        ["l", ""],
+        ["y", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", "The reply directly"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "The reply directly"]
+    },
+    {
+      "input": 18,
+      "force": true,
+      "stream": false,
+      "steps": [
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", "The reply directly"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "The reply directly"]
+    },
+    {
+      "input": 18,
+      "force": false,
+      "stream": true,
+      "steps": [
+        ["", "T"],
+        ["", "h"],
+        ["", "e"],
+        ["", " "],
+        ["", "r"],
+        ["", "e"],
+        ["", "p"],
+        ["", "l"],
+        ["", "y"],
+        ["", " "],
+        ["", "d"],
+        ["", "i"],
+        ["", "r"],
+        ["", "e"],
+        ["", "c"],
+        ["", "t"],
+        ["", "l"],
+        ["", "y"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "The reply directly"]
+    },
+    {
+      "input": 18,
+      "force": false,
+      "stream": false,
+      "steps": [
+        ["", "T"],
+        ["", "h"],
+        ["", "e"],
+        ["", " "],
+        ["", "r"],
+        ["", "e"],
+        ["", "p"],
+        ["", "l"],
+        ["", "y"],
+        ["", " "],
+        ["", "d"],
+        ["", "i"],
+        ["", "r"],
+        ["", "e"],
+        ["", "c"],
+        ["", "t"],
+        ["", "l"],
+        ["", "y"],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""],
+        ["", ""]
+      ],
+      "unary": ["", "The reply directly"]
+    }
+  ]
+}

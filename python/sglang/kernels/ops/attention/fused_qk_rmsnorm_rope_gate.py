@@ -12,6 +12,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 
 def _pdl_supported() -> bool:
@@ -60,6 +61,8 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     HAS_GATE: tl.constexpr,
     MROPE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    WEIGHT_SHIFT: tl.constexpr = 1.0,
+    EXPLICIT_ROPE_FMA: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -86,7 +89,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     w = tl.load(w_ptr + head_offs, mask=head_mask, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=0) / HEAD_DIM
     inv_rms = tl.rsqrt(var + EPS)
-    x_norm = (x * inv_rms * (w + 1.0)).to(out_dtype).to(tl.float32)
+    x_norm = (x * inv_rms * (w + WEIGHT_SHIFT)).to(out_dtype).to(tl.float32)
 
     # Pass-through tail [rotary_dim, head_dim)
     if HAS_PASS:
@@ -104,8 +107,8 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     wr2 = tl.load(w_ptr + HALF_ROTARY + rot_offs, mask=rot_mask, other=0.0).to(
         tl.float32
     )
-    xr1 = (xr1 * inv_rms * (wr1 + 1.0)).to(out_dtype).to(tl.float32)
-    xr2 = (xr2 * inv_rms * (wr2 + 1.0)).to(out_dtype).to(tl.float32)
+    xr1 = (xr1 * inv_rms * (wr1 + WEIGHT_SHIFT)).to(out_dtype).to(tl.float32)
+    xr2 = (xr2 * inv_rms * (wr2 + WEIGHT_SHIFT)).to(out_dtype).to(tl.float32)
 
     if MROPE:
         axis = tl.load(mrope_axis_map_ptr + rot_offs, mask=rot_mask, other=0)
@@ -121,8 +124,14 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     sin = tl.load(
         cos_sin_cache_ptr + cache_off + HALF_ROTARY + rot_offs, mask=rot_mask, other=0.0
     ).to(tl.float32)
-    tl.store(out_base + rot_offs, (xr1 * cos - xr2 * sin), mask=rot_mask)
-    tl.store(out_base + HALF_ROTARY + rot_offs, (xr2 * cos + xr1 * sin), mask=rot_mask)
+    if EXPLICIT_ROPE_FMA:
+        first = tl.fma(xr1, cos, -libdevice.mul_rn(xr2, sin))
+        second = tl.fma(xr2, cos, libdevice.mul_rn(xr1, sin))
+    else:
+        first = xr1 * cos - xr2 * sin
+        second = xr2 * cos + xr1 * sin
+    tl.store(out_base + rot_offs, first, mask=rot_mask)
+    tl.store(out_base + HALF_ROTARY + rot_offs, second, mask=rot_mask)
 
     # Gate copy (Q heads only)
     if HAS_GATE and not is_k:

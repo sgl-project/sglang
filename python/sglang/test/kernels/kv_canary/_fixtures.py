@@ -83,6 +83,7 @@ def make_real_kv_source(
     page_size: int = 1,
     read_bytes: Optional[int] = None,
     pad_dim1: int = 0,
+    row_gap: int = 0,
     device: torch.device,
     fill: int = 0,
 ) -> RealKvSource:
@@ -90,12 +91,18 @@ def make_real_kv_source(
 
     ``pad_dim1`` adds trailing per-row bytes the canary should skip — used by the "holey dim 1" case to
     confirm the kernel never reads past ``page_size * num_bytes_per_token``.
+
+    ``row_gap`` makes the source a strided view: each row is followed by ``row_gap`` bytes that belong
+    to the backing buffer but not to the view (filled with the complement of ``fill``), the way a
+    per-layer view into a larger KV entry is laid out. The kernel must step rows by ``stride(0)``.
     """
     num_rows = (num_slots + page_size - 1) // page_size
     cols = page_size * num_bytes_per_token + pad_dim1
-    tensor = torch.full(
-        (num_rows, cols), fill_value=fill, dtype=torch.uint8, device=device
+    backing = torch.full(
+        (num_rows, cols + row_gap), fill_value=fill, dtype=torch.uint8, device=device
     )
+    backing[:, cols:] = ~fill & 0xFF
+    tensor = backing[:, :cols]
     effective_read = read_bytes if read_bytes is not None else num_bytes_per_token
     return RealKvSource(
         tensor=tensor,
@@ -117,6 +124,7 @@ def make_real_kv_sources(
     device: torch.device,
     rng: Optional[random.Random] = None,
     fill_strategy: FillStrategy = "constant_per_source",
+    row_gap: int = 0,
 ) -> tuple[RealKvSource, ...]:
     sources: list[RealKvSource] = []
     for i in range(count):
@@ -126,6 +134,7 @@ def make_real_kv_sources(
             num_bytes_per_token=num_bytes_per_token,
             page_size=page_size,
             read_bytes=read_bytes_eff,
+            row_gap=row_gap,
             device=device,
             fill=(i + 1) * 17,
         )

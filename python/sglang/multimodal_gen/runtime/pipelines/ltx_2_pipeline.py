@@ -546,7 +546,7 @@ class LTX2ResidentResidencyStrategy(LTX2TwoStageResidencyStrategy):
         self._ensure_on_gpu("transformer")
         self._ensure_on_gpu("transformer_2")
         logger.info(
-            "Using resident LTX-2.3 two-stage transformers mode (both DiTs stay on GPU)"
+            "Using resident LTX-2 two-stage transformers mode (both DiTs stay on GPU)"
         )
         self.manager._active_phase = "stage1"
         self.manager._sync_refinement_stage_transformer("stage1")
@@ -607,14 +607,15 @@ class LTX2TwoStageResidencyController:
 
     @property
     def should_use_premerged(self) -> bool:
-        """Whether to keep a pre-merged stage-2 DiT for LTX-2.3 two-stage.
+        """Whether to keep a second DiT with the distilled LoRA merged in for stage 2.
 
-        We only enable this optimization for resident native LTX-2.3 two-stage
-        and when users did not explicitly provide a stage-1 LoRA path
+        Resident mode keeps both DiTs on the GPU, so stage 2 runs merged weights
+        like the official two-stage pipelines instead of a per-layer dynamic LoRA;
+        it needs the distilled LoRA and no user-provided stage-1 LoRA
         """
         return (
             self.mode == "resident"
-            and self.pipeline._should_merge_stage2_distilled_lora(self.server_args)
+            and self.pipeline._distilled_lora_path is not None
             and self.pipeline._stage1_lora_path is None
         )
 
@@ -718,7 +719,6 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         self._distilled_lora_path = distilled_lora_path
         self._stage1_lora_path = server_args.lora_path
         self._stage1_lora_scale = float(server_args.lora_scale)
-        self._active_lora_phase = None
         self._active_lora_signature = None
         self._use_premerged_stage2_transformer = False
         # set when original mode merges stage-1 distilled LoRA into the DiT base
@@ -808,7 +808,6 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
 
         self._stage1_distilled_in_base = True
         self._stage1_distilled_base_strength = strength
-        self._active_lora_phase = "stage1"
         self._active_lora_signature = None
         logger.info(
             "Merged LTX-2 stage-1 distilled LoRA (strength=%.4f) into the DiT base; "
@@ -963,7 +962,6 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         # A pre-distilled DiT has no LoRA to switch to and runs the same
         # weights in both stages. Guarding here covers every caller.
         if self._distilled_lora_path is None:
-            self._active_lora_phase = phase
             return
         distilled_lora_strength = self._get_stage_distilled_lora_strength(phase, batch)
         phase_signature = (phase, distilled_lora_strength)
@@ -972,7 +970,6 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
 
         if self._stage1_distilled_in_base:
             if self._switch_lora_phase_base_merged(phase, distilled_lora_strength):
-                self._active_lora_phase = phase
                 self._active_lora_signature = phase_signature
                 return
             # Base was restored (stage-1 strength override); fall through to the
@@ -981,7 +978,6 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         if self._ltx2_residency.enter_phase(
             phase
         ) and self._can_short_circuit_lora_switch(phase, batch):
-            self._active_lora_phase = phase
             self._active_lora_signature = phase_signature
             return
 
@@ -1015,7 +1011,6 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             # two-stage pipeline immediately.
             self.deactivate_lora_weights(target="transformer")
 
-        self._active_lora_phase = phase
         self._active_lora_signature = phase_signature
 
     def create_pipeline_stages(self, server_args: ServerArgs):

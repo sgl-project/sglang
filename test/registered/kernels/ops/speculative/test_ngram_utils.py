@@ -3,14 +3,11 @@ import sys
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
-
-if torch.version.cuda is not None:
-    from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
-else:
-    from sgl_kernel import reconstruct_indices_from_tree_mask
+from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 
 def test_reconstruct_indices_from_tree_mask():

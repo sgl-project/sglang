@@ -51,7 +51,7 @@ This section provides deployment configurations verified on AMD MI300X, MI325X, 
 **NVIDIA (B200/GB200):**
 * **GB200 Parallelism**: Use `--tp 4 --ep 4` on GB200. B200 uses the default NVIDIA settings generated above.
 * **NVFP4 Quantization**: Requires `--quantization modelopt_fp4` and uses a different model path (`nvidia/Qwen3-Coder-...`).
-* **DP Attention**: NVFP4 configuration supports `--enable-dp-attention` for improved throughput.
+* **DP Attention**: NVFP4 configuration supports DP attention (`--attn-dp-size <N>`) for improved throughput.
 
 **Intel Xeon CPU:**
 * Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.

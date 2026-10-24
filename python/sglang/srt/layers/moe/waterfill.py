@@ -77,16 +77,14 @@ class WaterfillBalancer:
         world_size: int,
         rank: int,
         layer_id: int,
-        routed_scaling_factor: float = 1.0,
+        shared_weight: float,
     ):
         self.num_routed_experts = num_routed_experts
         self.world_size = world_size
         self.rank = rank
         self.layer_id = layer_id
         self.old_experts_per_rank = num_routed_experts // world_size
-        self.shared_weight = (
-            1.0 / routed_scaling_factor if routed_scaling_factor != 0 else 1.0
-        )
+        self.shared_weight = shared_weight
         self._counts_buf: Optional[Tensor] = None
         self.use_static_waterfill = not envs.SGLANG_DISABLE_STATIC_WATERFILL.get()
 

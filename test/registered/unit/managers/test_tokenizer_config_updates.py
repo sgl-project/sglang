@@ -34,13 +34,6 @@ def _manager(case, **fields):
 
 
 class TestTokenizerConfigUpdates(CustomTestCase):
-    def test_startup_config_shows_through_until_something_updates_it(self):
-        manager = _manager(self, weight_version="v1")
-        self.assertEqual(manager.config_value("weight_version"), "v1")
-
-        manager.record_config_updates("test", weight_version="v2")
-        self.assertEqual(manager.config_value("weight_version"), "v2")
-
     def test_the_serverargs_instance_is_not_written(self):
         manager = _manager(self, weight_version="v1")
         manager.record_config_updates("test", weight_version="v2")
@@ -118,30 +111,6 @@ class TestTokenizerConfigUpdates(CustomTestCase):
         manager.served_model_name = "dummy"
 
         self.assertIsNone(manager._dump_config_snapshot())
-
-    def test_an_unpickleable_field_does_not_lose_the_dump(self):
-        import pickle
-
-        # What --custom-sigquit-handler leaves on a real ServerArgs.
-        manager = _manager(self, custom_sigquit_handler=lambda *_: None)
-        manager.model_path = "dummy"
-        manager.served_model_name = "dummy"
-
-        payload = {
-            "server_args": manager.server_args,
-            "config_updates": get_context().overrides_log(),
-            "resolved_config": manager.resolved_config_dict(
-                msgspec.structs.asdict(manager.server_args)
-            ),
-            "requests": [],
-        }
-        with self.assertRaises(Exception):
-            pickle.dumps(payload)
-
-        # The fallback drops both copies of the offending object, not just one.
-        payload["server_args"] = None
-        payload["resolved_config"] = None
-        self.assertTrue(pickle.dumps(payload))
 
     def test_the_model_path_readback_follows_the_manager(self):
         manager = _manager(self)

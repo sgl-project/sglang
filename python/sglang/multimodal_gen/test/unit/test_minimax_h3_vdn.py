@@ -73,9 +73,9 @@ def test_registry_resolves_vdn_h3_configs() -> None:
 
 def test_vdn_h3_sampling_defaults_and_rejections() -> None:
     params = VDNH3SamplingParams(prompt="p")
-    assert params.num_inference_steps == 9  # 8 NFE
-    with pytest.raises(ValueError, match="exactly nine sigma grid points"):
-        VDNH3SamplingParams(prompt="p", num_inference_steps=8)
+    assert params.num_inference_steps == 8
+    with pytest.raises(ValueError, match="exactly eight inference steps"):
+        VDNH3SamplingParams(prompt="p", num_inference_steps=9)
     fl2va = VDNH3SamplingParams(
         prompt="p",
         task="fl2va",
@@ -97,6 +97,7 @@ def test_vdn_h3_sampling_defaults_and_rejections() -> None:
 def _server_args(**overrides) -> SimpleNamespace:
     args = dict(
         model_variant=None,
+        performance_mode="speed",
         attention_backend=None,
         component_attention_backends={},
         attention_backend_config=None,

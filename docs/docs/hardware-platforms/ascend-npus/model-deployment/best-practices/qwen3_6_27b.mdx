@@ -51,8 +51,6 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -71,12 +69,13 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=300
+export SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE=128
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
@@ -96,7 +95,7 @@ python3 -m sglang.launch_server \
     --max-running-requests 60 \
     --max-mamba-cache-size 60 \
     --mem-fraction-static 0.74 \
-    --cuda-graph-bs-decode 2 4 8 14 16 24 26 32 36 37 40 42 44 45 46 50 52 60 \
+    --cuda-graph-bs-decode 2 4 8 16 24 32 40 42 45 50 60 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -152,8 +151,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -172,10 +169,11 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE=128
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_VIT_ENABLE_CUDA_GRAPH=1
 export STREAMS_PER_DEVICE=32
@@ -198,6 +196,7 @@ python3 -m sglang.launch_server \
     --enable-prefill-delayer \
     --prefill-delayer-queue-min-ratio 0.45 \
     --prefill-delayer-max-delay-ms 5500 \
+    --prefill-delayer-max-delay-passes 300 \
     --enable-multimodal \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
@@ -253,8 +252,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -274,11 +271,12 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -352,8 +350,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -372,9 +368,9 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=0
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=130
@@ -450,8 +446,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -469,9 +463,9 @@ unset ASCEND_LAUNCH_BLOCKING
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
@@ -516,8 +510,7 @@ python -m sglang.bench_serving \
     --num-prompts 12 \
     --random-input-len 64000 \
     --random-output-len 1000 \
-    --random-range-ratio 1 \
-    --seed 1
+    --random-range-ratio 1
 ```
 
 ### Qwen3.6-27B W8A8 2P IN128K OUT1K 50ms
@@ -542,8 +535,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -562,9 +553,9 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=20
@@ -636,8 +627,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -657,10 +646,11 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=50
 export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 export SGLANG_SET_CPU_AFFINITY=1
@@ -733,8 +723,6 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -753,9 +741,9 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export ASCEND_USE_FIA=1
-export GLOO_SOCKET_IFNAME=<network-interface>
+export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=<network-interface>
+export HCCL_SOCKET_IFNAME=lo
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30

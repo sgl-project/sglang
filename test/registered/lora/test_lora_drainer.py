@@ -12,7 +12,7 @@ from sglang.test.lora_utils import (
 )
 
 register_cuda_ci(est_time=52, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=100, suite="extra-a-test-1-gpu-small-amd")
 
 MOCK_START_TIME = 1000.0
 LORA_DRAIN_WAIT_THRESHOLD = 3.0

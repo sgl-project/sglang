@@ -166,6 +166,30 @@ Use the model's Diffusers pipeline, official implementation, or
 If the new model is close to Flux, Qwen-Image, GLM-Image, Wan, HunyuanVideo, or
 LTX, extend that implementation before starting from an empty file.
 
+## Video encode hand-off
+
+Reuse `EncodeWhileDecoding` and `streamed_video_output_path` instead of adding a
+model-specific ffmpeg writer. Explicit `DecodingStage.decode(..., on_frames=...)`
+calls can hand over the completed RGB video for VAEs without callbacks; no decoder
+modification is needed. This whole-clip path is not automatically enabled:
+ordinary decoders already use GPU-direct saving and may not benefit.
+To overlap encoding with existing incremental decoding, a native VAE can declare
+`supports_decode_on_frames = True` and accept `decode(..., on_frames=callback)`.
+Emit read-only `[1, 3, T, H, W]` runs in presentation order, only after overlap
+blending and cropping are final. Concatenating these runs must exactly reproduce
+the normal decode. Batched decoders can emit the complete batch once; the shared
+MP4 path currently only accepts a single output.
+
+Match the model's existing normalization, dtype, and uint8 conversion order.
+Audio must be available before opening the shared encoder. Keep component-use
+ordering identical across ranks, including ranks that do not write output.
+Encoder failures must retain the regular decode result for saving afterward.
+
+An untiled decoder may emit once at completion, reducing CPU frame materialization
+but not overlapping encoding with decode. Do not enable temporal tiling just to
+gain overlap: it can change the decoded video. Compare callback-on and callback-off
+with identical tiling, audio, encoding settings, and full request timing.
+
 ## Conditioning reuse
 
 Use the native `TextEncoder` / `ImageEncoder` base classes (or `EncoderTensorParallelMixin`) and call encoders through `encoder(...)`. This preserves the shared conditioning cache, module hooks, and encoder TP/folding group. A replicated custom encoder can use `ConditioningEncoderMixin`; do not apply it to a module with hidden mutable state or random sampling in `forward()`.

@@ -65,7 +65,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Compute partitions
         id: compute
@@ -101,7 +101,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -168,12 +168,18 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run SM120-only diffusion unit tests
+        timeout-minutes: 10
+        working-directory: python
+        run: |
+          python3 -m pytest -v sglang/multimodal_gen/test/unit/test_fp8_fa_sm120_attn.py
 
       - name: Run 5090 diffusion canary tests
         timeout-minutes: 120
@@ -233,7 +239,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -275,13 +281,13 @@ jobs:
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
     runs-on: 2-gpu-h100
-    timeout-minutes: 45
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
     steps:
       - name: Record retry deadline
-        run: echo "SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + 2400 ))" >> "$GITHUB_ENV"
+        run: echo "SGLANG_DIFFUSION_RETRY_DEADLINE=$(( $(date +%s) + 3000 ))" >> "$GITHUB_ENV"
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -298,7 +304,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -306,7 +312,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run diffusion server tests
-        timeout-minutes: 45
+        timeout-minutes: 55
         env:
           HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
@@ -368,7 +374,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -391,7 +397,7 @@ jobs:
         with:
           artifact-suffix: component-accuracy
 
-  multimodal-gen-test-1-b200:
+  multimodal-gen-test-4-gpu-b200:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
@@ -413,7 +419,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -421,6 +427,27 @@ jobs:
           SGLANG_CI_EARLY_LD_LIBRARY_PATH: "1"
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run VAE parallel-group regression
+        timeout-minutes: 10
+        run: |
+          python3 -m pytest -v python/sglang/multimodal_gen/test/single_test_file/test_wan_vae_parallel_groups_4_gpu.py
+
+      - name: Run Blackwell-only diffusion unit tests
+        timeout-minutes: 10
+        working-directory: python
+        run: |
+          python3 -m pytest -v \
+            sglang/multimodal_gen/test/unit/test_mxfp8_online_gemm.py \
+            sglang/multimodal_gen/test/unit/test_wan_gelu_mlp.py
+
+      - name: Run 4-GPU diffusion unit tests
+        timeout-minutes: 15
+        working-directory: python
+        run: |
+          python3 -m pytest -v \
+            sglang/multimodal_gen/test/unit/test_kandinsky6_sequence_parallel.py::test_joint_video_audio_tensor_sequence_parallel \
+            sglang/multimodal_gen/test/unit/test_kandinsky6_sr_sequence_parallel.py::test_sr_four_gpus
 
       - name: Run diffusion server tests
         timeout-minutes: 240
@@ -478,12 +505,19 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Install Quant-VideoGen
+        timeout-minutes: 5
+        run: |
+          # quant-videogen pins an incompatible torch, so install it without deps
+          # plus the import-time deps of the diffusion-qvg extra.
+          uv pip install --no-deps quant-videogen==0.1.0 "loguru>=0.7" "termcolor>=2.3"
 
       - name: Run diffusion unit tests
         timeout-minutes: 60
@@ -514,7 +548,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
       - name: Download all execution reports
         uses: actions/download-artifact@v4

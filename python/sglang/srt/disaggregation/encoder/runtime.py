@@ -1744,10 +1744,10 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
     This function owns backend construction only.  HTTP/gRPC middleware,
     service registration, and network serving remain Transport concerns.
     """
-    if get_parallel().dp_size > 1:
+    if get_parallel().num_dp_ranks > 1:
         raise ValueError(
-            "launch_local_runtime requires --dp-size 1; got "
-            f"dp_size={get_parallel().dp_size}."
+            "launch_local_runtime requires a single DP rank; got "
+            f"num_dp_ranks={get_parallel().num_dp_ranks}."
         )
 
     # Set up prometheus metrics.
@@ -1827,8 +1827,8 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
             "Encoder DP mode requires --dp-size > 1 and --tp-size 1; got "
             f"dp_size={get_parallel().dp_size}, tp_size={get_parallel().tp_size}."
         )
-    dp_size = get_parallel().dp_size
-    logger.info(f"Launching encoder in DP mode: dp_size={dp_size}")
+    num_dp_ranks = get_parallel().num_dp_ranks
+    logger.info(f"Launching encoder in DP mode: num_dp_ranks={num_dp_ranks}")
 
     # DP mode: workers (subprocesses) write metrics to the shared multiproc dir;
     # the main process exposes the aggregated /metrics endpoint.
@@ -1837,7 +1837,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
 
     ctx = mp.get_context("spawn")
     ipc_prefix = random_uuid()
-    async_zmq_ctx = zmq.asyncio.Context(dp_size + 1)
+    async_zmq_ctx = zmq.asyncio.Context(num_dp_ranks + 1)
 
     result_path = f"ipc:///tmp/{ipc_prefix}_dp_result"
     result_socket = get_zmq_socket(async_zmq_ctx, zmq.PULL, result_path, True)
@@ -1845,13 +1845,13 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
         get_zmq_socket(
             async_zmq_ctx, zmq.PUSH, f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{r}", True
         )
-        for r in range(dp_size)
+        for r in range(num_dp_ranks)
     ]
     release_sockets: List[zmq.asyncio.Socket] = [
         get_zmq_socket(
             async_zmq_ctx, zmq.PUSH, f"ipc:///tmp/{ipc_prefix}_dp_release_{r}", True
         )
-        for r in range(dp_size)
+        for r in range(num_dp_ranks)
     ]
 
     worker_processes: List[mp.Process] = []
@@ -1867,7 +1867,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
     # exception (atexit holds the list ref and reads it at exit time).
     atexit.register(_kill_workers)
 
-    for dp_rank in range(dp_size):
+    for dp_rank in range(num_dp_ranks):
         gpu_id = get_device().base_gpu_id + dp_rank
         # Pin the device parent-side around spawn (same convention as the
         # scheduler launcher and DP controller) so the child inherits
@@ -1894,7 +1894,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
     if get_observability().extra_metric_labels:
         labels.update(get_observability().extra_metric_labels)
     return DPDispatcher(
-        dp_size,
+        num_dp_ranks,
         dispatch_sockets,
         release_sockets,
         result_socket,

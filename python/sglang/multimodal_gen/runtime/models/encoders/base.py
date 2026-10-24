@@ -31,6 +31,18 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
+def get_attention_head_partition(
+    num_heads: int, num_kv_heads: int, tp_size: int
+) -> tuple[int, int]:
+    """Partition query heads and shard or replicate KV heads across TP ranks."""
+    assert num_heads % tp_size == 0
+    if num_kv_heads >= tp_size:
+        assert num_kv_heads % tp_size == 0
+    else:
+        assert tp_size % num_kv_heads == 0
+    return num_heads // tp_size, max(1, num_kv_heads // tp_size)
+
+
 def get_folding_tp_group(config: EncoderConfig):
     """Return the TP group selected for an encoder."""
     mode = config.parallel_folding_mode
@@ -218,7 +230,6 @@ class TextEncoder(
     # shard conditions left in the root group stays sharded unless the entry
     # point is registered; loaders read this and register each name.
     _fsdp_forward_methods: tuple[str, ...] = ()
-    _stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
     _supported_attention_backends: set[AttentionBackendEnum] = (
         TextEncoderConfig()._supported_attention_backends
     )
@@ -227,7 +238,6 @@ class TextEncoder(
         super().__init__()
         self.config = config
         self._fsdp_shard_conditions = config.arch_config._fsdp_shard_conditions
-        self._stacked_params_mapping = config.arch_config.stacked_params_mapping
         if not self.supported_attention_backends:
             raise ValueError(
                 f"Subclass {self.__class__.__name__} must define _supported_attention_backends"

@@ -5,7 +5,10 @@ from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
-from sglang.srt.arg_groups.model_override_base import model_config_of
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    model_config_of,
+)
 from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm, DllmRunOutput
@@ -31,11 +34,39 @@ def _denoiser_statistics(logits: torch.Tensor, temperatures: torch.Tensor):
 _compiled_denoiser_statistics = torch.compile(_denoiser_statistics, dynamic=True)
 
 
+def _use_split_denoiser_statistics(logits, temperatures):
+    return (
+        logits.dtype == temperatures.dtype == torch.float32
+        and logits.is_contiguous()
+        and temperatures.is_contiguous()
+        and logits.shape[-1] >= 65536
+        and logits.shape[0] * logits.shape[1] >= 32
+        and torch.cuda.get_device_capability(logits.device)[0] == 10
+    )
+
+
+def _denoiser_statistics_cuda(logits, temperatures, *, write_soft=False):
+    soft_probabilities = None
+    if _use_split_denoiser_statistics(logits, temperatures):
+        from sglang.kernels.ops.sampling.denoiser_statistics import denoiser_statistics
+
+        if write_soft:
+            soft_probabilities = torch.empty_like(logits, dtype=torch.bfloat16)
+        result = denoiser_statistics(logits, temperatures, soft_probabilities)
+    else:
+        result = _compiled_denoiser_statistics(logits, temperatures)
+    return *result, soft_probabilities
+
+
 def _sample_denoiser(probabilities: torch.Tensor, generator: torch.Generator):
     # The exponential-race formulation samples the same categorical distribution
     # as multinomial. Probabilities come from softmax, so multinomial's repeated
     # validation and device-to-host synchronization are unnecessary here.
     noise = torch.empty_like(probabilities).exponential_(1.0, generator=generator)
+    if probabilities.is_cuda:
+        from sglang.kernels.ops.speculative.row_argmax import div_argmax
+
+        return div_argmax(probabilities, noise)
     return (probabilities / noise).argmax(dim=-1)
 
 
@@ -43,6 +74,9 @@ class Gemma4Renoise(DllmAlgorithm):
     supported_architectures = ("DiffusionGemmaForBlockDiffusion",)
     requires_separate_context_encoding = True
     required_attention_backend = "triton"
+    reuse_forward_metadata = True
+    supported_attention_backends = ("triton", "fa4")
+    capture_input_preparation = True
 
     @classmethod
     def configure_server_args(cls, server_args: ServerArgs) -> None:
@@ -66,16 +100,24 @@ class Gemma4Renoise(DllmAlgorithm):
         ):
             raise ValueError("DiffusionGemma requires tied word embeddings")
 
+        graph_config = cfg.cuda_graph_config
+        if graph_config.prefill.backend == Backend.FULL:
+            prefill_backend, _ = attention_backends_of(cfg)
+            if prefill_backend != "fa4":
+                raise ValueError(
+                    "Gemma4Renoise FULL prefill CUDA graphs require prefill "
+                    f"backend 'fa4'; got '{prefill_backend}'."
+                )
+        else:
+            graph_config = with_phase(
+                graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            )
         declare_resolution(
             server_args,
             cls.__name__,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config,
-                Phase.PREFILL,
-                backend=Backend.DISABLED,
-            ),
+            cuda_graph_config=graph_config,
         )
 
     @classmethod
@@ -153,6 +195,11 @@ class Gemma4Renoise(DllmAlgorithm):
         self.seed = algorithm_config.get("seed")
         self.vocab_size = None
         self.embed_tokens = None
+        self._temperature_tables = {}
+        self._temperature_buffers = {}
+        self._zero_signals = {}
+        self.use_temperature_table = algorithm_config.get("use_temperature_table", True)
+        self.use_graph_input_preparation = config.capture_input_preparation
 
         if (
             not isinstance(self.max_denoising_steps, int)
@@ -226,40 +273,86 @@ class Gemma4Renoise(DllmAlgorithm):
                     "argmax": current,
                     "history": [],
                     "self_conditioning": None,
-                    "rng_state": generator.get_state(),
+                    "generator": generator,
                     "finished": False,
                 }
             )
         return states
 
+    @torch.no_grad()
     def prepare_inputs(
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
         states: List[Any],
     ) -> None:
-        self._write_input_ids(forward_batch, states)
+        if self.fdfo or all(
+            state["step"] == self.max_denoising_steps for state in states
+        ):
+            self._write_input_ids(forward_batch, states)
 
         signals = [state["self_conditioning"] for state in states]
         signal = next((value for value in signals if value is not None), None)
-        if signal is not None:
-            batched = torch.zeros(
-                (len(states), self.block_size, signal.shape[-1]),
-                dtype=signal.dtype,
-                device=signal.device,
+        if signal is not None or self.use_graph_input_preparation:
+            weight = self.embed_tokens.weight
+            key = (weight.device, weight.dtype, weight.shape[-1])
+            if key not in self._zero_signals:
+                self._zero_signals[key] = weight.new_zeros(
+                    self.block_size, weight.shape[-1]
+                )
+            zero = self._zero_signals[key]
+            shape = (len(states) * self.block_size, weight.shape[-1])
+            batched = forward_batch.dllm_input_preparation_state
+            if batched is None or batched.shape != shape:
+                batched = weight.new_empty(shape)
+            torch.stack(
+                [zero if value is None else value for value in signals],
+                out=batched.view(len(states), self.block_size, -1),
             )
-            for index, value in enumerate(signals):
-                if value is not None:
-                    batched[index].copy_(value)
-            signal = batched.view(len(states) * self.block_size, -1)
+            forward_batch.dllm_input_preparation_state = batched
+            signal = batched
 
-        forward_batch.input_embeds = model_runner.model.prepare_dllm_input_embeds(
-            forward_batch.input_ids, signal
+        if self.use_graph_input_preparation:
+            forward_batch.input_embeds = None
+        else:
+            forward_batch.input_embeds = model_runner.model.prepare_dllm_input_embeds(
+                forward_batch.input_ids, signal
+            )
+
+    @staticmethod
+    def prepare_graph_inputs(model, input_ids, state):
+        return model.prepare_dllm_input_embeds(input_ids, state)
+
+    def _temperatures(self, logits, states):
+        if not self.use_temperature_table:
+            return logits.new_tensor(
+                [self._temperature(state["step"]) for state in states]
+            )
+        key = (logits.device, logits.dtype)
+        if key not in self._temperature_tables:
+            self._temperature_tables[key] = logits.new_tensor(
+                [
+                    self._temperature(step)
+                    for step in range(self.max_denoising_steps + 1)
+                ]
+            )
+        table = self._temperature_tables[key]
+        if len(states) == 1:
+            step = states[0]["step"]
+            return table[step : step + 1]
+        buffer_key = (*key, len(states))
+        if buffer_key not in self._temperature_buffers:
+            self._temperature_buffers[buffer_key] = logits.new_empty(len(states))
+        return torch.stack(
+            [table[state["step"]] for state in states],
+            out=self._temperature_buffers[buffer_key],
         )
 
     def _write_input_ids(self, forward_batch: ForwardBatch, states: List[Any]) -> None:
-        current = torch.stack([state["current"] for state in states])
-        forward_batch.input_ids.copy_(current.view(-1))
+        torch.stack(
+            [state["current"] for state in states],
+            out=forward_batch.input_ids.view(len(states), self.block_size),
+        )
 
     def _soft_embeddings(self, probabilities: torch.Tensor) -> torch.Tensor:
         weight = self.embed_tokens.weight
@@ -292,13 +385,23 @@ class Gemma4Renoise(DllmAlgorithm):
             self._write_input_ids(forward_batch, states)
             return [True] * len(states)
 
-        temperatures = logits.new_tensor(
-            [self._temperature(state["step"]) for state in states]
-        )
-        statistics = (
-            _compiled_denoiser_statistics if logits.is_cuda else _denoiser_statistics
-        )
-        probabilities, token_entropies, argmax_tokens = statistics(logits, temperatures)
+        temperatures = self._temperatures(logits, states)
+        soft_probabilities = None
+        if logits.is_cuda:
+            probabilities, token_entropies, argmax_tokens, soft_probabilities = (
+                _denoiser_statistics_cuda(
+                    logits,
+                    temperatures,
+                    write_soft=(
+                        self.embed_tokens.weight.dtype == torch.bfloat16
+                        and getattr(self.embed_tokens, "tp_size", 1) == 1
+                    ),
+                )
+            )
+        else:
+            probabilities, token_entropies, argmax_tokens = _denoiser_statistics(
+                logits, temperatures
+            )
         sorted_entropy, indices = torch.sort(token_entropies, dim=-1)
         cumulative_entropy = torch.cumsum(sorted_entropy, dim=-1)
         sorted_selected = cumulative_entropy - sorted_entropy <= self.entropy_bound
@@ -312,8 +415,7 @@ class Gemma4Renoise(DllmAlgorithm):
             if state["finished"]:
                 continue
             active.append(index)
-            generator = torch.Generator(device=logits.device)
-            generator.set_state(state["rng_state"])
+            generator = state["generator"]
             denoiser = _sample_denoiser(probabilities[index], generator)
             random_canvas = torch.randint(
                 self.vocab_size,
@@ -327,7 +429,8 @@ class Gemma4Renoise(DllmAlgorithm):
             if self.stability_threshold == 0:
                 stable = torch.ones((), dtype=torch.bool, device=logits.device)
             elif len(history) == self.stability_threshold:
-                stable = (torch.stack(history) == argmax).all()
+                previous = history[0] if len(history) == 1 else torch.stack(history)
+                stable = (previous == argmax).all()
             else:
                 stable = torch.zeros((), dtype=torch.bool, device=logits.device)
             history.append(argmax)
@@ -335,7 +438,6 @@ class Gemma4Renoise(DllmAlgorithm):
                 history.pop(0)
             state["step"] -= 1
             state["argmax"] = argmax
-            state["rng_state"] = generator.get_state()
             finished.append((stable & confident[index]) | (state["step"] == 0))
 
         # One device-to-host synchronization for the whole batch. In particular,
@@ -348,7 +450,11 @@ class Gemma4Renoise(DllmAlgorithm):
         soft_embeds = None
         if not all(done):
             soft_embeds = self._soft_embeddings(
-                probabilities.reshape(-1, self.vocab_size)
+                (
+                    soft_probabilities
+                    if soft_probabilities is not None
+                    else probabilities
+                ).reshape(-1, self.vocab_size)
             ).view(len(states), self.block_size, -1)
         for index in active:
             state = states[index]

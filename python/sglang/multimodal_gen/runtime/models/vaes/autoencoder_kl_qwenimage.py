@@ -562,14 +562,6 @@ class QwenImageEncoder3d(nn.Module):
         super().__init__()
         dim_mult = list(dim_mult)
         temperal_downsample = list(temperal_downsample)
-        # dim = config.arch_config.dim
-        # z_dim = config.arch_config.z_dim
-        # dim_mult = config.arch_config.dim_mult
-        # num_res_blocks = config.arch_config.num_res_blocks
-        # attn_scales = config.arch_config.attn_scales
-        # temperal_downsample = config.arch_config.temperal_downsample
-        # dropout = config.arch_config.dropout
-        # non_linearity = config.arch_config.non_linearity
         self.dim = dim
         self.z_dim = z_dim
         self.dim_mult = dim_mult
@@ -951,18 +943,6 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.tile_sample_stride_height = 192
         self.tile_sample_stride_width = 192
 
-        # Precompute and cache conv counts for encoder and decoder for clear_cache speedup
-        self._cached_conv_counts = {
-            "decoder": sum(
-                isinstance(m, (QwenImageCausalConv3d, SpatialParallelCausalConv3d))
-                for m in self.decoder.modules()
-            )
-            if self.decoder is not None
-            else 0,
-            "encoder": sum(isinstance(m, QwenImageCausalConv3d) for m in self.encoder.modules())
-            if self.encoder is not None
-            else 0,
-        }
         cuda_device = get_local_torch_device()
         dtype = torch.get_default_dtype()
         latent_channels = config.arch_config.z_dim
@@ -1008,13 +988,6 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
         self.tile_sample_min_width = tile_sample_min_width or self.tile_sample_min_width
         self.tile_sample_stride_height = tile_sample_stride_height or self.tile_sample_stride_height
         self.tile_sample_stride_width = tile_sample_stride_width or self.tile_sample_stride_width
-
-    def disable_tiling(self) -> None:
-        r"""
-        Disable tiled VAE decoding. If `enable_tiling` was previously enabled, this method will go back to computing
-        decoding in one step.
-        """
-        self.use_tiling = False
 
     def enable_slicing(self) -> None:
         r"""

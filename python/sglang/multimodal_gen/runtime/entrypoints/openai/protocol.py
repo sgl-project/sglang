@@ -82,6 +82,9 @@ class ImageGenerationsRequest(BaseModel):
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
+    profile: Optional[bool] = False
+    num_profiled_timesteps: Optional[int] = None
+    profile_all_stages: Optional[bool] = False
     # Progressive resolution generation
     progressive_mode: Optional[str] = None
     progressive_levels: Optional[int] = None
@@ -100,17 +103,19 @@ class VideoResponse(BaseModel):
     seconds: str = "4"
     quality: str = "standard"
     url: Optional[str] = None
+    urls: Optional[List[Optional[str]]] = None
     remixed_from_video_id: Optional[str] = None
     completed_at: Optional[int] = None
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
     file_path: Optional[str] = None
-    file_paths: Optional[List[str]] = None
+    file_paths: Optional[List[Optional[str]]] = None
     num_outputs: Optional[int] = None
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
     revised_prompt: Optional[str] = None
     action: Optional[Dict[str, Any]] = None
+    lidar: Optional[Dict[str, Any]] = None
 
 
 class VideoGenerationsRequest(BaseModel):
@@ -158,6 +163,7 @@ class VideoGenerationsRequest(BaseModel):
     upscaling_scale: Optional[int] = 4
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
+    x264_preset: Optional[str] = None
     output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
@@ -170,10 +176,6 @@ class VideoGenerationsRequest(BaseModel):
 class VideoListResponse(BaseModel):
     data: List[VideoResponse]
     object: str = "list"
-
-
-class VideoRemixRequest(BaseModel):
-    prompt: str
 
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):

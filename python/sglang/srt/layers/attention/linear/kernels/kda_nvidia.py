@@ -237,8 +237,11 @@ class NvidiaKDAKernel(LinearAttnKernelBase):
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
         return_intermediate_states: bool = False,
+        beta_is_raw: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        if beta_is_raw:
+            beta = beta.float().sigmoid()
         num_tokens = q.shape[1]
         seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
         track_h_src = kwargs.get("track_ssm_h_src")

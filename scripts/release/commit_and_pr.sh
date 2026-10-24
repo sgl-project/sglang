@@ -41,7 +41,7 @@ git push origin "${BRANCH_NAME}"
 # Create pull request
 echo "Creating pull request..."
 PR_URL=$(gh pr create \
-  --title "chore: bump ${VERSION_TYPE} version to ${NEW_VERSION}" \
+  --title "[Chore] release: Bump ${VERSION_TYPE} version to ${NEW_VERSION}" \
   --body "## Summary
 
 This PR bumps the ${VERSION_TYPE} version to \`${NEW_VERSION}\` across all relevant files.

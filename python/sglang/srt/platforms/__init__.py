@@ -21,8 +21,11 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.mps import MpsSRTPlatform
+from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
+from sglang.srt.platforms.sail import SailSRTPlatform
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 
@@ -39,6 +42,10 @@ def _is_rocm_available() -> bool:
     return bool(torch.cuda.is_available() and torch.version.hip is not None)
 
 
+def _is_sail_available() -> bool:
+    return bool(torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name())
+
+
 def _is_cpu_available() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1"
 
@@ -49,6 +56,20 @@ def _is_npu_available() -> bool:
 
 def _is_xpu_available() -> bool:
     return torch.xpu.is_available()
+
+
+def _is_musa_available() -> bool:
+    if not hasattr(torch.version, "musa") or torch.version.musa is None:
+        return False
+    try:
+        import torchada  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _is_mps_available() -> bool:
+    return bool(getattr(torch, "mps", None) is not None and torch.mps.is_available())
 
 
 def _resolve_platform() -> SRTPlatform:
@@ -70,9 +91,14 @@ def _resolve_platform() -> SRTPlatform:
          - 0 activated + SGLANG_USE_CPU_ENGINE=1 → fallback CpuSRTPlatform
            (checked first; an explicit opt-in wins over CUDA/ROCm availability,
            so developers on GPU hosts can intentionally exercise the CPU path)
+         - 0 activated + SAIL available → fallback SailSRTPlatform
+           (checked before CUDA; SAIL also reports torch.cuda.is_available())
          - 0 activated + CUDA available → fallback CudaSRTPlatform
+         - 0 activated + NPU available  → fallback NPUSRTPlatform
          - 0 activated + ROCm available → fallback RocmSRTPlatform
          - 0 activated + XPU available  → fallback XpuSRTPlatform
+         - 0 activated + MUSA available → fallback MusaSRTPlatform
+         - 0 activated + MPS available  → fallback MpsSRTPlatform
          - 0 activated + none of the above → fallback base SRTPlatform
          - 1 activated → use it
          - N activated → RuntimeError (must set SGLANG_PLATFORM)
@@ -127,6 +153,11 @@ def _resolve_platform() -> SRTPlatform:
         if _is_cpu_available():
             logger.debug("SGLANG_USE_CPU_ENGINE=1. Using CPU SRTPlatform defaults.")
             return CpuSRTPlatform()
+        if _is_sail_available():
+            logger.debug(
+                "No platform plugin detected. Using SAIL SRTPlatform defaults."
+            )
+            return SailSRTPlatform()
         if _is_cuda_available():
             logger.debug(
                 "No platform plugin detected. Using CUDA SRTPlatform defaults."
@@ -143,6 +174,14 @@ def _resolve_platform() -> SRTPlatform:
         if _is_xpu_available():
             logger.debug("No platform plugin detected. Using XPU SRTPlatform defaults.")
             return XpuSRTPlatform()
+        if _is_musa_available():
+            logger.debug(
+                "No platform plugin detected. Using MUSA SRTPlatform defaults."
+            )
+            return MusaSRTPlatform()
+        if _is_mps_available():
+            logger.debug("No platform plugin detected. Using MPS SRTPlatform defaults.")
+            return MpsSRTPlatform()
         logger.debug("No platform detected. Using base SRTPlatform.")
         return SRTPlatform()
 

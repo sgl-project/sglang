@@ -62,8 +62,8 @@ class TestRetractDecode(CustomTestCase):
         assert self.process.poll() is None, "Server crashed during test"
 
 
-class TestRetractDecodeChunkCachePaged(TestRetractDecode):
-    """python -m unittest test_retract_decode.TestRetractDecodeChunkCachePaged"""
+class TestRetractDecodeRadixDisabledPaged(TestRetractDecode):
+    """python -m unittest test_retract_decode.TestRetractDecodeRadixDisabledPaged"""
 
     other_args = ["--disable-radix-cache", "--page-size", "16"]
 
@@ -99,13 +99,6 @@ class TestRetractDecodeLongOutput(CustomTestCase):
         res = requests.post(f"{self.base_url}/generate", json=data)
         assert res.status_code == 200, f"Request failed: {res.status_code}"
         assert self.process.poll() is None, "Server crashed during test"
-
-
-@unittest.skipIf(is_in_ci(), "Skipped in CI due to long runtime")
-class TestRetractDecodeLongOutputChunkCache(TestRetractDecodeLongOutput):
-    """python -m unittest test_retract_decode.TestRetractDecodeLongOutputChunkCache"""
-
-    other_args = ["--disable-radix-cache"]
 
 
 if __name__ == "__main__":

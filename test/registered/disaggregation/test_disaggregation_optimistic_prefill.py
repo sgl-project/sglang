@@ -457,7 +457,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             (req.kv.req_pool_idx, slice(0, len(self.PROMPT))), kv_indices
         )
         req.full_untruncated_fill_ids = array("q", self.PROMPT)
-        req.set_extend_range(0, len(self.PROMPT))
+        req.extend_end = len(self.PROMPT)
         req.kv.kv_committed_len = len(self.PROMPT)
         req.kv.kv_allocated_len = len(self.PROMPT)
         req.kv.mamba_last_track_seqlen = self.TRACK_SEQLEN

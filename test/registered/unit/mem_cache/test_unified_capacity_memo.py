@@ -28,8 +28,9 @@ import random
 import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def _build(lazy: bool):
@@ -183,7 +184,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         self.assertLessEqual(fla.available_size(), float_cached)
 
 
-class TestTriCapacityMemoCoherence(unittest.TestCase):
+class TestTriCapacityMemoCoherence(CustomTestCase):
     """Tri-composite twins of the 2-pool cases: the joint view walks THREE
     bands (mamba end, swa float, full end), so a mutation on ANY of them must
     invalidate the composite memo -- including the two only the tri has, a
@@ -213,6 +214,50 @@ class TestTriCapacityMemoCoherence(unittest.TestCase):
                 msg=f"stale available_size memo on {band.sub_pool_name!r}",
             )
         self.assertEqual(allocator.verify_byte_accounting(), [])
+
+    def test_joint_capacity_boundary_after_fragmentation(self):
+        """Equal FULL/SWA demand must fit exactly at the advertised boundary.
+
+        State allocations move a differently aligned peer, and SWA retirement
+        creates reusable holes. The cached joint capacity must still fund an
+        actual reservation, while the next page must exceed it.
+        """
+        from test_unified_tri_pool import TestUnifiedTriPool
+
+        fixture = TestUnifiedTriPool("test_chain_wiring_and_float_swa")
+        for page_size in (1, 4, 128):
+            for lazy in (False, True):
+                with self.subTest(page_size=page_size, lazy=lazy):
+                    _, allocator, _, _ = fixture._build(
+                        n_full=256 * page_size,
+                        n_swa=128 * page_size,
+                        n_state=32,
+                        page_size=page_size,
+                        lazy_compaction=lazy,
+                    )
+
+                    def check_boundary():
+                        capacity = allocator.available_size()
+                        self.assertTrue(allocator.can_reserve(capacity, capacity))
+                        self.assertFalse(
+                            allocator.can_reserve(
+                                capacity + page_size, capacity + page_size
+                            )
+                        )
+
+                    check_boundary()  # empty float is frontier-transparent
+                    states = allocator.mamba_allocator.alloc(3)
+                    self.assertIsNotNone(states)
+                    check_boundary()
+                    tokens = allocator.alloc(8 * page_size)
+                    self.assertIsNotNone(tokens)
+                    check_boundary()  # float now splits the available band
+                    allocator.free_swa(tokens[2 * page_size : 5 * page_size])
+                    check_boundary()  # interior holes are reusable
+                    allocator.free(tokens)
+                    check_boundary()  # float parks again
+                    allocator.mamba_allocator.free(states)
+                    check_boundary()
 
     def test_memos_track_tri_mutation_kinds(self):
         for lazy in (False, True):

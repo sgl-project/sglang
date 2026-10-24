@@ -5,6 +5,7 @@ from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -225,6 +226,15 @@ def test_composed_pair_shards_correctly_under_mock_tp():
     torch.testing.assert_close(
         torch.cat(stitched, dim=-1), expected, rtol=1e-5, atol=1e-5
     )
+
+
+def test_mis_sized_fused_lora_b_is_rejected():
+    layer = _make_layer()
+    with (
+        patch(_TP_RANK_PATCH, return_value=0),
+        pytest.raises(ValueError, match="fused LoRA B"),
+    ):
+        layer.slice_lora_b_weights(torch.zeros(sum(OUTPUT_SIZES) + 1, 2))
 
 
 def test_ipc_key_resolution_returns_fused_merge_index():

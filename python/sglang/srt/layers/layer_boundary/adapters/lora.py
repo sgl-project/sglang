@@ -17,12 +17,12 @@ from sglang.srt.layers.layer_boundary.layout import TokenAxis
 from sglang.srt.runtime_context import LoRABatchLayout, get_forward
 
 
-def publish_attention(enabled):
+def publish_attn_lora_rows(enabled):
     if enabled:
         get_forward().set("lora_batch_layout", LoRABatchLayout.DP_LOCAL)
 
 
-def publish_ffn(enabled, input_rows):
+def publish_ffn_lora_rows(enabled, input_rows):
     if enabled:
         get_forward().set(
             "lora_batch_layout",

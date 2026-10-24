@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -27,7 +28,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=1007, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=870, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
@@ -195,30 +196,30 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
         cls._disagg_failure_ctx.__exit__(None, None, None)
         super().tearDownClass()
 
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=f"http://{self.base_host}:{self.lb_port}",
-            eval_name="gsm8k",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
+    def test_servers_survive_transfer_failures(self):
+        # Failures are injected on every poll, so nearly every request fails.
+        # Send them directly: an eval client retries each failure with backoff
+        # and spends minutes waiting without checking anything more.
+        def generate(i):
+            return requests.post(
+                self.lb_url + "/generate",
+                json={
+                    "text": f"Request {i}: The capital of France is",
+                    "sampling_params": {"max_new_tokens": 32},
+                },
+                timeout=120,
+            )
 
-        # Expect lots of failure but the server cannot crash
-        try:
-            metrics = run_sgl_eval(args)
-            print(f"Evaluation metrics: {metrics}")
-        except Exception as e:
-            print(f"Test encountered expected errors: {e}")
-            # Check if servers are still healthy
-            try:
-                response = requests.get(self.prefill_url + "/health_generate")
-                assert response.status_code == 200
-                response = requests.get(self.decode_url + "/health_generate")
-                assert response.status_code == 200
-            except Exception as health_check_error:
-                # If health check fails, re-raise the original exception
-                raise e from health_check_error
+        with ThreadPoolExecutor(max_workers=64) as pool:
+            statuses = [r.status_code for r in pool.map(generate, range(64))]
+        print(f"Response status counts: {Counter(statuses)}")
+
+        # Requests may fail, but neither server may crash or stop serving.
+        for name, process, url in [
+            ("prefill", self.process_prefill, self.prefill_url),
+            ("decode", self.process_decode, self.decode_url),
+        ]:
+            assert_process_healthy(self, name, process, url, "/health_generate")
 
 
 class TestDisaggregationMooncakeSpec(

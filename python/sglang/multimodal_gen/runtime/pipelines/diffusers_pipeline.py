@@ -721,9 +721,6 @@ class DiffusersPipeline(ComposedPipelineBase):
             stage=DiffusersExecutionStage(self.diffusers_pipe),
         )
 
-    def initialize_pipeline(self, server_args: ServerArgs) -> None:
-        pass
-
     def post_init(self) -> None:
         """Post initialization hook."""
         if self.post_init_called:
@@ -744,11 +741,6 @@ class DiffusersPipeline(ComposedPipelineBase):
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
         return self
-
-    @property
-    def stages(self) -> list[PipelineStage]:
-        """List of stages in the pipeline."""
-        return self._stages
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:

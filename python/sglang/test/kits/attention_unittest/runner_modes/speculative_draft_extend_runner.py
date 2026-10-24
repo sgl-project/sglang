@@ -8,6 +8,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -89,6 +90,7 @@ from .speculative_cuda_graph_runner import (
 from .speculative_draft_runner import (
     EagleDraftRunnerSettings,
     _configure_runner_for_eagle_draft,
+    _DummyTpGroup,
     _reset_cuda_graph_test_buffers,
     _seeded_rng,
     _single_rank_graph_capture,
@@ -531,7 +533,7 @@ def _capture_eagle_draft_extend_graph_runner(
             "sglang.srt.model_executor.runner.decode_cuda_graph_runner.get_available_gpu_memory",
             lambda *args, **kwargs: 0.0,
         ),
-        get_parallel().override(attn_cp_size=1, tp_rank=0),
+        get_parallel().override(attn_cp_size=1, tp_rank=0, tp_group=_DummyTpGroup()),
     ):
         _reset_cuda_graph_test_buffers()
         return EAGLEDraftExtendCudaGraphRunner(
@@ -671,6 +673,7 @@ class _EagleDraftExtendForward(nn.Module):
         device: str,
     ):
         super().__init__()
+        self.shared_experts_config = SharedExpertsConfig()
         self.module = module
         self.token_embed = nn.Embedding(
             vocab_size, hidden_size, dtype=dtype, device=device

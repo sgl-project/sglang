@@ -5,13 +5,17 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.mla_host_dedup import (
     MLAHostDedupBroadcaster,
     MLAHostDedupContext,
     maybe_create_mla_host_dedup_context,
 )
-from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.dsa import (
+    DSAIndexerPoolHost,
+    make_dsa_indexer_pool_decl,
+)
+from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -52,13 +56,28 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             end_layer=2,
         )
         mla_host = MLATokenToKVPoolHost(
-            mla_device_pool,
+            MLAHostAllocation(
+                dtype=mla_device_pool.store_dtype,
+                kv_lora_rank=mla_device_pool.kv_lora_rank,
+                qk_rope_head_dim=mla_device_pool.qk_rope_head_dim,
+                kv_cache_dim=(
+                    mla_device_pool.kv_lora_rank + mla_device_pool.qk_rope_head_dim
+                ),
+                size_per_token=(
+                    mla_device_pool.kv_lora_rank + mla_device_pool.qk_rope_head_dim
+                )
+                * mla_device_pool.store_dtype.itemsize
+                * (mla_device_pool.layer_num),
+            ),
             host_to_device_ratio=2,
             host_size=0,
             page_size=2,
             layout="page_first",
             pin_memory=False,
-            is_dummy=True,
+            device_capacity_tokens=mla_device_pool.size,
+            start_layer=mla_device_pool.start_layer,
+            end_layer=mla_device_pool.end_layer,
+            target_layer_num=mla_device_pool.layer_num,
         )
 
         self.assertTrue(mla_host._is_dummy)
@@ -80,11 +99,13 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             end_layer=2,
             index_head_dim=8,
             quant_block_size=4,
+            page_size=2,
+            index_page_size=2,
+            skip_topk_layers=[False] * 2,
         )
         indexer_host = DSAIndexerPoolHost(
-            dsa_device_pool,
-            mla_host,
-            layout="page_first",
+            decl=make_dsa_indexer_pool_decl(dsa_device_pool),
+            anchor_host=mla_host,
             pin_memory=False,
             is_dummy=True,
         )
@@ -97,6 +118,83 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
             indexer_host.load_to_device_per_layer(
                 dsa_device_pool, slots, slots, layer_id=0, io_backend="kernel"
             )
+
+    def test_dummy_and_physical_hosts_share_capacity_geometry(self):
+        """Dedup peers must allocate identical IDs despite different host payloads."""
+        for dcp_size in (1, 2):
+            for host_size in (0, 0.000002):
+                with self.subTest(dcp_size=dcp_size, host_size=host_size):
+                    pool = MLATokenToKVPool(
+                        size=8,
+                        page_size=2,
+                        layer_num=2,
+                        dtype=torch.float16,
+                        kv_lora_rank=4,
+                        qk_rope_head_dim=2,
+                        start_layer=7,
+                        end_layer=9,
+                        device="cpu",
+                        enable_memory_saver=False,
+                    )
+                    pool.host_capacity_tokens = 16
+                    kwargs = dict(
+                        host_to_device_ratio=2,
+                        host_size=host_size,
+                        page_size=4,
+                        layout="page_first",
+                        pin_memory=False,
+                        dcp_size=dcp_size,
+                    )
+                    host = MLATokenToKVPoolHost(
+                        pool.get_device_pool_infos()[0].buffer_info,
+                        device_capacity_tokens=(
+                            pool.size
+                            if pool.host_capacity_tokens is None
+                            else pool.host_capacity_tokens
+                        ),
+                        start_layer=pool.start_layer,
+                        end_layer=pool.end_layer,
+                        target_layer_num=(
+                            (pool.layer_num + pool.layer_shard_size - 1)
+                            // pool.layer_shard_size
+                            if pool.layer_shard_enabled
+                            else pool.layer_num
+                        ),
+                        layer_shard_enabled=pool.layer_shard_enabled,
+                        **kwargs,
+                    )
+                    dummy = MLATokenToKVPoolHost(
+                        MLAHostAllocation(
+                            dtype=pool.store_dtype,
+                            kv_lora_rank=pool.kv_lora_rank,
+                            qk_rope_head_dim=pool.qk_rope_head_dim,
+                            kv_cache_dim=(pool.kv_lora_rank + pool.qk_rope_head_dim),
+                            size_per_token=(pool.kv_lora_rank + pool.qk_rope_head_dim)
+                            * pool.store_dtype.itemsize
+                            * (pool.layer_num),
+                        ),
+                        device_capacity_tokens=pool.host_capacity_tokens,
+                        start_layer=pool.start_layer,
+                        end_layer=pool.end_layer,
+                        target_layer_num=pool.layer_num,
+                        **kwargs,
+                    )
+                    self.addCleanup(host.destroy)
+                    self.addCleanup(dummy.destroy)
+                    self.assertEqual(
+                        (host.size, host.page_num, host.page_size, host.size_per_token),
+                        (
+                            dummy.size,
+                            dummy.page_num,
+                            dummy.page_size,
+                            dummy.size_per_token,
+                        ),
+                    )
+                    self.assertIsNone(dummy.kv_buffer)
+                    count = host.logical_size // 4 * 4
+                    self.assertEqual(
+                        host.alloc(count).tolist(), dummy.alloc(count).tolist()
+                    )
 
     def test_layer_broadcast_reuses_full_staging_capacity(self):
         broadcaster = MLAHostDedupBroadcaster.__new__(MLAHostDedupBroadcaster)

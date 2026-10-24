@@ -8,10 +8,6 @@ from transformers.image_utils import (
     SizeDict,
     get_image_size,
 )
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
-from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
-    smart_resize as smart_resize_video,
-)
 from transformers.utils import TensorType
 from transformers.video_utils import group_videos_by_shape, reorder_videos
 
@@ -86,19 +82,12 @@ def npu_wrapper_preprocess(func):
         )
         resized_images_grouped = {}
         for shape, stacked_images in grouped_images.items():
-            height, width = stacked_images.shape[-2:]
             if do_resize:
-                resized_height, resized_width = smart_resize(
-                    height,
-                    width,
-                    factor=patch_size * merge_size,
-                    min_pixels=size.shortest_edge,
-                    max_pixels=size.longest_edge,
-                )
                 stacked_images = self.resize(
-                    image=stacked_images,
-                    size=SizeDict(height=resized_height, width=resized_width),
+                    images=stacked_images,
+                    size=size,
                     resample=resample,
+                    factor=patch_size * merge_size,
                 )
             resized_images_grouped[shape] = stacked_images
         resized_images = reorder_images(resized_images_grouped, grouped_images_index)
@@ -193,26 +182,13 @@ def npu_wrapper_video_preprocess(func):
         resized_videos_grouped = {}
 
         for shape, stacked_videos in grouped_videos.items():
-            B, T, C, H, W = stacked_videos.shape
-            num_frames, height, width = T, H, W
             if do_resize:
-                resized_height, resized_width = smart_resize_video(
-                    num_frames=num_frames,
-                    height=height,
-                    width=width,
-                    temporal_factor=temporal_patch_size,
-                    factor=patch_size * merge_size,
-                    min_pixels=size.shortest_edge,
-                    max_pixels=size.longest_edge,
-                )
-                stacked_videos = stacked_videos.view(B * T, C, H, W)
                 stacked_videos = self.resize(
-                    stacked_videos,
-                    size=SizeDict(height=resized_height, width=resized_width),
+                    videos=stacked_videos,
+                    size=size,
                     resample=resample,
-                )
-                stacked_videos = stacked_videos.view(
-                    B, T, C, resized_height, resized_width
+                    factor=patch_size * merge_size,
+                    temporal_factor=temporal_patch_size,
                 )
             resized_videos_grouped[shape] = stacked_videos
         resized_videos = reorder_videos(resized_videos_grouped, grouped_videos_index)

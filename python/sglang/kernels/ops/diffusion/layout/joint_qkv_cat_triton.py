@@ -55,35 +55,6 @@ def _joint_qkv_cat_kernel(
     tl.store(OUT + (component * BATCH * sequence + row) * HIDDEN + cols, value, mask)
 
 
-def can_use_joint_qkv_cat(*inputs: torch.Tensor) -> bool:
-    if len(inputs) != 6 or torch.compiler.is_compiling() or torch.version.hip:
-        return False
-    first = inputs[0]
-    if first.ndim != 4 or not first.is_cuda:
-        return False
-    if first.dtype not in (torch.float16, torch.bfloat16):
-        return False
-    batch, tokens, heads, dim = first.shape
-    if min(batch, tokens, heads, dim) <= 0 or heads * dim > 8192:
-        return False
-    for index, value in enumerate(inputs):
-        expected = first.shape if index < 3 else inputs[3].shape
-        if (
-            value.ndim != 4
-            or value.shape != expected
-            or value.shape[0] != batch
-            or value.shape[2:] != (heads, dim)
-            or value.shape[1] <= 0
-            or value.dtype != first.dtype
-            or value.device != first.device
-            or value.requires_grad
-            or value.stride(-1) != 1
-            or value.stride(-2) != dim
-        ):
-            return False
-    return True
-
-
 def joint_qkv_cat(
     img_q: torch.Tensor,
     img_k: torch.Tensor,
@@ -98,7 +69,33 @@ def joint_qkv_cat(
     The three outputs occupy disjoint, contiguous regions of one allocation.
     """
     inputs = (img_q, img_k, img_v, txt_q, txt_k, txt_v)
-    assert can_use_joint_qkv_cat(*inputs)
+    if not (
+        img_q.is_cuda
+        and img_q.dtype in (torch.float16, torch.bfloat16)
+        and img_q.ndim == 4
+        and min(img_q.shape) > 0
+        and img_q.shape[-2] * img_q.shape[-1] <= 8192
+    ):
+        raise RuntimeError(
+            "joint QKV expects FP16/BF16 CUDA [B, S, H, D], 0 < H * D <= 8192"
+        )
+    for index, value in enumerate(inputs):
+        expected = img_q.shape if index < 3 else txt_q.shape
+        if not (
+            value.ndim == 4
+            and value.shape == expected
+            and value.shape[0] == img_q.shape[0]
+            and value.shape[2:] == img_q.shape[2:]
+            and value.shape[1] > 0
+            and value.dtype == img_q.dtype
+            and value.device == img_q.device
+            and not value.requires_grad
+            and value.stride(-1) == 1
+            and value.stride(-2) == img_q.shape[-1]
+        ):
+            raise RuntimeError(
+                "joint QKV inputs must share batch/head shape, dtype/device and have packed head rows without gradients"
+            )
     batch, image_tokens, heads, dim = img_q.shape
     text_tokens = txt_q.shape[1]
     output = torch.empty(

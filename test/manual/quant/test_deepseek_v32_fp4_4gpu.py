@@ -24,9 +24,8 @@ class TestDeepseekV32FP4DP(CustomTestCase):
         other_args = [
             "--tp",
             "4",
-            "--dp",
+            "--attn-dp-size",
             "4",
-            "--enable-dp-attention",
             "--moe-runner-backend",
             "flashinfer_trtllm",
             "--quantization",

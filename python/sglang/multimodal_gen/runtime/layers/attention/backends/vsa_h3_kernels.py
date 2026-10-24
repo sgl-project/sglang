@@ -12,11 +12,18 @@ The attention kernel consumes an explicit per-query-block index list
 chunks and 3D video tiles whose dimensions do not divide the tile shape - mask
 their pad columns exactly.
 
+Two kernels implement the same attention with different load paths: a TMA
+tensor-descriptor kernel for Hopper and newer, and a raw-pointer kernel for
+sm80, where Triton does not lower descriptor loads to TMA. Both compute
+identical results; ``vsa_h3_block_sparse_attn_forward`` picks between them
+from the device compute capability.
+
 ``vsa_h3_pack_tiles`` gathers packed ``[T, H, D]`` rows into the head-major
 padded tile layout the attention kernel reads and pools each tile in the same
 pass; ``vsa_h3_untile`` scatters the attention output back to packed rows and
 folds in the gated compression branch. Both replace chains of index copies
 and transposes that otherwise cost more than the attention kernel itself.
+``vsa_h3_gate_add`` folds the same branch after the caller's collectives.
 """
 
 import math
@@ -33,9 +40,23 @@ VSA_H3_KERNEL_BLOCK = 64
 
 # Pinned instead of autotuned: on B300 num_warps=4 wins at every sequence
 # length and num_stages=5 is within 0.5% of the best (7 spills); FastVideo
-# reports the same optimum for Blackwell.
+# reports the same optimum for Blackwell. The raw-pointer path used on sm80
+# measures best at num_stages=2 on the production DiT shape (H=56, D=128,
+# S=37760, keep=66); its loads are not TMA-prefetched, so the deeper pipeline
+# the descriptor path relies on does not help there.
 _ATTN_NUM_WARPS = 4
 _ATTN_NUM_STAGES = 5
+_ATTN_NUM_STAGES_PTR = 2
+
+
+def _use_pointer_loads(capability: tuple[int, int]) -> bool:
+    """Whether to use the raw-pointer kernel for the given compute capability.
+
+    ``TensorDescriptor`` loads are lowered to TMA only on Hopper and newer. On
+    sm80 Triton degrades them to synchronous tile loads without ``cp.async``
+    prefetch, so the pointer kernel is used there instead.
+    """
+    return capability[0] < 9
 
 
 @triton.jit
@@ -98,6 +119,95 @@ def _attn_fwd_sparse(
     )
 
 
+@triton.jit
+def _attn_fwd_sparse_ptr(
+    Q,
+    K,
+    V,
+    O,
+    sm_scale,
+    q2k_index,
+    q2k_num,
+    max_kv_blks,
+    variable_block_sizes,
+    H,
+    N_CTX_Q,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Same block-sparse attention as ``_attn_fwd_sparse``, loading Q/K/V/O
+    through raw pointers instead of TMA tensor descriptors.
+
+    On sm80 Triton does not lower ``TensorDescriptor`` loads to TMA; they become
+    synchronous tile loads with no ``cp.async`` prefetch, so each K/V tile load
+    exposes its full latency. Raw pointer loads let the pipeliner issue
+    ``cp.async`` for K/V on Ampere. The arithmetic is the same as the descriptor
+    kernel, so the output is bit-identical (verified against the Hopper path and
+    torch SDPA).
+    """
+    q_blk = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    q_tiles = N_CTX_Q // BLOCK_M
+    meta_base = off_hz * q_tiles + q_blk
+
+    kv_blocks = tl.load(q2k_num + meta_base)
+    kv_ptr = q2k_index + meta_base.to(tl.int64) * max_kv_blks
+
+    # Contiguous [B, H, S, D]: fold (b, h) into a single base offset.
+    bh = off_hz.to(tl.int64)
+    sd = N_CTX_Q * HEAD_DIM
+    q_base = Q + bh * sd
+    k_base = K + bh * sd
+    v_base = V + bh * sd
+    o_base = O + bh * sd
+
+    offs_m = q_blk * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q = tl.load(q_base + offs_m[:, None].to(tl.int64) * HEAD_DIM + offs_d[None, :])
+    m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    qk_scale = sm_scale * 1.44269504  # 1/ln2
+
+    for i in range(0, kv_blocks):
+        kv_idx = tl.load(kv_ptr + i).to(tl.int64)
+        block_size = tl.load(variable_block_sizes + kv_idx)
+        kv_row = kv_idx * BLOCK_N
+        k = tl.load(
+            k_base
+            + (kv_row + offs_n)[:, None].to(tl.int64) * HEAD_DIM
+            + offs_d[None, :]
+        )
+        qk = tl.dot(q, tl.trans(k))
+        mask = offs_n[None, :] < block_size
+        qk = tl.where(mask, qk, -float("inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+        p = tl.math.exp2(qk * qk_scale - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
+
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        acc = acc * alpha[:, None]
+
+        v = tl.load(
+            v_base
+            + (kv_row + offs_n)[:, None].to(tl.int64) * HEAD_DIM
+            + offs_d[None, :]
+        )
+        acc = tl.dot(p.to(tl.bfloat16), v, acc)
+        m_i = m_ij
+
+    acc = acc / l_i[:, None]
+    tl.store(
+        o_base + offs_m[:, None].to(tl.int64) * HEAD_DIM + offs_d[None, :],
+        acc.to(O.dtype.element_ty),
+    )
+
+
 def vsa_h3_block_sparse_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -106,10 +216,12 @@ def vsa_h3_block_sparse_attn_forward(
     q2k_num: torch.Tensor,
     variable_block_sizes: torch.Tensor,
     out: torch.Tensor | None = None,
+    use_sm100_kernel: bool = False,
 ) -> torch.Tensor:
     """q/k/v: contiguous [B, H, S_pad, D] bf16 with S_pad = n_tiles * 64; pad
     rows zero. q2k_index/q2k_num: contiguous [B, H, n_tiles, max_kv] /
-    [B, H, n_tiles] int32."""
+    [B, H, n_tiles] int32. ``use_sm100_kernel`` runs FastVideo's tcgen05 kernel (sm_100a /
+    sm_103a, even n_tiles) instead of the Triton kernel."""
     batch, heads, seq_q, head_dim = q.shape
     seq_kv = k.shape[2]
     if seq_q % VSA_H3_KERNEL_BLOCK or seq_kv % VSA_H3_KERNEL_BLOCK:
@@ -122,22 +234,62 @@ def vsa_h3_block_sparse_attn_forward(
             "variable_block_sizes must have one entry per 64-token key block: "
             f"{variable_block_sizes.numel()} vs {seq_kv // VSA_H3_KERNEL_BLOCK}"
         )
+    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+        raise ValueError("q/k/v must be contiguous [B, H, S_pad, D]")
     if out is None:
         out = torch.empty_like(q)
+    if use_sm100_kernel:
+        # Imported lazily: the sm100 tcgen05 kernel is an optional fast path, and
+        # the Triton kernel below must stay usable on stacks that do not ship it.
+        from sglang.kernels.ops.diffusion import vsa_block_sparse_sm100
+
+        vsa_block_sparse_sm100(
+            q,
+            k,
+            v,
+            q2k_index.view(-1, q2k_index.shape[-1]),
+            q2k_num.view(-1),
+            variable_block_sizes,
+            out,
+            1.0 / math.sqrt(head_dim),
+        )
+        return out
+    grid = (seq_q // VSA_H3_KERNEL_BLOCK, batch * heads, 1)
+    max_kv_blks = q2k_index.shape[-1]
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    if _use_pointer_loads(torch.cuda.get_device_capability()):
+        _attn_fwd_sparse_ptr[grid](
+            q,
+            k,
+            v,
+            out,
+            sm_scale,
+            q2k_index,
+            q2k_num,
+            max_kv_blks,
+            variable_block_sizes,
+            heads,
+            seq_q,
+            HEAD_DIM=head_dim,
+            BLOCK_M=VSA_H3_KERNEL_BLOCK,
+            BLOCK_N=VSA_H3_KERNEL_BLOCK,
+            num_warps=_ATTN_NUM_WARPS,
+            num_stages=_ATTN_NUM_STAGES_PTR,
+        )
+        return out
     block = [1, 1, VSA_H3_KERNEL_BLOCK, head_dim]
     desc_q, desc_k, desc_v, desc_o = (
         TensorDescriptor.from_tensor(t, block_shape=block) for t in (q, k, v, out)
     )
-    grid = (seq_q // VSA_H3_KERNEL_BLOCK, batch * heads, 1)
     _attn_fwd_sparse[grid](
         desc_q,
         desc_k,
         desc_v,
         desc_o,
-        1.0 / math.sqrt(head_dim),
+        sm_scale,
         q2k_index,
         q2k_num,
-        q2k_index.shape[-1],
+        max_kv_blks,
         variable_block_sizes,
         heads,
         seq_q,
@@ -243,9 +395,10 @@ def vsa_h3_pack_tiles(
     """Gather packed [T, H, D] rows into ``tiled`` [3|4, H, S_pad, D] and write
     fp32 per-tile means of q/k/v into ``pooled`` [3, H, n_tiles, D].
     ``src_index`` maps each padded position to its packed row, or -1 (pad -> 0).
+    S_pad may hold one extra empty tile past ``n_tiles``; it is left untouched.
     """
     _, heads, seq_pad, head_dim = tiled.shape
-    n_tiles = seq_pad // VSA_H3_KERNEL_BLOCK
+    n_tiles = pooled.shape[2]
     has_gate = gate is not None
     g = gate if has_gate else q
     assert all(t.stride(-1) == 1 for t in (q, k, v, g))
@@ -327,6 +480,8 @@ def vsa_h3_untile(
     heads, seq_pad, head_dim = out_tiled.shape
     total = result.shape[0]
     has_gate = gate_tiled is not None
+    # S_pad may carry one padded tile; the compression output does not
+    n_tiles = out_compress.shape[1] if has_gate else seq_pad // VSA_H3_KERNEL_BLOCK
     _untile_kernel[(triton.cdiv(total, VSA_H3_KERNEL_BLOCK), heads)](
         out_tiled,
         gate_tiled if has_gate else out_tiled,
@@ -336,8 +491,126 @@ def vsa_h3_untile(
         used,
         total,
         seq_pad,
-        seq_pad // VSA_H3_KERNEL_BLOCK,
+        n_tiles,
         HAS_GATE=has_gate,
         HEAD_DIM=head_dim,
         BLOCK=VSA_H3_KERNEL_BLOCK,
+    )
+
+
+@triton.jit
+def _gate_add_kernel(
+    Out,
+    Gate,
+    Compress,
+    tile_index,
+    num_rows,
+    stride_o_row,
+    stride_o_head,
+    stride_g_row,
+    stride_g_head,
+    N_TILES,
+    HEAD_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row_block = tl.program_id(0)
+    h = tl.program_id(1)
+    rows = row_block * BLOCK + tl.arange(0, BLOCK)
+    cols = tl.arange(0, HEAD_DIM)
+    in_rows = rows < num_rows
+    tile = tl.load(tile_index + rows, mask=in_rows, other=-1)
+    valid = (tile >= 0)[:, None]
+    o_off = (
+        rows.to(tl.int64)[:, None] * stride_o_row + h * stride_o_head + cols[None, :]
+    )
+    g_off = (
+        rows.to(tl.int64)[:, None] * stride_g_row + h * stride_g_head + cols[None, :]
+    )
+    o = tl.load(Out + o_off, mask=valid, other=0.0).to(tl.float32)
+    g = tl.load(Gate + g_off, mask=valid, other=0.0).to(tl.float32)
+    c = tl.load(
+        Compress + (h * N_TILES + tile)[:, None] * HEAD_DIM + cols[None, :],
+        mask=valid,
+        other=0.0,
+    )
+    o = o + c * g
+    tl.store(Out + o_off, o.to(Out.type.element_ty), mask=valid)
+
+
+def vsa_h3_gate_add(
+    out: torch.Tensor,
+    gate: torch.Tensor,
+    out_compress: torch.Tensor,
+    tile_index: torch.Tensor,
+) -> None:
+    """In place: ``out[t, h] += out_compress[h, tile_index[t]] * gate[t, h]``
+    where ``tile_index[t] >= 0``; same fp32 arithmetic as ``vsa_h3_untile``."""
+    num_rows, heads, head_dim = out.shape
+    assert out.stride(-1) == 1 and gate.stride(-1) == 1
+    assert out_compress.is_contiguous() and out_compress.shape[0] == heads
+    _gate_add_kernel[(triton.cdiv(num_rows, VSA_H3_KERNEL_BLOCK), heads)](
+        out,
+        gate,
+        out_compress,
+        tile_index,
+        num_rows,
+        out.stride(0),
+        out.stride(1),
+        gate.stride(0),
+        gate.stride(1),
+        out_compress.shape[1],
+        HEAD_DIM=head_dim,
+        BLOCK=VSA_H3_KERNEL_BLOCK,
+    )
+
+
+@triton.jit
+def _topk_lists_kernel(
+    mask_ptr,
+    out_ptr,
+    num_video_tiles,
+    prefix,
+    stride_mh,
+    stride_mr,
+    stride_oh,
+    stride_or,
+    VIDEO_POW2: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    mask_row = mask_ptr + head * stride_mh + row * stride_mr
+    out_row = out_ptr + head * stride_oh + row * stride_or
+    cols = tl.arange(0, VIDEO_POW2)
+    in_range = cols < num_video_tiles
+    picked = tl.load(mask_row + cols, mask=in_range, other=0).to(tl.int32)
+    slot = tl.cumsum(picked, axis=0) - 1
+    tl.store(out_row + prefix + slot, cols + prefix, mask=in_range & (picked != 0))
+    # Leave the mask zeroed for the next layer's scatter.
+    tl.store(mask_row + cols, tl.zeros_like(picked).to(tl.int8), mask=in_range)
+
+
+def vsa_h3_topk_lists(
+    picked: torch.Tensor, mask: torch.Tensor, out: torch.Tensor, num_prefix_tiles: int
+) -> None:
+    """Write ``sort(picked + prefix)`` into ``out[h, r, prefix:]``.
+
+    ``picked`` [H, rows, keep] holds distinct video-tile indices in any order;
+    ``mask`` [H, rows, num_video_tiles] is an all-zero int8 scratch, left
+    zeroed; ``out`` [H, rows, >= prefix + keep] is int32 whose first ``prefix``
+    columns already hold ``[0, prefix)``."""
+    heads, rows, _ = picked.shape
+    num_video_tiles = mask.shape[-1]
+    assert mask.dtype == torch.int8 and mask.is_contiguous()
+    assert out.dtype == torch.int32 and out.stride(-1) == 1
+    mask.scatter_(-1, picked, 1)
+    _topk_lists_kernel[(rows, heads)](
+        mask,
+        out,
+        num_video_tiles,
+        num_prefix_tiles,
+        mask.stride(0),
+        mask.stride(1),
+        out.stride(0),
+        out.stride(1),
+        VIDEO_POW2=triton.next_power_of_2(num_video_tiles),
     )

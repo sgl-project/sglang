@@ -545,6 +545,20 @@ class TestSubBlockNumerics(unittest.TestCase):
             self.skipTest("requires the SM120 SubBlock kernel")
         self._assert_kernel_backed_mixed_query_mask()
 
+    def test_head_chunks_match_one_call(self):
+        """Splitting a call by heads must not change its output."""
+        q, k, v = _structured_qkv(self.seq_len, torch.device("cuda"))
+        impl = self._impl(sparsity=0.75)
+        mask = torch.arange(self.seq_len // 64, device="cuda") >= self.seq_len // 128
+        whole = impl._sparse_attention(q, k, v, sparse_query_block_mask=mask)
+        one_head = (self.seq_len // 64) ** 2
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn._MAX_ROUTED_BLOCK_PAIRS",
+            one_head,
+        ):
+            chunked = impl._sparse_attention(q, k, v, sparse_query_block_mask=mask)
+        torch.testing.assert_close(chunked, whole, rtol=0, atol=0)
+
     def test_skipped_step_is_bitwise_dense(self):
         device = torch.device("cuda")
         q, k, v = _structured_qkv(self.seq_len, device)
@@ -575,6 +589,25 @@ class TestSubBlockNumerics(unittest.TestCase):
                 HEAD_DIM**-0.5,
             )[0]
             self.assertGreater(_cosine(out[start:stop], ref), 0.999)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.mem_get_info()[0] >= 48 * 2**30,
+    "needs a CUDA GPU with 48 GiB free",
+)
+class TestRouterPastInt32(unittest.TestCase):
+    def test_last_heads_match_when_tensors_pass_int32(self):
+        """With q/k and the score matrix past 2^31 elements, the last heads must
+        still match the same heads routed alone."""
+        shape = (1, 491_520, 56, HEAD_DIM)
+        q = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn_like(q)
+        router, tail = SubBlockRouter(), slice(54, 56)
+        kwargs = dict(sparsity=0.8, softmax_scale=HEAD_DIM**-0.5)
+        index = router.route(q, k, **kwargs).index[:, tail].sort(dim=-1).values
+        q, k = q[:, :, tail].contiguous(), k[:, :, tail].contiguous()
+        ref = router.route(q, k, **kwargs).index.sort(dim=-1).values
+        self.assertTrue(torch.equal(index, ref))
 
 
 if __name__ == "__main__":

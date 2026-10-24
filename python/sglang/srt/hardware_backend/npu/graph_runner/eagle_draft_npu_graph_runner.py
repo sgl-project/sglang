@@ -23,6 +23,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
     is_deepseek_v4,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
@@ -77,12 +78,12 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         decision = torch.tensor(
             int(can_run_graph and seed_ready),
             dtype=torch.int32,
-            device=self.device,
+            device="cpu",
         )
         torch.distributed.all_reduce(
             decision,
             op=torch.distributed.ReduceOp.MIN,
-            group=self.model_runner.tp_group.device_group,
+            group=get_parallel().tp_group.cpu_group,
         )
         return bool(decision.item())
 

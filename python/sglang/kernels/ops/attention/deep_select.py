@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING, Dict, NamedTuple, Optional, Tuple
 
 import torch
@@ -10,6 +11,7 @@ from sglang.kernels.jit.utils import (
     cache_once,
     load_jit,
     make_cpp_args,
+    parallel_compile,
 )
 
 if TYPE_CHECKING:
@@ -19,7 +21,7 @@ if TYPE_CHECKING:
 _INPUT_STRIDE_ALIGNMENT_BYTES = 128
 _OUTPUT_STRIDE_ALIGNMENT_BYTES = 32
 _CLUSTER_MAX_TOPK = 1024
-_CLUSTER_MAX_BATCH_SIZE = 6
+_CLUSTER_MIN_VOCAB_SIZE = 16384
 
 
 class _Config(NamedTuple):
@@ -79,11 +81,26 @@ _NORMAL_CONFIGS: Dict[Tuple[torch.dtype, int], Tuple[_Config, ...]] = {
 SUPPORTED_CUDA_ARCHS = ((9, 0), (10, 0), (10, 3))
 
 
+# (max rows, cluster size), widest first: the most rows each cluster size runs in one wave
 @cache_once
-def _cluster_tuning(device_capability: Tuple[int, int]) -> Tuple[int, int]:
-    # Return (cluster_size, min_vocab_size)
-    major = device_capability[0]
-    return (8, 128 * 1024) if major == 9 else (16, 512 * 1024)
+def _cluster_tiers() -> Tuple[Tuple[int, int], ...]:
+    from sglang.kernels.jit.utils.occupancy import (
+        NoSchedulableClustersError,
+        get_max_active_clusters,
+    )
+
+    tiers = []
+    # NOTE: only try these cluster sizes; add more variants if we need
+    for cluster_size in (16, 8, 4, 3, 2):
+        try:
+            # The cluster kernel runs one CTA per SM
+            max_rows = get_max_active_clusters(cluster_size, occupancy=1)
+        except NoSchedulableClustersError:
+            continue
+        # A narrower cluster earns a tier only by fitting more rows in one wave
+        if not tiers or max_rows > tiers[-1][0]:
+            tiers.append((max_rows, cluster_size))
+    return tuple(tiers)
 
 
 @cache_once
@@ -120,7 +137,8 @@ def _jit_deep_select_module(
             raise ValueError(
                 "the cluster kernel is tuned for bfloat16 at max_topk 1024 only"
             )
-        configs = [_Config(max_topk, 256, 1, 4096, 4096, 16, cluster_size)]
+        # The cluster kernel streams its own stages; this tuning only fixes 512 threads
+        configs = [_Config(max_topk, 512, 1, 8192, 4096, 5, cluster_size)]
         host_dispatch = "TopkCluster"
     classes = [
         config.to_cpp_class_name(
@@ -187,6 +205,51 @@ def is_deep_select_supported() -> bool:
     return (major, minor) in SUPPORTED_CUDA_ARCHS
 
 
+class _CachedModuleDispatch:
+    def __init__(self, mods: list[Module], rows: list[int], fallback: Module):
+        self._clusters = tuple(zip(rows, mods, strict=True))
+        self._fallback = fallback
+
+    def __call__(self, rows: int, vocab_size: int):
+        # NOTE: deficiency: cluster + sorted_index supports up to 1M context
+        if vocab_size > _CLUSTER_MIN_VOCAB_SIZE:
+            for max_rows, module in self._clusters:
+                if rows <= max_rows:
+                    return module
+        return self._fallback
+
+
+@cache_once
+def _precompile(
+    *,
+    dtype: torch.dtype,
+    topk: int,
+    sorted: bool,
+    indices_type: torch.dtype,
+    sorted_index: bool,
+    return_value: bool,
+    page_transform: bool,
+) -> _CachedModuleDispatch:
+    signature = (dtype, indices_type, sorted, sorted_index, return_value)
+    jobs = [(_get_max_topk_bucket(topk, False), 1)]
+    rows = []
+    if dtype == torch.bfloat16 and topk <= _CLUSTER_MAX_TOPK:
+        for max_rows, cluster_size in _cluster_tiers():
+            jobs.append((_get_max_topk_bucket(topk, True), cluster_size))
+            rows.append(max_rows)
+    modules = parallel_compile(
+        functools.partial(
+            _jit_deep_select_module,
+            *signature,
+            bucket,
+            cluster_size,
+            page_transform,
+        )
+        for bucket, cluster_size in jobs
+    )
+    return _CachedModuleDispatch(modules[1:], rows, modules[0])
+
+
 def topk(
     input: torch.Tensor,
     topk: int,
@@ -201,8 +264,8 @@ def topk(
     output_idx_offset: Optional[torch.Tensor] = None,
     idx_oob_fill_value: int = 2147483647,
     value_oob_fill_value: float = float("-inf"),
-    return_value: bool = True,
-    abort_when_nan_found: bool = True,
+    return_value: bool = False,
+    abort_when_nan_found: bool = False,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     """Select the largest ``topk`` values of every row of ``input``.
 
@@ -239,7 +302,7 @@ def topk_page_transform(
     sorted_index: bool = False,
     output_idx: Optional[torch.Tensor] = None,
     idx_oob_fill_value: int = -1,
-    abort_when_nan_found: bool = True,
+    abort_when_nan_found: bool = False,
 ) -> torch.Tensor:
     """Top-k indices of every row of ``input``, written through a page table.
 
@@ -291,19 +354,21 @@ def _launch_topk_impl(
     abort_when_nan_found: bool,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     rows, vocab_size = input.shape
-    device_capability = torch.cuda.get_device_capability(input.device)
-    cluster_size, cluster_min_vocab_size = _cluster_tuning(device_capability)
-    use_cluster = (
-        input.dtype == torch.bfloat16
-        and rows <= _CLUSTER_MAX_BATCH_SIZE
-        and vocab_size >= cluster_min_vocab_size
-        and topk <= _CLUSTER_MAX_TOPK
+    dtype = input.dtype
+    dispatch = _precompile(
+        dtype=dtype,
+        topk=topk,
+        sorted=sorted,
+        indices_type=indices_type,
+        sorted_index=sorted_index,
+        return_value=return_value,
+        page_transform=page_table is not None,
     )
     values = None
     if return_value:
         values = aligned_new_empty(
             (rows, topk),
-            input.dtype,
+            dtype,
             input.device,
             alignment_bytes=_OUTPUT_STRIDE_ALIGNMENT_BYTES,
         )
@@ -314,20 +379,10 @@ def _launch_topk_impl(
             input.device,
             alignment_bytes=_OUTPUT_STRIDE_ALIGNMENT_BYTES,
         )
-    module = _jit_deep_select_module(
-        input.dtype,
-        indices_type,
-        sorted,
-        sorted_index,
-        return_value,
-        _get_max_topk_bucket(topk, use_cluster),
-        cluster_size if use_cluster else 1,
-        page_table is not None,
-    )
     input_storage_bytes = (
         input.untyped_storage().nbytes() - input.storage_offset() * input.element_size()
     )
-    module.topk(
+    dispatch(rows, vocab_size).topk(
         input,
         values,
         output_idx,

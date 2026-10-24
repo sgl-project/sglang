@@ -15,6 +15,8 @@ import torch
 import torch.nn.functional as F
 
 import sglang.kernels.kda_kernels.ltx2_qknorm_split_rope_jit as ltx2_qknorm_jit
+from sglang.kernels.jit.utils import load_jit
+from sglang.kernels.kda_kernels import _cuda_source
 from sglang.kernels.ops.diffusion import (
     can_use_ltx2_qknorm_split_rope_cuda,
     ltx2_qknorm_split_rope_cuda,
@@ -22,7 +24,7 @@ from sglang.kernels.ops.diffusion import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 DEVICE = "cuda"
 BF16_FUSED_ATOL = 1.6e-1
@@ -175,6 +177,114 @@ def test_ltx2_qknorm_hopper_quality_path_matches_within_bf16() -> None:
     torch.testing.assert_close(k_out, k_ref, rtol=0, atol=BF16_FUSED_ATOL)
 
 
+@pytest.fixture(scope="module")
+def ltx2_hopper_baseline():
+    _require_sm90()
+    # Keep the original scalar CUDA implementation as the exact rounding oracle.
+    return load_jit(
+        "test_ltx2_qknorm_hopper_baseline",
+        cuda_files=[_cuda_source("diffusion/ltx2_qknorm_split_rope.cuh")],
+        cuda_wrappers=[
+            ("run", "ltx2_qknorm_split_rope::LTX2QKNormSplitRopeKernel::run<true>")
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "batch,q_seq,k_seq,num_heads,head_dim,q_pad,q_offset,k_pad,k_offset",
+    [
+        (1, 7, 3, 32, 128, 0, 0, 0, 0),
+        (2, 5, 2, 32, 64, 0, 0, 0, 0),
+        (2, 5, 2, 32, 128, 1, 0, 0, 0),
+        (1, 7, 3, 32, 128, 0, 1, 0, 2),
+        (1, 7, 3, 32, 128, 0, 2, 0, 0),
+        (2, 4, 3, 2, 6, 0, 0, 1, 1),
+        (2, 4, 3, 4, 4, 0, 0, 0, 0),
+        (1, 3, 2, 128, 8, 0, 0, 0, 0),
+        (1, 0, 3, 32, 128, 0, 0, 0, 0),
+        (1, 3, 0, 32, 128, 0, 0, 0, 0),
+        (1, 0, 0, 32, 128, 0, 0, 0, 0),
+    ],
+)
+def test_ltx2_qknorm_hopper_alignment_and_empty_sides(
+    ltx2_hopper_baseline,
+    batch,
+    q_seq,
+    k_seq,
+    num_heads,
+    head_dim,
+    q_pad,
+    q_offset,
+    k_pad,
+    k_offset,
+) -> None:
+    torch.cuda.manual_seed(20260927)
+    hidden = num_heads * head_dim
+
+    def packed(shape, offset):
+        size = 1
+        for dim in shape:
+            size *= dim
+        return torch.randn(size + offset, device=DEVICE, dtype=torch.bfloat16)[
+            offset:
+        ].view(shape)
+
+    def side(seq_len, pad, offset):
+        shape = (batch, num_heads, seq_len, head_dim // 2)
+        width = head_dim // 2 + pad
+        strides = (seq_len * num_heads * width, width, num_heads * width, 1)
+        size = (
+            offset
+            + 1
+            + sum(max(dim - 1, 0) * stride for dim, stride in zip(shape, strides))
+        )
+        rope = [
+            torch.randn(size, device=DEVICE, dtype=torch.bfloat16).as_strided(
+                shape, strides, offset
+            )
+            for _ in range(2)
+        ]
+        return [
+            packed((batch, seq_len, hidden), offset),
+            *rope,
+            packed((hidden,), offset),
+        ]
+
+    args = side(q_seq, q_pad, q_offset) + side(k_seq, k_pad, k_offset)
+
+    def baseline():
+        outputs = (torch.empty_like(args[0]), torch.empty_like(args[4]))
+        ltx2_hopper_baseline.run(*outputs, *args, 1e-6, num_heads, head_dim)
+        return outputs
+
+    def candidate():
+        return ltx2_qknorm_split_rope_cuda(
+            *args, eps=1e-6, num_heads=num_heads, head_dim=head_dim, allow_sm90=True
+        )
+
+    def assert_exact(actual, expected):
+        for output, reference in zip(actual, expected):
+            assert output.shape == reference.shape
+            assert output.stride() == reference.stride()
+            assert output.dtype == reference.dtype
+            assert torch.equal(output.view(torch.uint8), reference.view(torch.uint8))
+
+    assert_exact(candidate(), baseline())
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        candidate()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = candidate()
+    # Replay must consume current values, including on mixed scalar/vector paths.
+    for value in args:
+        value.add_(0.125)
+    graph.replay()
+    assert_exact(captured, baseline())
+
+
 @pytest.mark.parametrize(
     "batch,q_seq,k_seq,num_heads,head_dim",
     [
@@ -280,7 +390,11 @@ def test_ltx2_qknorm_split_rope_rejects_unsupported_inputs() -> None:
 
 
 def test_ltx2_qknorm_split_rope_custom_op_torch_compile_fullgraph() -> None:
-    _require_b200()
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    hopper = torch.cuda.get_device_capability() == (9, 0)
+    if not hopper:
+        _require_b200()
     torch.cuda.manual_seed(20260630)
     batch, q_seq, k_seq, num_heads, head_dim = 1, 3, 2, 32, 64
     hidden = num_heads * head_dim
@@ -304,10 +418,16 @@ def test_ltx2_qknorm_split_rope_custom_op_torch_compile_fullgraph() -> None:
             eps=1e-6,
             num_heads=num_heads,
             head_dim=head_dim,
+            allow_sm90=hopper,
         )
 
     compiled = torch.compile(fn, fullgraph=True)
     q_out, k_out = compiled(q, k, q_cos, q_sin, k_cos, k_sin, q_weight, k_weight)
+    if hopper:
+        expected = fn(q, k, q_cos, q_sin, k_cos, k_sin, q_weight, k_weight)
+        torch.testing.assert_close(q_out, expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(k_out, expected[1], rtol=0, atol=0)
+        return
     q_ref, k_ref = _ltx2_reference(
         q, k, q_cos, q_sin, k_cos, k_sin, q_weight, k_weight, 1e-6
     )

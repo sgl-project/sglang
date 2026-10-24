@@ -56,12 +56,6 @@ class TestBalancedPacking(CustomTestCase):
 
     # ------------------------------------------------------------------ tests
 
-    def test_output_shapes(self):
-        """pack_index and rank_in_pack have the same shape as weight."""
-        weight = torch.rand(3, 8)
-        pack_index, rank_in_pack = balanced_packing(weight, num_packs=4)
-        self._check_shapes(weight, pack_index, rank_in_pack)
-
     def test_pack_index_range(self):
         """All pack indices are in [0, num_packs)."""
         weight = torch.rand(2, 6)

@@ -32,7 +32,7 @@ def make_backend(mode, seq, req, *, fusion=True):
     backend.device = torch.device("cuda")
     backend.device_sm_major = torch.cuda.get_device_capability()[0]
     backend.num_q_heads = 64
-    backend.real_page_size = 64
+    backend.physical_page_size = 64
     backend.dsa_index_topk = TOPK
     backend.dsa_index_kpool = POOL
     backend.speculative_num_draft_tokens = NEXT_N
@@ -40,7 +40,7 @@ def make_backend(mode, seq, req, *, fusion=True):
     backend.dsa_decode_impl = "fa3"
     backend.dsa_prefill_impl = "fa3"
     backend.enable_auto_select_prefill_impl = False
-    backend.token_to_kv_pool = SimpleNamespace(slots_per_page=64)
+    backend.token_to_kv_pool = SimpleNamespace(index_page_size=64)
     # Only attention-dispatch state is synthetic; every metadata kernel is real.
     backend._is_in_breakable_cuda_graph = lambda: False
     backend._is_in_tc_piecewise_cuda_graph = lambda: False
@@ -96,13 +96,24 @@ def addresses(metadata):
     }
 
 
+def _topk_v2_plan_lengths(metadata, name):
+    if name == "topk_v2_plan":
+        return metadata.dsa_seqlens_expanded
+    if name == "pooled_topk_v2_plan":
+        return metadata.pooled_cache_seqlens_int32
+    if name == "kpool.pool_topk_v2_plan":
+        return metadata.kpool_write_plan.pool_seqlens_per_q
+    return None
+
+
 def assert_metadata_equal(test, actual, expected):
     actual_buffers, expected_buffers = tensor_buffers(actual), tensor_buffers(expected)
     test.assertEqual(actual_buffers.keys(), expected_buffers.keys())
     for name, value in actual_buffers.items():
         reference = expected_buffers[name]
-        if name == "topk_v2_plan":
-            if not topk_v2_plan_is_written(expected.dsa_seqlens_expanded):
+        plan_lengths = _topk_v2_plan_lengths(expected, name)
+        if plan_lengths is not None:
+            if not topk_v2_plan_is_written(plan_lengths):
                 continue
             # Unused plan rows are intentionally uninitialized. Active rows are
             # compacted by atomicAdd, so compare them in request order.

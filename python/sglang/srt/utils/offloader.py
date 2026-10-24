@@ -98,7 +98,16 @@ def _get_resident_parameter_ids(module: torch.nn.Module):
     # functional_call only replaces registered parameters and buffers, so cached
     # tensors held as ordinary attributes need their backing weights to stay put.
     resident = set()
+    cached_storages = set()
     for owner in module.modules():
+        for value in vars(owner).values():
+            if (
+                isinstance(value, torch.Tensor)
+                and not isinstance(value, torch.nn.Parameter)
+                and not value.is_meta
+                and value.numel() > 0
+            ):
+                cached_storages.add((value.device, value.untyped_storage().data_ptr()))
         # MLA post_load_weights derives w_kc/w_vc from kv_b_proj weights on
         # their current device. These attributes already exist before loading.
         projection = getattr(owner, "kv_b_proj", None)
@@ -108,29 +117,14 @@ def _get_resident_parameter_ids(module: torch.nn.Module):
             and hasattr(owner, "w_vc")
         ):
             resident.update(id(parameter) for parameter in projection.parameters())
-        # KDA caches a storage-sharing view of qkv_conv1d.weight in conv_weights
-        # during construction. Offloading the weight would leave that view stale.
-        projection = getattr(owner, "qkv_conv1d", None)
-        attention = getattr(owner, "attn", None)
-        if isinstance(projection, torch.nn.Module) and isinstance(
-            attention, torch.nn.Module
+    for parameter in module.parameters():
+        if (
+            not parameter.is_meta
+            and parameter.numel() > 0
+            and (parameter.device, parameter.untyped_storage().data_ptr())
+            in cached_storages
         ):
-            weight = getattr(projection, "weight", None)
-            cached = getattr(attention, "conv_weights", None)
-            if (
-                isinstance(weight, torch.nn.Parameter)
-                and isinstance(cached, torch.Tensor)
-                and cached.device == weight.device
-            ):
-                weight_storage = weight.untyped_storage()
-                cached_storage = cached.untyped_storage()
-                if (
-                    weight_storage.nbytes() > 0
-                    and weight_storage.data_ptr() != 0
-                    and weight_storage.nbytes() == cached_storage.nbytes()
-                    and weight_storage.data_ptr() == cached_storage.data_ptr()
-                ):
-                    resident.add(id(weight))
+            resident.add(id(parameter))
     return resident
 
 
@@ -210,7 +204,7 @@ class OffloaderV2(BaseOffloader):
         mode: str,
     ):
         parallel = get_parallel()
-        dp_rank, dp_size = parallel.dp_rank, parallel.dp_size
+        dp_rank, num_dp_ranks = parallel.dp_rank, parallel.num_dp_ranks
         self.group_size = group_size
         self.num_in_group = num_in_group
         self.prefetch_step = prefetch_step
@@ -224,7 +218,7 @@ class OffloaderV2(BaseOffloader):
             set_naive_distributed(
                 NaiveDistributed(
                     rank=dp_rank,
-                    world_size=dp_size,
+                    world_size=num_dp_ranks,
                     rendezvous=f"/tmp/{run_id}",
                 )
             )
@@ -267,6 +261,7 @@ class OffloaderV2(BaseOffloader):
                         module=submodule,
                         alt_stream=alt_stream,
                         whitelist_param_names=whitelist_param_names,
+                        resident_parameter_ids=_get_resident_parameter_ids(module),
                     )
                 )
 
@@ -328,6 +323,7 @@ class _ModuleOffloader(ABC):
         module: torch.nn.Module,
         alt_stream: torch.cuda.Stream,
         whitelist_param_names: List[str],
+        resident_parameter_ids: set[int],
     ):
         self.mode = mode
         self.module = module
@@ -349,6 +345,7 @@ class _ModuleOffloader(ABC):
         self._param_offloaders = {
             name: _BaseParamOffloader.create(mode, module=module, param_name=name)
             for name in whitelist_param_names
+            if id(param_dict[name]) not in resident_parameter_ids
         }
 
     def post_init(self):

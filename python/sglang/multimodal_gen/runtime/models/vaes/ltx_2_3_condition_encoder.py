@@ -131,7 +131,6 @@ class LTX23VideoConditionEncoder(
         latent_log_var = str(vae_config.get("latent_log_var", "uniform"))
 
         self.patch_size = patch_size
-        self.latency_channels = latent_channels
         self.latent_log_var = latent_log_var
         self.per_channel_statistics = LTX23PerChannelStatistics(latent_channels)
 

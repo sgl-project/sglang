@@ -27,6 +27,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -49,7 +50,13 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config, layer_id, quant_config=quant_config, prefix=prefix)
+        super().__init__(
+            config,
+            layer_id,
+            quant_config=quant_config,
+            prefix=prefix,
+            stage_boundaries=False,
+        )
 
         # Input layer concats embeds + target_hidden before qkv (input dim 2x).
         self.is_input_layer = layer_id == 0
@@ -187,12 +194,13 @@ class LlamaModel(nn.Module):
         else:
             self.fc_norm = None
 
-        self.layers = nn.ModuleList(
-            [
-                LlamaDecoderLayer(config, i, quant_config, prefix)
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    LlamaDecoderLayer(config, i, quant_config, prefix)
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.norm_output = getattr(config, "norm_output", False)

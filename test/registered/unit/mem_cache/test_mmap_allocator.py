@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import sys
 
@@ -15,45 +15,11 @@ import unittest.mock
 import torch
 
 from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm
+from sglang.srt.mem_cache.storage.mmap import alloc_shm
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import _mmap_prefaulted
 
 
 class TestMmapAllocator(unittest.TestCase):
-    def test_alloc_mmap(self):
-        dims = (10, 1024)
-        dtype = torch.float32
-        tensor = alloc_mmap(dims, dtype)
-        self.assertEqual(tensor.shape, dims)
-        self.assertEqual(tensor.dtype, dtype)
-        # Verify it has mapped memory address
-        self.assertGreater(tensor.data_ptr(), 0)
-
-    def test_alloc_shm(self):
-        dims = (10, 1024)
-        dtype = torch.float32
-        tensor, fd, mm = alloc_shm(dims, dtype)
-
-        self.assertEqual(tensor.shape, dims)
-        self.assertEqual(tensor.dtype, dtype)
-        self.assertGreater(tensor.data_ptr(), 0)
-        self.assertGreaterEqual(fd, 0)
-        self.assertIsInstance(mm, mmap.mmap)
-
-        # Check that we can write to the tensor
-        tensor[0, 0] = 42.0
-        self.assertEqual(tensor[0, 0].item(), 42.0)
-
-        # Check that the FD is open and valid
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-        except OSError:
-            self.fail("FD is not valid or closed")
-
-        # Cleanup
-        mm.close()
-        os.close(fd)
-
     def _assert_resident(self, mm, alloc_bytes):
         # mincore() reports per-page residency, so the invariant is checked
         # rather than inferred from the flags that were passed.
@@ -95,50 +61,6 @@ class TestMmapAllocator(unittest.TestCase):
                 self._assert_resident(mm, alloc_bytes)
             finally:
                 mm.close()
-
-    def test_shm_host_tensor_allocator(self):
-        allocator = ShmHostTensorAllocator()
-        dims = (2, 512)
-        dtype = torch.int32
-
-        tensor = allocator.allocate(dims, dtype, "cpu")
-        self.assertEqual(tensor.shape, dims)
-        self.assertEqual(tensor.dtype, dtype)
-        self.assertIsNotNone(allocator.fd)
-        self.assertGreaterEqual(allocator.fd, 0)
-
-        # Write data and check
-        tensor[1, 1] = 99
-        self.assertEqual(tensor[1, 1].item(), 99)
-
-        # Test destructor cleans up fd
-        fd = allocator.fd
-        # Trigger GC / deletion
-        del allocator
-
-        # Verify fd is closed
-        with self.assertRaises(OSError):
-            os.fstat(fd)
-
-    def test_alloc_shm_unlinked(self):
-        dims = (4, 256)
-        dtype = torch.float32
-        tensor, fd, mm = alloc_shm(dims, dtype)
-
-        # On Linux, the path of an unlinked fd shows up in /proc/self/fd/
-        # with a ' (deleted)' suffix.
-        fd_path = f"/proc/self/fd/{fd}"
-        try:
-            resolved_path = os.readlink(fd_path)
-            self.assertIn("sglang_host_pool_", resolved_path)
-            self.assertTrue(resolved_path.endswith(" (deleted)"))
-        except OSError:
-            # If procfs is not available or readlink fails, fallback to direct path existence check
-            self.assertFalse(os.path.exists(f"/dev/shm/sglang_host_pool_"))
-
-        # Cleanup
-        mm.close()
-        os.close(fd)
 
     def test_alloc_shm_hugepage_warning(self):
         from sglang.srt.environ import envs

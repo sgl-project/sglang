@@ -107,9 +107,8 @@ class TestGLM52DSACacheLayerSplitMixedMoE(TestGLM52DSACacheLayerSplit):
     gsm8k_num_threads = 32
 
     extra_decode_args = TestGLM52DSACacheLayerSplit.extra_decode_args + [
-        "--dp-size",
+        "--attn-dp-size",
         "4",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--ep-size",
         "4",

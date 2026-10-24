@@ -180,6 +180,30 @@ def test_warmup_executes_nested_encoders_and_seeds_serving_cache():
         assert model.calls == 4 and model.vision_calls == 3
 
 
+@torch.no_grad()
+def test_first_served_store_recycles_warmup_only_entries():
+    cache = ConditioningCache(4096)
+    model = Encoder().eval()
+    synthetic, reused, negative = torch.ones(4), torch.full((4,), 2.0), torch.zeros(4)
+    with cache.scope(refresh=True):
+        model(synthetic)
+        model(reused)
+        with prefer_conditioning_cache():
+            model(negative)
+    with cache.scope():
+        model(reused)
+        assert cache.evictions == 0
+        model(torch.full((4,), 3.0))
+        # only the warmup entry no served request touched is recycled
+        assert cache.evictions == 1 and cache.stats()["entries"] == 3
+        model(reused)
+        with prefer_conditioning_cache():
+            model(negative)
+        assert model.calls == 4
+        model(synthetic)
+        assert model.calls == 5
+
+
 @pytest.mark.parametrize("bypass", ["disabled", "inactive", "training", "grad", "ar"])
 def test_bypass(bypass):
     cache = ConditioningCache(0 if bypass == "disabled" else 1024)
@@ -305,6 +329,29 @@ def test_cuda_snapshot_waits_for_producing_stream_before_restore():
         restored.hidden_states, (expected, expected.T, expected[::2, ::2]), strict=True
     ):
         torch.testing.assert_close(actual.cpu(), reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")
+@torch.no_grad()
+def test_cuda_video_condition_key_covers_every_byte():
+    cache = ConditioningCache(256 * 1024 * 1024)
+    vae = VAE().eval()
+    # image followed by zero frames, large enough for the sparse block digest
+    video = torch.zeros(1, 3, 9, 512, 512, device="cuda")
+    video[:, :, 0] = torch.rand(1, 3, 512, 512, device="cuda")
+    negative_zero = video.clone()
+    negative_zero[0, 1, 5, 7, 7] = -0.0
+    last_byte = video.clone()
+    last_byte.view(-1)[-1] = 1
+    shifted = torch.roll(video, shifts=1, dims=2)
+    with cache.scope():
+        expected = vae.encode(video).latent_dist.mean
+        hit = vae.encode(video.clone()).latent_dist.mean
+        for changed in (negative_zero, last_byte, shifted):
+            vae.encode(changed)
+    torch.testing.assert_close(hit, expected, rtol=0, atol=0)
+    assert vae.calls == 4
+    assert cache.hits == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")

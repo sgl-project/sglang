@@ -10,7 +10,7 @@ from torch import nn
 
 from sglang.srt.layers.layer_boundary import UnreducedOutput
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.layers.layer_boundary.residual.add_norm import ADD
+from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import OwedOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -58,8 +58,8 @@ class DeferringLayer(nn.Module):
 
 class DeferringStageLayer(DeferringLayer):
     def forward(self, positions=None, hidden_states=None, forward_batch=None, **kwargs):
-        stream = residual_batch.current(forward_batch)
-        hidden_states, residual = stream.finish(hidden_states)
+        stream = residual_batch.stream_of(forward_batch)
+        hidden_states, residual = stream.export(hidden_states)
         residual = hidden_states if residual is None else hidden_states + residual
         stream.write(residual)
         output = (
@@ -67,7 +67,7 @@ class DeferringStageLayer(DeferringLayer):
             if self.is_last_layer
             else UnreducedOutput(torch.full_like(residual, 1 / TP_SIZE), group=GROUP)
         )
-        return stream.leave(output, ADD)
+        return stream.record(output, PLAIN_ADD)
 
 
 class SumNorm(nn.Module):
