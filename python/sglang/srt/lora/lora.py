@@ -19,6 +19,7 @@
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
 import logging
+import math
 import re
 from typing import Dict, List, Optional
 
@@ -68,7 +69,11 @@ class LoRAAdapter(nn.Module):
         self.base_hf_config: AutoConfig = base_hf_config
         self.load_config: LoadConfig = load_config
         self.lora_backend: BaseLoRABackend = lora_backend
-        self.scaling: float = self.config.lora_alpha / self.config.r
+        self.scaling: float = self.config.lora_alpha / (
+            math.sqrt(self.config.r)
+            if self.config.hf_config.get("use_rslora", False)
+            else self.config.r
+        )
 
         # Bypass nn.Module.__setattr__ so the base model is held as a plain
         # reference rather than auto-registered as a submodule (which would
@@ -210,6 +215,7 @@ class LoRAAdapter(nn.Module):
             self._normalize_in_proj(layer.weights)
             # Stack in_proj_q + in_proj_k + in_proj_v + in_proj_z → in_proj_qkvz for GDN layers
             self._normalize_in_proj_qkvz(layer.weights)
+            self._normalize_in_proj_ba(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
@@ -425,7 +431,19 @@ class LoRAAdapter(nn.Module):
            the buffer directly.
         """
         for weight_name in list(weights.keys()):
-            if "in_proj_q." in weight_name:
+            if "in_proj_qkv." in weight_name:
+                z_name = weight_name.replace("in_proj_qkv", "in_proj_z")
+                if z_name not in weights:
+                    raise ValueError("GDN in_proj_qkv LoRA requires in_proj_z")
+                qkvz_name = weight_name.replace("in_proj_qkv", "in_proj_qkvz")
+                qkv = weights.pop(weight_name)
+                z = weights.pop(z_name)
+                # Q, K and V share A in PEFT's combined QKV projection;
+                # the runtime has one rank block for each of Q, K, V, Z.
+                if "lora_A" in weight_name:
+                    qkv = qkv.repeat(3, 1)
+                weights[qkvz_name] = torch.cat((qkv, z), dim=0)
+            elif "in_proj_q." in weight_name:
                 k_name = weight_name.replace("in_proj_q", "in_proj_k")
                 v_name = weight_name.replace("in_proj_q", "in_proj_v")
                 z_name = weight_name.replace("in_proj_q", "in_proj_z")
@@ -458,6 +476,19 @@ class LoRAAdapter(nn.Module):
                 repeat_dims[ndim - 2] = 4
                 weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
             # else (in_proj_qkvz lora_B, or unrelated): no-op.
+
+    def _normalize_in_proj_ba(self, weights: Dict[str, torch.Tensor]):
+        """Pack GDN gating projections in the base layer's B, A order."""
+        for name in list(weights):
+            if "in_proj_b." not in name:
+                continue
+            a_name = name.replace("in_proj_b", "in_proj_a")
+            if a_name not in weights:
+                raise ValueError("GDN in_proj_b LoRA requires in_proj_a")
+            ba_name = name.replace("in_proj_b", "in_proj_ba")
+            weights[ba_name] = torch.cat(
+                (weights.pop(name), weights.pop(a_name)), dim=0
+            )
 
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]

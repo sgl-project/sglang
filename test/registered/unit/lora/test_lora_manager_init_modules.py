@@ -177,6 +177,54 @@ class TestShouldApplyLoRAGate(CustomTestCase):
                     name = encoder + ".layers.0.qkv_proj"
                     self.assertFalse(model.should_apply_lora(name), name)
 
+    def test_dense_shared_expert_does_not_wrap_routed_bank(self):
+        routed = FusedMoE.__new__(FusedMoE)
+        torch.nn.Module.__init__(routed)
+        routed.is_shared_fused_moe = False
+        shared_name = "language_model.model.layers.0.mlp.shared_expert.gate_up_proj"
+        manager = self._manager(
+            modules=[
+                ("language_model.model.layers.0.mlp.experts", routed),
+                (shared_name, torch.nn.Module()),
+            ],
+            target_modules={"gate_up_proj", "down_proj"},
+        )
+        manager.routed_expert_lora_enabled = False
+        with patch.object(manager, "set_lora_module", side_effect=lambda name, _: name):
+            manager.init_lora_modules()
+        self.assertEqual(list(manager.lora_modules[0]), [shared_name])
+
+    def test_dynamic_routed_adapter_cannot_be_silently_ignored(self):
+        manager = LoRAManager.__new__(LoRAManager)
+        manager.base_model = torch.nn.Module()
+        manager.base_hf_config = SimpleNamespace(num_hidden_layers=1)
+        manager.configs = {"routed": object()}
+        manager.loras = {}
+        manager.load_config = None
+        manager.lora_backend = None
+        manager.speculative_algorithm = None
+        manager.routed_expert_lora_enabled = False
+        adapter = SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    weights={
+                        "base_model.model.model.layers.0.mlp.experts.0.gate_up_proj.lora_A.weight": torch.zeros(
+                            1
+                        )
+                    }
+                )
+            ],
+            embedding_layers={},
+            initialize_weights_from_tensors=lambda _: None,
+        )
+        ref = SimpleNamespace(lora_id="routed", lora_name="routed")
+        with patch.object(lora_manager_module, "LoRAAdapter", return_value=adapter):
+            with self.assertRaisesRegex(
+                ValueError, "Routed-expert LoRA was not initialized"
+            ):
+                manager.load_lora_weights_from_tensors(ref, {})
+        self.assertEqual(manager.loras, {})
+
     def test_embed_tokens_outside_the_gated_prefix_is_still_wrapped(self):
         """The gate stays below the embed_tokens / lm_head handling."""
         embed_tokens = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
