@@ -635,6 +635,144 @@ class TestTritonAttention(CustomTestCase):
             torch.allclose(o_extend_triton, o_extend_torch, rtol=1e-3, atol=1e-3)
         )
 
+    def test_extend_attention_block_bidirectional(self):
+        """block_boundaries widens the causal mask to (k < P) | (q >= P) per
+        sequence; -1 keeps the sequence causal. Checked against the custom_mask
+        path carrying the same mask and against the plain causal kernel."""
+        dtype = torch.bfloat16
+        device = get_device()
+        torch.manual_seed(0)
+
+        def check(H_Q, H_KV, D, prefix_lens, extend_lens, boundaries):
+            B = len(prefix_lens)
+            b_seq_len_prefix = torch.tensor(
+                prefix_lens, dtype=torch.int32, device=device
+            )
+            b_seq_len_extend = torch.tensor(
+                extend_lens, dtype=torch.int32, device=device
+            )
+            b_seq_len = b_seq_len_prefix + b_seq_len_extend
+            total = int(b_seq_len.sum())
+            b_start_loc = torch.zeros((B,), dtype=torch.int32, device=device)
+            b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], 0)
+
+            kv_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+            kv_indptr[1:] = torch.cumsum(b_seq_len_prefix, 0)
+            kv_indices = torch.cat(
+                [
+                    torch.arange(
+                        int(b_start_loc[i]),
+                        int(b_start_loc[i] + b_seq_len_prefix[i]),
+                        device=device,
+                    )
+                    for i in range(B)
+                ]
+            ).to(torch.int32)
+            qo_indptr = torch.zeros((B + 1,), dtype=torch.int32, device=device)
+            qo_indptr[1:] = torch.cumsum(b_seq_len_extend, 0)
+
+            k_buffer = torch.randn((total, H_KV, D), dtype=dtype, device=device) * 0.2
+            v_buffer = torch.randn((total, H_KV, D), dtype=dtype, device=device) * 0.2
+            k_extend = torch.cat(
+                [
+                    k_buffer[
+                        int(b_start_loc[i] + b_seq_len_prefix[i]) : int(
+                            b_start_loc[i] + b_seq_len[i]
+                        )
+                    ]
+                    for i in range(B)
+                ]
+            )
+            v_extend = torch.cat(
+                [
+                    v_buffer[
+                        int(b_start_loc[i] + b_seq_len_prefix[i]) : int(
+                            b_start_loc[i] + b_seq_len[i]
+                        )
+                    ]
+                    for i in range(B)
+                ]
+            )
+            n_ext = int(b_seq_len_extend.sum())
+            q_extend = torch.randn((n_ext, H_Q, D), dtype=dtype, device=device) * 0.2
+            max_len_extend = int(b_seq_len_extend.max())
+
+            def run(o, custom_mask, mask_indptr, block_boundaries, is_causal=True):
+                extend_attention_fwd(
+                    q_extend,
+                    k_extend,
+                    v_extend,
+                    o,
+                    k_buffer,
+                    v_buffer,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    custom_mask,
+                    is_causal,
+                    mask_indptr,
+                    max_len_extend,
+                    D**-0.5,
+                    0.0,
+                    block_boundaries=block_boundaries,
+                )
+
+            o_causal = torch.empty_like(q_extend)
+            run(o_causal, None, None, None)
+
+            o_block = torch.empty_like(q_extend)
+            run(
+                o_block,
+                None,
+                None,
+                torch.tensor(boundaries, dtype=torch.int32, device=device),
+            )
+
+            mask_lens = b_seq_len_extend.to(torch.int64) * b_seq_len.to(torch.int64)
+            mask_indptr = torch.zeros((B + 1,), dtype=torch.int64, device=device)
+            mask_indptr[1:] = torch.cumsum(mask_lens, 0)
+            custom_mask = torch.empty(
+                (int(mask_lens.sum()),), dtype=torch.bool, device=device
+            )
+            for i in range(B):
+                L, P0, Pb = int(b_seq_len[i]), int(b_seq_len_prefix[i]), boundaries[i]
+                q_abs = torch.arange(P0, L, device=device)[:, None]
+                k_abs = torch.arange(L, device=device)[None, :]
+                m = k_abs <= q_abs
+                if Pb >= 0:
+                    m |= (k_abs < Pb) | (q_abs >= Pb)
+                custom_mask[mask_indptr[i] : mask_indptr[i + 1]] = m.flatten()
+            o_mask = torch.empty_like(q_extend)
+            # The custom-mask path only visits key tiles up to the diagonal when
+            # is_causal=True, so carry the causal part inside the mask instead.
+            run(o_mask, custom_mask, mask_indptr, None, is_causal=False)
+
+            self.assertTrue(torch.allclose(o_block, o_mask, rtol=1e-2, atol=1e-3))
+            # Causal sequence is untouched; a bidirectional one differs.
+            s0, e0 = int(qo_indptr[0]), int(qo_indptr[1])
+            self.assertTrue(
+                torch.allclose(o_block[s0:e0], o_causal[s0:e0], rtol=1e-2, atol=1e-3)
+            )
+            s1, e1 = int(qo_indptr[1]), int(qo_indptr[2])
+            self.assertFalse(
+                torch.allclose(o_block[s1:e1], o_causal[s1:e1], rtol=1e-2, atol=1e-3)
+            )
+
+        # -1 causal, 0 fully bidirectional, boundary at the cached prefix end,
+        # boundary inside the extend part (x2).
+        check(
+            8,
+            2,
+            128,
+            [0, 0, 96, 100, 37],
+            [150, 200, 70, 90, 131],
+            [-1, 0, 96, 130, 90],
+        )
+        # Qwen3.5-shaped heads with tile-aligned (1088 = 17 * 64) and unaligned boundaries.
+        check(
+            16, 4, 256, [0, 0, 0, 0], [1150, 1157, 3128, 1150], [-1, 1088, 3059, 1088]
+        )
+
     def test_extend_attention_sliding_window(self):
         window_sizes = [-1, 127]
         for window_size in window_sizes:

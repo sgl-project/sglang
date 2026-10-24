@@ -150,6 +150,7 @@ from sglang.srt.observability.request_metrics_exporter import (
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
     assert_published,
+    attention_backends,
     get_context,
     get_device,
     get_disagg,
@@ -1432,6 +1433,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
+            if obj.bidir_prefix_len is not None and obj.bidir_prefix_len >= 0:
+                if attention_backends()[0] != "triton":
+                    raise ValueError(
+                        "bidir_prefix_len (block-bidirectional attention) is only "
+                        "supported by the triton attention backend; launch with "
+                        "--attention-backend triton."
+                    )
+                prompt_len = len(input_ids) if input_ids is not None else 0
+                if obj.bidir_prefix_len > prompt_len:
+                    raise ValueError(
+                        f"bidir_prefix_len ({obj.bidir_prefix_len}) exceeds the "
+                        f"prompt length ({prompt_len})."
+                    )
+                chunk = self.server_args.chunked_prefill_size
+                if chunk is not None and 0 < chunk < input_token_num:
+                    raise ValueError(
+                        f"bidir_prefix_len prompts are not chunked; the prompt has "
+                        f"{input_token_num} tokens but --chunked-prefill-size is {chunk}."
+                    )
             if (
                 obj.return_sampling_mask
                 and obj.custom_logit_processor
@@ -1621,6 +1641,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 session_id=obj.session_id,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
+                bidir_prefix_len=(
+                    obj.bidir_prefix_len if obj.bidir_prefix_len is not None else -1
+                ),
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,

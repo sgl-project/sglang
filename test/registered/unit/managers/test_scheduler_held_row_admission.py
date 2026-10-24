@@ -21,6 +21,8 @@ NUM_ROWS = 4
 
 
 class _Req:
+    bidir_prefix_len = -1
+
     def __init__(self, holds_row):
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.beam_group = None
@@ -64,6 +66,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.is_hybrid_swa = False
         s.waiting_queue = waiting
         s.chunked_req = final_chunk
+        s.bidir_states_in_flight = {}
         s.min_free_slots_delayer = None
         s.policy = Mock()
         s.policy.shortest_prefill_chunk_limit.return_value = None

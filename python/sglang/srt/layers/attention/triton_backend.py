@@ -145,6 +145,8 @@ class ForwardMetadata:
     lean_locks: Optional[torch.Tensor] = None
     # One int32, set by get_num_kv_splits when the decode seq lens are uneven
     uneven_batch: Optional[torch.Tensor] = None
+    # Per-sequence block-bidirectional boundary (int32, -1 = causal), extend only
+    block_boundaries: Optional[torch.Tensor] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -1132,6 +1134,15 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch, IdSpaceKind.SLIDING_WINDOW
             )
 
+        block_boundaries = None
+        if (
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.bidir_prefix_lens is not None
+        ):
+            block_boundaries = torch.tensor(
+                forward_batch.bidir_prefix_lens, dtype=torch.int32, device=self.device
+            )
+
         self.forward_metadata = ForwardMetadata(
             attn_logits,
             attn_lse,
@@ -1155,6 +1166,7 @@ class TritonAttnBackend(AttentionBackend):
             lean_Op=lean_Op,
             lean_locks=lean_locks,
             uneven_batch=uneven_batch,
+            block_boundaries=block_boundaries,
         )
 
     def init_cuda_graph_state(
@@ -1918,6 +1930,8 @@ class TritonAttnBackend(AttentionBackend):
     def _forward_extend_kernel(self, layer, *args, **kwargs):
         if self.dllm_attention is not None:
             return self.dllm_attention.forward_extend(layer, *args, **kwargs)
+        if self.forward_metadata.block_boundaries is not None:
+            kwargs["block_boundaries"] = self.forward_metadata.block_boundaries
         return self.extend_attention_fwd(*args, **kwargs)
 
     def _dense_one_shot_kv_indptr_for(self, forward_batch: ForwardBatch):
