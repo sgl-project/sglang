@@ -1007,6 +1007,19 @@ class DeepseekV2MoE(nn.Module):
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
 
+        if get_moe_runner_backend().is_gluon():
+            if getattr(config, "model_type", None) != "glm_moe_dsa":
+                raise RuntimeError(
+                    "--moe-runner-backend gluon supports only GLM-5.2/5.3 "
+                    "Quark MXFP4 checkpoints"
+                )
+            from sglang.srt.layers.moe.glm_mxfp4_gluon import (
+                GlmMxfp4GluonMoeBackend,
+            )
+            from sglang.srt.layers.moe.gluon_backend import bind_gluon_moe_backend
+
+            bind_gluon_moe_backend(self, GlmMxfp4GluonMoeBackend())
+
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.
@@ -1057,7 +1070,28 @@ class DeepseekV2MoE(nn.Module):
         the V2/V3 layer-boundary handoff. ``leave_output_sum`` returns those
         pieces with the selected finalize kernel, for
         a boundary that owns reduction and the replicated shared add."""
+        from sglang.srt.layers.moe.gluon_backend import (
+            forward_gluon_moe,
+            should_use_gluon_moe,
+        )
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
+
+        num_token_non_padded = (
+            forward_batch.moe_num_token_non_padded()
+            if forward_batch is not None
+            else None
+        )
+        if should_use_gluon_moe(self):
+            output = forward_gluon_moe(
+                self,
+                hidden_states,
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=skip_shared_experts,
+                num_token_non_padded=num_token_non_padded,
+            )
+            return self._finalize_normal_output(output, None)
 
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(
@@ -1296,6 +1330,21 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
+    def _finalize_normal_output(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.reduce_results:
+            final_hidden_states = post_experts_all_reduce(final_hidden_states)
+        if (
+            shared_output is not None
+            and self._shared_expert_tp1
+            and self._adds_replicated_output()
+        ):
+            final_hidden_states += shared_output
+        return final_hidden_states
+
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -1447,17 +1496,7 @@ class DeepseekV2MoE(nn.Module):
             None if self._shared_expert_tp1 else shared_output,
             self.routed_scaling_factor,
         )
-        if self.reduce_results:
-            final_hidden_states = post_experts_all_reduce(final_hidden_states)
-        # TP1 shared experts are replicated: add them after this block's
-        # all-reduce, or on TP rank 0 only when the stage boundary sums.
-        if (
-            shared_output is not None
-            and self._shared_expert_tp1
-            and self._adds_replicated_output()
-        ):
-            final_hidden_states += shared_output
-        return final_hidden_states
+        return self._finalize_normal_output(final_hidden_states, shared_output)
 
     def _adds_replicated_output(self) -> bool:
         """Whether this rank adds the replicated TP1 shared-expert output."""
@@ -3387,6 +3426,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     @classmethod
     def num_fusable_shared_experts(cls, hf_config) -> int:
         """Return the model's fusable shared-expert count."""
+        # Generic Gluon EP kernels keep the shared expert native. GLM's
+        # target class overrides this hook for its fused rank-local slot.
+        if get_moe_runner_backend().is_gluon() and get_parallel().moe_ep_size > 1:
+            return 0
         return hf_config.n_shared_experts or 0
 
     def get_input_embeddings(self) -> nn.Embedding:
