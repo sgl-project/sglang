@@ -373,5 +373,32 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         self.assertFalse(allocator.verify_byte_accounting())
 
 
+class TestStarvedChunkedPrefill(CustomTestCase):
+    """A continuing chunk is bounded by the tokens the pool physically holds.
+
+    With the pass budget spent by running requests' decode headroom, the chunk
+    used to be handed its full size; alloc_token_slots then raised "Out of
+    memory. Try to lower your batch size" once the pool held fewer tokens.
+    """
+
+    def test_continuing_chunk_never_exceeds_physical_tokens(self):
+        with published_topology():
+            allocator = TokenToKVPoolAllocator(2048, torch.bfloat16, "cpu", None, False)
+            cache = RadixCache.create_simulated(mock_allocator=allocator)
+            budget = allocator.create_prefill_budget(cache)
+            self.assertIsNotNone(allocator.alloc(2048 - 100))
+            # The budget has room: the chunk takes what the budget allows.
+            self.assertEqual(budget.available_chunk_tokens(8192), 100)
+
+            budget.total_offset += 500  # decode headroom of running requests
+            self.assertLess(budget.remaining_total, 0)
+            # 100 tokens are free: the chunk gets them, less one page of slack.
+            self.assertEqual(budget.available_chunk_tokens(8192), 99)
+
+            self.assertIsNotNone(allocator.alloc(100))
+            # Nothing free and nothing evictable: the chunk waits for a decode step.
+            self.assertIsNone(budget.available_chunk_tokens(8192))
+
+
 if __name__ == "__main__":
     unittest.main()

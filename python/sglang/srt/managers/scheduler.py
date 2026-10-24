@@ -4151,6 +4151,13 @@ class Scheduler(
                 self.page_size,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            if (
+                self.chunked_req is not None
+                and self.chunked_req not in adder.can_run_list
+            ):
+                # A parked chunk must not be counted in flight by a batch built
+                # without it; skip the step so a decode step can retract.
+                return None, running_batch
 
         if self.enable_lora:
             running_loras = {
