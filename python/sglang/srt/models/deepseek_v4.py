@@ -3470,6 +3470,16 @@ def _scatter_tail_rows(
     return full
 
 
+def _cp_tail_to_extend_rows(
+    tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
+) -> torch.Tensor:
+    # Under prefill CP token_indices index this rank's extend rows; the tail's
+    # padding rows come after them.
+    full = rows.new_zeros((num_tokens, *rows.shape[1:]))
+    full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
+    return full
+
+
 class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
     """CUDA execution with declared residual reads and writes."""
 
@@ -4515,6 +4525,18 @@ class DeepseekV4Model(nn.Module):
             pre_hc_head = _scatter_tail_rows(
                 tail=tail, rows=pre_hc_head, num_tokens=num_tokens
             )
+        elif tail is not None and tail.cp_metadata is not None:
+            # Prefill CP with DSpark: the runner gathers every output, aux included,
+            # in this rank's extend layout (cp_gather_after_forward), and DSpark
+            # injects draft KV for all of those rows. Zero the rows outside the tail.
+            to_extend = functools.partial(
+                _cp_tail_to_extend_rows, tail=tail, num_tokens=input_ids.shape[0]
+            )
+            hidden_states = to_extend(rows=hidden_states)
+            pre_hc_head = to_extend(rows=pre_hc_head)
+            dspark_aux_hidden_states = [
+                to_extend(rows=aux) for aux in dspark_aux_hidden_states
+            ]
 
         if capture_dspark:
             return (hidden_states, pre_hc_head), dspark_aux_hidden_states.finalize()

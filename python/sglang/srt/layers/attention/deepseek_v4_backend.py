@@ -3469,12 +3469,18 @@ class DeepseekV4AttnBackend(
             )[:total]
             self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
         if run_indexer and layer.indexer is not None:
-            # A rank's local rows are not the batch's, so no req_rows to pass.
+            # A rank's local rows are request-major with q_lens_cpu rows each; the
+            # torch indexer (SM90) groups them by req_to_token row.
+            req_local = torch.repeat_interleave(
+                forward_batch.req_pool_indices.to(torch.int64),
+                async_h2d(q_lens_cpu, dtype=torch.int64, device=x.device),
+                output_size=num_local,
+            )
             self._low_ratio_index_topk(
                 layer,
                 x[:num_local],
                 q_lora[:num_local],
-                None,
+                req_local,
                 positions[:num_local].to(torch.int64),
                 forward_batch,
                 rows_per_request=q_lens_cpu,
