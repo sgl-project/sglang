@@ -3811,7 +3811,7 @@ class ServerArgs(DisaggServerArgsMixin):
         """Load a config file."""
         if config_file.endswith(".json"):
             with open(config_file, "r") as f:
-                return json.load(f)
+                data = json.load(f)
         elif config_file.endswith((".yaml", ".yml")):
             try:
                 import yaml
@@ -3821,9 +3821,20 @@ class ServerArgs(DisaggServerArgsMixin):
                     "`pip install pyyaml`"
                 )
             with open(config_file, "r") as f:
-                return yaml.safe_load(f)
+                data = yaml.safe_load(f)
         else:
             raise ValueError(f"Unsupported config file format: {config_file}")
+
+        if data is None:
+            data = {}
+
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Config file must contain a mapping/dictionary at the root level, "
+                f"but got {type(data).__name__}: {config_file}"
+            )
+
+        return data
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
