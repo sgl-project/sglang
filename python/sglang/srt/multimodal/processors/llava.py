@@ -292,12 +292,14 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
 class LlavaMultimodalProcessor(BaseMultimodalProcessor):
     """
-    This is a wrapper class used to identify the multimodal processor for Llava architectures' vision model.
+    Identifies the multimodal processor for Llava architectures' vision model;
+    constructing this class returns an instance of that processor.
     """
 
     models = [LlavaForConditionalGeneration, Mistral3ForConditionalGeneration]
 
-    def _get_sgl_processor_cls(self, model_type: str):
+    @staticmethod
+    def _get_sgl_processor_cls(model_type: str):
         if model_type == "clip_vision_model":
             return LlavaImageProcessor
         if hf_name := HF_MAPPING_NAMES.get(model_type):
@@ -311,21 +313,15 @@ class LlavaMultimodalProcessor(BaseMultimodalProcessor):
             f"Cannot find corresponding multimodal processor registered in sglang for model type `{model_type}`"
         )
 
-    def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+    def __new__(cls, hf_config, server_args, _processor, *args, **kwargs):
         assert hasattr(hf_config, "vision_config")
         assert hasattr(hf_config, "text_config")
-        self.vision_config = hf_config.vision_config
-        self.text_config = hf_config.text_config
-        self.hf_config = hf_config
 
-        if vision_type := getattr(self.vision_config, "model_type"):
-            self.inner = self._get_sgl_processor_cls(vision_type)(
+        if vision_type := getattr(hf_config.vision_config, "model_type"):
+            return cls._get_sgl_processor_cls(vision_type)(
                 hf_config, server_args, _processor, *args, **kwargs
             )
         else:
             raise ValueError(
                 f"Required `vision_config.model_type` is not found in hf_config: `{hf_config}`"
             )
-
-    async def process_mm_data_async(self, *args, **kwargs):
-        return await self.inner.process_mm_data_async(*args, **kwargs)
