@@ -246,6 +246,80 @@ fn resize_passes(
     }
 }
 
+fn torch_cubic_1(x: f32, a: f32) -> f32 {
+    ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+}
+
+fn torch_cubic_2(x: f32, a: f32) -> f32 {
+    ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a
+}
+
+#[inline]
+fn torch_bicubic_coeffs(lambda: f32) -> [f32; 4] {
+    let a = -0.75f32;
+    [
+        torch_cubic_2(lambda + 1.0, a),
+        torch_cubic_1(lambda, a),
+        torch_cubic_1(1.0 - lambda, a),
+        torch_cubic_2(2.0 - lambda, a),
+    ]
+}
+
+/// Float bicubic resize in CHW order, matching
+/// `torch.nn.functional.interpolate(..., mode="bicubic",
+/// align_corners=False)` on a float32 tensor. The source is expected to be
+/// already normalized; the result is kept in f32.
+pub fn resize_normalized_bicubic(
+    src: &[f32],
+    h: usize,
+    w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Vec<f32> {
+    if h == 0 || w == 0 || out_h == 0 || out_w == 0 {
+        return Vec::new();
+    }
+    debug_assert_eq!(src.len(), 3 * h * w);
+    let scale_h = h as f32 / out_h as f32;
+    let scale_w = w as f32 / out_w as f32;
+    let mut out = vec![0.0f32; 3 * out_h * out_w];
+
+    for c in 0..3 {
+        let plane = &src[c * h * w..(c + 1) * h * w];
+        let out_plane = &mut out[c * out_h * out_w..(c + 1) * out_h * out_w];
+        for oy in 0..out_h {
+            let real_y = scale_h * (oy as f32 + 0.5) - 0.5;
+            let input_y = real_y.floor() as i64;
+            let lambda_y = (real_y - input_y as f32).clamp(0.0, 1.0);
+            let wy = torch_bicubic_coeffs(lambda_y);
+            for ox in 0..out_w {
+                let real_x = scale_w * (ox as f32 + 0.5) - 0.5;
+                let input_x = real_x.floor() as i64;
+                let lambda_x = (real_x - input_x as f32).clamp(0.0, 1.0);
+                let wx = torch_bicubic_coeffs(lambda_x);
+                let mut value = 0.0f32;
+                for (jy, wy_j) in wy.iter().enumerate() {
+                    let sy = (input_y + jy as i64 - 1).clamp(0, h as i64 - 1) as usize;
+                    let row = &plane[sy * w..(sy + 1) * w];
+                    let sx0 = (input_x - 1).clamp(0, w as i64 - 1) as usize;
+                    let mut row_value = row[sx0] * wx[0];
+                    for jx in 1..4 {
+                        let sx = (input_x + jx as i64 - 1).clamp(0, w as i64 - 1) as usize;
+                        row_value += row[sx] * wx[jx];
+                    }
+                    if jy == 0 {
+                        value = row_value * wy_j;
+                    } else {
+                        value += row_value * wy_j;
+                    }
+                }
+                out_plane[oy * out_w + ox] = value;
+            }
+        }
+    }
+    out
+}
+
 pub fn resize_lanczos_rgb(src: &[u8], h: usize, w: usize, out_h: usize, out_w: usize) -> Vec<u8> {
     resize_rgb(src, h, w, out_h, out_w, Resample::Pil(Filter::Lanczos))
 }
