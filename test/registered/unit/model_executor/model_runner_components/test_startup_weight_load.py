@@ -34,7 +34,14 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import initialize_capture_safe_weights
-from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.runtime_context import (
+    get_context,
+    get_disagg,
+    get_parallel,
+    get_serving,
+    publish,
+    reset_context,
+)
 from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -824,6 +831,82 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             draft_runners=(worker.model_runner,) if use_draft_worker else ()
         )
         return trace
+
+    def test_ffn_role_skips_attention_and_kv_startup(self):
+        for mode in ("serial", "overlap"):
+            with self.subTest(mode=mode):
+                trace = []
+                worker = _SchedulerWorker(trace, post_capture_active=True)
+                worker.device = "cpu"
+                scheduler = self._scheduler(worker, trace, mode=mode)
+                group = SimpleNamespace(cpu_group=object())
+                with (
+                    get_disagg().override(afd_role="ffn"),
+                    get_parallel().override(tp_group=group),
+                ):
+                    scheduler.init_model_worker()
+                self.assertEqual(
+                    trace, ["start", "finalize"] if mode == "overlap" else []
+                )
+                self.assertIs(scheduler.model_worker, worker)
+                self.assertIs(scheduler.tp_cpu_group, group.cpu_group)
+                self.assertEqual(scheduler.max_total_num_tokens, 0)
+                self.assertEqual(scheduler.max_req_input_len, 0)
+                self.assertIsNone(scheduler.draft_worker)
+
+    def test_ffn_finishes_startup_without_attention_lifecycle_resources(self):
+        from sglang.srt.afd.ffn.scheduler import finish_ffn_scheduler_init
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            SchedulerMetricsReporter,
+        )
+        from sglang.srt.observability.metrics_collector import (
+            SchedulerMetricsCollectorContext,
+        )
+
+        trace = []
+        worker = _SchedulerWorker(trace)
+        worker.device = "cpu"
+        scheduler = self._scheduler(worker, trace, mode="serial")
+        scheduler.metrics_collector_context = SchedulerMetricsCollectorContext(
+            enable_metrics=False,
+            is_stats_logging_rank=False,
+            current_scheduler_metrics_enabled=False,
+            enable_kv_cache_events=False,
+            collector=None,
+        )
+        scheduler.metrics_collector = None
+        scheduler.init_profiler = lambda: trace.append("profiler")
+        scheduler.init_startup_timing_summary = lambda: setattr(
+            scheduler, "startup_time", 0.5
+        )
+        with (
+            get_disagg().override(afd_role="ffn"),
+            get_serving().override(grpc_port=30002),
+            get_parallel().override(
+                tp_group=SimpleNamespace(cpu_group=object()),
+                attn_dp_rank=0,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+            ),
+            patch("sglang.srt.afd.ffn.scheduler.AFDFFNCompute", autospec=True),
+        ):
+            scheduler.init_model_worker()
+            finish_ffn_scheduler_init(scheduler)
+            init_info = scheduler.get_init_info()
+        self.assertIsInstance(scheduler.metrics_reporter, SchedulerMetricsReporter)
+        self.assertIsNone(scheduler.rust_server)
+        self.assertIsNone(scheduler.async_d2h_worker)
+        self.assertFalse(scheduler.is_initializing)
+        self.assertEqual(trace, ["profiler"])
+        self.assertEqual(
+            init_info,
+            {
+                "status": "ready",
+                "max_total_num_tokens": 0,
+                "max_req_input_len": 0,
+                "startup_time": 0.5,
+            },
+        )
 
     def test_serial_path_skips_overlap_hooks(self):
         self.assertEqual(

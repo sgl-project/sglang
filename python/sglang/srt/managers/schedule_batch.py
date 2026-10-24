@@ -2652,6 +2652,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # The draft model can use a different MoE A2A backend than the target.
     draft_global_num_tokens: Optional[List[int]] = None
     draft_global_num_tokens_for_logprob: Optional[List[int]] = None
+    # Full DP token vector retained for AFD transport when native MoE is scattered.
+    global_num_tokens_across_dp: Optional[List[int]] = None
     # Full DP token vector retained for Aiter MegaMoE even when the normal MLP
     # TP gather path stores only this rank's token count.
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
@@ -4014,6 +4016,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dp_spec_prefill_coordination_applied=self.dp_spec_prefill_coordination_applied,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            global_num_tokens_across_dp=self.global_num_tokens_across_dp,
             can_run_decode_cuda_graph=self.can_run_decode_cuda_graph,
             can_run_dp_draft_cuda_graph=self.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,

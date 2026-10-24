@@ -26,6 +26,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.afd.afd_config import is_afd_attn_moe_scattered
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
@@ -313,6 +314,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
+        if get_moe_a2a_backend().is_afd_attn():
+            if is_afd_attn_moe_scattered():
+                return self.forward_deepep(hidden_states, forward_batch)
+            return self.forward_normal(hidden_states)
 
         if self._use_mega_moe:
             return self._forward_mega_moe(hidden_states, forward_batch)

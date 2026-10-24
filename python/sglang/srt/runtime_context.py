@@ -641,6 +641,8 @@ class Resources(_FlagGroupBase):
     # (owning accessors live in sglang.srt.eplb).
     expert_distribution_recorder: Any = None
     expert_location_metadata: Any = None
+    # Attention-side AFD dispatcher, published after the startup handshake.
+    afd_dispatcher: Any = None
     # LPLB: layer_id -> solver.
     lplb_solvers: dict = msgspec.field(default_factory=dict)
     # Named side streams (see RuntimeContext.get_stream): name -> stream.

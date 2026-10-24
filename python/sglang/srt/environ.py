@@ -771,6 +771,10 @@ class Envs:
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
 
+    # AFD (Attention-FFN Disaggregation)
+    SGLANG_AFD_HANDSHAKE_TIMEOUT_S = EnvInt(600)
+    SGLANG_AFD_LOG_INTERVAL = EnvInt(100)
+
     # ===================================================================
     # Distributed and model-parallel runtime
     # ===================================================================
