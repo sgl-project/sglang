@@ -1,18 +1,22 @@
 import gc
 import io
+import subprocess
 import sys
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 from PIL import Image
 
+from sglang.srt.utils import common
 from sglang.srt.utils.common import (
     _get_device_sm_via_nvml,
     _load_image,
     flatten_arrays_to_int64_tensor,
     freeze_gc,
+    get_amdgpu_memory_capacity,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
 )
@@ -155,6 +159,51 @@ class TestGetDeviceSmNvidiaSmi(CustomTestCase):
             self.assertEqual(get_device_sm_nvidia_smi(), (0, 0))
         finally:
             subprocess.run = original
+
+
+def _rocminfo(stdout: str, returncode: int = 0, stderr: str = ""):
+    return subprocess.CompletedProcess(
+        args="rocminfo", returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+class TestGetAmdgpuMemoryCapacity(CustomTestCase):
+    """rocminfo pool sizes are in KB; an empty or failed rocminfo falls back to
+    the smallest live HIP device. Subprocess and torch.cuda are mocked."""
+
+    def _capacity(self, rocminfo, *total_mib):
+        props = [SimpleNamespace(total_memory=t * 1024 * 1024) for t in total_mib]
+        cuda = common.torch.cuda
+        with (
+            mock.patch.object(common.subprocess, "run", return_value=rocminfo),
+            mock.patch.object(cuda, "is_available", return_value=bool(props)),
+            mock.patch.object(cuda, "device_count", return_value=len(props)),
+            mock.patch.object(
+                cuda, "get_device_properties", side_effect=lambda i: props[i]
+            ),
+        ):
+            return get_amdgpu_memory_capacity()
+
+    def test_reads_smallest_rocminfo_pool(self):
+        out = "301989888(0x12000000) KB\n301465600(0x11f80000) KB\n"
+        self.assertEqual(self._capacity(_rocminfo(out)), 301465600 / 1024)
+
+    def test_skips_lines_without_a_size(self):
+        out = "\n301989888(0x12000000) KB\nN/A\n"
+        self.assertEqual(self._capacity(_rocminfo(out)), 301989888 / 1024)
+
+    def test_empty_rocminfo_falls_back_to_hip(self):
+        self.assertEqual(self._capacity(_rocminfo(""), 294896, 294800), 294800)
+
+    def test_failed_rocminfo_logs_stderr_and_falls_back_to_hip(self):
+        failed = _rocminfo("", returncode=1, stderr="hsa init failed")
+        with self.assertLogs(common.logger, level="WARNING") as logs:
+            self.assertEqual(self._capacity(failed, 294896), 294896)
+        self.assertIn("hsa init failed", logs.output[0])
+
+    def test_no_rocminfo_and_no_device_raises(self):
+        with self.assertRaises(RuntimeError):
+            self._capacity(_rocminfo(""))
 
 
 class TestLoadImage(CustomTestCase):
