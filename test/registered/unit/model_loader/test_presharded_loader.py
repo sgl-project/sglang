@@ -999,5 +999,138 @@ class TestShardConfig(unittest.TestCase):
             self.assertEqual(plan["shard_config"]["tp"], 8)
 
 
+class TestFinalizeStateDictLoad(unittest.TestCase):
+    """Tests for _finalize_state_dict_load and _modules_with_quant_method."""
+
+    def test_kv_cache_scale_floats_synced_after_state_dict_copy(self):
+        import torch.nn as nn
+        from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+        from sglang.srt.model_loader.loader import _finalize_state_dict_load
+
+        class DummyAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.quant_method = BaseKVCacheMethod(quant_config=None)
+                self.quant_method.create_weights(self)
+
+        model = nn.Module()
+        model.attn = DummyAttn()
+
+        # State-dict loaders run process_weights_after_loading before copying
+        # state_dict, leaving k_scale_float / v_scale_float at 1.0.
+        model.attn.quant_method.process_weights_after_loading(model.attn)
+        self.assertEqual(model.attn.k_scale_float, 1.0)
+        self.assertEqual(model.attn.v_scale_float, 1.0)
+
+        # Simulate state_dict copy of calibrated FP8 KV-cache scales.
+        model.attn.k_scale.data.fill_(0.25)
+        model.attn.v_scale.data.fill_(0.5)
+
+        _finalize_state_dict_load(model)
+        self.assertAlmostEqual(model.attn.k_scale_float, 0.25)
+        self.assertAlmostEqual(model.attn.v_scale_float, 0.5)
+        self.assertAlmostEqual(float(model.attn.k_scale.item()), 0.25)
+        self.assertAlmostEqual(float(model.attn.v_scale.item()), 0.5)
+
+    def test_kv_cache_scale_single_or_uncalibrated_fallback(self):
+        import torch.nn as nn
+        from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+        from sglang.srt.model_loader.loader import _finalize_state_dict_load
+
+        class DummyAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.quant_method = BaseKVCacheMethod(quant_config=None)
+                self.quant_method.create_weights(self)
+
+        model = nn.Module()
+        model.attn_single = DummyAttn()
+        model.attn_uncalibrated = DummyAttn()
+        model.attn_single.quant_method.process_weights_after_loading(model.attn_single)
+        model.attn_uncalibrated.quant_method.process_weights_after_loading(
+            model.attn_uncalibrated
+        )
+
+        # Single kv_scale (k_scale > 0, v_scale <= 0) duplicates to both.
+        model.attn_single.k_scale.data.fill_(0.125)
+        model.attn_single.v_scale.data.fill_(-1.0)
+        # Uncalibrated (-1.0, -1.0) falls back to 1.0.
+        model.attn_uncalibrated.k_scale.data.fill_(-1.0)
+        model.attn_uncalibrated.v_scale.data.fill_(-1.0)
+
+        _finalize_state_dict_load(model)
+        self.assertAlmostEqual(model.attn_single.k_scale_float, 0.125)
+        self.assertAlmostEqual(model.attn_single.v_scale_float, 0.125)
+        self.assertAlmostEqual(float(model.attn_single.v_scale.item()), 0.125)
+        self.assertEqual(model.attn_uncalibrated.k_scale_float, 1.0)
+        self.assertEqual(model.attn_uncalibrated.v_scale_float, 1.0)
+        self.assertEqual(float(model.attn_uncalibrated.k_scale.item()), 1.0)
+        self.assertEqual(float(model.attn_uncalibrated.v_scale.item()), 1.0)
+
+    def test_rebinds_gemma_weight_and_qkv_conv1d_aliases(self):
+        import torch.nn as nn
+        from sglang.srt.model_loader.loader import _finalize_state_dict_load
+
+        class DummyGemmaNorm(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.zeros(4))
+                self.register_buffer("gemma_weight", torch.ones(4), persistent=False)
+
+        class DummyInnerLinearAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv_weights = None
+                self.bias = None
+                self.A_log = None
+                self.dt_bias = None
+
+        class DummyKimiLinearAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.qkv_conv1d = nn.Module()
+                self.qkv_conv1d.weight = nn.Parameter(torch.ones(6, 1, 4))
+                self.qkv_conv1d.bias = nn.Parameter(torch.full((6,), 2.0))
+                self.A_log = nn.Parameter(torch.full((2,), 3.0))
+                self.dt_bias = nn.Parameter(torch.full((2,), 4.0))
+                self.attn = DummyInnerLinearAttn()
+
+        root = nn.Module()
+        root.norm = DummyGemmaNorm()
+        root.linear_attn = DummyKimiLinearAttn()
+
+        # Simulate state_dict copy mutating norm.weight and replacing parameters.
+        root.norm.weight.data.fill_(0.5)
+        _finalize_state_dict_load(root)
+
+        self.assertTrue(torch.allclose(root.norm.gemma_weight, torch.full((4,), 1.5)))
+        self.assertEqual(root.linear_attn.attn.conv_weights.shape, (6, 4))
+        self.assertIs(root.linear_attn.attn.bias, root.linear_attn.qkv_conv1d.bias)
+        self.assertIs(root.linear_attn.attn.A_log, root.linear_attn.A_log)
+        self.assertIs(root.linear_attn.attn.dt_bias, root.linear_attn.dt_bias)
+
+    def test_modules_with_quant_method_skips_lora_wrappers(self):
+        import torch.nn as nn
+        from sglang.srt.lora.layers import BaseLayerWithLoRA
+        from sglang.srt.model_loader.loader import _modules_with_quant_method
+
+        class DummyQuantBase(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.quant_method = object()
+
+        class DummyLoRAWrapper(BaseLayerWithLoRA):
+            def __init__(self, base_layer):
+                super().__init__(base_layer, lora_backend=None)
+                self.quant_method = base_layer.quant_method
+
+        root = nn.Module()
+        base = DummyQuantBase()
+        root.lora_layer = DummyLoRAWrapper(base)
+
+        yielded = [m for m, _ in _modules_with_quant_method(root)]
+        self.assertEqual(yielded, [base])
+
+
 if __name__ == "__main__":
     unittest.main()

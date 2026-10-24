@@ -331,6 +331,90 @@ def _modules_with_quant_method(model: nn.Module):
             yield module, quant_method
 
 
+def _finalize_state_dict_load(model: nn.Module) -> None:
+    """Refresh derived parameter views and scalar KV-cache scale caches after
+    copying a pre-processed state_dict directly into ``model``.
+
+    State-dict loaders (``ShardedStateLoader``, ``PreshardedModelLoader``,
+    ``RemoteModelLoader._load_model_from_remote_kv``, and
+    ``RemoteInstanceModelLoader``) either invoke
+    ``quant_method.process_weights_after_loading`` *before* copying saved
+    tensors into ``model.state_dict()`` so that quantized linear/MoE parameters
+    have their post-processed shapes, or copy parameter buffers directly via
+    NCCL/RDMA without running parameter ``weight_loader`` hooks. That leaves:
+      1. ``GemmaRMSNorm.gemma_weight`` (a non-persistent buffer normally
+         populated by ``GemmaRMSNorm._weight_loader``) at ``1.0`` instead of
+         ``weight.data + 1.0``;
+      2. linear-attention ``conv1d`` / ``qkv_conv1d`` parameter views on
+         ``module.attn`` pointing at pre-load tensors; and
+      3. ``BaseKVCacheMethod`` scalar caches ``k_scale_float`` /
+         ``v_scale_float`` uninitialized or stuck at ``1.0`` (computed while
+         ``k_scale`` and ``v_scale`` were still ``-1.0``) even after calibrated
+         scales are copied into ``module.k_scale`` and ``module.v_scale``.
+    """
+    from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+
+    PreshardedModelLoader._rebind_parameter_aliases(model)
+
+    for _, module in model.named_modules():
+        if hasattr(module, "refresh_gemma_weight"):
+            module.refresh_gemma_weight()
+        else:
+            gemma_w = getattr(module, "gemma_weight", None)
+            weight = getattr(module, "weight", None)
+            if (
+                isinstance(gemma_w, torch.Tensor)
+                and isinstance(weight, torch.nn.Parameter)
+                and gemma_w.shape == weight.shape
+            ):
+                torch.add(weight.data, 1.0, out=gemma_w)
+
+        attn = getattr(module, "attn", None)
+        qkv_conv1d = getattr(module, "qkv_conv1d", None)
+        if attn is not None and qkv_conv1d is not None:
+            cweight = getattr(qkv_conv1d, "weight", None)
+            if cweight is not None and hasattr(attn, "refresh_conv_weights"):
+                attn.refresh_conv_weights(cweight)
+            elif cweight is not None and hasattr(attn, "conv_weights"):
+                if cweight.dim() == 3 and cweight.size(1) == 1:
+                    attn.conv_weights = cweight.view(cweight.size(0), cweight.size(2))
+                else:
+                    attn.conv_weights = (
+                        cweight.squeeze() if cweight.dim() > 2 else cweight
+                    )
+            if hasattr(qkv_conv1d, "bias") and hasattr(attn, "bias"):
+                attn.bias = qkv_conv1d.bias
+
+        k_scale = getattr(module, "k_scale", None)
+        v_scale = getattr(module, "v_scale", None)
+        if (
+            isinstance(k_scale, torch.Tensor)
+            and isinstance(v_scale, torch.Tensor)
+            and k_scale.numel() == 1
+            and v_scale.numel() == 1
+            and (
+                isinstance(getattr(module, "quant_method", None), BaseKVCacheMethod)
+                or hasattr(module, "k_scale_float")
+                or hasattr(module, "v_scale_float")
+            )
+        ):
+            k_val = float(k_scale.item())
+            v_val = float(v_scale.item())
+            if k_val <= 0.0 and v_val <= 0.0:
+                k_val = 1.0
+                v_val = 1.0
+                k_scale.data.fill_(1.0)
+                v_scale.data.fill_(1.0)
+            elif k_val <= 0.0 or v_val <= 0.0:
+                scale_val = max(k_val, v_val)
+                k_val = scale_val
+                v_val = scale_val
+                k_scale.data.fill_(scale_val)
+                v_scale.data.fill_(scale_val)
+            module.k_scale_float = k_val
+            module.v_scale_float = v_val
+
+
 class BaseModelLoader(ABC):
     """Base class for model loaders."""
 
@@ -1283,11 +1367,9 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         model.recorded_loader = recorded_loader
 
         # Apply FP8 quantization (creates new Parameters, loses attributes)
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+        for module, quant_method in _modules_with_quant_method(model):
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
 
         model.flash_rl_initial_load_complete = True
         self._initial_load_complete = True
@@ -1516,16 +1598,14 @@ class DummyModelLoader(BaseModelLoader):
 
             post_load_weights(model)
 
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    # Skip FusedMoE layers already quantized during init (FP8 or FP4)
-                    if (
-                        hasattr(module, "is_weights_quantized")
-                        and module.is_weights_quantized()
-                    ):
-                        continue
-                    quant_method.process_weights_after_loading(module)
+            for module, quant_method in _modules_with_quant_method(model):
+                # Skip FusedMoE layers already quantized during init (FP8 or FP4)
+                if (
+                    hasattr(module, "is_weights_quantized")
+                    and module.is_weights_quantized()
+                ):
+                    continue
+                quant_method.process_weights_after_loading(module)
 
         return model.eval()
 
@@ -1633,10 +1713,8 @@ class ShardedStateLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config, quant_config)
-                for _, module in model.named_modules():
-                    quant_method = getattr(module, "quant_method", None)
-                    if quant_method is not None:
-                        quant_method.process_weights_after_loading(module)
+                for module, quant_method in _modules_with_quant_method(model):
+                    quant_method.process_weights_after_loading(module)
             rank = get_parallel().tp_rank
             pattern = os.path.join(
                 local_model_path,
@@ -1676,6 +1754,7 @@ class ShardedStateLoader(BaseModelLoader):
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
             post_load_weights(model)
+            _finalize_state_dict_load(model)
 
         return model.eval()
 
@@ -2469,11 +2548,9 @@ class PreshardedModelLoader(DefaultModelLoader):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
 
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            for module, quant_method in _modules_with_quant_method(model):
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
 
             rank, _ = self._world_rank_and_size()
             with open(os.path.join(presharded_dir, self.CHECKSUM_FILENAME)) as f:
@@ -2530,7 +2607,7 @@ class PreshardedModelLoader(DefaultModelLoader):
                     f"checkpoint at {presharded_dir}."
                 )
 
-            self._rebind_parameter_aliases(model)
+            _finalize_state_dict_load(model)
 
             if self._verify_on_load:
                 self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
@@ -3119,12 +3196,10 @@ class GGUFModelLoader(BaseModelLoader):
                 self._get_weights_iterator(local_model_path, gguf_weights_map)
             )
 
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
-        return model
+            for module, quant_method in _modules_with_quant_method(model):
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+        return model.eval()
 
 
 class RemoteInstanceModelLoader(BaseModelLoader):
@@ -3287,6 +3362,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             current_platform.synchronize()
 
             post_load_weights(model)
+            _finalize_state_dict_load(model)
         end_get_weights_tic = time.time()
         logger.debug(
             f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
@@ -3350,6 +3426,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             return False
 
         post_load_weights(model)
+        _finalize_state_dict_load(model)
 
         return True
 
@@ -3412,10 +3489,8 @@ class RemoteModelLoader(BaseModelLoader):
     def _load_model_from_remote_kv(
         self, model: nn.Module, model_config: ModelConfig, client
     ):
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                quant_method.process_weights_after_loading(module)
+        for module, quant_method in _modules_with_quant_method(model):
+            quant_method.process_weights_after_loading(module)
         weights_iterator = self._get_weights_iterator_kv(client)
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
         for key, tensor in weights_iterator:
@@ -3440,6 +3515,7 @@ class RemoteModelLoader(BaseModelLoader):
             raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
         post_load_weights(model)
+        _finalize_state_dict_load(model)
 
     def _load_model_from_remote_fs(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
@@ -3449,16 +3525,14 @@ class RemoteModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             model.load_weights(self._get_weights_iterator_fs(client))
 
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    # When quant methods need to process weights after loading
-                    # (for repacking, quantizing, etc), they expect parameters
-                    # to be on the global target device. This scope is for the
-                    # case where cpu offloading is used, where we will move the
-                    # parameters onto device for processing and back off after.
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            for module, quant_method in _modules_with_quant_method(model):
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
 
     def load_model(
         self,
@@ -3519,16 +3593,14 @@ def load_model_with_cpu_quantization(
         if not isinstance(self, DummyModelLoader):
             model.load_weights(self._get_all_weights(model_config, model))
 
-        for _, module in model.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                # When quant methods need to process weights after loading
-                # (for repacking, quantizing, etc), they expect parameters
-                # to be on the global target device. This scope is for the
-                # case where cpu offloading is used, where we will move the
-                # parameters onto device for processing and back off after.
-                with device_loading_context(module, target_device):
-                    quant_method.process_weights_after_loading(module)
+        for module, quant_method in _modules_with_quant_method(model):
+            # When quant methods need to process weights after loading
+            # (for repacking, quantizing, etc), they expect parameters
+            # to be on the global target device. This scope is for the
+            # case where cpu offloading is used, where we will move the
+            # parameters onto device for processing and back off after.
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
 
         model.to(target_device)
 
