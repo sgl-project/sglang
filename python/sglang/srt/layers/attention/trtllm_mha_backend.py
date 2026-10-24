@@ -246,7 +246,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Runtime parameters
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        self.page_size = model_runner.page_size
+        self.page_size = self._kernel_page_size(model_runner)
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.device = model_runner.device
 
@@ -500,6 +500,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             model_output.copy_(output)
             return model_output
         return output.to(self.q_data_type)
+
+    @staticmethod
+    def _kernel_page_size(model_runner: ModelRunner) -> int:
+        """Kernel page size: a page over 128 tokens is read as 64-token pages."""
+        page_size = model_runner.page_size
+        if page_size <= 128:
+            return page_size
+        if getattr(model_runner.token_to_kv_pool, "use_hnd", False):
+            raise ValueError(
+                f"trtllm_mha reads {page_size}-token pages as 64-token pages, "
+                "which needs the NHD KV layout. Unset SGLANG_USE_HND_KVCACHE."
+            )
+        return 64
 
     @staticmethod
     def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:

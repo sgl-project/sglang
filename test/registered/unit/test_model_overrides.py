@@ -3423,6 +3423,23 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {"page_size": 64},
         )
+        # a DSA target keeps its 256-token page under a trtllm_mha draft
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(
+                    speculative_draft_attention_backend="trtllm_mha",
+                    page_size=256,
+                    _model_config=SimpleNamespace(
+                        attention_arch=None,
+                        hf_config=SimpleNamespace(
+                            architectures=["Glm5NextForConditionalGeneration"],
+                            index_topk=2048,
+                        ),
+                    ),
+                )
+            ),
+            {},
+        )
         # no matching backend: nothing declared
         self.assertEqual(_mla_backend_page_constraints(_view()), {})
 
