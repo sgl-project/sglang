@@ -11,7 +11,7 @@
 /python/sglang/kernels/ops/attention/linear @yizhang2077 @hebiao064 @yuan-luo
 /python/sglang/kernels/ops/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
 /python/sglang/kernels/jit/csrc/lora @Ying1123 @Fridge003 @lifuhuang @yushengsu-thu @jybsuper
-/python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf @triple-mu @kevin-mii @niehen6174
+/python/sglang/multimodal_gen @mickqian @ping1jing2 @HaiShaw @yichiche @AgainstEntropy @BBuf @triple-mu @kevin-mii @niehen6174 @Makcum888e
 /python/sglang/multimodal_gen/runtime/cache @DefTruth
 /python/sglang/multimodal_gen/runtime/layers/quantization/ @HaiShaw @BowenBao @OrangeRedeng @TallMessiWu
 /python/sglang/multimodal_gen/test/server/ascend  @ping1jing2 @ssshinigami @Makcum888e @e-martirosian
