@@ -119,8 +119,11 @@ def validate_native_region_phase(*, description, point, graph_phase, phase, step
         if group.forward_mode == "TARGET_VERIFY":
             variant = json.loads(query.module_variant)
             require(
-                variant["draft_history_tokens"]
-                == [r.bounded_draft_history_tokens(128) for r in group.requests]
+                (
+                    variant["schema_version"] == 2
+                    or variant["draft_history_tokens"]
+                    == [r.bounded_draft_history_tokens(128) for r in group.requests]
+                )
                 and type(execution["draft_buffer_capacity"]) is int
                 and variant["buffer_capacity"] == execution["draft_buffer_capacity"]
                 and variant["buffer_device_matches"]

@@ -246,6 +246,7 @@ def source_case(tmp_path):
                 nnodes=1,
                 attn_cp_size=1,
                 speculative_algorithm="DSPARK",
+                speculative_draft_window_size=None,
                 enable_decoder_swa_bounded_replay=True,
                 disable_cuda_graph=False,
                 cuda_graph_backend_prefill="disabled",
@@ -271,6 +272,7 @@ def source_case(tmp_path):
                     "model_metadata_files": {
                         "config.json": {"sha256": MODEL_CONFIG_SHA256}
                     },
+                    "resolved_model_config": {"sliding_window": 128},
                     "model_runner_module": modules["model_runner"],
                     "loaded_realization_modules": modules,
                     "torch_version": "CPU schema fixture",
@@ -575,7 +577,8 @@ def test_real_sdk_projector_prepares_each_region_and_ordinary_perfdb_has_no_cost
             == 8200
         )
         assert variant["verify_plan_cpu_max_seq_len"] == 8448
-        assert variant["draft_history_tokens"] == [128]
+        assert variant["draft_read_extent_tokens"] == [128]
+        assert variant["schema_version"] == 2 and "draft_history_tokens" not in variant
         assert query.to_shape()["physical_rows"] == (
             5 if region == "decode_proposal" else 6
         )
@@ -633,26 +636,13 @@ def test_full_phase_coverage_reaches_missing_perfdb_before_progress_or_history(
     assert transaction.base_ledger.last_forward_id == -1
 
 
-@pytest.mark.parametrize(
-    "change", ["history", "original_input", "reference_view", "runtime"]
-)
+@pytest.mark.parametrize("change", ["original_input", "reference_view", "runtime"])
 def test_missing_causal_inputs_do_not_become_default_native_facts(source_case, change):
     model = UMDDSparkCostModel(
         source_case.database, native_source_policy=source_case.policy
     )
     step, native, view = before("DECODE", source_case)
-    if change == "history":
-        r = step.requests[0]
-        step = replace(
-            step,
-            groups=(
-                replace(
-                    step.groups[0],
-                    requests=(replace(r, draft_valid_to=r.target_prefix_len - 1),),
-                ),
-            ),
-        )
-    elif change == "original_input":
+    if change == "original_input":
         del native.reqs[0].origin_input_ids
     elif change == "reference_view":
         view = None
@@ -667,6 +657,33 @@ def test_missing_causal_inputs_do_not_become_default_native_facts(source_case, c
             buffer_capacity=4,
             buffer_device_matches=True,
         )
+
+
+def test_nominal_cost_read_extent_does_not_claim_or_require_valid_written_history(
+    source_case,
+):
+    model = UMDDSparkCostModel(
+        source_case.database, native_source_policy=source_case.policy
+    )
+    step, native, view = before("DECODE", source_case)
+    request = step.requests[0]
+    group = replace(
+        step.groups[0],
+        requests=(replace(request, draft_valid_to=request.target_prefix_len - 1),),
+    )
+    execution = model.execution_for(
+        group=group,
+        runtime_profile_json=step.runtime_profile_json,
+        native_batch=native,
+        reference_view=view,
+        buffer_capacity=4,
+        buffer_device_matches=True,
+    )
+    variant = json.loads(execution["native_segment_module_variant"])
+    assert variant["draft_read_extent_tokens"] == [128]
+    assert "draft_history_tokens" not in variant
+    # The cost API has neither repaired the semantic interval nor made progress.
+    assert group.requests[0].draft_valid_to == request.target_prefix_len - 1
 
 
 def stage_policy_metadata(case, *, failure=None):

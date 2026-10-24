@@ -218,11 +218,6 @@ class UMDDSparkCostModel:
                 ),
                 seq_lens_cpu=reference_view.seq_lens_cpu,
                 nxt_kv_lens_cpu=reference_view.nxt_kv_lens_cpu,
-                draft_history_tokens=tuple(
-                    r.bounded_draft_history_tokens(128) for r in group.requests
-                )
-                if decode
-                else None,
                 buffer_capacity=buffer_capacity if decode else None,
                 buffer_device_matches=buffer_device_matches if decode else None,
             )

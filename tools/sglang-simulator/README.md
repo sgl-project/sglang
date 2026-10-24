@@ -144,9 +144,16 @@ or separate verify-plan argument. With a verified native policy, the resolver
 passes the source driver's separate `reference_view` and matching ordered request
 metadata to SDK `project_native_segment_query`. It retains the returned canonical
 module variant unchanged. Native-region phase graphs bind the exact region, ordered work, full sampling,
-buffer/history, execution profile and actual runtime identity, including a complete
+buffer state, nominal attention read extent, execution profile and actual runtime identity, including a complete
 phase attestation for native proposal, through SDK `prepare_native_dspark_phase`.
 Native and legacy proposal selectors reject conflicting cost grains.
+
+Native-region schema2 lets the SDK derive nominal cached read extent from the
+verified non-ring HIP SWA128 branch and ordered prefix lengths. It does not use
+the simulator's valid-written-KV ledger to choose that cost coordinate. Semantic
+validity, acceptance and future progress retain their existing state ownership;
+the separate legacy proposal selector keeps its saturated-history requirement.
+Schema1 region history keys remain distinct and are never relabeled as schema2.
 
 For a HuggingFace snapshot whose `config.json` links into the cache's blob
 directory, set `model_config_root` to the explicit containing checkpoint/cache
