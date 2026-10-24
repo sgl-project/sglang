@@ -11,9 +11,10 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=49, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=95, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestRequestLengthValidation(CustomTestCase):
@@ -167,6 +168,62 @@ class TestRequestLengthValidation(CustomTestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
+
+
+class TestClampMaxNewTokensToContext(CustomTestCase):
+    """--clamp-max-new-tokens-to-context: max_tokens is a cap, not a reservation."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.context_length = 1000
+        cls.process = popen_launch_server(
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=(
+                "--max-total-tokens",
+                str(cls.context_length),
+                "--context-length",
+                str(cls.context_length),
+                "--clamp-max-new-tokens-to-context",
+            ),
+        )
+        cls.client = openai.Client(api_key=cls.api_key, base_url=f"{cls.base_url}/v1")
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process"):
+            terminate_and_kill_process_tree(cls.process)
+
+    def test_max_tokens_over_the_remaining_window_is_capped(self):
+        response = self.client.chat.completions.create(
+            model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            messages=[{"role": "user", "content": "hello " * 500}],
+            temperature=0,
+            max_tokens=self.context_length,
+            extra_body={"ignore_eos": True},
+        )
+
+        usage = response.usage
+        self.assertEqual(response.choices[0].finish_reason, "length")
+        self.assertGreater(usage.completion_tokens, 0)
+        self.assertLessEqual(
+            usage.prompt_tokens + usage.completion_tokens, self.context_length
+        )
+
+    def test_prompt_longer_than_context_is_still_rejected(self):
+        with self.assertRaises(openai.BadRequestError) as cm:
+            self.client.chat.completions.create(
+                model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                messages=[{"role": "user", "content": "hello " * 1200}],
+                temperature=0,
+                max_tokens=16,
+            )
+
+        self.assertIn("is longer than the model's context length", str(cm.exception))
 
 
 if __name__ == "__main__":

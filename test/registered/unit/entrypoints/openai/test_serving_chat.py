@@ -1396,6 +1396,31 @@ class ServingChatTestCase(CustomTestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 self.chat._convert_to_internal_request(req, self.fastapi_request)
 
+    def test_validate_request_max_completion_tokens_above_context(self):
+        """max_completion_tokens above the whole context is a 400 by default and a
+        cap under --clamp-max-new-tokens-to-context."""
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_completion_tokens=4096,
+        )
+        for clamp in (False, True):
+            override = get_context().override_server_args(
+                model_path="dummy",
+                context_length=1024,
+                clamp_max_new_tokens_to_context=clamp,
+            )
+            override.install()
+            try:
+                error = self.chat._validate_request(req)
+            finally:
+                override.restore()
+            with self.subTest(clamp=clamp):
+                if clamp:
+                    self.assertIsNone(error)
+                else:
+                    self.assertIn("max_completion_tokens is too large", error)
+
     def test_validate_request_rejects_sampling_mask_without_meta_info(self):
         req = ChatCompletionRequest(
             model="x",
