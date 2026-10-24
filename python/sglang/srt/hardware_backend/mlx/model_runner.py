@@ -160,6 +160,7 @@ class MlxModelRunner:
     _trunk = None
     _enable_sampling = False
     _sanitize_nan = False
+    _memory_log = False
     _deterministic_seeding = False
 
     def __init__(
@@ -196,6 +197,7 @@ class MlxModelRunner:
         # Counter used to trigger periodic mx.clear_cache() calls.
         self._decode_step_ct: int = 0
         self._clear_steps = envs.SGLANG_MLX_CLEAR_CACHE_STEPS.get()
+        self._memory_log = envs.SGLANG_MLX_MEMORY_LOG.get()
         # On-the-fly quantization preset (e.g. "mlx_q4"). None = no on-load quantization.
         # Pre-quantized HF repos load correctly regardless of this setting:
         # mlx_lm.load() detects the config and instantiates QuantizedLinear
@@ -1069,6 +1071,7 @@ class MlxModelRunner:
         self._req_pool_idx[pending.req_id] = pending.req_pool_idx
         self._req_synced_offset[pending.req_id] = pending.synced_offset
         self._store_auxiliary_state(pending.req_pool_idx, pending.cache)
+        self.log_memory("prefill")
         return next_token
 
     def extend_start(
@@ -1128,6 +1131,7 @@ class MlxModelRunner:
             self._req_pool_idx[pending.req_id],
             self._req_caches[pending.req_id],
         )
+        self.log_memory("extend")
         return next_token
 
     def _trunk_forward(self, input_ids: mx.array, cache: list[Any]) -> mx.array | None:
@@ -1675,9 +1679,32 @@ class MlxModelRunner:
 
         self._decode_step_ct += 1
         if self._clear_steps > 0 and self._decode_step_ct % self._clear_steps == 0:
+            self.log_memory("before_clear_cache")
             mx.clear_cache()
+            self.log_memory("after_clear_cache")
 
         return next_tokens
+
+    def log_memory(self, event: str) -> None:
+        """Log MLX allocator state when SGLANG_MLX_MEMORY_LOG is set.
+
+        ``idle_kv`` counts the request KV buffers parked in the reuse pool,
+        which stay allocated (active, not cache) until a new request takes
+        them.
+        """
+        if not self._memory_log:
+            return
+        gib = 1024**3
+        idle_kv = sum(a.nbytes for a in self.cache_state_arrays(self._cache_pool))
+        logger.info(
+            f"MLX memory [{event}]: "
+            f"active={mx.get_active_memory() / gib:.2f} GiB, "
+            f"cache={mx.get_cache_memory() / gib:.2f} GiB, "
+            f"peak={mx.get_peak_memory() / gib:.2f} GiB, "
+            f"requests={len(self._req_caches)}, "
+            f"idle_kv_lists={len(self._cache_pool)}, "
+            f"idle_kv={idle_kv / gib:.2f} GiB"
+        )
 
     def has_request(self, req_id: str) -> bool:
         """Check if a request has active state."""
@@ -1693,6 +1720,7 @@ class MlxModelRunner:
             self._release_cache(cache)
         self._req_pool_idx.pop(req_id, None)
         self._req_synced_offset.pop(req_id, None)
+        self.log_memory("release")
 
     def clear(self):
         """Clear all request states."""
