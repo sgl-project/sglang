@@ -167,6 +167,7 @@ def _make_model_runner(
     spec = MagicMock()
     spec.is_eagle.return_value = False
     spec.is_standalone.return_value = False
+    spec.is_frozen_kv_mtp.return_value = False
     spec.is_dflash.return_value = False
     spec.is_dflash_family.return_value = False
     spec.is_none.return_value = True
@@ -1081,6 +1082,77 @@ class TestEagleConfigurator(CustomTestCase):
         used = full_tokens * full_pt * 2 + swa_tokens * swa_pt * 3
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
+
+
+class TestFrozenKvMtpDraftBudget(CustomTestCase):
+    """FROZEN_KV_MTP drafts read the target KV pool, so they own no pool to budget."""
+
+    AVAILABLE = 10_000_000
+    DRAFT_LAYERS = 4
+
+    def _tokens(self, *, algorithm, hybrid_swa, unified=False):
+        if hybrid_swa:
+            mr = _make_model_runner(
+                self,
+                num_layers=4,
+                is_hybrid_swa=True,
+                full_attention_layer_ids=[0, 1],
+                swa_attention_layer_ids=[2, 3],
+                swa_num_kv_heads=2,
+                swa_full_tokens_ratio=0.25,
+                enable_unified_memory=unified,
+            )
+        else:
+            mr = _make_model_runner(self, num_layers=4, enable_unified_memory=unified)
+        spec = mr.spec_algorithm
+        spec.is_none.return_value = algorithm == "NONE"
+        spec.is_eagle.return_value = algorithm in ("EAGLE", "FROZEN_KV_MTP")
+        spec.is_frozen_kv_mtp.return_value = algorithm == "FROZEN_KV_MTP"
+        if algorithm != "NONE":
+            mr.spec_aux_config.eagle_draft_num_layers = self.DRAFT_LAYERS
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(
+                available_bytes=self.AVAILABLE, page_size=1
+            )
+        return config.max_total_num_tokens
+
+    def test_hybrid_swa_pool_is_sized_without_draft_layers(self):
+        """Gemma-4 shape: the draft term shrank the full pool for KV nobody allocates."""
+        self.assertEqual(
+            self._tokens(algorithm="FROZEN_KV_MTP", hybrid_swa=True),
+            self._tokens(algorithm="NONE", hybrid_swa=True),
+        )
+
+    def test_default_pool_is_sized_without_draft_layers(self):
+        """Non-hybrid target: the same draft term shrank the pool."""
+        self.assertEqual(
+            self._tokens(algorithm="FROZEN_KV_MTP", hybrid_swa=False),
+            self._tokens(algorithm="NONE", hybrid_swa=False),
+        )
+
+    def test_eagle_still_pays_for_draft_layers(self):
+        """The exemption is FROZEN_KV_MTP only; EAGLE drafts own a real KV pool."""
+        for hybrid_swa in (True, False):
+            self.assertLess(
+                self._tokens(algorithm="EAGLE", hybrid_swa=hybrid_swa),
+                self._tokens(algorithm="NONE", hybrid_swa=hybrid_swa),
+            )
+
+    def test_unified_memory_keeps_charging_draft_layers(self):
+        """Under unified memory the draft worker sizes its own virtual-space pool."""
+        for hybrid_swa in (True, False):
+            self.assertEqual(
+                self._tokens(
+                    algorithm="FROZEN_KV_MTP", hybrid_swa=hybrid_swa, unified=True
+                ),
+                self._tokens(algorithm="EAGLE", hybrid_swa=hybrid_swa, unified=True),
+            )
 
 
 class TestDSAIndexerAllocationPolicy(CustomTestCase):

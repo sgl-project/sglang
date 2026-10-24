@@ -104,6 +104,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _target_pays_for_draft_kv(kvc: KVCacheConfigurator) -> bool:
+    spec = kvc.spec_algorithm
+    if kvc.is_draft_worker or not (spec.is_eagle() or spec.is_standalone()):
+        return False
+    # A FROZEN_KV_MTP draft reads the target pool and owns no KV, except under
+    # unified memory, where its worker builds a pool over the virtual id space.
+    return not spec.is_frozen_kv_mtp() or get_memory().enable_unified_memory
+
+
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds, 0 if none; replicated across DCP
     ranks because the draft pool spans the widened virtual location space."""
@@ -254,9 +263,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
-        if (
-            kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
-        ) and not kvc.is_draft_worker:
+        if _target_pays_for_draft_kv(kvc):
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
             fused_full_entry = kvc.fused_entry_bytes("full")
             if fused_full_entry is not None:
@@ -707,9 +714,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         self._draft_full_layers_num = 0
         self._draft_swa_layers_num = 0
         self._draft_swa_full_layers_num = 0
-        if (
-            kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
-        ) and not kvc.is_draft_worker:
+        if _target_pays_for_draft_kv(kvc):
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if draft_layers is not None and int(draft_layers) > 0:
                 draft_layers = int(draft_layers)
