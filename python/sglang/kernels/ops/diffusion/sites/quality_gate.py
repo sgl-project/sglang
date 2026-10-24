@@ -58,12 +58,18 @@ class QualityGatedFusion:
         if not sites:
             return False
 
+        # Static rejections are input-independent; avoid repeated warnings.
+        rejected_attr = f"{self.enabled_attr}_static_rejected"
+        if getattr(root, rejected_attr, False):
+            return False
+
         if self.reject_reason is not None:
             for site in sites:
                 reason = self.reject_reason(site)
                 if reason is None:
                     continue
                 self._set_enabled(sites, False)
+                setattr(root, rejected_attr, True)
                 logger.info(
                     "%s: %s site failed static guards (%s); keeping the "
                     "whole model on the reference path",

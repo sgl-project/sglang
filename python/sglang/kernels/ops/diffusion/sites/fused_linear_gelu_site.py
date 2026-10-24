@@ -34,6 +34,7 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.jit.utils import get_jit_cuda_arch
+from sglang.kernels.ops.diffusion.common.platform import platform_key
 from sglang.kernels.ops.diffusion.sites.quality_gate import QualityGatedFusion
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -167,6 +168,12 @@ def _site_reject_reason(site: nn.Module) -> str | None:
 
 
 class _LinearGeluFusion(QualityGatedFusion):
+    def mark(self, module: nn.Module, metadata: Any = True) -> None:
+        # The cublasLt GELU epilogue is CUDA-only.
+        if platform_key() == "npu":
+            return
+        super().mark(module, metadata)
+
     def mount(self, root: nn.Module) -> bool:
         _VERDICTS.clear()
         return super().mount(root)

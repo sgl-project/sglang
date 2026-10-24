@@ -208,10 +208,19 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     try:
-        import custom_ops  # noqa: F401
         import sgl_kernel_npu  # noqa: F401
     except ImportError as e:
-        logger.warning("NPU custom kernel packages unavailable: %s", e)
+        logger.warning("Failed to import NPU kernel package 'sgl_kernel_npu': %s", e)
+
+    try:
+        import custom_ops  # noqa: F401
+    except ImportError as e:
+        if not (
+            "sglang.multimodal_gen" in sys.modules
+            and isinstance(e, ModuleNotFoundError)
+            and e.name == "custom_ops"
+        ):
+            logger.warning("Failed to import NPU kernel package 'custom_ops': %s", e)
 
     import torch_npu
 
@@ -222,7 +231,9 @@ def init_npu_backend():
 
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
-        torch_npu.npu.config.allow_internal_format = True
+        # The public query initializes the default NPU before rank selection.
+        if torch_npu._C._npu_get_soc_version() < 260:
+            torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
