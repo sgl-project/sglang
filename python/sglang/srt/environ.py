@@ -1070,6 +1070,11 @@ class Envs:
     )
     # Select the AITER MLA kernel for target verify, "asm" or "gluon".
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
+    # gfx950, FP8 latent cache: an extend whose requests each add at most this many
+    # tokens after a cached prefix attends the latent cache with absorbed queries
+    # (kernels/ops/attention/mla_absorbed_extend.py) instead of expanding the prefix
+    # through kv_b_proj; 0 disables. Measured faster up to ~64 new tokens on MI350X.
+    SGLANG_ROCM_MLA_ABSORBED_EXTEND_MAX_TOKENS = EnvInt(64)
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.

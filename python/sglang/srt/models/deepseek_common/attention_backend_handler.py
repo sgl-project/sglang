@@ -188,6 +188,15 @@ def handle_attention_aiter(attn, forward_batch):
     if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MHA
     if forward_batch.forward_mode.is_extend_without_speculative():
+        from sglang.srt.layers.attention.aiter_backend import (
+            uses_absorbed_cached_extend,
+        )
+        from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+
+        if uses_absorbed_cached_extend(
+            forward_batch, attn.num_local_heads, get_token_to_kv_pool().dtype
+        ):
+            return AttnForwardMethod.MLA
         if not _support_mha_one_shot(attn, forward_batch, "aiter"):
             return AttnForwardMethod.MHA_CHUNKED_KV
         if get_parallel().dcp_enabled:

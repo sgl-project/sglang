@@ -72,6 +72,7 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
+from sglang.kernels.ops.attention import mla_absorbed_extend
 from sglang.kernels.ops.attention.dcp_kernels import (
     compact_dcp_verify_token_table_to_ragged,
     create_mla_kv_page_table_for_dcp,
@@ -177,6 +178,23 @@ class MlaPrefillPsMetadata:
     num_partial_tiles: int
 
 
+def uses_absorbed_cached_extend(forward_batch, num_heads: int, kv_dtype) -> bool:
+    """A plain extend that attends the FP8 latent cache with absorbed queries:
+    gfx950, every request adds at most SGLANG_ROCM_MLA_ABSORBED_EXTEND_MAX_TOKENS
+    tokens and some request has a cached prefix."""
+    max_tokens = envs.SGLANG_ROCM_MLA_ABSORBED_EXTEND_MAX_TOKENS.get()
+    return (
+        max_tokens > 0
+        and forward_batch.forward_mode == ForwardMode.EXTEND
+        and is_gfx95_supported()
+        and kv_dtype == fp8_dtype
+        and num_heads <= mla_absorbed_extend.MAX_HEADS
+        and get_parallel().attn_dcp_size <= 1
+        and any(forward_batch.extend_prefix_lens_cpu)
+        and max(forward_batch.extend_seq_lens_cpu) <= max_tokens
+    )
+
+
 @dataclass
 class ForwardMetadata:
     kv_indptr: torch.Tensor
@@ -209,6 +227,8 @@ class ForwardMetadata:
     # (page_indptr, page_ids, last_page_len); None means use the token-level table
     paged_kv_view: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
     prefill_ps_metadata: Optional[MlaPrefillPsMetadata] = None
+    # Work list of an extend that runs absorbed over the latent cache.
+    absorbed_extend_plan: Optional[mla_absorbed_extend.AbsorbedExtendPlan] = None
     chunked_skip_prefix_ps_metadata: Optional[MlaPrefillPsMetadata] = None
     chunked_prefix_ps_metadatas: Optional[list[Optional[MlaPrefillPsMetadata]]] = None
     # cprr
@@ -1857,6 +1877,32 @@ class AiterAttnBackend(AttentionBackend):
         )
         return merge_state_triton(out_a, lse_a, out_b, lse_b.view(n_rows, num_heads))
 
+    def _expand_prefix_kv_fp8(
+        self,
+        layer: RadixAttention,
+        k_buffer: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_lora_rank: int,
+        qk_nope_head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The cached prefix's K/V for the FP8 prefill, expanded through
+        kv_b_proj and already in its fp8 dtype and padded head count."""
+        from sglang.kernels.ops.attention.mla_prefix_kv_pack import (
+            gather_prefix_latent,
+            pack_prefix_kv_fp8,
+        )
+
+        kvc, k_pe = gather_prefix_latent(k_buffer, kv_indices, kv_lora_rank)
+        kv = layer.kv_b_proj(kvc)[0]
+        return pack_prefix_kv_fp8(
+            kv,
+            k_pe,
+            num_heads=layer.tp_k_head_num,
+            num_heads_padded=self.fp8_prefill_num_head,
+            nope_dim=qk_nope_head_dim,
+            v_dim=layer.v_head_dim,
+        )
+
     def mla_fp8_prefill_attn(
         self,
         q: torch.Tensor,
@@ -1886,9 +1932,13 @@ class AiterAttnBackend(AttentionBackend):
         # to fill and the extra output columns sliced back off.
         head_pad = self.fp8_prefill_num_head - nhead
         if head_pad:
-            q = self.pad_heads(q, self.fp8_prefill_num_head)
-            k = self.pad_heads(k, self.fp8_prefill_num_head)
-            v = self.pad_heads(v, self.fp8_prefill_num_head)
+            # k / v from _expand_prefix_kv_fp8 arrive padded already.
+            q, k, v = (
+                x
+                if x.shape[1] == self.fp8_prefill_num_head
+                else self.pad_heads(x, self.fp8_prefill_num_head)
+                for x in (q, k, v)
+            )
             nhead = self.fp8_prefill_num_head
 
         if q.dtype != fp8_dtype:
@@ -2540,6 +2590,16 @@ class AiterAttnBackend(AttentionBackend):
                         exact_partial_count=False,
                     )
 
+                absorbed_extend_plan = None
+                if uses_absorbed_cached_extend(
+                    forward_batch, self.num_head, self.kv_cache_dtype
+                ):
+                    absorbed_extend_plan = mla_absorbed_extend.plan_absorbed_extend(
+                        forward_batch.extend_seq_lens_cpu,
+                        forward_batch.seq_lens_cpu,
+                        qo_indptr.device,
+                    )
+
                 self.forward_metadata = ForwardMetadata(
                     self.mla_indices_updater_prefill.kv_indptr,
                     self.mla_indices_updater_prefill.kv_indices,
@@ -2548,6 +2608,7 @@ class AiterAttnBackend(AttentionBackend):
                     max_q_len,
                     self.mla_indices_updater_prefill.max_kv_len,
                     prefill_ps_metadata=prefill_ps_metadata,
+                    absorbed_extend_plan=absorbed_extend_plan,
                 )
             else:
                 self.indices_updater_prefill.update(
@@ -3868,6 +3929,16 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return output
                 elif layer.qk_head_dim != (kv_lora_rank + qk_rope_head_dim):
+                    if (
+                        self.use_fp8_prefill_attn
+                        and self.kv_cache_dtype == fp8_dtype
+                        and K_Buffer.dtype == fp8_dtype
+                        and layer.kv_b_proj.weight.dtype == torch.bfloat16
+                    ):
+                        k, v = self._expand_prefix_kv_fp8(
+                            layer, K_Buffer, kv_indices, kv_lora_rank, qk_nope_head_dim
+                        )
+                        return self.mla_fp8_prefill_attn(q, k, v, layer)
                     K_Buffer = torch.index_select(K_Buffer, 0, kv_indices)
                     kvc, k_pe = torch.split(
                         K_Buffer, [kv_lora_rank, qk_rope_head_dim], dim=-1
@@ -3935,6 +4006,20 @@ class AiterAttnBackend(AttentionBackend):
                             causal=True,
                         )
 
+                elif self.forward_metadata.absorbed_extend_plan is not None:
+                    return mla_absorbed_extend.mla_absorbed_extend(
+                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim).to(
+                            fp8_dtype
+                        ),
+                        K_Buffer.view(-1, layer.qk_head_dim),
+                        kv_indices,
+                        kv_indptr,
+                        qo_indptr,
+                        self.forward_metadata.absorbed_extend_plan,
+                        layer.scaling,
+                        kv_lora_rank,
+                        kv_scale=self._resolve_fp8_kv_scale_float(layer, k_descale),
+                    )
                 else:
                     if self.head_pad_mode == "zero":
                         # 12 heads/rank (Kimi-K3 TP8): zero-pad q to 16 heads,
