@@ -30,34 +30,22 @@ pub(super) fn render_chat(
     kwargs: Option<&ChatTemplateKwargs>,
     defaults: &ChatTemplateKwargs,
 ) -> Result<RenderedChat, TemplateError> {
-    match formatter {
-        ChatFormatter::DeepSeekV4(_)
-        | ChatFormatter::DeepSeekV41
-        | ChatFormatter::Glm53(_)
-        | ChatFormatter::KimiK3
-        | ChatFormatter::Qwen38 { .. } => {
-            // The continuation's leading BOS is dropped once its ids are encoded.
-            let (prompt, continuation) = match formatter.render_request(body, defaults) {
-                Ok(rendered) => rendered,
-                // There is no engine to hand a request the SGLang path declines
-                // to, so the formatter's own template renders it, as it did
-                // before that path existed. DeepSeek-V4 has no other path.
-                Err(TemplateError::EngineOnly { .. })
-                    if !matches!(
-                        formatter,
-                        ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41
-                    ) =>
-                {
-                    return render_template(formatter, request, kwargs, defaults);
-                }
-                Err(error) => return Err(error),
-            };
-            Ok(RenderedChat {
-                prompt,
-                continuation,
-            })
+    if !formatter.renders_requests() {
+        return render_template(formatter, request, kwargs, defaults);
+    }
+    // The continuation's leading BOS is dropped once its ids are encoded.
+    match formatter.render_request(body, defaults) {
+        Ok((prompt, continuation)) => Ok(RenderedChat {
+            prompt,
+            continuation,
+        }),
+        // There is no engine to hand a request the SGLang path declines to, so
+        // the formatter's own template renders it, as it did before that path
+        // existed; a formatter with no other path declines it again.
+        Err(TemplateError::EngineOnly { .. }) => {
+            render_template(formatter, request, kwargs, defaults)
         }
-        _ => render_template(formatter, request, kwargs, defaults),
+        Err(error) => Err(error),
     }
 }
 
