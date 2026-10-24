@@ -452,6 +452,14 @@ pub struct DeploymentInfo {
     pub hicache_write_policy: Option<String>,
     pub hicache_host_total_tokens: Option<u64>,
     pub kv_event_sources: Vec<KvEventSource>,
+    pub rust_server_endpoints: Vec<RustServerEndpoint>,
+}
+
+/// One DP rank's listener, as a base URL (`http://host:port`).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RustServerEndpoint {
+    pub dp_rank: u32,
+    pub endpoint: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

@@ -20,7 +20,8 @@ use serde_json::json;
 use tower::util::ServiceExt;
 
 use super::{indexed_decode_stream, model_error, openai_error, routes};
-use crate::api_server::core::{CoreCall, CoreEvent, CoreHandle};
+use crate::api_server::core::CoreEvent;
+use crate::api_server::handlers::{CoreCall, CoreHandle};
 use crate::message::config::ServerArgs;
 use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::tokenizer_manager::wiring::TmEvent;
@@ -28,13 +29,14 @@ pub(super) fn core_handle() -> CoreHandle {
     CoreHandle::new(
         flume::unbounded().0,
         flume::unbounded().0,
-        crate::api_server::core::CoreConfig {
+        crate::api_server::handlers::CoreConfig {
             response_capacity: 8,
             response_activity: Default::default(),
             startup_ready: false,
             is_disaggregation: false,
             mm_limits: Default::default(),
-            metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
+            peer_endpoints: Vec::new(),
+            metadata: crate::api_server::handlers::CoreMetadata::from(server_args().as_ref()),
         },
     )
 }
@@ -125,13 +127,14 @@ pub(super) fn frontend_closed() -> CoreHandle {
     CoreHandle::new(
         tm_tx,
         abort_tx,
-        crate::api_server::core::CoreConfig {
+        crate::api_server::handlers::CoreConfig {
             response_capacity: 8,
             response_activity: Default::default(),
             startup_ready: false,
             is_disaggregation: false,
             mm_limits: Default::default(),
-            metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
+            peer_endpoints: Vec::new(),
+            metadata: crate::api_server::handlers::CoreMetadata::from(server_args().as_ref()),
         },
     )
 }
@@ -150,13 +153,14 @@ fn answering_app_state() -> Arc<super::AppState> {
     let core = CoreHandle::new(
         intake_tx,
         flume::unbounded().0,
-        crate::api_server::core::CoreConfig {
+        crate::api_server::handlers::CoreConfig {
             response_capacity: 8,
             response_activity: Default::default(),
             startup_ready: false,
             is_disaggregation: false,
             mm_limits: Default::default(),
-            metadata: crate::api_server::core::CoreMetadata::from(server_args().as_ref()),
+            peer_endpoints: Vec::new(),
+            metadata: crate::api_server::handlers::CoreMetadata::from(server_args().as_ref()),
         },
     );
     let server_args = server_args();

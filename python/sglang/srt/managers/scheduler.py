@@ -2412,7 +2412,15 @@ class Scheduler(
         set, and point the ingress receiver at it. All the plumbing lives in
         ``RustServer`` (scheduler_components/rust_scheduler.py)."""
 
-        if not self._hosts_rust_server():
+        hosts_listener = self._hosts_rust_server()
+        # A collective: every rank takes part so the listener ranks learn
+        # every other listener's address, for control-request fan-out.
+        self.rust_server_endpoints = (
+            self.get_rust_server_class().gather_server_endpoints(hosts_listener)
+            if envs.SGLANG_RUST_SERVER.get()
+            else []
+        )
+        if not hosts_listener:
             # Always define the attribute: init_output_streamer and the
             # process_input_requests hook read self.rust_server unconditionally.
             self.rust_server = None

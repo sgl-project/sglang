@@ -3782,6 +3782,7 @@ dependencies = [
  "numpy",
  "pyo3",
  "regex-syntax",
+ "reqwest",
  "rmp-serde",
  "rmpv",
  "rustix",

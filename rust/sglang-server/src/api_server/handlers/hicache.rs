@@ -3,7 +3,9 @@
 use sglang_api_types::api::v1 as api;
 use tokio::sync::RwLock;
 
-use super::{CoreError, CoreHandle};
+use super::handle::CoreHandle;
+use crate::api_server::core::CoreError;
+use crate::api_server::core::fanout;
 use crate::message::config::ServerArgs;
 use crate::message::ids::Rid;
 use crate::message::io_struct::{
@@ -35,42 +37,46 @@ impl HiCacheManager {
         self.config.read().await.clone()
     }
 
+    /// Clear the storage backend on every DP rank; cleared only where every
+    /// rank cleared.
     pub(crate) async fn clear(&self) -> Result<api::HiCacheStorageResponse, CoreError> {
-        let bytes = self
+        let outputs = self
             .core
-            .control(ControlRequest::ClearHiCacheReqInput(
-                ClearHiCacheReqInput::new(Rid::new().to_string()),
-            ))
-            .await?;
-        rmp_serde::from_slice::<ClearHiCacheOutput>(&bytes)
-            .map(|output| api::HiCacheStorageResponse {
-                success: output.success,
-                message: String::new(),
+            .control(&|| {
+                ControlRequest::ClearHiCacheReqInput(ClearHiCacheReqInput::new(
+                    Rid::new().to_string(),
+                ))
             })
-            .map_err(|error| {
-                CoreError::InvalidResponse(format!("invalid HiCache clear response: {error}"))
-            })
+            .await
+            .decode::<ClearHiCacheOutput>("HiCache clear")?;
+        let (success, message) =
+            fanout::merge_status(outputs.iter().map(|output| (output.success, "")));
+        Ok(api::HiCacheStorageResponse { success, message })
     }
 
+    /// Detach the storage backend on every DP rank. The recorded configuration
+    /// changes only when every rank detached, as Python's does.
     pub(crate) async fn detach(&self) -> Result<api::HiCacheStorageResponse, CoreError> {
         let mut config = self.config.write().await;
-        let bytes = self
+        let outputs = self
             .core
-            .control(ControlRequest::DetachHiCacheStorageReqInput(
-                DetachHiCacheStorageReqInput::new(Rid::new().to_string()),
-            ))
-            .await?;
-        let output: DetachHiCacheOutput = rmp_serde::from_slice(&bytes).map_err(|error| {
-            CoreError::InvalidResponse(format!("invalid HiCache detach response: {error}"))
-        })?;
-        if output.success {
+            .control(&|| {
+                ControlRequest::DetachHiCacheStorageReqInput(DetachHiCacheStorageReqInput::new(
+                    Rid::new().to_string(),
+                ))
+            })
+            .await
+            .decode::<DetachHiCacheOutput>("HiCache detach")?;
+        let (success, message) = fanout::merge_status(
+            outputs
+                .iter()
+                .map(|output| (output.success, output.message.as_str())),
+        );
+        if success {
             config.hicache_storage_backend = None;
             config.hicache_storage_backend_extra_config = None;
         }
-        Ok(api::HiCacheStorageResponse {
-            success: output.success,
-            message: output.message,
-        })
+        Ok(api::HiCacheStorageResponse { success, message })
     }
 
     pub(crate) async fn attach(
@@ -81,22 +87,27 @@ impl HiCacheManager {
             CoreError::InvalidArgument("missing field `hicache_storage_backend`".into())
         })?;
         let mut config = self.config.write().await;
-        let bytes = self
+        let outputs = self
             .core
-            .control(ControlRequest::AttachHiCacheStorageReqInput(
-                AttachHiCacheStorageReqInput::new(
+            .control(&|| {
+                ControlRequest::AttachHiCacheStorageReqInput(AttachHiCacheStorageReqInput::new(
                     Rid::new().to_string(),
                     backend.clone(),
                     body.hicache_storage_backend_extra_config_json.clone(),
                     body.hicache_storage_prefetch_policy.clone(),
                     body.hicache_write_policy.clone(),
-                ),
-            ))
-            .await?;
-        let output: AttachHiCacheOutput = rmp_serde::from_slice(&bytes).map_err(|error| {
-            CoreError::InvalidResponse(format!("invalid HiCache attach response: {error}"))
-        })?;
-        if output.success {
+                ))
+            })
+            .await
+            .decode::<AttachHiCacheOutput>("HiCache attach")?;
+        // Attached only where every rank attached; a partial attach is
+        // reported as a failure (no rollback, as in Python).
+        let (success, message) = fanout::merge_status(
+            outputs
+                .iter()
+                .map(|output| (output.success, output.message.as_str())),
+        );
+        if success {
             config.hicache_storage_backend = body.hicache_storage_backend;
             if let Some(value) = body.hicache_storage_backend_extra_config_json {
                 config.hicache_storage_backend_extra_config = Some(value);
@@ -108,10 +119,7 @@ impl HiCacheManager {
                 config.hicache_write_policy = Some(value);
             }
         }
-        Ok(api::HiCacheStorageResponse {
-            success: output.success,
-            message: output.message,
-        })
+        Ok(api::HiCacheStorageResponse { success, message })
     }
 }
 
@@ -140,7 +148,7 @@ struct AttachHiCacheOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api_server::core::{CoreConfig, CoreMetadata};
+    use crate::api_server::handlers::{CoreConfig, CoreMetadata};
     use crate::message::response::ResponseItem;
     use crate::tokenizer_manager::wiring::TmEvent;
     use bytes::Bytes;
@@ -161,6 +169,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::default(),
             },
         );

@@ -40,6 +40,11 @@ pub(crate) enum CoreError {
     #[error("{0}")]
     Cancelled(String),
 
+    /// A DP rank did not answer a control request within the fan-out's
+    /// deadline (see [`super::fanout`]).
+    #[error("{0}")]
+    DeadlineExceeded(String),
+
     /// The internal producer disappeared before returning a terminal result.
     ///
     /// This is a server-side failure, not evidence that the caller cancelled.
@@ -77,6 +82,7 @@ impl CoreError {
             Self::Unavailable => CoreErrorKind::Unavailable,
             Self::Overloaded(_) => CoreErrorKind::ResourceExhausted,
             Self::Cancelled(_) => CoreErrorKind::Cancelled,
+            Self::DeadlineExceeded(_) => CoreErrorKind::DeadlineExceeded,
             Self::ResponseTruncated => CoreErrorKind::Internal,
             Self::RuntimeRejected { kind, .. } => *kind,
             Self::InvalidResponse(_) | Self::Internal(_) => CoreErrorKind::Internal,
@@ -86,7 +92,7 @@ impl CoreError {
     /// Translate the scheduler's inherited HTTP-coded failure into a semantic
     /// category once, at the runtime boundary. HTTP can retain the exact legacy
     /// status while other adapters consume [`Self::kind`].
-    pub(super) fn from_runtime_rejection(message: String, legacy_http_status: u16) -> Self {
+    pub(crate) fn from_runtime_rejection(message: String, legacy_http_status: u16) -> Self {
         let kind = match legacy_http_status {
             404 => CoreErrorKind::NotFound,
             408 | 504 => CoreErrorKind::DeadlineExceeded,
@@ -163,6 +169,10 @@ mod tests {
         assert_eq!(
             CoreError::Cancelled("gone".into()).http_status().as_u16(),
             499
+        );
+        assert_eq!(
+            CoreError::DeadlineExceeded("late".into()).http_status(),
+            StatusCode::GATEWAY_TIMEOUT
         );
         assert_eq!(
             CoreError::RuntimeRejected {

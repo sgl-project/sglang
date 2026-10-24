@@ -104,6 +104,8 @@ def _build_server_args(
         "kv_event_sources": scheduler.kv_events_publisher.local_kv_event_sources(
             scheduler.page_size * get_parallel().dcp_size
         ),
+        # Every Rust listener of the deployment (`RustServer.gather_server_endpoints`).
+        "rust_server_endpoints": scheduler.rust_server_endpoints,
     }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
     # snapshots directly; the ZMQ transport (multi-node DP) has no file to read.

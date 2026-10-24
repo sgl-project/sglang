@@ -16,9 +16,9 @@ use crate::message::types::TokenIds;
 ///
 /// The runtime correlation ID is deliberately absent: it is an implementation
 /// detail used for scheduler routing, while adapters obtain the client-visible
-/// identity from [`crate::api_server::core::CoreCall::public_id`]. Runtime-only
+/// identity from [`crate::api_server::handlers::CoreCall::public_id`]. Runtime-only
 /// response variants such as raw control bytes are likewise hidden by
-/// [`crate::api_server::core::CoreCall`].
+/// [`crate::api_server::handlers::CoreCall`].
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoreOutput {
     pub(crate) token_ids: TokenIds,

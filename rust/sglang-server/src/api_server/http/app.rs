@@ -9,8 +9,8 @@ use axum::Router;
 
 use super::{hicache, info, loads, metrics, native_api, openai};
 use crate::HttpLayer;
-use crate::api_server::core::{CoreHandle, HiCacheManager};
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
+use crate::api_server::handlers::{CoreHandle, HiCacheManager};
 use crate::api_server::log;
 use crate::message::config::ServerArgs;
 use crate::message::request::GenerationPolicy;

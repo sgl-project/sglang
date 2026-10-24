@@ -8,9 +8,8 @@ use sglang_api_types::api::v1 as api;
 use tonic::{Code, Status};
 
 use super::service::ResponseStream;
-use crate::api_server::core::{
-    CoreCall, CoreError, CoreErrorKind, CoreEvent, CoreOutput, recv_indexed,
-};
+use crate::api_server::core::{CoreError, CoreErrorKind, CoreEvent, CoreOutput};
+use crate::api_server::handlers::{CoreCall, recv_indexed};
 
 pub(super) struct StreamOptions {
     /// `stream` as sent: false folds each item to its one terminal frame.

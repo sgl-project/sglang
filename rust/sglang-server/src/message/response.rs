@@ -43,7 +43,7 @@ pub type ResponseSource = mpsc::Receiver<ResponseItem>;
 
 /// Runtime-facing output delivered to the core boundary: a detok-decoded
 /// [`ChunkEvent`], a serialized internal-operation result, or a stage error.
-/// [`crate::api_server::core::CoreHandle`] translates these variants before a
+/// [`crate::api_server::handlers::CoreHandle`] translates these variants before a
 /// transport adapter sees them.
 #[derive(Debug)]
 pub enum ResponseItem {

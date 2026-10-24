@@ -37,7 +37,8 @@ use super::{
     AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
     indexed_decode_stream, model_error, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreCall, CoreEvent};
+use crate::api_server::core::CoreEvent;
+use crate::api_server::handlers::CoreCall;
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
@@ -1224,7 +1225,7 @@ mod tests {
     #[tokio::test]
     async fn system_message_tools_reach_http_responses() {
         use super::super::test_utils::{body_json, post_json};
-        use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+        use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
         use crate::message::config::ServerArgs;
         use crate::message::request::RequestKind;
         use crate::tokenizer_manager::wiring::TmEvent;
@@ -1246,6 +1247,7 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(args.as_ref()),
                 },
             );
