@@ -40,6 +40,16 @@ class ShutdownReq(msgspec.Struct):
     pass
 
 
+ABORTED_ERROR = "Request aborted"
+
+
+class AbortReq(msgspec.Struct):
+    """Drop queued generation requests: the given request ids, or all of them."""
+
+    request_ids: Optional[List[str]] = None
+    abort_all: bool = False
+
+
 class ReleaseRealtimeSessionReq(msgspec.Struct):
     session_id: str
 

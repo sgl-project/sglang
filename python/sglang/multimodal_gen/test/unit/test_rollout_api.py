@@ -1,17 +1,33 @@
 """Unit tests for the rollout generate API (serialization, io_struct, rollout_api)."""
 
+import asyncio
 import types
 import unittest
+from collections import deque
+from unittest.mock import AsyncMock, Mock, patch
 
 import torch
+from fastapi import HTTPException
+from pydantic import ValidationError
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    ABORTED_ERROR,
+    AbortReq,
+)
+from sglang.multimodal_gen.runtime.entrypoints.post_training import rollout_api
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    RolloutAbortRequest,
+    RolloutRequest,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_deserialize,
     _maybe_serialize,
     bytes_to_tensor,
     tensor_to_bytes,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
     RolloutDenoisingEnv,
@@ -414,6 +430,97 @@ class TestBuildSamplingKwargs(unittest.TestCase):
         req = Req(sampling_params=sp)
         self.assertEqual(req.rollout_sde_step_indices, [0, 2])
         self.assertEqual(req.rollout_return_step_indices, [1, 3])
+
+
+class TestRolloutAbort(unittest.TestCase):
+    @staticmethod
+    def _req(request_id, is_warmup=False):
+        req = Req(sampling_params=SamplingParams(prompt="p", request_id=request_id))
+        req.is_warmup = is_warmup
+        return req
+
+    @staticmethod
+    def _scheduler(queued):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.metrics = None
+        scheduler.return_result = Mock()
+        scheduler.waiting_queue = deque((name, req, 0.0) for name, req in queued)
+        return scheduler
+
+    @staticmethod
+    def _replies(scheduler):
+        return {
+            identity: output.error or output.output
+            for (output, identity), _ in scheduler.return_result.call_args_list
+        }
+
+    def test_abort_drops_matching_queued_and_same_batch_requests(self):
+        a, b, c, d, e = (self._req(x) for x in "abcde")
+        scheduler = self._scheduler([(b"a", a), (b"b", b), (b"c", c), (b"d", d)])
+
+        remaining = scheduler._apply_aborts(
+            [
+                (b"e", e),
+                (b"x", AbortReq(request_ids=["a", "c", "e", "unknown"])),
+                (b"f", self._req("f")),
+            ]
+        )
+
+        # the abort never enters the queue, so it cannot wait behind what it cancels
+        self.assertEqual([r.request_id for _, r in remaining], ["f"])
+        self.assertEqual([entry[1] for entry in scheduler.waiting_queue], [b, d])
+        self.assertEqual(
+            self._replies(scheduler),
+            {
+                b"a": ABORTED_ERROR,
+                b"c": ABORTED_ERROR,
+                b"e": ABORTED_ERROR,
+                b"x": {"success": True, "num_aborted": 3},
+            },
+        )
+
+    def test_abort_all_spares_warmup_and_matches_groups(self):
+        warmup = self._req("w", is_warmup=True)
+        group = [self._req("g"), self._req("g2")]
+        scheduler = self._scheduler([(b"w", warmup), (b"a", self._req("a"))])
+        scheduler.waiting_queue.append((b"g", group, 0.0))
+
+        scheduler._apply_aborts([(b"x", AbortReq(abort_all=True))])
+
+        self.assertEqual([entry[1] for entry in scheduler.waiting_queue], [warmup])
+        self.assertEqual(
+            self._replies(scheduler)[b"x"], {"success": True, "num_aborted": 2}
+        )
+
+    def test_aborted_rollout_returns_499_with_client_request_id(self):
+        with (
+            patch.object(rollout_api, "get_global_server_args"),
+            patch.object(rollout_api, "build_sampling_params") as build,
+            patch.object(rollout_api, "prepare_request"),
+            patch.object(
+                rollout_api.async_scheduler_client,
+                "forward",
+                AsyncMock(return_value=OutputBatch(error=ABORTED_ERROR)),
+            ),
+            self.assertRaises(HTTPException) as ctx,
+        ):
+            asyncio.run(
+                rollout_api.rollout_generate(
+                    RolloutRequest(prompt="p", request_id="miles-0-1")
+                )
+            )
+        self.assertEqual(ctx.exception.status_code, 499)
+        # the client's id is what the scheduler matches aborts against
+        self.assertEqual(build.call_args.args[0], "miles-0-1")
+
+    def test_invalid_abort_inputs_are_rejected(self):
+        # the id can end up in file names such as profiler traces
+        for request_id in ["../etc/passwd", "a/b", "", "x" * 129]:
+            with self.assertRaises(ValidationError):
+                RolloutRequest(prompt="p", request_id=request_id)
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(rollout_api.rollout_abort(RolloutAbortRequest()))
+        self.assertEqual(ctx.exception.status_code, 400)
 
 
 if __name__ == "__main__":

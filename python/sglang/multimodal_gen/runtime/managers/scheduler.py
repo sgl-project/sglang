@@ -26,6 +26,8 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
 )
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+    ABORTED_ERROR,
+    AbortReq,
     GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -1397,6 +1399,41 @@ class Scheduler(
 
         return recv_reqs
 
+    def _apply_aborts(
+        self, new_reqs: list[tuple[bytes | None, Any]]
+    ) -> list[tuple[bytes | None, Any]]:
+        """Drop queued and same-batch requests matched by each AbortReq; a running request finishes."""
+        aborts = [(i, r) for i, r in new_reqs if isinstance(r, AbortReq)]
+        new_reqs = [(i, r) for i, r in new_reqs if not isinstance(r, AbortReq)]
+        for identity, abort_req in aborts:
+            request_ids = set(abort_req.request_ids or [])
+
+            def matches(entry) -> bool:
+                req = get_first_generation_req(entry[1])
+                return (
+                    req is not None
+                    and not is_warmup_req(entry[1])
+                    and (abort_req.abort_all or req.request_id in request_ids)
+                )
+
+            queued = [e for e in self.waiting_queue if matches(e)]
+            pending = [e for e in new_reqs if matches(e)]
+            self.waiting_queue = deque(e for e in self.waiting_queue if not matches(e))
+            new_reqs = [e for e in new_reqs if not matches(e)]
+            # same-batch requests were never enqueued in metrics
+            if self.metrics is not None:
+                for _, req, _ in queued:
+                    self.metrics.finish(id(req), error=True)
+            for item_identity, *_ in queued + pending:
+                self.return_result(OutputBatch(error=ABORTED_ERROR), item_identity)
+            num_aborted = len(queued) + len(pending)
+            logger.info("Aborted %d queued request(s)", num_aborted)
+            self.return_result(
+                OutputBatch(output={"success": True, "num_aborted": num_aborted}),
+                identity,
+            )
+        return new_reqs
+
     def event_loop(self) -> None:
         """
         The main event loop that listens for ZMQ requests.
@@ -1425,6 +1462,8 @@ class Scheduler(
             try:
                 new_reqs = self.recv_reqs()
                 new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
+                # aborts skip the queue, or they would wait behind the requests they cancel
+                new_reqs = self._apply_aborts(new_reqs)
                 now = time.monotonic()
                 self.waiting_queue.extend(
                     [(identity, req, now) for identity, req in new_reqs]
