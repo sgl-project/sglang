@@ -132,7 +132,7 @@ class StartupWeightLoadOptions:
             enable_lora=get_lora().enable_lora,
             has_lora_paths=bool(get_lora().lora_paths),
             weight_loader_disable_mmap=get_model().weight_loader_disable_mmap,
-            weight_loader_drop_cache_after_load=(
+            weight_loader_drop_cache_after_load=bool(
                 get_model().weight_loader_drop_cache_after_load
             ),
             has_custom_weight_loader=bool(get_model().custom_weight_loader),
