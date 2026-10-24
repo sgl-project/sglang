@@ -115,6 +115,7 @@ from sglang.srt.speculative.spec_utils import (
     sample_draft_proposal,
     select_top_k_tokens,
     spec_stage_span,
+    validate_hot_token_ids_fit,
 )
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
@@ -363,6 +364,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None and head is not None:
+                validate_hot_token_ids_fit(self.hot_token_id, head.shape[0])
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
                 head.data = head.data[self.hot_token_id]
