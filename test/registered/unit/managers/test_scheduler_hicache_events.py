@@ -96,9 +96,10 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
     def test_pp_prefill_drains_before_admission(self):
         s = self.scheduler
         s.init_pp_loop_state = Mock()
+        s.pp_prefetch_admission = None
         s.pp_loop_size = 1
         enter_scope(self, published_topology(pp_size=2))
-        s.pp_group = SimpleNamespace(is_last_rank=True)
+        s.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
         s.running_mbs = [self.running_batch]
         s.last_mbs = [None]
         s.ingest_requests = Mock(return_value=[])

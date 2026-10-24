@@ -1715,6 +1715,8 @@ class Req(ReqDllmMixin):
         self,
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
+        *,
+        max_cache_prefix_tokens: Optional[int] = None,
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
@@ -1743,6 +1745,10 @@ class Req(ReqDllmMixin):
         # avoiding an O(context) copy per prefill-batch build.
         token_ids_to_match = self.full_untruncated_fill_ids
         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
+        if max_cache_prefix_tokens is not None:
+            # Limit the native match itself: device/host anchors and their lock
+            # receipts must describe the certified full-prefix boundary.
+            key_limit = min(key_limit, max_cache_prefix_tokens)
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.

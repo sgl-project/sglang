@@ -21,6 +21,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_pp_mixin import PrefillControl
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -659,7 +660,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def prepare_pp_scheduler(self, scheduler):
         enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
-        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler.pp_prefetch_admission = None
+        scheduler.pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()
@@ -670,7 +672,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = Mock(
             return_value=(None, GenerationBatchResult(), Mock())
         )
-        scheduler._pp_pd_get_prefill_transferred_ids = Mock(return_value=None)
+        scheduler._pp_recv_prefill_control = Mock(return_value=PrefillControl([]))
+        scheduler._pp_pd_send_prefill_return = Mock(return_value=([], None))
+        scheduler._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
         scheduler._pp_pd_get_retract_ids = Mock(return_value=None)
         scheduler._pp_pd_get_prealloc_ids = Mock(return_value=None)
         scheduler._pp_pd_get_decode_transferred_ids = Mock(return_value=None)

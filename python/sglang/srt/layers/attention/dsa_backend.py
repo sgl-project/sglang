@@ -16,6 +16,9 @@ import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+from sglang.srt.mem_cache.pp_prefetch_config import (
+    requires_logical_dsa_pp_topk,
+)
 from sglang.srt.runtime_context import (
     get_buffer,
     get_exec,
@@ -663,10 +666,26 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
-        self.use_fused_topk = should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
+        self.pp_topk_uses_logical_positions = (
+            not model_runner.is_draft_worker
+            and requires_logical_dsa_pp_topk(
+                model_config=model_runner.model_config.hf_config,
+            )
+        )
+        self.use_fused_topk = (
+            should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend)
+            and not self.pp_topk_uses_logical_positions
+        )
+        if self.pp_topk_uses_logical_positions:
+            logger.info(
+                "PP cache admission uses logical DSA top-k indices: stage=%d",
+                get_parallel().pp_rank,
+            )
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
             print_warning_once(
-                "Disabling fused DSA top-k for IndexShare under PD disaggregation."
+                "Disabling allocator-local fused DSA top-k for asynchronous PP index sharing."
+                if self.pp_topk_uses_logical_positions
+                else "Disabling fused DSA top-k for IndexShare under PD disaggregation."
             )
 
         if _is_xpu:

@@ -808,6 +808,10 @@ class Envs:
     # ===================================================================
     # HiCache storage backends and mmap allocation
     # ===================================================================
+    # Launch-time opt-in for cache-mode PD-prefill hop-by-hop PP admission.
+    SGLANG_ENABLE_PP_L3_CACHE_ASYNC_ADMISSION = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_PP_L3_CACHE_ASYNC_ADMISSION"
+    )
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
     # HiCache host<->device transfers use the TMA staging kernel when the GPU

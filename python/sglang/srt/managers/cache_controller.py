@@ -42,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.pp_prefetch_config import pp_cache_admission_enabled
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
@@ -88,6 +89,19 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+
+    def configure_overlap_capacity(self, max_inflight: int):
+        """Size the load-event ring before any load or consumer is scheduled."""
+        if max_inflight < 1:
+            raise ValueError("Load overlap capacity must be positive")
+        if self.producer_index != -1 or self.consumer_index != -1:
+            raise RuntimeError("Cannot resize load events after scheduling starts")
+        target = max(self.num_counters, max_inflight)
+        self.events.extend(
+            LayerLoadingEvent(self.num_layers)
+            for _ in range(target - self.num_counters)
+        )
+        self.num_counters = target
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -411,7 +425,7 @@ class HiCacheController:
             base_groups = [self.attn_cp_group, self.attn_tp_group]
         else:
             base_groups = [self.tp_group]
-        if self.pp_group is not None:
+        if self.pp_group is not None and not pp_cache_admission_enabled():
             base_groups.append(self.pp_group)
 
         for group in base_groups:
@@ -1242,6 +1256,11 @@ class HiCacheController:
             sidecar_hits = count_pool_hits(sidecar_results)
 
         # Clamp to minimal number of hits.
+        if pp_cache_admission_enabled():
+            # A missing required DSA sidecar result cannot certify KV bytes.
+            return min(
+                [kv_hits] + [sidecar_hits.get(t.name, 0) for t in kv_derived_transfers]
+            )
         return min([kv_hits, *sidecar_hits.values()])
 
     def prefetch_io_aux_func(self):
