@@ -255,6 +255,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
+    if IS_VARLEN:
+        num_seqs = tl.num_programs(1) if SPLIT_N_HV_GRID else tl.num_programs(2) // HV
+        if i_n == num_seqs - 1:
+            # Graph padding has no tokens in cu_seqlens, so the recurrent loop
+            # never writes its output. Clear the unused tail in the last
+            # sequence's programs, without touching real tokens or state slots.
+            for pad_token in range(eos, all):
+                p_pad = o + ((i_k * all + pad_token) * HV + i_hv) * V + o_v
+                tl.store(p_pad, 0.0, mask=mask_v)
+
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
         # Slot stride comes from the caller (h0_source.stride(0)): the state pool
