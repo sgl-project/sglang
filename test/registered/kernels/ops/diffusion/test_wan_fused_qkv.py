@@ -1,6 +1,7 @@
 """Wan's q/k/v projections share one weight after loading and run as one GEMM;
-the block's output must keep its bits, and any layer that stops reading the
-shared weight must send the block back to its own three projections."""
+the block's output must keep its bits, any layer that stops reading the shared
+weight must send the block back to its own three projections, and moving the
+block must not leave the shared weight behind."""
 
 import sys
 from contextlib import ExitStack
@@ -63,20 +64,42 @@ def test_fused_qkv_keeps_bits_and_falls_back():
         cache = torch.cat([cos, sin], dim=-1).contiguous()
         run = lambda: block(x, context, temb, (cos, sin), rope_cos_sin_cache=cache)
 
-        weights = [proj.weight.clone() for proj in (block.to_q, block.to_k, block.to_v)]
-        ref = run()
-        assert not block._qkv_fused(x)
+        projs = (block.to_q, block.to_k, block.to_v)
+        weights = [proj.weight.clone() for proj in projs]
+        bits = lambda out: out.view(torch.int16)
+        ref = bits(run())
+        assert block._fused_qkv(x.device) is None
         block.fuse_qkv_weights()
-        assert block._qkv_fused(x)
-        for proj, w in zip((block.to_q, block.to_k, block.to_v), weights):
+        assert block._fused_qkv(x.device) is not None
+        for proj, w in zip(projs, weights):
             assert torch.equal(proj.weight, w)
-        fused = run()
-        assert torch.equal(fused.view(torch.int16), ref.view(torch.int16))
+        assert torch.equal(bits(run()), ref)
 
         # a layer whose weight moved (offload, a weight swap) stops the fused GEMM
         block.to_k.weight.data = block.to_k.weight.data.clone()
-        assert not block._qkv_fused(x)
-        assert torch.equal(run().view(torch.int16), ref.view(torch.int16))
+        assert block._fused_qkv(x.device) is None
+        assert torch.equal(bits(run()), ref)
+
+        # moving the block takes the shared weight with it: nothing else holds it
+        block.fuse_qkv_weights()
+        on_gpu = [*block.parameters(), *block.buffers()]
+        gpu_bytes = sum(t.numel() * t.element_size() for t in on_gpu)
+        del on_gpu
+        allocated = torch.cuda.memory_allocated()
+        block.to("cpu")
+        assert allocated - torch.cuda.memory_allocated() >= gpu_bytes
+        assert block._fused_qkv(torch.device("cpu")) is None
+        block.fuse_qkv_weights()
+        fused_weight, fused_bias = block._fused_qkv(torch.device("cpu"))
+        assert torch.equal(fused_weight, torch.cat(weights).cpu())
+        assert torch.equal(fused_bias, torch.cat([p.bias for p in projs]))
+
+        block.to("cuda")
+        assert block._fused_qkv(x.device) is None
+        assert torch.equal(bits(run()), ref)
+        block.fuse_qkv_weights()
+        assert block._fused_qkv(x.device) is not None
+        assert torch.equal(bits(run()), ref)
 
 
 if __name__ == "__main__":

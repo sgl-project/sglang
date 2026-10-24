@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-import weakref
 from functools import lru_cache
 from typing import Any
 
@@ -68,7 +67,10 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     PatchEmbed,
     TimestepEmbedder,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    DENOISING_LOOP_STATE,
+    get_forward_context,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -432,6 +434,26 @@ def _wan_temb_table_slices(
     return _eager_temb_table_slices(table, temb)
 
 
+def _rows_of_one_buffer(parts: list[torch.Tensor]) -> torch.Tensor | None:
+    """``torch.cat(parts)`` without a copy, when the parts are consecutive equal-shape
+    rows of one buffer"""
+    first = parts[0]
+    start, nbytes = first.data_ptr(), first.nbytes
+    storage = first.untyped_storage()
+    if start + len(parts) * nbytes > storage.data_ptr() + storage.nbytes():
+        return None
+    for i, part in enumerate(parts):
+        if (
+            part.data_ptr() != start + i * nbytes
+            or part.shape != first.shape
+            or not part.is_contiguous()
+        ):
+            return None
+    return first.as_strided(
+        (len(parts) * first.shape[0], *first.shape[1:]), first.stride()
+    )
+
+
 class WanTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -629,24 +651,24 @@ class WanTransformerBlock(nn.Module):
         )
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-        # [3 * dim, dim] weight / [3 * dim] bias whose row blocks back to_q, to_k, to_v
-        self.qkv_weight: torch.Tensor | None = None
-        self.qkv_bias: torch.Tensor | None = None
+        # set by fuse_qkv_weights: to_q / to_k / to_v are plain unquantized linears
+        self.qkv_fusable = False
         # exchange-block addresses -> (q, k) destination tables of _attend_qk_filled
         self._qk_tables: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def fuse_qkv_weights(self) -> None:
-        """Back to_q / to_k / to_v with one weight and one bias, so a single GEMM
-        projects all three while each layer keeps a view of its own rows"""
+        """Move to_q / to_k / to_v into consecutive rows of one weight and one bias, so a
+        single GEMM projects all three (``_fused_qkv``)"""
         layers = (self.to_q, self.to_k, self.to_v)
-        if not all(
+        self.qkv_fusable = all(
             type(layer) is ColumnParallelLinear
             and isinstance(layer.quant_method, UnquantizedLinearMethod)
             and layer.bias is not None
             and not layer.skip_bias_add
             and not layer.gather_output
             for layer in layers
-        ):
+        )
+        if not self.qkv_fusable:
             return
         with torch.no_grad():
             weight = torch.cat([layer.weight for layer in layers])
@@ -655,22 +677,27 @@ class WanTransformerBlock(nn.Module):
         for i, layer in enumerate(layers):
             layer.weight.data = weight[i * rows : (i + 1) * rows]
             layer.bias.data = bias[i * rows : (i + 1) * rows]
-        self.qkv_weight, self.qkv_bias = weight, bias
 
-    def _qkv_fused(self, x: torch.Tensor) -> bool:
-        # the layers still read views of the fused weight (offload or a LoRA wrapper undo it)
-        weight, bias = self.qkv_weight, self.qkv_bias
-        if weight is None or weight.device != x.device:
-            return False
+    def _fused_qkv(
+        self, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The [3 * dim, dim] weight and [3 * dim] bias of ``fuse_qkv_weights``, read back
+        from the layers while they still share them on ``device``. Only the layers hold
+        the shared buffers, so moving the module or offloading or swapping a layer's
+        weight frees them."""
         layers = (self.to_q, self.to_k, self.to_v)
-        w_step = self.to_q.weight.numel() * weight.element_size()
-        b_step = self.to_q.bias.numel() * bias.element_size()
-        return all(
-            type(layer) is ColumnParallelLinear
-            and layer.weight.data_ptr() == weight.data_ptr() + i * w_step
-            and layer.bias.data_ptr() == bias.data_ptr() + i * b_step
-            for i, layer in enumerate(layers)
-        )
+        if (
+            not self.qkv_fusable
+            or torch.compiler.is_compiling()
+            or not all(type(layer) is ColumnParallelLinear for layer in layers)
+            or self.to_q.weight.device != device
+        ):
+            return None
+        weight = _rows_of_one_buffer([layer.weight for layer in layers])
+        bias = _rows_of_one_buffer([layer.bias for layer in layers])
+        if weight is None or bias is None:
+            return None
+        return weight, bias
 
     def _qkv(
         self, norm_hidden_states: torch.Tensor, local_heads: int
@@ -692,10 +719,9 @@ class WanTransformerBlock(nn.Module):
     def _project_qkv(
         self, norm_hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self._qkv_fused(norm_hidden_states):
-            qkv = apply_unquantized_linear(
-                norm_hidden_states, self.qkv_weight, self.qkv_bias
-            )
+        fused = self._fused_qkv(norm_hidden_states.device)
+        if fused is not None:
+            qkv = apply_unquantized_linear(norm_hidden_states, *fused)
             return qkv.split(self.to_q.weight.shape[0], dim=-1)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
@@ -1294,6 +1320,10 @@ class WanTransformerBlock_VSA(nn.Module):
         return hidden_states
 
 
+# DENOISING_LOOP_STATE entry of the text K/V (WanTransformer3DModel._text_kvs)
+_TEXT_KV_STATE = "wan_text_kv"
+
+
 class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
@@ -1384,20 +1414,18 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self.layer_names = ["blocks"]
-        # id(prompt embeds) -> (weakref to the request, that tensor, every block's
-        # cross-attention K/V)
-        self._text_kv_cache: dict[int, tuple] = {}
 
     def _text_kvs(
         self, source: torch.Tensor, context: torch.Tensor
     ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
         """Every block's cross-attention (K, V) of ``context``, the embedding of ``source``.
 
-        The denoising stage hands the same prompt tensor to every step of a request's
-        loop, so the K/V are projected once per (request, prompt tensor); holding the
-        tensor keeps its id from being reused while cached, and a new request (whose
-        LoRA or weights may differ) projects again. Off when the projections could
-        differ step to step (LoRA wrappers, offloaded weights) or would be captured.
+        The denoising stage hands the same prompt tensor to every step of a loop, so the
+        K/V are projected once per (model, prompt tensor) and kept in the request's
+        DENOISING_LOOP_STATE, which the stage drops when the loop ends; the module holds
+        none of them. Holding the tensor keeps its id from being reused while cached.
+        Off when the projections could differ step to step (LoRA wrappers, offloaded
+        weights) or would be captured.
         """
         req = get_forward_context().forward_batch
         if (
@@ -1415,14 +1443,26 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
         ):
             return None
-        entry = self._text_kv_cache.get(id(source))
-        if entry is not None and entry[0]() is req and entry[1] is source:
-            return entry[2]
+        # (id(model), id(prompt tensor)) -> (that tensor, every block's K/V)
+        cached = req.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault(
+            _TEXT_KV_STATE, {}
+        )
+        key = (id(self), id(source))
+        entry = cached.pop(key, None)
+        if (
+            entry is not None
+            and entry[0] is source
+            and entry[1][0][0].device == context.device
+        ):
+            cached[key] = entry
+            return entry[1]
+        # the other expert is done with its K/V; keep this model's other CFG branch
+        mine = [k for k in cached if k[0] == id(self)]
+        for stale in [k for k in cached if k[0] != id(self)] + mine[:-1]:
+            del cached[stale]
+        del entry
         kvs = [block.attn2.project_context_kv(context) for block in self.blocks]
-        # one entry per CFG branch is enough
-        if len(self._text_kv_cache) >= 2:
-            self._text_kv_cache.pop(next(iter(self._text_kv_cache)))
-        self._text_kv_cache[id(source)] = (weakref.ref(req), source, kvs)
+        cached[key] = (source, kvs)
         return kvs
 
     def _plain_blocks(self) -> bool:
@@ -1445,7 +1485,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             if isinstance(block, WanTransformerBlock):
                 block.fuse_qkv_weights()
         fused = sum(
-            isinstance(block, WanTransformerBlock) and block.qkv_weight is not None
+            isinstance(block, WanTransformerBlock)
+            and block._fused_qkv(block.to_q.weight.device) is not None
             for block in self.blocks
         )
         logger.info(
