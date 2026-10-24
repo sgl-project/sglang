@@ -9,7 +9,10 @@ import torch
 from safetensors.torch import load_file as safetensors_load_file
 from torch import nn
 
-from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+from sglang.multimodal_gen.runtime.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from .base_config import QuantizationConfig, QuantizeMethodBase
@@ -90,8 +93,8 @@ class NunchakuConfig(QuantizationConfig):
         # priority: skip > awq_w4a16 > svdq_w4a4 > default
         skip_patterns = quant_rules.get("skip", [])
         for pattern in skip_patterns:
-            if pattern in prefix.lower():
-                return None
+            if pattern in prefix:
+                return UnquantizedLinearMethod()
 
         awq_patterns = quant_rules.get("awq_w4a16", [])
         for pattern in awq_patterns:
@@ -236,18 +239,14 @@ def _patch_nunchaku_scales(
     if not safetensors_list:
         return
 
-    if len(safetensors_list) != 1:
-        logger.warning(
-            "Nunchaku scale patch expects a single safetensors file, "
-            "but got %d files. Skipping.",
-            len(safetensors_list),
-        )
-        return
-
     from nunchaku.models.linear import SVDQW4A4Linear  # type: ignore[import]
 
-    state_dict = safetensors_load_file(safetensors_list[0])
-    if state_dict is None:
+    state_dict: dict[str, Any] = {}
+    for shard_path in safetensors_list:
+        shard = safetensors_load_file(shard_path)
+        if shard is not None:
+            state_dict.update(shard)
+    if not state_dict:
         return
 
     num_wtscale = 0

@@ -52,7 +52,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         self.legacy_mul_scale_key = prefix + ".div.mul_scale"
         self.has_mul_scale = (
             self.legacy_mul_scale_key in quant_config
-            and self.mul_scale_key in quant_config
+            or self.mul_scale_key in quant_config
         )
         self.single_level_kernel = None
         if not self.is_dual_scale:
@@ -62,7 +62,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
 
             self.single_level_kernel = NPUSingleLevelMXFP4OfflineLinearMethod()
         else:
-            if self.is_dual_scale_key not in self.quant_config:
+            if self.dual_scale_key not in self.quant_config:
                 raise ValueError(
                     f"Dual-level MXFP4 quantization requires missing '{self.dual_scale_key}' in quant_config."
                     "Check that the model was exported with dual-level quantization."
