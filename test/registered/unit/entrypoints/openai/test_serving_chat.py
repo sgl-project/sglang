@@ -20,9 +20,14 @@ from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
+from tokenizers import Tokenizer as BackendTokenizer
+from tokenizers import models as tokenizer_models
+from tokenizers import pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
 from sglang.srt.entrypoints.openai.chat_encoding import resolve_chat_encoding_spec
+from sglang.srt.entrypoints.openai.parallel_prompt_encode import encode_prompt_segments
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     Function,
@@ -42,6 +47,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
+from sglang.srt.parser.python_chat_template import GLM53, install_python_chat_template
 from sglang.srt.parser.response_template import (
     GRAMMAR_AFTER_REASONING,
     GRAMMAR_FROM_START,
@@ -305,6 +311,63 @@ class TestChatTemplateCache(CustomTestCase):
         )
         self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 2)
         self.tokenizer_manager.tokenizer.decode.assert_not_called()
+
+
+class TestPythonChatTemplateSegments(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", default_chat_template_kwargs=None),
+            role="tokenizer",
+        )
+        backend = BackendTokenizer(
+            tokenizer_models.WordLevel(vocab={"[UNK]": 0}, unk_token="[UNK]")
+        )
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        self.tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend, unk_token="[UNK]", eos_token="<|endoftext|>"
+        )
+        self.tokenizer.add_tokens(
+            ["hello", "[gMASK]", "<sop>", "<|system|>", "<|user|>", "<|assistant|>"]
+        )
+        install_python_chat_template(self.tokenizer, GLM53)
+        tokenizer_manager = _MockTokenizerManager()
+        tokenizer_manager.tokenizer = self.tokenizer
+        template_manager = _MockTemplateManager()
+        template_manager.python_chat_template = GLM53
+        self.chat = OpenAIServingChat(tokenizer_manager, template_manager)
+        self.messages = [{"role": "user", "content": "hello there"}]
+
+    def _render(self, template_kwargs):
+        return self.chat._render_and_encode_chat_template(
+            self.messages,
+            tools=None,
+            template_kwargs=template_kwargs,
+            encode_kwargs={},
+            use_cache=False,
+        )[0]
+
+    def test_template_variables_encode_the_rendered_segments(self):
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.encode_prompt_segments",
+            wraps=encode_prompt_segments,
+        ) as encode:
+            ids = self._render({"reasoning_effort": "low"})
+            # An apply_chat_template argument goes through apply_chat_template.
+            documents_ids = self._render(
+                {"reasoning_effort": "low", "documents": [{"title": "t", "text": "x"}]}
+            )
+        self.assertEqual(encode.call_count, 1)
+        rendered = self.tokenizer.apply_chat_template(
+            self.messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            reasoning_effort="low",
+        )
+        self.assertEqual(ids, self.tokenizer.encode(rendered))
+        self.assertEqual(documents_ids, ids)
 
 
 class ServingChatTestCase(CustomTestCase):

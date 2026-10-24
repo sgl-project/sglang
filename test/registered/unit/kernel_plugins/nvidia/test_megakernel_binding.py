@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.megakernels import binding as mb
+from sglang.srt.kernel_plugins.nvidia import binding as mb
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
