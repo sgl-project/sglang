@@ -232,16 +232,23 @@ def test_empty_stash():
 
 
 class BufferedBackend(MemoryBackend):
-    """Like a Mooncake client: a read fails unless it fits next to the read results still
-    referenced, and a result stays referenced while any view of it lives."""
+    """Like a Mooncake client: a read takes whole size classes of ``class_bytes`` and fails
+    unless it fits next to the read results still referenced, and a result stays
+    referenced while any view of it lives."""
 
-    def __init__(self, capacity_bytes: int):
+    def __init__(self, capacity_bytes: int, *, class_bytes: int = 1):
         super().__init__()
         self.capacity_bytes = capacity_bytes
+        self.class_bytes = class_bytes
         self.live_bytes = 0
 
+    def read_buffer_bytes(self, nbytes):
+        return -(-nbytes // self.class_bytes) * self.class_bytes
+
     def get_many(self, keys, *, parts):
-        requested = sum(nbytes for named in parts for _, nbytes in named)
+        requested = sum(
+            self.read_buffer_bytes(nbytes) for named in parts for _, nbytes in named
+        )
         if self.live_bytes + requested > self.capacity_bytes:
             raise RuntimeError(
                 f"read buffer full: {self.live_bytes} live + {requested} requested"
@@ -252,8 +259,9 @@ class BufferedBackend(MemoryBackend):
             got = {}
             for name, _ in named:
                 buffer = _ReadBuffer(self.objects[key][name])
-                self.live_bytes += len(buffer)
-                weakref.finalize(buffer, self._release, len(buffer))
+                held = self.read_buffer_bytes(len(buffer))
+                self.live_bytes += held
+                weakref.finalize(buffer, self._release, held)
                 got[name] = memoryview(buffer)
             out.append(got)
         return out
@@ -286,6 +294,31 @@ def test_read_many_reads_named_fields_in_chunks_and_copies_them_out():
         np.testing.assert_array_equal(g.indexer_topk, w.indexer_topk)
         assert g.output_token_sampling_mask_lengths is None
         assert g.routed_experts.flags.writeable
+
+
+def test_read_many_counts_fields_as_the_backend_allocates_them():
+    stashes = [token_stash(40 + i) for i in range(3)]
+    nbytes = stashes[0].routed_experts.nbytes
+    # Two fields' bytes fit the buffer, but not the two size classes they take.
+    backend = BufferedBackend(capacity_bytes=2 * nbytes + 1, class_bytes=nbytes + 1)
+    store = OutputStore(backend=backend)
+    refs = store.put_many(stashes)
+
+    got = store.read_many(
+        [(ref, ["routed_experts"]) for ref in refs],
+        stash_type=TokenOutputStash,
+        buffer_bytes=2 * nbytes + 1,
+    )
+
+    assert backend.reads == [["routed_experts"]] * 3
+    for g, w in zip(got, stashes):
+        np.testing.assert_array_equal(g.routed_experts, w.routed_experts)
+    with pytest.raises(ValueError, match=f"takes {nbytes + 1} to read"):
+        store.read_many(
+            [(refs[0], ["routed_experts"])],
+            stash_type=TokenOutputStash,
+            buffer_bytes=nbytes,
+        )
 
 
 def test_read_many_splits_one_ref_across_chunks():
