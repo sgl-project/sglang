@@ -167,12 +167,30 @@ class RecipeEncoder:
             prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
         return prompt_ids
 
-    def continuation_stage(self, messages: list[dict[str, Any]]) -> Any:
-        """Where output parsing begins after a thinking-mode prompt that continues
-        the last message of `messages`."""
+    def parse_start(
+        self,
+        *,
+        thinking: bool,
+        task: Optional[str] = None,
+        continued: Optional[dict[str, Any]] = None,
+    ) -> Any:
+        """Where output parsing begins after the prompt `encode` renders for these
+        settings, as recipe's ThinkingInitialStage; None when the output is answer
+        only. `continued` is the final assistant message the prompt continues."""
+        if not thinking or (task is not None and task not in TASKS_AFTER_HEADER):
+            return None
         recipe = load_deepseek_recipe()
+        if continued is None:
+            return recipe.ThinkingInitialStage.ReasoningStart
+        if task is not None:
+            # The continued prefix follows the task token.
+            return recipe.ThinkingInitialStage.ContentContinuation
         body = pre_normalize(
-            {"messages": messages, "thinking": True, "continue_final_message": True}
+            {
+                "messages": [{"role": "user", "content": ""}, continued],
+                "thinking": True,
+                "continue_final_message": True,
+            }
         )
         body["model"] = self.model
         try:

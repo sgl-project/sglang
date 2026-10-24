@@ -25,9 +25,7 @@ from sglang.srt.parser.deepseek_recipe_output import (
     whole_tool_calls,
 )
 from sglang.srt.parser.deepseek_recipe_renderer import (
-    TASKS_AFTER_HEADER,
     RecipeEncoder,
-    load_deepseek_recipe,
     parse_effort_budget,
 )
 from sglang.srt.runtime_context import get_serving
@@ -330,9 +328,23 @@ class DeepSeekRecipeChatEncodingAdapter:
         self, request: ChatCompletionRequest
     ) -> DeepSeekRecipeOutputParser:
         response_format = request.response_format
+        continued = (
+            _trailing_assistant_turn(
+                [
+                    message.model_dump(exclude_unset=True, by_alias=True, mode="json")
+                    for message in request.messages[-1:]
+                ]
+            )
+            if request.continue_final_message
+            else None
+        )
         return DeepSeekRecipeOutputParser(
             self.encoder,
-            thinking_stage=self._thinking_stage(request),
+            thinking_stage=self.encoder.parse_start(
+                thinking=self._hooks.thinking_requested(request),
+                task=request.task,
+                continued=continued,
+            ),
             parse_tool_calls=request.task is None
             and self._hooks.tool_call_parsing_active(request),
             parse_json_output=response_format is not None
@@ -342,27 +354,6 @@ class DeepSeekRecipeChatEncodingAdapter:
             stop=_stop_strings(request.stop),
         )
 
-    def _thinking_stage(self, request: ChatCompletionRequest) -> Any:
-        """Where parsing begins, from the prompt `encode_messages` rendered."""
-        # Other tasks replace the generation header, so the answer is plain text.
-        task = request.task
-        if (task is not None and task not in TASKS_AFTER_HEADER) or not (
-            self._hooks.thinking_requested(request)
-        ):
-            return None
-        stages = load_deepseek_recipe().ThinkingInitialStage
-        last = request.continue_final_message and _trailing_assistant_turn(
-            [
-                message.model_dump(exclude_unset=True, by_alias=True, mode="json")
-                for message in request.messages[-1:]
-            ]
-        )
-        if not last:
-            return stages.ReasoningStart
-        if task is not None:
-            return stages.ContentContinuation  # the prefix follows the task token
-        return self.encoder.continuation_stage([{"role": "user", "content": ""}, last])
-
     def _new_responses_parser(
         self,
         request: ResponsesRequest,
@@ -370,10 +361,9 @@ class DeepSeekRecipeChatEncodingAdapter:
         separate_reasoning: bool,
         parse_tool_calls: bool,
     ) -> DeepSeekRecipeOutputParser:
-        stages = load_deepseek_recipe().ThinkingInitialStage
         return DeepSeekRecipeOutputParser(
             self.encoder,
-            thinking_stage=stages.ReasoningStart if require_reasoning else None,
+            thinking_stage=self.encoder.parse_start(thinking=require_reasoning),
             parse_tool_calls=parse_tool_calls,
             separate_reasoning=separate_reasoning,
             stop=_stop_strings(request.stop),
