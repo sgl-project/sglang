@@ -364,29 +364,28 @@ fn copy_prompt_per_choice(generate: &mut Value) -> Result<(), Error> {
     if n <= 1 {
         return Ok(());
     }
+    // Python's parallel sampling repeats a prompt's one-element list fields with
+    // it; other lengths are left for validation against the batch.
+    let repeated: Vec<&str> = PROMPT_LIST_FIELDS
+        .into_iter()
+        .filter(|key| {
+            generate[*key]
+                .as_array()
+                .is_some_and(|items| items.len() == 1)
+        })
+        .collect();
     // Bounded before the copy: a huge `n`, or a large list field, would overflow
     // or exhaust the allocation.
     let ids = generate["input_ids"].as_array().map_or(0, Vec::len);
-    let fields: Vec<&Value> = PROMPT_LIST_FIELDS
-        .iter()
-        .map(|key| &generate[*key])
-        .filter(|field| field.is_array())
-        .collect();
+    let fields: Vec<&Value> = repeated.iter().map(|key| &generate[*key]).collect();
     check_prompt_copies(ids, &fields, n)?;
     generate["sampling_params"]["n"] = 1.into();
     generate["input_ids"] = Value::Array(vec![generate["input_ids"].take(); n]);
-    // Python's parallel sampling repeats the prompt's list-form fields with it,
-    // and a rid list names the one prompt.
-    for key in PROMPT_LIST_FIELDS {
-        if let Some(Value::Array(items)) = generate.get_mut(key) {
-            *items = items
-                .iter()
-                .cycle()
-                .take(items.len() * n)
-                .cloned()
-                .collect();
-        }
+    for key in repeated {
+        let item = generate[key][0].take();
+        generate[key] = Value::Array(vec![item; n]);
     }
+    // A rid list names the one prompt.
     if let Some(Value::Array(rids)) = generate.get_mut("rid")
         && rids.len() == 1
     {
