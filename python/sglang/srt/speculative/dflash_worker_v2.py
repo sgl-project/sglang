@@ -100,6 +100,7 @@ from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
     check_simulate_acc_token_mode,
+    draft_owns_attention,
     draft_pp_context,
     draft_tp_context,
 )
@@ -411,11 +412,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._tp_sync = SpecTpSync(get_dp_tp_group())
         check_simulate_acc_token_mode()
 
-        # DP drafts use per-DP attention TP, independent of idle peers. CP
-        # drafts use full TP without CP, including their backend and KV pool.
-        self.draft_owns_attention = (
-            get_parallel().attn_dp_enabled or get_parallel().attn_cp_size > 1
-        )
+        self.draft_owns_attention = draft_owns_attention()
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
         with draft_pp_context(), draft_tp_context(self.draft_owns_attention):
