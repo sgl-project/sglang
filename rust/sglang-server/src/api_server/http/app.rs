@@ -10,7 +10,7 @@ use axum::Router;
 use super::generate_hook::GenerateHook;
 use super::{hicache, info, loads, metrics, native_api, openai};
 use crate::HttpLayer;
-use crate::api_server::core::{CoreHandle, HiCacheManager};
+use crate::api_server::core::{CoreHandle, FLUSH_INTERVAL, HiCacheManager};
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
 use crate::api_server::log;
 use crate::message::config::ServerArgs;
@@ -94,6 +94,19 @@ pub async fn serve(
         .merge(openai::routes());
     if server_args.metrics.is_some() && metrics_listener {
         router = router.merge(metrics::routes());
+    }
+    // Keep this frontend's metrics files current for the directory's other
+    // readers (the node's metrics listener, when this is a DP rank's offset
+    // listener); stops with the runtime.
+    if let Some(frontend) = state.core.metrics().cloned() {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(FLUSH_INTERVAL);
+            loop {
+                interval.tick().await;
+                let frontend = frontend.clone();
+                let _ = tokio::task::spawn_blocking(move || frontend.flush_or_warn()).await;
+            }
+        });
     }
 
     // TODO(auth): no API-key boundary yet. Python gates every route (except

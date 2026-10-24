@@ -344,6 +344,7 @@ mod tests {
                 is_disaggregation: false,
                 mm_limits: Default::default(),
                 metadata: CoreMetadata::from(server_args.as_ref()),
+                metrics: None,
             },
         );
         (
