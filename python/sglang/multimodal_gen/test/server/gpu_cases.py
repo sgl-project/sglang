@@ -1364,6 +1364,12 @@ TWO_GPU_CASES = [
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
         ),
+        # 85x48 image tokens pad to the 1024x1024 warmup's 4096 (2048 per rank)
+        # over another grid, so RoPE tables kept from the warmup corrupt it
+        lead_sampling_params=DiffusionSamplingParams(
+            prompt=T2I_sampling_params.prompt,
+            output_size="1360x768",
+        ),
     ),
     DiffusionTestCase(
         "zimage_image_t2i_2_gpus_non_square",
