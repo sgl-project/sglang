@@ -19,14 +19,8 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
-from sglang.srt.layers.layer_boundary import (
-    append_stages,
-    declare_attn,
-    declare_ffn,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
@@ -1051,7 +1045,14 @@ class Qwen3NextForCausalLM(nn.Module):
         )
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        from sglang.srt.layers.quantization.gguf import get_gguf_dequantized_weight
+
+        return (
+            get_gguf_dequantized_weight(
+                self.model.embed_tokens, self.config.torch_dtype
+            ),
+            get_gguf_dequantized_weight(self.lm_head, self.config.torch_dtype),
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -1065,7 +1066,11 @@ class Qwen3NextForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def get_embed(self):
-        return self.model.embed_tokens.weight
+        from sglang.srt.layers.quantization.gguf import get_gguf_dequantized_weight
+
+        return get_gguf_dequantized_weight(
+            self.model.embed_tokens, self.config.torch_dtype
+        )
 
     def set_embed(self, embed):
         # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
