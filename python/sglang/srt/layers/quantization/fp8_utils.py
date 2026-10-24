@@ -2510,11 +2510,86 @@ def apply_fp8_linear(
     # This could change in the future.
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
+    # Pre-quantized fast path: the caller already produced
+    # (qfp8, x_scale[m,1], orig_dtype) by folding the per-token activation quant
+    # into the upstream fused RMSNorm (fused_qk_rmsnorm quant_type=per_Token).
+    # Skip the standalone per_token_group_quant_fp8 launch and go straight to the
+    # tuned gemm_a8w8_bpreshuffle. Only the aiter per-token-per-channel GEMM
+    # below consumes this shape; other backends have no pre-quant producer wired.
+    if isinstance(input, tuple):
+        assert _use_aiter, (
+            "apply_fp8_linear received a pre-quantized (fp8, scale) tuple but "
+            "the aiter per-token GEMM path is unavailable"
+        )
+        # Mirror the non-tuple aiter bpreshuffle branch below: WQ=weight.T,
+        # output feature dim = weight.shape[1], x_scale is per-token [m, 1].
+        # orig_dtype carries the pre-quant activation dtype so FP16 is not
+        # silently promoted to BF16; older 2-tuple producers default to bf16.
+        if len(input) == 3:
+            qinput, x_scale, orig_dtype = input
+        else:
+            qinput, x_scale = input
+            orig_dtype = pre_quant_output_dtype or torch.bfloat16
+        input_2d = qinput.view(-1, qinput.shape[-1])
+        # This path is only valid for a whole-row per-token scale [M, 1].
+        assert x_scale.shape == (input_2d.shape[0], 1), (
+            f"per-token bpreshuffle path requires x_scale [M, 1], got "
+            f"{tuple(x_scale.shape)} for M={input_2d.shape[0]}"
+        )
+        output_shape = [*qinput.shape[:-1], weight.shape[1]]
+        # Must agree with the load-time predicate that decides whether the
+        # weight was pre-shuffled (e.g. Quark in_proj_ba with N=32 at TP4).
+        if not use_aiter_bpreshuffle_gemm(weight.shape[1]):
+            output = torch._scaled_mm(
+                input_2d,
+                weight,
+                out_dtype=orig_dtype,
+                scale_a=x_scale,
+                scale_b=weight_scale.view(1, -1),
+                bias=bias,
+            )
+            return _process_scaled_mm_output(output, input_2d.shape, output_shape)
+        output = gemm_a8w8_bpreshuffle(
+            XQ=input_2d,
+            WQ=weight.T,
+            x_scale=x_scale,
+            w_scale=weight_scale,
+            dtype=orig_dtype,
+        )
+        if bias is not None:
+            output += bias
+        return _process_scaled_mm_output(output, input_2d.shape, output_shape)
+
     if pad_output is None:
         pad_output = not cutlass_fp8_supported and not get_bool_env_var(
             "SGLANG_ENABLE_TORCH_COMPILE"
         )
     output_padding = 17 if pad_output else None
+
+    # Pre-quantized fast path: a fused producer may pass (qinput_fp8, x_scale)
+    # directly to skip the redundant activation quant. Only the AITER per-token x
+    # per-channel a8w8 GEMM is supported; mirrors the non-fused HIP branch below.
+    if _use_aiter and isinstance(input, tuple):
+        qinput, x_scale = input
+        qinput = qinput.view(-1, qinput.shape[-1])
+        if x_scale.dim() == 1:
+            x_scale = x_scale.view(-1, 1)
+        output_shape = [*qinput.shape[:-1], weight.shape[1]]
+        if not use_per_token_if_dynamic:
+            raise NotImplementedError(
+                "Pre-quantized fp8 input is only supported on the AITER "
+                "per-token / per-channel a8w8 path."
+            )
+        output = gemm_a8w8_bpreshuffle(
+            XQ=qinput,
+            WQ=weight.T,
+            x_scale=x_scale,
+            w_scale=weight_scale,
+            dtype=torch.bfloat16,
+        )
+        if bias is not None:
+            output += bias
+        return _process_scaled_mm_output(output, qinput.shape, output_shape)
 
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
@@ -2556,6 +2631,7 @@ def apply_fp8_linear(
             input_2d.shape[0],
         )
         qinput = input_2d
+        is_per_token_scale = _use_aiter and input_scale.shape == (input_2d.shape[0], 1)
         if (
             input_scale.numel() == 1
             and channelwise_cutlass
@@ -2563,8 +2639,15 @@ def apply_fp8_linear(
         ):
             # Unsupported CUTLASS epilogues require one A scale per row.
             x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
-        else:
+        elif is_per_token_scale:
             x_scale = input_scale
+        else:
+            assert input_scale.numel() == 1
+            if channelwise_cutlass and not native_scalar_a_scale:
+                # Unsupported CUTLASS epilogues require one A scale per row.
+                x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
+            else:
+                x_scale = input_scale
     elif compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
