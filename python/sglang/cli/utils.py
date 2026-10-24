@@ -44,6 +44,29 @@ def _is_diffusion_model_from_registry(model_path: str) -> bool:
     return is_registered_diffusion_model_path(model_path)
 
 
+def is_registered_native_pipeline(pipeline_class_name: str | None) -> bool:
+    """Whether ``pipeline_class_name`` names a registered native diffusion pipeline.
+
+    Lets a caller treat an explicit ``--pipeline-class-name`` as a diffusion
+    signal even when the ``model_path`` itself is not auto-detectable (e.g. a bare
+    ``.safetensors`` file with no ``model_index.json``, as with FLUX.3). Guarded so
+    LLM-only installs (no diffusion deps) simply return False.
+    """
+    if not pipeline_class_name:
+        return False
+    try:
+        from sglang.multimodal_gen.registry import (
+            _PIPELINE_REGISTRY,
+            _discover_and_register_pipelines,
+        )
+    except ImportError:
+        # if diffusion dependencies are not installed
+        return False
+
+    _discover_and_register_pipelines()
+    return pipeline_class_name in _PIPELINE_REGISTRY
+
+
 def _is_diffusers_model_dir(model_dir: str) -> bool:
     """Check for a standard or modular Diffusers pipeline index."""
     for filename in ("model_index.json", "modular_model_index.json"):
@@ -143,6 +166,51 @@ def get_model_path(extra_argv):
                 "Error: --model-path is required. Please provide the path to the model."
             )
     return model_path
+
+
+def get_pipeline_class_name(extra_argv):
+    """Return the explicitly selected pipeline class, or None if absent.
+
+    Mirrors :func:`get_model_path`'s lightweight pre-parse (handles both
+    spellings accepted by ``ServerArgs`` and their ``--flag=value`` forms) so
+    the generate dispatcher can consult it before the full parser runs. If the
+    pipeline is selected only in a JSON/YAML ``--config``, inspect that as a
+    fallback; malformed configs are left for the full parser to diagnose.
+    """
+    pipeline_flags = ("--pipeline", "--pipeline-class-name")
+    for i, arg in enumerate(extra_argv):
+        if arg in pipeline_flags:
+            if i + 1 < len(extra_argv):
+                return extra_argv[i + 1]
+        elif any(arg.startswith(f"{flag}=") for flag in pipeline_flags):
+            return arg.split("=", 1)[1]
+
+    config_path = None
+    for i, arg in enumerate(extra_argv):
+        if arg == "--config" and i + 1 < len(extra_argv):
+            config_path = extra_argv[i + 1]
+            break
+        if arg.startswith("--config="):
+            config_path = arg.split("=", 1)[1]
+            break
+    if config_path:
+        try:
+            with open(config_path) as f:
+                if config_path.endswith(".json"):
+                    config = json.load(f)
+                elif config_path.endswith((".yaml", ".yml")):
+                    import yaml
+
+                    config = yaml.safe_load(f)
+                else:
+                    return None
+            if isinstance(config, dict):
+                return config.get("pipeline_class_name") or config.get("pipeline")
+        except (ImportError, OSError, ValueError) as exc:
+            logger.debug(
+                "Failed to pre-parse pipeline class from %s: %s", config_path, exc
+            )
+    return None
 
 
 @lru_cache(maxsize=1)

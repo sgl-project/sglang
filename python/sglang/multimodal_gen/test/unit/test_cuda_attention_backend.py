@@ -200,6 +200,49 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
                 "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.DynamicCudnnSDPABackend",
             )
 
+    def test_blackwell_serves_fa4_head_sizes_outside_the_fa3_list(self):
+        FakeCudaPlatform.is_blackwell_device = True
+        fa_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
+        dynamic_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.DynamicCudnnSDPABackend"
+
+        with patch.object(
+            FakeCudaPlatform,
+            "_prepare_flash_attention_for_blackwell",
+            return_value=True,
+        ):
+            for head_size in (72, 80):
+                with self.subTest(head_size=head_size):
+                    self.assertEqual(
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            None, head_size, torch.bfloat16
+                        ),
+                        dynamic_cls_str,
+                    )
+                    self.assertEqual(
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            AttentionBackendEnum.FA, head_size, torch.bfloat16
+                        ),
+                        fa_cls_str,
+                    )
+            for head_size in (68, 136):
+                with self.subTest(head_size=head_size):
+                    self.assertEqual(
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            None, head_size, torch.bfloat16
+                        ),
+                        SDPA_BACKEND_CLS_STR,
+                    )
+
+    def test_pre_blackwell_keeps_torch_sdpa_for_head_size_72(self):
+        for selected_backend in (None, AttentionBackendEnum.FA):
+            with self.subTest(selected_backend=selected_backend):
+                self.assertEqual(
+                    FakeCudaPlatform.get_attn_backend_cls_str(
+                        selected_backend, 72, torch.bfloat16
+                    ),
+                    SDPA_BACKEND_CLS_STR,
+                )
+
     def test_invalid_backend_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
             self.resolve(AttentionBackendEnum.AITER_SAGE)
@@ -346,6 +389,35 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             )
 
         self.assertEqual(backend.get_enum(), AttentionBackendEnum.AITER)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestTrtllmGenSageMetadata(unittest.TestCase):
+    def test_metadata_builds_inside_cuda_graph_capture(self):
+        """The DiT prepares this metadata inside its forward, which breakable
+        CUDA graphs capture; a host-to-device copy there failed the capture."""
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            ForwardContext,
+        )
+
+        context = ForwardContext(current_timestep=0, attn_metadata=None)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            qo, kv, seq_lens = context.get_trtllm_gen_sequence_metadata(
+                torch.cuda.current_device(), 2, 3, 5
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(qo.tolist(), [0, 3, 6])
+        self.assertEqual(kv.tolist(), [0, 5, 10])
+        self.assertEqual(seq_lens.tolist(), [5, 5])
+        self.assertEqual({t.dtype for t in (qo, kv, seq_lens)}, {torch.int32})
+        self.assertIs(
+            context.get_trtllm_gen_sequence_metadata(
+                torch.cuda.current_device(), 2, 3, 5
+            )[0],
+            qo,
+        )
 
 
 if __name__ == "__main__":
