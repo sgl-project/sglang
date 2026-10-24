@@ -2892,10 +2892,14 @@ def select_experts(
     # Only aiter_biased_grouped_topk wants the bias in the gating dtype. The JIT
     # router returns before it in biased_grouped_topk_gpu and upcasts the bias
     # in-register, so downcasting here would only buy it a per-call cast back.
+    # The cached copy is of topk_config.correction_bias, so only use it while
+    # correction_bias is still that tensor: the fake EP dispatch above replaces
+    # it with zeros, which must reach the router.
     if (
         _use_aiter
         and use_grouped_topk
         and correction_bias is not None
+        and correction_bias is topk_config.correction_bias
         and not envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
         and dynamic_expert_bias is None
     ):
