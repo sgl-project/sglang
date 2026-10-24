@@ -1213,6 +1213,145 @@ class TestBaseFormatDetector(unittest.TestCase):
             params["city"], "杭州", "Should correctly parse Chinese city name"
         )
 
+    def test_open_string_streaming_fast_path_escapes_and_whitespace(self):
+        """Test open-string streaming fast path across split escapes, whitespace, and multiple args."""
+        city_val = 'San "Fran"\n\t\\Bay   Area / 杭州 \b\f\r end'
+        note_val = "line1\nline2   tail"
+        payload = (
+            '<tool_call>{"name": "get_weather", "arguments": {"city": '
+            + json.dumps(city_val, ensure_ascii=False).replace(
+                " / 杭州 ", " \\/ \\u676d\\u5dde "
+            )
+            + ', "note": '
+            + json.dumps(note_val, ensure_ascii=False)
+            + "}}</tool_call>"
+        )
+
+        for step in (1, 2, 3, 5, 7, 13):
+            detector = self.detector.__class__()
+            chunks = [payload[i : i + step] for i in range(0, len(payload), step)]
+            accumulated = ""
+            tool_name = None
+            for chunk in chunks:
+                res = detector.parse_streaming_increment(chunk, self.tools)
+                for call in res.calls:
+                    if call.name:
+                        tool_name = call.name
+                    if call.parameters:
+                        accumulated += call.parameters
+
+            self.assertEqual(tool_name, "get_weather")
+            parsed = json.loads(accumulated)
+            self.assertEqual(parsed, {"city": city_val, "note": note_val})
+            self.assertEqual(
+                detector.prev_tool_call_arr[0]["arguments"],
+                {"city": city_val, "note": note_val},
+            )
+
+        # Also verify UTF-16 surrogate pairs (\uD83D\uDE00) and duplicate JSON keys
+        surrogate_payload = (
+            '<tool_call>{"name": "get_weather", "arguments": '
+            '{"city": "San Francisco", "note": "x\\uD83D\\uDE00y"}}</tool_call>'
+        )
+        for step in (1, 2, 3, 4, 7):
+            detector = self.detector.__class__()
+            chunks = [
+                surrogate_payload[i : i + step]
+                for i in range(0, len(surrogate_payload), step)
+            ]
+            accumulated = ""
+            for chunk in chunks:
+                res = detector.parse_streaming_increment(chunk, self.tools)
+                for call in res.calls:
+                    if call.parameters:
+                        accumulated += call.parameters
+            self.assertEqual(
+                json.loads(accumulated),
+                {"city": "San Francisco", "note": "x😀y"},
+            )
+
+        dup_payload = (
+            '<tool_call>{"name": "get_weather", "arguments": '
+            '{"city": "Paris", "note": "Berlin", "city": "San Francisco 123"}}</tool_call>'
+        )
+        for step in (1, 2, 4, 7):
+            detector = self.detector.__class__()
+            chunks = [
+                dup_payload[i : i + step] for i in range(0, len(dup_payload), step)
+            ]
+            for chunk in chunks:
+                detector.parse_streaming_increment(chunk, self.tools)
+            self.assertEqual(
+                detector.prev_tool_call_arr[0]["arguments"],
+                {"city": "San Francisco 123", "note": "Berlin"},
+            )
+
+        # Verify sibling object after arguments with matching key does not leak into arguments
+        sibling_payload = (
+            '<tool_call>{"name": "get_weather", "arguments": {"city": "SF"}, '
+            '"meta": {"city": "SHOULD_NOT_LEAK_INTO_ARGS"}}</tool_call>'
+        )
+        for step in (1, 2, 3, 5):
+            detector = self.detector.__class__()
+            chunks = [
+                sibling_payload[i : i + step]
+                for i in range(0, len(sibling_payload), step)
+            ]
+            accumulated = ""
+            for chunk in chunks:
+                res = detector.parse_streaming_increment(chunk, self.tools)
+                for call in res.calls:
+                    if call.parameters:
+                        accumulated += call.parameters
+            self.assertEqual(json.loads(accumulated), {"city": "SF"})
+            self.assertEqual(
+                detector.prev_tool_call_arr[0]["arguments"], {"city": "SF"}
+            )
+
+    def test_open_string_streaming_avoids_quadratic_reparse(self):
+        """Verify streaming a large string argument does not invoke _partial_json_loads on every chunk."""
+        from unittest.mock import patch
+
+        import sglang.srt.function_call.base_format_detector as bfd
+
+        large_city = ("block='val' \"q\"\\n\tpath\\\\dir 杭州   " * 200) + "final"
+        payload = (
+            "<tool_call>"
+            + json.dumps(
+                {"name": "get_weather", "arguments": {"city": large_city}},
+                ensure_ascii=False,
+            ).replace("杭州", "\\u676d\\u5dde")
+            + "</tool_call>"
+        )
+        chunks = [payload[i : i + 3] for i in range(0, len(payload), 3)]
+        self.assertGreater(len(chunks), 1500)
+
+        detector = self.detector.__class__()
+        accumulated = ""
+        with patch.object(
+            bfd, "_partial_json_loads", wraps=bfd._partial_json_loads
+        ) as mock_pjl:
+            for chunk in chunks:
+                res = detector.parse_streaming_increment(chunk, self.tools)
+                for call in res.calls:
+                    if call.parameters:
+                        accumulated += call.parameters
+
+        self.assertEqual(json.loads(accumulated), {"city": large_city})
+        self.assertLess(mock_pjl.call_count, 30)
+
+    def test_find_common_prefix(self):
+        """Test _find_common_prefix edge cases."""
+        from sglang.srt.function_call.utils import _find_common_prefix
+
+        self.assertEqual(_find_common_prefix("", ""), "")
+        self.assertEqual(_find_common_prefix("abc", ""), "")
+        self.assertEqual(_find_common_prefix("abc", "abc"), "abc")
+        self.assertEqual(_find_common_prefix("abcdef", "abcxyz"), "abc")
+        self.assertEqual(_find_common_prefix("xyz", "abc"), "")
+        prefix = "a" * 5000
+        self.assertEqual(_find_common_prefix(prefix + "1", prefix + "2"), prefix)
+
 
 class TestLlama32Detector(unittest.TestCase):
     def setUp(self):

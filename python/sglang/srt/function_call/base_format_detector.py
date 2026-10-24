@@ -1,7 +1,8 @@
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
@@ -28,6 +29,179 @@ from sglang.srt.function_call.utils import (
 
 logger = logging.getLogger(__name__)
 
+_SIMPLE_ESCAPE_MAP = {
+    '"': '"',
+    "\\": "\\",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
+_STRUCTURAL_TOKEN_RE = re.compile(r'["\[\]{}]')
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_SURROGATE_RE = re.compile(r"\\u[dD][89abABcdefCDEF]")
+
+
+def _is_escaped(text: str, index: int) -> bool:
+    bs = 0
+    k = index - 1
+    while k >= 0 and text[k] == "\\":
+        bs += 1
+        k -= 1
+    return (bs % 2) == 1
+
+
+def _check_open_top_level_arg_string(
+    raw_json: str, expected_key: Optional[str] = None
+) -> Optional[int]:
+    """Return the consumed prefix length if ``raw_json`` ends inside an open
+    top-level string value of ``arguments``/``parameters`` (brace depth 2),
+    or ``None`` if full partial-JSON parsing is required."""
+    in_string = False
+    prev_string_start = -1
+    last_string_start = -1
+    last_string_end = -1
+    top_stack: List[Tuple[int, str, int, int]] = []
+    for match in _STRUCTURAL_TOKEN_RE.finditer(raw_json):
+        i = match.start()
+        ch = match.group()
+        if ch == '"':
+            if not in_string:
+                in_string = True
+                last_string_start = i
+            elif not _is_escaped(raw_json, i):
+                in_string = False
+                prev_string_start = last_string_start
+                last_string_end = i
+        elif not in_string:
+            if ch in "{[":
+                top_stack.append((i, ch, prev_string_start, last_string_end))
+            else:
+                if not top_stack:
+                    return None
+                top_stack.pop()
+                if not top_stack:
+                    return None
+
+    if not in_string or len(top_stack) != 2:
+        return None
+    if top_stack[0][1] != "{" or top_stack[1][1] != "{":
+        return None
+    arg_obj_pos, _, arg_key_start, arg_key_end = top_stack[1]
+    if arg_key_start <= top_stack[0][0]:
+        return None
+    if raw_json[arg_key_end + 1 : arg_obj_pos].strip() != ":":
+        return None
+    if raw_json[arg_key_start + 1 : arg_key_end] not in ("arguments", "parameters"):
+        return None
+
+    if prev_string_start <= arg_obj_pos:
+        return None
+    if raw_json[last_string_end + 1 : last_string_start].strip() != ":":
+        return None
+    if (
+        expected_key is not None
+        and raw_json[prev_string_start + 1 : last_string_end] != expected_key
+    ):
+        return None
+
+    # partial_json_parser strips trailing whitespace before completing open strings.
+    stripped_end = len(raw_json.rstrip())
+    tail_window = raw_json[max(last_string_start + 1, stripped_end - 12) : stripped_end]
+    if (
+        "\\U" in tail_window
+        or "\\x" in tail_window
+        or _SURROGATE_RE.search(tail_window) is not None
+    ):
+        return None
+    _u = raw_json.rfind(
+        "\\u", max(last_string_start + 1, stripped_end - 5), stripped_end
+    )
+    if _u != -1 and not _is_escaped(raw_json, _u):
+        if stripped_end < len(raw_json):
+            return None
+        return _u
+    bs_count = stripped_end - len(raw_json[:stripped_end].rstrip("\\"))
+    if bs_count % 2 == 1:
+        if stripped_end < len(raw_json):
+            return None
+        return stripped_end - 1
+    return stripped_end
+
+
+def _decode_simple_json_str_delta(
+    raw_tail: str, reject_single_quote: bool = False
+) -> Optional[Tuple[int, str, str]]:
+    """Incrementally decode a chunk suffix inside an open JSON string value.
+
+    Returns ``(consumed_len, encoded_delta, decoded_delta)`` when ``raw_tail``
+    only contains characters and simple escapes whose ``json.dumps``
+    representation can be computed directly, or ``None`` if ``raw_tail``
+    closes the string or contains escapes requiring the full parser."""
+    if not raw_tail:
+        return 0, "", ""
+    stripped_len = len(raw_tail.rstrip())
+    n = len(raw_tail)
+    i = 0
+    encoded_chars: List[str] = []
+    decoded_chars: List[str] = []
+    while i < n:
+        ch = raw_tail[i]
+        if ch == '"':
+            return None
+        if ch == "\\":
+            if i + 1 >= n:
+                if i < stripped_len:
+                    break
+                return None
+            nxt = raw_tail[i + 1]
+            if nxt in _SIMPLE_ESCAPE_MAP:
+                if nxt == "/":
+                    return None
+                if i < stripped_len:
+                    encoded_chars.append(raw_tail[i : i + 2])
+                    decoded_chars.append(_SIMPLE_ESCAPE_MAP[nxt])
+                i += 2
+                continue
+            if nxt == "u":
+                if i + 6 > n:
+                    if stripped_len == n and all(
+                        c in _HEX_DIGITS for c in raw_tail[i + 2 : n]
+                    ):
+                        break
+                    return None
+                hex4 = raw_tail[i + 2 : i + 6]
+                if not all(c in _HEX_DIGITS for c in hex4):
+                    return None
+                code = int(hex4, 16)
+                if code < 0x20 or (0xD800 <= code <= 0xDFFF):
+                    return None
+                dec = chr(code)
+                if (
+                    dec == '"'
+                    or dec == "\\"
+                    or (reject_single_quote and dec == "'")
+                ):
+                    return None
+                if i < stripped_len:
+                    encoded_chars.append(dec)
+                    decoded_chars.append(dec)
+                i += 6
+                continue
+            return None
+        if (
+            ord(ch) < 0x20
+            or (reject_single_quote and ch == "'")
+            or (0xD800 <= ord(ch) <= 0xDFFF)
+        ):
+            return None
+        if i < stripped_len:
+            encoded_chars.append(ch)
+            decoded_chars.append(ch)
+        i += 1
+    return min(i, stripped_len), "".join(encoded_chars), "".join(decoded_chars)
+
 
 class BaseFormatDetector(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
@@ -50,6 +224,12 @@ class BaseFormatDetector(ABC):
         # Critical for serving layer to calculate remaining content when streaming ends.
         # Each index corresponds to a tool_id. Example: ['{"location": "San Francisco"', '{"temp": 72']
         self.streamed_args_for_tool: List[str] = []
+
+        # Open-string streaming fast-path state (O(1) per chunk inside string arguments)
+        self._open_arg_key: Optional[str] = None
+        self._open_arg_consumed_pos: int = 0
+        self._open_arg_quote_pos: int = -1
+        self._open_arg_pending_delta: str = ""
 
         # Token configuration (override in subclasses)
         self.bot_token = ""
@@ -144,6 +324,52 @@ class BaseFormatDetector(ABC):
         self._buffer += new_text
         current_text = self._buffer
 
+        # Fast path: when streaming inside an open top-level string argument,
+        # extend the open string in O(|delta|) without re-running partial_json_parser
+        # and json.dumps over the entire accumulated buffer on every chunk.
+        open_key = getattr(self, "_open_arg_key", None)
+        if (
+            open_key is not None
+            and self.current_tool_name_sent
+            and 0 <= self.current_tool_id < len(self.prev_tool_call_arr)
+        ):
+            try:
+                consumed_pos = self._open_arg_consumed_pos
+                quote_pos = self._open_arg_quote_pos
+                reject_sq = self.bot_token == "<|python_tag|>"
+                if len(current_text) >= consumed_pos and (
+                    not reject_sq or quote_pos == -1 or current_text[quote_pos] == "'"
+                ):
+                    raw_tail = current_text[consumed_pos:]
+                    decoded_info = _decode_simple_json_str_delta(
+                        raw_tail, reject_single_quote=reject_sq
+                    )
+                    if decoded_info is not None:
+                        consumed_len, encoded_delta, decoded_delta = decoded_info
+                        if consumed_len == 0:
+                            return StreamingParseResult()
+                        self._open_arg_consumed_pos = consumed_pos + consumed_len
+                        prev_args = self.prev_tool_call_arr[self.current_tool_id][
+                            "arguments"
+                        ]
+                        prev_args[open_key] = prev_args[open_key] + decoded_delta
+                        argument_diff = self._open_arg_pending_delta
+                        self._open_arg_pending_delta = encoded_delta
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            argument_diff
+                        )
+                        return StreamingParseResult(
+                            calls=[
+                                ToolCallItem(
+                                    tool_index=self.current_tool_id,
+                                    parameters=argument_diff,
+                                )
+                            ],
+                        )
+            except Exception:
+                pass
+            self._open_arg_key = None
+
         # The current_text has tool_call if it is the start of a new tool call sequence
         # or it is the start of a new tool call after a tool call separator, when there is a previous tool call
         if not (
@@ -211,9 +437,8 @@ class BaseFormatDetector(ABC):
                     else:
                         raise
 
-                is_current_complete = _is_complete_json(
-                    current_text[start_idx : start_idx + end_idx]
-                )
+                raw_slice = current_text[start_idx : start_idx + end_idx]
+                is_current_complete = _is_complete_json(raw_slice)
 
                 # Validate tool name if present
                 if "name" in obj and obj["name"] not in self._tool_indices:
@@ -221,6 +446,7 @@ class BaseFormatDetector(ABC):
                     self._buffer = ""
                     self.current_tool_id = -1
                     self.current_tool_name_sent = False
+                    self._open_arg_key = None
                     if self.streamed_args_for_tool:
                         self.streamed_args_for_tool.pop()
                     return StreamingParseResult()
@@ -297,6 +523,7 @@ class BaseFormatDetector(ABC):
 
                         # Only remove the processed portion, keep unprocessed content
                         self._buffer = current_text[start_idx + end_idx :]
+                        self._open_arg_key = None
 
                     # If the tool is still being parsed, send incremental changes
                     elif prev_arguments:
@@ -336,6 +563,35 @@ class BaseFormatDetector(ABC):
                             ],
                         )
                         self.streamed_args_for_tool[tool_index_to_use] += argument_diff
+
+                    if (
+                        not is_current_complete
+                        and isinstance(cur_arguments, dict)
+                        and cur_arguments
+                    ):
+                        last_key = next(reversed(cur_arguments))
+                        if isinstance(cur_arguments[last_key], str):
+                            consumed_in_slice = _check_open_top_level_arg_string(
+                                raw_slice, last_key
+                            )
+                            if consumed_in_slice is not None:
+                                new_sent = len(
+                                    self.streamed_args_for_tool[self.current_tool_id]
+                                )
+                                if (
+                                    cur_args_json.endswith('"}')
+                                    and new_sent <= len(cur_args_json) - 2
+                                ):
+                                    self._open_arg_key = last_key
+                                    self._open_arg_consumed_pos = (
+                                        start_idx + consumed_in_slice
+                                    )
+                                    self._open_arg_quote_pos = current_text.rfind(
+                                        "'", 0, start_idx + consumed_in_slice
+                                    )
+                                    self._open_arg_pending_delta = cur_args_json[
+                                        new_sent:-2
+                                    ]
 
             return res
 
