@@ -3,6 +3,7 @@ import logging
 import re
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -104,17 +105,39 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """Check if the text contains a deepseek v32 format tool call."""
         return self.bot_token in text or self.invoke_start_token in text
 
+    def _has_dsml_tag(self, text: str) -> bool:
+        if self.current_tool_id != -1 and (
+            f"<{self.dsml_token}" in text or f"</{self.dsml_token}" in text
+        ):
+            return True
+        return (
+            self.has_tool_call(text)
+            or self.eot_token in text
+            or self.invoke_end_token in text
+        )
+
+    def _has_partial_dsml_tag_suffix(self, text: str) -> bool:
+        return any(
+            self._ends_with_partial_token(text, token) > 0
+            for token in (
+                self.bot_token,
+                self.eot_token,
+                self.invoke_start_token,
+                self.invoke_end_token,
+            )
+        )
+
     def _text_before_dsml(self, text: str) -> str:
-        """Prose preceding the first DSML tag, with the trailing blank line the
-        chat template inserts before a tool call removed."""
-        idx = text.find(self.dsml_token)
-        if idx == -1:
+        """Prose preceding the first DSML tool-call tag, with the trailing blank
+        line the chat template inserts before a tool call removed."""
+        positions = [
+            pos
+            for pos in (text.find(self.bot_token), text.find(self.invoke_start_token))
+            if pos != -1
+        ]
+        if not positions:
             return text
-        if idx >= 2 and text[idx - 2 : idx] == "</":
-            idx -= 2
-        elif idx >= 1 and text[idx - 1] == "<":
-            idx -= 1
-        return text[:idx].removesuffix("\n\n")
+        return text[: min(positions)].removesuffix("\n\n")
 
     @staticmethod
     def _unpack_invoke_match(m: "re.Match[str]") -> tuple[str, str, bool]:
@@ -259,38 +282,22 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if buffer contains any DSML markers or ends with potential tag prefix
-        # This handles partial/streaming DSML content
-        bar = self.dsml_token[0]
-        dsml_markers = [self.dsml_token, f"<{bar}", f"</{bar}"]
-        potentially_dsml = any(marker in current_text for marker in dsml_markers)
+        stripped = current_text.rstrip()
+        ends_with_prefix = self._has_partial_dsml_tag_suffix(stripped)
 
-        # Also check if text ends with start of a tag (to handle "<" arriving separately)
-        dsml_prefixes = ["<", f"<{bar}", "</", f"</{bar}"]
-        ends_with_prefix = any(
-            current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes
-        )
-
-        if (
-            not self.has_tool_call(current_text)
-            and not potentially_dsml
-            and not ends_with_prefix
-        ):
+        if not self._has_dsml_tag(current_text) and not ends_with_prefix:
             # Trailing whitespace may be the blank line ahead of a DSML block;
             # hold it so it is trimmed with the preamble or dropped with the block.
-            stripped = current_text.rstrip()
             if not stripped:
                 return StreamingParseResult()
             self._buffer = current_text[len(stripped) :]
             current_text = stripped
-            for e_token in [self.eot_token, self.invoke_end_token]:
-                if e_token in current_text:
-                    current_text = current_text.replace(e_token, "")
             return StreamingParseResult(normal_text=current_text)
 
         all_calls: list[ToolCallItem] = []
-        # Only recovered for the first call: the DSML guard above never releases a
-        # buffer that still holds a marker, so later prose stays buffered.
+        tool_indices = self._get_tool_indices(tools)
+        # Only recovered for the first call: once a tool call starts, later prose
+        # stays buffered inside the DSML block.
         preamble = ""
         try:
             # Loop to handle multiple consecutive invoke blocks
@@ -332,6 +339,15 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self._buffer = current_text[invoke_match.end() :]
                     current_text = self._buffer
                     continue
+
+                if not (func_name and func_name in tool_indices):
+                    logger.warning(
+                        f"Model attempted to call undefined function: {func_name}"
+                    )
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        self._buffer = current_text[invoke_match.end() :]
+                        current_text = self._buffer
+                        continue
 
                 # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
