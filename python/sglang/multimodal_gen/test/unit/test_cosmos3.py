@@ -887,6 +887,29 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         self.assertEqual(output.action_pred.shape, (2, 4, 3))
 
 
+class TestCosmos3AudioTokenizer(unittest.TestCase):
+    def test_load_folds_weight_norm(self):
+        from sglang.multimodal_gen.runtime.models.vaes.cosmos3_avae import (
+            Cosmos3AVAEAudioTokenizer,
+        )
+
+        config = {
+            "dec_dim": 4,
+            "dec_c_mults": [1, 2],
+            "dec_strides": [2, 2],
+            "vocoder_input_dim": 8,
+        }
+        reference = Cosmos3AVAEAudioTokenizer(config)
+        tokenizer = Cosmos3AVAEAudioTokenizer(config)
+        tokenizer.load_state_dict(reference.state_dict())
+
+        self.assertFalse(
+            [n for n, _ in tokenizer.named_parameters() if n.endswith("_g")]
+        )
+        latent = torch.randn(1, 8, 5)
+        torch.testing.assert_close(tokenizer.decode(latent), reference.decode(latent))
+
+
 class TestCosmos3ModelResolution(unittest.TestCase):
     """Verify Cosmos3 checkpoints resolve to the native SGLang pipeline."""
 
