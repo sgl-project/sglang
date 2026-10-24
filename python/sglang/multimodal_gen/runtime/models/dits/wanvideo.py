@@ -1211,8 +1211,8 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 else None
             )
 
-        hidden_states = self.patch_embedding(hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2).contiguous()
+        # token-major straight from the patchify GEMM, no [B, C, T, H, W] round trip
+        hidden_states = self.patch_embedding(hidden_states, tokens=True).contiguous()
 
         # shape is [B, T' * H' * W', C]
         seq_len_orig = hidden_states.shape[1]

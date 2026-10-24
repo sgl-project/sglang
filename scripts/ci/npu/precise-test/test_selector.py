@@ -79,13 +79,18 @@ def _get_test_files_from_pr_diff(diff_file: str) -> list[str]:
         print(f"  Warning: Failed to read diff file for test file detection: {e}")
         return test_files_found
 
-    # Pattern to match test file paths: test/registered/ directory
+    # Pattern to match test file paths: test/registered/ directory and the
+    # multimodal_gen diffusion tests.
     # In diff output:
     #   - +++ b/test/registered/unit/xxx/test_xxx.py (new/modified test file)
     #   - rename to test/registered/unit/xxx/test_xxx.py (renamed test file)
     # Test files must be in test/ directory and start with test_
     test_file_pattern = re.compile(
-        r"^(?:\+\+\+ [ab]/|rename to )((?:test/registered(?:/.+)?/test_\w+\.py|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py))",
+        r"^(?:\+\+\+ [ab]/|rename to )("
+        r"test/registered(?:/.+)?/test_\w+\.py"
+        r"|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py"
+        r"|python/sglang/multimodal_gen/test/(?:.*/)?test_\w+\.py"
+        r")",
         re.MULTILINE,
     )
 
@@ -130,10 +135,15 @@ def _get_deleted_test_files_from_pr(diff_file: str, test_case_map: dict) -> list
         print(f"  Warning: Failed to read diff file for deleted test detection: {e}")
         return deleted_test_files
 
-    # Pattern to match deleted test files (test/registered/ directory)
+    # Pattern to match deleted test files (test/registered/ directory and
+    # multimodal_gen diffusion tests)
     # Match --- a/test/... followed by +++ /dev/null (deleted file marker)
     deleted_pattern = re.compile(
-        r"^--- a/(test/registered(?:/.+)?/test_\w+\.py|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py)\s*\n\s*\+\+\+ [ab]?/dev/null",
+        r"^--- a/("
+        r"test/registered(?:/.+)?/test_\w+\.py"
+        r"|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py"
+        r"|python/sglang/multimodal_gen/test/(?:.*/)?test_\w+\.py"
+        r")\s*\n\s*\+\+\+ [ab]?/dev/null",
         re.MULTILINE,
     )
 
