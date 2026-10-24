@@ -22,6 +22,9 @@ class ReqDllmMixin:
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
+        self.dllm_pair_pending = None
+        self.dllm_pair_applied_offset = None
+        self.dllm_pair_future_width = None
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
         self.dllm_has_literal_mask = False
@@ -48,6 +51,9 @@ class ReqDllmMixin:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE
             return
 
+        if self.dllm_pair_applied_offset is not None:
+            self.dllm_phase = DllmReqPhase.STAGING_DECODE
+            return
         prefix_length = self.prefix_len
         if self.dllm_config.requires_separate_context_encoding:
             self.dllm_phase = (
@@ -110,6 +116,10 @@ class ReqDllmMixin:
                     [self.dllm_config.mask_id] * self.dllm_config.block_size,
                 )
             )
+        if self.dllm_pair_pending is not None:
+            from sglang.srt.dllm.refresh_pair_serving import apply_prefetch
+
+            apply_prefetch(self)
         self.dllm_initialized = True
 
     def _update_block_offset_for_dllm(self):
