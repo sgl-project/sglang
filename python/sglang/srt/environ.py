@@ -1495,6 +1495,11 @@ class Envs:
     # Deterministic inference and all-reduce
     # ===================================================================
     SGLANG_ENABLE_DETERMINISTIC_INFERENCE = EnvBool(False)
+    # Run the KDA gate cumsum, chunk-local cumsum and chunk output kernels on one
+    # fixed config instead of the one each process autotunes. Implied by
+    # --enable-deterministic-inference; set it to get this without the flag,
+    # e.g. with an attention backend that deterministic inference refuses.
+    SGLANG_KDA_FIXED_AUTOTUNE = EnvBool(False)
     # Use 1-stage all-reduce kernel on AMD (deterministic, fixed accumulation order)
     # If not set: auto (enabled when --enable-deterministic-inference is on)
     # Set to 1: force enable (even without --enable-deterministic-inference)

@@ -28,6 +28,7 @@ from sglang.kernels.ops.attention.fla.op import exp, exp2, log
 from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     check_shared_mem,
+    deterministic_autotune_prune,
     is_intel,
     is_nvidia,
 )
@@ -763,6 +764,11 @@ def recompute_w_u_fwd(
         for num_stages in [2, 3, 4]
     ],
     key=["BT", "IS_VARLEN"],
+    prune_configs_by={
+        "early_config_prune": deterministic_autotune_prune(
+            BK=64, BV=64, num_warps=4, num_stages=2
+        )
+    },
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
@@ -942,6 +948,9 @@ def softplus_fwd(x):
         for num_warps in [2, 4, 8]
     ],
     key=["H", "S", "BT", "IS_VARLEN", "HAS_BETA"],
+    # The tl.cumsum below adds in an order set by BS and num_warps, so the
+    # configs do not all give the same bits. Pinned: the smallest BS, 4 warps.
+    prune_configs_by={"early_config_prune": deterministic_autotune_prune(num_warps=4)},
 )
 @triton.jit(do_not_specialize=["T"])
 def kda_gate_chunk_cumsum_vector_kernel(

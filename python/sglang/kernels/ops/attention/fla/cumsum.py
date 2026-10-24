@@ -9,7 +9,11 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
-from sglang.kernels.ops.attention.fla.utils import check_shared_mem, input_guard
+from sglang.kernels.ops.attention.fla.utils import (
+    check_shared_mem,
+    deterministic_autotune_prune,
+    input_guard,
+)
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -77,6 +81,8 @@ def chunk_local_cumsum_scalar_kernel(
         for num_warps in [2, 4, 8]
     ],
     key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
+    # Pinned: the smallest BS, 4 warps.
+    prune_configs_by={"early_config_prune": deterministic_autotune_prune(num_warps=4)},
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_vector_kernel(
