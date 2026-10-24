@@ -1,0 +1,573 @@
+--- a/csrc/params.h
++++ b/csrc/params.h
+@@ -67,6 +67,8 @@
+     float sm_scale, sm_scale_div_log2;
+     int num_blocks, page_block_size, topk;
+     ModelType model_type;
++    bool is_nvfp4_kvcache = false;
++    float* __restrict__ kv_global_scale = nullptr;
+
+     cutlass::bfloat16_t* __restrict__ q;   // [b, s_q, h_q, d_qk]
+     cutlass::bfloat16_t* __restrict__ kv;  // [num_blocks, page_block_size, d_qk]
+--- a/csrc/api/sparse_decode.h
++++ b/csrc/api/sparse_decode.h
+@@ -193,7 +193,8 @@
+     const std::optional<at::Tensor> &extra_indices,
+     const std::optional<at::Tensor> &extra_topk_length,
+     int d_v,
+-    float sm_scale
++    float sm_scale,
++    const std::optional<at::Tensor> &kv_global_scale = std::nullopt
+ ) {
+     using bf16 = cutlass::bfloat16_t;
+
+@@ -217,6 +218,7 @@
+     bool have_extra_kcache = extra_kv.has_value();
+     bool have_extra_topk_length = extra_topk_length.has_value();
+     bool have_attn_sink = attn_sink.has_value();
++    bool is_nvfp4_kvcache = kv_global_scale.has_value();
+
+     int extra_num_blocks = 0, extra_page_block_size = 0, extra_topk = 0;
+     if (have_extra_kcache) {
+@@ -254,6 +256,7 @@
+     KU_CHECK_DEVICE(extra_kv);
+     KU_CHECK_DEVICE(extra_indices);
+     KU_CHECK_DEVICE(extra_topk_length);
++    KU_CHECK_DEVICE(kv_global_scale);
+
+     // Check data type
+     KU_CHECK_DTYPE(q, torch::kBFloat16);
+@@ -268,6 +271,13 @@
+     KU_CHECK_DTYPE(num_splits, torch::kInt32);
+     KU_CHECK_DTYPE(extra_indices, torch::kInt32);
+     KU_CHECK_DTYPE(extra_topk_length, torch::kInt32);
++    KU_CHECK_DTYPE(kv_global_scale, torch::kFloat32);
++    if (is_nvfp4_kvcache) {
++        TORCH_CHECK(kv_global_scale->numel() == 1);
++        TORCH_CHECK(h_q == 64, "NVFP4 is only implemented for H64");
++        TORCH_CHECK(d_qk == 576 && d_v == 512, "NVFP4 is only implemented for V32");
++        TORCH_CHECK(!have_extra_kcache, "NVFP4 extra cache is not implemented");
++    }
+
+     // Check layout
+     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
+@@ -287,7 +297,9 @@
+     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
+     {
+         int bytes_per_token;
+-        if (d_qk == 576 && d_v == 512) {
++        if (is_nvfp4_kvcache) {
++            bytes_per_token = 416;
++        } else if (d_qk == 576 && d_v == 512) {
+             // V3.2 style
+             bytes_per_token = 512 + 64*2 + (512/128)*4;
+         } else if (d_qk == 512 && d_v == 512) {
+@@ -310,7 +322,7 @@
+     KU_CHECK_SHAPE(extra_topk_length, b);
+
+     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+-    auto opts = q.options();
++    auto opts = q.options().dtype(at::kBFloat16);
+
+     at::Tensor out = torch::empty({b, s_q, h_q, d_v}, opts);
+     at::Tensor lse = torch::empty({b, s_q, h_q}, opts.dtype(at::kFloat));
+@@ -381,12 +393,44 @@
+     }
+
+     DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
++    if (is_nvfp4_kvcache && tile_scheduler_metadata.has_value()) {
++        // CUDA graph callers preallocate scheduler metadata using the stock
++        // FlashMLA policy and retain its address across replays.  Honor that
++        // externally supplied partition count so split-K scratch allocation
++        // and combine agree with the captured schedule.  The compact NVFP4
++        // policy below remains active when metadata is generated internally.
++        const int supplied_num_sm_parts = tile_scheduler_metadata->size(0);
++        TORCH_CHECK(
++            supplied_num_sm_parts > 0 &&
++                supplied_num_sm_parts <= impl_meta.num_sm_parts,
++            "Invalid externally supplied scheduler partition count: ",
++            supplied_num_sm_parts,
++            " (kernel maximum ",
++            impl_meta.num_sm_parts,
++            ")");
++        impl_meta.num_sm_parts = supplied_num_sm_parts;
++    } else if (is_nvfp4_kvcache) {
++        // Preserve the scheduler's one-KV-block payload while avoiding idle
++        // partitions.  The stock H64 policy launches one partition per SM for
++        // B1/Sq1 (148 on B200), although topk=2048 has 32 blocks plus five
++        // fixed scheduling-cost units.  Capping at 37 therefore retains all
++        // 32 useful splits without launching 111 empty partitions.
++        const int max_blocks_per_request =
++            (topk + extra_topk + impl_meta.block_size_topk - 1) /
++            impl_meta.block_size_topk;
++        const int max_useful_parts = std::max(
++            b * (max_blocks_per_request + impl_meta.fixed_overhead_num_blocks),
++            1);
++        impl_meta.num_sm_parts = std::min(impl_meta.num_sm_parts, max_useful_parts);
++    }
+
+     SparseAttnDecodeParams params = {
+         b, s_q, h_q, h_kv, d_qk, d_v,
+         sm_scale, sm_scale * LOG_2_E,
+         num_blocks, page_block_size, topk,
+         model_type,
++        is_nvfp4_kvcache,
++        ku::get_optional_tensor_ptr<float>(kv_global_scale),
+
+         (bf16*)q.data_ptr(),
+         (bf16*)kv.data_ptr(),
+--- a/csrc/sm100/decode/head64/config.h
++++ b/csrc/sm100/decode/head64/config.h
+@@ -58,9 +58,11 @@
+
+ template<
+     typename Shape_Q_SW128, typename TMA_Q_SW128,
+-    typename Shape_O, typename TMA_O
++    typename Shape_O, typename TMA_O,
++    bool IS_NVFP4_STORAGE
+ >
+ struct TmaParams {
++    static constexpr bool kIsNvfp4Storage = IS_NVFP4_STORAGE;
+     Shape_Q_SW128 shape_Q_SW128; TMA_Q_SW128 tma_Q_SW128;
+     Shape_O shape_O; TMA_O tma_O;
+     CUtensorMap tensor_map_q_sw64;  // Invalid if D_Q_SW64 == 0
+@@ -211,4 +213,4 @@
+
+ };
+
+-}
+\ No newline at end of file
++}
+--- a/csrc/sm100/decode/head64/kernel.cuh
++++ b/csrc/sm100/decode/head64/kernel.cuh
+@@ -16,6 +16,52 @@
+
+ namespace sm100::decode::head64 {
+
++// SGLANG_SM100_GLM52_NVFP4_BF16_V1
++// Decode one packed E2M1 block directly into the BF16 tile consumed by the
++// existing FlashMLA QK/PV pipeline.  Storage format and consumer compute type
++// intentionally remain independent: NVFP4 changes only the producer.
++struct Nvfp4Bf16x8 {
++    bf16 values[8];
++};
++
++__device__ __forceinline__ Nvfp4Bf16x8
++nvfp4_dequant_e2m1x8_prepared_half2(uint32_t packed, __half2 scale_half2) {
++    uint32_t fp16x2[4];
++    asm volatile(
++        "{\n"
++        ".reg .b8 byte0, byte1, byte2, byte3;\n"
++        "mov.b32 {byte0, byte1, byte2, byte3}, %4;\n"
++        "cvt.rn.f16x2.e2m1x2 %0, byte0;\n"
++        "cvt.rn.f16x2.e2m1x2 %1, byte1;\n"
++        "cvt.rn.f16x2.e2m1x2 %2, byte2;\n"
++        "cvt.rn.f16x2.e2m1x2 %3, byte3;\n"
++        "}\n"
++        : "=r"(fp16x2[0]), "=r"(fp16x2[1]),
++          "=r"(fp16x2[2]), "=r"(fp16x2[3])
++        : "r"(packed));
++    Nvfp4Bf16x8 result;
++    uint32_t* pairs = reinterpret_cast<uint32_t*>(&result);
++    CUTE_UNROLL
++    for (int i = 0; i < 4; ++i) {
++        const __half2 scaled = __hmul2(
++            *reinterpret_cast<const __half2*>(&fp16x2[i]), scale_half2);
++        const __nv_bfloat162 value = __float22bfloat162_rn(
++            __half22float2(scaled));
++        pairs[i] = *reinterpret_cast<const uint32_t*>(&value);
++    }
++    return result;
++}
++
++__device__ __forceinline__ half nvfp4_e4m3_scale_to_half(uint8_t code) {
++    const uint16_t packed = uint16_t(code) | (uint16_t(code) << 8);
++    uint32_t fp16x2;
++    asm volatile(
++        "cvt.rn.f16x2.e4m3x2 %0, %1;\n"
++        : "=r"(fp16x2)
++        : "h"(packed));
++    return *reinterpret_cast<const half*>(&fp16x2);
++}
++
+ template<ModelType MODEL_TYPE>
+ template<typename TmaParam>
+ __device__ void
+@@ -598,17 +644,23 @@
+                     for (int row = 0; row < B_TOPK; row += 4) {
+                         if (row+4 < B_TOPK)
+                             nxt_cur_indices = *(int4*)(plan.tma_coord[rs.index_buf_idx] + row + 4);
++                        uint8_t* raw_dst = reinterpret_cast<uint8_t*>(
++                            plan.u.kv.raw_nope[rs.buf_idx].data());
++                        constexpr int raw_row_bytes =
++                            TmaParam::kIsNvfp4Storage ? 288 : D_NOPE;
+                         ku::tma_gather4(
+                             block_idx >= args.num_orig_kv_blocks ? &tma_params.tensor_map_extra_kv_nope : &tma_params.tensor_map_kv_nope,
+                             plan.bar_raw_ready[rs.buf_idx],
+-                            plan.u.kv.raw_nope[rs.buf_idx].data() + D_NOPE*row,
++                            raw_dst + raw_row_bytes * row,
+                             0,
+                             cur_indices,
+                             (int64_t)TMA::CacheHintSm90::EVICT_LAST
+                         );
+                         cur_indices = nxt_cur_indices;
+                     }
+-                    plan.bar_raw_ready[rs.buf_idx].arrive_and_expect_tx(B_TOPK*D_NOPE*sizeof(e4m3));
++                    constexpr int raw_bytes = B_TOPK *
++                        (TmaParam::kIsNvfp4Storage ? 288 : D_NOPE);
++                    plan.bar_raw_ready[rs.buf_idx].arrive_and_expect_tx(raw_bytes);
+                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].arrive();
+                     rs.update();
+                 }
+@@ -654,12 +706,18 @@
+             // Indices transformation warp
+             // Responsible for generating: TMA coordinates, scale factors, and valid masks
+             static_assert(B_TOPK == 64);
+-            static constexpr int tma_coords_step_per_token = MODEL_TYPE == ModelType::V32 ? 656/TMA_K_STRIDE : 576/TMA_K_STRIDE;
+-            int tma_coords_step_per_block = params.stride_kv_block / TMA_K_STRIDE; // must < 2G since k_batch_stride < 1T and TMA_K_STRIDE > 512
++            constexpr int tma_stride =
++                TmaParam::kIsNvfp4Storage ? 416 : TMA_K_STRIDE;
++            constexpr int tma_coords_step_per_token =
++                TmaParam::kIsNvfp4Storage
++                ? 1
++                : (MODEL_TYPE == ModelType::V32 ? 656/TMA_K_STRIDE : 576/TMA_K_STRIDE);
++            int tma_coords_step_per_block = params.stride_kv_block / tma_stride;
+             int tma_coords_step_per_extra_block = params.stride_extra_kv_block / TMA_K_STRIDE;
+             uint8_t* k_scales_ptr =
+                 MODEL_TYPE == ModelType::V32 ?
+-                (uint8_t*)params.kv + D_NOPE :
++                (uint8_t*)params.kv +
++                    (TmaParam::kIsNvfp4Storage ? 256 : D_NOPE) :
+                 (uint8_t*)params.kv + params.page_block_size*(D_NOPE+2*D_ROPE);
+             uint8_t* extra_k_scales_ptr =
+                 MODEL_TYPE == ModelType::V32 ?
+@@ -695,22 +753,28 @@
+                     char valid_mask = 0;
+                     CUTE_UNROLL
+                     for (int i = 0; i < 2; ++i) {
+-                        int block_idx, idx_in_block;
+-                        block_idx = (unsigned int)my_indices[i] / cur_block_size;
+-                        idx_in_block = (unsigned int)my_indices[i] % cur_block_size;
+-                        bool is_token_valid = my_indices[i] != -1 && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
++                        int physical_limit = cur_block_size *
++                            (IS_EXTRA_BLOCK ? params.extra_num_blocks : params.num_blocks);
++                        bool is_token_valid =
++                            my_indices[i] >= 0 && my_indices[i] < physical_limit &&
++                            (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
++                        int safe_index = is_token_valid ? my_indices[i] : 0;
++                        int block_idx = (unsigned int)safe_index / cur_block_size;
++                        int idx_in_block = (unsigned int)safe_index % cur_block_size;
+                         valid_mask |= is_token_valid << i;
+                         tma_coords[i] = is_token_valid ? block_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1; // If the token is invalid because it topk position exceeds topk_length, we must manually fill tma_coords with -1 to avoid copying-in NaN.
+                         if constexpr (MODEL_TYPE == ModelType::V32) {
+-                            int64_t offset = is_token_valid ? block_idx*cur_k_block_stride + idx_in_block*cur_k_row_stride : 0;
+-                            float4 cur_scale_fp32 = __ldg((float4*)(cur_k_scales_ptr + offset));
+-                            __nv_bfloat16 res[4];
+-                            res[0] = __float2bfloat16(cur_scale_fp32.x);
+-                            res[1] = __float2bfloat16(cur_scale_fp32.y);
+-                            res[2] = __float2bfloat16(cur_scale_fp32.z);
+-                            res[3] = __float2bfloat16(cur_scale_fp32.w);
+-                            if (!is_token_valid) *(uint64_t*)res = (uint64_t)0;
+-                            *(uint64_t*)(scales+i*NUM_SCALES_EACH_TOKEN) = *(uint64_t*)(res);
++                            if constexpr (!TmaParam::kIsNvfp4Storage) {
++                                int64_t offset = is_token_valid ? block_idx*cur_k_block_stride + idx_in_block*cur_k_row_stride : 0;
++                                float4 cur_scale_fp32 = __ldg((float4*)(cur_k_scales_ptr + offset));
++                                __nv_bfloat16 res[4];
++                                res[0] = __float2bfloat16(cur_scale_fp32.x);
++                                res[1] = __float2bfloat16(cur_scale_fp32.y);
++                                res[2] = __float2bfloat16(cur_scale_fp32.z);
++                                res[3] = __float2bfloat16(cur_scale_fp32.w);
++                                if (!is_token_valid) *(uint64_t*)res = (uint64_t)0;
++                                *(uint64_t*)(scales+i*NUM_SCALES_EACH_TOKEN) = *(uint64_t*)(res);
++                            }
+                         } else {
+                             int64_t offset = block_idx*cur_k_block_stride + idx_in_block*8; // Each token has 7 scale factors with an extra 1B padding
+                             uint64_t scalesx8 = is_token_valid ? __ldg((uint64_t*)(cur_k_scales_ptr + offset)) : 0;
+@@ -721,7 +785,9 @@
+                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x1);
+                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x2);
+                     if constexpr (MODEL_TYPE == ModelType::V32) {
+-                        *(__int128_t*)(plan.scales[rs.index_buf_idx] + lane_idx*2) = *(__int128_t*)scales;
++                        if constexpr (!TmaParam::kIsNvfp4Storage) {
++                            *(__int128_t*)(plan.scales[rs.index_buf_idx] + lane_idx*2) = *(__int128_t*)scales;
++                        }
+                     } else {
+                         *(__int128_t*)(plan.scales[rs.index_buf_idx] + lane_idx*2) = *(__int128_t*)scales;
+                     }
+@@ -754,10 +820,16 @@
+         constexpr int GROUP_SIZE = 8, NUM_GROUPS = 128/8, ROWS_PER_GROUP = B_TOPK / NUM_GROUPS, COLS_PER_GROUP = D_NOPE/(GROUP_SIZE*8);
+         int group_idx = idx_in_warpgroup/GROUP_SIZE, idx_in_group = idx_in_warpgroup%GROUP_SIZE;
+         Tensor nope0 = make_tensor(make_smem_ptr(plan.u.kv.dequant[0].nope.data()), SmemLayoutKTiles_SW128<D_NOPE/64>{});
++        Tensor nope1 = make_tensor(make_smem_ptr(plan.u.kv.dequant[1].nope.data()), SmemLayoutKTiles_SW128<D_NOPE/64>{});
+         bf16* nope0_base = &nope0(group_idx, idx_in_group*8);
+         bf16* nope1_base = nope0_base + (plan.u.kv.dequant[1].nope.data() - plan.u.kv.dequant[0].nope.data());
+         e4m3* raw_nope0_base = plan.u.kv.raw_nope[rs.buf_idx].data() + group_idx*D_NOPE + idx_in_group*8;
+         e4m3* raw_nope1_base = raw_nope0_base + B_H*D_NOPE;
++        half nvfp4_global_scale_half{};
++        if constexpr (TmaParam::kIsNvfp4Storage) {
++            nvfp4_global_scale_half =
++                __float2half_rn(__ldg(params.kv_global_scale));
++        }
+
+         run_main_loop([&](const MainLoopArgs &args) {
+             // plan.bar_last_store_done.wait(args.bar_phase_batch_rel); // No need to wait since the raw nope producer must wait
+@@ -776,31 +848,131 @@
+                         : "r"(cur_nope_base_uint_addr + 2*(local_row_idx*NUM_GROUPS*64 + local_col_idx*B_TOPK*64)), "q"(data)   // 2 for sizeof(bf16)
+                     );  // We have this `asm volatile` here, otherwise the compiler generates ST.E instead of STS
+                 };
++                auto st_bf16x8 = [&](bf16* destination,
++                                     const Nvfp4Bf16x8 &data) {
++                    const uint32_t smem_address =
++                        cute::cast_smem_ptr_to_uint(destination);
++                    asm volatile ("st.weak.shared::cta.b128 [%0], %1;\n"
++                        :
++                        : "r"(smem_address),
++                          "q"(*reinterpret_cast<const __int128_t*>(&data)));
++                };
+                 auto get_raw_fp8 = [&](int local_row_idx, int local_col_idx) -> uint64_t {
+                     return *(uint64_t*)(raw_nope_base + local_row_idx*NUM_GROUPS*D_NOPE + local_col_idx*(GROUP_SIZE*8));
+                 };
+                 // The following code suffers from a 2-way bank conflict when reading from SMEM.
+                 if constexpr (MODEL_TYPE == ModelType::V32) {
+-                    CUTE_UNROLL
+-                    for (int local_row_idx = 0; local_row_idx < ROWS_PER_GROUP; ++local_row_idx) {
+-                        int row_idx = local_row_idx*NUM_GROUPS + group_idx;
+-                        bf16 scales[4];
+-                        *(uint64_t*)scales = *(uint64_t*)plan.scales[rs.index_buf_idx][row_idx];
+-
+-                        uint64_t cur_data_fp8x8 = get_raw_fp8(local_row_idx, 0);
++                    if constexpr (TmaParam::kIsNvfp4Storage) {
++                        // Four lanes own one 64-value stripe. Each lane
++                        // decodes a full block-16, keeping its scale local.
++                        constexpr int NV_GROUP_SIZE = 4;
++                        constexpr int NV_NUM_GROUPS = 128 / NV_GROUP_SIZE;
++                        constexpr int NV_ROWS_PER_GROUP =
++                            B_TOPK / NV_NUM_GROUPS;
++                        constexpr int NV_COLS_PER_GROUP =
++                            D_NOPE / (NV_GROUP_SIZE * 16);
++                        const int nv_group_idx =
++                            idx_in_warpgroup / NV_GROUP_SIZE;
++                        const int nv_idx_in_group =
++                            idx_in_warpgroup % NV_GROUP_SIZE;
++                        const uint8_t* raw_buffer =
++                            reinterpret_cast<const uint8_t*>(
++                                plan.u.kv.raw_nope[rs.buf_idx].data());
++                        auto &nope = rs.buf_idx == 0 ? nope0 : nope1;
++
++                        CUTE_NO_UNROLL
++                        for (int local_row_idx = 0;
++                             local_row_idx < NV_ROWS_PER_GROUP;
++                             ++local_row_idx) {
++                            const int row_idx =
++                                local_row_idx * NV_NUM_GROUPS + nv_group_idx;
++                            const uint8_t* row_buffer =
++                                raw_buffer + row_idx * 288;
++                            const int first_logical_dim =
++                                nv_idx_in_group * 16;
++                            uint64_t cur_packed =
++                                *reinterpret_cast<const uint64_t*>(
++                                    row_buffer + first_logical_dim / 2);
++                            uint8_t cur_scale_code =
++                                row_buffer[256 + first_logical_dim / 16];
++
++                            CUTE_NO_UNROLL
++                            for (int local_col_idx = 0;
++                                 local_col_idx < NV_COLS_PER_GROUP;
++                                 ++local_col_idx) {
++                                const int logical_dim =
++                                    nv_idx_in_group * 16 +
++                                    local_col_idx * (NV_GROUP_SIZE * 16);
++                                const uint64_t packed = cur_packed;
++                                const uint8_t scale_code = cur_scale_code;
++                                if (local_col_idx + 1 < NV_COLS_PER_GROUP) {
++                                    const int next_logical_dim =
++                                        logical_dim + NV_GROUP_SIZE * 16;
++                                    cur_packed =
++                                        *reinterpret_cast<const uint64_t*>(
++                                            row_buffer + next_logical_dim / 2);
++                                    cur_scale_code = row_buffer[
++                                        256 + next_logical_dim / 16];
++                                }
++                                const half block_scale =
++                                    nvfp4_e4m3_scale_to_half(scale_code);
++                                const half effective_scale = __hmul(
++                                    block_scale, nvfp4_global_scale_half);
++                                const __half2 effective_scale_half2 =
++                                    __halves2half2(
++                                        effective_scale, effective_scale);
++                                const Nvfp4Bf16x8 low =
++                                    nvfp4_dequant_e2m1x8_prepared_half2(
++                                        static_cast<uint32_t>(packed),
++                                        effective_scale_half2);
++                                st_bf16x8(
++                                    &nope(row_idx, logical_dim), low);
++                                const Nvfp4Bf16x8 high =
++                                    nvfp4_dequant_e2m1x8_prepared_half2(
++                                        static_cast<uint32_t>(packed >> 32),
++                                        effective_scale_half2);
++                                st_bf16x8(
++                                    &nope(row_idx, logical_dim + 8), high);
++                            }
++                        }
++                    } else {
+                         CUTE_UNROLL
+-                        for (int local_col_idx = 0; local_col_idx < COLS_PER_GROUP; ++local_col_idx) {
+-                            ku::nve4m3x2 data_fp8[4];
+-                            ku::nvbf16x2 data_bf16[4];
+-                            *(uint64_t*)data_fp8 = cur_data_fp8x8;
+-                            if (local_col_idx+1 < COLS_PER_GROUP)
+-                                cur_data_fp8x8 = get_raw_fp8(local_row_idx, local_col_idx+1);
+-                            bf16 scale = scales[local_col_idx / (D_NOPE/(GROUP_SIZE*8)/4)];
++                        for (int local_row_idx = 0;
++                             local_row_idx < ROWS_PER_GROUP;
++                             ++local_row_idx) {
++                            int row_idx =
++                                local_row_idx * NUM_GROUPS + group_idx;
++                            bf16 scales[4];
++                            *(uint64_t*)scales = *(uint64_t*)
++                                plan.scales[rs.index_buf_idx][row_idx];
++
++                            uint64_t cur_data_fp8x8 =
++                                get_raw_fp8(local_row_idx, 0);
+                             CUTE_UNROLL
+-                            for (int i = 0; i < 4; ++i) {
+-                                data_bf16[i] = fp8x2_to_bf16x2_with_scale(data_fp8[i], *(ku::nvbf16*)(&scale));
++                            for (int local_col_idx = 0;
++                                 local_col_idx < COLS_PER_GROUP;
++                                 ++local_col_idx) {
++                                ku::nve4m3x2 data_fp8[4];
++                                ku::nvbf16x2 data_bf16[4];
++                                *(uint64_t*)data_fp8 = cur_data_fp8x8;
++                                if (local_col_idx + 1 < COLS_PER_GROUP) {
++                                    cur_data_fp8x8 = get_raw_fp8(
++                                        local_row_idx, local_col_idx + 1);
++                                }
++                                bf16 scale = scales[
++                                    local_col_idx /
++                                    (D_NOPE / (GROUP_SIZE * 8) / 4)];
++                                CUTE_UNROLL
++                                for (int i = 0; i < 4; ++i) {
++                                    data_bf16[i] =
++                                        fp8x2_to_bf16x2_with_scale(
++                                            data_fp8[i],
++                                            *(ku::nvbf16*)(&scale));
++                                }
++                                st_128b(
++                                    local_row_idx, local_col_idx,
++                                    *(__int128_t*)data_bf16);
+                             }
+-                            st_128b(local_row_idx, local_col_idx, *(__int128_t*)data_bf16);
+                         }
+                     }
+                 } else {
+@@ -865,6 +1037,10 @@
+         constexpr int BYTES_PER_TOKEN = D_NOPE + 2*D_ROPE + 8;
+         KU_ASSERT(params.stride_kv_row == BYTES_PER_TOKEN, "Each page block in KV cache must be contiguous for head64 sparse fp8 decoding attention in MODEL1");  // Each block must be contiguous
+     }
++    if (params.is_nvfp4_kvcache && MODEL_TYPE != ModelType::V32) {
++        CUTE_INVALID_CONTROL_PATH("NVFP4 KV cache is only supported by V32");
++        return;
++    }
+
+     auto shape_Q_SW128 = make_shape(B_H, D_Q, params.s_q, params.b);
+     auto tma_Q_SW128 = cute::make_tma_copy(
+@@ -908,6 +1084,38 @@
+     auto get_nope_rope_tensormap = [&](bool is_extra, void* k_ptr, int num_blocks, int64_t k_batch_stride) -> std::pair<CUtensorMap, CUtensorMap> {
+         static_assert(D_NOPE%8 == 0);
+         KU_ASSERT((int64_t)k_ptr % 16 == 0, "The base address of %sk_ptr (%p) must be 16B aligned for sparse fp8 attention on sm100f", is_extra?"extra_":"", k_ptr);
++        if (params.is_nvfp4_kvcache) {
++            constexpr int NVFP4_ROW_BYTES = 416;
++            constexpr int PACKED_AND_SCALE_BYTES = 288;
++            constexpr int ROPE_OFFSET = 288;
++            KU_ASSERT(!is_extra, "NVFP4 extra cache is not implemented");
++            KU_ASSERT(k_batch_stride % NVFP4_ROW_BYTES == 0,
++                "NVFP4 k_cache.stride(0) (%ld) must be a multiple of %d",
++                k_batch_stride, NVFP4_ROW_BYTES);
++            CUtensorMap tensor_map_kv_nope = ku::make_tensor_map(
++                {PACKED_AND_SCALE_BYTES/8,
++                 (uint64_t)num_blocks *
++                     (k_batch_stride/NVFP4_ROW_BYTES)},
++                {NVFP4_ROW_BYTES},
++                {PACKED_AND_SCALE_BYTES/8, 1},
++                k_ptr,
++                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT64,
++                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
++                CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
++            );
++            CUtensorMap tensor_map_kv_rope = ku::make_tensor_map(
++                {D_ROPE,
++                 (uint64_t)num_blocks *
++                     (k_batch_stride/NVFP4_ROW_BYTES)},
++                {NVFP4_ROW_BYTES},
++                {K_ROPE_SW/2, 1},
++                (uint8_t*)k_ptr + ROPE_OFFSET,
++                CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
++                CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_64B,
++                CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B
++            );
++            return {tensor_map_kv_nope, tensor_map_kv_rope};
++        }
+         KU_ASSERT(k_batch_stride % TMA_K_STRIDE == 0, "%sk_cache.stride(0) (%ld) must be a multiple of %d. Padding might be necessary", is_extra?"extra_":"", k_batch_stride, TMA_K_STRIDE);
+         CUtensorMap tensor_map_kv_nope = ku::make_tensor_map(
+             {D_NOPE/8, (uint64_t)num_blocks * (k_batch_stride/TMA_K_STRIDE)},
+@@ -936,27 +1144,41 @@
+         std::tie(tensor_map_extra_kv_nope, tensor_map_extra_kv_rope) = get_nope_rope_tensormap(true, params.extra_kv, params.extra_num_blocks, params.stride_extra_kv_block);
+     }
+
+-    TmaParams<
+-        decltype(shape_Q_SW128), decltype(tma_Q_SW128),
+-        decltype(shape_O), decltype(tma_O)
+-    > tma_params = {
+-        shape_Q_SW128, tma_Q_SW128,
+-        shape_O, tma_O,
+-        tensor_map_q_sw64,
+-        tensor_map_kv_nope,
+-        tensor_map_kv_rope,
+-        tensor_map_extra_kv_nope,
+-        tensor_map_extra_kv_rope
+-    };
+-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE>, decltype(tma_params)>;
+-
+     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+     static_assert(smem_size < 227*1024);
+-    KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+-
+-    // NOTE Don't use PDL because of potential compiler bugs!
+-    mla_kernel<<<dim3(params.s_q, params.num_sm_parts, 1), dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(params, tma_params);
+-    KU_CHECK_KERNEL_LAUNCH();
++    auto launch = [&]<bool IS_NVFP4_STORAGE>() {
++        TmaParams<
++            decltype(shape_Q_SW128), decltype(tma_Q_SW128),
++            decltype(shape_O), decltype(tma_O),
++            IS_NVFP4_STORAGE
++        > tma_params = {
++            shape_Q_SW128, tma_Q_SW128,
++            shape_O, tma_O,
++            tensor_map_q_sw64,
++            tensor_map_kv_nope,
++            tensor_map_kv_rope,
++            tensor_map_extra_kv_nope,
++            tensor_map_extra_kv_rope
++        };
++        auto mla_kernel =
++            &flash_fwd_splitkv_mla_fp8_sparse_kernel<
++                KernelTemplate<MODEL_TYPE>, decltype(tma_params)>;
++        KU_CUDA_CHECK(cudaFuncSetAttribute(
++            mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
++            smem_size));
++
++        // NOTE Don't use PDL because of potential compiler bugs!
++        mla_kernel<<<dim3(params.s_q, params.num_sm_parts, 1),
++                     dim3(NUM_THREADS, 1, 1), smem_size, params.stream>>>(
++            params, tma_params);
++        KU_CHECK_KERNEL_LAUNCH();
++    };
++
++    if (params.is_nvfp4_kvcache) {
++        launch.template operator()<true>();
++    } else {
++        launch.template operator()<false>();
++    }
+ }
+
+ template<ModelType MODEL_TYPE>

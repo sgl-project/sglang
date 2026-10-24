@@ -58,10 +58,12 @@ from sglang.srt.arg_groups.moe_hook import (
     validate_deepep_v2_speculative_draft,
 )
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     declare_resolution,
     max_speculative_num_draft_tokens,
     post_capture_kv_sizing_planned,
     resolution_result,
+    resolved_view,
 )
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
@@ -2869,6 +2871,72 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             with self.subTest(kv_cache_dtype=kv_cache_dtype):
                 with self.assertRaisesRegex(ValueError, "nvfp4.*fp4_mx_block16"):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
+
+
+class TestDsaKV4Compatibility(CustomTestCase):
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_dsa_nvfp4_preserves_its_recipe_through_both_kv4_hooks(self):
+        """The generic MHA recipe selector must not reject or reroute DSA."""
+        for backend_source in ("explicit", "model_override", "phase_backends"):
+            with self.subTest(backend_source=backend_source):
+                args = ServerArgs(
+                    model_path="dummy",
+                    kv_cache_dtype="nvfp4",
+                    attention_backend="dsa" if backend_source == "explicit" else None,
+                    prefill_attention_backend=(
+                        "dsa" if backend_source == "phase_backends" else None
+                    ),
+                    decode_attention_backend=(
+                        "dsa" if backend_source == "phase_backends" else None
+                    ),
+                    dsa_prefill_backend="flashmla_sparse",
+                    dsa_decode_backend="flashmla_kv",
+                )
+                if backend_source != "explicit":
+                    declare_resolution(args, "test_dsa_model", attention_backend="dsa")
+                with patch(
+                    "sglang.srt.arg_groups.kv_cache_hook.use_mla_backend",
+                    return_value=True,
+                ):
+                    handle_nvfp4_prefill_kv_dequant_dtype(args)
+                    handle_kv4_compatibility(args)
+                cfg = resolved_view(args)
+                self.assertEqual(attention_backends_of(cfg), ("dsa", "dsa"))
+                self.assertEqual(cfg.prefill_kv_cache_dequant_dtype, "auto")
+                self.assertEqual(cfg.dsa_prefill_backend, "flashmla_sparse")
+                self.assertEqual(cfg.dsa_decode_backend, "flashmla_kv")
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_dsa_nvfp4_rejects_mha_prefill_dequant_recipe(self):
+        for dtype in ("nvfp4", "fp8_e4m3"):
+            with self.subTest(dtype=dtype):
+                args = ServerArgs(
+                    model_path="dummy",
+                    attention_backend="dsa",
+                    kv_cache_dtype="nvfp4",
+                    prefill_kv_cache_dequant_dtype=dtype,
+                )
+                with self.assertRaisesRegex(ValueError, "DSA.*auto"):
+                    handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_dsa_nvfp4_is_allowed_by_generic_mla_gate(self):
+        args = ServerArgs(
+            model_path="dummy",
+            attention_backend="dsa",
+            kv_cache_dtype="nvfp4",
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.use_mla_backend",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.attention_backends_of",
+                return_value=("dsa", "dsa"),
+            ),
+        ):
+            handle_kv4_compatibility(args)
 
 
 class TestPipelineParallelCompat(CustomTestCase):

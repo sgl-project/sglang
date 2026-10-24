@@ -226,9 +226,9 @@ def _set_k_and_s_triton_kernel(
     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
     PRESHUFFLE_TILE: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
+    token_id = tl.program_id(0).to(tl.int64)
 
-    loc = tl.load(loc_ptr + token_id)
+    loc = tl.load(loc_ptr + token_id).to(tl.int64)
 
     in_k_offsets = token_id * index_k_ptr_stride_0 + tl.arange(0, NUM_K_ELEMS_PER_TOKEN)
 
@@ -357,8 +357,10 @@ def _get_k_and_s_triton_kernel(
     Each program handles one token (seq_len tokens total).
     Loads 128 bytes (K) + 4 bytes (S) from the appropriate page.
     """
-    batch_id = tl.program_id(0)
-    block_token_start = tl.program_id(1) * BLOCK_SIZE
+    # Both the physical cache and the gathered output can exceed 2 GiB.
+    # Widen indices before multiplying by page, row, or batch strides.
+    batch_id = tl.program_id(0).to(tl.int64)
+    block_token_start = tl.program_id(1).to(tl.int64) * BLOCK_SIZE
     thread_idx = tl.program_id(2)
 
     # Define the token range within the block and the K dimension range handled by the thread.
@@ -374,7 +376,10 @@ def _get_k_and_s_triton_kernel(
 
     pre_batch_idx = tl.arange(0, seq_len_num_pow)
     mask_pre_batch_idx = pre_batch_idx < batch_id
-    prev_seq_lens = tl.load(seq_len_ptr + pre_batch_idx, mask=mask_pre_batch_idx)
+    # The flattened output row offset must stay wide through its stride multiply.
+    prev_seq_lens = tl.load(
+        seq_len_ptr + pre_batch_idx, mask=mask_pre_batch_idx, other=0
+    ).to(tl.int64)
     batch_token_offset = tl.sum(prev_seq_lens)
 
     # Batch calculate the page index and in-page offset of each token.
@@ -382,10 +387,12 @@ def _get_k_and_s_triton_kernel(
     token_offset_in_page = token_ids % page_size
     page_indices_base = batch_id * page_indice_batch_offset
     page_idx_valid_mask = page_idx < page_indice_batch_offset
+    # Int32 page IDs can name pages whose byte offsets exceed 2**31.
     page_index = tl.load(
         page_indices_ptr + page_idx + page_indices_base,
         mask=token_valid_mask & page_idx_valid_mask,
-    )
+        other=0,
+    ).to(tl.int64)
 
     # ===== Load K data =====
     # The address calculation logic for K: page_index * total number of elements in a single page + K offset of the token within the page.

@@ -175,7 +175,7 @@ class Parallel(msgspec.Struct):
     # Split DSA GPU KV/indexer cache layers across CP ranks.
     enable_dsa_cache_layer_split: A[
         bool,
-        "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
+        "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Requires interleave prefill CP and PP=1. PD prefill requires the Mooncake transfer backend. Unified GLM DSA serving requires NVFP4 KV, TP=CP, DP=1, and flashmla_sparse/flashmla_kv backends.",
     ] = False
     enable_cp_decode_attn_tp: A[
         bool,

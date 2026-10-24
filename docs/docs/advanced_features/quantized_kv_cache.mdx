@@ -95,6 +95,285 @@ python3 -m sglang.launch_server \
 Native NVFP4 prefill requires SM100, a page size divisible by 4, and an attention head dimension divisible by 64. TRT-LLM GenMHA uses FP8 query and output buffers internally; SGLang converts the result back to the model activation dtype. Top-k-1 EAGLE/EAGLE3/NEXTN and breadth-1 NGRAM speculative decoding are supported: an EAGLE-family draft worker uses `trtllm_mha`, and target verification consumes the physical NVFP4 cache directly in eager execution and CUDA Graphs. Set `--speculative-ngram-max-bfs-breadth=1` for NGRAM. With the mixed FlashInfer-prefill/TRT-LLM-decode recipe, SGLang resolves `--speculative-attention-mode` to `decode` so verification does not depend on FlashInfer's transient dequantization workspace. Other speculative algorithms, PD disaggregation, hierarchical KV cache, and LMCache are not currently supported by the SM100 native NVFP4 path. SM120 XQA continues to use its architecture-specific linear scale layout and BF16 query/output path.
 </Note>
 
+### GLM-5.2 DSA NVFP4 on SM100
+
+SGLang has a fused NVFP4 KV-cache decode path for the GLM-5.2 DSA layout on
+NVIDIA SM100 GPUs. The implementation stores each main-cache token in 416
+bytes: 256 bytes of packed E2M1 latent values, 32 bytes of block-16 E4M3
+scales, and 128 bytes of BF16 RoPE values. Together with the 132-byte DSA
+indexer row, this uses 548 bytes per token per layer.
+
+The specialization requires the GLM-5.2 DSA shape (512 NoPE dimensions, 64
+RoPE dimensions, and 512 value dimensions), 64 local query heads, and a page
+size of 64. Attention DP provides this head count in the following TP8 launch:
+
+```bash Command
+export MODEL_PATH="${MODEL_PATH:?set MODEL_PATH to the GLM-5.2 checkpoint}"
+
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --tp-size 8 \
+    --dp-size 8 \
+    --enable-dp-attention \
+    --attention-backend dsa \
+    --dsa-prefill-backend flashmla_sparse \
+    --dsa-decode-backend flashmla_kv \
+    --kv-cache-dtype nvfp4 \
+    --page-size 64
+```
+
+The weight dtype and weight-quantization method are independent of the KV
+cache format and should be selected for the checkpoint being served. Decode
+reads the packed cache directly and performs E2M1 dequantization inside the
+FlashMLA producer before the existing BF16 attention consumer. It does not
+materialize a full BF16 cache. Prefill gathers and dequantizes the paged prefix
+into a BF16 compatibility workspace for FlashMLA sparse-prefill; only decode is
+fused, and ordinary decode supports CUDA Graph replay.
+
+Prefill context parallelism is supported with the CP-v2 interleave strategy.
+Each CP rank first all-gathers the BF16 latent K/RoPE rows into logical token
+order. By default, each rank writes a replicated NVFP4 cache. CP alone does not
+shard KV-cache capacity or reduce the BF16 CP communication volume. For TP8, use:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --tp-size 8 \
+    --dp-size 1 \
+    --enable-prefill-cp \
+    --cp-strategy interleave \
+    --attn-cp-size 8 \
+    --attention-backend dsa \
+    --dsa-prefill-backend flashmla_sparse \
+    --dsa-decode-backend flashmla_kv \
+    --kv-cache-dtype nvfp4 \
+    --page-size 64
+```
+
+Prefill CUDA Graph is disabled while Prefill CP is active; ordinary decode
+CUDA Graph remains available.
+
+This path currently rejects non-SM100 devices, other DSA model layouts, local
+query-head counts other than 64, page sizes other than 64, DCP, non-interleave
+Prefill CP, and Prefill CP decode attention-TP.
+HiSparse is not supported on this path. The native FlashMLA operator must be
+rebuilt from a source revision that includes the SM100 NVFP4 specialization; a
+missing operator is reported at backend initialization instead of silently
+falling back to an unfused decode path.
+
+#### Unified serving with NVFP4 layer splitting
+
+You can also enable `--enable-dsa-cache-layer-split` on one server that handles
+both prefill and decode (`--disaggregation-mode null`). This mode requires:
+
+- A GLM-5.2 DSA checkpoint with the SM100 layout described above.
+- `--kv-cache-dtype nvfp4` and `--page-size 64`.
+- Interleave prefill CP, with TP=CP greater than one.
+- DP=1, attention DP=1, DCP=1, and PP=1.
+- `flashmla_sparse` prefill and `flashmla_kv` decode.
+- Unpooled index keys (`index_kpool=1` in the model configuration).
+
+Unified layer splitting does not support FP8 KV, CP decode attention TP, or
+two-batch overlap. Prefill runs eagerly. Decode and EAGLE target verification
+can use CUDA Graphs. EAGLE/MTP draft workers keep their complete cache.
+
+The target pool stores only the layers owned by each CP rank. During eager
+CP prefill, it transfers the physical cache pages needed by the full batch,
+including cached prefixes. A shared prefix page is transferred once per layer.
+The remote scratch buffers retain their full capacity. During decode and target
+verification, each layer owner computes attention and broadcasts its result.
+These transfers add work; measure their effect on your workload.
+
+The following example uses one Linux host with eight NVIDIA SM100 GPUs. Use a
+GLM-5.2 checkpoint that includes the native MTP weights. Set `KV_TOKEN_CAPACITY`
+to a multiple of 64 that fits your per-GPU KV budget. The next section explains
+how to choose separate capacities for layer splitting ON and OFF.
+Use an SGLang source revision with unified NVFP4 layer splitting and a matching
+`sgl-kernel` build with the SM100 FlashMLA NVFP4 operator.
+
+```bash Unified NVFP4 layer split
+export MODEL_PATH="/path/to/GLM-5.2-checkpoint"
+export KV_TOKEN_CAPACITY="${KV_TOKEN_CAPACITY:?set the budgeted KV token capacity}"
+
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --trust-remote-code \
+    --disaggregation-mode null \
+    --tp-size 8 --dp-size 1 --attn-dp-size 1 \
+    --enable-prefill-cp --cp-strategy interleave --attn-cp-size 8 \
+    --enable-dsa-cache-layer-split \
+    --attention-backend dsa --kv-cache-dtype nvfp4 --page-size 64 \
+    --dsa-prefill-backend flashmla_sparse --dsa-decode-backend flashmla_kv \
+    --chunked-prefill-size 16384 --max-prefill-tokens 16384 \
+    --max-total-tokens "$KV_TOKEN_CAPACITY" --mem-fraction-static 0.85 \
+    --max-running-requests 1024 \
+    --cuda-graph-backend-prefill disabled --cuda-graph-backend-decode full \
+    --cuda-graph-max-bs-decode 256 \
+    --speculative-algorithm EAGLE --speculative-num-steps 5 \
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 6
+```
+
+The checkpoint's weight format does not select the KV format. Keep
+`--kv-cache-dtype nvfp4` explicit. This unified configuration uses the same
+server endpoint for both phases and does not need a PD router.
+
+#### Compare ON and OFF with the same KV byte budget
+
+Use the same hardware, source revision, checkpoint, calibration, attention
+backends, and EAGLE settings. Keep prefill CP enabled in both configurations.
+For OFF, remove only `--enable-dsa-cache-layer-split` from the feature settings.
+Choose the KV token capacity and client concurrency separately for each mode.
+
+1. Set one KV allocation ceiling in bytes for each GPU. Include target KV and
+   indexer buffers, remote scratch, all global scales, and the complete draft
+   pool. Also include `prefill_main_staging_bytes`,
+   `prefill_index_staging_bytes`, and `prefill_page_ids_bytes` for ON.
+2. Select the largest page-aligned `--max-total-tokens` that stays within that
+   ceiling on every rank. Check the startup `DSA NVFP4 pool bytes` JSON records.
+   Sum `total_bytes` for the target and draft pools on each GPU. Layer ownership
+   can be uneven, so check every rank. The same `--mem-fraction-static` value
+   alone does not establish an equal KV byte budget.
+3. Keep the long-context request set, input/output lengths, prefix reuse,
+   context limit, scheduler limits, and graph settings fixed. Sweep client
+   concurrency independently. ON can use a higher client concurrency to use
+   its additional token capacity. Increase concurrency until the KV budget is
+   used or the agreed latency limit is reached.
+4. Record actual running requests, waiting requests, active KV occupancy,
+   prefix-cache hits, and retractions. Client concurrency includes queued work;
+   it does not measure the number of resident requests.
+5. Compare completed-request throughput against TTFT, TPOT, and end-to-end
+   latency at the same latency limit. Save errors, timeouts, run duration,
+   launch commands, allocation records, and versions. Repeat candidate points
+   before reporting a throughput or latency improvement.
+
+For token capacity `T` and page size 64, ON allocates `T / 64 + 1` page-ID
+entries, including the reserved page. Its two staging buffers each hold at most
+`min(1024, T / 64 + 1)` pages. Their combined size is
+`min(1024, T / 64 + 1) * 64 * (416 + 132)` bytes. Page IDs use another
+`(T / 64 + 1) * 8` bytes. The 416-byte main row is already packed; do not halve
+it again for FP4. Keep these buffers separate from the full-capacity remote
+scratch buffers when calculating the budget.
+
+An equal-concurrency test measures the transfer cost at that offered load.
+The independent concurrency sweeps also test whether the extra capacity changes
+throughput at an acceptable latency. Neither test guarantees an improvement.
+
+#### PD layer splitting with NVFP4
+
+On NVIDIA SM100, `--enable-dsa-cache-layer-split` can shard the NVFP4 main cache
+and the DSA indexer cache across the Prefill CP ranks. Each rank stores its owned
+layers and one remote-layer scratch buffer. Per-layer FP32 global scales remain
+replicated. The main cache uses 416 bytes per token per stored layer. The indexer
+uses 132 bytes per token per stored layer. Include both scratch buffers when
+measuring memory savings.
+
+In PD mode, layer splitting requires a Prefill worker, interleave CP, Mooncake transfer,
+and PP=1. The Decode worker receives the complete cache and uses attention DP.
+EAGLE/MTP draft workers retain their complete cache. Use the same checkpoint and
+per-layer scale calibration on both sides. The model's weight format does not
+select the KV cache format; set `--kv-cache-dtype nvfp4` explicitly on both sides.
+
+The following Linux/CUDA example targets one eight-GPU B300 node. Set
+`MODEL_PATH` to a GLM-5.2 checkpoint in both terminals. Start Prefill on GPUs 0–3:
+
+```bash Prefill
+python3 -m sglang.launch_server \
+    --model-path "${MODEL_PATH:?set MODEL_PATH to the GLM-5.2 checkpoint}" \
+    --port 30001 --nccl-port 29501 \
+    --disaggregation-mode prefill \
+    --disaggregation-bootstrap-port 8998 \
+    --disaggregation-transfer-backend mooncake \
+    --tp-size 4 --dp-size 1 --base-gpu-id 0 \
+    --enable-prefill-cp --cp-strategy interleave --attn-cp-size 4 \
+    --enable-dsa-cache-layer-split \
+    --attention-backend dsa --kv-cache-dtype nvfp4 --page-size 64 \
+    --dsa-prefill-backend flashmla_sparse --dsa-decode-backend flashmla_kv \
+    --chunked-prefill-size 4096 --max-prefill-tokens 4096 \
+    --max-total-tokens 131072 --mem-fraction-static 0.85 \
+    --speculative-algorithm EAGLE --speculative-num-steps 5 \
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 6
+```
+
+Start Decode on GPUs 4–7:
+
+```bash Decode
+python3 -m sglang.launch_server \
+    --model-path "${MODEL_PATH:?set MODEL_PATH to the GLM-5.2 checkpoint}" \
+    --port 30002 --nccl-port 29502 \
+    --disaggregation-mode decode \
+    --disaggregation-bootstrap-port 8998 \
+    --disaggregation-transfer-backend mooncake \
+    --tp-size 4 --dp-size 4 --enable-dp-attention --base-gpu-id 4 \
+    --attention-backend dsa --kv-cache-dtype nvfp4 --page-size 64 \
+    --dsa-prefill-backend flashmla_sparse --dsa-decode-backend flashmla_kv \
+    --max-total-tokens 131072 --mem-fraction-static 0.85 \
+    --speculative-algorithm EAGLE --speculative-num-steps 5 \
+    --speculative-eagle-topk 1 --speculative-num-draft-tokens 6
+```
+
+Connect both workers through the PD router described in
+[PD Disaggregation](/docs/advanced_features/pd_disaggregation).
+Prefill CP still communicates BF16 K/RoPE rows. Layer splitting reduces stored
+cache capacity per rank; measure throughput and latency separately.
+
+For acceptance, first run the local codec and layer-broadcast tests. Then run
+the full GSM8K comparison from the repository root. Do not insert a separate
+generation smoke test between these steps:
+
+```bash Full acceptance
+python3 scripts/bench_glm52_nvfp4_layersplit.py \
+    --model-path "${MODEL_PATH:?set MODEL_PATH to the GLM-5.2 checkpoint}" \
+    --max-total-tokens 131072 \
+    --output-dir "${RESULT_DIR:?set RESULT_DIR to a new results directory}"
+```
+
+OCI GB300 exposes four GPUs per Slurm segment. Use two segments for the same
+P4/D4 comparison. Run the following command inside an eight-GPU allocation.
+Both segments must use the same source, ARM64 kernel build, model, and container:
+
+```bash Two-segment GB300 acceptance
+export SGLANG_ACCEPTANCE_NODES
+SGLANG_ACCEPTANCE_NODES=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | paste -sd, -)
+srun --nodes=2 --ntasks=2 --ntasks-per-node=1 \
+    python3 scripts/bench_glm52_nvfp4_layersplit_slurm.py \
+    --model-path "${MODEL_PATH:?set MODEL_PATH to the shared GLM-5.2 checkpoint}" \
+    --max-total-tokens 131072 \
+    --output-dir "${RESULT_DIR:?set RESULT_DIR to a new shared results directory}"
+```
+
+If the nodes do not load `nvidia-peermem`, set `WITH_NVIDIA_PEERMEM=0` to use
+DMA-BUF for Mooncake GPU memory registration. Set `MC_GID_INDEX` to a routable
+RoCE v2 GID. If automatic topology discovery selects a management NIC, use
+`MC_CUSTOM_TOPO_JSON` to select the data NICs. Apply the same settings on both
+segments and save them with the results.
+
+The first segment runs Prefill and the evaluation client. The second runs
+Decode. Each server uses local GPUs 0–3. Run the local kernel and broadcast tests
+before this command. The runner uses health checks before the full evaluation.
+It does not send generation smoke requests. Its performance comparison applies
+to the recorded GB300 topology.
+
+Add `--performance-only` to the two-segment runner to defer dataset accuracy
+evaluation. This mode samples ShareGPT token sequences with a fixed seed. It
+repeats or truncates each sequence to the required length. It measures 8192 input
+tokens and 512 output tokens at concurrency 32 and 200. It also measures 32768
+input tokens and 512 output tokens at concurrency 8. Each workload runs three
+times per configuration. Generation warmup requests are disabled. The results
+include throughput, TTFT, TPOT, and the actual Prefill pool allocation. This
+mode reports performance changes without applying the GSM8K accuracy or
+performance gates below.
+
+The runner uses 1319 questions, 20 shots, 200 client threads, and at most 512
+output tokens per question. The 20 demonstrations come from the training split.
+All 1319 test questions remain in the evaluation. The prepared dataset and its
+SHA-256 hash are saved with the results.
+Each configuration runs three times. All runs must
+score at least 93.5%. The median output throughput must reach at least 95% of
+the replicated-cache baseline. Median total evaluation time must stay within
+105% of that baseline. The runner also checks the per-rank cache allocation
+records. It writes versions, launch arguments, server logs, and `results.json`.
+These performance gates apply only to this GSM8K workload.
+
 ### Scaling Factors
 
 FP8 quantization requires scaling factors to properly quantize and dequantize the KV cache.
@@ -131,7 +410,11 @@ If scaling factors are not provided and not found in the checkpoint, it will def
 </Warning>
 
 <Tip>
-**FP4 (MXFP4)**: Unlike FP8, FP4 quantization handles scaling factors automatically on-the-fly during quantization and dequantization. No pre-quantized models or external scaling factor files are required—the block-based scaling factors are computed dynamically as needed.
+**FP4 block scales** are computed dynamically during cache writes. The
+GLM-5.2 DSA NVFP4 path additionally applies a persistent per-layer global K
+scale. SGLang loads that scale from the model's attention layer when present
+and otherwise uses `1.0`; calibrated checkpoint scales are recommended for
+accuracy.
 </Tip>
 
 ## Performance Considerations

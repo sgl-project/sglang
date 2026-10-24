@@ -1223,6 +1223,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
+        local_cache: bool = False,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
@@ -1252,7 +1253,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
+        pool = get_token_to_kv_pool()
+        kv_cache_fp8 = (
+            pool.get_owned_index_buffer(layer_id)
+            if local_cache
+            else self._get_index_k_read_buffer(pool, layer_id)
+        )
 
         blocksize = page_size
         if (
@@ -1356,26 +1362,32 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     max_len,
                     clean_logits=clean_logits,
                 )
-            logits_chunks = []
+            # Keep only one chunk alive beside the output. Retaining all chunks
+            # for torch.cat doubles the dense logits allocation at long context.
+            logits = torch.empty(
+                (batch_size * chunk_next_n, max_len),
+                dtype=torch.float32,
+                device=q.device,
+            )
             for start in range(0, batch_size, self.sm_count):
                 end = min(start + self.sm_count, batch_size)
                 chunk_context_lens = context_lens[start:end]
                 chunk_schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
                     chunk_context_lens, blocksize, self.sm_count
                 )
-                logits_chunks.append(
-                    resolve_fp8_paged_mqa_logits_fn()(
-                        q[start:end],
-                        kv_cache,
-                        w[start * chunk_next_n : end * chunk_next_n],
-                        chunk_context_lens,
-                        block_table[start:end],
-                        chunk_schedule_metadata,
-                        max_len,
-                        clean_logits=clean_logits,
-                    )
+                chunk_logits = resolve_fp8_paged_mqa_logits_fn()(
+                    q[start:end],
+                    kv_cache,
+                    w[start * chunk_next_n : end * chunk_next_n],
+                    chunk_context_lens,
+                    block_table[start:end],
+                    chunk_schedule_metadata,
+                    max_len,
+                    clean_logits=clean_logits,
                 )
-            return torch.cat(logits_chunks, dim=0)
+                logits[start * chunk_next_n : end * chunk_next_n].copy_(chunk_logits)
+                del chunk_logits
+            return logits
 
         if self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
@@ -1537,6 +1549,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             topk_result = torch.full(
                 (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
             )
+        pool = get_token_to_kv_pool()
+        if getattr(pool, "prefill_page_plan_active", False):
+            # The owner has stored the globally gathered keys before this call.
+            # Transfer before any rank-local consumer can skip its work.
+            pool.index_key_cache.prepare_prefill_buffer(layer_id)
         if batch_size == 0:
             return topk_result
 
@@ -1911,6 +1928,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
+        _layer_owner_only: bool = False,
     ) -> Optional[torch.Tensor]:
         # A padded eager IDLE rank has no real requests and therefore no valid
         # DSA page-table rows to index. Return invalid rows with the physical DP
@@ -1926,6 +1944,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
+
+        pool = get_token_to_kv_pool()
+        if (
+            not _layer_owner_only
+            and getattr(pool, "unified_decode", False)
+            and pool.use_owner_compute(forward_batch.forward_mode)
+        ):
+            x_meta = x[0] if isinstance(x, tuple) else x
+            result = pool.run_on_layer_owner(
+                layer_id,
+                lambda: self.forward_cuda(
+                    x,
+                    q_lora,
+                    positions,
+                    forward_batch,
+                    layer_id,
+                    return_indices,
+                    _layer_owner_only=True,
+                ),
+                shape=(x_meta.shape[0], self.index_topk) if return_indices else None,
+                dtype=torch.int32,
+                device=x_meta.device,
+            )
+            return maybe_capture_indexer_topk(layer_id, result)
 
         if _is_hip and not _is_gfx1250_supported:
             from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
@@ -1976,6 +2018,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 metadata,
                 return_indices,
             )
+            if _layer_owner_only:
+                return topk_result
             topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
             return maybe_capture_indexer_topk(layer_id, topk_result)
 
@@ -2209,6 +2253,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         dtype=torch.int,
                         device=x_meta.device,
                     )
+                    if _layer_owner_only:
+                        return topk_result
                     topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
                     return maybe_capture_indexer_topk(layer_id, topk_result)
 
@@ -2218,7 +2264,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
+                    forward_batch,
+                    layer_id,
+                    q_fp8,
+                    weights,
+                    metadata,
+                    local_cache=_layer_owner_only,
                 )
             else:
                 # In-graph (PCG/BCG) non-CP prefill is handled earlier by the
@@ -2238,5 +2289,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
         else:
             raise NotImplementedError("DSA indexer only supports CUDA, HIP, and NPU")
+        if _layer_owner_only:
+            # CP peers wait for the owner-result broadcast in forward_cuda.
+            # Do not enter the optional attention-TP rank-zero collective here.
+            return topk_result
         topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
         return maybe_capture_indexer_topk(layer_id, topk_result)

@@ -51,6 +51,43 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _validate_unified_dsa_cache_layer_split(server_args: Any, model_arch: str) -> None:
+    """Keep owner-compute decode inside one replicated attention CP group."""
+    cfg = resolving_view(server_args)
+    if model_arch != "GlmMoeDsaForCausalLM" or cfg.kv_cache_dtype != "nvfp4":
+        raise ValueError(
+            "Non-PD --enable-dsa-cache-layer-split currently requires "
+            "GLM DSA with --kv-cache-dtype nvfp4."
+        )
+    if (
+        cfg.attn_cp_size <= 1
+        or cfg.tp_size != cfg.attn_cp_size
+        or cfg.dp_size != 1
+        or cfg.attn_dp_size != 1
+        or cfg.dcp_size != 1
+        or cfg.pp_size != 1
+    ):
+        raise ValueError(
+            "Non-PD --enable-dsa-cache-layer-split requires TP=CP>1, "
+            "DP=1, attention DP=1, DCP=1 and PP=1 so each CP rank "
+            "processes the same decode batch with all query heads."
+        )
+    if cfg.enable_cp_decode_attn_tp or cfg.enable_two_batch_overlap:
+        raise ValueError(
+            "Non-PD --enable-dsa-cache-layer-split does not support "
+            "CP decode attention TP or two-batch overlap."
+        )
+    if (
+        cfg.dsa_prefill_backend != "flashmla_sparse"
+        or cfg.dsa_decode_backend != "flashmla_kv"
+    ):
+        raise ValueError(
+            "Non-PD --enable-dsa-cache-layer-split requires "
+            "--dsa-prefill-backend flashmla_sparse and "
+            "--dsa-decode-backend flashmla_kv."
+        )
+
+
 def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_two_batch_overlap:
@@ -373,11 +410,7 @@ def handle_model_specific_adjustments(server_args: Any):
                         "optimization; decode receives full cache shards "
                         "through PD transfer."
                     )
-                raise ValueError(
-                    "--enable-dsa-cache-layer-split is only supported on PD "
-                    "prefill workers. Non-PD workers also run decode and "
-                    "require ordinary local decode cache semantics."
-                )
+                _validate_unified_dsa_cache_layer_split(server_args, model_arch)
             if cfg.enable_dsa_cache_layer_split and (
                 not cfg.enable_prefill_cp or cfg.cp_strategy != "interleave"
             ):
@@ -385,11 +418,12 @@ def handle_model_specific_adjustments(server_args: Any):
                     "--enable-dsa-cache-layer-split requires "
                     "--enable-prefill-cp and --cp-strategy interleave."
                 )
-            # Layer split relies on the mooncake all-CP-rank KV/indexer
+            # PD layer split relies on the mooncake all-CP-rank KV/indexer
             # transfer path. mori/nixl support is a temporary limitation
             # and will be added later by the community.
             if (
                 cfg.enable_dsa_cache_layer_split
+                and cfg.disaggregation_mode == "prefill"
                 and cfg.disaggregation_transfer_backend != "mooncake"
             ):
                 raise ValueError(
