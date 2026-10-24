@@ -2033,6 +2033,10 @@ class Req(ReqDllmMixin):
         if self.to_finish:
             self.finished_reason = self.to_finish
             self.to_finish = None
+            # An abort can arrive during a speculative step that commits a run
+            # past the output budget. Keep the abort reason, but hide the excess.
+            if len(self.output_ids) > self.sampling_params.max_new_tokens:
+                self.finished_len = self.sampling_params.max_new_tokens
             return
 
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
