@@ -6,8 +6,9 @@ use std::collections::HashMap;
 
 use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
 use dynamo_renderer::RenderedPrompt;
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use super::models::{normalize_json_schema_types, pydantic_bool};
 use super::{
     ChatFormatter, TemplateArgsRequest, TemplateError, requested_effort, requested_thinking,
 };
@@ -17,6 +18,7 @@ use super::{
 pub struct TemplateArgs {
     kwargs: HashMap<String, Value>,
     continuing: bool,
+    tools: Option<Value>,
 }
 
 impl TemplateArgs {
@@ -44,6 +46,7 @@ impl TemplateArgs {
         Self {
             kwargs,
             continuing: body["continue_final_message"] == true,
+            tools: jinja_tools(body),
         }
     }
 }
@@ -63,15 +66,60 @@ impl ChatFormatter {
             _ => last_assistant_message(request, args.continuing),
         }
         .unzip();
-        let args = args.kwargs.clone();
+        let jinja = matches!(
+            self,
+            ChatFormatter::HuggingFace { .. }
+                | ChatFormatter::Glm53(_)
+                | ChatFormatter::Qwen38 { .. }
+        );
         let request = TemplateArgsRequest {
             request,
-            args,
+            args: args.kwargs.clone(),
             messages,
+            tools: jinja.then(|| args.tools.clone()),
         };
         let prompt = self.render_prompt(&request)?;
         Ok((prompt, continuation.unwrap_or_default()))
     }
+}
+
+/// The tools Python's Jinja path hands the template: the request's (only the
+/// named one under a named `tool_choice`, none under `"none"`), as `Tool.model_dump()`.
+fn jinja_tools(body: &Value) -> Option<Value> {
+    let tools = body["tools"].as_array()?;
+    let named = match &body["tool_choice"] {
+        Value::String(choice) if choice == "none" => return None,
+        choice => choice["function"]["name"].as_str(),
+    };
+    let tools: Vec<Value> = tools
+        .iter()
+        .filter(|tool| named.is_none_or(|name| tool["function"]["name"] == name))
+        .map(tool_model_dump)
+        .collect();
+    (!tools.is_empty()).then_some(Value::Array(tools))
+}
+
+/// `Tool.model_dump()`, after `_validate_request` normalizes the schema types.
+fn tool_model_dump(tool: &Value) -> Value {
+    let flag = |value: &Value| pydantic_bool(value).ok();
+    let f = &tool["function"];
+    let mut parameters = f["parameters"].clone();
+    normalize_json_schema_types(&mut parameters);
+    let mut function = json!({
+        "description": f["description"],
+        "name": f["name"],
+        "parameters": parameters,
+        "strict": flag(&f["strict"]).unwrap_or(false),
+    });
+    // `Tool._propagate_defer_loading`; `Function` drops an unset flag.
+    if let Some(defer) = flag(&f["defer_loading"]).or_else(|| flag(&tool["defer_loading"])) {
+        function["defer_loading"] = defer.into();
+    }
+    let kind = tool
+        .get("type")
+        .cloned()
+        .unwrap_or_else(|| "function".into());
+    json!({"type": kind, "function": function, "defer_loading": flag(&tool["defer_loading"])})
 }
 
 /// Python's `_handle_last_assistant_message`: a trailing assistant message's text
@@ -152,6 +200,16 @@ mod tests {
             json!([{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]);
         let (prompt, _) = render(&formatter, json!({"messages": messages}), &none);
         assert_eq!(prompt, "<user>Hi<user><assistant>");
+    }
+
+    /// A Jinja template sees the tools as Python's `Tool.model_dump()`, not as sent.
+    #[test]
+    fn jinja_template_sees_dumped_tools() {
+        let formatter = jinja("{{ tools | tojson }}");
+        let tool = json!({"type": "function", "function": {"name": "f", "parameters": {}}});
+        let body = json!({"messages": [{"role": "user", "content": "Hi"}], "tools": [tool]});
+        let dumped = r#"[{"type": "function", "function": {"description": null, "name": "f", "parameters": {}, "strict": false}, "defer_loading": null}]"#;
+        assert_eq!(render(&formatter, body, &HashMap::new()).0, dumped);
     }
 
     /// Kimi K3's template fallback, like SGLang's K3 encoder, splits a trailing
