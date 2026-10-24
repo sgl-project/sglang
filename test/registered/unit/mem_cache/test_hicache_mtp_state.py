@@ -8,6 +8,7 @@ import pytest
 from sglang.srt.configs import model_config as model_config_module
 from sglang.srt.configs.inkling import InklingMMConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     resolve_layer_indices,
 )
@@ -124,6 +125,66 @@ def test_separate_state_requires_compatible_slot_ownership(monkeypatch, missing_
     )
     with pytest.raises(AssertionError, match="target Mamba slot|separate state"):
         spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+
+def _dsa_draft_worker(monkeypatch, *, nextn_layers, dcp_replicated, dcp_size=4):
+    monkeypatch.setattr(
+        spec, "get_parallel", lambda: SimpleNamespace(attn_dcp_size=dcp_size)
+    )
+    worker, _, runners = _worker(
+        monkeypatch,
+        SimpleNamespace(num_nextn_predict_layers=nextn_layers),
+        None,
+        (None,),
+    )
+    monkeypatch.setattr(
+        spec,
+        "get_memory",
+        lambda: SimpleNamespace(
+            enable_hierarchical_cache=True, enable_unified_cache_external_linker=False
+        ),
+    )
+    pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
+    pool.dcp_replicated = dcp_replicated
+    runners[0].token_to_kv_pool = pool
+    return worker
+
+
+@pytest.mark.parametrize(
+    "nextn_layers, dcp_replicated, error",
+    [
+        (1, True, "replicated across the DCP group"),
+        (0, False, "DCP-sharded"),
+    ],
+)
+def test_dcp_rejects_a_dsa_draft_layout_the_plan_would_misread(
+    monkeypatch, nextn_layers, dcp_replicated, error
+):
+    worker = _dsa_draft_worker(
+        monkeypatch, nextn_layers=nextn_layers, dcp_replicated=dcp_replicated
+    )
+    with pytest.raises(NotImplementedError, match=error):
+        spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+
+@pytest.mark.parametrize(
+    "nextn_layers, dcp_replicated, dcp_size, mode",
+    [
+        (1, False, 4, spec.HiCacheDraftMode.PACKED),
+        (0, True, 4, spec.HiCacheDraftMode.SIDECAR),
+        (1, True, 1, spec.HiCacheDraftMode.PACKED),
+    ],
+)
+def test_dsa_draft_layout_matching_the_plan_is_kept(
+    monkeypatch, nextn_layers, dcp_replicated, dcp_size, mode
+):
+    worker = _dsa_draft_worker(
+        monkeypatch,
+        nextn_layers=nextn_layers,
+        dcp_replicated=dcp_replicated,
+        dcp_size=dcp_size,
+    )
+    assert spec.BaseSpecWorker._build_hicache_draft_plan(worker).mode == mode
 
 
 if __name__ == "__main__":

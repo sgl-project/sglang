@@ -193,8 +193,10 @@ class DSAIndexerPoolHost(HostKVCache):
         self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
 
         self.indexer_dtype = storage_info.dtype
-        self.size = anchor_host.size
-        self.page_num = anchor_host.page_num
+        # Under DCP the device index-K spans every rank's slots, so its host
+        # mirror pages the widened transfer indices untranslated.
+        self.size = anchor_host.logical_size
+        self.page_num = anchor_host.page_num * anchor_host.dcp_size
 
         # uint8 storage, so element counts below are byte counts
         self.indexer_page_stride_size = storage_info.page_bytes(self.page_size)
