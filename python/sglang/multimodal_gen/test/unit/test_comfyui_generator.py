@@ -449,3 +449,104 @@ def test_get_model_info_reads_the_card_from_v1_models(monkeypatch) -> None:
     client = server_api.SGLDiffusionServerAPI(base_url="http://host:30010/v1")
     assert client.get_model_info() == card
     assert urls == ["http://host:30010/v1/models"]
+
+
+class _FakeResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self.body
+
+    def iter_content(self, chunk_size):
+        yield self.body
+
+
+@pytest.mark.parametrize("final", ["completed", "failed"])
+def test_generate_mesh_uploads_set_options_and_waits(
+    monkeypatch, tmp_path, final
+) -> None:
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import server_api
+
+    sent, polls = {}, []
+
+    def fake_post(url, data, files, headers, timeout):
+        sent.update(data, image=files["image"][1].read())
+        return _FakeResponse({"id": "m1"})
+
+    def fake_get(url, headers=None, timeout=None):
+        polls.append(url)
+        status = final if len(polls) == 2 else "queued"
+        return _FakeResponse({"status": status, "error": {"message": "no GPU"}})
+
+    monkeypatch.setattr(server_api.requests, "post", fake_post)
+    monkeypatch.setattr(server_api.requests, "get", fake_get)
+    image = tmp_path / "in.png"
+    image.write_bytes(b"png")
+    client = server_api.SGLDiffusionServerAPI(base_url="http://host/v1")
+
+    def run():
+        # -1 / 0 are the node's "unset" values and must not reach the server.
+        return client.generate_mesh(
+            str(image),
+            "obj",
+            seed=7,
+            num_inference_steps=0,
+            guidance_scale=-1.0,
+            poll_interval=0,
+        )
+
+    if final == "failed":
+        with pytest.raises(RuntimeError, match="no GPU"):
+            run()
+    else:
+        assert run()["status"] == "completed"
+    assert sent == {"output_format": "obj", "seed": 7, "image": b"png"}
+    assert polls == ["http://host/v1/meshes/m1"] * 2
+
+
+def test_fetch_mesh_sources_and_server_value_sanitizing(monkeypatch, tmp_path) -> None:
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core import server_api
+
+    seen = []
+
+    def fake_get(url, headers=None, stream=False, timeout=None):
+        seen.append((url, headers.get("Authorization")))
+        return _FakeResponse(b"glb")
+
+    monkeypatch.setattr(server_api.requests, "get", fake_get)
+    client = server_api.SGLDiffusionServerAPI(base_url="http://host/v1")
+    dest = str(tmp_path / "out" / "m.glb")
+    secret = tmp_path / "secret.glb"
+    secret.write_bytes(b"secret")
+
+    # A file_path outside the server roots is ignored and /content is used.
+    client.fetch_mesh(
+        {"id": "m1", "file_path": str(secret)}, dest, [str(tmp_path / "srv")]
+    )
+    # A cloud url never gets the API key.
+    client.fetch_mesh({"id": "m1", "url": "https://cdn/m1.glb"}, dest)
+    assert seen == [
+        ("http://host/v1/meshes/m1/content", "Bearer sk-proj-1234567890"),
+        ("https://cdn/m1.glb", None),
+    ]
+    assert open(dest, "rb").read() == b"glb"
+    # A file_path inside the server roots is copied without a request.
+    client.fetch_mesh({"id": "m1", "file_path": str(secret)}, dest, [str(tmp_path)])
+    assert open(dest, "rb").read() == b"secret" and len(seen) == 2
+    with pytest.raises(RuntimeError, match="Refusing"):
+        client.fetch_mesh({"id": "m1", "url": "http://evil/m.glb"}, dest)
+
+    path = server_api.mesh_dest_path(str(tmp_path), {"id": "../../x"}, "glb")
+    assert path == str(tmp_path / "sgld_x.glb")
+    with pytest.raises(RuntimeError, match="format"):
+        server_api.mesh_dest_path(str(tmp_path), {"id": "m1", "format": "sh"}, "glb")

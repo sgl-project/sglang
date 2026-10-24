@@ -108,6 +108,27 @@ def test_chained_lora_nodes_keep_every_lora() -> None:
     assert set(second.patches) == {"style", "detail"}
 
 
+def test_mesh_node_returns_file_3d_and_removes_its_temp_image(
+    monkeypatch, tmp_path
+) -> None:
+    """The node's output must be what ComfyUI's Preview 3D accepts."""
+    types_ = pytest.importorskip("comfy_api.latest").Types
+    nodes = _load_nodes()
+    for name in ("get_output_directory", "get_temp_directory"):
+        monkeypatch.setattr(
+            nodes.folder_paths, name, lambda: str(tmp_path), raising=False
+        )
+    client = mock.Mock()
+    client.generate_mesh.return_value = {"id": "m1", "format": "glb"}
+    client.fetch_mesh.side_effect = lambda job, dest, local_roots: dest
+    model, path = nodes.SGLDiffusionGenerateMesh().generate_mesh(
+        client, torch.rand(2, 8, 8, 3)
+    )
+    assert isinstance(model, types_.File3D)
+    assert path == str(tmp_path / "mesh" / "sgld_m1.glb")
+    assert not os.path.exists(client.generate_mesh.call_args.kwargs["image_path"])
+
+
 class _TupleLinear(torch.nn.Linear):
     def forward(self, x):
         return super().forward(x), None

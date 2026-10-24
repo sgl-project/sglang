@@ -16,6 +16,7 @@ import folder_paths
 import torch
 
 from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
+from .core.server_api import mesh_dest_path
 from .options import SGLDOptions
 
 
@@ -659,6 +660,102 @@ class SGLDiffusionGenerateVideo:
         return (video, video_path, revised_prompt)
 
 
+class SGLDiffusionGenerateMesh:
+    """Node to generate a 3D mesh (GLB / OBJ) from an image on an SGLang Diffusion server."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "sgld_client": ("SGLD_CLIENT",),
+                "image": ("IMAGE",),
+            },
+            "optional": {
+                "output_format": (["glb", "obj"], {"default": "glb"}),
+                "seed": (
+                    "INT",
+                    {
+                        "default": -1,
+                        "min": -1,
+                        "max": 2**31 - 1,
+                        "tooltip": "-1 lets the server pick",
+                    },
+                ),
+                "steps": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 200,
+                        "tooltip": "0 keeps the server default",
+                    },
+                ),
+                "guidance_scale": (
+                    "FLOAT",
+                    {
+                        "default": -1.0,
+                        "min": -1.0,
+                        "max": 30.0,
+                        "step": 0.1,
+                        "tooltip": "-1 keeps the server default. Texturing is "
+                        "set when the server is launched, not here.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("FILE_3D", "STRING")
+    RETURN_NAMES = ("model_3d", "file_path")
+    FUNCTION = "generate_mesh"
+    CATEGORY = "SGLDiffusion"
+
+    def generate_mesh(
+        self,
+        sgld_client: SGLDiffusionServerAPI,
+        image: torch.Tensor,
+        output_format: str = "glb",
+        seed: int = -1,
+        steps: int = 0,
+        guidance_scale: float = -1.0,
+    ):
+        """Generate a mesh from the first image of the batch."""
+        image_path = get_image_path(image[:1])
+        try:
+            job = sgld_client.generate_mesh(
+                image_path=image_path,
+                output_format=output_format,
+                seed=seed,
+                num_inference_steps=steps,
+                guidance_scale=guidance_scale,
+            )
+            roots = os.environ.get("SGLD_SERVER_OUTPUT_DIRS", "")
+            mesh_path = sgld_client.fetch_mesh(
+                job,
+                mesh_dest_path(
+                    os.path.join(folder_paths.get_output_directory(), "mesh"),
+                    job,
+                    output_format,
+                ),
+                local_roots=[r for r in roots.split(os.pathsep) if r],
+            )
+        finally:
+            # get_image_path wrote this PNG for this request only.
+            try:
+                os.remove(image_path)
+            except OSError:
+                pass
+        return (_as_file_3d(mesh_path), mesh_path)
+
+
+def _as_file_3d(path: str):
+    """ComfyUI's File3D when this ComfyUI has it; the "file_path" output covers older ones."""
+    try:
+        from comfy_api.latest import Types
+    except ImportError:
+        return path
+    return Types.File3D(path)
+
+
 class SGLDiffusionGenerateH3:
     """Node to generate joint video and audio with MiniMax-H3.
 
@@ -1069,6 +1166,7 @@ NODE_CLASS_MAPPINGS = {
     "SGLDiffusionServerModel": SGLDiffusionServerModel,
     "SGLDiffusionGenerateImage": SGLDiffusionGenerateImage,
     "SGLDiffusionGenerateVideo": SGLDiffusionGenerateVideo,
+    "SGLDiffusionGenerateMesh": SGLDiffusionGenerateMesh,
     "SGLDiffusionGenerateH3": SGLDiffusionGenerateH3,
     "SGLDiffusionServerSetLora": SGLDiffusionServerSetLora,
     "SGLDiffusionServerUnsetLora": SGLDiffusionServerUnsetLora,
@@ -1082,6 +1180,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDiffusionServerModel": "SGLDiffusion Server Model",
     "SGLDiffusionGenerateImage": "SGLDiffusion Generate Image",
     "SGLDiffusionGenerateVideo": "SGLDiffusion Generate Video",
+    "SGLDiffusionGenerateMesh": "SGLDiffusion Generate Mesh (Image to 3D)",
     "SGLDiffusionGenerateH3": "SGLDiffusion Generate MiniMax-H3",
     "SGLDiffusionServerSetLora": "SGLDiffusion Server Set LoRA",
     "SGLDiffusionServerUnsetLora": "SGLDiffusion Server Unset LoRA",

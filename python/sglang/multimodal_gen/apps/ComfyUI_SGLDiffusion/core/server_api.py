@@ -7,16 +7,48 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
+from urllib.parse import urlparse
 
 import requests
+
+MESH_FORMATS = ("glb", "obj", "ply", "usdz")
+MAX_MESH_BYTES = 2 << 30  # 2 GiB
+MESH_DOWNLOAD_DEADLINE_S = 600
 
 # Server-supplied names used to build a local path for a downloaded video.
 _SAFE_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]+")
 _VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".mkv")
 _MAX_VIDEO_BYTES = 2 * 1024**3
 _DOWNLOAD_DEADLINE_S = 600
+
+
+def _safe_job_id(job_id: Any) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(job_id or ""))
+    if not safe:
+        raise RuntimeError(f"Server returned an invalid job id: {job_id!r}")
+    return safe
+
+
+def _is_within(path: str, root: str) -> bool:
+    path, root = os.path.realpath(path), os.path.realpath(root)
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def mesh_dest_path(output_dir: str, job: Dict[str, Any], fallback_format: str) -> str:
+    """Local path for a mesh job, built only from sanitized server values."""
+    fmt = str(job.get("format") or fallback_format).lower()
+    if fmt not in MESH_FORMATS:
+        raise RuntimeError(f"Server returned an unsupported mesh format: {fmt!r}")
+    dest = os.path.join(output_dir, f"sgld_{_safe_job_id(job.get('id'))}.{fmt}")
+    if not _is_within(dest, output_dir):
+        raise RuntimeError(f"Mesh path escapes the output directory: {dest}")
+    return dest
 
 
 class SGLDiffusionServerAPI:
@@ -441,6 +473,141 @@ class SGLDiffusionServerAPI:
             return self._localize_video_result(status, video_id, output_path)
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
+
+    def generate_mesh(
+        self,
+        image_path: str,
+        output_format: str = "glb",
+        seed: Optional[int] = None,
+        num_inference_steps: Optional[int] = None,
+        guidance_scale: Optional[float] = None,
+        poll_interval: float = 3.0,
+        max_wait_time: float = 1800.0,
+    ) -> Dict[str, Any]:
+        """Generate a mesh from an image (POST /v1/meshes) and wait for the job.
+
+        Texturing is decided by how the server was launched, not per request.
+        Returns the completed job dict.
+        """
+        form: Dict[str, Any] = {"output_format": output_format}
+        if seed is not None and seed >= 0:
+            form["seed"] = seed
+        if num_inference_steps:
+            form["num_inference_steps"] = num_inference_steps
+        if guidance_scale is not None and guidance_scale >= 0:
+            form["guidance_scale"] = guidance_scale
+
+        # multipart upload: the shared headers pin Content-Type to JSON
+        headers = {"Authorization": self.headers["Authorization"]}
+        try:
+            with open(image_path, "rb") as image_file:
+                response = requests.post(
+                    f"{self.base_url}/meshes",
+                    data=form,
+                    files={
+                        "image": (
+                            os.path.basename(image_path),
+                            image_file,
+                            self._get_content_type(image_path),
+                        )
+                    },
+                    headers=headers,
+                    timeout=60,
+                )
+            response.raise_for_status()
+            return self._wait_for_job(
+                "meshes", response.json()["id"], poll_interval, max_wait_time
+            )
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Failed to generate mesh: {str(e)}")
+
+    def _wait_for_job(
+        self, collection: str, job_id: str, poll_interval: float, max_wait_time: float
+    ) -> Dict[str, Any]:
+        max_consecutive_errors = 5
+        consecutive_errors = 0
+        start_time = time.time()
+        while time.time() - start_time < max_wait_time:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/{collection}/{job_id}",
+                    headers=self.headers,
+                    timeout=30,
+                )
+                response.raise_for_status()
+                status = response.json()
+                consecutive_errors = 0
+                if status.get("status") == "completed":
+                    return status
+                if status.get("status") == "failed":
+                    error = status.get("error") or {}
+                    raise RuntimeError(
+                        f"Generation failed: {error.get('message', 'Unknown error')}"
+                    )
+            except requests.exceptions.RequestException as e:
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    raise RuntimeError(
+                        f"Lost the server after {consecutive_errors} consecutive "
+                        f"errors: {str(e)}"
+                    )
+            time.sleep(poll_interval)
+        raise TimeoutError(f"Generation timed out after {max_wait_time} seconds")
+
+    def fetch_mesh(
+        self,
+        job: Dict[str, Any],
+        dest_path: str,
+        local_roots: Optional[Sequence[str]] = None,
+    ) -> str:
+        """Put a completed mesh job's file at dest_path and return it.
+
+        The server's file_path is only copied when it resolves inside one of
+        local_roots (the server's output dirs, shared with this host); any other
+        path the server names is ignored so it cannot make us read arbitrary
+        local files. Otherwise the file is downloaded from the cloud url (only
+        https or the server's own host, without the API key) or from the
+        server's /content endpoint.
+        """
+        os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+        local_path = job.get("file_path")
+        if (
+            local_path
+            and local_roots
+            and any(_is_within(local_path, root) for root in local_roots)
+            and os.path.isfile(local_path)
+        ):
+            shutil.copyfile(local_path, dest_path)
+            return dest_path
+        if job.get("url"):
+            url, headers = job["url"], {}
+            parsed = urlparse(url)
+            same_host = parsed.netloc == urlparse(self.base_url).netloc
+            if parsed.scheme not in ("http", "https") or not (
+                parsed.scheme == "https" or same_host
+            ):
+                raise RuntimeError(f"Refusing to download mesh from {url!r}")
+        else:
+            url = f"{self.base_url}/meshes/{_safe_job_id(job.get('id'))}/content"
+            headers = {"Authorization": self.headers["Authorization"]}
+        deadline = time.monotonic() + MESH_DOWNLOAD_DEADLINE_S
+        try:
+            with requests.get(url, headers=headers, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                size = 0
+                with open(dest_path, "wb") as out:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        size += len(chunk)
+                        if size > MAX_MESH_BYTES:
+                            raise RuntimeError("Mesh download exceeds 2 GiB")
+                        if time.monotonic() > deadline:
+                            raise RuntimeError("Mesh download timed out")
+                        out.write(chunk)
+        except (requests.exceptions.RequestException, RuntimeError) as e:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+            raise RuntimeError(f"Failed to download mesh: {str(e)}")
+        return dest_path
 
     def _localize_video_result(
         self, status: Dict[str, Any], video_id: str, output_path: Optional[str]
