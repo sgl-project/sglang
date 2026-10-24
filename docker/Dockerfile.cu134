@@ -389,11 +389,18 @@ FROM base AS cu134_wheels_pypi
 ARG SGL_KERNEL_VERSION
 ARG SGL_DEEP_GEMM_VERSION
 ARG SGL_DEEP_EP_VERSION
+ARG TORCH_VERSION
+# Released wheels pin the stable torch they were built against; fail here, not in pip resolution.
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip download --only-binary=:all: --no-deps -d /wheels \
         "sglang-kernel==${SGL_KERNEL_VERSION}" \
         "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" \
-        "sgl-deep-ep==${SGL_DEEP_EP_VERSION}"
+        "sgl-deep-ep==${SGL_DEEP_EP_VERSION}" \
+    && python3 -c 'import glob, os, re, sys, zipfile; \
+want = os.environ["TORCH_VERSION"].split("+")[0]; \
+metadata = {os.path.basename(w): z.read(n).decode() for w in sorted(glob.glob("/wheels/*.whl")) for z in [zipfile.ZipFile(w)] for n in z.namelist() if n.endswith(".dist-info/METADATA")}; \
+bad = {w: p for w, text in metadata.items() for p in re.findall(r"^Requires-Dist: torch\s*\(?==\s*([^\s;,)]+)", text, re.M) if p.split("+")[0] != want}; \
+bad and sys.exit(f"released wheels pin torch {bad} but TORCH_VERSION={want}; set TORCH_INDEX_URL, TORCH_VERSION, TORCHVISION_VERSION and TORCHAUDIO_VERSION to the matching stable wheels")'
 
 FROM cu134_wheels_${SGL_WHEELS_SOURCE} AS cu134_wheels
 
