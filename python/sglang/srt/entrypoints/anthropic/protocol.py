@@ -211,6 +211,14 @@ def _tool_discriminator(v) -> str:
         t = getattr(v, "type", None)
     if not t or t == "custom":
         return "custom"
+    if not isinstance(t, str):
+        # A non-string tag (list, bool, int, ...) is a client error. Returning
+        # a tag here is the only way to surface it as a pydantic
+        # ValidationError (``tools.N.type: Input should be 'custom'``) that
+        # FastAPI maps to the Anthropic 400 envelope. Raising from a
+        # discriminator escapes validation as a bare exception and the
+        # client gets a plain-text HTTP 500 (NVBug 6917691).
+        return "custom"
     if t.startswith("web_search_"):
         return "web_search"
     if t.startswith("computer_"):
