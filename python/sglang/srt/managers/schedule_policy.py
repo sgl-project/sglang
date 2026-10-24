@@ -1108,12 +1108,13 @@ class PrefillAdder:
                 return req
             if self.kv_shard_granule:
                 # Align the absolute boundary to keep pages within one scratch region.
-                # If no budget remains, use a full chunk to make progress.
                 prefix_len = req.prefix_len
                 floored = (
                     prefix_len + _rem_tokens
                 ) // self.kv_shard_granule * self.kv_shard_granule - prefix_len
-                _rem_tokens = floored if floored > 0 else self.rem_chunk_tokens
+                if floored <= 0:
+                    return req
+                _rem_tokens = floored
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1175,6 +1176,10 @@ class PrefillAdder:
             request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
         )
+        if truncated:
+            self.memory_budget.reserve_unfinished_chunk(
+                cand_extend_input_len - new_len
+            )
 
         # Return if chunked prefill not finished
         return req if truncated else None

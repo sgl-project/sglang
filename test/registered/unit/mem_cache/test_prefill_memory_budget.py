@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget, SWAPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
@@ -371,6 +371,29 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         self.assertTrue(evict_from_tree_cache(cache, 8))
         self.assertIsNotNone(allocator.alloc(8))
         self.assertFalse(allocator.verify_byte_accounting())
+
+
+class TestSinglePoolPrefillBudget(unittest.TestCase):
+    def _budget(self, *, available_size: int, total_offset: int = 0):
+        allocator = object.__new__(TokenToKVPoolAllocator)
+        allocator.page_size = 4
+        allocator.available_size = lambda: available_size
+        cache = SimpleNamespace(
+            evictable_size=lambda: 0,
+            full_evictable_size=lambda: 0,
+            supports_mamba=lambda: False,
+        )
+        budget = PrefillBudget(allocator, cache)
+        budget.total_offset = total_offset
+        return budget
+
+    def test_exhausted_total_uses_real_current_capacity(self):
+        budget = self._budget(available_size=4096, total_offset=6000)
+        self.assertEqual(budget.available_chunk_tokens(8192), 4092)
+
+    def test_no_real_capacity_defers_instead_of_forcing_a_chunk(self):
+        budget = self._budget(available_size=0, total_offset=100)
+        self.assertIsNone(budget.available_chunk_tokens(8192))
 
 
 if __name__ == "__main__":

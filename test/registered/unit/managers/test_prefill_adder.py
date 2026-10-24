@@ -1900,6 +1900,43 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual((req.prefix_len, req.extend_end), (0, 200))
         self.assertIn(req, adder.can_run_list)
 
+    def test_exhausted_single_pool_continuation_uses_real_capacity(self):
+        running = self.create_mock_req(
+            "running-decode", priority=0, max_new_tokens=6000
+        )
+        self.mock_token_allocator.available_size.return_value = 4096
+        adder = self.create_adder(
+            self.create_running_batch([running]),
+            page_size=64,
+            rem_chunk_tokens=8192,
+        )
+        req = self._create_delayer_req(10_000)
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIs(result, req)
+        self.assertEqual(req.extend_len, 4032)
+        self.assertIn(req, adder.can_run_list)
+        self.assertLess(adder.memory_budget.remaining_total, 0)
+
+    def test_no_single_pool_capacity_defers_continuation(self):
+        running = self.create_mock_req(
+            "running-decode", priority=0, max_new_tokens=6000
+        )
+        self.mock_token_allocator.available_size.return_value = 0
+        adder = self.create_adder(
+            self.create_running_batch([running]),
+            page_size=64,
+            rem_chunk_tokens=8192,
+        )
+        req = self._create_delayer_req(10_000)
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIs(result, req)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(req.extend_end)
+
     def _adder_with_extend_lens(self, extend_lens):
         adder = PrefillAdder.__new__(PrefillAdder)
         adder.can_run_list = [
