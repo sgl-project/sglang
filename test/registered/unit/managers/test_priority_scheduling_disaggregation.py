@@ -205,6 +205,7 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         req = SimpleNamespace(
             rid="req",
             get_fill_ids=lambda: [1, 2, 3, 4],
+            get_cacheable_fill_ids=lambda: [1, 2, 3, 4],
             kv=SimpleNamespace(
                 req_pool_idx=1,
                 cache_protected_len=2,

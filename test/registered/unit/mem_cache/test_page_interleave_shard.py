@@ -63,6 +63,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     _release_nccl_window_buffer,
     allocate_symmetric_buffer,
 )
+from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
@@ -1117,10 +1118,11 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
             UnifiedRadixCache(params)  # no raise: sharding is off
 
 
-class _GraftReq:
+class _GraftReq(ReqDllmMixin):
     """Minimal Req stand-in for checkpoint."""
 
     def __init__(self, fill_ids, req_pool_idx=0):
+        self.dllm_incomplete_ids = array("q")
         self.fill_ids = list(fill_ids)
         self.origin_input_ids = array("q", fill_ids)
         self.full_untruncated_fill_ids = self.origin_input_ids

@@ -1160,7 +1160,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished()
-        token_ids = req.full_untruncated_fill_ids[:up_to]
+        # Excludes a dLLM request's in-flight denoise block (see ReqDllmMixin).
+        cache_len = req.cacheable_checkpoint_len(up_to)
+        token_ids = req.full_untruncated_fill_ids[:cache_len]
 
         if self.disable:
             if is_finished:
@@ -1330,7 +1332,7 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
         assert not self.supports_mamba()
-        token_ids = req.get_fill_ids()
+        token_ids = req.get_cacheable_fill_ids()
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             priority=req.priority or 0,

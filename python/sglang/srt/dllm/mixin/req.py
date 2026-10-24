@@ -43,6 +43,33 @@ class ReqDllmMixin:
             DllmReqPhase.INCOMING_PREFILL,
         ]
 
+    def get_cacheable_fill_ids(self: Req) -> array:
+        """The fill ids a prefix cache may take ownership of.
+
+        A dLLM request's in-flight denoise block is rewritten in full on every
+        step (``dllm_incomplete_ids`` is reassigned in the scheduler mixin), so
+        its token ids are not final. Because the dLLM page size is pinned to the
+        block size, that block is a whole trailing page of the radix key: caching
+        it makes the next step's key diverge there, which drives the match below
+        ``cache_protected_len`` and leaves the tree owning two nodes for the same
+        pages. Only the settled prefix is cacheable; the block is inserted on a
+        later step, once it resolves and moves into the committed fill ids.
+        """
+        fill_ids = self.get_fill_ids()
+        if self.dllm_incomplete_ids:
+            return fill_ids[: len(fill_ids) - len(self.dllm_incomplete_ids)]
+        return fill_ids
+
+    def cacheable_checkpoint_len(self: Req, up_to: int) -> int:
+        """Clamp a checkpoint length so the in-flight denoise block stays out.
+
+        The block is the tail of ``[:extend_end]``, so the cacheable part ends
+        where the block starts (see ``get_cacheable_fill_ids``).
+        """
+        if self.dllm_incomplete_ids:
+            return min(up_to, self.extend_end - len(self.dllm_incomplete_ids))
+        return up_to
+
     def determine_dllm_phase(self: Req):
         if self.dllm_incomplete_ids:
             self.dllm_phase = DllmReqPhase.STAGING_DECODE

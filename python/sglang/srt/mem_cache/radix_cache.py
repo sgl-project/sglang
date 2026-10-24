@@ -510,7 +510,9 @@ class RadixCache(BasePrefixCache):
     def checkpoint(self, req: Req, *, up_to: int):
         if self.disable:
             return
-        token_ids = req.full_untruncated_fill_ids[:up_to]
+        # Excludes a dLLM request's in-flight denoise block (see ReqDllmMixin).
+        cache_len = req.cacheable_checkpoint_len(up_to)
+        token_ids = req.full_untruncated_fill_ids[:cache_len]
         # Pure-SWA trees never cache what the window already evicted.
         swa_evict_floor = req.kv.swa_evict_floor
         key_limit = (

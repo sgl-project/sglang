@@ -42,6 +42,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCacheTransferMixin,
     DecodePrefixMatch,
 )
+from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
@@ -83,12 +84,17 @@ def _make_cache_with_pools(page_size=1):
     return cache, req_to_token
 
 
-class MockReq:
-    """Minimal mock Req with fields needed by checkpoint / release_kv_cache."""
+class MockReq(ReqDllmMixin):
+    """Minimal mock Req with fields needed by checkpoint / release_kv_cache.
+
+    Inherits ReqDllmMixin for the same reason Req does: the prefix caches call
+    cacheable_checkpoint_len(), which the mixin supplies.
+    """
 
     def __init__(
         self, fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None, lock=None
     ):
+        self.dllm_incomplete_ids = array("q")
         self.full_untruncated_fill_ids = array("q", fill_ids)
         self.extend_end = len(self.full_untruncated_fill_ids)
         self.origin_input_ids = array(
