@@ -596,6 +596,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.served_model_name = get_serving().served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
+        self.model_supports_input_embeds: Optional[bool] = None
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
@@ -670,6 +671,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             raise ValueError(
                 "--mm-feature-transport=cuda_vmm is not supported by model class "
                 f"{model_class.__name__}"
+            )
+
+    def _validate_input_embeds_support(self) -> None:
+        # Resolved on the first input_embeds request, so servers that never
+        # receive one don't import the model class in this process.
+        if self.model_supports_input_embeds is None:
+            from sglang.srt.model_loader.utils import supports_input_embeds
+
+            self.model_supports_input_embeds = supports_input_embeds(self.model_config)
+        if not self.model_supports_input_embeds:
+            raise ValueError(
+                "input_embeds is not supported by this model's architecture "
+                f"({', '.join(self.model_config.hf_config.architectures)}). "
+                "Send text or input_ids instead."
             )
 
     def init_ipc_channels(self, port_args: PortArgs):
@@ -1122,6 +1137,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
         if obj.input_embeds is not None:
+            self._validate_input_embeds_support()
             if not get_memory().disable_radix_cache:
                 raise ValueError(
                     "input_embeds is provided while disable_radix_cache is False. "
