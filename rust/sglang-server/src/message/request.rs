@@ -19,6 +19,7 @@ use crate::message::ids::Rid;
 use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_i64, error::Error};
 use sglang_api_types::api::v1 as api_v1;
+use sglang_processor::dynamo_renderer::RenderedPrompt;
 
 /// Hard cap on how many scheduler requests one `/generate` HTTP call may expand
 /// into. Every column below is allocated per item before anything is dispatched,
@@ -426,10 +427,8 @@ pub fn into_requests(
             GenerateRequest {
                 rid,
                 text,
+                chat_prompt: None,
                 input_ids,
-                // Plain text prompts keep the post-processor specials; the
-                // chat flow sets this explicitly.
-                skip_special_tokens: false,
                 sampling_params,
                 // The decoded request no longer shows which keys the client sent;
                 // the adapter marks this from the body it received.
@@ -538,10 +537,44 @@ pub enum RequestKind {
     /// Walks the same FSM to `Queued`, then the tokenizer pool answers it
     /// through the request's own sink with one `TokenIds` payload. It never
     /// reaches a detok shard, so it is not registered with one.
-    Tokenize {
+    Tokenize(TokenizeInput),
+}
+
+#[derive(Debug)]
+pub enum TokenizeInput {
+    Text {
         text: String,
         add_special_tokens: bool,
     },
+    Chat(Box<RenderedChat>),
+}
+
+/// A rendered chat prompt and the `continue_final_message` text after it.
+#[derive(Debug, Clone)]
+pub struct RenderedChat {
+    pub prompt: RenderedPrompt,
+    pub continuation: String,
+}
+
+impl RenderedChat {
+    /// Python's chat encode, through the processor's tokenizer.
+    pub fn encode(
+        &self,
+        tokenizer: &dyn sglang_processor::TextTokenizer,
+    ) -> Result<Vec<i32>, sglang_processor::ProcessorError> {
+        let segments = self.prompt.encode_segments().unwrap_or_else(|| {
+            vec![sglang_processor::dynamo_tokenizers::EncodeSegment::new(
+                self.prompt.as_str(),
+                true,
+            )]
+        });
+        tokenizer.encode_chat(&segments, &self.continuation)
+    }
+
+    #[cfg(test)]
+    pub fn into_text(self) -> String {
+        self.prompt.into_text() + &self.continuation
+    }
 }
 
 /// A single in-flight generation request (one item after adapter fan-out),
@@ -567,14 +600,10 @@ pub struct GenerateRequest {
     /// detok sink, which is now unrepresentable.
     pub rid: Rid,
     pub text: Option<String>,
+    /// A rendered chat prompt the Tokenizer stage encodes in place of `text`.
+    pub chat_prompt: Option<Box<RenderedChat>>,
     /// Client-supplied token ids, or filled by the Tokenizer stage.
     pub input_ids: Option<TokenIds>,
-    /// Template-rendered prompts (chat) already contain their role/special
-    /// tokens, so the tokenizer pool strips the auto-added BOS/EOS prefix —
-    /// the Rust analogue of Python's `add_special_tokens=False` at the
-    /// chat-template encode site (`serving_chat._encode_messages`). Consumed
-    /// by the pool before the header is built; never reaches the scheduler wire.
-    pub skip_special_tokens: bool,
     /// Sampling params (defaults when the client sent none, as in Python);
     /// normalized + verified, then serialized into the header.
     pub sampling_params: SamplingParams,
@@ -816,6 +845,18 @@ impl<T: HeapBytes> HeapBytes for Option<T> {
 /// element) both mean "not set".
 fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
     column.into_iter().map(Option::flatten).collect()
+}
+
+/// Reject `n` copies of one prompt (chat's `n` choices) before they are
+/// cloned: the batch cap and clone budget a `/generate` list is held to.
+pub(crate) fn check_prompt_copies(per_clone: usize, n: usize) -> Result<(), Error> {
+    if batch_size_exceeds_limit(n, *MAX_BATCH_REQS_PER_HTTP_REQ) {
+        return Err(Error::Validation(format!(
+            "batch size {n} exceeds the maximum of {}",
+            *MAX_BATCH_REQS_PER_HTTP_REQ
+        )));
+    }
+    check_broadcast_budget(per_clone, n, "input_ids")
 }
 
 /// Reject a broadcast whose clones would exceed [`MAX_BROADCAST_CLONE_BYTES`].

@@ -17,6 +17,7 @@ mod loader;
 mod models;
 mod reasoning;
 mod selection;
+mod template;
 mod thinking;
 
 use self::legacy::LegacyFormatter;
@@ -29,6 +30,7 @@ use self::models::{
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
+pub use self::template::TemplateArgs;
 pub use self::thinking::ThinkingTemplates;
 
 /// Legacy stop strings: a single separator-style stop or a list of stops.
@@ -166,9 +168,17 @@ impl ChatFormatter {
                 content_parts,
                 ..
             } => render_qwen38(formatter, *content_parts, request, default_kwargs).map(text),
-            _ => Err("this formatter renders through render_prompt".into()),
+            _ => Err(format!(
+                "this formatter's requests render {RENDER_FALLBACK_SUFFIX}"
+            )),
         }
-        .map_err(|message| TemplateError::Renderer { message })
+        .map_err(|message| {
+            if message.ends_with(RENDER_FALLBACK_SUFFIX) {
+                TemplateError::NeedsRenderFallback { message }
+            } else {
+                TemplateError::Renderer { message }
+            }
+        })
     }
 
     /// The template's stop strings — Python `Conversation.stop_str`
@@ -295,6 +305,10 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
     }
 }
 
+/// How a parity renderer ends the message refusing a valid request, which
+/// [`ChatFormatter::render_request`] maps to [`TemplateError::NeedsRenderFallback`].
+const RENDER_FALLBACK_SUFFIX: &str = "on the engine";
+
 #[derive(Debug, Error)]
 pub enum TemplateError {
     #[error("failed to read {kind} `{path}`: {source}")]
@@ -336,6 +350,11 @@ pub enum TemplateError {
 
     #[error("invalid chat template: {message}")]
     Renderer { message: String },
+
+    /// A valid request [`ChatFormatter::render_request`] cannot render exactly as
+    /// SGLang does; the host should render it another way, not reject it.
+    #[error("{message}")]
+    NeedsRenderFallback { message: String },
 
     #[error("legacy chat template `{path}` must be a JSON object")]
     LegacyNotObject { path: PathBuf },
