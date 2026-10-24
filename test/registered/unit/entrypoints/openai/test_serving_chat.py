@@ -2600,6 +2600,20 @@ class ServingChatTestCase(CustomTestCase):
             self.assertEqual(tool_calls[1].id, "functions.get_weather:2")
             self.assertEqual(tool_calls[1].function.name, "get_weather")
 
+    def test_kimi_k3_tool_call_id_unique_when_history_count_repeats(self):
+        # Regression: history-count K3 ids repeated when a client sent a shorter
+        # history (context compaction); dedup-by-id clients dropped the call.
+        self.chat.tool_call_parser = "kimi_k3"
+        call_item = Mock()
+        call_item.name = "Bash"
+        call_item.tool_index = 0
+
+        first = self.chat._process_tool_call_id(call_item, history_tool_calls_cnt=3)
+        second = self.chat._process_tool_call_id(call_item, history_tool_calls_cnt=3)
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("call_"))
+
     def test_non_streaming_tool_call_index_is_the_call_ordinal(self):
         """Two calls to one tool are numbered 0 and 1, as in the streaming deltas,
         not by the detector's tool_index (0 for both)."""
