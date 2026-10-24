@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     ErrorResponse,
+    PromptTokensDetails,
     SglExt,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
@@ -398,6 +399,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
+                        cached_tokens=(
+                            PromptTokensDetails(
+                                cached_tokens=cached_tokens.get(index, 0)
+                            )
+                            if get_serving().enable_cache_report
+                            else None
+                        ),
                     )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
