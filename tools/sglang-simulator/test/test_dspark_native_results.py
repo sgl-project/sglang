@@ -16,6 +16,7 @@ def test_native_result_next_input_and_cpu_reserve_use_native_sglang_types():
     run_python(
         """
 from types import SimpleNamespace as NS
+from dataclasses import replace
 from unittest.mock import patch
 import torch
 from sglang_simulator.simulation.sglang.hook_bootstrap import install_simulator_hooks
@@ -40,6 +41,17 @@ assert result.block_accept_lens is None and result.cap_lens is None
 assert result.new_seq_lens.tolist() == [514]
 assert result.next_draft_input.new_seq_lens.tolist() == [514]
 assert result.next_draft_input.bonus_tokens.tolist() == [1]
+# Native Q6 commits can cross the visible output limit. Keep the full result
+# and KV progression; the actual scheduler owns finished_len/output exposure.
+tail_request = replace(r, output_tokens_before=19)
+tail_step = replace(s, groups=(replace(g, requests=(tail_request,)),))
+tail_prediction = DSparkStepResult(tail_step, t, DSparkProgress(0, (('a', 6),), 'CPU fixture'))
+tail_result = NativeDSparkResults(1).build(batch=NS(seq_lens=torch.tensor([512])), prediction=tail_prediction)
+assert tail_request.remaining_output_tokens == 1
+assert tail_result.accept_lens.tolist() == [6]
+assert tail_result.new_seq_lens.tolist() == [518]
+assert tail_result.next_draft_input.new_seq_lens.tolist() == [518]
+assert tail_result.next_token_ids.tolist() == [1] * 6
 pool = ReqToTokenPool(1, 32, 'cpu', False)
 pool.write((1, slice(0,4)), torch.tensor([1,2,3,4], dtype=torch.int32))
 req = NS(kv=NS(kv_committed_len=4, kv_allocated_len=4), decode_batch_idx=0, sampling_params=NS(top_k=100))

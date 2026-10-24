@@ -149,13 +149,16 @@ def test_no_unvalidated_condition_or_changed_recipe_fallback(artifact):
         )
 
 
-def test_live_tail_uses_before_work_output_budget(artifact):
+def test_live_tail_preserves_native_commit_label_for_scheduler_finish_clipping(
+    artifact,
+):
     recipe, profile, _, _, _, load = artifact
     model = load()
     s = before(recipe, profile)
     request = replace(s.requests[0], output_tokens_before=19)
     s = replace(s, groups=(replace(s.groups[0], requests=(request,)),))
-    assert model.predict_progress(s).committed_tokens == (("a", 1),)
+    assert request.remaining_output_tokens == 1
+    assert model.predict_progress(s).committed_tokens[0][1] in {2, 4}
 
 
 def test_missing_recipe_fields_and_current_outcome_inputs_are_rejected(artifact):

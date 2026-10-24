@@ -1,7 +1,7 @@
 """Causal DSPark simulation inputs, progress and staged worker timing.
 
 The scheduler supplies the actual local batches. A cost adapter owns measured
-phase costs and a separate progress model owns committed output counts. Neither
+phase costs and a separate progress model owns native committed counts. Neither
 acceptance observations from the current call nor a speculative speedup are
 accepted as execution inputs. This module imports no SGLang or device runtime.
 """
@@ -257,7 +257,9 @@ class DSparkStepTiming:
 @dataclass(frozen=True)
 class DSparkProgress:
     forward_id: int
-    # Ordered (request ID, committed output count), never current measured counts.
+    # Ordered native (request ID, commit count), never current measured counts.
+    # The native scheduler owns visible output/finish clipping. A verify commit
+    # may cross the output budget and still advances KV by its full count.
     committed_tokens: tuple[tuple[str, int], ...]
     model_ref: str
 
@@ -281,10 +283,8 @@ class DSparkProgress:
             )
             if not request.emits_output and count != 0:
                 _fail("an intermediate prefill chunk cannot emit output")
-            if count > min(request.extend_len, request.remaining_output_tokens):
-                _fail(
-                    "DSPark progress exceeds executed work or remaining output budget"
-                )
+            if count > request.extend_len:
+                _fail("DSPark progress exceeds executed work")
         return self
 
 

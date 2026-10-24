@@ -151,14 +151,14 @@ def test_progress_rejects_invalid_or_unexecuted_commit_lengths(count):
     assert run.history_for("a") == CommittedHistory(512, 0, 512)
 
 
-def test_tail_budget_is_before_work_and_progress_must_respect_it():
+def test_tail_native_commit_advances_full_kv_before_scheduler_output_clipping():
     r = replace(request(), output_tokens_before=19)
     before = step(requests=(r,))
-    with pytest.raises(PredictorError, match="remaining output budget"):
-        session(before).execute(before)
-    progress = Progress()
-    progress.count = 1
-    session(before, progress=progress).execute(before)
+    run = session(before)
+    result = run.execute(before)
+    assert r.remaining_output_tokens == 1
+    assert result.progress.committed_tokens == (("a", 2),)
+    assert run.history_for("a") == CommittedHistory(514, 0, 514)
 
 
 def test_unknown_draft_gap_cannot_be_bridged_by_commit():

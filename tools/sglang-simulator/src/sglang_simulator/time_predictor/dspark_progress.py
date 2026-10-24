@@ -387,9 +387,10 @@ class EmpiricalDSparkProgress:
                 if choice < 0:
                     selected = count
                     break
-            predictions.append(
-                (request.rid, min(selected, request.remaining_output_tokens))
-            )
+            # The retained labels are native commit_lens, not visible output
+            # counts. Native Q6 can cross max_new_tokens; SGLang's scheduler
+            # updates KV with the full commit and owns the finish boundary.
+            predictions.append((request.rid, selected))
         return DSparkProgress(
             step.forward_id, tuple(predictions), self.model_ref
         ).validate_for(step)

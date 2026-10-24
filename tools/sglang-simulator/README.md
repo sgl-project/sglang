@@ -96,8 +96,10 @@ fits conditional count distributions from training trajectories only, keyed by
 explicit prefix/history bins and the full recipe digest. Distinct heldout
 trajectories provide visible mean/distribution errors. Native observation IDs
 and trajectories cannot overlap splits; unsupported recipes/layouts/conditions
-have no fallback. Deterministic sampling reads only before-work and clips to
-the remaining output budget. Neither loading nor heldout support is an accuracy
+have no fallback. Deterministic sampling reads only before-work and preserves
+the native verify commit count, including commits crossing the remaining output
+budget. SGLang's native scheduler owns visible output and finish clipping; KV
+advances by the full native commit. Neither loading nor heldout support is an accuracy
 admission; causal-history evidence still requires its separate source review.
 
 Actual multi-DP scheduling/heterogeneous coordination, complete measured worker
