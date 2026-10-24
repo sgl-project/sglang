@@ -1,9 +1,10 @@
 # flash_mla
-# DeepSeek v4.1 kernels, 528 B/token caches read as V4.1 by default (sgl-project/FlashMLA@3620b63).
+# DeepSeek v4.1 kernels, 528 B/token caches read as V4.1 by default.
+# Optional sparse-prefill statistics (sgl-project/FlashMLA#17).
 FetchContent_Declare(
     repo-flashmla
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/3620b63fc4ebe33950c50e1b7701b6607f44150e.tar.gz
-    URL_HASH SHA256=7d7f9819bc1b121ef8226281de7265cd97be0cbe15d6450575fc8e3f241041a2
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/17599170dd1ea200af4c45fa18ec98831c496b29.tar.gz
+    URL_HASH SHA256=cb4cc23de6b007f293db93f05dae92e345f05e6677cb252d2ade9b2c56e71f73
 )
 FetchContent_Populate(repo-flashmla)
 

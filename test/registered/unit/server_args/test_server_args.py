@@ -4725,7 +4725,9 @@ class TestDcpCommBackendDefault(CustomTestCase):
     def test_no_dcp_is_ag_rs(self):
         self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
 
-    @override_platform(is_npu=True, is_cuda=False, is_hip=False, is_xpu=False)
+    @override_platform(
+        is_npu=True, is_cuda=False, is_hip=False, is_xpu=False, is_sm100=False
+    )
     def test_a5_npu_supports_dcp(self):
         self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
 

@@ -374,6 +374,65 @@ def _make_q8kv8_kernel_args(
     }
 
 
+@pytest.mark.parametrize("is_xpu", [False, True])
+def test_sparse_prefill_preserves_platform_flashmla_signature(monkeypatch, is_xpu):
+    """Check caller arguments without launching kernels or requiring hardware."""
+    q_flat, workspace, indices, lengths, sink, output = (object() for _ in range(6))
+    calls = []
+
+    def legacy_prefill(q, kv, indices, sm_scale, d_v, attn_sink, topk_length):
+        calls.append((q, kv, indices, sm_scale, d_v, attn_sink, topk_length))
+        return output, None, None
+
+    def native_prefill(*, return_log2_lse=True, **kwargs):
+        assert return_log2_lse is False
+        calls.append("native")
+        return legacy_prefill(**kwargs)
+
+    package = types.ModuleType("sgl_kernel")
+    package.flash_mla_sparse_fwd = legacy_prefill
+    package.flash_mla = types.ModuleType("sgl_kernel.flash_mla")
+    package.flash_mla.flash_mla_sparse_fwd = native_prefill
+    monkeypatch.setitem(sys.modules, "sgl_kernel", package)
+    monkeypatch.setitem(sys.modules, "sgl_kernel.flash_mla", package.flash_mla)
+    backend_module = sys.modules[DeepseekV4AttnBackend.__module__]
+    monkeypatch.setattr(backend_module, "_is_xpu", is_xpu)
+    monkeypatch.setattr(
+        backend_module, "dequantize_k_cache_paged_dsv4", lambda *args, **kwargs: None
+    )
+
+    backend = DeepseekV4AttnBackend.__new__(DeepseekV4AttnBackend)
+    backend.forward_metadata = SimpleNamespace(
+        sparse_prefill_cache=SimpleNamespace(
+            swa_token_ids=SimpleNamespace(shape=(2,)),
+            swa_page_size=64,
+            c0_combined_indices=SimpleNamespace(unsqueeze=lambda dim: indices),
+            c0_combined_lens=lengths,
+        )
+    )
+    backend.sparse_prefill_workspace = SimpleNamespace(get=lambda size: workspace)
+    backend.softmax_scale = 0.125
+    backend.head_dim_v = 512
+    pool = SimpleNamespace(
+        get_swa_key_buffer_radix=lambda layer_id: None,
+        get_swa_key_layout=lambda: None,
+    )
+
+    result = backend._forward_prefill_sparse(
+        q=SimpleNamespace(squeeze=lambda dim: q_flat),
+        layer_id=0,
+        compress_ratio=0,
+        forward_batch=None,
+        token_to_kv_pool=pool,
+        core_attn_metadata=None,
+        attn_sink=sink,
+    )
+
+    assert result is output
+    expected = (q_flat, workspace, indices, 0.125, 512, sink, lengths)
+    assert calls == ([expected] if is_xpu else ["native", expected])
+
+
 @contextmanager
 def _patched_sparse_kernels(
     bf16_capture: _Capture,
@@ -388,7 +447,9 @@ def _patched_sparse_kernels(
         d_v,
         attn_sink,
         topk_length,
+        return_log2_lse=True,
     ):
+        assert return_log2_lse is False
         bf16_capture.record(
             q=q,
             kv=kv,
@@ -401,10 +462,7 @@ def _patched_sparse_kernels(
         out = torch.zeros(
             (q.shape[0], q.shape[1], d_v), dtype=torch.bfloat16, device=q.device
         )
-        meta = torch.zeros(
-            (q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device
-        )
-        return out, meta, meta
+        return out, None, None
 
     def fake_sparse_mla_q8kv8_prefill_fwd(
         *,
