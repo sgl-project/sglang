@@ -834,6 +834,7 @@ class MiniMaxM3Attention(nn.Module):
             and self.index_rotary_emb is self.rotary_emb
         )
         self._aiter_cos_sin_cache = None
+        self._aiter_kv_scales = None
         self._can_use_aiter_fused_qknorm_static = (
             self.is_sparse_attention_layer
             and self.disable_index_value
@@ -1079,6 +1080,43 @@ class MiniMaxM3Attention(nn.Module):
         sparse_backend = getattr(attn_backend, "sparse", None)
         return getattr(sparse_backend, "kv_pool", None)
 
+    def _aiter_fused_kv_scales(self):
+        """(kv_cache_dtype, k_scale, v_scale) for an FP8 main cache, or None.
+
+        aiter has two FP8 modes and they are not interchangeable: `fp8_e4m3_unit`
+        fixes the scale at 1.0 and REFUSES scale tensors, while `fp8_e4m3_static`
+        REQUIRES them as 1-element fp32 device tensors; the kernel asserts both
+        contracts (csrc/kernels/fused_qknorm_idxrqknorm.cu). The mode therefore
+        has to be chosen from the pool's actual scales. Assuming unit writes a
+        non-unit per-tensor scale to the cache unscaled.
+
+        Built lazily, not at load time: `k_scale_float` is assigned by the
+        KV-cache quant method's `process_weights_after_loading`, which runs AFTER
+        `load_weights`, so building these alongside the fused projection would
+        capture None for every layer. Allocating is not allowed under graph
+        capture, so a capture arriving before warmup built them falls back rather
+        than allocating; warmup runs eagerly first, so in practice they exist.
+        """
+        k = self.attn.k_scale_float
+        v = self.attn.v_scale_float
+        if (k is None or k == 1.0) and (v is None or v == 1.0):
+            return "fp8_e4m3_unit", None, None
+        scales = self._aiter_kv_scales
+        if scales is None:
+            if get_is_capture_mode():
+                return None
+            device = self.q_norm.weight.device
+            scales = (
+                torch.tensor(
+                    [1.0 if k is None else float(k)], dtype=torch.float32, device=device
+                ),
+                torch.tensor(
+                    [1.0 if v is None else float(v)], dtype=torch.float32, device=device
+                ),
+            )
+            self._aiter_kv_scales = scales
+        return "fp8_e4m3_static", scales[0], scales[1]
+
     def _get_aiter_cos_sin_cache(self, packed_qkv: torch.Tensor) -> torch.Tensor:
         source = self.rotary_emb.cos_sin_cache
         cached = self._aiter_cos_sin_cache
@@ -1169,12 +1207,19 @@ class MiniMaxM3Attention(nn.Module):
             or idx_k_cache.shape[1:] != (1, self.idx_head_dim)
             or k_cache.shape[0] % page_size != 0
             or idx_k_cache.dtype != packed_qkv.dtype
+            # The kernel stores the index cache at a hardcoded unit scale, so a
+            # non-unit index-K scale would be written unscaled and read back wrong.
+            or self.attn.idx_k_scale_float not in (None, 1.0)
         ):
             return None
 
         fp8_e4m3_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        k_scale = v_scale = None
         if k_cache.dtype in fp8_e4m3_dtypes:
-            kv_cache_dtype = "fp8_e4m3_unit"
+            fp8_mode = self._aiter_fused_kv_scales()
+            if fp8_mode is None:
+                return None
+            kv_cache_dtype, k_scale, v_scale = fp8_mode
         elif k_cache.dtype == packed_qkv.dtype:
             kv_cache_dtype = "auto"
         else:
@@ -1221,6 +1266,8 @@ class MiniMaxM3Attention(nn.Module):
             out_cache_loc,
             kv_cache_dtype=kv_cache_dtype,
             index_cache_dtype="auto",
+            k_scale=k_scale,
+            v_scale=v_scale,
             asm_layout=False,
         )
 
