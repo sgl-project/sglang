@@ -1150,6 +1150,14 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "EAGLE / EAGLE3 / NEXTN, not "
                 f"speculative_algorithm={cfg.speculative_algorithm}."
             )
+        if cfg.pp_size > 1:
+            raise ValueError(
+                "--speculative-use-rejection-sampling is not supported with "
+                "pipeline parallelism: the current PP speculative relay does not "
+                "carry the target-vocab draft proposal distribution required for "
+                "rejection sampling. This also applies when "
+                "--speculative-use-block-verification enables rejection sampling."
+            )
         if cfg.speculative_eagle_topk != 1:
             raise ValueError(
                 "--speculative-use-rejection-sampling requires --speculative-eagle-topk=1."
