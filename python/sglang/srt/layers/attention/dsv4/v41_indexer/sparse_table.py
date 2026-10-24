@@ -269,7 +269,7 @@ class SparseTableBackend:
         logits = deep_gemm_fp4_paged_mqa_logits(
             q,
             data.k_cache,
-            data.weights,
+            data.weights.to(torch.bfloat16),
             lens,
             table,
             metadata.deep_gemm_metadata,
@@ -347,7 +347,7 @@ class SparseTableBackend:
             logits = deep_gemm_fp4_paged_mqa_logits(
                 q,
                 data.k_cache,
-                data.weights[rows],
+                data.weights[rows].to(torch.bfloat16),
                 lens,
                 table,
                 plan,
