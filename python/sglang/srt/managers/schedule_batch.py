@@ -3837,13 +3837,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         strip_beam_tail(self)
         if keep_indices is None:
             if isinstance(reqs_to_exclude, Req):
-                reqs_to_exclude = [reqs_to_exclude]
+                reqs_to_exclude_ids = {id(reqs_to_exclude)}
             elif reqs_to_exclude is None:
-                reqs_to_exclude = []
+                reqs_to_exclude_ids = set()
+            else:
+                reqs_to_exclude_ids = {id(req) for req in reqs_to_exclude}
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
-                if not self.reqs[i].finished() and self.reqs[i] not in reqs_to_exclude
+                if not self.reqs[i].finished()
+                and id(self.reqs[i]) not in reqs_to_exclude_ids
             ]
 
         if keep_indices is None or len(keep_indices) == 0:

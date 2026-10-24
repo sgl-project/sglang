@@ -31,6 +31,7 @@ class RankMetadata:
         self.lock = threading.Lock()
         self.num_pages = num_pages
         self.free_pages: List[int] = list(range(num_pages))
+        self.free_pages_set: set[int] = set(self.free_pages)
         self.key_to_index: OrderedDict[str, int] = OrderedDict()
         # Todo: Support multi files for HF3FS
 
@@ -58,6 +59,7 @@ class RankMetadata:
             for i, key, prefix_key in new_keys_to_process:
                 if len(self.free_pages) > 0:
                     page_index = self.free_pages.pop()
+                    self.free_pages_set.discard(page_index)
                 else:
                     page_index = self.key_to_index.popitem(last=False)[1]
 
@@ -77,8 +79,9 @@ class RankMetadata:
                 self.key_to_index.move_to_end(key)
 
             for page_index in pages_to_release:
-                if page_index not in self.free_pages:
+                if page_index not in self.free_pages_set:
                     self.free_pages.append(page_index)
+                    self.free_pages_set.add(page_index)
 
     def delete_keys(self, keys: List[str]) -> int:
         """Delete keys and return count of deleted keys."""
@@ -87,8 +90,9 @@ class RankMetadata:
             for key in keys:
                 if key in self.key_to_index:
                     page_index = self.key_to_index.pop(key)
-                    if page_index not in self.free_pages:
+                    if page_index not in self.free_pages_set:
                         self.free_pages.append(page_index)
+                        self.free_pages_set.add(page_index)
                     count += 1
             return count
 
@@ -96,6 +100,7 @@ class RankMetadata:
         """Clear all metadata."""
         with self.lock:
             self.free_pages = list(range(self.num_pages))
+            self.free_pages_set = set(self.free_pages)
             self.key_to_index.clear()
 
     def get_page_indices(self, keys: List[str]) -> List[Optional[int]]:
@@ -139,6 +144,7 @@ class GlobalMetadataState:
                     num_pages = data["num_pages"]
                     rank_meta = RankMetadata(num_pages)
                     rank_meta.free_pages = data["free_pages"]
+                    rank_meta.free_pages_set = set(rank_meta.free_pages)
                     rank_meta.key_to_index = OrderedDict(data["key_to_index"])
                     self.ranks[key_str] = rank_meta
                 logging.info(
