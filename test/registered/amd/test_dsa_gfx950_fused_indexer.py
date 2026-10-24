@@ -1,8 +1,7 @@
 """Numerical checks for kernels 1 and 4 against torch.mm and the standard
-top-k path respectively.
+top-k path respectively, and for kernel 3's two launch shapes against each other.
 
-Kernel 3 runs here only as the fixture that produces kernel 4's inputs; nothing
-asserts on its logits. Kernel 2 is NOT covered -- it is the kernel that *writes*
+Kernel 3 is otherwise the fixture that produces kernel 4's inputs. Kernel 2 is NOT covered -- it is the kernel that *writes*
 the preshuffled FP8 cache, so testing it means comparing that cache byte for
 byte against indexer_k_quant_and_cache, which this file does not do."""
 
@@ -105,7 +104,9 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
                 self.assertGreater(_snr_db(x.float() @ w_kw.float().t(), kw), 35.0)
 
     # -- node 4 --------------------------------------------------------------
-    def _fused_logits(self, rows: int, ctx: int, pt_width: int = 0):
+    def _fused_logits(
+        self, rows: int, ctx: int, pt_width: int = 0, share_pages: bool = False
+    ):
         """Logits and the paired histogram from node 3, for the node-4 tests.  The cache
         content is synthetic; only node 4's selection is asserted, which is sound
         because both sides of that comparison read the same logits."""
@@ -143,11 +144,12 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
             logits,
             ghist,
             self.loader.LOGITS_BLOCKS_PER_ROW,
+            share_pages,
         )
         torch.cuda.synchronize()
         return logits, ghist, (q_fp8, kv, gate, seqlens, page_table_64, ctx)
 
-    def _assert_matches_standard_path(self, rows, ctx, pt_width=0):
+    def _assert_matches_standard_path(self, rows, ctx, pt_width=0, share_pages=False):
         """Node 4 against the path it replaces, on identical logits.
 
         The reference is sglang's own v2 paged transform -- the one
@@ -163,7 +165,7 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
         )
 
         logits, ghist, (_, _, _, seqlens, page_table_64, _) = self._fused_logits(
-            rows, ctx, pt_width=pt_width
+            rows, ctx, pt_width=pt_width, share_pages=share_pages
         )
         if pt_width:
             self.assertEqual(page_table_64.shape[1], pt_width)
@@ -199,6 +201,12 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
     def test_topk_transform_matches_standard_path(self):
         self._assert_matches_standard_path(rows=8, ctx=8192)
 
+    def test_topk_transform_on_shared_page_logits(self):
+        """Node 4 on the histogram the shared-page logits kernel builds."""
+        self._assert_matches_standard_path(
+            rows=6, ctx=131072, pt_width=16384, share_pages=True
+        )
+
     def test_topk_transform_at_graph_width(self):
         """k_scatter is selected on the page-table width, and GLM-5.2 captures wider
         than the LDS window, so this is the form serving traffic."""
@@ -228,6 +236,106 @@ class TestGfx950FusedIndexerKernels(unittest.TestCase):
         self.assertEqual(
             int(ghist.abs().sum()), 0, "topk_transform left its histogram dirty"
         )
+
+    # -- node 3 --------------------------------------------------------------
+    def _mtp_rows(self, ctxs, pt_width: int):
+        """Rows as MTP verify launches them: 6 per request, one page table per
+        request, seqlens ctx-5 .. ctx.  K is fp8 with an fp32 per-token scale in
+        [2^-8, 2^-6), the layout the cache writer produces."""
+        reqs = len(ctxs)
+        rows = 6 * reqs
+        pages = [(c + PAGE_SIZE - 1) // PAGE_SIZE for c in ctxs]
+        total = sum(pages)
+        kv_u8 = torch.empty(total, PAGE_SIZE * 132, dtype=torch.uint8, device=self.dev)
+        k_bytes = PAGE_SIZE * HEAD_DIM
+        kv_u8[:, :k_bytes] = (
+            (0.7 * torch.randn(total, k_bytes, device=self.dev))
+            .to(FP8)
+            .view(torch.uint8)
+        )
+        scale = torch.exp2(-8 + 2 * torch.rand(total, PAGE_SIZE, device=self.dev))
+        kv_u8[:, k_bytes:] = scale.view(torch.uint8)
+        perm = torch.randperm(total, device=self.dev, dtype=torch.int64).to(torch.int32)
+        page_table = torch.zeros(rows, pt_width, dtype=torch.int32, device=self.dev)
+        seqlens = torch.empty(rows, dtype=torch.int32, device=self.dev)
+        off = 0
+        for i, (c, n) in enumerate(zip(ctxs, pages)):
+            page_table[6 * i : 6 * i + 6, :n] = perm[off : off + n]
+            seqlens[6 * i : 6 * i + 6] = torch.arange(
+                c - 5, c + 1, dtype=torch.int32, device=self.dev
+            )
+            off += n
+        q = (2.0 * torch.randn(rows, N_HEADS, HEAD_DIM, device=self.dev)).to(FP8)
+        gate = torch.rand(rows, N_HEADS, dtype=torch.float32, device=self.dev) * 0.02
+        return q, kv_u8.view(FP8), gate, seqlens, page_table
+
+    def _logits(self, q, kv, gate, seqlens, page_table, share_pages):
+        rows, width = page_table.shape
+        logits = torch.full(
+            (rows, width * PAGE_SIZE),
+            float("nan"),
+            dtype=torch.float32,
+            device=self.dev,
+        )
+        ghist = torch.zeros(
+            rows, self.topk_mod.hist_stride(), dtype=torch.int32, device=self.dev
+        )
+        self.logits_mod.logits_hist(
+            q,
+            kv,
+            gate,
+            seqlens,
+            page_table,
+            logits,
+            ghist,
+            self.loader.LOGITS_BLOCKS_PER_ROW,
+            share_pages,
+        )
+        torch.cuda.synchronize()
+        return logits, ghist
+
+    def test_logits_hist_shared_pages_matches_per_row(self):
+        """The shared-page kernel (share_pages, grids of at most 18 rows) against
+        the per-row kernel on the same rows, bit for bit: logits (NaN-prefilled,
+        so a skipped column shows) and the histogram.  Covers both of its widths,
+        mixed requests and partial grids; with more than 18 rows share_pages must
+        leave the per-row kernel in place."""
+        torch.manual_seed(1)
+        cases = [
+            [1000],
+            [4096],
+            [40000],
+            [70000],
+            [150000],
+            [600000],
+            [3000, 90000],
+            [65536, 65536],
+            [200000, 200000],
+            [2048, 2049, 300000],
+            [33000, 33000, 33000],
+            [120000, 5000, 120000],
+            [70000] * 4,
+        ]
+        for ctxs in cases:
+            pt_width = max((c + PAGE_SIZE - 1) // PAGE_SIZE for c in ctxs) + 3
+            q, kv, gate, seqlens, page_table = self._mtp_rows(ctxs, pt_width)
+            rows = q.shape[0]
+            for n in sorted({rows, rows - 1, 4, 1} - {0}):
+                with self.subTest(ctxs=ctxs, rows=n):
+                    args = (
+                        q[:n],
+                        kv,
+                        gate[:n],
+                        seqlens[:n],
+                        page_table[:n].contiguous(),
+                    )
+                    shared = self._logits(*args, True)
+                    per_row = self._logits(*args, False)
+                    for got, ref, what in zip(shared, per_row, ("logits", "ghist")):
+                        self.assertTrue(
+                            torch.equal(got.view(torch.int32), ref.view(torch.int32)),
+                            f"{what} differ between the shared-page and per-row kernels",
+                        )
 
 
 if __name__ == "__main__":

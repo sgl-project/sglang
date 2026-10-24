@@ -44,7 +44,13 @@ from sglang.srt.layers.attention.dsa.utils import (
     resolve_num_sms,
     resolve_paged_mqa_logits_metadata_fn,
 )
-from sglang.srt.layers.attention.graph_variants import DSA_DENSE
+from sglang.srt.layers.attention.graph_variants import (
+    DSA_DENSE,
+    DSA_SHARED_PAGES_MAX_ROWS,
+    DSA_SPARSE_SHARED_PAGES,
+    dsa_max_kv_len,
+    dsa_share_logits_pages,
+)
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
@@ -830,6 +836,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # The owned/read buffer split the standard path uses.
         kv_write = pool.get_index_k_with_scale_buffer(layer_id=layer_id).view(fp8_dtype)
         kv_read = self._get_index_k_read_buffer(pool, layer_id).view(fp8_dtype)
+        # MTP verify rows of one request read the same pages; long enough
+        # contexts share them (a graph variant under capture, chosen on the host).
+        share_pages = False
+        if forward_batch.forward_mode.is_target_verify():
+            if get_is_capture_mode():
+                from sglang.srt.model_executor.runner_utils.capture_mode import (
+                    get_capture_attention_variant,
+                )
+
+                share_pages = get_capture_attention_variant() == DSA_SPARSE_SHARED_PAGES
+            elif rows <= DSA_SHARED_PAGES_MAX_ROWS:
+                max_kv_len = dsa_max_kv_len(forward_batch)
+                share_pages = max_kv_len is not None and dsa_share_logits_pages(
+                    rows, max_kv_len
+                )
         return state.run(
             x=x,
             q_lora=q_lora,
@@ -841,6 +862,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             row_ends_int32=seqlens,
             page_table_64=page_table_64,
             rows=rows,
+            share_pages=share_pages,
         )
 
     def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
