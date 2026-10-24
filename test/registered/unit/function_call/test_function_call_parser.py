@@ -37,6 +37,7 @@ from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.utils import get_schema_properties
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -2630,6 +2631,76 @@ null
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
+
+
+class TestStep3Detector(CustomTestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="write_file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "path": {"type": "string"},
+                        },
+                    },
+                ),
+            )
+        ]
+        self.detector = Step3Detector()
+
+    def _tool_call_text(self, content, path):
+        detector = self.detector
+        return (
+            f"{detector.bot_token}{detector.tool_call_begin}"
+            f"function{detector.tool_sep}"
+            '<steptml:invoke name="write_file">'
+            f'<steptml:parameter name="content">{content}</steptml:parameter>'
+            f'<steptml:parameter name="path">{path}</steptml:parameter>'
+            "</steptml:invoke>"
+            f"{detector.tool_call_end}{detector.eot_token}"
+        )
+
+    def test_detect_and_parse_keeps_value_containing_lt(self):
+        """A multiline value with '<' must not vanish or swallow the next parameter."""
+        content = "x = 1\nif x < 2:\n    print(x)"
+        text = self._tool_call_text(content=content, path="main.py")
+
+        result = self.detector.detect_and_parse(text=text, tools=self.tools)
+
+        self.assertEqual(
+            [(call.name, json.loads(call.parameters)) for call in result.calls],
+            [("write_file", {"content": content, "path": "main.py"})],
+        )
+
+    def test_streaming_keeps_value_containing_lt(self):
+        """A streamed multiline value with '<' must not vanish from the arguments."""
+        content = "<b>hi</b>\n<i>there</i>"
+        text = self._tool_call_text(content=content, path="index.html")
+        chunk_size = 6
+
+        streamed = {}
+        for start in range(0, len(text), chunk_size):
+            result = self.detector.parse_streaming_increment(
+                new_text=text[start : start + chunk_size], tools=self.tools
+            )
+            for call in result.calls:
+                name, arguments = streamed.get(call.tool_index, ("", ""))
+                streamed[call.tool_index] = (
+                    name + (call.name or ""),
+                    arguments + call.parameters,
+                )
+
+        self.assertEqual(
+            {
+                index: (name, json.loads(arguments))
+                for index, (name, arguments) in streamed.items()
+            },
+            {0: ("write_file", {"content": content, "path": "index.html"})},
+        )
 
 
 class TestGptOssDetector(unittest.TestCase):
