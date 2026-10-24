@@ -2363,3 +2363,7 @@ MPS and does not read them.
     </tr>
   </tbody>
 </table>
+
+### K-pool indexer prefill query sharding
+
+Set `SGLANG_OPT_USE_DSA_KPOOL_PREFILL_TP=1` to partition large CUDA k-pool prefill query rows across attention TP ranks. The default is off. Each rank computes its own logits and top-k rows, then gathers the selected indices in place. Prefill context parallelism, scattered attention inputs, graph capture and replay, small batches, and empty pooled-key sets retain the replicated path. This path was checked on TP4 B200. Other GPU types and TP sizes still need validation.
