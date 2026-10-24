@@ -25,13 +25,8 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-TEST_MODEL = (
-    os.environ.get("SGLANG_ELASTIC_RECOVER_TEST_MODEL")
-    # Shared with test_mooncake_scale_down.py in this directory, so one export
-    # aims both at a locally staged copy. Checked before the cached default,
-    # which reaches the hub and so fails on a host without access to it.
-    or os.environ.get("NIXL_EP_TEST_MODEL")
-    or try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
+TEST_MODEL = os.environ.get("SGLANG_ELASTIC_RECOVER_TEST_MODEL") or try_cached_model(
+    DEFAULT_MODEL_NAME_FOR_TEST_MLA
 )
 EP_SIZE = 8
 LOCAL_EP_SIZE = 4
@@ -43,16 +38,11 @@ RECOVER_TIMEOUT_SECONDS = float(
     os.environ.get("SGLANG_ELASTIC_RECOVER_TIMEOUT_SECONDS", "300")
 )
 RANDOM_SEED = int(os.environ.get("SGLANG_ELASTIC_RECOVER_RANDOM_SEED", "42"))
-# Raise this above the scheduler's watchdog to let a stuck cohort dump its stacks
-# rather than have the client give up first and take the servers down with it.
+# Above the scheduler watchdog so a stuck cohort dumps stacks before the client quits.
 REQUEST_TIMEOUT_SECONDS = float(
     os.environ.get("SGLANG_ELASTIC_RECOVER_REQUEST_TIMEOUT_S", "90")
 )
-# Named explicitly, as test_mooncake_scale_down.py does. ``auto`` resolves to
-# ``triton`` for the unquantized BF16 weights this test defaults to, and no
-# ``deepep_ll``->``triton`` pre-permute is registered, so with
-# --deepep-mode low_latency every rank dies on its first forward with
-#   AssertionError: Pre-permute function for deepep_ll to triton is not registered
+# ``auto`` picks ``triton`` for BF16, which has no ``deepep_ll`` pre-permute.
 MOE_RUNNER_BACKEND = os.environ.get(
     "SGLANG_ELASTIC_RECOVER_MOE_RUNNER_BACKEND", "deep_gemm"
 ).strip()
@@ -257,9 +247,8 @@ class TestElasticRecover4To4(CustomTestCase):
         self.fail(f"Timed out waiting for recovery collective: {primary_log}")
 
     def _generate_ok_on_recovered_rank(self, dp_rank: int) -> None:
-        # Round robin may never land on a recovered rank, so pin one request to each.
-        # The controller rejects a pin until it sees the rank active, and that reject
-        # returns at once; a request it accepts but never answers hits the timeout.
+        # Round robin may skip a recovered rank, so pin one request to each. A pin is
+        # rejected at once until the rank is active; an unanswered one hits the timeout.
         description = f"request routed to recovered DP{dp_rank}"
         deadline = time.monotonic() + RECOVER_TIMEOUT_SECONDS
         while True:
