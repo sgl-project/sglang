@@ -44,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    mamba_cache_chunk_size,
     publish,
     spawn_world_rank,
 )
@@ -221,6 +222,7 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    combine_truncation_align,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -694,6 +696,9 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
         self.init_dsa_kpool_truncation_align()
+        # A mamba checkpoint is donated only where the cached prefix sits on the chunk grid,
+        # so one off-grid cut costs the request every later donation.
+        self.init_mamba_truncation_align()
         self.check_truncation_align_fits_chunk()
 
         self.init_weight_updater()
@@ -1769,6 +1774,13 @@ class Scheduler(
         else:
             self.truncation_align_size = math.lcm(
                 self.truncation_align_size, dsa_index_kpool
+            )
+
+    def init_mamba_truncation_align(self):
+        """Keep chunked-prefill cuts on the mamba cache chunk grid."""
+        if get_exec().mamba.enable_mamba_extra_buffer:
+            self.truncation_align_size = combine_truncation_align(
+                self.truncation_align_size, grid=mamba_cache_chunk_size()
             )
 
     def check_truncation_align_fits_chunk(self):
@@ -4150,7 +4162,9 @@ class Scheduler(
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
             )
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self.chunked_req = adder.add_chunked_req(
+                self.chunked_req, truncation_align_size=self.truncation_align_size
+            )
 
         if self.enable_lora:
             running_loras = {

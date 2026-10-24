@@ -222,6 +222,17 @@ class TestPrefillAdder(CustomTestCase):
             self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
         )
 
+    def test_continuing_chunk_cut_stays_on_truncation_align(self):
+        adder = self.create_shortest_prefill_adder()
+        adder.chunked_req_limit = 2560
+        continuation = self.create_shared_req("continuation")
+        continuation.full_untruncated_fill_ids = list(range(16384))
+        self.assertIs(
+            adder.add_chunked_req(continuation, truncation_align_size=1024),
+            continuation,
+        )
+        self.assertEqual(continuation.extend_len, 2048)
+
     def test_shortest_prefill_reserves_space_for_complete_waiting_requests(self):
         adder = self.create_shortest_prefill_adder()
         policy = SchedulePolicy(

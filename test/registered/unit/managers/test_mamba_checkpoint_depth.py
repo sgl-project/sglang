@@ -19,6 +19,10 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     _MambaRadixCacheV2TrackEntry,
 )
+from sglang.srt.managers.schedule_policy import (
+    _floor_chunk_cut,
+    combine_truncation_align,
+)
 from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -26,6 +30,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -129,6 +134,45 @@ class TestMambaCheckpointDepth(unittest.TestCase):
             _track_seqlen(tree_page=16, prefix_len=4253, extend_len=16384),
             20637,
         )
+
+
+class TestChunkedPrefillStaysOnTheChunkGrid(CustomTestCase):
+    """An off-grid prefix like 37 comes from a prefill chunk cut there; every later chunk
+    inherits the offset, so one off-grid cut loses every later donation under DCP."""
+
+    def _floor(self, cut_len: int, extend_input_len: int) -> int:
+        return _floor_chunk_cut(
+            cut_len,
+            extend_input_len=extend_input_len,
+            truncation_align_size=combine_truncation_align(None, grid=CHUNK),
+        )
+
+    def test_every_chunk_of_a_cut_up_request_can_still_donate(self):
+        # Walk a 100k prompt through chunks cut to whatever the shared budget had left.
+        prefix_len, total = 0, 100_000
+        for budget in (8192, 5000, 8192, 3333, 8192, 777):
+            extend_len = self._floor(budget, total - prefix_len)
+            self.assertIsNotNone(
+                _track_seqlen(
+                    tree_page=256,
+                    prefix_len=prefix_len,
+                    extend_len=extend_len,
+                    dcp_enabled=True,
+                ),
+                f"no donation at {prefix_len=} {extend_len=}",
+            )
+            prefix_len += extend_len
+
+    def test_finishing_chunk_and_sub_grid_cut_keep_their_length(self):
+        self.assertEqual(self._floor(37, 37), 37)
+        # Rounding to zero would stall a request that already holds its KV.
+        self.assertEqual(self._floor(40, 8192), 40)
+
+    def test_mamba_grid_keeps_existing_alignment(self):
+        # Deterministic-inference and DSA kpool alignments must survive the mamba grid.
+        self.assertEqual(combine_truncation_align(4096, grid=CHUNK), 4096)
+        self.assertEqual(combine_truncation_align(96, grid=CHUNK), 192)
+        self.assertEqual(combine_truncation_align(4096, grid=1), 4096)
 
 
 class TestMambaTrackPosition(unittest.TestCase):
