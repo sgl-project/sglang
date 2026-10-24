@@ -6,7 +6,14 @@ import pkgutil
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.runtime_context import get_model
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_strategies,
+    strategy_for,
+)
+from sglang.srt.multimodal.token_space_mm_process.sglang import (
+    TokenSpaceSGLangProcessor,
+)
+from sglang.srt.runtime_context import get_mm, get_model
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -40,6 +47,7 @@ def import_processors(package_name: str, overwrite: bool = False):
                                 del PROCESSOR_MAPPING[model_cls]
                                 break
                     PROCESSOR_MAPPING[arch] = cls
+            register_strategies(module)
 
 
 def get_mm_processor_cls(hf_config, model_config=None):
@@ -53,6 +61,12 @@ def get_mm_processor_cls(hf_config, model_config=None):
         uses_transformers_backend = (
             get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS
         )
+
+    # The transformers backend keeps the legacy processors.
+    if get_mm().enable_token_space_processor and not uses_transformers_backend:
+        strategy_class = strategy_for(hf_config)
+        if strategy_class is not None:
+            return TokenSpaceSGLangProcessor.for_strategy(strategy_class)
 
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
         if model_cls.__name__ not in hf_config.architectures:

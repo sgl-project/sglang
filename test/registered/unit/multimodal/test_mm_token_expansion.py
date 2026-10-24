@@ -18,10 +18,18 @@ TokenSpaceProcessor.process(media, IDs)
   processor_output / precomputed_embedding source -> ValueError
   bare source instead of a list -> TypeError
   strategy loading options -> load kwargs
+
+get_mm_processor -> TokenSpaceSGLangProcessor
+  each strategy keeps its legacy processor's loader and worker defaults
+  tokenizer + strategy -> served output; caller IDs never decoded
+  --allowed-media-domains / max file size -> the core's media URL policy
+  adjacent images -> two offsets from mm_spans, not one scanned run
 """
 
 import asyncio
+import contextlib
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import torch
@@ -29,7 +37,13 @@ from PIL import Image
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
+from sglang.srt.managers.multimodal_processor import (
+    PROCESSOR_MAPPING,
+    get_mm_processor,
+    import_processors,
+)
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
 from sglang.srt.multimodal.token_space_mm_process.expansion import (
     expand_token_placeholders,
@@ -40,6 +54,15 @@ from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
 from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
 )
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    TOKEN_SPACE_STRATEGY_MAPPING,
+)
+from sglang.srt.multimodal.token_space_mm_process.sglang import (
+    TokenSpaceSGLangProcessor,
+)
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import configure_media_url_security
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -263,6 +286,158 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         load.assert_awaited_once_with(
             ["image"], None, None, audio_sample_rate=24000, discard_alpha_channel=False
         )
+
+
+# Class attributes the media loader and worker pools read.
+_LOADER_ATTRIBUTES = (
+    "gpu_image_decode",
+    "smart_rgb_conversion",
+    "video_preprocessing_device",
+    "supports_mm_processor_concurrency",
+)
+
+
+class _StopInit(Exception):
+    pass
+
+
+def _legacy_defaults(processor_cls, hf_config):
+    # Stops at the shared base, after a processor has applied its model defaults.
+    processor = processor_cls.__new__(processor_cls)
+    with (
+        patch.object(BaseMultimodalProcessor, "__init__", side_effect=_StopInit),
+        contextlib.suppress(_StopInit),
+    ):
+        processor_cls.__init__(processor, hf_config, None, None)
+    defaults = {name: getattr(processor, name) for name in _LOADER_ATTRIBUTES}
+    # None and an unset worker default both mean the base's own choice.
+    defaults["auto_mm_processor_worker_num"] = (
+        processor.auto_mm_processor_worker_num or 2
+    )
+    defaults["auto_mm_io_worker_num"] = processor.auto_mm_io_worker_num
+    return defaults
+
+
+def _token_space_defaults(strategy_class):
+    core_cls = TokenSpaceProcessor.for_strategy(strategy_class)
+    defaults = {name: getattr(core_cls, name) for name in _LOADER_ATTRIBUTES}
+    # The wrapper's auto count when preprocessing does not compete with the scheduler.
+    defaults["auto_mm_processor_worker_num"] = 2
+    defaults["auto_mm_io_worker_num"] = core_cls.auto_mm_io_worker_num
+    return defaults
+
+
+# The model types each registered architecture is served with.
+_MODEL_TYPES_BY_ARCH = {}
+
+
+class TestTokenSpaceSGLangProcessor(unittest.TestCase):
+    def test_strategies_keep_the_legacy_processor_defaults(self):
+        """A token-space model loads and schedules media like the legacy processor it replaces."""
+        import_processors("sglang.srt.multimodal.processors")
+        legacy = {
+            model_cls.__name__: cls for model_cls, cls in PROCESSOR_MAPPING.items()
+        }
+        for arch, strategy_class in TOKEN_SPACE_STRATEGY_MAPPING.items():
+            if arch not in legacy:
+                continue
+            for model_type in _MODEL_TYPES_BY_ARCH[arch]:
+                hf_config = SimpleNamespace(model_type=model_type)
+                expected = _legacy_defaults(legacy[arch], hf_config)
+                with self.subTest(arch=arch, model_type=model_type):
+                    self.assertEqual(_token_space_defaults(strategy_class), expected)
+
+    def test_strategy_alone_serves_a_model_without_an_hf_processor(self):
+        """A strategy plus a tokenizer is enough to register, build, and serve."""
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            model_impl="sglang",
+            mm_process_config={},
+            enable_token_space_processor=True,
+            mm_processor_worker_num=1,
+        )
+        publish(server_args, role="test")
+        config = SimpleNamespace(
+            architectures=list(_ImageWidthStrategy.models),
+            model_type="image_width",
+            to_dict=lambda: {"model_type": "image_width"},
+        )
+        tokenizer = _bare_tokenizer()
+        with patch.dict(
+            TOKEN_SPACE_STRATEGY_MAPPING,
+            {_ImageWidthStrategy.models[0]: _ImageWidthStrategy},
+            clear=True,
+        ):
+            processor = get_mm_processor(config, server_args, tokenizer, None)
+        self.addCleanup(processor.shutdown)
+        self.assertIsInstance(processor, TokenSpaceSGLangProcessor)
+        with patch.object(
+            tokenizer,
+            "decode",
+            side_effect=AssertionError("Caller IDs must never decode"),
+        ):
+            output = asyncio.run(
+                processor.process_mm_data_async(
+                    image_data=[Image.new("RGB", (2, 1))], input_ids=[1, IMAGE, 2]
+                )
+            )
+        self.assertEqual(output.input_ids, [1, IMAGE, IMAGE, 2])
+        self.assertEqual([item.offsets for item in output.mm_items], [[(1, 2)]])
+        self.assertEqual(output.im_token_id, IMAGE)
+
+    def test_served_core_applies_the_server_media_url_policy(self):
+        """Building a core resets the process-wide URL policy to its config's.
+
+        Serving must pass the server's allowlist, or every media domain is allowed.
+        """
+        reset_context()
+        self.addCleanup(reset_context)
+        self.addCleanup(configure_media_url_security, [], 64)
+        server_args = ServerArgs(
+            model_path="dummy",
+            model_impl="sglang",
+            mm_process_config={},
+            enable_token_space_processor=True,
+            mm_processor_worker_num=1,
+            allowed_media_domains=["media.example.com"],
+            media_url_max_file_size_mb=7,
+        )
+        publish(server_args, role="test")
+        with patch(
+            "sglang.srt.multimodal.multimodal_processor_mixin.configure_media_url_security"
+        ) as configure:
+            processor = TokenSpaceSGLangProcessor.for_strategy(_ImageWidthStrategy)(
+                None, server_args, _bare_tokenizer(), None
+            )
+        self.addCleanup(processor.shutdown)
+        configure.assert_called_once_with(["media.example.com"], 7)
+
+    def test_serving_offsets_come_from_mm_spans(self):
+        """Adjacent images form one placeholder run; only mm_spans can divide it."""
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            model_impl="sglang",
+            mm_process_config={},
+            enable_token_space_processor=True,
+            mm_processor_worker_num=1,
+        )
+        publish(server_args, role="test")
+        processor = TokenSpaceSGLangProcessor.for_strategy(_ImageWidthStrategy)(
+            None, server_args, _bare_tokenizer(), None
+        )
+        self.addCleanup(processor.shutdown)
+        output = asyncio.run(
+            processor.process_mm_data_async(
+                image_data=[Image.new("RGB", (2, 1)), Image.new("RGB", (3, 1))],
+                input_ids=[1, IMAGE, IMAGE, 2],
+            )
+        )
+        self.assertEqual(output.input_ids, [1] + [IMAGE] * 5 + [2])
+        self.assertEqual([item.offsets for item in output.mm_items], [[(1, 2), (3, 5)]])
 
 
 if __name__ == "__main__":
