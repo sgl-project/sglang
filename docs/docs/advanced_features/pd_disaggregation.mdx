@@ -461,6 +461,41 @@ python -m sglang_router.launch_router \
   --host 0.0.0.0 --port 8000
 ```
 
+## Connex
+The `connex` backend keeps the Mooncake backend's protocol and replaces the
+transfer engine with connex-rs, the data plane of
+[Connex](https://github.com/HeterInfra/connex): one-sided RDMA writes over UCX
+(GPUDirect RDMA when available), peer-failure events within milliseconds, and
+endpoints keyed by a logical identity, so a restarted instance rejoins under
+the same session id. Connex's PD router can add and remove prefill and decode
+instances at run time and resume a request whose decode instance failed.
+
+### Requirements
+
+```bash
+pip install "connex-ai[rs]"
+```
+
+For RDMA, build the `connex-rs` wheel against the UCX of the host (see the
+Connex documentation). Use a page size of at least 16 so that each KV chunk
+is large enough for zero-copy transfers.
+
+### Usage
+
+```bash
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode prefill \
+  --port 30000 --page-size 16 \
+  --disaggregation-transfer-backend connex
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode decode \
+  --port 30001 --base-gpu-id 1 --page-size 16 \
+  --disaggregation-transfer-backend connex
+python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
+```
+
 ## NIXL
 ### Requirements
 

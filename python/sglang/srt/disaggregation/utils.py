@@ -684,6 +684,7 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
+    CONNEX = "connex"
 
 
 class KVClassType(Enum):
@@ -766,6 +767,20 @@ def get_kv_class(
             KVClassType.SENDER: AscendKVSender,
             KVClassType.RECEIVER: AscendKVReceiver,
             KVClassType.BOOTSTRAP_SERVER: AscendKVBootstrapServer,
+        }
+    elif transfer_backend == TransferBackend.CONNEX:
+        from sglang.srt.disaggregation.connex import (
+            ConnexKVBootstrapServer,
+            ConnexKVManager,
+            ConnexKVReceiver,
+            ConnexKVSender,
+        )
+
+        class_mapping = {
+            KVClassType.MANAGER: ConnexKVManager,
+            KVClassType.SENDER: ConnexKVSender,
+            KVClassType.RECEIVER: ConnexKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: ConnexKVBootstrapServer,
         }
     elif transfer_backend == TransferBackend.NIXL:
         from sglang.srt.disaggregation.nixl import (
