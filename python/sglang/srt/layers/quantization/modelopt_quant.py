@@ -313,6 +313,20 @@ def _compile_exclusion_pattern(pattern: str) -> re.Pattern[str]:
     return re.compile(pattern.replace(".", r"\.").replace("*", r".*"))
 
 
+def _modelopt_prefix_candidates(prefix: str) -> Tuple[str, ...]:
+    candidates = [prefix]
+
+    if prefix.startswith("language_model."):
+        candidates.append(prefix.removeprefix("language_model."))
+
+    if prefix == "model.visual" or prefix.startswith("model.visual."):
+        candidates.append(prefix.removeprefix("model."))
+    elif prefix == "visual" or prefix.startswith("visual."):
+        candidates.append(f"model.{prefix}")
+
+    return tuple(dict.fromkeys(candidates))
+
+
 class ModelOptQuantConfig(QuantizationConfig):
     def __init__(
         self,
@@ -339,9 +353,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
-            ) or self.is_layer_excluded(prefix):
+            if self._is_quantized_module_excluded(prefix):
                 return UnquantizedLinearMethod()
             return Linear(self)
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
@@ -376,6 +388,17 @@ class ModelOptQuantConfig(QuantizationConfig):
             # Preserve order, drop duplicates.
             self.exclude_modules = list(dict.fromkeys(expanded))
 
+    def _is_quantized_module_excluded(self, prefix: str) -> bool:
+        skipped = any(
+            is_layer_skipped(
+                candidate,
+                self.exclude_modules,
+                self.packed_modules_mapping,
+            )
+            for candidate in _modelopt_prefix_candidates(prefix)
+        )
+        return skipped or self.is_layer_excluded(prefix)
+
     def is_layer_excluded(self, prefix: str) -> bool:
         """Check if a layer should be excluded from quantization.
 
@@ -389,10 +412,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         if not self.exclude_modules:
             return False
 
-        # Build prefix variants: some models wrap layers under "language_model."
-        prefixes_to_check = [prefix]
-        if prefix.startswith("language_model."):
-            prefixes_to_check.append(prefix.removeprefix("language_model."))
+        prefixes_to_check = _modelopt_prefix_candidates(prefix)
 
         # Fused module patterns: the exclude list may reference a sub-component
         # (e.g., "q_a_proj") that is fused into a combined parameter name
@@ -1009,7 +1029,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
 
     @staticmethod
     def _quantized_layer_prefix_candidates(prefix: str) -> Tuple[str, ...]:
-        candidates = [prefix]
+        candidates = list(_modelopt_prefix_candidates(prefix))
 
         if prefix.endswith(".lm_head"):
             candidates.append("lm_head")
@@ -1023,7 +1043,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
             candidates.append("model." + prefix[len("model.language_model.") :])
-        elif prefix.startswith("model."):
+        elif prefix.startswith("model.") and not (
+            prefix == "model.visual" or prefix.startswith("model.visual.")
+        ):
             # VL models such as Qwen4-Exp name the text stack `model.layers.*`
             # while ModelOpt keys it `model.language_model.layers.*`.
             candidates.append("model.language_model." + prefix[len("model.") :])
@@ -1046,9 +1068,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         quant_algo = self._resolve_quant_algo(prefix)
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
-            ) or self.is_layer_excluded(prefix):
+            if self._is_quantized_module_excluded(prefix):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
@@ -1065,9 +1085,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         # Must stay after the ParallelLMHead branch: ParallelLMHead subclasses
         # VocabParallelEmbedding, and a tied lm_head IS the embedding module.
         if isinstance(layer, VocabParallelEmbedding):
-            if is_layer_skipped(
-                prefix, self.exclude_modules, self.packed_modules_mapping
-            ) or self.is_layer_excluded(prefix):
+            if self._is_quantized_module_excluded(prefix):
                 return None
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4EmbeddingMethod(self.nvfp4_config)
@@ -2098,19 +2116,20 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 x, tuple
             ):
                 x_fp4, x_scale_interleaved = x
-                x_m = x_fp4.shape[0]
+                output_prefix_shape = (x_fp4.shape[0],)
                 output_dtype = layer.params_dtype
             else:
+                output_prefix_shape = x.shape[:-1]
+                x = x.reshape(-1, x.shape[-1])
                 # NVFP4_AWQ: apply the per-input-channel pre_quant_scale.
                 if self.quant_config.is_awq:
                     x = x * layer.pre_quant_scale
                 x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
-                x_m, _ = x.shape
                 output_dtype = x.dtype
 
             output_size = layer.output_size_per_partition
             w_n, _ = layer.weight.shape
-            output_shape = [x_m, output_size]
+            output_shape = [*output_prefix_shape, output_size]
 
             assert x_fp4.dtype == torch.uint8
             assert layer.weight.dtype == torch.uint8
