@@ -641,6 +641,9 @@ class Resources(_FlagGroupBase):
     # (owning accessors live in sglang.srt.eplb).
     expert_distribution_recorder: Any = None
     expert_location_metadata: Any = None
+    # Weight cache: this engine's link to its daemon's record of the expert
+    # layout (owning accessors live in sglang.srt.weight_cache.expert_layout).
+    expert_layout_session: Any = None
     # LPLB: layer_id -> solver.
     lplb_solvers: dict = msgspec.field(default_factory=dict)
     # Named side streams (see RuntimeContext.get_stream): name -> stream.

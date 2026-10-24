@@ -257,6 +257,7 @@ from sglang.srt.utils.offloader import (
 from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
+from sglang.srt.weight_cache.expert_layout import adopt_weight_cache_expert_layout
 
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -755,9 +756,16 @@ class ModelRunner:
             else 0
         )
         set_global_expert_location_metadata(
-            compute_initial_expert_location_metadata(
+            # With the weight cache, route with the layout the daemon's
+            # weights are in, which an EPLB rebalance may have changed.
+            adopt_weight_cache_expert_layout(
+                compute_initial_expert_location_metadata(
+                    model_config=self.model_config,
+                    moe_ep_rank=expert_rank,
+                ),
                 model_config=self.model_config,
                 moe_ep_rank=expert_rank,
+                gpu_id=self.gpu_id,
             )
         )
         if (
