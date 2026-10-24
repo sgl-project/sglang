@@ -12,6 +12,9 @@ needs the server on this host's clock, with SGLANG_LOG_MS=1. In HTTP mode the
 package, GPU and environment fields describe the benchmark client; server_info
 records the server.
 
+--prefill-completions saves measured request timestamps before scoring, including
+partial completions on failure. This diagnostic file is not a validated result.
+
   python bench_engine_steps.py prefill --base-url URL --dp 4 --tokens-per-step 8192
   python bench_engine_steps.py decode --base-url URL --dp 8 --batch-per-rank 64
   python bench_engine_steps.py prefill --engine --dp 4 --model-path M --dp-size 4 ...
@@ -442,9 +445,33 @@ async def prefill(args, tp, prompt):
     n_warmup = args.warmup_steps * per_step
     await batch(args, tp, prompt, n_warmup, params, [], "warmup", check_prefix=True)
     done = []
-    await batch(
-        args, tp, prompt, args.requests, params, done, "measured", check_prefix=True
-    )
+    drained = False
+    try:
+        await batch(
+            args, tp, prompt, args.requests, params, done, "measured", check_prefix=True
+        )
+        drained = True
+    finally:
+        # Persist after timed tasks are joined, before scoring can reject the run.
+        if path := getattr(args, "prefill_completions", None):
+            with open(path, "w") as f:
+                json.dump(
+                    dict(
+                        schema_version=1,
+                        phase="measured_prefill",
+                        requests_drained=drained,
+                        validation="not_evaluated",
+                        columns=[
+                            "arrival_time_s",
+                            "scheduler_time_s",
+                            "new_tokens",
+                            "rank",
+                        ],
+                        completions=done,
+                    ),
+                    f,
+                )
+                f.write("\n")
     stamp = "scheduler" if all(s for _, s, _, _ in done) else "arrival"
     times = [s if stamp == "scheduler" else t for t, s, _, _ in done]
     # The window comes from all completions; steps from each rank's own ends, since
@@ -599,8 +626,18 @@ OPTIONS = [  # flag, type, default, help
     ("--timeout", pos_float, 600, "seconds a stalled server gets before failing"),
     ("--seed", int, 0, "seed of the random ids"),
     ("--out", str, None, "write the JSON record here"),
+    (
+        "--prefill-completions",
+        str,
+        None,
+        "save raw prefill completions before validation",
+    ),
 ]
-WORKLOAD = [flag[2:].replace("-", "_") for flag, *_ in OPTIONS if flag != "--out"]
+WORKLOAD = [
+    flag[2:].replace("-", "_")
+    for flag, *_ in OPTIONS
+    if flag not in ("--out", "--prefill-completions")
+]
 
 
 def main():

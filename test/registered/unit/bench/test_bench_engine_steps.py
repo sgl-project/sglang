@@ -97,6 +97,42 @@ class TestStepWindow(unittest.TestCase):
             bench.group_window([(1.0, 10)], 0.2, 0.9)
 
 
+class TestCompletionDiagnostics(unittest.TestCase):
+    def test_raw_written_on_request_or_scoring_failure(self):
+        for request_failure in (False, True):
+            with (
+                self.subTest(request_failure=request_failure),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                path = Path(tmp) / "raw.json"
+                args = SimpleNamespace(
+                    new_tokens=2,
+                    tokens_per_step=4,
+                    dp=1,
+                    requests=2,
+                    warmup_steps=0,
+                    lo=0.2,
+                    hi=0.9,
+                    prefill_completions=str(path),
+                )
+
+                async def fake_batch(
+                    args, tp, prompt, n, params, done, phase, **kwargs
+                ):
+                    if phase == "measured":
+                        done.append((1.01, 1.0, 2, 0))
+                        if request_failure:
+                            raise RuntimeError("request failed")
+
+                with patch.object(bench, "batch", fake_batch):
+                    with self.assertRaises((SystemExit, RuntimeError)):
+                        asyncio.run(bench.prefill(args, None, None))
+                raw = json.loads(path.read_text())
+                self.assertEqual(raw["requests_drained"], not request_failure)
+                self.assertEqual(raw["validation"], "not_evaluated")
+                self.assertEqual(raw["completions"], [[1.01, 1.0, 2, 0]])
+
+
 class TestLogSteps(unittest.TestCase):
     def test_prefill_and_decode_lines(self):
         t0 = datetime(2026, 10, 22, 10, 0, 5).timestamp()
