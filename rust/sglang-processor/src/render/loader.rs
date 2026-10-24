@@ -311,6 +311,8 @@ mod tests {
             r#"{"model_type":"phi4mm","architectures":["Phi4MMForCausalLM"]}"#,
         )
         .unwrap();
+        // Python guesses the legacy template before reading the checkpoint's.
+        std::fs::write(model_dir.join("chat_template.jinja"), "{{ messages }}").unwrap();
         let (formatter, error) = select_chat_formatter(&ChatFormatterOptions {
             tokenizer_path: model_dir.to_str().unwrap().into(),
             model_path: model_dir.to_str().unwrap().into(),
