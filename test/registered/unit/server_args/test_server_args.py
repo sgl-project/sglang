@@ -4276,6 +4276,52 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
             args.enable_kv_cache_sharding = False
             self.assertTrue(post_capture_kv_sizing_planned(args))
 
+    def test_post_capture_kv_sizing_survives_short_prefill_graph_coverage(self):
+        """A prefill graph that covers fewer tokens than the prefill buffer must
+        not switch the feature off (the resize reserves eager prefill headroom);
+        a disabled prefill graph or chunked prefill off still does."""
+        prefill_graph = SimpleNamespace(backend=Backend.BREAKABLE, bs=[1024])
+        args = ServerArgs(
+            model_path="dummy",
+            enable_kv_cache_sharding=False,
+            device="cuda",
+            dcp_size=1,
+            kv_cache_dtype="auto",
+            prefill_only_disable_kv_cache=False,
+            enable_memory_saver=False,
+            disaggregation_mode="prefill",
+            cuda_graph_config=CudaGraphConfig(prefill=prefill_graph),
+            chunked_prefill_size=4096,
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.overrides.use_mla_backend",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.arg_groups.overrides.model_config_of",
+                return_value=SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+                ),
+            ),
+            patch.object(
+                envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING,
+                "get",
+                return_value=True,
+            ),
+            patch.object(
+                envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL,
+                "get",
+                return_value=None,
+            ),
+        ):
+            self.assertTrue(post_capture_kv_sizing_planned(args))
+            prefill_graph.backend = Backend.DISABLED
+            self.assertFalse(post_capture_kv_sizing_planned(args))
+            prefill_graph.backend = Backend.BREAKABLE
+            args.chunked_prefill_size = -1
+            self.assertFalse(post_capture_kv_sizing_planned(args))
+
     def test_chunk_rounding_expands_automatic_activation_headroom(self):
         args = self._rounding_args(raw_mem_fraction=None, resolved_mem_fraction=0.9)
         gpu_mem = 80 * 1024

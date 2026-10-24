@@ -1794,8 +1794,14 @@ def max_prefill_buffer_tokens() -> int:
     return prefill_buffer_ceiling_of(get_server_args(), tokens)
 
 
-def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
-    """Return the activation reserve in MB before CUDA graph capture, using current config."""
+def pre_capture_activation_reserve_mb(
+    gpu_mem: float | None, *, prefill_tokens: int = 0
+) -> float:
+    """Return the activation reserve in MB before CUDA graph capture, using current config.
+
+    ``prefill_tokens`` raises the prefill token count for an eager forward that can
+    run past ``chunked_prefill_size``, such as a PP dynamic chunk.
+    """
     schedule = get_schedule()
     if get_disagg().disaggregation_mode == "decode":
         running_requests = (
@@ -1807,7 +1813,7 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
             running_requests * (get_spec().speculative_num_draft_tokens or 1), 2048
         )
     elif schedule.chunked_prefill_size > 0:
-        activation_tokens = max(schedule.chunked_prefill_size, 2048)
+        activation_tokens = max(schedule.chunked_prefill_size, prefill_tokens, 2048)
     else:
         activation_tokens = max(schedule.max_prefill_tokens, 2048)
     parallel = get_parallel()
