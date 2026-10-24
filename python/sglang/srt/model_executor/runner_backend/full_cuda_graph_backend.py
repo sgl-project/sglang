@@ -179,7 +179,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             self._reuse_output_buffer = self._output_buffer is not None
         del warmup_output
 
-        graph = torch.cuda.CUDAGraph()
+        graph = self._create_graph()
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
@@ -197,7 +197,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         with (
             graph_pool_capture_scope(),
-            graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
+            self._capture_graph(graph_ctx, graph),
         ):
             self._precarve.mint()
             out = forward_fn()
@@ -214,6 +214,12 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+
+    def _capture_graph(self, graph_ctx, graph):
+        return graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream)
+
+    def _create_graph(self):
+        return torch.cuda.CUDAGraph()
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs

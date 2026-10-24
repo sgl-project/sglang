@@ -246,17 +246,10 @@ class _ProfilerBase(ABC):
     @staticmethod
     def create(activities, with_stack, record_shapes, **kwargs):
         inners = []
-        if current_platform.is_out_of_tree():
-            if current_platform.get_torch_profiler_activity_str() in activities:
-                inners.append(
-                    _ProfilerTorch(
-                        **kwargs,
-                        activities=activities,
-                        with_stack=with_stack,
-                        record_shapes=record_shapes,
-                    )
-                )
-        if ("CPU" in activities) or ("GPU" in activities):
+        device_activity_requested = (
+            current_platform.is_out_of_tree() or current_platform.is_mlu()
+        ) and current_platform.get_torch_profiler_activity_str() in activities
+        if "CPU" in activities or "GPU" in activities or device_activity_requested:
             inners.append(
                 _ProfilerTorch(
                     **kwargs,
@@ -325,11 +318,13 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
 
-        if current_platform.is_out_of_tree():
+        if current_platform.is_out_of_tree() or current_platform.is_mlu():
             activity_map[current_platform.get_torch_profiler_activity_str()] = (
                 current_platform.get_torch_profiler_activity()
             )
 
+        if current_platform.is_mlu():
+            activity_map["GPU"] = current_platform.get_torch_profiler_activity()
         torchprof_activities = [
             activity_map[a] for a in self.activities if a in activity_map
         ]

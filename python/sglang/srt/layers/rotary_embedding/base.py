@@ -126,6 +126,7 @@ class RotaryEmbedding(BaseFusedOp):
             and not (_is_npu)
             and not (_is_musa)
             and not (_is_mps)
+            and not current_platform.is_mlu()
             and not (current_platform.is_out_of_tree())
         ):
             # rotary_embedding from sglang.kernels.ops.attention.rope and vllm._custom_ops has the same implementation.
@@ -317,6 +318,20 @@ class RotaryEmbedding(BaseFusedOp):
         cos_sin = self.cos_sin_cache[:seqlen]
         cos, sin = cos_sin.chunk(2, dim=-1)
         return cos, sin
+
+    def forward_mlu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.hardware_backend.mlu.rope import apply_rotary
+
+        return apply_rotary(
+            self, positions, query, key, offsets, fused_set_kv_buffer_arg
+        )
 
     def forward_native(
         self,

@@ -138,6 +138,15 @@ def create_wave_backend(runner):
     return WaveAttnBackend(runner)
 
 
+@register_attention_backend("mlu")
+def create_mlu_backend(runner):
+    if runner.use_mla_backend:
+        raise ValueError("The MLU attention backend supports dense GQA models.")
+    from sglang.srt.hardware_backend.mlu.attention import MLUAttnBackend
+
+    return MLUAttnBackend(runner)
+
+
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
     from sglang.srt.hardware_backend.npu.attention.ascend_backend import (

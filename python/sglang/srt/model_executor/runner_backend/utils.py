@@ -92,7 +92,7 @@ def resolve_decode_backend(
         raise ValueError(f"Unsupported decode graph backend: {backend_name}")
 
     full_backend_cls = None
-    if current_platform.is_out_of_tree():
+    if current_platform.is_out_of_tree() or current_platform.is_mlu():
         full_backend_cls = current_platform.get_full_graph_backend_cls()
 
     if full_backend_cls is None:
@@ -108,6 +108,16 @@ def resolve_prefill_backend(
     cuda_graph_runner: BaseCudaGraphRunner,
 ) -> BaseCudaGraphBackend:
     """Pick a backend instance from cuda_graph_config['prefill']['backend']."""
+    if current_platform.is_mlu():
+        if get_exec().graph.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
+            raise ValueError("MLU prefill graph requires the breakable backend.")
+        from sglang.srt.hardware_backend.mlu.graph import BreakableMluGraphBackend
+
+        return BreakableMluGraphBackend(
+            cuda_graph_runner,
+            enable_memory_saver=get_exec().features.enable_memory_saver,
+            debug_eager=get_exec().graph.debug_cuda_graph,
+        )
     cfg = get_exec().graph.cuda_graph_config
     backend_name = cfg.prefill.backend if cfg is not None else Backend.BREAKABLE
 
