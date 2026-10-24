@@ -1,6 +1,7 @@
 # Modified for SGLang; see this directory's README.md for upstream source.
 
 import math
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -10,6 +11,16 @@ def modulate(x, shift, scale=None):
     if shift is None:
         return x * (1 + scale)
     return x * (1 + scale) + shift
+
+
+@lru_cache(maxsize=8)
+def _timestep_freqs(half: int, max_period: float, device: torch.device):
+    # host-built as before, uploaded once per device
+    return torch.exp(
+        -math.log(max_period)
+        * torch.arange(start=0, end=half, dtype=torch.float32)
+        / half
+    ).to(device=device)
 
 
 class TimestepEmbedder(nn.Module):
@@ -37,11 +48,7 @@ class TimestepEmbedder(nn.Module):
         """
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
         half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period)
-            * torch.arange(start=0, end=half, dtype=torch.float32)
-            / half
-        ).to(device=t.device)
+        freqs = _timestep_freqs(half, max_period, t.device)
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
