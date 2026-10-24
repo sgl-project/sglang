@@ -27,7 +27,7 @@ jobs:
     name: simulator-test-cpu
     if: fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).simulator == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -64,13 +64,13 @@ jobs:
           shared-key: "sglang-grpc-cpu"
 
       - name: Install dependencies
-        timeout-minutes: 20
+        timeout-minutes: 30
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
           uv pip install -e "python" --index-strategy unsafe-best-match --prerelease allow
           uv pip install pytest
-          uv pip install "./tools/sglang-simulator[aic]"
+          uv pip install -e "tools/sglang-simulator[aisimulate]"
 
       - name: Prebuild HiCache native hash extension
         timeout-minutes: 5
@@ -96,3 +96,7 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_import.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_predictor.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_native.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_native_runner.py

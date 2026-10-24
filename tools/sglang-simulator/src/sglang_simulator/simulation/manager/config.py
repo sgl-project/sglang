@@ -10,7 +10,7 @@ from sglang_simulator.simulation.utils import (
 )
 from sglang_simulator.spec import AcceleratorInfo, DataType, ModelInfo
 from sglang_simulator.time_predictor import (
-    AIConfiguratorTimePredictor,
+    AISimulateTimePredictor,
     InferTimePredictor,
 )
 from sglang_simulator.utils import get_logger
@@ -188,35 +188,35 @@ class ConfigManager:
             raise RuntimeError(f"Unsupported backend[{backend}] server args parser.")
 
     @classmethod
+    def uses_native_aisimulate(cls) -> bool:
+        predictor = cls._get_raw_config().get("predictor", {})
+        return (
+            predictor.get("name") == "aisimulate"
+            and predictor.get("estimation_mode") is not None
+        )
+
+    @classmethod
     def get_inference_time_predictor(
         cls, model: ModelInfo, hw: AcceleratorInfo, sched_config: SchedulerConfig
     ) -> InferTimePredictor:
         config = cls._get_raw_config()
         predictor_config = config.get("predictor", {})
-        if predictor_config.get("name") == "aiconfigurator":
-            database_mode = predictor_config.get("database_mode", "SILICON")
-            prefill_scale_factor = predictor_config.get("prefill_scale_factor", 1)
-            decode_scale_factor = predictor_config.get("decode_scale_factor", 1)
-            prefill_min_latency = predictor_config.get("prefill_min_latency", 0)
-            workload_distribution = predictor_config.get(
-                "workload_distribution", "balanced"
-            )
-            enable_oom_check = predictor_config.get("enable_oom_check", False)
-
-            return AIConfiguratorTimePredictor(
-                model,
-                hw=hw,
-                config=sched_config,
-                database_path=cls.resolve_config_relative_path(
-                    predictor_config.get("database_path")
-                ),
-                database_mode=database_mode,
-                prefill_scale_factor=prefill_scale_factor,
-                decode_scale_factor=decode_scale_factor,
-                prefill_min_latency=prefill_min_latency,
-                workload_distribution=workload_distribution,
-                enable_oom_check=enable_oom_check,
-            )
+        if predictor_config.get("name") == "aisimulate":
+            options = {k: v for k, v in predictor_config.items() if k != "name"}
+            if options.get("database_path") is not None:
+                options["database_path"] = cls.resolve_config_relative_path(
+                    options["database_path"]
+                )
+            config_dir = Path(Envs.config_path()).resolve().parent
+            if options.get("tune_observations") is not None:
+                options["tune_observations"] = str(
+                    config_dir / options["tune_observations"]
+                )
+            if options.get("systems_paths") is not None:
+                options["systems_paths"] = [
+                    str(config_dir / p) for p in options["systems_paths"]
+                ]
+            return AISimulateTimePredictor(model, hw=hw, config=sched_config, **options)
         elif predictor_config.get("name") == "ml":
             from sglang_simulator.time_predictor.ml import MLTimePredictor
 
@@ -246,7 +246,15 @@ class ConfigManager:
                 miss_knn_k=predictor_config.get("miss_knn_k", 3),
             )
         else:
+            name = predictor_config.get("name")
+            if name == "aiconfigurator":
+                raise ValueError(
+                    "The 'aiconfigurator' predictor was renamed 'aisimulate'. "
+                    "Update the 'predictor.name' field in the simulator "
+                    "configuration to 'aisimulate', and pair it with an "
+                    "AISimulate database backend_version (the examples use "
+                    "'0.5.10')."
+                )
             raise ValueError(
-                f"Unknown predictor name: {predictor_config.get('name')}. "
-                f"Supported: aiconfigurator, ml, replay"
+                f"Unknown predictor name: {name}. Supported: aisimulate, ml, replay"
             )

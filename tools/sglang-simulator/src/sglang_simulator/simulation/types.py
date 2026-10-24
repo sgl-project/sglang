@@ -11,8 +11,9 @@ class SchedulerConfig:
         None  # Data type for model weights and activations. If none is set, it will be automatically detected.
     )
     kv_cache_data_type: Optional[DataType] = None
-    # AIC adapter overrides — bypass MAP_DTYPE_TO_* lookup when set.
-    # Pass aiconfigurator MoEQuantMode/FMHAQuantMode/CommQuantMode enum name as string
+    # AISimulate adapter overrides — bypass MAP_DTYPE_TO_* lookup when set.
+    # Pass an AISimulate (aisimulate.sdk) MoEQuantMode/FMHAQuantMode/
+    # CommQuantMode enum name as string
     # (e.g. 'w4a8_mxfp4_mxfp8' for DSv4-Pro on Blackwell).
     moe_quant_mode_override: Optional[str] = None
     fmha_quant_mode_override: Optional[str] = None

@@ -14,6 +14,7 @@ from sglang_simulator.hook import (
 )
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
+from sglang_simulator.simulation.sglang.batch_snapshot import capture_batch_entry
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
@@ -332,10 +333,17 @@ class C_SchedulerHook(BaseHook):
 
                 hw = ConfigManager.get_accelerator_info()
 
-                if ConfigManager.get_scheduler_config() is None:
+                if (
+                    ConfigManager.uses_native_aisimulate()
+                    or ConfigManager.get_scheduler_config() is None
+                ):
                     sched_config = resolve_scheduler_config(
                         server_args=self.server_args,
                         model_config=self.model_config,
+                        native=ConfigManager.uses_native_aisimulate(),
+                        scheduler_overrides=ConfigManager._get_raw_config().get(
+                            "scheduler", {}
+                        ),
                     )
                     ConfigManager.set_scheduler_config(sched_config)
                 sched_config = ConfigManager.get_scheduler_config()
@@ -415,33 +423,39 @@ class C_SchedulerHook(BaseHook):
             req_stats.recv_host_hit_len = req.host_hit_length
 
         def wrapped_run_batch(self, *args, **kwargs):
-            ret = original_run_batch(self, *args, **kwargs)
-
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
+            predictor = C_SchedulerHook.INFERENCE_PREDICTOR
+            captured = None
+            if getattr(predictor, "requires_batch_snapshot", False):
+                captured = capture_batch_entry(batch)
+            ret = original_run_batch(self, *args, **kwargs)
 
             if ret.__class__.__name__ == "GenerationBatchResult":
-                simulation_batch = SimulationScheduleBatch(reqs=[])
-                if batch.forward_mode.is_extend():
-                    for req in batch.reqs:
-                        extend_length = getattr(req, "extend_input_len", None)
-                        if extend_length is None:
-                            extend_length = req.extend_len
-                        simulation_batch.reqs.append(
-                            ScheduleRequest(
-                                extend_length=extend_length,
-                                past_kv_length=req.prefix_len + len(req.output_ids),
+                if captured is not None:
+                    simulation_batch = captured
+                else:
+                    simulation_batch = SimulationScheduleBatch(reqs=[])
+                    if batch.forward_mode.is_extend():
+                        for req in batch.reqs:
+                            extend_length = getattr(req, "extend_input_len", None)
+                            if extend_length is None:
+                                extend_length = req.extend_len
+                            simulation_batch.reqs.append(
+                                ScheduleRequest(
+                                    extend_length=extend_length,
+                                    past_kv_length=req.prefix_len + len(req.output_ids),
+                                )
                             )
-                        )
-                elif batch.forward_mode.is_decode():
-                    for req in batch.reqs:
-                        simulation_batch.reqs.append(
-                            ScheduleRequest(
-                                extend_length=1,
-                                past_kv_length=req.prefix_len + len(req.output_ids),
+                    elif batch.forward_mode.is_decode():
+                        for req in batch.reqs:
+                            simulation_batch.reqs.append(
+                                ScheduleRequest(
+                                    extend_length=1,
+                                    past_kv_length=req.prefix_len + len(req.output_ids),
+                                )
                             )
-                        )
 
                 if not simulation_batch.is_empty():
                     StateManager.inc_iteration()
@@ -527,6 +541,7 @@ class C_SchedulerHook(BaseHook):
                 C_SchedulerHook.ITERATION_STATS.append(
                     {
                         "requests": C_SchedulerHook.SIMULATION_BATCH.request_info(),
+                        "forward_mode": C_SchedulerHook.SIMULATION_BATCH.forward_mode,
                         "forward_latency": current_inference_dur,
                         "l2_load_latency": hicache_l2_load_dur,
                         "l2_blocking_wall_latency": blocked_l2_wall_dur,
