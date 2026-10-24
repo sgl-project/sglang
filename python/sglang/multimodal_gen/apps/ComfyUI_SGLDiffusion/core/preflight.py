@@ -114,9 +114,10 @@ def check_sgld_options(sgld_options: dict) -> None:
 
 H3_MODELS = ("minimax_h3", "fast_h3", "vdn_h3")
 _DISTILLED_H3 = ("fast_h3", "vdn_h3")
-# Every ComfyUI step is its own request, so a step cache needs a per-run state;
-# only the H3 step stage keeps one today.
-_CACHE_MODELS = {"cache_dit": H3_MODELS, "spectrum": H3_MODELS, "teacache": ()}
+# Every ComfyUI step is its own request, so a step cache needs a per-run state.
+# The worker keeps one Cache-DiT context per sampler run for every model (None);
+# only the H3 step stage keeps spectrum state.
+_CACHE_MODELS = {"cache_dit": None, "spectrum": H3_MODELS, "teacache": ()}
 _ATTENTION_BY_MODEL = {
     "generic": ("fa", "torch_sdpa", "sage_attn", "sage_attn_3"),
     "minimax_h3": (
@@ -193,7 +194,8 @@ def _check_cache(model_type: str, opts: dict) -> None:
     mode = opts.get("cache_mode", "off")
     if mode == "off":
         return
-    if model_type not in _CACHE_MODELS[mode]:
+    allowed = _CACHE_MODELS[mode]
+    if allowed is not None and model_type not in allowed:
         raise _unsupported(mode, model_type)
     if mode == "spectrum":
         sp = (opts.get("ulysses_degree") or 1) * (opts.get("ring_degree") or 1)

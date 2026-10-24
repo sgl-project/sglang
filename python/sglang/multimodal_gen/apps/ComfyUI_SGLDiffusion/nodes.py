@@ -16,6 +16,11 @@ import folder_paths
 import torch
 
 from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
+from .executors.cache_options import (
+    CONSERVATIVE_PRESET,
+    build_cache_options,
+    with_cache_options,
+)
 from .options import SGLDOptions
 
 
@@ -1063,6 +1068,46 @@ class SGLDiffusionServerUnsetLora:
             raise RuntimeError(f"Failed to unset LoRA adapter: {str(e)}")
 
 
+class SGLDCacheOptions:
+    """Per-run Cache-DiT toggle on a cloned MODEL; never restarts the worker."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        knob = {"default": -1, "min": -1, "step": 1}
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "enable_cache_dit": (["default", "on", "off"], {"default": "default"}),
+            },
+            "optional": {
+                "preset": (["server default", "conservative"],),
+                "Fn_compute_blocks": ("INT", knob),
+                "Bn_compute_blocks": ("INT", knob),
+                "max_warmup_steps": ("INT", knob),
+                "max_continuous_cached_steps": ("INT", knob),
+                "residual_diff_threshold": (
+                    "FLOAT",
+                    {"default": -1.0, "min": -1.0, "step": 0.01},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "apply"
+    CATEGORY = "SGLDiffusion"
+
+    def apply(
+        self, model, enable_cache_dit="default", preset="server default", **knobs
+    ):
+        # -1 means "keep the preset / server value" for every knob.
+        params = dict(CONSERVATIVE_PRESET) if preset == "conservative" else {}
+        params.update({k: v for k, v in knobs.items() if v is not None and v >= 0})
+        enable = {"default": None, "on": True, "off": False}[enable_cache_dit]
+        options = build_cache_options(enable, params or None)
+        return (with_cache_options(model, options),)
+
+
 # Register nodes
 NODE_CLASS_MAPPINGS = {
     "SGLDH3DistilledSigmas": SGLDH3DistilledSigmas,
@@ -1076,6 +1121,7 @@ NODE_CLASS_MAPPINGS = {
     "SGLDNativeModelLoader": SGLDNativeModelLoader,
     "SGLDOptions": SGLDOptions,
     "SGLDLoraLoader": SGLDLoraLoader,
+    "SGLDCacheOptions": SGLDCacheOptions,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1089,4 +1135,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SGLDNativeModelLoader": "SGLDiffusion Native Model Loader",
     "SGLDOptions": "SGLDiffusion Options",
     "SGLDLoraLoader": "SGLDiffusion LoRA Loader",
+    "SGLDCacheOptions": "SGLDiffusion Cache Options",
 }

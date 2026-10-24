@@ -116,6 +116,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
+    comfyui_cache_dit_run,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.component_loading import (
     load_transformer_if_needed,
     register_loaded_transformer,
@@ -1009,10 +1012,24 @@ class DenoisingStage(PipelineStage):
                     "CUDA graphs are enabled."
                 )
             return
+        comfyui_run = (
+            comfyui_cache_dit_run(batch) if self.server_args.comfyui_mode else None
+        )
+        if comfyui_run is not None:
+            num_inference_steps = comfyui_run[0]
         self._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
             batch.sampling_params.cache_dit_params
         )
-        has_separate_cfg = requested and self._cache_dit_has_separate_cfg(batch)
+        # A ComfyUI CFG step arrives as one request per branch, so the request
+        # itself carries no CFG; the sampler run says whether branches alternate.
+        has_separate_cfg = requested and (
+            self._cache_dit_has_separate_cfg(batch)
+            or (
+                comfyui_run is not None
+                and comfyui_run[2]
+                and not self.server_args.enable_cfg_parallel
+            )
+        )
         desired_key = (
             (
                 cache_dit_overrides_key(self._cache_dit_request_overrides),
@@ -1024,6 +1041,8 @@ class DenoisingStage(PipelineStage):
         # opt-out or knob change: unmount, then remount below (or return)
         if self._cache_dit_enabled and desired_key != self._cache_dit_active_key:
             self._unmount_cache_dit()
+        if self._cache_dit_enabled and comfyui_run is not None and not comfyui_run[1]:
+            return
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
             primary_num_steps, secondary_num_steps = self._cache_dit_step_counts(
@@ -1139,6 +1158,12 @@ class DenoisingStage(PipelineStage):
                 sp_group=sp_group,
                 tp_group=tp_group,
                 has_separate_cfg=has_separate_cfg,
+                # Registered adapters ignore has_separate_cfg and assume a diffusers
+                # pipeline that batches CFG; ComfyUI sends one request per branch,
+                # so pass the run's own value (False too, or cfg=1 runs alternate).
+                separate_cfg_override=(
+                    bool(comfyui_run[2]) if comfyui_run is not None else None
+                ),
                 joint_cfg_decision=self._cache_dit_joint_cfg_decision(),
             )
             logger.info(

@@ -430,6 +430,29 @@ def test_renamed_h3_paths_resolve_through_the_plugin_model_id(
     assert info.pipeline_config_cls.__name__ == config_cls
 
 
+def test_loader_cache_dit_flag_change_reuses_worker() -> None:
+    runtime = SGLDiffusionGenerator()
+    patcher = object()
+    runtime.last_options = {
+        "model_path": "h3.safetensors",
+        "model_options": {},
+        "sgld_options": {},
+        "set_model_type": None,
+        "runtime_model_path": None,
+        "int8_kernel": "auto",
+        "worker_patch_identity": (),
+    }
+    runtime.model_type = "minimax_h3"
+    runtime.generator = object()
+    runtime._patcher = patcher
+    runtime.executor = SimpleNamespace(enable_cache_dit=None)
+    runtime._is_live = lambda: True
+    for mode, flag in (("cache_dit", True), ("off", False)):
+        got = runtime.load_model("h3.safetensors", {}, {"cache_mode": mode})
+        assert got is patcher
+        assert runtime.executor.enable_cache_dit is flag
+
+
 def test_get_model_info_reads_the_card_from_v1_models(monkeypatch) -> None:
     """The plugin reads the OpenAI /v1/models route, not the deprecated root
     /models, so it must unwrap the card from the list envelope."""

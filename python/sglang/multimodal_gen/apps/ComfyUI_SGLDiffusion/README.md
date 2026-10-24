@@ -74,7 +74,8 @@ worker and raises instead of dropping a setting. Current limits in integrated mo
 | torch_compile | all but FastH3 and VDN-H3 |
 | ring_degree > 1 | not FastH3 / VDN-H3; MiniMax H3 needs `fa` |
 | quantization | native model directories; BF16 Qwen-Image-2.1 files with `convrot_int8`. Other ComfyUI files carry their own format |
-| cache_dit, spectrum | MiniMax H3 family (spectrum: sequence-parallel degree 1); other models send each sampler step as its own request, so a step cache needs per-run state first |
+| cache_dit | all integrated-mode models; the worker keeps one Cache-DiT context per sampler run |
+| spectrum | MiniMax H3 family, sequence-parallel degree 1; other models send each sampler step as its own request, so spectrum needs per-run state first |
 | teacache | none yet |
 
 Changing anything but the Cache group restarts the worker on the next run.
@@ -181,3 +182,23 @@ Per sampler step:
 4. The worker pipeline is the native model class with modules trimmed to `transformer` + pass-through scheduler. A single-file checkpoint goes through `comfyui_checkpoints`. After the first step, conditioning stays in a worker session; later steps send latents and the timestep.
 
 Adding a model means a checkpoint spec plus a `ComfyUIModelAdapter`. There is no extra ComfyUI pipeline class.
+
+## Per-run cache options
+
+`SGLDiffusion Cache Options` takes a MODEL and returns a clone carrying a per-run Cache-DiT toggle (plus an optional preset and DBCache knobs; `-1` keeps the preset or server value). It is sent as a per-request sampling field, so changing it between runs does not restart the worker.
+
+- Works for every integrated-mode model. ComfyUI sends one request per DiT call, so the worker keeps one Cache-DiT context for the whole sampler run (sized from the run's `sample_sigmas`) instead of one per request.
+- CFG works: with `cfg` other than 1 and a negative prompt, the cond and uncond calls of a step count as one Cache-DiT step. A run that sends an uncond call while its guider does not run CFG raises a `ValueError`. MiniMax-H3 keeps its own run state and is not limited this way.
+- TeaCache is not exposed: H3 rejects `enable_teacache`, and the other models reset TeaCache state every request.
+- Quality trade-off: Cache-DiT reuses transformer residuals on steps where they barely changed, so the output is not bit-identical to the uncached run. It stays a clean image, but the layout shifts more as the threshold goes up. Measured on Flux.1-dev (1024x1024, 25 steps, euler, cfg 1, same seed, H100), against cache off:
+
+  | Setting | Speedup | PSNR | SSIM |
+  | --- | --- | --- | --- |
+  | `conservative` preset (warmup 8, threshold 0.08) | 1.37x | 22.5 dB | 0.81 |
+  | warmup 8, threshold 0.12 | 1.45x | 20.7 dB | 0.74 |
+  | warmup 4, threshold 0.12 | 1.52x | 19.2 dB | 0.69 |
+  | server default (warmup 4, threshold 0.24) | 1.81x | 18.1 dB | 0.62 |
+
+  Start from `conservative` when the output should stay close to the uncached run, and raise the threshold for more speed. Explicit knobs override the preset.
+- `off` disables caching and ignores any knobs left set, so there is no need to reset them. `default` keeps the knobs and applies them only if the loader option or server enables caching.
+- `cache_mode` (and `cache_dit_tuning`) in `SGLDiffusion Options` sets the loader default. A per-run `on`/`off` wins over it; `default` falls back to it, and changing it does not restart the worker.

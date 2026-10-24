@@ -33,6 +33,7 @@ class PackedForward:
     # Per-step residual tensors (ComfyUI ControlNet); never cached on the worker.
     control: dict[str, list] | None = None
     unpack_ctx: dict[str, Any] = field(default_factory=dict)
+    cache_options: dict[str, Any] = field(default_factory=dict)
 
 
 class ComfyUIModelAdapter:

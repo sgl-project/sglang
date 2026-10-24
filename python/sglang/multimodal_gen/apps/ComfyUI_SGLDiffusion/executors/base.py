@@ -7,6 +7,13 @@ import uuid
 
 import torch
 
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.cache_options import (
+    expected_model_calls,
+    guider_runs_cfg,
+    read_cache_options,
+    request_cache_dit_for_run,
+)
+
 try:
     from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
     from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -158,6 +165,16 @@ class SGLDiffusionExecutor(torch.nn.Module):
     """Shared ComfyUI DiT-forward executor. Per-model logic lives on the adapter."""
 
     adapter_cls = None
+    # False when the model's worker stage owns the per-run Cache-DiT state (H3).
+    cache_dit_needs_run_steps = True
+    # Loader-option default (SGLDOptions); a per-run SGLDCacheOptions value wins.
+    enable_cache_dit: bool | None = None
+    # Loader-option knobs (SGLDOptions manual tuning); per-run knobs override them.
+    cache_dit_params: dict | None = None
+    # Whether the current sampler run alternates cond and uncond requests.
+    _run_separate_cfg: bool = False
+    # DiT calls the current sampler run makes; None when the wrapper saw no sigmas.
+    _run_model_calls: int | None = None
 
     def __init__(self, generator, model_path, model, config):
         super(SGLDiffusionExecutor, self).__init__()
@@ -225,6 +242,17 @@ class SGLDiffusionExecutor(torch.nn.Module):
         if self._ensure_runtime is not None:
             self._ensure_runtime(self)
         model_wrap = args[0] if args else kwargs["model_wrap"]
+        self._run_separate_cfg = guider_runs_cfg(model_wrap)
+        # executor wraps KSAMPLER.sample(guider, sigmas, ...)
+        sigmas = args[1] if len(args) > 1 else kwargs.get("sigmas")
+        sampler_fn = getattr(
+            getattr(executor, "class_obj", None), "sampler_function", None
+        )
+        self._run_model_calls = (
+            expected_model_calls(sampler_fn, sigmas)
+            if sigmas is not None and len(sigmas) > 1
+            else None
+        )
         desired = model_wrap.model_patcher.model_options.get("sgld_lora_input")
         if desired != self._lora_input:
             if self._lora_input is not None:
@@ -293,7 +321,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
                 self._sent_conds.add(key)
 
     def _sampling_params_kwargs(self, packed, timestep) -> dict:
-        return {
+        kwargs = {
             "prompt": " ",
             "guidance_scale": packed.guidance_scale,
             "height": packed.height,
@@ -303,6 +331,25 @@ class SGLDiffusionExecutor(torch.nn.Module):
             "save_output": False,
             "suppress_logs": self.should_suppress_logs(timestep),
         }
+        enable = self._cache_dit_enabled_for(packed)
+        if enable is not None:
+            kwargs["enable_cache_dit"] = enable
+        # None leaves the switch to the server; the worker ignores params when off
+        if enable is not False:
+            params = {
+                **(self.cache_dit_params or {}),
+                **(packed.cache_options.get("cache_dit_params") or {}),
+            }
+            if params:
+                kwargs["cache_dit_params"] = params
+        return kwargs
+
+    def _cache_dit_enabled_for(self, packed) -> bool | None:
+        """Per-run SGLDCacheOptions value, else the loader option; None = server default."""
+        enable = packed.cache_options.get("enable_cache_dit")
+        if enable is None:
+            enable = self.enable_cache_dit
+        return None if enable is None else bool(enable)
 
     def _execute_packed(self, packed, x, timestep):
         if _RUNTIME_IMPORT_ERROR is not None:
@@ -325,7 +372,12 @@ class SGLDiffusionExecutor(torch.nn.Module):
         self.adapter.fill_req(req, packed)
         extra = dict(req.extra or {})
         extra["comfyui_session_id"] = self.comfyui_session_id()
-        for key in ("comfyui_cond_key", "comfyui_cache_fp"):
+        for key in (
+            "comfyui_cond_key",
+            "comfyui_cache_fp",
+            "comfyui_num_steps",
+            "comfyui_separate_cfg",
+        ):
             value = packed.extra_req.get(key)
             if value is not None:
                 extra[key] = value
@@ -380,4 +432,12 @@ class SGLDiffusionExecutor(torch.nn.Module):
         packed.unpack_ctx["comfyui_cond_uuid"] = (
             None if cond_uuid is None else (cond_uuid, _cond_row)
         )
+        packed.cache_options = read_cache_options(kwargs.get("transformer_options"))
+        if self.cache_dit_needs_run_steps and self._cache_dit_enabled_for(packed):
+            request_cache_dit_for_run(
+                packed,
+                kwargs.get("transformer_options"),
+                self._run_separate_cfg,
+                self._run_model_calls,
+            )
         return self._execute_packed(packed, x, timestep)
