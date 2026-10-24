@@ -418,6 +418,7 @@ class _LongCatJointAttention(nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
+            global_num_heads=num_attention_heads,
             head_size=attention_head_dim,
             causal=False,
         )
@@ -537,6 +538,7 @@ class _LongCatSingleAttention(nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
+            global_num_heads=num_attention_heads,
             head_size=attention_head_dim,
             causal=False,
         )

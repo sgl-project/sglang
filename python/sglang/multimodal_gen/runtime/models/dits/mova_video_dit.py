@@ -154,6 +154,7 @@ class SelfAttention(_MOVAAttention):
         self.attn = USPAttention(
             # Local heads per TP rank.
             num_heads=self.num_heads_per_rank,
+            global_num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,

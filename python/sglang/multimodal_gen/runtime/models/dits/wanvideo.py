@@ -240,6 +240,7 @@ class WanSelfAttention(nn.Module):
         # Scaled dot product attention
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -530,6 +531,7 @@ class WanTransformerBlock(nn.Module):
 
             self.attn1 = USPAttention(
                 num_heads=self.local_num_heads,
+                global_num_heads=num_heads,
                 head_size=dim // num_heads,
                 causal=False,
                 supported_attention_backends=self_attn_backends,
