@@ -212,7 +212,7 @@ python3 -m sglang.bench_serving \
 - `--extra-request-body '&#123;"top_p":0.9,"temperature":0.6&#125;'`: merged into payload (sampling params, etc.)
 - `--disable-ignore-eos`: pass through EOS behavior (varies by backend)
 - `--warmup-requests N`: run warmup requests with short output first (default 1)
-- `--flush-cache`: call `/flush_cache` (sglang) before main run
+- `--flush-cache`: after warmup, call `/flush_cache` for SGLang or `/reset_prefix_cache` for vLLM. Default is off.
 - `--profile`: call `/start_profile` and `/stop_profile` (requires server to enable profiling, e.g., `SGLANG_TORCH_PROFILER_DIR`)
 - `--lora-name name1 name2 ...`: randomly pick one per request and pass to backend (e.g., `lora_path` for sglang)
 - `--tokenize-prompt`: send integer IDs instead of text (currently supports `--backend sglang` only)
@@ -226,6 +226,21 @@ export OPENAI_API_KEY=sk-...yourkey...
 ```
 
 The script will add `Authorization: Bearer $OPENAI_API_KEY` automatically for OpenAI-compatible routes.
+
+### Radix cache and JSONL records
+
+SGLang keeps a radix prefix cache on the server between requests. `bench_serving` does not flush that cache by default. The same command run twice against one server therefore measures two cache states. The second run hits prefixes left by the first run.
+
+CI sets `SGLANG_IS_IN_CI=true`. For sglang backends that env value turns the post-warmup flush on, even when you omit `--flush-cache`. A command copied from a CI log and run locally without that env value does not flush.
+
+Each JSONL result row always includes:
+
+- `flushed_cache`: whether this invocation flushed after warmup
+- `cache_flush_reason`: `none`, `cli`, `ci`, or `cli_and_ci`
+- `cache_state`: `cold-flushed` when this invocation flushed, otherwise `uncontrolled`
+- `total_cached_tokens`: cached prompt tokens reported by successful requests in the measured run
+
+A third party can still call `POST /flush_cache` between your runs. That event has no reason code. Compare `total_cached_tokens` across rows to tell a residue rerun from a cold server. Pass `--flush-cache` when you want a local cold measurement that matches CI.
 
 ### Metrics explained
 
