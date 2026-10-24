@@ -161,6 +161,9 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+# Measured on B200: below 16 requests, the grouped C4 verify call is up to 1.2x
+# slower at short context.
+C4_GROUPED_VERIFY_MIN_REQUESTS = 16
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -1495,6 +1498,15 @@ class DeepseekV4AttnBackend(
             online_state_slot_offset=online_c128_state_slot_offset,
         )
 
+    def _c4_indexer_groups_verify_rows(self, bs: int) -> bool:
+        return (
+            bs >= C4_GROUPED_VERIFY_MIN_REQUESTS
+            and get_platform().is_sm100
+            and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+        )
+
     def init_forward_metadata_indexer(
         self,
         core_attn_metadata: DSV4AttnMetadata,
@@ -2288,9 +2300,14 @@ class DeepseekV4AttnBackend(
             need_compress=True,
             num_groups=bs,
         )
+        rows_per_request = 1 if is_ragged else num_draft_tokens
         indexer_metadata = (
             self.init_forward_metadata_indexer(
-                core_attn_metadata, use_prefill_cuda_graph=graph_backed
+                core_attn_metadata,
+                use_prefill_cuda_graph=graph_backed,
+                rows_per_request=(
+                    rows_per_request if self._c4_indexer_groups_verify_rows(bs) else 1
+                ),
             )
             if self.has_c4
             else None
@@ -2313,7 +2330,6 @@ class DeepseekV4AttnBackend(
         if c128_compress_metadata is None and self.has_c128:
             c128_compress_metadata = create(compress_ratio=128)
         low = core_attn_metadata.low_ratios
-        rows_per_request = 1 if is_ragged else num_draft_tokens
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,

@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.layers.attention.dsv4.indexer import group_verify_rows
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
@@ -45,17 +46,12 @@ class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
     def paged_logits_args(self, metadata, rows=slice(None)):
         """``(q, lengths, page_table)`` for ``deep_gemm_fp4_paged_mqa_logits`` over
         ``rows``, ``metadata.rows_per_request`` consecutive rows per request."""
-        n = metadata.rows_per_request
-        q_fp4, q_sf = self.q_fp4[rows], self.q_sf[rows]
-        lens = metadata.compressed_seq_lens[rows]
-        table = metadata.page_table[rows]
-        if n > 1:
-            heads = q_fp4.shape[2]
-            q_fp4 = q_fp4.view(-1, n, heads, 64)
-            q_sf = q_sf.view(-1, n, heads)
-            lens = lens.view(-1, n)
-            table = table[::n]
-        return (q_fp4, q_sf), lens, table
+        return group_verify_rows(
+            (self.q_fp4[rows], self.q_sf[rows]),
+            metadata.compressed_seq_lens[rows],
+            metadata.page_table[rows],
+            metadata.rows_per_request,
+        )
 
 
 class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
