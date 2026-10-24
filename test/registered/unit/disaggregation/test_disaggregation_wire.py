@@ -822,10 +822,12 @@ class TestQwen4StateWire(unittest.TestCase):
         pool.get_state_layer_ids = lambda: [2]
         pool.page_size = 4
         pool.qsa_compress_ratio = 2
+        # Sized for speculative verify: wider than one group.
+        pool.qsa_ring_size = 4
         pool.qsa_compressed_page_size = 2
         pool.full_attention_layer_id_mapping = {layer_id: 0}
-        pool.qsa_key_state_buffer_pool = [torch.zeros((6, 1, 8), dtype=torch.bfloat16)]
-        pool.qsa_rope_position_buffer = torch.zeros((6, 3), dtype=torch.int64)
+        pool.qsa_key_state_buffer_pool = [torch.zeros((12, 1, 8), dtype=torch.bfloat16)]
+        pool.qsa_rope_position_buffer = torch.zeros((12, 3), dtype=torch.int64)
         pool.qsa_compressed_k_buffer_pool = [
             torch.zeros((6, 1, 8), dtype=torch.bfloat16)
         ]
@@ -849,9 +851,9 @@ class TestQwen4StateWire(unittest.TestCase):
             kv_args.state_types,
             [StateType.MAMBA, StateType.QSA_PENDING, StateType.QSA_COMPRESSED],
         )
-        # Pending entries are whole two-row request rings; compressed-K remains
+        # Pending entries are whole four-row request rings; compressed-K remains
         # a two-row compressed page corresponding to one four-token KV page.
-        self.assertEqual(kv_args.state_item_lens[1:], [[32, 48], [32]])
+        self.assertEqual(kv_args.state_item_lens[1:], [[64, 96], [32]])
         self.assertEqual(
             kv_args.state_layer_ids[1:],
             [[24, QSA_ROPE_STATE_LAYER_ID], [24]],
