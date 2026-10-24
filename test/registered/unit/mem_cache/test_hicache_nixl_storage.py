@@ -551,7 +551,7 @@ class TestNixlUnified(CustomTestCase):
         """Zero-copy MLA batch_exists counts one storage key per logical key."""
         self.hicache.is_zero_copy = True
         self.hicache.is_mla_model = True
-        self.hicache.agent.query_memory = lambda *a, **kw: [object(), None]
+        self.hicache.agent.query_memory = lambda *a, **kw: [{"size": "16"}, None]
 
         self.assertEqual(self.hicache.batch_exists(["key1", "key2"]), 1)
 
@@ -560,8 +560,8 @@ class TestNixlUnified(CustomTestCase):
         self.hicache.is_zero_copy = True
         self.hicache.is_mla_model = False
         self.hicache.agent.query_memory = lambda *a, **kw: [
-            object(),
-            object(),
+            {"size": "16"},
+            {"size": "16"},
             None,
             None,
         ]
@@ -625,6 +625,83 @@ class TestNixlUnified(CustomTestCase):
             self.hicache.batch_get_v2([transfer]), {PoolName.INDEXER: [True]}
         )
         self.assertTrue(torch.equal(host.get_data_page(64), expected))
+
+    def test_batch_exists_rejects_incomplete_files(self):
+        """Empty files miss lookup; truncated reads cannot publish partial KV."""
+        self.addCleanup(self.hicache.close)
+        keys = ["complete", "incomplete", "later"]
+        for zero_copy in (False, True):
+            with self.subTest(zero_copy=zero_copy):
+                host = MockMemPoolHost(is_zero_copy_mode=zero_copy)
+                self.hicache.register_mem_pool_host(host)
+                self.assertEqual(
+                    self.hicache.batch_set_v1(keys, torch.arange(6)), [True] * 3
+                )
+                storage_key = (
+                    self.hicache._get_key_list_from_meta(keys)[3]
+                    if zero_copy
+                    else self.hicache._get_suffixed_key(keys[1])
+                )
+                path = self.hicache.file_manager.get_file_path(storage_key)
+                full_size = os.path.getsize(path)
+                self.assertEqual(self.hicache.batch_exists(keys), 3)
+                for size in (0, full_size - 1, full_size, full_size + 4096):
+                    with self.subTest(size=size):
+                        os.truncate(path, size)
+                        self.assertEqual(
+                            self.hicache.batch_exists(keys),
+                            1 if size == 0 else 3,
+                        )
+                        host.kv_buffer.fill_(9)
+                        self.assertEqual(
+                            self.hicache.batch_get_v1(keys, torch.arange(6)),
+                            [size >= full_size] * 3,
+                        )
+                        if size < full_size:
+                            self.assertTrue(torch.all(host.kv_buffer == 9))
+
+    def test_batch_exists_v2_rejects_incomplete_sidecars(self):
+        """Complete KV cannot make a truncated indexer or Mamba state a hit."""
+        self.addCleanup(self.hicache.close)
+        keys = ["sidecar-first", "sidecar-second", "sidecar-third"]
+        self.hicache.register_mem_pool_host(MockMemPoolHost(False))
+        self.assertEqual(self.hicache.batch_set_v1(keys, torch.arange(6)), [True] * 3)
+        for name, zero_copy in ((PoolName.INDEXER, False), (PoolName.MAMBA, True)):
+            with self.subTest(pool=name):
+                host = MockHybridPool(expose_zero_copy=zero_copy)
+                if zero_copy:
+                    # The temporal and convolution components need different sizes.
+                    host.conv_buffer = [torch.zeros((4, 16), dtype=torch.uint8)]
+                self.hicache.register_mem_host_pool_v2(host, name)
+                transfer = PoolTransfer(
+                    name=name, keys=keys, host_indices=torch.arange(3)
+                )
+                self.assertEqual(
+                    self.hicache.batch_set_v2([transfer]), {name: [True] * 3}
+                )
+                result = self.hicache.batch_exists_v2(keys, [transfer])
+                self.assertEqual(result.kv_hit_pages, 3)
+                multiplier = 2 if zero_copy else 1
+                storage_key = self.hicache._get_hybrid_component_keys(
+                    keys, name, multiplier
+                )[2 * multiplier - 1]
+                path = self.hicache.file_manager.get_file_path(storage_key)
+                full_size = os.path.getsize(path)
+                for size in (0, full_size - 1, full_size):
+                    with self.subTest(size=size):
+                        os.truncate(path, size)
+                        result = self.hicache.batch_exists_v2(keys, [transfer])
+                        self.assertEqual(result.kv_hit_pages, 1 if size == 0 else 3)
+                        self.assertEqual(result.extra_pool_hit_pages[PoolName.KV], 3)
+                        host.temporal_buffer.fill_(9)
+                        host.conv_buffer[0].fill_(9)
+                        self.assertEqual(
+                            self.hicache.batch_get_v2([transfer]),
+                            {name: [size >= full_size] * 3},
+                        )
+                        if size < full_size:
+                            self.assertTrue(torch.all(host.temporal_buffer == 9))
+                            self.assertTrue(torch.all(host.conv_buffer[0] == 9))
 
     def test_register_mem_host_pool_v2_uses_zero_copy_when_supported(self):
         pool = MockHybridPool(expose_zero_copy=True)
