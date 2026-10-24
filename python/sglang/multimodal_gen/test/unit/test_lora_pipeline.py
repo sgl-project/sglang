@@ -190,6 +190,7 @@ def test_quantized_base_uses_dynamic_lora_in_auto_mode():
 def test_dynamic_lora_reactivates_cached_layers_without_weight_update_context():
     layer = _make_layer()
     pipeline = _make_pipeline(layer)
+    pipeline.lora_layers["uncovered"] = _make_layer()
     context_calls = 0
 
     @contextmanager
@@ -267,9 +268,63 @@ def test_merged_lora_still_uses_weight_update_context():
     assert pipeline.is_lora_merged["transformer"]
 
 
+def test_repeated_auto_lora_kept_unmerged_is_skipped():
+    layer = BaseLayerWithLoRA(torch.nn.Linear(64, 96, bias=False, dtype=torch.bfloat16))
+    pipeline = _make_pipeline(layer)
+    g = torch.Generator().manual_seed(0)
+    pipeline.lora_adapters["adapter"]["linear.lora_A"] = torch.randn(8, 64, generator=g)
+    pipeline.lora_adapters["adapter"]["linear.lora_B"] = 1e-5 * torch.randn(
+        96, 8, generator=g
+    )
+    pipeline.auto_merge_rounding_loss = {}
+    contexts = []
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: (
+        contexts.append(1) or nullcontext([])
+    )
+
+    def set_auto():
+        with patch(_RANK_PATCH, return_value=0):
+            pipeline.set_lora("adapter", None, target="transformer", merge_mode="auto")
+
+    set_auto()
+    assert not layer.merged  # the update is below a BF16 ulp
+    set_auto()
+    assert not layer.merged
+    assert len(contexts) == 1  # an unchanged request skips the weight update
+
+
+def test_lora_critic_is_covered_by_all_and_packed_checks():
+    pipeline = _make_pipeline(_make_layer())
+    critic = torch.nn.Module()
+    critic.register_parameter(
+        "qweight", torch.nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+    )
+    pipeline.modules["fake_score_transformer"] = critic
+    pipeline.is_target_layer = lambda name: True
+    with pytest.raises(ValueError, match="fake_score_transformer"):
+        pipeline._reject_lora_on_packed_weights()
+
+    critic.disable_offload = critic.enable_offload = lambda: None
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline."
+            "is_layerwise_offloaded_module",
+            side_effect=lambda module: module is critic,
+        ),
+        pipeline._temporarily_disable_offload(
+            target="all", use_module_names_only=True
+        ) as disabled,
+    ):
+        assert disabled == [critic]
+
+
 def test_lora_alpha_override_updates_cached_adapter_scale():
     layer = _make_layer()
     pipeline = _make_pipeline(layer)
+
+    pipeline.load_lora_adapter = lambda path, nickname, rank, lora_alpha: (
+        pipeline.loaded_adapter_alphas.update({nickname: lora_alpha})
+    )
 
     with patch(_RANK_PATCH, return_value=0):
         pipeline.set_lora(
@@ -405,7 +460,9 @@ def test_cached_merge_restores_untouched_base_view():
     torch.testing.assert_close(base.weight, original, rtol=0, atol=0)
 
 
-def test_switching_adapters_unmerges_layers_the_new_adapter_skips():
+# "b" skips x; "c" covers x after it, so x must hold "c" alone, not "a" + "c".
+@pytest.mark.parametrize(("new", "delta_x"), [(["b"], 0.0), (["b", "c"], 2.0)])
+def test_switching_adapters_unmerges_layers_the_new_adapter_skips(new, delta_x):
     layer_x, layer_y = _make_layer(), _make_layer()
     base_x = layer_x.base_layer.weight.detach().clone()
     pipeline = _make_pipeline(layer_x)
@@ -414,6 +471,8 @@ def test_switching_adapters_unmerges_layers_the_new_adapter_skips():
     pipeline.lora_adapters["a"]["x.lora_B"] = torch.ones(2, 1)
     pipeline.lora_adapters["b"]["y.lora_A"] = torch.ones(1, 2)
     pipeline.lora_adapters["b"]["y.lora_B"] = torch.ones(2, 1)
+    pipeline.lora_adapters["c"]["x.lora_A"] = torch.ones(1, 2)
+    pipeline.lora_adapters["c"]["x.lora_B"] = torch.full((2, 1), 2.0)
 
     with patch(_RANK_PATCH, return_value=0):
         pipeline._apply_lora_to_layers(
@@ -421,15 +480,17 @@ def test_switching_adapters_unmerges_layers_the_new_adapter_skips():
         )
         assert not torch.equal(layer_x.base_layer.weight, base_x)
         pipeline._apply_lora_to_layers(
-            pipeline.lora_layers, ["b"], ["/b"], 0, [1.0], clear_existing=True
+            pipeline.lora_layers,
+            new,
+            [f"/{n}" for n in new],
+            0,
+            [1.0] * len(new),
+            clear_existing=True,
         )
 
-    assert not layer_x.merged
-    assert layer_x.disable_lora
-    assert layer_x.lora_weights_list == []
-    torch.testing.assert_close(layer_x.base_layer.weight, base_x)
+    assert len(layer_x.lora_weights_list) == (1 if delta_x else 0)
     x = torch.randn(3, 2)
-    torch.testing.assert_close(layer_x(x), x @ base_x.T)
+    torch.testing.assert_close(layer_x(x), x @ (base_x + delta_x).T)
 
 
 def test_unmerge_restores_base_even_when_lora_disabled():
@@ -442,3 +503,59 @@ def test_unmerge_restores_base_even_when_lora_disabled():
 
     assert not layer.merged
     torch.testing.assert_close(layer.base_layer.weight, base)
+
+
+def test_merge_strength_override_applies_to_every_adapter():
+    layer = _make_layer()
+    base = layer.base_layer.weight.detach().clone()
+    pipeline = _make_pipeline(layer)
+    pipeline.server_args.lora_merge_mode = "merge"
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+    pipeline.loaded_adapter_paths["second"] = "/second"
+    pipeline.loaded_adapter_alphas["second"] = None
+    pipeline.lora_adapters["second"] = pipeline.lora_adapters["adapter"]
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora(
+            ["adapter", "second"],
+            [None, None],
+            target="transformer",
+            strength=[0.5, 1.0],
+            merge_mode="merge",
+        )
+        torch.testing.assert_close(layer.base_layer.weight, base + 1.5)
+        # 0.5 equals only the first adapter's strength; the merge must not skip.
+        pipeline.merge_lora_weights("transformer", strength=0.5)
+
+    torch.testing.assert_close(layer.base_layer.weight, base + 1.0)
+    assert pipeline.cur_adapter_config["transformer"] == (
+        ["adapter", "second"],
+        [0.5, 0.5],
+    )
+
+
+def test_set_lora_all_updates_every_module_that_differs():
+    pipeline = _make_pipeline(_make_layer())
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+    pipeline.modules["transformer_2"] = torch.nn.Module()
+    pipeline.lora_layers_transformer_2 = {"linear": _make_layer()}
+    pipeline.loaded_adapter_paths["low"] = "/low"
+    pipeline.loaded_adapter_alphas["low"] = None
+    pipeline.lora_adapters["low"] = pipeline.lora_adapters["adapter"]
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", target="transformer", merge_mode="dynamic")
+        pipeline.set_lora("low", target="transformer_2", merge_mode="dynamic")
+        pipeline.set_lora("adapter", target="all", merge_mode="dynamic")
+
+    assert pipeline.cur_adapter_name["transformer_2"] == "adapter"
+
+
+def test_critic_offload_lookup_uses_fake_score_transformer():
+    pipeline = _make_pipeline(_make_layer())
+    critic = torch.nn.Module()
+    pipeline.modules["fake_score_transformer"] = critic
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline."
+        "is_layerwise_offloaded_module",
+        side_effect=lambda module: module is critic,
+    ):
+        assert pipeline._has_layerwise_offload([("critic", {})])
