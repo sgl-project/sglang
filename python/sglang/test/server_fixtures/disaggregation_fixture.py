@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    get_gpu_count,
     is_in_ci,
     popen_launch_pd_server,
     popen_with_error_check,
@@ -54,6 +55,9 @@ class PDDisaggregationServerBase(CustomTestCase):
     prefill_tp_size: ClassVar[int] = 1
     decode_tp_size: ClassVar[int] = 1
     decode_base_gpu_id: ClassVar[int] = 1
+    # False for runners without RDMA NICs (e.g. Intel XPU): CI mode then skips the
+    # NIC lookup, --disaggregation-ib-device, and the MC_GID_INDEX/UCX_NET_DEVICES env.
+    use_rdma: ClassVar[bool] = True
     _prefill_stdout_buf: ClassVar[Optional[io.StringIO]] = None
     _prefill_stderr_buf: ClassVar[Optional[io.StringIO]] = None
     _decode_stdout_buf: ClassVar[Optional[io.StringIO]] = None
@@ -96,11 +100,13 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls._ucx_net_devices_set = False
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
-            _warn_if_rdma_unopenable()
-            ib_devices = get_rdma_devices_args()
-            cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
-            cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
-            cls._ucx_net_devices_set = _maybe_set_ucx_net_devices(ib_devices)
+            cls.rdma_devices = []
+            if cls.use_rdma:
+                _warn_if_rdma_unopenable()
+                ib_devices = get_rdma_devices_args()
+                cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
+                cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
+                cls._ucx_net_devices_set = _maybe_set_ucx_net_devices(ib_devices)
         else:
             cls.transfer_backend = [
                 "--disaggregation-transfer-backend",
@@ -380,9 +386,7 @@ def get_rdma_devices_args(gpu_indices=None) -> str:
         return ",".join([rdma_all_devices[0], rdma_all_devices[n_rdma // 2]])
 
     try:
-        import torch
-
-        total_gpus = torch.cuda.device_count()
+        total_gpus = get_gpu_count()
     except Exception:
         total_gpus = 0
     total_gpus = total_gpus or max(8, gpu_indices[-1] + 1)

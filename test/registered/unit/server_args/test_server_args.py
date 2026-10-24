@@ -282,6 +282,37 @@ class TestPrepareServerArgs(CustomTestCase):
                     chunked_prefill_size=-1,
                 ).check_server_args()
 
+    @staticmethod
+    def _check_with_custom_mem_pool(device: str, pool: str) -> None:
+        with patch.dict(os.environ, {"SGLANG_MOONCAKE_CUSTOM_MEM_POOL": pool}):
+            ServerArgs(
+                model_path="dummy",
+                served_model_name="dummy",
+                device=device,
+                chunked_prefill_size=-1,
+            ).check_server_args()
+
+    def test_mooncake_custom_mem_pool_rejected_on_xpu(self):
+        """XPU has no CUDA allocator for Mooncake's pools; fail at startup."""
+        for pool in ("INTRA_NODE_NVLINK", "NVLINK"):
+            with (
+                self.subTest(pool=pool),
+                self.assertRaisesRegex(
+                    ValueError, "SGLANG_MOONCAKE_CUSTOM_MEM_POOL is not supported"
+                ),
+            ):
+                self._check_with_custom_mem_pool("xpu", pool)
+
+    def test_mooncake_custom_mem_pool_check_is_xpu_only(self):
+        """Other devices keep their behaviour, and a disabling value passes on XPU."""
+        for device, pool in (
+            ("cuda", "INTRA_NODE_NVLINK"),
+            ("npu", "INTRA_NODE_NVLINK"),
+            ("xpu", "False"),
+        ):
+            with self.subTest(device=device, pool=pool):
+                self._check_with_custom_mem_pool(device, pool)
+
     def test_enable_w4a4_mxfp4_megamoe_preserves_legacy_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",

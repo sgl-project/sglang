@@ -108,4 +108,114 @@ ARG TORCH_MEMORY_SAVER_REF=a5c99f11b18ebb8e9fda71a68812e476ae49e417
 RUN TMS_PLATFORM=xpu pip install --no-cache-dir --no-build-isolation \
     git+https://github.com/fzyzcjy/torch_memory_saver.git@${TORCH_MEMORY_SAVER_REF}
 
+# Mooncake transfer engine for PD disaggregation, built with icpx (the XPU TUs
+# use -fsycl). TENT carries the XPU path: on one node it copies KV card to card
+# through Level Zero IPC (kvcache-ai/Mooncake#4379), so no RDMA NIC is needed.
+# WITH_STORE=OFF: the store does not build with icpx at this commit.
+ARG MOONCAKE_REPO=https://github.com/kvcache-ai/Mooncake.git
+ARG MOONCAKE_COMMIT=c67a88f381f69e869045f353539e90c76e738830
+RUN git clone ${MOONCAKE_REPO} /tmp/Mooncake && \
+    cd /tmp/Mooncake && \
+    git checkout ${MOONCAKE_COMMIT} && \
+    # Mooncake uses Boost headers only (as the script's SHCA path assumes), and
+    # libboost-all-dev pulls OpenMPI, libfabric and a second UCX (about 500 MB).
+    # The grep, anchored to the package entry, fails the build if a
+    # MOONCAKE_COMMIT bump renames or drops it.
+    grep -qE '^ +libboost-all-dev \\$' dependencies.sh && \
+    sed -i 's/libboost-all-dev/libboost-dev/' dependencies.sh && \
+    bash dependencies.sh -y && \
+    cmake -S . -B build -G Ninja \
+        -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+        -DCMAKE_BUILD_TYPE=Release -DENABLE_DEBUG_SYMBOLS=OFF \
+        -DUSE_XPU=ON -DUSE_TENT=ON \
+        -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+        -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF && \
+    cmake --build build -j "$(nproc)" && \
+    cmake --install build && \
+    cd / && rm -rf /tmp/Mooncake /usr/local/go && \
+    sed -i '\|/usr/local/go/bin|d' /root/.bashrc && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    python -c "import mooncake.engine"
+
+# UCX with the Level Zero (ze) and mlx5 transports, then NIXL on top of it, for
+# the NIXL PD transfer backend. --with-ze=yes builds ZE copy and ZE IPC.
+# A master commit, not a release: ZE IPC for Intel GPUs (openucx/ucx#11218) is in no
+# release yet (not v1.22.0, v1.23.0-rc1 or the v1.23.x branch). Move to the first
+# release tag that contains it.
+ARG UCX_REPO=https://github.com/openucx/ucx.git
+ARG UCX_COMMIT=d76cd54b62b64d263e5e588e91871085dc4da7b2
+ARG UCX_INSTALL_DIR=/opt/ucx
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        autoconf automake libtool pkg-config libibverbs-dev && \
+    git clone ${UCX_REPO} /tmp/ucx && \
+    cd /tmp/ucx && \
+    git checkout ${UCX_COMMIT} && \
+    ./autogen.sh && \
+    ./configure --prefix=${UCX_INSTALL_DIR} --with-mlx5=yes --with-ze=yes --enable-mt \
+        --disable-static --enable-optimizations --disable-doxygen-doc && \
+    make -j "$(nproc)" && \
+    make -j install-strip && \
+    cd / && rm -rf /tmp/ucx && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    test -f ${UCX_INSTALL_DIR}/lib/ucx/libuct_ze.so && \
+    test -f ${UCX_INSTALL_DIR}/lib/ucx/libuct_ib_mlx5.so
+
+# NIXL needs Abseil 20240116 or newer (older fails with VLOG not declared), but
+# Mooncake's dependencies.sh pulls in Ubuntu's libabsl-dev 20220623. Build a static
+# copy and put it first on PKG_CONFIG_PATH so meson resolves every absl module to it.
+ARG ABSEIL_VERSION=20250814.1
+ARG ABSEIL_PREFIX=/opt/abseil
+# Record which NIXL build tools the venv lacks, so only those are removed after the
+# NIXL build; ones sglang already depends on (ninja, pyyaml) stay.
+RUN for pkg in meson ninja pybind11 meson-python patchelf pyyaml tomlkit; do \
+        pip show -q "$pkg" >/dev/null 2>&1 || echo "$pkg"; \
+    done > /tmp/nixl-build-only.txt && \
+    pip install --no-cache-dir meson ninja pybind11 && \
+    curl -fsSL https://github.com/abseil/abseil-cpp/releases/download/${ABSEIL_VERSION}/abseil-cpp-${ABSEIL_VERSION}.tar.gz \
+        | tar xz -C /tmp && \
+    cmake -S /tmp/abseil-cpp-${ABSEIL_VERSION} -B /tmp/absl_build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=${ABSEIL_PREFIX} \
+        -DCMAKE_CXX_STANDARD=20 \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DABSL_PROPAGATE_CXX_STD=ON \
+        -DBUILD_TESTING=OFF && \
+    ninja -C /tmp/absl_build install && \
+    rm -rf /tmp/abseil-cpp-${ABSEIL_VERSION} /tmp/absl_build
+
+# NIXL's documented source install: the nixl-cu12 Python package, the C++ libraries
+# and plugins, then the nixl meta package. The Python package keeps a RUNPATH to the
+# meson prefix for libnixl_common and friends, so both builds must share NIXL_PREFIX.
+# --no-build-isolation reuses the image's XPU torch (pyproject pins a CUDA torch).
+ARG NIXL_REPO=https://github.com/ai-dynamo/nixl.git
+# Includes ai-dynamo/nixl#1536: the UCX plugin passes the VRAM memory type to UCX at
+# registration (auto-selects ze-device on a ZE-only UCX), so XPU memory is not
+# misclassified as host and no UCX_MEMTYPE_CACHE override is needed.
+ARG NIXL_COMMIT=466ebb1ccc5a6e4e8cbaf954c94020400c9ae876
+ARG NIXL_PREFIX=/opt/nixl
+RUN export PKG_CONFIG_PATH=${ABSEIL_PREFIX}/lib/pkgconfig:${UCX_INSTALL_DIR}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}} && \
+    pip install --no-cache-dir meson-python patchelf pyyaml tomlkit && \
+    git clone ${NIXL_REPO} /tmp/nixl && \
+    cd /tmp/nixl && \
+    git checkout ${NIXL_COMMIT} && \
+    pip install --no-cache-dir --no-deps --no-build-isolation . \
+        --config-settings=setup-args="-Dprefix=${NIXL_PREFIX}" \
+        --config-settings=setup-args="-Ducx_path=${UCX_INSTALL_DIR}" \
+        --config-settings=setup-args="-Denable_plugins=UCX,POSIX" \
+        --config-settings=setup-args="-Dbuild_examples=false" && \
+    meson setup build --prefix=${NIXL_PREFIX} --buildtype=release \
+        -Dinstall_headers=true -Ducx_path=${UCX_INSTALL_DIR} \
+        -Denable_plugins=UCX,POSIX -Dbuild_examples=false && \
+    ninja -C build install && \
+    pip install --no-cache-dir --no-deps build/src/bindings/python/nixl-meta/nixl-*-py3-none-any.whl && \
+    xargs -r pip uninstall -y < /tmp/nixl-build-only.txt && \
+    cd / && rm -rf /tmp/nixl /tmp/nixl-build-only.txt
+RUN python -c "import nixl; nixl.nixl_agent('agent1')"
+
+# The PD tests launch a sglang-router between the prefill and decode servers.
+ARG SGLANG_ROUTER_VERSION=0.3.2
+RUN pip install --no-cache-dir sglang-router==${SGLANG_ROUTER_VERSION}
+
 CMD ["bash"]
