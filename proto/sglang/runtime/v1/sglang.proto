@@ -70,6 +70,7 @@ message SamplingParams {
   optional string regex = 15 [deprecated = true];
   optional int64 seed = 16;
   optional GuidedDecoding guided_decoding = 17;
+  bool use_remaining_context = 18;
 }
 
 message GuidedDecoding {
