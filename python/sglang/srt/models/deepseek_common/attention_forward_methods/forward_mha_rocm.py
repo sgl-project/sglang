@@ -8,11 +8,13 @@ cores in `DeepseekMHAForwardMixin` are reused as-is.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp import all_gather_kv_cache_for_mha_extend
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -39,6 +41,8 @@ from sglang.srt.utils import BumpAllocator, get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+logger = logging.getLogger(__name__)
 
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and _use_aiter_gfx95
@@ -363,3 +367,37 @@ class DeepseekMHARocmForwardMixin:
             )
             kv_a = kv_a.squeeze(1).contiguous()
         return kv_a, k_pe
+
+
+_PREFIX_KV_FP8_LOGGED: set[int] = set()
+
+
+def project_prefix_kv_fp8(self, kv_a: torch.Tensor, k_pe: torch.Tensor):
+    # MXFP4 kv_b_proj writes unit-scale FP8 K/V, RoPE concat included.
+    if k_pe is None:
+        return None
+    if not envs.SGLANG_ENABLE_AITER_MLA_FLYDSL_FUSED_KV_PROJ.get():
+        return None
+    weight = self.kv_b_proj.weight
+    if weight is None or weight.dtype != torch.uint8:
+        return None
+    if kv_a.dim() == 3:
+        kv_a = kv_a.squeeze(1)
+    if k_pe.dim() == 2:
+        k_pe = k_pe.unsqueeze(1)
+    if k_pe.shape[1] != self.num_local_heads:
+        k_pe = k_pe.expand(-1, self.num_local_heads, -1)
+    if self.layer_id not in _PREFIX_KV_FP8_LOGGED:
+        logger.info("MLA prefix chunks project K/V directly to unit-scale FP8")
+        _PREFIX_KV_FP8_LOGGED.add(self.layer_id)
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+
+    return self.kv_b_proj(
+        (
+            kv_a,
+            k_pe,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+            fp8_dtype,
+        )
+    )[0]
