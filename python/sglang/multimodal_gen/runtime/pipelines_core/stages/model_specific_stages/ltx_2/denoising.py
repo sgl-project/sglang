@@ -77,6 +77,8 @@ class LTX2DenoisingContext(DenoisingContext):
     # fp32 copies of scheduler.sigmas taken once per loop, so steps never sync on them
     sigmas_host: torch.Tensor | None = None
     sigmas_device: torch.Tensor | None = None
+    # key of the prompt K/V the DiT projected for this loop (prepare_prompt_kv)
+    prompt_kv_key: tuple[int, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -1136,6 +1138,20 @@ class LTX2DenoisingStage(DenoisingStage):
             self._ltx2_coords_cache.popitem(last=False)
         return coords
 
+    @staticmethod
+    def _ltx23_token_timesteps(
+        timestep: torch.Tensor, num_tokens: int, batch: Req
+    ) -> torch.Tensor:
+        """Per-token LTX-2.3 timesteps ``[B, num_tokens]``, or ``[B, 1]`` under lossless.
+
+        Without a denoise mask every token carries the step's sigma, so the DiT can
+        build one AdaLN row per sample and broadcast it instead of one per token.
+        """
+        timestep = timestep.view(-1, 1)
+        if quality_allows(batch.quality, "lossless"):
+            return timestep
+        return timestep.expand(-1, num_tokens)
+
     def _prepare_ltx2_model_inputs(
         self,
         ctx: LTX2DenoisingContext,
@@ -1185,8 +1201,8 @@ class LTX2DenoisingStage(DenoisingStage):
                 batch_size, int(latent_model_input.shape[1]), 1
             )
         elif use_ltx23_two_stage_prompt_timestep:
-            timestep_video = timestep.view(batch_size, 1).expand(
-                batch_size, int(latent_model_input.shape[1])
+            timestep_video = self._ltx23_token_timesteps(
+                timestep, int(latent_model_input.shape[1]), batch
             )
         else:
             timestep_video = timestep
@@ -1196,8 +1212,8 @@ class LTX2DenoisingStage(DenoisingStage):
                 batch_size, int(audio_latent_model_input.shape[1]), 1
             )
         elif use_ltx23_two_stage_prompt_timestep and audio_latent_model_input.ndim == 3:
-            timestep_audio = timestep.view(batch_size, 1).expand(
-                batch_size, int(audio_latent_model_input.shape[1])
+            timestep_audio = self._ltx23_token_timesteps(
+                timestep, int(audio_latent_model_input.shape[1]), batch
             )
         else:
             timestep_audio = timestep
@@ -1460,6 +1476,36 @@ class LTX2DenoisingStage(DenoisingStage):
                 current_timestep=step.step_index, attn_metadata=step.attn_metadata
             ):
                 yield
+
+    def _use_cached_ltx2_prompt_kv(
+        self,
+        ctx: LTX2DenoisingContext,
+        step: DenoisingStepState,
+        model_kwargs: dict[str, object],
+    ) -> dict[str, object]:
+        """Project the prompt K/V on the loop's first step and have every step read them.
+
+        The text and the DiT weights are fixed for one loop (the LoRA phase switches
+        before it), so the K/V each step would project are the same tensors.
+        """
+        model = step.current_model
+        if (
+            not model.caches_prompt_kv
+            or model.layerwise_offload_managers
+            or self._cache_dit_enabled
+        ):
+            return model_kwargs
+        if ctx.prompt_kv_key is None:
+            ctx.prompt_kv_key = model.prepare_prompt_kv(
+                model_kwargs["encoder_hidden_states"],
+                model_kwargs["audio_encoder_hidden_states"],
+            )
+        return {
+            **model_kwargs,
+            "encoder_hidden_states": None,
+            "audio_encoder_hidden_states": None,
+            "cached_prompt_kv": ctx.prompt_kv_key,
+        }
 
     def _ltx2_call_current_model(
         self,
@@ -1769,6 +1815,7 @@ class LTX2DenoisingStage(DenoisingStage):
                         model_kwargs["audio_encoder_attention_mask"] = (
                             repeated_attention_mask
                         )
+            model_kwargs = self._use_cached_ltx2_prompt_kv(ctx, step, model_kwargs)
 
             with self._ltx2_model_forward_context(ctx, step):
                 model_video, model_audio = self._ltx2_call_current_model(

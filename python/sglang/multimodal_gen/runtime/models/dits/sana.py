@@ -611,6 +611,9 @@ class SanaTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             encoder_attention_mask = encoder_attention_mask.expand(
                 batch_size, -1
             ).contiguous()
+        if encoder_attention_mask is not None:
+            # every block's cross-attention reads the mask as bool: cast it once
+            encoder_attention_mask = encoder_attention_mask.bool()
 
         for block in self.transformer_blocks:
             hidden_states = block(
