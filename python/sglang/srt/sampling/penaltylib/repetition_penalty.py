@@ -1,3 +1,5 @@
+from itertools import chain
+
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
@@ -18,7 +20,7 @@ def apply_scaling_penalties(logits, scaling_penalties):
 
 class BatchedRepetitionPenalizer(_BatchedPenalizer):
     """
-    Repetition penalizer penalizes tokens based on their presence in the generated output.
+    Repetition penalizer penalizes tokens based on their presence in the prompt and generated output.
     """
 
     is_multiplicative: bool = True
@@ -48,6 +50,26 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
             .to(self.orchestrator.device, non_blocking=True)
             .unsqueeze_(1)
         )
+
+        rows = []
+        token_ids = []
+        for row, req in enumerate(self.orchestrator.reqs()):
+            if req.sampling_params.repetition_penalty == 1.0:
+                continue
+            seen = {
+                token_id
+                for token_id in chain(req.origin_input_ids_unpadded, req.output_ids)
+                if 0 <= token_id < self.orchestrator.vocab_size
+            }
+            rows.extend([row] * len(seen))
+            token_ids.extend(seen)
+        if token_ids:
+            indices = torch.tensor(
+                [rows, token_ids], dtype=torch.int64, pin_memory=pin_memory
+            ).to(self.orchestrator.device, non_blocking=True)
+            self.cumulated_repetition_penalties[indices[0], indices[1]] = (
+                self.repetition_penalties[indices[0], 0]
+            )
 
     def _cumulate_output_tokens(self, output_ids: torch.Tensor):
         self.cumulated_repetition_penalties.scatter_(
