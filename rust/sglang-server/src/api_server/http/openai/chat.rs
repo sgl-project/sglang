@@ -27,7 +27,6 @@ use sglang_processor::dynamo_protocols::types::{
     FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
     TopLogprobs,
 };
-use sglang_processor::openai::ChatModel;
 use sglang_processor::{
     ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning,
     tool_call_stream,
@@ -173,24 +172,12 @@ async fn chat_completions(
     let tools = (!tools.is_empty()).then_some(tools);
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    // Python's chat-layer facts for the served template, and whether the
-    // reply starts in reasoning, as Python decides it from the request.
-    let chat_model = state
-        .chat_formatter
-        .as_ref()
-        .map(ChatModel::for_formatter)
-        .unwrap_or_default();
-    let force_reasoning = chat_model.request_thinking(
-        reasoning_parser.as_deref(),
-        &raw,
-        &state.server_args.default_chat_template_kwargs,
-    );
     let (request, rendered) = match prepare_chat_request(&state, raw, request).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
 
-    let mut sampling = match chat_sampling(
+    let sampling = match chat_sampling(
         &request,
         SamplingDefaults::CHAT,
         parser.as_deref(),
@@ -204,10 +191,6 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, message, false);
         }
     };
-
-    if chat_model.keeps_special_tokens(reasoning_parser.as_deref()) {
-        sampling.skip_special_tokens = false;
-    }
 
     let stream = request.stream.unwrap_or(false);
     let prompt_count = 1;
@@ -234,13 +217,8 @@ async fn chat_completions(
         || state.server_args.stream_response_default_include_usage;
     let mut submitted = Vec::with_capacity(choices_per_prompt);
 
-    let prompt_stub_tokens = chat_model.unreported_prompt_tokens() as u32;
-    // As Python, the continued text decides whether generation starts in reasoning.
-    let reasoning_options = ReasoningOptions {
-        force_reasoning,
-        previous_content: Some(rendered.continuation.clone()),
-        ..Default::default()
-    };
+    let starts_in_reasoning =
+        starts_in_reasoning(reasoning_parser.as_deref(), rendered.prompt.as_str());
     let mut prompt = Some(Box::new(rendered));
     for index in 0..choices_per_prompt {
         let rid = Rid::from_client(&format!("{response_id}-{index}"));
@@ -266,9 +244,6 @@ async fn chat_completions(
             bootstrap_room,
             routed_dp_rank: routing.routed_dp_rank,
             disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
-            // Python's thinking mode: the grammar starts after the reasoning,
-            // which the scheduler also counts.
-            require_reasoning: reasoning_options.force_reasoning == Some(true),
             ..Default::default()
         };
         let call = match submit_generation(&state, native, stream).await {
@@ -288,8 +263,7 @@ async fn chat_completions(
             include_usage,
             parser,
             reasoning_parser,
-            reasoning_options,
-            prompt_stub_tokens,
+            starts_in_reasoning,
             tools,
             stream_tool_choice,
             uses_tool_call_structural_tag,
@@ -307,8 +281,7 @@ async fn chat_completions(
             want_logprobs,
             parser,
             reasoning_parser,
-            reasoning_options,
-            prompt_stub_tokens,
+            starts_in_reasoning,
             tools,
             parallel_tool_calls,
             service_tier,
@@ -505,12 +478,15 @@ pub(super) async fn unary_chat(
     want_logprobs: bool,
     parser: Option<String>,
     reasoning_parser: Option<String>,
-    reasoning_options: ReasoningOptions,
-    prompt_stub_tokens: u32,
+    starts_in_reasoning: bool,
     tools: Option<Vec<ToolDefinition>>,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
 ) -> Response {
+    let reasoning_options = ReasoningOptions {
+        force_reasoning: starts_in_reasoning.then_some(true),
+        ..Default::default()
+    };
     let mut choices = Vec::with_capacity(submitted.len());
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0u64;
@@ -524,7 +500,7 @@ pub(super) async fn unary_chat(
         };
 
         if prompt_tokens == 0 {
-            prompt_tokens = output.prompt_tokens.saturating_sub(prompt_stub_tokens);
+            prompt_tokens = output.prompt_tokens;
         }
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
@@ -595,8 +571,7 @@ pub(super) fn chat_event_stream(
     include_usage: bool,
     parser: Option<String>,
     reasoning_parser: Option<String>,
-    reasoning_options: ReasoningOptions,
-    prompt_stub_tokens: u32,
+    starts_in_reasoning: bool,
     tools: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
@@ -614,7 +589,10 @@ pub(super) fn chat_event_stream(
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
             if reasoning_parser.is_some() {
                 (0..count)
-                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), reasoning_options.clone()))
+                    .map(|_| ReasoningStreamSplitter::new(reasoning_parser.as_deref(), ReasoningOptions {
+                        force_reasoning: starts_in_reasoning.then_some(true),
+                        ..Default::default()
+                    }))
                     .collect()
             } else {
                 vec![]
@@ -662,7 +640,7 @@ pub(super) fn chat_event_stream(
                 }
             };
             if prompt_tokens == 0 {
-                prompt_tokens = output.prompt_tokens.saturating_sub(prompt_stub_tokens);
+                prompt_tokens = output.prompt_tokens;
             }
             completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
             let finish_reason = chat_finish_reason(&output);
@@ -896,23 +874,27 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
     }
 }
 
+/// V4, GLM-5.3 and Qwen3.8 prefill `<think>` (Qwen3.8 with a newline) when
+/// thinking, so the generated stream has no opening marker.
+fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
+    matches!(
+        reasoning_parser,
+        Some("deepseek-v4" | "deepseek_v4" | "deepseekv4" | "glm45" | "qwen3")
+    ) && prompt.trim_end_matches('\n').ends_with("<think>")
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::super::ChatFormatter;
-    use super::super::test_utils::{
-        answering_app_state_with, body_json, chat_submitted, chunk, post_json,
-    };
+    use super::super::test_utils::{chat_submitted, chunk};
     use super::{
         SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        merge_template_stops, starts_in_reasoning, unary_chat,
     };
-    use crate::message::config::{DefaultSamplingParams, ServerArgs};
+    use crate::message::config::DefaultSamplingParams;
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
     use futures::StreamExt;
-    use sglang_processor::ReasoningOptions;
     use sglang_processor::dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
 
     fn request() -> CreateChatCompletionRequest {
@@ -921,6 +903,30 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn prefilled_think_starts_in_reasoning() {
+        let glm = Some("glm45");
+        assert!(starts_in_reasoning(glm, "<|user|>hi<|assistant|><think>"));
+        assert!(!starts_in_reasoning(
+            glm,
+            "<|user|>hi<|assistant|><think></think>"
+        ));
+        let qwen = Some("qwen3");
+        assert!(starts_in_reasoning(
+            qwen,
+            "<|im_start|>assistant\n<think>\n"
+        ));
+        assert!(!starts_in_reasoning(
+            qwen,
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        ));
+        assert!(starts_in_reasoning(
+            Some("deepseek-v4"),
+            "<｜Assistant｜><think>"
+        ));
+        assert!(!starts_in_reasoning(None, "<think>\n"));
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
@@ -1085,8 +1091,7 @@ mod tests {
             false,
             None,
             None,
-            ReasoningOptions::default(),
-            3, // Kimi K3's generation stub
+            false,
             None,
             true,
             None,
@@ -1100,60 +1105,8 @@ mod tests {
         assert_eq!(value["choices"][0]["message"]["role"], "assistant");
         assert_eq!(value["choices"][0]["message"]["content"], "Paris");
         assert_eq!(value["choices"][1]["index"], 1);
-        assert_eq!(
-            value["usage"]["prompt_tokens"], 2,
-            "the stub is not reported"
-        );
+        assert_eq!(value["usage"]["prompt_tokens"], 5);
         assert_eq!(value["usage"]["completion_tokens"], 2);
-    }
-
-    /// The first choice's message for `body`, against a core answering `text`.
-    async fn chat_message(
-        reasoning_parser: &str,
-        formatter: ChatFormatter,
-        text: &'static str,
-        body: serde_json::Value,
-    ) -> serde_json::Value {
-        let args = ServerArgs {
-            served_model_name: "model".into(),
-            reasoning_parser: Some(reasoning_parser.into()),
-            ..Default::default()
-        };
-        let state = answering_app_state_with(Arc::new(args), formatter, None, text);
-        let app = super::routes().with_state(state);
-        let response = post_json(app, "/v1/chat/completions", body).await;
-        body_json(response).await["choices"][0]["message"].clone()
-    }
-
-    /// A continuation that already closed its think block generates content.
-    #[tokio::test]
-    async fn continuation_after_think_end_is_content() {
-        let body = serde_json::json!({
-            "model": "model",
-            "messages": [
-                {"role": "user", "content": "What is 17*23?"},
-                {"role": "assistant", "content": "17*23</think>The answer is"}
-            ],
-            "continue_final_message": true,
-            "chat_template_kwargs": {"thinking": true}
-        });
-        let message = chat_message("deepseek-v4", ChatFormatter::DeepSeekV41, " 391.", body).await;
-        assert_eq!(message["content"], " 391.");
-        assert!(message["reasoning_content"].is_null());
-    }
-
-    /// Kimi K3 with thinking off generates content, though its detector defaults to reasoning.
-    #[tokio::test]
-    async fn kimi_k3_thinking_off_is_content() {
-        let messages = serde_json::json!([{"role": "user", "content": "Hi"}]);
-        for body in [
-            serde_json::json!({"model": "model", "messages": messages, "chat_template_kwargs": {"thinking": false}}),
-            serde_json::json!({"model": "model", "messages": messages, "reasoning_effort": "none"}),
-        ] {
-            let message = chat_message("kimi_k3", ChatFormatter::KimiK3, "Hello!", body).await;
-            assert_eq!(message["content"], "Hello!");
-            assert!(message["reasoning_content"].is_null());
-        }
     }
 
     #[tokio::test]
@@ -1175,8 +1128,7 @@ mod tests {
             false,
             None,
             Some("deepseek-r1".into()),
-            ReasoningOptions::default(),
-            0,
+            false,
             None,
             true,
             None,
@@ -1215,8 +1167,7 @@ mod tests {
             true,
             None,
             Some("deepseek-r1".into()),
-            ReasoningOptions::default(),
-            0,
+            false,
             None,
             None,
             false,
@@ -1262,8 +1213,7 @@ mod tests {
             true,
             None,
             None,
-            ReasoningOptions::default(),
-            0,
+            false,
             None,
             None,
             false,
@@ -1337,7 +1287,6 @@ mod tests {
                 };
                 let prompt = generate.chat_prompt.as_ref().unwrap();
                 assert!(prompt.prompt.as_str().contains("lookup"));
-                assert!(!generate.sampling_params.skip_special_tokens);
                 assert!(
                     generate
                         .sampling_params

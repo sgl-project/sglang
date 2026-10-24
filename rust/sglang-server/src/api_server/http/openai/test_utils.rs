@@ -166,22 +166,12 @@ pub(super) fn frontend_closed() -> CoreHandle {
 /// `ok` chunk, with the ChatML template so chat can render.
 fn answering_app_state() -> Arc<super::AppState> {
     let formatter = sglang_processor::load_chat_formatter(None, None, None, Some("chatml"));
-    answering_app_state_with(server_args(), formatter.unwrap(), None, "ok")
-}
-
-/// App state whose core intake answers every generation with one finished `text` chunk.
-pub(super) fn answering_app_state_with(
-    server_args: Arc<ServerArgs>,
-    formatter: super::ChatFormatter,
-    tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
-    text: &'static str,
-) -> Arc<super::AppState> {
-    answering_app_state_with_item(server_args, formatter, tokenizer, move |rid| {
-        chunk(rid, text, true)
+    answering_app_state_with_item(server_args(), formatter.unwrap(), None, |rid| {
+        chunk(rid, "ok", true)
     })
 }
 
-/// [`answering_app_state_with`], answering each request with `answer(rid)`.
+/// App state whose core intake answers each generation with `answer(rid)`.
 pub(super) fn answering_app_state_with_item(
     server_args: Arc<ServerArgs>,
     formatter: super::ChatFormatter,
