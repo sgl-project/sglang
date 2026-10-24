@@ -412,6 +412,7 @@ class TestRunnerSelectTokens(CustomTestCase):
         runner._enable_sampling = enable_sampling
         runner._cache_layout = self._FakeLayout()
         runner._req_sampling = {}
+        runner._req_min_new_tokens = {}
         runner._rng_key = mx.random.key(0) if enable_sampling else None
         return runner
 
@@ -569,6 +570,218 @@ class TestRunnerSelectTokens(CustomTestCase):
             mx.eval(t)
             toks.add(int(t[0].item()))
         self.assertGreater(len(toks), 3, toks)
+
+
+@unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
+class TestMinNewTokens(CustomTestCase):
+    """Use real request/cache/sampling paths with a fixed-logit model boundary."""
+
+    class _Model:
+        def __call__(self, input_ids, cache):
+            from sglang.srt.hardware_backend.mlx.kv_cache import get_context
+
+            kv = mx.zeros((1, 1, input_ids.shape[1], 1))
+            context = get_context()
+            if context is None:
+                for layer in cache:
+                    layer.update_and_fetch(kv, kv)
+            else:
+                for layer in context.attention_layer_caches:
+                    for request_cache in layer:
+                        request_cache.write_token(kv, kv)
+            # Every stop-token source outranks the only ordinary token, 1.
+            return mx.broadcast_to(
+                mx.array([0.0, 1.0, 6.0, 5.0, 4.0, 3.0]),
+                (*input_ids.shape, 6),
+            )
+
+    def _runner(self, enable_sampling=True, *, window=None, radix=False):
+        from types import SimpleNamespace
+
+        from sglang.srt.hardware_backend.mlx.aot import MlxAOTKernelSet
+        from sglang.srt.hardware_backend.mlx.kv_cache import (
+            MlxAttentionKVPool,
+            MlxModelCacheLayout,
+        )
+        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
+
+        runner = object.__new__(MlxModelRunner)
+        runner.model = self._Model()
+        runner._enable_sampling = enable_sampling
+        runner.disable_radix_cache = not radix
+        runner._max_seq_len = 32
+        runner._cache_layout = MlxModelCacheLayout.from_attention_discovery(
+            [SimpleNamespace(self_attn=object())],
+            ["self_attn"],
+            layer_window_sizes={0: window} if window else {},
+        )
+        runner._cache_pool = []
+        runner._req_caches = {}
+        runner._req_token_ids = {}
+        runner._req_sampling = {}
+        runner._req_min_new_tokens = {}
+        runner._req_pool_idx = {}
+        runner._req_synced_offset = {}
+        runner._req_to_token_pool = None
+        runner._attention_kv_pool = (
+            MlxAttentionKVPool(33, 1, 1, 1, mx.float32) if radix else None
+        )
+        runner._aot_kernels = MlxAOTKernelSet()
+        runner._decode_step_ct = 0
+        runner._clear_steps = 0
+        runner._rng_key = mx.random.key(0) if enable_sampling else None
+        return runner
+
+    @staticmethod
+    def _req(rid="r", minimum=2, prompt=(0, 1)):
+        from array import array
+        from types import SimpleNamespace
+
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        req = Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=SamplingParams(
+                temperature=0,
+                max_new_tokens=8,
+                min_new_tokens=minimum,
+                stop_token_ids=[2],
+            ),
+            eos_token_ids={3},
+        )
+        req.tokenizer = SimpleNamespace(eos_token_id=4, additional_stop_token_ids={5})
+        req.sampling_params.normalize(req.tokenizer)
+        req.kv.req_pool_idx = 1
+        req.vocab_size = 6
+        req._refresh_fill_ids()
+        req.set_extend_range(0, len(prompt))
+        return req
+
+    @staticmethod
+    def _prefill(runner, req, *, tokens=None, prefix=(), needs_logits=True, spec=None):
+        tokens = list(req.origin_input_ids) if tokens is None else tokens
+        pending = runner.prefill_start(
+            req.rid,
+            tokens[len(prefix) :],
+            tokens,
+            list(prefix),
+            list(range(len(prefix) + 1, len(tokens) + 1)),
+            req.kv.req_pool_idx,
+            req=req,
+            needs_logits=needs_logits,
+            logprob_spec=spec,
+        )
+        return runner.prefill_finalize(pending), pending
+
+    def test_minimum_survives_chained_decode_without_cpu_outputs(self):
+        for enabled, greedy in ((False, True), (True, True), (True, False)):
+            for window in (None, 2):
+                with self.subTest(sampling=enabled, greedy=greedy, window=window):
+                    runner = self._runner(enabled, window=window)
+                    req = self._req()
+                    if not greedy:
+                        req.sampling_params.temperature = 1.0
+                        req.sampling_params.top_k = 2
+                    first, _ = self._prefill(runner, req)
+                    fresh = runner.decode_batch_start([req.rid])
+                    chained = runner.decode_batch_start_chained(fresh)
+                    # No finalize/output_ids update between graph builds.
+                    actual = [
+                        first,
+                        *fresh.lazy_tokens.tolist(),
+                        *chained.lazy_tokens.tolist(),
+                    ]
+                    if greedy:
+                        self.assertEqual(actual, [1, 1, 2])
+                    else:
+                        self.assertTrue(set(actual[:2]) <= {0, 1})
+                    self.assertEqual(list(req.output_ids), [])
+                    self.assertEqual(runner.decode_batch_finalize(fresh), actual[1:2])
+                    self.assertEqual(runner.decode_batch_finalize(chained), actual[2:3])
+
+    def test_final_chunk_counts_only_generated_tokens(self):
+        runner = self._runner()
+        req = self._req(prompt=(0, 1, 0, 1))
+        self._prefill(runner, req, tokens=[0, 1], needs_logits=False)
+        final = runner.extend_start(req.rid, [0, 1], [3, 4])
+        self.assertEqual(runner.extend_finalize(final), 1)
+        self.assertEqual(runner.decode_batch([req.rid]), [1])
+        self.assertEqual(runner.decode_batch([req.rid]), [2])
+
+    def test_prefix_hit_and_reprefill_preserve_generated_count(self):
+        runner = self._runner(radix=True)
+        req = self._req()
+        self._prefill(runner, req)
+        runner.remove_request(req.rid)
+        # A complete prompt cache hit must not count prompt tokens as output.
+        token, _ = self._prefill(runner, req, prefix=[1, 2])
+        self.assertEqual(token, 1)
+        runner.remove_request(req.rid)
+        # A retracted request prefills the prompt plus its accepted outputs.
+        req.output_ids.extend([1, 1])
+        token, _ = self._prefill(runner, req, tokens=[0, 1, 1, 1], prefix=[1, 2])
+        self.assertEqual(token, 2)
+        runner.remove_request(req.rid)
+        self.assertFalse(runner._req_min_new_tokens)
+        replacement = self._req(minimum=0)
+        self.assertEqual(self._prefill(runner, replacement)[0], 2)
+        runner.clear()
+        self.assertFalse(runner._req_min_new_tokens)
+
+    def test_stop_sources_logprobs_and_custom_processor_order(self):
+        runner = self._runner()
+        req = self._req()
+        # Duplicates across sources must not change the penalty.
+        req.sampling_params.stop_token_ids.add(3)
+        spec = MlxLogprobSpec(top_ks=(1,), token_ids=((2, 3, 4, 5),))
+        token, pending = self._prefill(runner, req, spec=spec)
+        self.assertEqual(token, 1)
+        logprobs = runner.collect_logprobs(pending.lazy_logprobs)
+        self.assertEqual(logprobs.token_ids_val, [[-float("inf")] * 4])
+
+        def custom_processor(logits):
+            self.assertEqual(logits[0, 2:].tolist(), [-float("inf")] * 4)
+            # Like CUDA, a custom processor can deliberately replace penalties.
+            logits[0, 2] = 10.0
+            return logits
+
+        pending = runner.decode_batch_start([req.rid], logits_hook=custom_processor)
+        self.assertEqual(runner.decode_batch_finalize(pending), [2])
+
+    def test_mixed_prefill_and_decode_apply_each_requests_minimum(self):
+        import torch
+
+        from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.runtime_context import get_context
+        from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+        with get_context().override_server_args(mlx_enable_sampling=True):
+            runner = self._runner()
+            decoding = self._req("decode", minimum=1)
+            self._prefill(runner, decoding)
+            prefill = self._req("prefill", minimum=2)
+            worker = object.__new__(MlxTpModelWorker)
+            worker._mlx_runner = runner
+            worker._mlx_active_rids = {decoding.rid}
+            worker._mlx_pool_initialized = True
+            batch = ScheduleBatch(
+                reqs=[prefill, decoding],
+                device="cpu",
+                forward_mode=ForwardMode.MIXED,
+                input_ids=torch.tensor([0, 1, 1]),
+                out_cache_loc=torch.tensor([3, 4, 5]),
+                extend_lens=[2, 1],
+                decoding_reqs=[decoding],
+            )
+            batch.sampling_info = SamplingBatchInfo.from_schedule_batch(batch, 6)
+            pending = worker.async_forward_batch_generation_mlx(batch)
+            result = worker.finalize_mlx_result(pending, batch.reqs)
+            self.assertEqual(result.next_token_ids.tolist(), [1, 2])
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
