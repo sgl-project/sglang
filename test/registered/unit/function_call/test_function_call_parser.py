@@ -2887,6 +2887,24 @@ class TestGlm4MoeDetector(unittest.TestCase):
             tool_calls[1]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}'
         )
 
+    def test_streaming_long_argument_is_not_rescanned(self):
+        from unittest.mock import patch
+
+        city = "Beijing " * 500
+        chunks = ["<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>"]
+        rest = f"{city}</arg_value>\n<arg_key>date</arg_key>\n<arg_value>2024-06-27</arg_value>\n</tool_call>"
+        chunks += [rest[i : i + 3] for i in range(0, len(rest), 3)]
+        pattern = Glm4MoeDetector._STREAMING_PARTIAL_PATTERN
+        parameters = ""
+        with patch.object(
+            Glm4MoeDetector, "_STREAMING_PARTIAL_PATTERN", wraps=pattern
+        ) as mock_pattern:
+            for chunk in chunks:
+                result = self.detector.parse_streaming_increment(chunk, self.tools)
+                parameters += "".join(call.parameters for call in result.calls)
+        self.assertEqual(mock_pattern.search.call_count, 1)
+        self.assertEqual(json.loads(parameters), {"city": city, "date": "2024-06-27"})
+
     def test_tool_call_id(self):
         """Test that the buffer and state are reset after a tool call is completed."""
         chunks = [
@@ -3215,6 +3233,24 @@ class TestGlm47MoeDetector(unittest.TestCase):
         self.assertEqual(
             tool_calls[1]["parameters"], '{"city": "Shanghai", "date": "2024-06-28"}'
         )
+
+    def test_streaming_long_argument_is_not_rescanned(self):
+        from unittest.mock import patch
+
+        city = "Beijing " * 500
+        chunks = ["<tool_call>get_weather<arg_key>city</arg_key><arg_value>"]
+        rest = f"{city}</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>"
+        chunks += [rest[i : i + 3] for i in range(0, len(rest), 3)]
+        pattern = Glm47MoeDetector._STREAMING_PARTIAL_PATTERN
+        parameters = ""
+        with patch.object(
+            Glm47MoeDetector, "_STREAMING_PARTIAL_PATTERN", wraps=pattern
+        ) as mock_pattern:
+            for chunk in chunks:
+                result = self.detector.parse_streaming_increment(chunk, self.tools)
+                parameters += "".join(call.parameters for call in result.calls)
+        self.assertEqual(mock_pattern.search.call_count, 1)
+        self.assertEqual(json.loads(parameters), {"city": city, "date": "2024-06-27"})
 
     def test_tool_call_id(self):
         """Test that the buffer and state are reset after a tool call is completed."""
