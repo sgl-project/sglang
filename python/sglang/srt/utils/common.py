@@ -2320,9 +2320,36 @@ def configure_hf_hub_logger():
     hf_logging.enable_propagation()
 
 
+# Packages that only exist on NVIDIA CUDA installs (e.g. nvidia-cutlass-dsl).
+_CUDA_ONLY_MODULES = frozenset({"cutlass"})
+
+
+def log_ignored_import_error(log: logging.Logger, name: str, e: Exception) -> None:
+    """Report a module skipped during registry auto-import.
+
+    Missing CUDA-only packages are expected off CUDA, so they are logged at
+    debug level there instead of warning on every launch.
+    """
+    missing = getattr(e, "name", None) or ""
+    expected = (
+        isinstance(e, ModuleNotFoundError)
+        and missing.split(".")[0] in _CUDA_ONLY_MODULES
+        and not is_cuda()
+    )
+    (log.debug if expected else log.warning)(
+        f"Ignore import error when loading {name}: {e}"
+    )
+
+
 def suppress_noisy_warnings():
     """Suppress known noisy warnings from third-party libraries."""
     configure_hf_hub_logger()
+    # timm still decorates classes with torch.jit.interface.
+    warnings.filterwarnings(
+        "ignore",
+        message=re.escape("`torch.jit.interface` is deprecated."),
+        category=FutureWarning,
+    )
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
@@ -2367,6 +2394,10 @@ def suppress_noisy_warnings():
 
         _filtered_showwarning._sglang_patched_cutlass_dsl = True
         warnings.showwarning = _filtered_showwarning
+
+    # PyTorch itself still uses its deprecated opaque-type APIs internally.
+    for name in ("torch._opaque_base", "torch._library.opaque_object"):
+        logging.getLogger(name).setLevel(logging.ERROR)
 
     # Suppress noisy third-party HTTP loggers.
     # huggingface_hub uses httpx which logs every HTTP request at INFO level.

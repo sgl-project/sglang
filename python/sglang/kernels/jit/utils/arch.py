@@ -108,7 +108,8 @@ def _init_jit_cuda_arch_once():
         device = torch.cuda.current_device()
         major, minor = torch.cuda.get_device_capability(device)
     except Exception:
-        logger.warning("Cannot detect CUDA architecture.")
+        log = logger.warning if torch.cuda.is_available() else logger.debug
+        log("Cannot detect CUDA architecture.")
         major, minor = 0, 0  # invalid value to trigger compile error if used
     # JIT builds target the exact local GPU, so the arch-specific target is
     # always correct on Hopper+ and unlocks arch-only instructions (redux.f32).

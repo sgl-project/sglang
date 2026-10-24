@@ -12,6 +12,7 @@ from typing import AbstractSet, Dict, List, Optional, Tuple, Type, Union
 import torch.nn as nn
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import log_ignored_import_error
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,7 @@ def import_model_classes(package_name: str, strict: bool = False):
             except Exception as e:
                 if strict:
                     raise
-                logger.warning(f"Ignore import error when loading {name}: {e}")
+                log_ignored_import_error(logger, name, e)
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass

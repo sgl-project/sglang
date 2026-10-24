@@ -8,6 +8,7 @@ from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.runtime_context import get_model
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import log_ignored_import_error
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,7 @@ def import_processors(package_name: str, overwrite: bool = False):
             try:
                 module = importlib.import_module(name)
             except Exception as e:
-                logger.warning(f"Ignore import error when loading {name}: {e}")
+                log_ignored_import_error(logger, name, e)
                 continue
             all_members = inspect.getmembers(module, inspect.isclass)
             classes = [

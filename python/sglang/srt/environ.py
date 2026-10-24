@@ -2252,13 +2252,28 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
 }
 
 
+# SGL_-prefixed variables owned by sgl-kernel (sgl-kernel-xpu sets the JIT ones
+# itself on import), so they are not legacy sglang names.
+_SGL_KERNEL_ENVS = frozenset(
+    {
+        "SGL_JIT_TORCH_INCLUDE",
+        "SGL_JIT_TORCH_LIB",
+        "SGL_H2D_PROFILE",
+    }
+)
+
+
 def _handle_deprecated_envs():
     for old_name, deprecation in _DEPRECATED_ENVS.items():
         deprecation.apply(old_name)
 
     # Rewrite the legacy SGL_ prefix to SGLANG_ (names not covered above).
     for key, value in list(os.environ.items()):
-        if key.startswith("SGL_") and key not in _DEPRECATED_ENVS:
+        if (
+            key.startswith("SGL_")
+            and key not in _DEPRECATED_ENVS
+            and key not in _SGL_KERNEL_ENVS
+        ):
             new_key = key.replace("SGL_", "SGLANG_", 1)
             warnings.warn(
                 f"Environment variable {key} is deprecated, please use {new_key}"
