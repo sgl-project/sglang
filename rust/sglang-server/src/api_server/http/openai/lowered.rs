@@ -26,7 +26,7 @@ use crate::api_server::http::native_api::{
     GenerateItem, RequestTiming, drain_unary, generate_requests, generation_event_stream_with,
 };
 use crate::message::config::ServerArgs;
-use crate::message::request::check_prompt_copies;
+use crate::message::request::{JSON_TO_HEAP_FACTOR, check_prompt_copies};
 use crate::utils::error::Error;
 
 /// The server facts and tokenizer the processor's chat layer reads.
@@ -318,32 +318,41 @@ fn copy_prompt_per_choice(generate: &mut Value) -> Result<(), Error> {
     if n <= 1 {
         return Ok(());
     }
-    // Bounded before the copy: a huge `n` would overflow or exhaust the allocation.
-    let per_clone = generate["input_ids"]
-        .as_array()
-        .map_or(0, |ids| ids.len().saturating_mul(size_of::<Value>()));
-    check_prompt_copies(per_clone, n)?;
-    generate["sampling_params"]["n"] = 1.into();
-    generate["input_ids"] = Value::Array(vec![generate["input_ids"].take(); n]);
-    // Python's parallel sampling repeats the prompt's list-form fields with it,
-    // and a rid list names the one prompt.
-    for key in [
+    // Python's parallel sampling repeats a prompt's one-element list fields with
+    // it; other lengths are left for validation against the batch.
+    let repeated: Vec<&str> = [
         "bootstrap_host",
         "bootstrap_port",
         "bootstrap_room",
         "extra_key",
         "cache_salt",
         "lora_path",
-    ] {
-        if let Some(Value::Array(items)) = generate.get_mut(key) {
-            *items = items
-                .iter()
-                .cycle()
-                .take(items.len() * n)
-                .cloned()
-                .collect();
-        }
+    ]
+    .into_iter()
+    .filter(|key| {
+        generate[*key]
+            .as_array()
+            .is_some_and(|items| items.len() == 1)
+    })
+    .collect();
+    // Bounded before any copy: a huge `n` or field would exhaust the allocation.
+    let per_clone = repeated.iter().fold(
+        generate["input_ids"]
+            .as_array()
+            .map_or(0, |ids| ids.len().saturating_mul(size_of::<Value>())),
+        |bytes, key| {
+            let field = serde_json::to_vec(&generate[*key]).map_or(0, |json| json.len());
+            bytes.saturating_add(field.saturating_mul(JSON_TO_HEAP_FACTOR))
+        },
+    );
+    check_prompt_copies(per_clone, n)?;
+    generate["sampling_params"]["n"] = 1.into();
+    generate["input_ids"] = Value::Array(vec![generate["input_ids"].take(); n]);
+    for key in repeated {
+        let item = generate[key][0].take();
+        generate[key] = Value::Array(vec![item; n]);
     }
+    // A rid list names the one prompt.
     if let Some(Value::Array(rids)) = generate.get_mut("rid")
         && rids.len() == 1
     {
@@ -520,6 +529,17 @@ mod tests {
         });
         let value = body_json(post_json(app, "/v1/chat/completions", body).await).await;
         assert_eq!(value["choices"].as_array().unwrap().len(), 2);
+    }
+
+    /// Repeated list fields count toward the copies' budget before any copy.
+    #[tokio::test]
+    async fn oversized_repeated_field_is_rejected() {
+        let app = lowered_state(|rid| chunk(rid, "ok", true));
+        let messages = json!([{"role": "user", "content": "hi"}]);
+        let salt = "x".repeat(16385);
+        let body = json!({"model": "model", "messages": messages, "n": 512, "cache_salt": [salt]});
+        let response = post_json(app, "/v1/chat/completions", body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     /// A scheduler abort in a stream, whatever its status, is Python's error
