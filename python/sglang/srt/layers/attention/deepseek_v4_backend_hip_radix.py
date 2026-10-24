@@ -2252,6 +2252,7 @@ class DeepseekV4HipRadixBackend(
             tail_len=SWA_WINDOW,
             device=device,
             whole_extend=late_layer_whole_extend(forward_batch, dspark=self.is_dspark),
+            prompt_rest_lens=forward_batch.extend_prompt_rest_lens_cpu,
         )
         contiguous_start = (
             extend_lens_cpu[0] - tail_lens_cpu[0] if len(extend_lens_cpu) == 1 else None

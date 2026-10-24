@@ -1024,7 +1024,10 @@ def late_layer_num_tokens(forward_batch: ForwardBatch, *, dspark: bool) -> int:
     whole_extend = late_layer_whole_extend(forward_batch, dspark=dspark)
     return sum(
         late_layer_tail_lens(
-            forward_batch.extend_seq_lens_cpu, SWA_WINDOW, whole_extend
+            forward_batch.extend_seq_lens_cpu,
+            SWA_WINDOW,
+            whole_extend,
+            prompt_rest_lens=forward_batch.extend_prompt_rest_lens_cpu,
         )
     )
 
@@ -1834,6 +1837,7 @@ class DeepseekV4AttnBackend(
             whole_extend=late_layer_whole_extend(
                 forward_batch, dspark=self.model_runner.spec_algorithm.is_dspark()
             ),
+            prompt_rest_lens=forward_batch.extend_prompt_rest_lens_cpu,
         )
         if self.encoder_row_floor is not None:
             # Folded hits: a tail row never reads below its request's replay start.
