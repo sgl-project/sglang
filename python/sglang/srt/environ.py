@@ -2088,6 +2088,9 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+    # Prefer the fused JIT CUDA vision RoPE for DeepSeek-V4.1; set False to force
+    # the eager half-split PyTorch fallback (also used if JIT compile/load fails).
+    SGLANG_DSV41_VIT_ROPE_CUDA = EnvBool(True)
 
     # ===================================================================
     # Symmetric memory
