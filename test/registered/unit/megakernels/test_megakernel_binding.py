@@ -23,6 +23,9 @@ class Pool:
     def __init__(self):
         self.keys = [torch.zeros(4, 8) for _ in range(2)]
 
+    def get_key_buffer(self, layer_id):
+        return self.keys[layer_id]
+
     def get_swa_key_buffer_radix(self, layer_id):
         return self.keys[layer_id]
 
@@ -54,6 +57,38 @@ class TestMegakernelBinding(CustomTestCase):
         self.assertEqual(view.metadata.core_attn_metadata, "core")
         self.assertIs(view.kv_pool.pool, pool)
         self.assertIs(view.kv_pool.get_swa_key_buffer_radix(1), pool.keys[1])
+
+    def test_mla_cache_is_a_view_of_the_native_pool(self):
+        pool = Pool()
+        pool.keys[1] = torch.empty(8, 1, 576, dtype=torch.float8_e4m3fn)
+        attn_backend = backend(pool)
+        attn_backend.use_fused_topk = True
+        with patch(BACKEND, return_value=attn_backend):
+            binding = mb.MegakernelBinding(model=torch.nn.Module())
+            view = binding.forward_view()
+            cache = view.kv_pool.get_key_buffer(1)
+            self.assertIs(cache, pool.keys[1])
+            self.assertEqual(cache.dtype, torch.float8_e4m3fn)
+            self.assertEqual(cache.stride(), (576, 576, 1))
+            self.assertTrue(view.use_fused_topk)
+            binding.assert_live()
+            pool.keys[1] = torch.empty_like(cache)
+            with self.assertRaisesRegex(RuntimeError, r"kv_cache\[1\]"):
+                binding.assert_live()
+
+    def test_mla_cache_stride_change_is_detected(self):
+        pool = Pool()
+        storage = torch.empty(8, 1, 576)
+        pool.keys[1] = storage[::2]
+        attn_backend = backend(pool)
+        with patch(BACKEND, return_value=attn_backend):
+            binding = mb.MegakernelBinding(model=torch.nn.Module())
+            view = binding.forward_view()
+            view.kv_pool.get_key_buffer(1)
+            pool.keys[1] = storage[:4]
+            with self.assertRaisesRegex(RuntimeError, r"kv_cache\[1\]"):
+                binding.assert_live()
+        self.assertFalse(view.use_fused_topk)
 
     def test_a_replaced_source_fails_assert_live_by_name(self):
         model = torch.nn.Module()
