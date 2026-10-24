@@ -65,6 +65,11 @@ def _scheduler_for_typed_config():
         ({"hicache_write_policy": "write_back"}, "hicache_write_policy", "write_back"),
         ({"smg_grpc_mode": True}, "grpc_port", None),
         ({"grpc_mode": True}, "grpc_port", None),
+        (
+            {"grpc_response_timeout_secs": 900},
+            "grpc_response_timeout_secs",
+            900,
+        ),
         ({"default_priority_value": 5}, "default_priority_value", None),
         (
             {"enable_priority_scheduling": True, "default_priority_value": 5},
@@ -86,6 +91,7 @@ def _scheduler_for_typed_config():
         "hicache_write_policy",
         "legacy-smg",
         "deprecated-legacy-smg",
+        "grpc-response-timeout",
         "priority-off",
         "priority-on",
         "mm-limits-unset",
