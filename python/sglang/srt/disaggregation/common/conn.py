@@ -398,6 +398,8 @@ class CommonKVManager(BaseKVManager):
         # A poisoned room has a permanently outstanding transfer whose backend
         # can no longer prove quiescent. A new room lifecycle clears this state.
         self._deferred_ack_poisoned_rooms: Set[int] = set()
+        # Decode endpoints to fail once a prefill-aborted room drains.
+        self._abort_notify_targets: Dict[int, List[Tuple[str, int]]] = {}
         self.defer_decode_allocation = (
             get_disagg().disaggregation_decode_allocation_policy == "prefill_complete"
         )
@@ -603,6 +605,7 @@ class CommonKVManager(BaseKVManager):
                 # previous request that used this bootstrap_room.
                 self._deferred_ack_targets.pop(bootstrap_room, None)
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
+                self._abort_notify_targets.pop(bootstrap_room, None)
                 self._staging_outstanding.pop(bootstrap_room, None)
                 self.request_status[bootstrap_room] = status
             return
@@ -790,6 +793,7 @@ class CommonKVManager(BaseKVManager):
             # Success permits decode to reuse the room after true retraction.
             # Publish it from sender.clear(), after worker and scheduler cleanup.
             return status
+        self._abort_notify_targets.pop(bootstrap_room, None)
         self.send_kv_status_message(
             targets=targets,
             bootstrap_room=bootstrap_room,
@@ -945,8 +949,20 @@ class CommonKVManager(BaseKVManager):
         if room in self._deferred_ack_poisoned_rooms:
             # A target registered concurrently with the poison must not fire.
             self._deferred_ack_targets.pop(room, None)
+            self._abort_notify_targets.pop(room, None)
             return
+        self._send_abort_failure(room, self._abort_notify_targets.pop(room, None))
         self._send_abort_acks(room, self._deferred_ack_targets.pop(room, None))
+
+    def _send_abort_failure(
+        self, room: int, targets: Optional[List[Tuple[str, int]]]
+    ) -> None:
+        self.send_kv_status_message(
+            targets=targets or [],
+            bootstrap_room=room,
+            status=KVPoll.Failed,
+            failure_reason="Prefill aborted the request",
+        )
 
     def _send_abort_acks(
         self, room: int, targets: Optional[Dict[Tuple[str, int], AckTarget]]
@@ -2236,8 +2252,21 @@ class CommonKVSender(BaseKVSender):
             self.bootstrap_room,
             "Aborted by AbortReq.",
         )
+        # A room already Failed was reported by its failure path or aborted by
+        # decode; deferred bootstrap notifies decode itself.
+        notify_decode = (
+            self.kv_mgr.deferred_bootstrap is None
+            and self.kv_mgr.enable_deferred_decode_kv_release
+            and self.kv_mgr.request_status.get(self.bootstrap_room)
+            not in (None, KVPoll.Success, KVPoll.Failed)
+        )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
+        if notify_decode:
+            targets = self.kv_mgr._room_notify_targets(self.bootstrap_room)
+            if targets:
+                self.kv_mgr._abort_notify_targets[self.bootstrap_room] = targets
+                self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
 
 
 class CommonKVReceiver(BaseKVReceiver):
