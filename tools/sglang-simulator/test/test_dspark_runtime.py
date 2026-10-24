@@ -90,6 +90,37 @@ def test_prefill_then_native_committed_decode_updates_next_causal_work(runtime):
     assert third_before.requests[0].draft_valid_to == 514
 
 
+def test_native_runtime_excludes_all_replacement_worker_wall_from_virtual_cpu_time(
+    runtime, monkeypatch
+):
+    clock = [0.0]
+    monkeypatch.setattr(adapter.time, "perf_counter", lambda: clock[0])
+
+    def timed(function, seconds):
+        def call(*args, **kwargs):
+            result = function(*args, **kwargs)
+            clock[0] += seconds
+            return result
+
+        return call
+
+    runtime.capture = timed(runtime.capture, 2.0)
+    runtime.session.cost_model.predict_step = timed(
+        runtime.session.cost_model.predict_step, 3.0
+    )
+    runtime.results.build = timed(runtime.results.build, 5.0)
+    runtime.session.commit = timed(runtime.session.commit, 11.0)
+
+    def publish(_value):
+        clock[0] += 7.0
+
+    result = forward(runtime, batch(), publish)
+    prediction = getattr(result, STEP_ATTRIBUTE)
+    assert prediction.prediction_wall_seconds == 28.0
+    assert prediction.timing.seconds == pytest.approx(0.04)
+    assert runtime.session.history_for("a").target_prefix_len == 512
+
+
 def test_cached_target_prefix_does_not_invent_draft_prefix(runtime):
     prediction = getattr(
         forward(runtime, batch(prefix=1024, extend=64)), STEP_ATTRIBUTE

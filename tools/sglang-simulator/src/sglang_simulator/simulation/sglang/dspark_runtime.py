@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
 
 from sglang_simulator.simulation.sglang.dspark import (
@@ -367,6 +368,7 @@ class DSparkNativeRuntime:
         )
 
     def forward_batch_generation(self, *, worker, batch, on_publish=None):
+        started = time.perf_counter()
         if worker.query_token_num != 5 or worker.verify_num_draft_tokens != 6:
             raise PredictorError(
                 "unsupported_execution_profile",
@@ -385,6 +387,19 @@ class DSparkNativeRuntime:
                 self._draft_buffer_capacity, len(batch.reqs)
             )
         self._forward_id += 1
+        # The scheduler adds native CPU work outside this replacement worker.
+        # None of capture/model lookup/result construction/publication/ledger
+        # emulation is additional target work to add to a complete worker cost.
+        # Exclude the entire replacement call, not just Session.predict(), from
+        # the offline wall-clock contribution.
+        setattr(
+            result,
+            STEP_ATTRIBUTE,
+            replace(
+                prediction,
+                prediction_wall_seconds=time.perf_counter() - started,
+            ),
+        )
         return result
 
     def note_request_finished(self, *, rid, natural_stop):

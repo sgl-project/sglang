@@ -302,6 +302,8 @@ class DSparkStepResult:
     timing: DSparkStepTiming
     progress: DSparkProgress
     local_attention_dp_rank: int = 0
+    # CPU simulation work to exclude from the offline scheduler wall term.
+    # The native runtime supplies its complete replacement-worker wall cost.
     prediction_wall_seconds: float = 0.0
 
     def __post_init__(self):

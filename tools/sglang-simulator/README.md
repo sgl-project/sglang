@@ -594,6 +594,13 @@ adaptive, coordinated and constrained paths fail before simulator declarations.
 This removes native accelerator-only argument rejection; complete cost/progress
 assets and predictor launch wiring remain necessary for a full run.
 
+For offline DSPark timing, the native adapter records its entire CPU replacement
+worker call as simulation overhead. The scheduler excludes that wall time from
+its CPU contribution while retaining native scheduler work outside the worker.
+Before-work capture, database lookup, synthetic result construction, publication
+and history bookkeeping therefore do not add host-dependent emulator time to a
+complete modeled worker duration.
+
 Run repository checks before submitting:
 
 ```bash
