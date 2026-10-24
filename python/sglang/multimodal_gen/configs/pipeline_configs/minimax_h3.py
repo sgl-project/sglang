@@ -60,8 +60,12 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     vae_precision: str = "fp32"
     vae_decode_precision: str = "fp16"
     audio_vae_precision: str = "fp32"
-    # Default VSA-H3 sparsity; --attention-backend-config VSA_sparsity overrides.
+    # Default VSA-H3 sparsity, tile size and reference-video keep rate;
+    # --attention-backend-config VSA_sparsity / vsa_tile_size /
+    # vsa_ref_keep_rate override them.
     vsa_sparsity: float = 0.9
+    vsa_tile_size: int = 64
+    vsa_ref_keep_rate: float | None = None
     text_encoder_configs: tuple[MiniMaxH3Qwen3VLConfig, ...] = field(
         default_factory=lambda: (MiniMaxH3Qwen3VLConfig(),)
     )
@@ -225,6 +229,11 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     def validate_server_args(self, server_args) -> None:
         # Reject known-inexact VAE modes before any large component download.
         self.vae_config.resolved_parallel_decode_mode()
+        if server_args.performance_mode == "memory":
+            # Batched decoder tiles add activations on top of the resident
+            # decoder; memory mode keeps the one-tile recipe at every tier.
+            self.vae_config.decoder_tile_batch = 1
+            self.vae_config.window_batch = 1
         if current_platform.is_mps():
             required_components = (
                 "transformer",
@@ -342,7 +351,8 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
 
     def __post_init__(self) -> None:
         self.dit_config.arch_config.has_gate_compress = True
-        self.vae_config.stack_tiling = True
+        # FastVideo's recipe decodes each rank's tiles in one call.
+        self.vae_config.decoder_tile_batch = 0
 
     def validate_quality_deployment(self, server_args) -> None:
         raise ValueError(
@@ -396,11 +406,41 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
         )
 
 
-__all__ = ["FastH3PipelineConfig", "MiniMaxH3PipelineConfig"]
+@dataclass
+class FastH3OmniPipelineConfig(FastH3PipelineConfig):
+    """FastH3 Omni 8-Step V1: PDD + VSA-distilled MiniMax-H3, ref2va only."""
+
+    # The checkpoint's trained VSA (fastvideo_inference.json).
+    vsa_sparsity: float = 0.9
+    vsa_tile_size: int = 128
+    vsa_ref_keep_rate: float | None = 0.1
+
+    def __post_init__(self) -> None:
+        self.dit_config.arch_config.has_gate_compress = True
+        # Omni also encodes reference videos. The encoder runs one tile per
+        # forward regardless, and the decoder keeps the base
+        # ``decoder_tile_batch`` cap instead of FastH3's all-tiles recipe.
+
+    def validate_server_args(self, server_args) -> None:
+        if server_args.model_variant is not None:
+            raise ValueError(
+                "FastH3 Omni ships one ref2va-distilled weight partition; "
+                "--model-variant does not apply."
+            )
+        self._default_to_trained_sparse_attention(server_args)
+        MiniMaxH3PipelineConfig.validate_server_args(self, server_args)
+
+
+__all__ = [
+    "FastH3OmniPipelineConfig",
+    "FastH3PipelineConfig",
+    "MiniMaxH3PipelineConfig",
+]
 
 
 def register():
     from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+        FastH3OmniSamplingParams,
         FastH3SamplingParams,
         MiniMaxH3SamplingParams,
     )
@@ -429,6 +469,19 @@ def register():
         model_detectors=[
             lambda model_id: (
                 "fasth3" in model_id.lower().replace("-", "").replace("_", "")
+                and "omni" not in model_id.lower()
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=FastH3OmniSamplingParams,
+        pipeline_config_cls=FastH3OmniPipelineConfig,
+        hf_model_paths=[
+            "FastVideo/FastVideo-FastH3-Omni-8-Step-V1",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "fasth3omni" in model_id.lower().replace("-", "").replace("_", "")
             )
         ],
     )
