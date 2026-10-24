@@ -3,7 +3,7 @@
     pinned benchmark rows + rendered prompts + SHA-256 checked local media
                      |                         |
         legacy route subprocess        candidate route subprocess
-        full input_text every turn     full input_ids every turn
+        full input_text every turn     input_ids; expanded prefix + new suffix
                      |                         |
         legacy Qwen class          serving factory -> Qwen token-space processor
                      |                         |
@@ -320,8 +320,11 @@ async def _capture(checkout, manifest_path, route):
                         request_obj=request,
                     )
                 else:
+                    start_len = len(previous_expanded_ids)
+                    partial_ids = previous_expanded_ids + input_ids[len(previous_ids) :]
                     request = GenerateReqInput(
-                        input_ids=input_ids,
+                        input_ids=partial_ids,
+                        mm_token_expansion_start_len=start_len,
                         image_data=sources["image"],
                         video_data=sources["video"],
                         audio_data=sources["audio"],
@@ -330,11 +333,10 @@ async def _capture(checkout, manifest_path, route):
                         image_data=request.image_data,
                         audio_data=request.audio_data,
                         input_text="",
-                        input_ids=input_ids,
+                        input_ids=partial_ids,
                         request_obj=request,
                     )
-                    boundary = len(previous_expanded_ids)
-                    assert output.input_ids[:boundary] == previous_expanded_ids
+                    assert output.input_ids[:start_len] == previous_expanded_ids
                 model_inputs = msgspec.structs.asdict(output)
                 captures[case_id] = {
                     "unexpanded_input_ids": input_ids,
