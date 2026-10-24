@@ -1481,6 +1481,7 @@ class Envs:
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
+    SGLANG_OPT_KDA_FUSED_PREFILL = EnvBool(False)
 
     # ===================================================================
     # Logits and log-probability processing
