@@ -121,6 +121,7 @@ def get_model_config(
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "GlmMoeDsaForCausalLM",
+                "Glm5NextForConditionalGeneration",
                 "MistralLarge3ForCausalLM",
             ]
             else 1
