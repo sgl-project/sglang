@@ -632,6 +632,7 @@ class Scheduler(
             c.attach_radix_cache(self.tree_cache)
 
         self.init_hisparse_coordinator()
+        self.init_hisparse_v2_coordinator()
 
         if (
             get_disagg().disaggregation_mode == "decode"
@@ -1288,6 +1289,25 @@ class Scheduler(
             startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
         )
 
+    def init_hisparse_v2_coordinator(self) -> None:
+        """Bind DSA HiSparse to the scheduler's HiCache and forward stream."""
+        self.hisparse_v2_coordinator = None
+        if not get_memory().enable_hisparse_v2:
+            return
+        self.hisparse_v2_coordinator = (
+            self.tp_worker.model_runner.hisparse_v2_coordinator
+        )
+        draft_runners = (
+            self.draft_worker._draft_model_runners()
+            if self.draft_worker is not None
+            else ()
+        )
+        self.hisparse_v2_coordinator.attach_tree(
+            self.tree_cache,
+            draft_caches=tuple(runner.hisparse_v2_cache for runner in draft_runners),
+        )
+        self.hisparse_v2_coordinator.forward_stream = self.forward_stream
+
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
         if not self.enable_hisparse:
@@ -1928,6 +1948,8 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
+        if self.hisparse_v2_coordinator is not None:
+            self.hisparse_v2_coordinator.destroy()
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
@@ -2634,6 +2656,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            hisparse_v2_coordinator=self.hisparse_v2_coordinator,
             req_to_token_pool=self.req_to_token_pool,
             decode_offload_manager=self.decode_offload_manager,
             metrics_collector=self.metrics_collector,
@@ -4051,8 +4074,13 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_priority_preemption or self.is_hybrid_swa:
-            # Reset batch_is_full to try preemption with a prefill adder.
+        if (
+            self.enable_priority_preemption
+            or self.is_hybrid_swa
+            or self.hisparse_v2_coordinator is not None
+        ):
+            # Preemption, window movement and HiSparse demotion can free capacity
+            # without a running request finishing.
             running_batch.batch_is_full = False
         if running_batch.is_empty():
             # An empty batch has no request left to leave, and only a leaving
@@ -4135,6 +4163,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            hisparse_v2_coordinator=self.hisparse_v2_coordinator,
         )
 
         if self.chunked_req is not None:

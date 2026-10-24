@@ -977,6 +977,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         is_draft_worker: bool = False,
         kv_layout: Union[str, KVLayout] = KVLayout.V4,
         compressed_kv_layout: Optional[str] = None,
+        hisparse_v2_host_tokens: int = 0,
     ):
         super().__init__(
             swa_size,
@@ -988,6 +989,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             start_layer,
             end_layer,
         )
+        # HiSparse V2 keeps the index keys of host pages on GPU: the ratio-1/2 index
+        # pools gain this many tokens past the full pool, host page h at full page
+        # hisparse_v2_base_full_pages + h.
+        self.hisparse_v2_host_tokens = hisparse_v2_host_tokens
         # Layout of the SWA (main) cache; compressed caches follow
         # resolve_compressed_kv_layout, so valid (main, extra) pairs form only here.
         self.kv_layout = KVLayout.parse(kv_layout)
@@ -1628,11 +1633,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for ratio, config in configs.items()
             if config.indexer_size is not None
         }
+        self.hisparse_v2_base_full_pages = (
+            (self.full_size + page_size) // page_size if low_ratio_sources else 0
+        )
         for ratio, sources in low_ratio_sources.items():
             # Reserved FULL page 0 pushes real slots past full_size, and one index
             # padding page is too small to cover that gap.
             self.index_pools[ratio] = self._make_indexer_pool(
-                (self.full_size + page_size) // ratio,
+                (self.full_size + page_size + self.hisparse_v2_host_tokens) // ratio,
                 DSV41_INDEX_PAGE_SIZE,
                 dtype,
                 self.indexer_head_dim,

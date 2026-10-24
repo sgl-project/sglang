@@ -936,6 +936,8 @@ class DeepseekV4HipRadixBackend(
         # The C4 state ring is addressed per SWA page, so a page holds whole windows.
         assert self.token_to_kv_pool.swa_page_size % SWA_WINDOW == 0
         self.hisparse_coordinator = model_runner.hisparse_coordinator
+        # The target worker's HiSparse V2 cache for the ratio-1/2 KV, if enabled.
+        self.hisparse_v2_cache = model_runner.hisparse_v2_cache
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
@@ -1599,6 +1601,11 @@ class DeepseekV4HipRadixBackend(
             if need_compress and self.has_c4
             else None
         )
+        if self.hisparse_v2_cache is not None:
+            # The ratio-1/2 indexers score demoted pages through their host region.
+            self.hisparse_v2_cache.patch_page_table(
+                core_attn_metadata.page_table, req_pool_indices
+            )
         low_ratio_indexer_metadata = self._init_low_ratio_indexer_metadata(
             core_attn_metadata, is_prefill=False
         )
@@ -3493,6 +3500,22 @@ class DeepseekV4HipRadixBackend(
             low_ratio_index_topk_hip_decode(
                 self, layer, x, q_lora, pos, forward_batch=forward_batch
             )
+            if (
+                self.hisparse_v2_cache is not None
+                and forward_batch.forward_mode.is_decode()
+            ):
+                ratio = layer.compress_ratio
+                metadata = self.forward_metadata
+                core = metadata.core_metadata
+                self.hisparse_v2_cache.swap_in(
+                    layer_id=layer.layer_id,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    compressed_seq_lens=metadata.low_ratio_indexer_metadata(
+                        ratio
+                    ).compressed_seq_lens,
+                    raw_indices=core.sparse_raw_indices(ratio),
+                    page_indices=core.sparse_page_indices(ratio),
+                )
         elif forward_batch.forward_mode.is_extend():
             # HIP rejects V4.1 prefill CP, the only caller passing rows_per_request
             assert rows_per_request is None, "V4.1 prefill CP is not supported on HIP"

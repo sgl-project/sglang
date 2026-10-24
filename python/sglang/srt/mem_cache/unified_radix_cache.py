@@ -209,6 +209,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.init_metrics_collector()
         self._enable_metrics_flag = params.enable_metrics
         self.enable_storage_metrics = False
+        self.hisparse_v2_coordinator = None
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
         self.extra_metric_labels = None
 
@@ -418,6 +419,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if self.hisparse_v2_coordinator is not None:
+            self.hisparse_v2_coordinator.reset()
         self.tree_core.reset()
         self.session_refs.reset()
 
@@ -1143,6 +1146,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if self.hisparse_v2_coordinator is not None:
+            self.hisparse_v2_coordinator.request_finished(req)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -1150,6 +1155,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "up_to"])
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        if self.hisparse_v2_coordinator is not None:
+            if req.hisparse_v2_active:
+                return
+            if not req.finished():
+                up_to = self.hisparse_v2_coordinator.checkpoint_up_to(req, up_to)
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)

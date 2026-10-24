@@ -102,11 +102,14 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
+    indexer_page_table: Optional[torch.Tensor] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
 
     def get_page_table_64(self) -> torch.Tensor:
+        if self.indexer_page_table is not None:
+            return self.indexer_page_table
         return self.attn_metadata.real_page_table
 
     def get_logical_page_table(self) -> torch.Tensor:

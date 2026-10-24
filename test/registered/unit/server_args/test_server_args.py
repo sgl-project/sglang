@@ -37,6 +37,7 @@ from sglang.srt.arg_groups.hisparse_hook import (
     validate_hisparse,
     validate_hisparse_dsa_backend,
     validate_hisparse_kv_cache_dtype,
+    validate_hisparse_v2,
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
@@ -1632,6 +1633,92 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "speculative-adaptive"):
                 validate_hisparse(server_args)
+
+
+class TestHiSparseV2Policy(CustomTestCase):
+    @staticmethod
+    def _args(**overrides):
+        values = dict(
+            model_path="dummy",
+            device="cuda",
+            enable_hisparse_v2=True,
+            enable_hierarchical_cache=True,
+            page_size=64,
+            hicache_ratio=2,
+            hicache_write_policy="write_back",
+            hicache_mem_layout="page_first",
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend="flashmla_sparse",
+            dsa_decode_backend="flashmla_sparse",
+        )
+        values.update(overrides)
+        args = ServerArgs(**values)
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["DeepseekV32ForCausalLM"],
+                index_topk=2048,
+            )
+        )
+        return args
+
+    @override_platform(is_hip=False)
+    def test_shared_host_mode_requires_compatible_ownership(self):
+        validate_hisparse_v2(self._args())
+        for overrides in (
+            {"enable_hisparse": True},
+            {"enable_hierarchical_cache": False},
+            {"disable_radix_cache": True},
+            {"hicache_write_policy": "write_through"},
+            {"hicache_host_memory_mode": "buffer_only"},
+            {"enable_streaming_session": True},
+            {"disaggregation_mode": "decode"},
+            {"attn_cp_size": 2},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                validate_hisparse_v2(self._args(**overrides))
+
+    @override_platform(is_hip=False)
+    def test_rejects_inconsistent_index_or_swap_capacity(self):
+        for config in (
+            {"top_k": 1024},
+            {"device_buffer_size": 2049},
+            {"device_buffer_size": True},
+            {"expansion_ratio": 0},
+            {"expansion_ratio": float("nan")},
+            {"swap_in_block_size": 1025},
+        ):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                validate_hisparse_v2(self._args(hisparse_config=json.dumps(config)))
+
+    @override_platform(is_hip=False)
+    def test_mtp_accepts_fixed_linear_queries_and_rejects_other_layouts(self):
+        for num_draft_tokens in (2, 3, 4):
+            with self.subTest(num_draft_tokens=num_draft_tokens):
+                validate_hisparse_v2(
+                    self._args(
+                        speculative_algorithm="EAGLE",
+                        speculative_eagle_topk=1,
+                        speculative_num_draft_tokens=num_draft_tokens,
+                    )
+                )
+        for overrides in (
+            {"speculative_algorithm": "EAGLE3"},
+            {"speculative_algorithm": "DFLASH"},
+            {"speculative_eagle_topk": 2},
+            {"speculative_adaptive": True},
+            {"enable_multi_layer_eagle": True},
+            {"speculative_num_draft_tokens": None},
+            {"speculative_num_draft_tokens": 1},
+            {"speculative_num_draft_tokens": 5},
+        ):
+            values = dict(
+                speculative_algorithm="EAGLE",
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=4,
+            )
+            values.update(overrides)
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                validate_hisparse_v2(self._args(**values))
 
 
 class TestFa4PageSizeAutoForce(CustomTestCase):

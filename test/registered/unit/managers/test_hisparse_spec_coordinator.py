@@ -285,5 +285,160 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         self.assertTrue(coordinator._skip_first_backup[0])
 
 
+class TestHiSparseV2SpecOwnership(CustomTestCase):
+    def _fixture(self, num_query_steps=4):
+        from sglang.srt.managers.hisparse_v2_cache import HiSparseV2Cache
+        from sglang.srt.managers.hisparse_v2_coordinator import HiSparseV2Coordinator
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+
+        req_pool = SimpleNamespace(
+            req_to_token=torch.full((4, 1024), -1, dtype=torch.int32)
+        )
+
+        def make_cache():
+            buffers = [torch.arange(194 * 64).view(194, 64).clone() for _ in range(2)]
+            pool = SimpleNamespace(
+                size=4096,
+                page_size=64,
+                layer_num=2,
+                start_layer=0,
+                index_k_with_scale_buffer=buffers,
+                get_index_k_with_scale_buffer=lambda layer: buffers[layer],
+            )
+            cache = HiSparseV2Cache(
+                req_to_token_pool=req_pool,
+                token_to_kv_pool=pool,
+                top_k=64,
+                buffer_tokens=64,
+                block_size=256,
+                device="cpu",
+                num_query_steps=num_query_steps,
+            )
+            cache.host_pool = SimpleNamespace(size=8192)
+            return cache
+
+        cache, draft = make_cache(), make_cache()
+        allocator = PagedTokenToKVPoolAllocator(
+            size=4096,
+            page_size=64,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=cache.pool,
+            need_sort=False,
+        )
+        coordinator = HiSparseV2Coordinator(cache=cache, allocator=allocator)
+        coordinator.caches = (cache, draft)
+        coordinator.tree_cache = SimpleNamespace(
+            supports_prefix_sharing=lambda: False,
+            unlock=lambda lock: None,
+            tree_core=SimpleNamespace(
+                node_by_id=lambda node: SimpleNamespace(parent=None)
+            ),
+        )
+        req = SimpleNamespace(
+            rid="request",
+            full_untruncated_fill_ids=list(range(320)),
+            kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=320),
+            last_node=0,
+            lock=object(),
+            hisparse_v2_active=False,
+        )
+        prefix = allocator.alloc(320)
+        req_pool.req_to_token[0, :320] = prefix.int()
+        return coordinator, cache, draft, req, prefix
+
+    def test_hot_and_scratch_are_reserved_once_before_prefill(self):
+        coordinator, cache, draft, req, prefix = self._fixture()
+        before = coordinator.allocator.available_size()
+        self.assertTrue(coordinator.reserve_prefill(req, max_new_tokens=16))
+        self.assertEqual(coordinator.reserved_temp_tokens(), 320)
+        self.assertEqual(coordinator.allocator.available_size(), before - 320)
+        reserved = coordinator.pending[req.rid].temp
+        self.assertTrue(coordinator.reserve_prefill(req, max_new_tokens=16))
+        self.assertEqual(coordinator.allocator.available_size(), before - 320)
+        self.assertTrue(coordinator.admit_request(req))
+        self.assertTrue(req.hisparse_v2_active)
+        self.assertIsNone(req.lock)
+        self.assertEqual(coordinator.reserved_temp_tokens(), 320)
+        self.assertEqual(coordinator.allocator.available_size(), before - 320)
+        self.assertIs(coordinator.requests[req.kv.req_pool_idx].temp, reserved)
+        locations = torch.cat((cache.temp_locs[0, 0, :64], cache.scratch_locs[0, 0]))
+        self.assertEqual(locations.unique().numel(), 320)
+        torch.testing.assert_close(cache.temp_locs, draft.temp_locs)
+        torch.testing.assert_close(cache.scratch_locs, draft.scratch_locs)
+        self.assertTrue(torch.all(cache.residency[:, 0] == -1))
+        torch.testing.assert_close(cache.req_to_token[0, :320], prefix.int())
+        coordinator.request_finished(req)
+        self.assertEqual(coordinator.reserved_temp_tokens(), 0)
+        self.assertEqual(coordinator.allocator.available_size(), before)
+        self.assertTrue(torch.all(cache.host_locs == -1))
+        self.assertTrue(torch.all(draft.host_locs == -1))
+        coordinator.allocator.free(prefix)
+        self.assertEqual(coordinator.allocator.available_size(), 4096)
+
+    def test_target_and_draft_indexes_follow_host_pages_after_device_reuse(self):
+        coordinator, cache, draft, req, prefix = self._fixture()
+        self.assertTrue(coordinator.reserve_prefill(req, max_new_tokens=16))
+        self.assertTrue(coordinator.admit_request(req))
+        hosts = torch.arange(8192 - 320, 8192)
+        for current in (cache, draft):
+            expected = [
+                buffer[prefix[::64] // 64].clone() for buffer in current.index_buffers
+            ]
+            current.preserve_index(prefix, hosts)
+            current.host_locs[0, :320] = hosts
+            for buffer in current.index_buffers:
+                buffer[prefix[::64] // 64] = -1
+            current.req_to_token[0, :320] = -1
+            pages = current.indexer_page_table(
+                req_pool_indices=torch.tensor([0]), num_pages=5
+            )
+            for buffer, wanted in zip(current.index_buffers, expected):
+                torch.testing.assert_close(buffer[pages[0].long()], wanted)
+        coordinator.request_finished(req)
+
+    def test_host_address_space_must_fit_the_index_expansion(self):
+        _, cache, _, _, _ = self._fixture()
+        with self.assertRaisesRegex(ValueError, "cover the HiCache host pool"):
+            cache.attach_host_pool(SimpleNamespace(size=130 * 64))
+
+    def test_speculative_index_tables_expand_queries_and_refresh_in_place(self):
+        from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        coordinator, cache, draft, req, prefix = self._fixture()
+        self.assertTrue(coordinator.reserve_prefill(req, max_new_tokens=16))
+        self.assertTrue(coordinator.admit_request(req))
+        backend = object.__new__(DeepseekSparseAttnBackend)
+        backend.hisparse_v2_cache = cache
+        backend.physical_page_size = 64
+        backend.speculative_num_draft_tokens = 4
+        for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2):
+            table = backend._build_hisparse_v2_indexer_page_table(
+                forward_mode=mode,
+                req_pool_indices=torch.tensor([0]),
+                max_seqlen_k=320,
+            )
+            expected = (prefix[::64] // 64).int().expand(4, -1)
+            torch.testing.assert_close(table, expected)
+            metadata = SimpleNamespace(
+                indexer_page_table=table,
+                page_table_1=torch.empty((4, 320), dtype=torch.int32),
+            )
+            pointer = table.data_ptr()
+            hosts = torch.arange(8192 - 320, 8192)
+            cache.host_locs[0, :320] = hosts
+            cache.req_to_token[0, :320] = -1
+            backend._refresh_hisparse_v2_indexer_page_table(
+                metadata, forward_mode=mode, req_pool_indices=torch.tensor([0])
+            )
+            self.assertEqual(table.data_ptr(), pointer)
+            torch.testing.assert_close(
+                table, (cache.base_pages + hosts[::64] // 64).int().expand(4, -1)
+            )
+            cache.req_to_token[0, :320] = prefix.int()
+        coordinator.request_finished(req)
+
+
 if __name__ == "__main__":
     unittest.main()

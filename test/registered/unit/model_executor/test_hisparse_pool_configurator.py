@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -19,6 +20,8 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
         *,
         enable_hisparse: bool,
         host_to_device_ratio: int = 1,
+        enable_hisparse_v2: bool = False,
+        expansion_ratio: float | None = None,
     ) -> int:
         num_layers = 2
         hf_config = SimpleNamespace(
@@ -28,9 +31,15 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
         )
         hf_config.get_text_config = lambda: hf_config
 
+        config = {"host_to_device_ratio": host_to_device_ratio}
+        if expansion_ratio is not None:
+            config["expansion_ratio"] = expansion_ratio
         override = get_context().override_server_args(
             enable_hisparse=enable_hisparse,
-            hisparse_config=f'{{"host_to_device_ratio": {host_to_device_ratio}}}',
+            hisparse_config=json.dumps(config),
+            enable_hisparse_v2=enable_hisparse_v2,
+            hicache_ratio=2,
+            page_size=64,
             enable_hierarchical_cache=False,
             disaggregation_mode="null",
             dsa_prefill_backend="flashmla_sparse",
@@ -47,6 +56,7 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
                 kv_lora_rank=512,
                 qk_rope_head_dim=64,
                 hf_config=hf_config,
+                hf_text_config=hf_config,
             ),
             layer_info=SimpleNamespace(start_layer=0, end_layer=num_layers),
             server_args=server_args,
@@ -80,6 +90,19 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
                     host_to_device_ratio=host_to_device_ratio,
                 )
                 self.assertEqual(cell_size, expected_cell_size)
+
+    def test_v2_accounts_for_base_and_expanded_index_regions(self):
+        for ratio, expected in ((None, 2104), (0.5, 1708), (0.3, 1656)):
+            with self.subTest(expansion_ratio=ratio):
+                self.assertEqual(
+                    self._compute_cell_size(
+                        torch.float8_e4m3fn,
+                        enable_hisparse=False,
+                        enable_hisparse_v2=True,
+                        expansion_ratio=ratio,
+                    ),
+                    expected,
+                )
 
 
 if __name__ == "__main__":

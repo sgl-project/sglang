@@ -2061,6 +2061,14 @@ class KVCacheConfigurator:
             is_draft_worker=self.is_draft_worker,
             spec_algorithm=self.spec_algorithm,
         )
+        if get_memory().enable_hisparse_v2 and not self.is_draft_worker:
+            from sglang.srt.mem_cache.sparsity.hisparse_v2_config import (
+                hisparse_v2_dsv4_host_tokens,
+            )
+
+            kv_layout_kwargs["hisparse_v2_host_tokens"] = hisparse_v2_dsv4_host_tokens(
+                full_max_total_num_tokens, self.pool_page_size
+            )
 
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
@@ -2297,6 +2305,23 @@ class KVCacheConfigurator:
 
             pool_kwargs["host_to_device_ratio"] = (
                 parse_hisparse_config().host_to_device_ratio
+            )
+        elif get_memory().enable_hisparse_v2:
+            from sglang.srt.mem_cache.sparsity.hisparse_v2_config import (
+                parse_hisparse_v2_config,
+            )
+
+            config = parse_hisparse_v2_config(
+                model_top_k=self.model_config.hf_text_config.index_topk
+            )
+            PoolCls = dsa_pool_class
+            pool_kwargs["index_buf_size"] = (
+                max_total_num_tokens
+                + int(max_total_num_tokens * config.expansion_ratio)
+                // self.pool_page_size
+                * self.pool_page_size
+                # HiCache rounds host capacity up by one page.
+                + self.pool_page_size
             )
         elif dsa_cp_layer_shard_rank is not None:
             reject_out_of_tree_path(
