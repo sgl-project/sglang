@@ -330,6 +330,9 @@ class BaseSpecWorker(ABC):
             raise NotImplementedError(
                 "The external linker supports one non-packed draft KV pool."
             )
+        if target_model_runner.bundles_draft_kv:
+            # The tree's SWA component carries the draft pool and its host pool.
+            return HiCacheDraftPlan()
 
         return HiCacheDraftPlan(
             mode=HiCacheDraftMode.SIDECAR,

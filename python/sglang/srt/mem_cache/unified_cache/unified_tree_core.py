@@ -3126,6 +3126,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 f"[Leaf] {len(overlap)} in both sets: {[n.id for n in list(overlap)[:5]]}"
             )
 
+        for component in self.components:
+            component.validate_component_state(all_node_set, E)
         if self.enable_session_radix_cache:
             for component in self.components:
                 component.validate_session_state(all_node_set, E)

@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 )
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import (
+    DraftSWATokenToKVPoolAllocator,
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
     is_swa_req_ring,
@@ -352,10 +353,18 @@ class KVCacheConfigurator:
     kv_shard_group: Optional[GroupCoordinator] = field(init=False)
     is_hybrid_swa_mtp_draft: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    bundles_draft_kv: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
+        # A bundled DFLASH draft's KV is the SWA side of the target allocator.
+        if self.is_draft_worker:
+            self.bundles_draft_kv = isinstance(
+                self.token_to_kv_pool_allocator, DraftSWATokenToKVPoolAllocator
+            )
+        else:
+            self.bundles_draft_kv = self._resolve_draft_kv_bundling()
         self.hybrid_kda_config = hybrid_kda_config(self.model_config)
         self._resolve_kv_shard()
         self.is_hybrid_swa_mtp_draft = self.layer_info.is_hybrid_swa_mtp_draft
@@ -507,7 +516,7 @@ class KVCacheConfigurator:
         max_running_requests = config.max_running_requests
         full_max_total_num_tokens = None
         swa_max_total_num_tokens = None
-        if self.is_hybrid_swa:
+        if self.is_hybrid_swa or self.bundles_draft_kv:
             full_max_total_num_tokens = config.full_max_total_num_tokens
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
@@ -1867,6 +1876,12 @@ class KVCacheConfigurator:
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                     mha_pool_class=mha_pool_class,
                 )
+            elif self.is_draft_worker and self.bundles_draft_kv:
+                token_to_kv_pool = self._build_draft_swa_kv_pool(
+                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                    mha_pool_class=mha_pool_class,
+                )
             elif is_minimax_sparse(self.model_config.hf_config):
                 reject_out_of_tree_path(
                     current_platform, subsystem="the MiniMax sparse-index KV pool"
@@ -2498,6 +2513,34 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _build_draft_swa_kv_pool(
+        self,
+        *,
+        full_max_total_num_tokens: int,
+        swa_max_total_num_tokens: int,
+        mha_pool_class: type,
+    ) -> KVCache:
+        """Draft pool addressed through the target allocator's full->SWA mapping."""
+        return SWAKVPool(
+            size=full_max_total_num_tokens,
+            size_swa=swa_max_total_num_tokens,
+            page_size=self.pool_page_size,
+            dtype=self.kv_cache_dtype,
+            post_capture_active=self.post_capture_kv_active,
+            head_num=self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            swa_attention_layer_ids=list(
+                range(self.layer_info.start_layer, self.layer_info.end_layer)
+            ),
+            full_attention_layer_ids=[],
+            device=self.device,
+            enable_kv_cache_copy=True,
+            token_to_kv_pool_class=mha_pool_class,
+        )
+
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
@@ -2823,6 +2866,17 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                         req_to_token_pool=req_to_token_pool,
                     )
+                elif self.bundles_draft_kv:
+                    token_to_kv_pool_allocator = DraftSWATokenToKVPoolAllocator(
+                        sizes.full_max_total_num_tokens,
+                        sizes.swa_max_total_num_tokens,
+                        page_size=get_schedule().page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=token_to_kv_pool,
+                        need_sort=need_sort,
+                        req_to_token_pool=req_to_token_pool,
+                    )
                 else:
                     if get_memory().enable_hisparse:
                         from sglang.srt.mem_cache.sparsity import (
@@ -2926,6 +2980,8 @@ class KVCacheConfigurator:
                     token_to_kv_pool.register_mapping(
                         swa_allocator.full_to_swa_index_mapping
                     )
+            elif self.bundles_draft_kv:
+                token_to_kv_pool_allocator.attach_draft_kv_pool(token_to_kv_pool)
         return token_to_kv_pool_allocator
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
@@ -2999,6 +3055,36 @@ class KVCacheConfigurator:
             )
 
         return int(rest_memory * (1 << 30))  # return in bytes
+
+    def _resolve_draft_kv_bundling(self) -> bool:
+        from sglang.srt.mem_cache.kv_cache_builder import uses_ssm_state
+
+        if not self.spec_algorithm.is_dflash() or not uses_ssm_state(self.model_config):
+            return False
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_draft_kv_bundling_blocker,
+        )
+
+        aux = self.spec_aux_config
+        if self.is_hybrid_swa:
+            blocker = "the target has sliding-window layers"
+        elif self.post_capture_kv_active:
+            blocker = "SGLANG_ENABLE_POST_CAPTURE_KV_SIZING is on"
+        elif not aux.dflash_draft_cell_size_per_token or aux.draft_model_config is None:
+            blocker = "the draft's KV geometry is unresolved"
+        else:
+            blocker = dflash_draft_kv_bundling_blocker(
+                self.device, aux.draft_model_config.hf_config
+            )
+        if blocker is not None:
+            logger.info("DFLASH draft KV is not bundled: %s.", blocker)
+            return False
+        return True
+
+    @property
+    def draft_window_tokens(self) -> int:
+        window = get_spec().speculative_draft_window_size
+        return -(-window // self.page_size) * self.page_size
 
     def _calculate_mamba_ratio(self) -> int:
         if get_memory().disable_radix_cache:

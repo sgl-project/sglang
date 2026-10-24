@@ -197,6 +197,9 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # (component, TreeComponent.device_eviction_proxy) pairs.
+    _device_eviction_proxies: tuple[tuple[ComponentType, ComponentType], ...] = ()
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -226,6 +229,11 @@ class UnifiedRadixCache(BasePrefixCache):
         }
         self._components_tuple: tuple[TreeComponent, ...] = tuple(
             self.components.values()
+        )
+        self._device_eviction_proxies = tuple(
+            (ct, component.device_eviction_proxy)
+            for ct, component in self.components.items()
+            if component.device_eviction_proxy is not None
         )
         # Whether SWA is enabled.
         self.is_swa_enabled = ComponentType.SWA in params.tree_components
@@ -810,12 +818,16 @@ class UnifiedRadixCache(BasePrefixCache):
         tracker = {ct: 0 for ct in self.tree_components}
 
         request_by_type = self._evict_request_by_type(params)
+        proxy_targets = self._device_eviction_proxy_targets(
+            request_by_type, available_size_targets
+        )
         self._evict_components(
             request_by_type,
             tracker,
             available_size_targets=available_size_targets,
             allocation_reclaim_satisfied=allocation_reclaim_satisfied,
         )
+        self._evict_through_proxies(proxy_targets, tracker)
 
         if (
             self.cache_controller is not None
@@ -830,6 +842,57 @@ class UnifiedRadixCache(BasePrefixCache):
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
             mamba_num_evicted=tracker.get(ComponentType.MAMBA, 0),
         )
+
+    def _device_eviction_proxy_targets(
+        self,
+        request_by_type: dict[ComponentType, int],
+        available_size_targets: Optional[
+            dict[ComponentType, tuple[ComponentType, int]]
+        ],
+    ) -> dict[ComponentType, tuple[ComponentType, int]]:
+        """Free-capacity targets of proxied components, keyed by proxy."""
+        targets: dict[ComponentType, tuple[ComponentType, int]] = {}
+        for ct, proxy in self._device_eviction_proxies:
+            if request_by_type[ct] <= 0:
+                continue
+            target = (available_size_targets or {}).get(ct)
+            if target is None:
+                target = (
+                    ct,
+                    self._component_available_size(ct) + request_by_type[ct],
+                )
+            targets[proxy] = target
+        return targets
+
+    def _evict_through_proxies(
+        self,
+        proxy_targets: dict[ComponentType, tuple[ComponentType, int]],
+        tracker: dict[ComponentType, int],
+    ) -> None:
+        """Evict each proxy until its client component reaches the target."""
+        for proxy, (ct, target_size) in proxy_targets.items():
+            if self._component_available_size(ct) >= target_size:
+                continue
+            # Unreachable even by evicting everything: evict nothing.
+            if (
+                self._component_available_size(ct)
+                + self.tree_core.component_evictable_size(ct)
+                < target_size
+            ):
+                continue
+            request_by_type = {component: 0 for component in self.tree_components}
+            request_by_type[proxy] = self.tree_core.component_evictable_size(proxy)
+            proxy_tracker = {component: 0 for component in self.tree_components}
+            self._evict_components(
+                request_by_type,
+                proxy_tracker,
+                available_size_targets={proxy: (ct, target_size)},
+            )
+            self._accumulate_tracker(tracker, proxy_tracker)
+            if self.metrics_collector is not None and proxy_tracker[proxy] > 0:
+                self.metrics_collector.increment_draft_bundle_evictions(
+                    proxy_tracker[proxy]
+                )
 
     def _free_values(
         self,

@@ -5,9 +5,10 @@ import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.mem_cache import hicache_auto_size as sizing
+from sglang.srt.mem_cache.allocator.swa import DraftSWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -89,6 +90,39 @@ class TestHiCacheAutoSize(CustomTestCase):
             page_size=2,
         )
         self.assertEqual(sizing._estimate_hicache_bytes(params, None), 4096 + 1024)
+
+    def test_bundled_draft_counts_one_window_per_mamba_slot(self):
+        """The allocator's bundled draft pool holds a 12-token window (10
+        rounded up to a page) per Mamba slot, at 16 bytes per draft token."""
+        target = Mock(
+            spec=MHATokenToKVPool,
+            size=128,
+            host_capacity_bytes=None,
+            get_kv_size_bytes=Mock(return_value=(2048, 2048)),
+        )
+        draft = Mock(
+            spec=MHATokenToKVPool,
+            size=32,
+            host_capacity_bytes=None,
+            get_kv_size_bytes=Mock(return_value=(256, 256)),
+        )
+        mamba_pool = Mock(
+            size=4, host_capacity_bytes=None, get_kv_size_bytes=Mock(return_value=100)
+        )
+        params = CacheInitParams(
+            disable=False,
+            req_to_token_pool=Mock(spec=HybridReqToTokenPool, mamba_pool=mamba_pool),
+            token_to_kv_pool_allocator=Mock(
+                spec=DraftSWATokenToKVPoolAllocator,
+                get_kvcache=Mock(return_value=target),
+                draft_kv_pool=Mock(swa_kv_pool=draft),
+            ),
+            page_size=4,
+            sliding_window_size=10,
+        )
+        self.assertEqual(
+            sizing._estimate_hicache_bytes(params, None), 4096 + 100 + 4 * 12 * 16
+        )
 
     def test_default_ratio_fits_host_budget_and_pools_book_it(self):
         """With only --enable-hierarchical-cache the default ratio shrinks to the

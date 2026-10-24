@@ -42,6 +42,7 @@ from sglang.srt.utils import is_npu
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.mem_cache.allocator.swa import DraftSWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -2503,6 +2504,53 @@ def _apply_stack_result(
     )
 
 
+def _add_draft_swa_host_pool(
+    *,
+    cache: UnifiedRadixCache,
+    allocator: DraftSWATokenToKVPoolAllocator,
+    result: StackBuildResult,
+) -> None:
+    """Register a bundled draft pool as the SWA host pool, beside --hicache-size:
+    one window per host Mamba slot, at most one slot per host target token."""
+    draft_pool = allocator.draft_kv_pool.swa_kv_pool
+    controller = result.cache_controller
+    # Draft layer i is loaded with target transfer layer i.
+    assert draft_pool.layer_num <= controller.transfer_layer_id_max
+    host_mamba_slots = result.host_pool_group.get_pool(PoolName.MAMBA).size
+    window_tokens = cache.components[ComponentType.SWA].window_tokens
+    host_tokens = min(
+        host_mamba_slots * window_tokens, result.host_pool_group.logical_size
+    )
+    host_pool = _build_mha_mla_host_pool(
+        pool=draft_pool,
+        host_to_device_ratio=host_tokens / draft_pool.size,
+        page_size=controller.page_size,
+        layout=get_memory().hicache_mem_layout,
+        allocator_type=_get_allocator_type(),
+        pool_label="swa",
+    )
+    controller.register_host_pool_entry(
+        build_pool_entry(
+            name=PoolName.SWA,
+            host_pool=host_pool,
+            device_pool=draft_pool,
+            layer_mapping={i: i for i in range(draft_pool.layer_num)},
+            transfer_layer_id_max=draft_pool.layer_num,
+            host_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+            device_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
+            **_swa_allocation_callbacks(allocator.swa_attn_allocator),
+        )
+    )
+    result.component_host_pools[ComponentType.SWA] = host_pool
+    result.pools_desc += " + draft SWA"
+    logger.info(
+        "DFLASH draft KV host pool: %d tokens (%d host Mamba slots x %d-token windows)",
+        host_pool.size,
+        host_mamba_slots,
+        window_tokens,
+    )
+
+
 def attach_hybrid_pool_to_unified_cache(
     cache: UnifiedRadixCache,
     params: CacheInitParams,
@@ -2514,9 +2562,15 @@ def attach_hybrid_pool_to_unified_cache(
     storage_prefetch_threshold: int = 256,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
+    from sglang.srt.mem_cache.allocator.swa import DraftSWATokenToKVPoolAllocator
+
     try:
-        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        allocator = params.token_to_kv_pool_allocator
+        kvcache = allocator.get_kvcache()
         components = set(cache.components.keys())
+        bundled_draft = isinstance(allocator, DraftSWATokenToKVPoolAllocator)
+        if bundled_draft:
+            components.discard(ComponentType.SWA)
         strategy = _select_strategy(kvcache, components)
         result = strategy.build(
             cache=cache,
@@ -2530,6 +2584,8 @@ def attach_hybrid_pool_to_unified_cache(
             model_name=get_serving().served_model_name,
             enable_storage_metrics=cache._enable_metrics_flag,
         )
+        if bundled_draft:
+            _add_draft_swa_host_pool(cache=cache, allocator=allocator, result=result)
         _check_declared_pools_present(kvcache=kvcache, result=result, strategy=strategy)
         _apply_stack_result(cache, kvcache, params, result)
     except Exception:

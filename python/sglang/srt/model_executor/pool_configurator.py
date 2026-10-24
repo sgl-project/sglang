@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -311,7 +311,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        if (
+            kvc.spec_algorithm.is_dflash_family()
+            and not kvc.is_draft_worker
+            and not kvc.bundles_draft_kv
+        ):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
@@ -1018,6 +1022,98 @@ class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):
         )
 
 
+class DFlashDraftBundlePoolConfigurator(DefaultPoolConfigurator):
+    """Sizes a draft pool holding one W'-token window per Mamba slot, plus what
+    R running requests (s slots each, capped at M // s) need beyond those windows:
+
+        D = ceil_page(M * W' + max(0, C_run - s * R * W'))
+
+    capped at one draft slot per target token, and C_run without the radix
+    cache. The pool comes out of the target KV budget.
+    """
+
+    def __init__(self, kvc: KVCacheConfigurator):
+        super().__init__(kvc)
+        self._page_size = kvc.page_size
+        self._window = get_spec().speculative_draft_window_size
+        self._window_tokens = kvc.draft_window_tokens
+        self._draft_cell_size = _dflash_draft_cell_size(kvc)
+        assert self._draft_cell_size > 0, "bundling needs the draft's KV bytes/token"
+        self._attn_dp_size = kvc.attn_dp_size
+        self._mamba_slots_per_request = kvc._calculate_mamba_ratio()
+
+    def _draft_tokens(self) -> int:
+        schedule = get_schedule()
+        mamba_slots = schedule.max_mamba_cache_size
+        # As KVCacheConfigurator caps max_running_requests.
+        self._running = min(
+            schedule.max_running_requests // self._attn_dp_size,
+            mamba_slots // self._mamba_slots_per_request,
+        )
+        self._request_cap = compute_swa_request_cap(
+            page_size=self._page_size,
+            window=self._window,
+            attn_dp_size=self._attn_dp_size,
+            max_running_requests=self._running * self._attn_dp_size,
+        )
+        if get_memory().disable_radix_cache:
+            tokens = self._request_cap
+        else:
+            running_windows = (
+                self._mamba_slots_per_request * self._running * self._window_tokens
+            )
+            tokens = mamba_slots * self._window_tokens + max(
+                0, self._request_cap - running_windows
+            )
+        return ceil_div(tokens, self._page_size) * self._page_size
+
+    def _with_draft_pool(
+        self, config: MemoryPoolConfig, draft_tokens: int
+    ) -> MemoryPoolConfig:
+        logger.info(
+            f"DFLASH draft KV bundles: window={self._window} "
+            f"({self._window_tokens} tokens per bundle), "
+            f"mamba slots={get_schedule().max_mamba_cache_size}, running requests="
+            f"{self._running} x {self._mamba_slots_per_request} slots, "
+            f"request cap={self._request_cap}, "
+            f"draft pool={draft_tokens} tokens "
+            f"({draft_tokens * self._draft_cell_size / (1 << 30):.2f} GB)"
+        )
+        return replace(
+            config,
+            full_max_total_num_tokens=config.max_total_num_tokens,
+            swa_max_total_num_tokens=draft_tokens,
+        )
+
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        draft_tokens = self._draft_tokens()
+        per_token_cell_size = self._cell_size + self._draft_cell_size
+        if draft_tokens * per_token_cell_size >= available_bytes:
+            # One draft slot per target token holds every window.
+            config = super().calculate_pool_sizes(
+                available_bytes * self._cell_size // per_token_cell_size, page_size
+            )
+            return self._with_draft_pool(config, config.max_total_num_tokens)
+        config = super().calculate_pool_sizes(
+            available_bytes - draft_tokens * self._draft_cell_size, page_size
+        )
+        return self._with_draft_pool(
+            config, min(draft_tokens, config.max_total_num_tokens)
+        )
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        config = super().calculate_pool_sizes_from_max_tokens(
+            max_total_num_tokens, page_size
+        )
+        return self._with_draft_pool(
+            config, min(self._draft_tokens(), config.max_total_num_tokens)
+        )
+
+
 # Used when --swa-full-tokens-ratio is at its default and cap mode is unusable.
 DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
 
@@ -1655,5 +1751,7 @@ def create_memory_pool_configurator(
         if SWARequestCapPoolConfigurator.is_applicable(kvc):
             return SWARequestCapPoolConfigurator(kvc)
         return HybridSWAPoolConfigurator(kvc)
+    if kvc.bundles_draft_kv:
+        return DFlashDraftBundlePoolConfigurator(kvc)
     # Future: MambaPoolConfigurator
     return DefaultPoolConfigurator(kvc)

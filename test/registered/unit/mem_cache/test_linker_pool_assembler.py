@@ -694,7 +694,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             ),
         )
         target = SimpleNamespace(
-            spec_algorithm=SpeculativeAlgorithm.EAGLE, req_to_token_pool=None
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            req_to_token_pool=None,
+            bundles_draft_kv=False,
         )
         worker = SimpleNamespace(
             target_worker=SimpleNamespace(model_runner=target),

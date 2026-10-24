@@ -146,6 +146,19 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     return create_unified_radix_cache(ctx)
 
 
+def _bundles_draft_windows(ctx: TreeCacheBuildContext, params: CacheInitParams) -> bool:
+    from sglang.srt.mem_cache.allocator.swa import DraftSWATokenToKVPoolAllocator
+
+    if not isinstance(
+        params.token_to_kv_pool_allocator, DraftSWATokenToKVPoolAllocator
+    ):
+        return False
+    assert ctx.is_hybrid_ssm and ctx.is_hybrid_swa, (
+        "a bundled draft pool needs a hybrid SSM target and the SWA component"
+    )
+    return True
+
+
 def create_unified_radix_cache(
     ctx: TreeCacheBuildContext,
     *,
@@ -180,6 +193,17 @@ def create_unified_radix_cache(
         }
 
     params.tree_components = tuple(tree_components)
+    if _bundles_draft_windows(ctx, params):
+        from sglang.srt.mem_cache.unified_cache.components.draft_window import (
+            DraftWindowComponent,
+            DraftWindowMambaComponent,
+        )
+
+        params.component_registry_override = {
+            **(params.component_registry_override or {}),
+            ComponentType.SWA: DraftWindowComponent,
+            ComponentType.MAMBA: DraftWindowMambaComponent,
+        }
     if use_mlx() and ctx.is_hybrid_ssm:
         from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
             MlxAuxiliaryStateComponent,

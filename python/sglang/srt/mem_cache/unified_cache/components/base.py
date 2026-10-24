@@ -183,6 +183,10 @@ class TreeComponent(ABC):
     # Subclasses MUST set this as a class attribute (not @property)
     component_type: ComponentType
 
+    # Another component whose device eviction frees this one's state. The
+    # cache evicts it to meet the rest of this component's device request.
+    device_eviction_proxy: Optional[ComponentType] = None
+
     def reset_session_state(self) -> None:
         self._session_leaves = defaultdict(set)
 
@@ -325,6 +329,13 @@ class TreeComponent(ABC):
             self._unmark_session_leaf(session_id, node)
             if fallback is not None:
                 self._mark_session_leaf(session_id, fallback)
+
+    def validate_component_state(
+        self,
+        reachable_nodes: set[UnifiedTreeNode],
+        report_error: Callable[[str], None],
+    ) -> None:
+        """Report violations of invariants this component keeps across nodes."""
 
     def validate_session_state(
         self,

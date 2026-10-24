@@ -134,6 +134,49 @@ def dflash_draft_cell_size_per_token(
     return int(num_kv_heads * kv_dim_per_head * int(draft_num_layers) * dtype_size)
 
 
+def dflash_draft_kv_bundling_blocker(
+    device: str, draft_hf_config: Any
+) -> Optional[str]:
+    """Why the serving config rules out bundling the draft KV, or None."""
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
+    from sglang.srt.utils import is_cuda
+
+    if not envs.SGLANG_DFLASH_DRAFT_KV_BUNDLING.get():
+        return "SGLANG_DFLASH_DRAFT_KV_BUNDLING is off"
+    if get_spec().speculative_draft_window_size is None:
+        return "--speculative-draft-window-size is not set"
+    # Attention backends translate draft slots only for sliding-window layers.
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if not layer_types or any(t != "sliding_attention" for t in layer_types):
+        return f"the draft has non-sliding-window layers ({layer_types})"
+    if not (device.startswith("cuda") and is_cuda()):
+        return f"device {device} is not CUDA"
+    memory = get_memory()
+    for blocker, active in (
+        (
+            "HiCache buffer mode",
+            memory.enable_hierarchical_cache
+            and memory.hicache_host_memory_mode != "cache",
+        ),
+        ("--hicache-storage-backend", memory.hicache_storage_backend is not None),
+        (
+            "--enable-unified-cache-external-linker",
+            memory.enable_unified_cache_external_linker,
+        ),
+        ("--enable-lmcache", memory.enable_lmcache),
+        ("--enable-flexkv", memory.enable_flexkv),
+        ("--radix-cache-backend", memory.radix_cache_backend is not None),
+        ("--enable-unified-memory", memory.enable_unified_memory),
+        ("--enable-hisparse", memory.enable_hisparse),
+        ("PD disaggregation", get_disagg().disaggregation_mode != "null"),
+        ("--dcp-size", get_parallel().attn_dcp_size > 1),
+    ):
+        if active:
+            return f"{blocker} is not supported yet"
+    return None
+
+
 def scale_kv_cell_size_per_token_for_dflash(
     *,
     target_cell_size_per_token: int,

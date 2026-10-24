@@ -91,6 +91,8 @@ def _make_model_runner(
     qk_rope_head_dim=64,
     swa_kv_lora_rank=128,
     swa_qk_rope_head_dim=32,
+    speculative_draft_window_size=None,
+    max_mamba_cache_size=None,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -150,6 +152,8 @@ def _make_model_runner(
         speculative_algorithm=speculative_algorithm,
         speculative_num_steps=speculative_num_steps,
         speculative_eagle_topk=speculative_eagle_topk,
+        speculative_draft_window_size=speculative_draft_window_size,
+        max_mamba_cache_size=max_mamba_cache_size,
         disaggregation_mode=disaggregation_mode,
         max_running_requests=max_running_requests,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
@@ -183,11 +187,13 @@ def _make_model_runner(
     )
     mr.attn_dp_size = 1
     mr.pp_size = 1
+    mr.bundles_draft_kv = False
     mr.pp_group = SimpleNamespace(rank_in_group=0)
     mr.spec_aux_config = SimpleNamespace(
         eagle_draft_num_layers=None,
         eagle_draft_swa_num_layers=None,
         dflash_draft_num_layers=None,
+        dflash_draft_cell_size_per_token=None,
     )
     # Fused draft KV is off unless a test opts in (a bare MagicMock return
     # would read as a truthy entry size and take the fused pricing branch).
@@ -1861,6 +1867,122 @@ class TestFusedDraftPricing(unittest.TestCase):
             fused._full_per_token * fused._full_layers_num
             + fused._swa_full_tokens_ratio * 4_321,
         )
+
+
+class TestDFlashDraftBundlePoolConfigurator(CustomTestCase):
+    """A bundled draft pool holds a W'-token window per Mamba slot plus what
+    running requests need beyond their own slots' windows, out of the target
+    KV budget."""
+
+    WINDOW = 60  # rounds up to 64 tokens at page size 16
+    PAGE = 16
+    DRAFT_CELL = 48
+    MAMBA_SLOTS = 40
+    SLOTS_PER_REQUEST = 3
+
+    def _run(self, available_bytes=100_000_000, swa_eviction_interval=4, **kwargs):
+        mr = _make_model_runner(
+            self,
+            num_layers=4,
+            page_size=self.PAGE,
+            speculative_algorithm="DFLASH",
+            speculative_num_steps=1,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=8,
+            disable_overlap_schedule=True,
+            chunked_prefill_size=32,
+            speculative_draft_window_size=self.WINDOW,
+            max_mamba_cache_size=self.MAMBA_SLOTS,
+            **kwargs,
+        )
+        mr.spec_algorithm.is_dflash.return_value = True
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.dflash_draft_num_layers = 5
+        mr.spec_aux_config.dflash_draft_cell_size_per_token = self.DRAFT_CELL
+        mr.bundles_draft_kv = True
+        mr.draft_window_tokens = 64
+        mr._calculate_mamba_ratio.return_value = self.SLOTS_PER_REQUEST
+        with mock_cpu_env(swa_eviction_interval=swa_eviction_interval):
+            from sglang.srt.model_executor.pool_configurator import (
+                compute_swa_request_cap,
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available_bytes, self.PAGE)
+            cap = compute_swa_request_cap(
+                page_size=self.PAGE,
+                window=self.WINDOW,
+                attn_dp_size=1,
+                max_running_requests=cfg._running,
+            )
+        return mr, config, cap
+
+    def _assert_budget_used(self, mr, config, available):
+        target_cell = _full_per_token(mr) * 4
+        used = (
+            config.max_total_num_tokens * target_cell
+            + config.swa_max_total_num_tokens * self.DRAFT_CELL
+        )
+        self.assertLessEqual(used, available)
+        self.assertGreater(
+            used, available - self.PAGE * (target_cell + self.DRAFT_CELL)
+        )
+
+    def test_idle_tree_bounds_a_lightly_loaded_pool(self):
+        _, config, cap = self._run(max_running_requests=2)
+        self.assertLess(cap, self.SLOTS_PER_REQUEST * 2 * 64)
+        self.assertEqual(config.swa_max_total_num_tokens, self.MAMBA_SLOTS * 64)
+
+    def test_running_requests_add_what_their_slots_do_not_hold(self):
+        mr, config, cap = self._run(swa_eviction_interval=128, max_running_requests=8)
+        extra = cap - self.SLOTS_PER_REQUEST * 8 * 64
+        self.assertGreater(extra, 0)
+        self.assertEqual(
+            config.swa_max_total_num_tokens,
+            -(-(self.MAMBA_SLOTS * 64 + extra) // self.PAGE) * self.PAGE,
+        )
+        self.assertEqual(config.full_max_total_num_tokens, config.max_total_num_tokens)
+        self._assert_budget_used(mr, config, 100_000_000)
+
+    def test_windows_beyond_the_budget_fall_back_to_one_slot_per_token(self):
+        mr, config, _ = self._run(available_bytes=100_000, max_running_requests=2)
+        self.assertGreater(config.max_total_num_tokens, 0)
+        self.assertEqual(config.swa_max_total_num_tokens, config.max_total_num_tokens)
+        self._assert_budget_used(mr, config, 100_000)
+
+
+class TestDFlashDraftKVBundlingGate(CustomTestCase):
+    def test_unsupported_options_keep_the_per_token_draft_pool(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.runtime_context import get_context, get_disagg
+        from sglang.srt.speculative.dflash_utils import (
+            dflash_draft_kv_bundling_blocker as blocker,
+        )
+
+        override = get_context().override_server_args(
+            speculative_algorithm="DFLASH", speculative_draft_window_size=2047
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        sliding = SimpleNamespace(layer_types=["sliding_attention"] * 5)
+        with (
+            envs.SGLANG_DFLASH_DRAFT_KV_BUNDLING.override(True),
+            patch("sglang.srt.utils.is_cuda", return_value=True),
+        ):
+            self.assertIsNone(blocker("cuda:0", sliding))
+            full = SimpleNamespace(layer_types=["full_attention"])
+            self.assertIn("non-sliding-window", blocker("cuda:0", full))
+            self.assertIn("not CUDA", blocker("cpu", sliding))
+            buffer_mode = dict(
+                enable_hierarchical_cache=True, hicache_host_memory_mode="buffer"
+            )
+            with get_memory().override(**buffer_mode):
+                self.assertIn("HiCache buffer mode", blocker("cuda:0", sliding))
+            with get_disagg().override(disaggregation_mode="decode"):
+                self.assertIn("PD disaggregation", blocker("cuda:0", sliding))
+        self.assertIn("SGLANG_DFLASH_DRAFT_KV_BUNDLING", blocker("cuda:0", sliding))
 
 
 if __name__ == "__main__":

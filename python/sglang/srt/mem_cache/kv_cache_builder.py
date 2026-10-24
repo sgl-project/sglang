@@ -37,7 +37,10 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
-from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
+from sglang.srt.mem_cache.allocator.swa import (
+    DraftSWATokenToKVPoolAllocator,
+    is_swa_req_ring,
+)
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -56,6 +59,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 from sglang.srt.utils import ceil_align, is_hip, is_npu
@@ -118,6 +122,9 @@ def prepare_hicache_staging(
                 pool.swa_kv_pool if isinstance(pool, BaseSWAKVPool) else pool,
                 sidecar=True,
             )
+    allocator = runner.token_to_kv_pool_allocator
+    if isinstance(allocator, DraftSWATokenToKVPoolAllocator):
+        prepare(allocator.draft_kv_pool.swa_kv_pool)
 
 
 def maybe_register_hicache_draft(
@@ -330,16 +337,25 @@ def build_kv_cache(
 
     # Hybrid memory pool
     token_to_kv_pool = tp_worker.model_runner.token_to_kv_pool
-    is_hybrid_swa = tp_worker.is_hybrid_swa and (
-        not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        or token_to_kv_pool.needs_paged_swa_allocator
+    # A bundled draft's KV is the allocator's SWA side.
+    bundled_draft_kv = tp_worker.model_runner.bundles_draft_kv
+    is_hybrid_swa = bundled_draft_kv or (
+        tp_worker.is_hybrid_swa
+        and (
+            not isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+            or token_to_kv_pool.needs_paged_swa_allocator
+        )
     )
     is_hybrid_ssm = uses_ssm_state(tp_worker.model_runner.model_config)
     is_dsa = is_deepseek_dsa(model_config.hf_config)
 
     sliding_window_size = None
     if is_hybrid_swa:
-        sliding_window_size = tp_worker.sliding_window_size
+        sliding_window_size = (
+            get_spec().speculative_draft_window_size
+            if bundled_draft_kv
+            else tp_worker.sliding_window_size
+        )
         full_tokens_per_layer, swa_tokens_per_layer = (
             tp_worker.get_tokens_per_layer_info()
         )
