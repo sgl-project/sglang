@@ -504,6 +504,7 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
     attention.num_heads = 8
     attention.softmax_scale = 128**-0.5
     attention.prefix = "test.attn"
+    attention.quant_config = None
     attention._cube_sparse_capable = False
 
     with patch(
