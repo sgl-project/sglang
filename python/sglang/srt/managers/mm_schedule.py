@@ -247,7 +247,14 @@ def _can_batch_cross_request_image_misses(
         and getattr(data_embedding_func, "__name__", None) == "get_image_feature"
         and getattr(owner, "supports_batched_image_encoding", False)
         and envs.SGLANG_NPU_VIT_MAX_BATCH_PATCHES.get() > 0
+        # ViT NPU graphs are keyed on the exact cu_seqlens layout. Batched
+        # variable layouts corrupt outputs (measured 15/16 divergence from
+        # baseline, embeddings misrouted). Lift only once graphs bucket
+        # variable layouts.
         and not envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+        # Encoder DP + batching measured ~12x slower prefill (mean TTFT
+        # 1089 ms -> 13222 ms on GLM-4.1V-9B TP=2, correct but pathologically
+        # slow). Lift only after the sharding/allgather slowdown is root-caused.
         and not getattr(owner, "use_data_parallel", False)
     )
 
