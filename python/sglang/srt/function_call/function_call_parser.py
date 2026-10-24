@@ -173,7 +173,9 @@ class FunctionCallParser:
             return False
         return self.detector.has_tool_call(text)
 
-    def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
+    def parse_non_stream(
+        self, full_text: str, *, finish_reason: Optional[str] = None
+    ) -> Tuple[str, list[ToolCallItem]]:
         """
         One-time parsing of the full text to extract tool calls.
 
@@ -188,9 +190,14 @@ class FunctionCallParser:
         if not self.tools and not self.detector.parses_without_tools():
             return full_text, []
         has_tool_call = self.detector.has_tool_call(full_text)
-        parsed_result = self.detector.detect_and_parse(full_text, self.tools)
+        if isinstance(self.detector, KimiK3Detector):
+            parsed_result = self.detector.detect_and_parse(
+                full_text, self.tools, allow_incomplete=finish_reason == "length"
+            )
+        else:
+            parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
-        if tool_call_list or has_tool_call:
+        if tool_call_list or has_tool_call or isinstance(self.detector, KimiK3Detector):
             return parsed_result.normal_text, tool_call_list
         else:
             return full_text, []
@@ -221,7 +228,9 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
-    def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
+    def parse_stream_end(
+        self, *, finish_reason: Optional[str] = None
+    ) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.
 
         Text a detector held back waiting for a marker (which can no longer
@@ -229,7 +238,12 @@ class FunctionCallParser:
         """
         if not self.tools and not self.detector.parses_without_tools():
             return "", []
-        sp_result = self.detector.finish(self.tools)
+        if isinstance(self.detector, KimiK3Detector):
+            sp_result = self.detector.finish(
+                self.tools, allow_incomplete=finish_reason == "length"
+            )
+        else:
+            sp_result = self.detector.finish(self.tools)
         return sp_result.normal_text, sp_result.calls
 
     def get_legacy_structural_tag(

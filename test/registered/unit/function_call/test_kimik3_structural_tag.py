@@ -22,6 +22,7 @@ from sglang.srt.function_call.kimik3_format import (
     TOOLS_CLOSE,
     TOOLS_OPEN,
 )
+from sglang.srt.function_call.kimik3_native import KimiK3ParseError
 from sglang.srt.function_call.kimik3_structural_tag import (
     get_kimik3_auto_tool_call_structural_tag,
     get_kimik3_structural_tag,
@@ -597,9 +598,8 @@ def test_auto_hook_does_not_swallow_parser_visible_closes():
         + TOOLS_CLOSE
     )
 
-    parsed = KimiK3Detector().detect_and_parse(output, [_tool(strict=False)])
-
-    assert json.loads(parsed.calls[0].parameters) == {"city": "Paris", "days": ""}
+    with pytest.raises(KimiK3ParseError, match="invalid_json"):
+        KimiK3Detector().detect_and_parse(output, [_tool(strict=False)])
     assert not _token_accepts(structural_tag, output)
 
 
