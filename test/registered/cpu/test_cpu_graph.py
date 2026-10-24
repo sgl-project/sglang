@@ -1,9 +1,12 @@
-import copy
-import os
+"""
+Usage:
+python3 -m unittest test_cpu_graph.TestCPUGraph.test_mmlu_torch_compile_cpu
+"""
+
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import get_cpu_ids_by_node, kill_process_tree
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
@@ -11,6 +14,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    get_tp_cpu_bind,
     intel_amx_benchmark,
     is_in_ci,
     popen_launch_server,
@@ -25,7 +29,7 @@ class TestCPUGraph(CustomTestCase):
             "--batch-size",
             "1",
             "--mem-fraction-static",
-            "0.05",
+            "0.5",
             "--enable-torch-compile",
             "--torch-compile-max-bs",
             "2",
@@ -40,10 +44,10 @@ class TestCPUGraph(CustomTestCase):
     def test_mmlu_torch_compile_cpu(self):
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST
-        cpu_ids_by_node = get_cpu_ids_by_node()
-        n_numa_node = len(cpu_ids_by_node)
-        env = copy.deepcopy(os.environ)
-        env["SGLANG_CPU_OMP_THREADS_BIND"] = "all"
+        # Confine to an already-set SGLANG_CPU_OMP_THREADS_BIND; otherwise
+        # fall back to the original one-rank-per-numa-node default.
+        tp_size = 6
+        bind = get_tp_cpu_bind(tp_size)
         process = popen_launch_server(
             model,
             base_url,
@@ -52,7 +56,7 @@ class TestCPUGraph(CustomTestCase):
                 "--attention-backend",
                 "intel_amx",
                 "--mem-fraction-static",
-                "0.05",
+                "0.5",
                 "--disable-radix",
                 "--trust-remote-code",
                 "--disable-overlap-schedule",
@@ -60,9 +64,9 @@ class TestCPUGraph(CustomTestCase):
                 "--cuda-graph-bs-decode",
                 "2",
                 "--tp",
-                f"{n_numa_node}",
+                f"{tp_size}",
             ],
-            env=env,
+            env={"SGLANG_CPU_OMP_THREADS_BIND": bind if bind is not None else "all"},
         )
 
         try:

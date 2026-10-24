@@ -11,6 +11,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    get_tp_cpu_bind,
     intel_amx_benchmark,
     is_in_ci,
     popen_launch_server,
@@ -21,14 +22,14 @@ register_cpu_ci(est_time=685, suite="stage-a-tp-test-cpu-intel")
 
 class TestIntelAMXAttnBackend(CustomTestCase):
     @intel_amx_benchmark(
-        extra_args=["--batch-size", "4", "--mem-fraction-static", "0.3"],
+        extra_args=["--batch-size", "4", "--mem-fraction-static", "0.5"],
         min_throughput=10,
     )
     def test_latency_mla_model(self):
         return DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
     @intel_amx_benchmark(
-        extra_args=["--batch-size", "4", "--mem-fraction-static", "0.3"],
+        extra_args=["--batch-size", "4", "--mem-fraction-static", "0.5"],
         min_throughput=40,
     )
     def test_latency_default_model(self):
@@ -45,7 +46,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
                 "--attention-backend",
                 "intel_amx",
                 "--mem-fraction-static",
-                "0.3",
+                "0.5",
                 "--disable-radix",
                 "--trust-remote-code",
                 "--disable-overlap-schedule",
@@ -70,6 +71,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
 class TestDPAttention(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        tp_size = 2
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
@@ -78,10 +80,10 @@ class TestDPAttention(CustomTestCase):
             "--attention-backend",
             "intel_amx",
             "--mem-fraction-static",
-            "0.3",
+            "0.5",
             "--disable-overlap-schedule",
             "--tp",
-            "2",
+            str(tp_size),
             "--attn-dp-size",
             "2",
         ]
@@ -90,6 +92,11 @@ class TestDPAttention(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
+            env=(
+                {"SGLANG_CPU_OMP_THREADS_BIND": bind}
+                if (bind := get_tp_cpu_bind(tp_size)) is not None
+                else None
+            ),
         )
 
     @classmethod
