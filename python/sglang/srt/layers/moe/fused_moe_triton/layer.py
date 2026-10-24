@@ -635,13 +635,17 @@ class FusedMoE(torch.nn.Module):
     def num_global_routed_experts(self) -> int:
         return self._num_global_routed
 
-    def bind_full_expert_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+    def bind_full_expert_weights(
+        self, weights: Dict[str, torch.Tensor], *, prefetched: bool = True
+    ) -> None:
         """Rebind this layer's expert weight tensors to externally provided
         full [num_experts, ...] tensors and collapse its EP view to a single
         rank that owns every routed expert (ep_size=1, no expert remapping).
 
         Callers are weight-replication schemes that materialize all expert
         weights locally after load time (e.g. DWDP's composite-VA prefetch).
+        ``prefetched`` says whether DWDP's per-layer prefetch fills the tensors,
+        so forward must wait on it; pass False for fully resident copies.
         """
         self.moe_ep_size = 1
         self.moe_ep_rank = 0
@@ -659,7 +663,7 @@ class FusedMoE(torch.nn.Module):
         for name, tensor in weights.items():
             self.replace_expert_tensor(name, tensor)
 
-        self._dwdp_bound = True
+        self._dwdp_bound = prefetched
 
     def named_per_expert_tensors(
         self, num_local_experts: int

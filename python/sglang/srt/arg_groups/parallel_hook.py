@@ -448,8 +448,15 @@ def handle_dwdp(server_args: Any):
     assert not cfg.enable_eplb, (
         "EPLB dynamic migration conflicts with static DWDP partitioning"
     )
-    assert cfg.speculative_algorithm is None, (
-        "DWDP does not support speculative decoding (MTP/draft workers)"
+    # MTP drafts are built by the same DWDP-aware model code; the draft runner
+    # replicates their routed experts at load time. On a PD prefill server the
+    # draft only runs extend; its eager decode steps in null mode are not covered.
+    assert cfg.speculative_algorithm is None or (
+        cfg.disaggregation_mode == "prefill"
+        and cfg.speculative_algorithm.upper() in ("EAGLE", "NEXTN")
+    ), (
+        "DWDP supports speculative decoding only with EAGLE/NEXTN (MTP) drafts "
+        "and --disaggregation-mode prefill"
     )
     assert cfg.pp_size == 1, "DWDP requires pp_size == 1"
     assert not cfg.enable_two_batch_overlap, (

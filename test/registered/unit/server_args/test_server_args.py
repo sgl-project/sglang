@@ -1760,6 +1760,39 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertTrue(is_interleave())
 
 
+class TestDwdpSpeculativeDecoding(CustomTestCase):
+    """DWDP runs MoE on DP-local tokens with no post-experts sum. The draft
+    runner replicates the routed experts of an MTP (NextN) draft for that, which
+    covers a PD prefill server, where the draft only runs extend. Other drafts and
+    null mode, where the draft also decodes, are not validated under DWDP."""
+
+    @staticmethod
+    def _dwdp_args(speculative_algorithm, disaggregation_mode="prefill"):
+        return ServerArgs(
+            model_path="dummy",
+            tp_size=2,
+            dwdp_size=2,
+            disaggregation_mode=disaggregation_mode,
+            speculative_algorithm=speculative_algorithm,
+        )
+
+    def test_mtp_drafts_are_accepted_on_prefill(self):
+        for algorithm in ("EAGLE", "NEXTN"):
+            # handle_dwdp also sets SGLANG_SCHEDULER_SKIP_ALL_GATHER.
+            with self.subTest(algorithm=algorithm), patch.dict(os.environ):
+                parallel_hook.handle_dwdp(self._dwdp_args(algorithm))
+
+    def test_other_drafts_and_null_mode_are_rejected(self):
+        for algorithm, mode in (
+            ("EAGLE3", "prefill"),
+            ("DSPARK", "prefill"),
+            ("EAGLE", "null"),
+        ):
+            with self.subTest(algorithm=algorithm, mode=mode), patch.dict(os.environ):
+                with self.assertRaisesRegex(AssertionError, "EAGLE/NEXTN"):
+                    parallel_hook.handle_dwdp(self._dwdp_args(algorithm, mode))
+
+
 class TestFlashinferA2ADispatchType(CustomTestCase):
     def setUp(self):
         self._nvfp4_env_backup = os.environ.get("SGLANG_MOE_NVFP4_DISPATCH")

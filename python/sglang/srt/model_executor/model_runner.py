@@ -1434,12 +1434,14 @@ class ModelRunner:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
     def maybe_init_dwdp(self):
-        if self.is_draft_worker:
-            return
         if get_parallel().dwdp_size <= 1:
             return
-        from sglang.srt.layers.moe.dwdp import DwdpManager
+        from sglang.srt.layers.moe.dwdp import DwdpManager, replicate_routed_experts
 
+        if self.is_draft_worker:
+            # The target's manager prefetches only the target's MoE layers.
+            replicate_routed_experts(self.model)
+            return
         manager = DwdpManager(self.server_args)
         set_global_dwdp_manager(manager)
         manager.setup(self.model)
@@ -2020,7 +2022,8 @@ class ModelRunner:
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
 
             dwdp_mgr = get_global_dwdp_manager()
-            if dwdp_mgr is not None:
+            # The manager is the target's; a draft forward consumes no prefetch.
+            if dwdp_mgr is not None and not self.is_draft_worker:
                 dwdp_mgr.prefetch_first_layers()
 
             if forward_batch.forward_mode.is_split_prefill():
