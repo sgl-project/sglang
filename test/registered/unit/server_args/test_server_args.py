@@ -4872,6 +4872,21 @@ class TestTrtllmMlaArchGuard(CustomTestCase):
             "TensorRT-LLM MLA backend only supports kv-cache-dtype of fp8_e4m3, bf16, or auto.",
         )
 
+    @override_platform(is_sm100=True, is_sm120=False, is_blackwell=True)
+    def test_trtllm_mla_accepts_bfloat16_kv_cache_dtype(self):
+        for backends in (
+            {"attention_backend": "trtllm_mla"},
+            {
+                "attention_backend": "triton",
+                "prefill_attention_backend": "trtllm_mla",
+                "decode_attention_backend": "triton",
+            },
+        ):
+            with self.subTest(**backends):
+                handle_attention_backend_compatibility(
+                    self._make_args(kv_cache_dtype="bfloat16", **backends)
+                )
+
     @override_platform(is_sm100=False, is_sm120=False, is_blackwell=False)
     def test_unused_global_backend_does_not_trigger_mla_checks(self):
         handle_attention_backend_compatibility(
