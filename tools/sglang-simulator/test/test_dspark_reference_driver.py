@@ -1,6 +1,7 @@
 """Production event wiring on CPU protocols; no qualified timing/progress rows."""
 
 import ast
+import asyncio
 import json
 from collections import deque
 from dataclasses import replace
@@ -22,6 +23,9 @@ from test_dspark_reference import native_page_sizing
 from test_dspark_runtime import batch, forward
 from test_dspark_runtime import runtime as runtime_fixture
 from test_scheduler_predictor_hooks import hooked_scheduler as scheduler_fixture
+from test_scheduler_predictor_hooks import (
+    mock_profile_output,
+)
 
 runtime = runtime_fixture
 hooked_scheduler = scheduler_fixture
@@ -295,6 +299,28 @@ def test_failed_forward_never_installs_reference_session_buffer_or_fid(run, fail
             launch(run, current)
 
 
+def test_publication_cancellation_after_external_effect_latches_and_cannot_retry(run):
+    current = selected(run)
+    base, selection = run.driver.adapter, run.driver.selection
+    effects = []
+    cancellation = asyncio.CancelledError("publication was already visible")
+
+    def publish(lengths):
+        effects.append(list(lengths))
+        raise cancellation
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        launch(run, current, publish)
+    assert caught.value is cancellation and effects == [[512]]
+    assert run.driver.failure["event"] == "publication/session commit"
+    assert run.driver.adapter is base and run.driver.selection is selection
+    assert run.runtime.session._history == {}
+    assert run.runtime._forward_id == run.runtime._draft_buffer_capacity == 0
+    with pytest.raises(PredictorError, match="restart the run"):
+        launch(run, current, publish)
+    assert effects == [[512]] and run.driver.adapter.ledger.pending == ()
+
+
 def test_cancel_pending_drain_and_reset_keep_buffer_and_monotonic_fid(run):
     current = selected(run)
     result = launch(run, current)
@@ -446,6 +472,193 @@ def test_installed_scheduler_and_worker_hooks_activate_driver_and_consume_timing
         target.process_batch_result(current, result)
     target.on_idle()
     assert run.runtime.session.history_for("a").target_prefix_len == 512
+
+
+def install_native_hooks(run, hooked_scheduler):
+    from sglang_simulator.simulation.sglang.dspark_worker import C_DSparkWorkerHook
+
+    target = hooked_scheduler.target
+    hooked_scheduler.predictor.supports_dspark = True
+    hooked_scheduler.predictor.dspark_runtime = run.runtime
+    target.enable_overlap = True
+    target.future_map = run.scheduler.future_map
+    run.scheduler = target
+
+    class Worker:
+        pass
+
+    C_DSparkWorkerHook.hook(Worker)
+    worker = Worker.__new__(Worker)
+    worker.query_token_num = 5
+    worker.verify_num_draft_tokens = 6
+
+    def worker_call(native_batch, result):
+        selection = run.driver.selection
+        if selection.future_indices_ready:
+            published = selection.allocation.prepared.published_seq_lens
+            native_batch.seq_lens = list(published)
+            native_batch.seq_lens_cpu = (
+                list(published) if selection.simulator_needs_cpu_seq_lens else None
+            )
+        vars(result).update(vars(worker.forward_batch_generation(native_batch)))
+
+    target.after_forward = worker_call
+    return target
+
+
+def test_native_result_cancellation_after_response_latches_and_cannot_retry(
+    run, hooked_scheduler
+):
+    from sglang_simulator.simulation.sglang import scheduler
+
+    target = install_native_hooks(run, hooked_scheduler)
+    current = selected(run)
+    result = target.run_batch(current)
+    effects = []
+    cancellation = asyncio.CancelledError("response was already visible")
+
+    def process_then_cancel(batch, result):
+        batch.reqs[0].output_ids.append(1)
+        effects.append(batch.reqs[0].rid)
+        raise cancellation
+
+    target.after_process = process_then_cancel
+    with pytest.raises(asyncio.CancelledError) as caught:
+        target.process_batch_result(current, result)
+    assert caught.value is cancellation and effects == ["a"]
+    assert run.driver.failure["event"] == "native result processing"
+    assert getattr(result, scheduler._DSPARK_ACCOUNTED) is False
+    assert getattr(target, scheduler._DSPARK_PENDING_RESULTS) == 1
+    with pytest.raises(PredictorError, match="restart the run"):
+        target.process_batch_result(current, result)
+    assert effects == ["a"]
+    assert hooked_scheduler.hook.ITERATION_STATS == []
+
+
+@pytest.mark.parametrize("failure", [None, "pending", "save"])
+def test_profile_reset_clears_old_idle_credit_only_after_success(
+    run, hooked_scheduler, monkeypatch, tmp_path, failure
+):
+    from sglang_simulator.simulation.manager.state import StateManager
+    from sglang_simulator.simulation.sglang import scheduler
+
+    target = install_native_hooks(run, hooked_scheduler)
+    current = selected(run)
+    process(run, current, launch(run, current))
+    current = selected(run, "DECODE", req=current.reqs[0])
+    process(run, current, launch(run, current))
+    assert run.runtime._draft_buffer_capacity > 0
+    target.plan = NS(batch_to_run=None, running_batch=None)
+    original_selected = run.driver.selected
+
+    def idle_selection(*args, **kwargs):
+        result = original_selected(*args, **kwargs)
+        hooked_scheduler.clock.now += 2.0
+        return result
+
+    monkeypatch.setattr(run.driver, "selected", idle_selection)
+    target.get_next_batch_to_run()
+    run.driver.callback_wall_seconds = 3.0
+    target.on_idle()
+    assert getattr(target, scheduler._DSPARK_WALL_CREDIT) == 2.0
+    assert run.driver.callback_wall_seconds == 3.0
+    mock_profile_output(monkeypatch)
+    monkeypatch.setattr(
+        scheduler.Envs, "output_dir", classmethod(lambda cls: str(tmp_path))
+    )
+    if failure == "pending":
+        pending = selected(run, "DECODE", req=current.reqs[0])
+        target.run_batch(pending)
+        assert getattr(target, scheduler._DSPARK_PENDING_RESULTS) == 1
+    elif failure == "save":
+        stats = scheduler.request_stats_manager.get_req_stats("a")
+        stats.created_time = stats.queue_start = stats.queue_end = 100
+        stats.last_event_time = 101
+        stats.gen_token_latencies = [1]
+
+        def fail_open(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(scheduler, "open", fail_open, raising=False)
+    base = run.driver.adapter
+    history = dict(run.runtime.session._history)
+    capacity, fid = run.runtime._draft_buffer_capacity, run.runtime._forward_id
+    clock_before = StateManager.get_global_clock()
+    profile = next(iter(target._request_dispatcher._mapping.values()))
+    result = profile(hooked_scheduler.profile_req)
+    assert result.success is (failure is None)
+    assert getattr(target, scheduler._DSPARK_WALL_CREDIT) == (
+        0.0 if failure is None else 2.0
+    )
+    assert run.driver.callback_wall_seconds == (0.0 if failure is None else 3.0)
+    if failure is not None:
+        assert StateManager.get_global_clock() == clock_before
+    assert run.driver.adapter is base and run.driver.owner is target
+    assert run.runtime.session._history == history
+    assert (
+        run.runtime._draft_buffer_capacity == capacity
+        and run.runtime._forward_id == fid
+    )
+
+
+def test_finished_successor_skips_response_metrics_but_accounts_launched_cost_once(
+    run, hooked_scheduler, monkeypatch
+):
+    from sglang_simulator.simulation.manager.state import StateManager
+    from sglang_simulator.simulation.sglang import dspark_runtime, scheduler
+
+    target = install_native_hooks(run, hooked_scheduler)
+    monkeypatch.setattr(
+        dspark_runtime,
+        "sampling_snapshot",
+        lambda params: '{"ignore_eos":true,"is_normalized":true,"max_new_tokens":3}',
+    )
+
+    def settle(batch, result):
+        prediction = getattr(result, STEP_ATTRIBUTE)
+        for req, (_, count) in zip(
+            batch.reqs, prediction.progress.committed_tokens, strict=True
+        ):
+            if req.finished():
+                continue
+            req.output_ids.extend([1] * count)
+            if prediction.local_group.forward_mode == "TARGET_VERIFY":
+                req.kv.kv_committed_len += count
+            req.done = len(req.output_ids) >= 3
+            if req.done:
+                run.runtime.note_request_finished(rid=req.rid, natural_stop=False)
+
+    target.after_process = settle
+    initial = selected(run)
+    first = target.run_batch(initial)
+    target.process_batch_result(initial, first)
+    previous = selected(run, "DECODE", req=initial.reqs[0])
+    result = target.run_batch(previous)
+    successor = selected(run, "DECODE", req=initial.reqs[0])
+    tail = target.run_batch(successor)
+    target.process_batch_result(previous, result)
+    req = initial.reqs[0]
+    assert req.finished() and len(req.output_ids) == 3
+    stats = scheduler.request_stats_manager.get_req_stats(req.rid)
+    events_before = tuple(stats.gen_token_latencies)
+    event_time_before = stats.last_event_time
+    assert len(events_before) == 2
+    clock_before = StateManager.get_global_clock()
+    tail_seconds = getattr(tail, STEP_ATTRIBUTE).timing.seconds
+    target.process_batch_result(successor, tail)
+    assert len(req.output_ids) == 3
+    assert tuple(stats.gen_token_latencies) == events_before
+    assert stats.last_event_time == event_time_before
+    assert StateManager.get_global_clock() >= clock_before + tail_seconds
+    assert len(hooked_scheduler.hook.ITERATION_STATS) == 3
+    assert hooked_scheduler.hook.ITERATION_STATS[-1]["forward_latency"] == tail_seconds
+    assert getattr(tail, scheduler._DSPARK_ACCOUNTED) is True
+    assert getattr(target, scheduler._DSPARK_PENDING_RESULTS) == 0
+    assert run.driver.adapter.ledger.pending == ()
+    clock_after = StateManager.get_global_clock()
+    with pytest.raises(PredictorError, match="already consumed"):
+        target.process_batch_result(successor, tail)
+    assert StateManager.get_global_clock() == clock_after
 
 
 def test_native_abort_release_retires_admitted_chunks_without_a_later_result(

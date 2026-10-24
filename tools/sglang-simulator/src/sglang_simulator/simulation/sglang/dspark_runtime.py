@@ -559,8 +559,10 @@ class DSparkNativeRuntime:
             if driver is not None:
                 driver.validate_owner(transaction)
             self.session.commit(prediction)
-        except Exception as error:
+        except BaseException as error:
             if driver is not None:
+                # Publication can already be externally visible. Cancellation
+                # must leave the run terminal, while propagating unchanged.
                 driver.fail("publication/session commit", error)
             raise
         if driver is not None:

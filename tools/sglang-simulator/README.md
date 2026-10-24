@@ -841,6 +841,11 @@ success. Idle preserves history; a drained cache reset clears both histories whi
 preserving proposal capacity and monotonic forward IDs. Reference event emulation
 outside the worker is excluded once from offline host timing, alongside the full
 replacement-worker wall interval. No scheduler or cost lookup is duplicated.
+Cancellation after publication or native response processing makes the driver
+terminal and propagates unchanged. A successful profile reset clears prior wall
+credits while preserving runtime history/buffer ownership; failed saves preserve
+those credits. An already-launched successor still incurs its cost when its
+finished request is skipped, but adds no response/ITL event without new output.
 
 CPU regressions include the native overlap loop body loaded from this checkout,
 installed scheduler/worker hooks, cached chunks/final bonus, dynamic membership,

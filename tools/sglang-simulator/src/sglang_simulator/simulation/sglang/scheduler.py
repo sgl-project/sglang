@@ -812,10 +812,15 @@ class C_SchedulerHook(BaseHook):
                 )
             process_batch_result_start = time.perf_counter()
             driver = reference_driver()
+            native_output_before = None
             reference_wall = 0.0
             if driver is not None:
                 started = time.perf_counter()
                 try:
+                    native_output_before = {
+                        id(req): (len(req.output_ids), req.finished())
+                        for req in batch.reqs
+                    }
                     driver.before_result(batch, native_result)
                 except Exception as error:
                     driver.fail("native result preparation", error)
@@ -828,7 +833,7 @@ class C_SchedulerHook(BaseHook):
                     driver.after_result()
                     reference_wall += time.perf_counter() - started
                     reference_wall += driver.take_callback_wall_seconds()
-            except Exception as error:
+            except BaseException as error:
                 if driver is not None:
                     driver.fail("native result processing", error)
                 raise
@@ -881,7 +886,14 @@ class C_SchedulerHook(BaseHook):
                 request_response_time = StateManager.get_global_clock()
                 # Request statistics
                 for req in batch.reqs:
-                    if len(req.output_ids) != 0:  # not chunked
+                    if native_output_before is not None:
+                        count_before, finished_before = native_output_before[id(req)]
+                        emitted_output = (
+                            not finished_before and len(req.output_ids) > count_before
+                        )
+                    else:
+                        emitted_output = len(req.output_ids) != 0
+                    if emitted_output:
                         req_stats = request_stats_manager.get_req_stats(req.rid)
                         req_stats.gen_token_latencies.append(
                             request_response_time
@@ -1016,6 +1028,13 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook.REQ_DISPATCHER.reset()
             C_SchedulerHook.REQ_DISPATCHER.profile_active = is_start_profile
             C_SchedulerHook.INFERENCE_PREDICTOR.reset_metrics()
+            # This successful reset starts a new accounting interval. Idle
+            # selection/retirement emulation from the previous interval must
+            # not reduce the next profile's native CPU overhead.
+            setattr(_scheduler, _DSPARK_WALL_CREDIT, 0.0)
+            driver = reference_driver()
+            if driver is not None:
+                driver.take_callback_wall_seconds()
 
             ProfileReqOutput = getattr(
                 importlib.import_module("sglang.srt.managers.io_struct"),
