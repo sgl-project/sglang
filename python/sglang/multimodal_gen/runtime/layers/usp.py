@@ -411,8 +411,14 @@ def _usp_input_all_to_all_packed_qkv(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    *,
+    plane_major: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exchange 3D Q/K/V with one destination-major Ulysses collective."""
+    """Exchange 3D Q/K/V with one destination-major Ulysses collective.
+
+    ``plane_major`` is opt-in for SM100 sparse Sage FP8 consumers. Existing
+    callers retain the interleaved layout and original output strides.
+    """
     world_size = get_ulysses_parallel_world_size()
     if world_size <= 1:
         return q, k, v
@@ -422,6 +428,11 @@ def _usp_input_all_to_all_packed_qkv(
     assert h_global % world_size == 0
     h_local = h_global // world_size
 
+    packed_shape = (
+        (world_size, s_local, 3, h_local, head_size)
+        if plane_major
+        else (world_size, s_local, h_local, 3 * head_size)
+    )
     if (
         q.device.type in _A2A_DEVICE_TYPES
         and q.dtype in (torch.float16, torch.bfloat16)
@@ -436,14 +447,15 @@ def _usp_input_all_to_all_packed_qkv(
             world_size,
             out=_a2a_staging_buffer(
                 "usp_packed_qkv_src",
-                (world_size, s_local, h_local, 3 * head_size),
+                packed_shape,
                 q.dtype,
                 q.device,
             ),
+            plane_major=plane_major,
         )
     else:
         packed = torch.empty(
-            (world_size, s_local, h_local, 3 * head_size),
+            packed_shape,
             dtype=q.dtype,
             device=q.device,
         )
@@ -451,11 +463,20 @@ def _usp_input_all_to_all_packed_qkv(
             head_shards = tensor.view(s_local, world_size, h_local, head_size).permute(
                 1, 0, 2, 3
             )
-            packed[..., index * head_size : (index + 1) * head_size].copy_(head_shards)
+            if plane_major:
+                packed[:, :, index].copy_(head_shards)
+            else:
+                packed[..., index * head_size : (index + 1) * head_size].copy_(
+                    head_shards
+                )
 
     packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
-    packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
-    q, k, v = packed.split(head_size, dim=-1)
+    if plane_major:
+        packed = packed.reshape(s_local * world_size, 3, h_local, head_size)
+        q, k, v = packed[:, 0], packed[:, 1], packed[:, 2]
+    else:
+        packed = packed.reshape(s_local * world_size, h_local, 3 * head_size)
+        q, k, v = packed.split(head_size, dim=-1)
     return q, k, v
 
 
