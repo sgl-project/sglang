@@ -1602,9 +1602,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     actual_cu_seqlens_q = metadata.cu_seqlens_q
 
                     if self.padded_q_buffer is not None:
-                        padded_q = self.padded_q_buffer[
-                            :bs, :actual_max_seq_len_q, :, :
-                        ].to(dtype=q.dtype)
+                        # The padding kernel requires packed rows even when
+                        # the captured request width exceeds this batch's.
+                        padded_q = (
+                            self.padded_q_buffer.flatten(0, 1)[
+                                : bs * actual_max_seq_len_q
+                            ]
+                            .view(
+                                bs,
+                                actual_max_seq_len_q,
+                                layer.tp_q_head_num,
+                                layer.head_dim,
+                            )
+                            .to(dtype=q.dtype)
+                        )
                         padded_q.zero_()
                     else:
                         padded_q = torch.zeros(

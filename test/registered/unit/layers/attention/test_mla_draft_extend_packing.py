@@ -1,4 +1,5 @@
 import unittest
+from itertools import product
 from types import SimpleNamespace
 
 import torch
@@ -12,13 +13,16 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestMLADraftExtendPacking(unittest.TestCase):
     def test_query_rows_stay_with_their_request(self):
-        for lengths in ([1, 3], [3, 1], [2, 4], [1, 4], [2, 2], [4]):
-            with self.subTest(lengths=lengths):
+        for lengths, buffer_width in product(
+            ([1, 3], [3, 1], [2, 4], [1, 4], [2, 2], [4]), (None, 4)
+        ):
+            with self.subTest(lengths=lengths, buffer_width=buffer_width):
                 query = torch.arange(1, sum(lengths) + 1, dtype=torch.float32)
                 query = query.view(-1, 1, 1)
                 seen_queries = []
 
                 def pad(q, padded, seq_lens, indptr):
+                    self.assertTrue(padded.is_contiguous())
                     for i, n in enumerate(seq_lens.tolist()):
                         padded[i, :n] = q[indptr[i] : indptr[i + 1]]
                     return padded
@@ -53,7 +57,11 @@ class TestMLADraftExtendPacking(unittest.TestCase):
                         get_key_buffer=lambda _: torch.zeros(4, 1, 1)
                     ),
                     forward_decode_metadata=metadata,
-                    padded_q_buffer=None,
+                    padded_q_buffer=(
+                        torch.empty(4, buffer_width, 1, 1)
+                        if buffer_width is not None
+                        else None
+                    ),
                     pad_draft_extend_query=pad,
                     unpad_draft_extend_output=unpad,
                     _run_decode_kernel=kernel,
