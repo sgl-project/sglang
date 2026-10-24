@@ -22,6 +22,9 @@ from sglang.srt.sampling.penaltylib.orchestrator import (
 from sglang.srt.sampling.penaltylib.presence_penalty import (
     BatchedPresencePenalizer,
 )
+from sglang.srt.sampling.penaltylib.repetition_penalty import (
+    BatchedRepetitionPenalizer,
+)
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -138,6 +141,38 @@ class TestBatchedPenalizerOrchestrator(CustomTestCase):
         )
         orch1.merge(orch2)  # should not raise
         self.assertFalse(orch1.is_required)
+
+    def test_cumulate_with_row_start_updates_only_those_rows(self):
+        """A mixed batch feeds only its decode rows; every penalizer must leave the
+        rows before row_start and after the fed tokens unchanged."""
+        reqs = [_make_req(freq=1.0, presence=1.0, min_tokens=4) for _ in range(3)]
+        for req in reqs:
+            req.sampling_params.repetition_penalty = 2.0
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE,
+            _make_batch(reqs),
+            {
+                BatchedFrequencyPenalizer,
+                BatchedPresencePenalizer,
+                BatchedRepetitionPenalizer,
+                BatchedMinNewTokensPenalizer,
+            },
+        )
+
+        orch.cumulate_output_tokens(torch.tensor([5]), row_start=1)
+
+        freq = orch.penalizers[BatchedFrequencyPenalizer]
+        presence = orch.penalizers[BatchedPresencePenalizer]
+        repetition = orch.penalizers[BatchedRepetitionPenalizer]
+        min_new = orch.penalizers[BatchedMinNewTokensPenalizer]
+        self.assertEqual(freq.cumulated_frequency_penalties[:, 5].tolist(), [0, 1, 0])
+        self.assertEqual(
+            presence.cumulated_presence_penalties[:, 5].tolist(), [0, 1, 0]
+        )
+        self.assertEqual(
+            repetition.cumulated_repetition_penalties[:, 5].tolist(), [1, 2, 1]
+        )
+        self.assertEqual(min_new.len_output_tokens[:, 0].tolist(), [0, 1, 0])
 
 
 # BatchedFrequencyPenalizer
