@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_gfx95_supported, is_npu
 from sglang.srt.utils.common import (
     calc_diff,
     get_bool_env_var,
@@ -19,6 +19,7 @@ from sglang.srt.utils.common import (
 )
 
 _is_npu = is_npu()
+_is_gfx95 = is_gfx95_supported()
 if _is_npu:
     import torch_npu
 
@@ -170,6 +171,49 @@ def matmul_kernel_persistent(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
+def _matmul_persistent_configs() -> dict:
+    configs = {
+        torch.bfloat16: {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_stages": 3,
+            "num_warps": 8,
+        },
+        torch.float16: {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_stages": 3,
+            "num_warps": 8,
+        },
+        torch.float32: {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": 8,
+            "num_stages": 3,
+            "num_warps": 8,
+        },
+    }
+    if _is_gfx95:
+        # Measured on MI350X: faster than the default on average over M = 1-4096
+        # on dense and MoE linear shapes up to N ~ 8k, neutral on wider N; needs
+        # gfx950's 160 KB of LDS.
+        configs[torch.bfloat16] = {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 8,
+            "num_stages": 3,
+            "num_warps": 8,
+            "matrix_instr_nonkdim": 16,
+        }
+    return configs
+
+
 def _matmul_persistent_triton(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -198,32 +242,7 @@ def _matmul_persistent_triton(
             ),
         )
 
-    configs = {
-        torch.bfloat16: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-        torch.float16: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 256,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-        torch.float32: {
-            "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 32,
-            "GROUP_SIZE_M": 8,
-            "num_stages": 3,
-            "num_warps": 8,
-        },
-    }
+    configs = _matmul_persistent_configs()
     # print(a.device, b.device, c.device)
     matmul_kernel_persistent[grid](
         a,
@@ -246,6 +265,210 @@ def _matmul_persistent_triton(
         HAS_BIAS=bias is not None,
         **configs[a.dtype],
     )
+    return c
+
+
+# The segmented matmul splits K into _SEGMENT_COUNT fixed segments and adds the
+# segment sums in order, at every M. Small M runs the segments in separate programs
+# (fp32 partials, then a fixed-order reduce) and large M runs them in one program;
+# both give the same bits, so tiles and the split may be chosen by M and N. Outputs
+# with the same BLOCK_K and segment count were bitwise equal across tiles and warps
+# on MI350X; changing either changes the numerics.
+_SEGMENT_COUNT = 4
+_SEGMENT_BLOCK_K = 64
+
+
+@triton.jit
+def _segmented_matmul_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    partial_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    SEGMENT_K: tl.constexpr,
+    SEGMENT_COUNT: tl.constexpr,
+    SPLIT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    segment = tl.program_id(1)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    first_pid_m = (pid // num_pid_in_group) * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % num_pid_in_group) % group_size_m
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)).to(tl.int64)
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)).to(tl.int64)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    total = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    first = segment if SPLIT else 0
+    last = segment + 1 if SPLIT else SEGMENT_COUNT
+    for s in range(first, last):
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k0 in range(0, SEGMENT_K, BLOCK_SIZE_K):
+            k = s * SEGMENT_K + k0 + offs_k
+            a = tl.load(
+                a_ptr + offs_m[:, None] * stride_am + k[None, :] * stride_ak,
+                mask=(offs_m[:, None] < M) & (k[None, :] < K),
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptr + k[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                mask=(k[:, None] < K) & (offs_n[None, :] < N),
+                other=0.0,
+            )
+            acc = tl.dot(a, b, acc)
+        total += acc
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    if SPLIT:
+        tl.store(
+            partial_ptr
+            + segment.to(tl.int64) * M * N
+            + offs_m[:, None] * N
+            + offs_n[None, :],
+            total,
+            mask=mask,
+        )
+    else:
+        if HAS_BIAS:
+            bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+            total += bias.to(tl.float32)[None, :]
+        tl.store(
+            c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+            total.to(c_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
+@triton.jit
+def _segment_reduce_kernel(
+    partial_ptr,
+    c_ptr,
+    bias_ptr,
+    M,
+    N,
+    SEGMENT_COUNT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < M * N
+    total = tl.zeros((BLOCK,), dtype=tl.float32)
+    for s in range(SEGMENT_COUNT):
+        total += tl.load(
+            partial_ptr + s * (M * N).to(tl.int64) + offs, mask=mask, other=0.0
+        )
+    if HAS_BIAS:
+        total += tl.load(bias_ptr + offs % N, mask=mask, other=0.0).to(tl.float32)
+    tl.store(c_ptr + offs, total.to(c_ptr.dtype.element_ty), mask=mask)
+
+
+def _segmented_matmul_launch(M: int, N: int) -> tuple:
+    """(BLOCK_SIZE_M, BLOCK_SIZE_N, num_warps, num_stages, split) by M and N.
+
+    None of these change the bits. Measured on MI350X over the bf16 linear shapes of
+    Qwen3-8B, Qwen3.8-27B, Qwen3-30B-A3B and gpt-oss-20b, M = 1-8192.
+
+    Without the split, one program loops over all segments, and it is never
+    software-pipelined (num_stages 1): with pipelining across that loop the output
+    was not run-to-run deterministic for some K on MI350X.
+    """
+    if N < 1024:
+        return 32, 64, 4, 2, True
+    if N <= 8192:
+        if M <= 32:
+            return 32, 64, 4, 2, True
+        if M <= 64:
+            return 64, 64, 4, 2, True
+        if M <= 256:
+            return 128, 128, 8, 3, True
+        if M <= 1024:
+            return 128, 128, 8, 2, True
+        if M <= 2048:
+            return 128, 128, 8, 1, False
+        return 128, 256, 8, 1, False
+    if M <= 32:
+        return 32, 64, 4, 2, True
+    if M <= 64:
+        return 64, 64, 4, 2, True
+    if M <= 128:
+        return 128, 128, 8, 2, True
+    return 256, 128, 8, 1, False
+
+
+def _matmul_segmented_triton(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+):
+    M, K = a.shape
+    N = b.shape[1]
+    block_m, block_n, num_warps, num_stages, split = _segmented_matmul_launch(M, N)
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    segment_k = (
+        triton.cdiv(triton.cdiv(K, _SEGMENT_COUNT), _SEGMENT_BLOCK_K) * _SEGMENT_BLOCK_K
+    )
+    c = torch.empty((M, N), device=a.device, dtype=out_dtype)
+    partial = (
+        torch.empty((_SEGMENT_COUNT, M, N), device=a.device, dtype=torch.float32)
+        if split
+        else c
+    )
+    _segmented_matmul_kernel[(num_tiles, _SEGMENT_COUNT if split else 1)](
+        a,
+        b,
+        c,
+        partial,
+        bias,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        SEGMENT_K=segment_k,
+        SEGMENT_COUNT=_SEGMENT_COUNT,
+        SPLIT=split,
+        HAS_BIAS=bias is not None,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_N=block_n,
+        BLOCK_SIZE_K=_SEGMENT_BLOCK_K,
+        GROUP_SIZE_M=8,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        matrix_instr_nonkdim=16,
+    )
+    if split:
+        block = 4096
+        _segment_reduce_kernel[(triton.cdiv(M * N, block),)](
+            partial,
+            c,
+            bias,
+            M,
+            N,
+            SEGMENT_COUNT=_SEGMENT_COUNT,
+            HAS_BIAS=bias is not None,
+            BLOCK=block,
+        )
     return c
 
 
@@ -335,6 +558,9 @@ def matmul_persistent(
         if bias is not None:
             out += bias
         return out
+
+    if _is_gfx95 and a.dtype == torch.bfloat16 and out_dtype == torch.bfloat16:
+        return _matmul_segmented_triton(a=a, b=b, bias=bias, out_dtype=out_dtype)
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias, out_dtype=out_dtype)
 
