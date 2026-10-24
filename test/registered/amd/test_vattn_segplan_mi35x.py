@@ -218,10 +218,9 @@ class TestVattnSegPlan(CustomTestCase):
                 ).float()
             self.assertEqual(tri.call_count, 1)
         torch.cuda.synchronize()
-        self.assertFalse(torch.isnan(o_tri).any().item())
-        # measured on MI355X: max diff 2e-6 on an output absmax of 4e-3 (~5e-4 relative)
-        scale_o = o_vred.abs().max().item()
-        self.assertLess((o_vred - o_tri).abs().max().item(), 0.01 * scale_o)
+        self.assertLess(
+            (o_vred - o_tri).abs().max().item(), 0.01 * o_vred.abs().max().item()
+        )
 
     def test_plan_cache_per_forward(self):
         V = self.V

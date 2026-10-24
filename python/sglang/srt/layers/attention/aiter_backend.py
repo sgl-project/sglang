@@ -201,7 +201,7 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
-    # (seq_lens, capturing, seq_lens + max_q_len) for target-verify attention
+    # (capturing, seq_lens + max_q_len) for target-verify attention
     verify_seqused_k: Optional[tuple] = None
     # ASM context-chunk prefill: KV slots to gather and cu_seqlens_k, computed
     # once per batch by AiterAttnBackend._asm_context_prefill_indices.
@@ -4183,14 +4183,14 @@ class AiterAttnBackend(AttentionBackend):
                     # One add per forward, shared by every layer, so the asm kernel's
                     # per-forward seg-plan cache (keyed on this tensor) hits after layer 0.
                     md = self.forward_metadata
-                    key = (
-                        forward_batch.seq_lens,
-                        torch.cuda.is_current_stream_capturing(),
-                    )
+                    cap = torch.cuda.is_current_stream_capturing()
                     hit = md.verify_seqused_k
-                    if hit is None or hit[0] is not key[0] or hit[1] != key[1]:
-                        hit = md.verify_seqused_k = (*key, key[0] + md.max_q_len)
-                    seqused_k = hit[2]
+                    if hit is None or hit[0] != cap:
+                        hit = md.verify_seqused_k = (
+                            cap,
+                            forward_batch.seq_lens + md.max_q_len,
+                        )
+                    seqused_k = hit[1]
                     if use_unified_attention_3d_mtp:
                         unified_attention_3d_mtp_func(
                             q=q_unified,

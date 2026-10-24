@@ -341,7 +341,7 @@ def mtp_verify_attn_seg_max(
     if num_cus is None:
         num_cus = _seg_plan_target_wgs()
     uniform_share = max(1, num_cus // max(1, num_seqs * num_kv_heads))
-    return max(16, min(num_cus, 2 * uniform_share))  # 16 = min segments, not tiles
+    return max(16, min(num_cus, 2 * uniform_share))
 
 
 def _get_plan_kernel():
@@ -513,10 +513,8 @@ def _get_reduce_triton():
             HEAD_SIZE: tl.constexpr,
             BLOCK_D: tl.constexpr,
         ):
-            # same contract as vred.s, one program per (token, head, BLOCK_D dims).
-            # Not unified_attention_3d_mtp_reduce_segments_kernel: that one derives the
-            # segment count from seq_len, this one takes the planner's tok_nseg.
-            # Each BLOCK_D program recomputes max/denominator over the segments on purpose.
+            # same contract as vred.s, one program per (token, head, BLOCK_D dims);
+            # takes the planner's tok_nseg
             t = tl.program_id(0)
             h = tl.program_id(1)
             s = tl.arange(0, NSEG_P2)
