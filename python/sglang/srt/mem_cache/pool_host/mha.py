@@ -1416,9 +1416,8 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 
     def _flat_page_unsupported(self) -> NotImplementedError:
         return NotImplementedError(
-            "Models with head_dim != v_head_dim do not support the flat-page "
-            "interface used by HiCache L3 storage backends {hf3fs, eic, nixl}. "
-            "Use a backend that does not use this interface (e.g. mooncake, simm)."
+            "Models with head_dim != v_head_dim only support flat pages "
+            "(get_data_page(flat=True)): K and V live in separate buffers."
         )
 
     if _is_xpu:
@@ -1586,14 +1585,55 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                 f"{io_backend}; expected 'kernel' or 'direct'."
             )
 
+    # Flat page = K of the page flattened, followed by V of the page flattened.
+    # K and V live in two buffers with different head dims, so a page cannot be
+    # a single view; get_data_page returns a copy (torch.cat).
+
+    def _page_slices(self, index: int):
+        if self.layout == "page_first":
+            return (
+                self.k_buffer[index : index + self.page_size],
+                self.v_buffer[index : index + self.page_size],
+            )
+        if self.layout == "page_first_direct":
+            real_index = index // self.page_size
+            return (
+                self.k_buffer[real_index : real_index + 1],
+                self.v_buffer[real_index : real_index + 1],
+            )
+        raise ValueError(
+            f"Unsupported layout for models with head_dim != v_head_dim: {self.layout}"
+        )
+
+    def _flat_page_numels(self):
+        per_token = self.layer_num * self.head_num * self.page_size
+        return per_token * self.head_dim, per_token * self.v_head_dim
+
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        raise self._flat_page_unsupported()
+        if not flat:
+            raise self._flat_page_unsupported()
+        k, v = self._page_slices(index)
+        return torch.cat([k.reshape(-1), v.reshape(-1)])
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        raise self._flat_page_unsupported()
+        k_numel, v_numel = self._flat_page_numels()
+        return torch.zeros(
+            k_numel + v_numel,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        raise self._flat_page_unsupported()
+        k_numel, v_numel = self._flat_page_numels()
+        if data_page.numel() != k_numel + v_numel:
+            raise ValueError(
+                f"Flat page has {data_page.numel()} elements, expected "
+                f"{k_numel + v_numel} (K {k_numel} + V {v_numel})"
+            )
+        k, v = self._page_slices(index)
+        k.copy_(data_page[:k_numel].reshape(k.shape))
+        v.copy_(data_page[k_numel:].reshape(v.shape))
 
     def get_split_heads_page_buffer_meta(
         self, indices: torch.Tensor, split_factor: int
