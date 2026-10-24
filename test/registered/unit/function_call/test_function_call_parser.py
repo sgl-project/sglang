@@ -542,6 +542,79 @@ class TestPythonicDetector(unittest.TestCase):
         self.assertEqual(params["location"], "New York")
         self.assertEqual(params["unit"], "celsius")
 
+    def test_parse_streaming_bracket_in_string(self):
+        result = self.detector.parse_streaming_increment(
+            '[search(query="]")', self.tools
+        )
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.calls, [])
+
+        result = self.detector.parse_streaming_increment("]", self.tools)
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "search")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "]"})
+
+    def test_parse_streaming_quoted_brackets_across_chunks(self):
+        cases = [
+            ('"["', "["),
+            ("']'", "]"),
+            ('"a]b[c"', "a]b[c"),
+            (r'"a\" [ b"', 'a" [ b'),
+            (r"'a\' ] b'", "a' ] b"),
+            (r'"a\\]"', "a\\]"),
+            ('"""a" ] b"""', 'a" ] b'),
+            ("'''a' [ b'''", "a' [ b"),
+        ]
+        for literal, expected in cases:
+            text = f"[search(query={literal})]"
+            partitions = [[text], list(text)] + [
+                [text[:cut], text[cut:]] for cut in range(1, len(text))
+            ]
+            for chunks in partitions:
+                with self.subTest(literal=literal, chunks=chunks):
+                    parser = FunctionCallParser(self.tools, "pythonic")
+                    calls = []
+                    for chunk in chunks:
+                        normal_text, current_calls = parser.parse_stream_chunk(chunk)
+                        self.assertEqual(normal_text, "")
+                        calls.extend(current_calls)
+                    self.assertEqual(parser.parse_stream_end(), ("", []))
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0].tool_index, 0)
+                    self.assertEqual(calls[0].name, "search")
+                    self.assertEqual(
+                        json.loads(calls[0].parameters), {"query": expected}
+                    )
+
+    def test_parse_streaming_quoted_brackets_in_nested_arguments(self):
+        text = '[search(query={"]": ["[", "a]b"]}), get_weather(location="]")]'
+        calls = []
+        for char in text:
+            result = self.detector.parse_streaming_increment(char, self.tools)
+            self.assertEqual(result.normal_text, "")
+            calls.extend(result.calls)
+        self.assertEqual([call.name for call in calls], ["search", "get_weather"])
+        self.assertEqual([call.tool_index for call in calls], [0, 1])
+        self.assertEqual(
+            [json.loads(call.parameters) for call in calls],
+            [{"query": {"]": ["[", "a]b"]}}, {"location": "]"}],
+        )
+
+    def test_parse_streaming_ignores_quotes_in_comments(self):
+        for newline in ("\n", "\r\n", "\r"):
+            text = f"[search(query='ok' # don't open a string{newline})]"
+            for chunks in ([text], list(text)):
+                with self.subTest(newline=newline, chunks=chunks):
+                    parser = FunctionCallParser(self.tools, "pythonic")
+                    calls = []
+                    for chunk in chunks:
+                        normal_text, current_calls = parser.parse_stream_chunk(chunk)
+                        self.assertEqual(normal_text, "")
+                        calls.extend(current_calls)
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(json.loads(calls[0].parameters), {"query": "ok"})
+
     def test_parse_streaming_partial_tool_call(self):
         """Test parsing a partial tool call that spans multiple chunks."""
         # First chunk with opening bracket but no closing bracket
