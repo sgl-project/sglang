@@ -345,6 +345,56 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
         normalize_json_schema_types(schema)
         self.assertEqual(schema, once)
 
+    def test_null_required_dropped(self):
+        """``required: null`` (emitted by some SDKs when there are no required
+        fields) must be dropped rather than 400 with "None is not of type
+        'array'" -- it is semantically equivalent to omitting ``required``."""
+        schema = {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": None,
+        }
+        normalize_json_schema_types(schema)
+        self.assertNotIn("required", schema)
+        self._assert_accepts(schema)
+
+    def test_null_properties_dropped(self):
+        """``properties: null`` is likewise dropped instead of 400 with "None
+        is not of type 'object'"."""
+        schema = {"type": "object", "properties": None}
+        normalize_json_schema_types(schema)
+        self.assertNotIn("properties", schema)
+        self._assert_accepts(schema)
+
+    def test_null_required_dropped_in_nested_defs(self):
+        """The null-strip applies at every level the walker visits, including
+        ``$defs`` sub-schemas."""
+        schema = {
+            "type": "object",
+            "$defs": {
+                "Row": {
+                    "type": "object",
+                    "properties": {"id": {"type": "int"}},
+                    "required": None,
+                }
+            },
+        }
+        normalize_json_schema_types(schema)
+        self.assertNotIn("required", schema["$defs"]["Row"])
+        self.assertEqual(schema["$defs"]["Row"]["properties"]["id"]["type"], "integer")
+        self._assert_accepts(schema)
+
+    def test_valid_required_list_preserved(self):
+        """A genuine ``required`` array is left untouched (only null is dropped)."""
+        schema = {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "required": ["a"],
+        }
+        normalize_json_schema_types(schema)
+        self.assertEqual(schema["required"], ["a"])
+        self._assert_accepts(schema)
+
     def test_non_string_type_values_pass_through(self):
         """``type`` that isn't str/list is left for the real validator to reject."""
         for bad in (None, 42, {"$ref": "#/$defs/Foo"}, ["string", 1, None]):
