@@ -497,9 +497,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             allocated_tokens + self.num_reserved_decode_tokens,
             self._rebootstrap_prefill_len(req)
             - prefix_len
-            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+            + self._remaining_new_tokens(req)
             - retractable_tokens,
         )
+
+    def _remaining_new_tokens(self, req: Req) -> int:
+        # A rebootstrap prefills the outputs it already emitted. They count
+        # toward max_new_tokens, so only the rest still needs room to decode.
+        emitted = self._rebootstrap_prefill_len(req) - len(req.origin_input_ids)
+        return min(req.sampling_params.max_new_tokens - emitted, CLIP_MAX_NEW_TOKEN)
 
     def _prealloc_reservation_fits(
         self,
@@ -1542,10 +1548,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc:
                 _, swa_required = self._prealloc_required_tokens(decode_req.req)
                 _, swa_len = self._prealloc_kv_lens(decode_req.req)
-                max_new_tokens = min(
-                    decode_req.req.sampling_params.max_new_tokens,
-                    CLIP_MAX_NEW_TOKEN,
-                )
+                max_new_tokens = self._remaining_new_tokens(decode_req.req)
                 swa_required_for_admission = max(
                     swa_required,
                     swa_len + max_new_tokens - retractable_swa_tokens,
