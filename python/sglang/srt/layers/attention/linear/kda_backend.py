@@ -767,6 +767,30 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     self.mamba_chunk_size,
                 )
 
+    def fused_kda_layer_state(self, layer_id: int):
+        """Conv/recurrent state pools + per-request metadata for a whole-layer
+        fused KDA kernel. The trailing ``replayssm_active`` flag is ``True`` when
+        the slot uses the buffered ReplaySSM path, which the fused kernels do not
+        own -- the caller must then fall back to the native decode chain."""
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
+        return (
+            layer_cache.conv[0],
+            layer_cache.temporal,
+            self.forward_metadata.mamba_cache_indices,
+            self.forward_metadata.query_start_loc,
+            layer_cache.replayssm_d is not None,
+        )
+
+    def track_fused_decode_state(
+        self, forward_batch, conv_states, ssm_states, cache_indices, layer_id
+    ):
+        """Public wrapper so the model layer records the single-token decode
+        state update after a whole-layer fused KDA decode kernel, identical to
+        the native decode path's bookkeeping."""
+        self._track_mamba_state_decode(
+            forward_batch, conv_states, ssm_states, cache_indices, layer_id
+        )
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,

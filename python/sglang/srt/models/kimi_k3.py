@@ -366,6 +366,10 @@ def _add3(
 # One-shot log guard: proves the merged front is live (see _ep_front).
 _EP_FRONT_LOGGED = False
 
+# One-shot-per-mode guard: logs the first prefill/decode dispatch through the
+# whole-layer fused KDA aiter backend, so operators can confirm it is live.
+_KDA_AITER_DISPATCH_LOGGED: set = set()
+
 
 def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
     """Whether o_proj can write into caller-owned storage. ``apply_into`` is an
@@ -1515,6 +1519,13 @@ class KimiK3DeltaAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.all_reduce_fusion = all_reduce_fusion
+        # Whole-layer fused KDA backend (gfx950/MI355X TP8). When "aiter", the
+        # entire KDA layer is routed through the aiter Gluon ops; eligibility
+        # (arch, weights, shapes) is re-checked per forward and falls back to
+        # the native path on any miss. Only meaningful on HIP.
+        self._kda_fused_layer_aiter = (
+            _is_hip and get_exec().mamba.kimi_kda_fused_layer_backend == "aiter"
+        )
         # Side stream for the [f_a|b] + f_b tiny GEMVs: they read only
         # hidden_states, so they overlap the wide [q,k,v,g] GEMM on the main
         # stream (graphed decode/verify only; SM bound as the MLA gate stream).
@@ -2083,6 +2094,174 @@ class KimiK3DeltaAttention(nn.Module):
             )
         return qkv, beta, forget_gate, g_proj_states
 
+    def _forward_kda_fused_layer(self, hidden_states, forward_batch):
+        """Whole-layer fused KDA via the aiter Gluon ops (gfx950/MI355X TP8).
+
+        Returns the layer output when the aiter whole-layer kernels cover this
+        call, else ``None`` to fall back to the native per-kernel path. The
+        decode kernel fuses the O projection and returns the un-reduced o_proj
+        partial -- the decoder boundary reduces it exactly as the native
+        ``self.o_proj(core)[0]`` path would. Prefill returns the (m, 1536) gated
+        norm and applies the native ``o_proj`` (which owns its TP reduction).
+
+        Fail-closed: any arch / layer-config / shape / reduce-topology miss
+        returns ``None`` before the state pools are touched.
+        """
+        if not self._kda_fused_layer_aiter:
+            return None
+        # Static layer-config contract shared by prefill and decode, matching
+        # the whole-layer kernels' fixed TP8 shapes.
+        if not (
+            self.do_fuse_qkvbfg
+            and self.use_full_rank_gate
+            and self.attn_tp_size == 8
+            and self._bfa_w is not None
+            and not self.all_reduce_fusion
+            and tuple(self.split_sizes) == (4608, 1536)
+            and (self._bfa_fa_size, self._bfa_b_size) == (128, 12)
+            and self.attn.bias is None
+            and self.attn.lower_bound == -5.0
+            and self.o_norm.eps == 1e-5
+        ):
+            return None
+
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        if isinstance(backend, HybridLinearAttnBackend):
+            backend = backend.linear_attn_backend
+        if not isinstance(backend, KDAAttnBackend):
+            return None
+        layer_id = self.attn.layer_id
+        conv, state, ids, cu, replayssm = backend.fused_kda_layer_state(layer_id)
+        if replayssm:
+            return None
+
+        mode = forward_batch.forward_mode
+        if mode.is_decode():
+            return self._kda_fused_decode(
+                hidden_states, forward_batch, backend, conv, state, ids, layer_id
+            )
+        # Strict EXTEND only: is_extend() also admits mixed/speculative/
+        # split-prefill batches, which need intermediate recurrent snapshots the
+        # final-state-only prefill kernel does not produce.
+        if mode == ForwardMode.EXTEND and forward_batch.spec_info is None:
+            return self._kda_fused_prefill(
+                hidden_states, forward_batch, backend, conv, state, ids, cu
+            )
+        return None
+
+    def _kda_fused_decode(
+        self, hidden_states, forward_batch, backend, conv, state, ids, layer_id
+    ):
+        from sglang.srt.runtime_context import get_forward
+
+        # The decode kernel bypasses o_proj.forward, so it is only faithful when
+        # o_proj would return the raw TP partial (no SP reduce-scatter / decode
+        # attn-TP all-reduce). Fall back to native otherwise.
+        if get_forward().sp_active or self.o_proj.use_decode_attn_tp:
+            return None
+
+        from aiter.ops.triton.kimi_delta_attn import (
+            kimi_kda_fused_layer_decode,
+            kimi_kda_fused_layer_decode_supported,
+        )
+
+        m = hidden_states.shape[0]
+        args = (
+            hidden_states,
+            self.fused_qkvg_proj.weight,
+            self._bfa_w,
+            self.o_proj.weight,
+            self._bfa_f_b_w,
+            self.attn.conv_weights,
+            self.attn.A_log.reshape(-1),
+            self.attn.dt_bias,
+            self.o_norm.weight,
+            conv,
+            state,
+            ids,
+        )
+        ok, _ = kimi_kda_fused_layer_decode_supported(*args)
+        if not ok:
+            return None
+        if "decode" not in _KDA_AITER_DISPATCH_LOGGED:
+            _KDA_AITER_DISPATCH_LOGGED.add("decode")
+            rank0_log("Kimi-K3 whole-layer KDA: aiter fused decode backend active")
+        out = torch.empty(
+            (m, self.hidden_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        partial, _, _ = kimi_kda_fused_layer_decode(
+            *args,
+            lower_bound=self.attn.lower_bound,
+            norm_eps=self.o_norm.eps,
+            output_tensor=out,
+        )
+        backend.track_fused_decode_state(forward_batch, conv, state, ids, layer_id)
+        return partial
+
+    def _kda_fused_prefill(
+        self, hidden_states, forward_batch, backend, conv, state, ids, cu
+    ):
+        # Native small-M alternate-stream path owns its own launch/lifetime
+        # policy; leave it to the native forward.
+        m = hidden_states.shape[0]
+        if self._bfa_alt_stream is not None and m <= self._bfa_bs_limit:
+            return None
+        metadata = backend.forward_metadata
+        # Only the no-intermediate-snapshot (final-state) path is eligible.
+        if metadata.has_mamba_track_mask:
+            return None
+
+        from aiter.ops.triton.kimi_delta_attn import (
+            kimi_kda_fused_layer_prefill,
+            kimi_kda_fused_layer_prefill_supported,
+        )
+
+        # Raw [q,k,v,g] + [forget-A | beta] projections, shared with the native
+        # prefill path; defer_f_b leaves forget-A un-projected because the fused
+        # kernel applies forget-B itself.
+        qkv, beta, forget_a, gate = self.forward_qkvbfg_fused(
+            hidden_states, defer_f_b=True
+        )
+        has_initial_state = forward_batch.extend_prefix_lens > 0
+
+        args = (
+            qkv,
+            gate,
+            forget_a,
+            beta,
+            self._bfa_f_b_w,
+            self.attn.conv_weights,
+            self.attn.A_log.reshape(-1),
+            self.attn.dt_bias,
+            self.o_norm.weight,
+            conv,
+            state,
+            ids,
+            cu,
+            has_initial_state,
+        )
+        ok, _ = kimi_kda_fused_layer_prefill_supported(*args)
+        if not ok:
+            return None
+        if "prefill" not in _KDA_AITER_DISPATCH_LOGGED:
+            _KDA_AITER_DISPATCH_LOGGED.add("prefill")
+            rank0_log("Kimi-K3 whole-layer KDA: aiter fused prefill backend active")
+        out, _, _ = kimi_kda_fused_layer_prefill(
+            *args, lower_bound=self.attn.lower_bound, norm_eps=self.o_norm.eps
+        )
+        # Native o_proj applies the (m, 1536) -> (m, 7168) projection and owns
+        # the O-projection TP reduction, identical to the native prefill return.
+        return self.o_proj(out)[0]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2090,6 +2269,9 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        fused = self._forward_kda_fused_layer(hidden_states, forward_batch)
+        if fused is not None:
+            return fused
         defer_f_b = (
             self._kda_hip_fused_decode_ready and forward_batch.forward_mode.is_decode()
         )

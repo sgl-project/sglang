@@ -533,6 +533,17 @@ class ExecMamba(msgspec.Struct):
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl"],
         ),
     ] = None
+    kimi_kda_fused_layer_backend: A[
+        str,
+        Arg(
+            help="Whole-layer fused Kimi-K3 KDA backend (gfx950/MI355X TP8 only). "
+            "'aiter' routes the entire KDA layer (in-projection + conv + gated-delta "
+            "recurrence + gated RMSNorm, plus the O projection on decode) through the "
+            "aiter Gluon ops, falling back to 'native' when the arch/shape is not "
+            "covered. 'native' (default) keeps the stock per-kernel KDA path.",
+            choices=["native", "aiter"],
+        ),
+    ] = "native"
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
     # ring + periodic flush to cut per-step HBM state traffic.
     enable_linear_replayssm: A[
