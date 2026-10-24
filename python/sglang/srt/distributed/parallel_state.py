@@ -99,6 +99,61 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
+_PP_DEVICE_BACKEND = "nccl-lazy"
+
+
+def _default_group_options(
+    torch_distributed_backend: Union[str, Backend], pg_options: Any
+) -> Any:
+    backend = str(torch_distributed_backend).rsplit(":", 1)[-1]
+    nccl2_selected = backend in {"nccl2", _PP_DEVICE_BACKEND} or (
+        backend == "nccl"
+        and hasattr(torch.distributed, "ProcessGroupNCCL2")
+        and os.environ.get("TORCH_DIST_USE_NCCL2") != "0"
+    )
+    if not nccl2_selected:
+        return pg_options
+    if pg_options is None:
+        pg_options = torch.distributed.ProcessGroupNCCL.Options()
+    pg_options.lazy_init = True
+    return pg_options
+
+
+def _resolved_device_backend(
+    torch_distributed_backend: Union[str, Backend],
+) -> str:
+    backend = str(torch_distributed_backend)
+    if backend.rsplit(":", 1)[-1] == "nccl":
+        default_pg = torch.distributed.distributed_c10d._get_default_group()
+        return default_pg._get_backend(torch.device("cuda")).name()
+    return backend
+
+
+def _pipeline_parallel_backend(
+    group_name: str, torch_distributed_backend: Union[str, Backend]
+) -> Union[str, Backend]:
+    backend = str(torch_distributed_backend)
+    if group_name not in {"pp", "self_pp"} or backend.rsplit(":", 1)[-1] != "nccl":
+        return torch_distributed_backend
+
+    resolved_backend = _resolved_device_backend(torch_distributed_backend)
+    if resolved_backend in {"nccl2", _PP_DEVICE_BACKEND}:
+        return _PP_DEVICE_BACKEND
+    return torch_distributed_backend
+
+
+def _lazy_group_options(
+    torch_distributed_backend: Union[str, Backend],
+    pg_options: Any,
+    lazy_init: bool,
+) -> Any:
+    if not lazy_init or _resolved_device_backend(torch_distributed_backend) != "nccl2":
+        return pg_options
+    if pg_options is None:
+        pg_options = torch.distributed.ProcessGroupNCCL.Options()
+    pg_options.lazy_init = True
+    return pg_options
+
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
@@ -333,6 +388,17 @@ class GroupCoordinator:
 
         self.device = _group_coordinator_device(local_rank)
         self.device_module = torch.get_device_module(self.device)
+        device_backend = _pipeline_parallel_backend(
+            group_name, torch_distributed_backend
+        )
+        use_lazy_device_group = group_name == "world" or any(
+            (
+                use_pynccl,
+                use_mscclpp,
+                use_custom_allreduce,
+                use_torch_symm_mem_all_reduce,
+            )
+        )
 
         for ranks in group_ranks:
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
@@ -391,9 +457,14 @@ class GroupCoordinator:
                 )
                 active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
                 pg_options = get_torch_distributed_pg_options(group_name)
+                pg_options = _lazy_group_options(
+                    device_backend,
+                    pg_options,
+                    lazy_init=len(ranks) == 1 or use_lazy_device_group,
+                )
                 device_group = torch.distributed.new_group(
                     ranks,
-                    backend=torch_distributed_backend,
+                    backend=device_backend,
                     pg_options=pg_options,
                     timeout=subgroup_timeout,
                     group_desc=f"{group_name}:device",
@@ -2515,6 +2586,7 @@ def init_distributed_environment(
                 pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
         else:
             pg_options = get_torch_distributed_pg_options()
+        pg_options = _default_group_options(backend, pg_options)
 
         # this backend is used for WORLD
         torch.distributed.init_process_group(

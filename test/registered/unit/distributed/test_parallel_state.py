@@ -52,6 +52,102 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
 
 
+@pytest.mark.parametrize(
+    ("resolved_backend", "expected"),
+    [("nccl2", "nccl-lazy"), ("nccl", "nccl")],
+)
+def test_pipeline_parallel_backend_selection(monkeypatch, resolved_backend, expected):
+    backend = Mock()
+    backend.name.return_value = resolved_backend
+    default_group = Mock()
+    default_group._get_backend.return_value = backend
+    monkeypatch.setattr(
+        torch.distributed.distributed_c10d,
+        "_get_default_group",
+        lambda: default_group,
+    )
+
+    assert parallel_state._pipeline_parallel_backend("pp", "nccl") == expected
+    assert parallel_state._pipeline_parallel_backend("self_pp", "nccl") == expected
+    assert parallel_state._pipeline_parallel_backend("tp", "nccl") == "nccl"
+
+    options = parallel_state._lazy_group_options("nccl", None, lazy_init=True)
+    if resolved_backend == "nccl2":
+        assert options.lazy_init
+    else:
+        assert options is None
+
+
+@pytest.mark.parametrize(
+    ("backend", "nccl2_available", "use_nccl2", "expected_lazy"),
+    [
+        ("nccl", True, None, True),
+        ("nccl", True, "0", False),
+        ("nccl", False, None, False),
+        ("nccl2", False, None, True),
+        ("gloo", True, None, False),
+    ],
+)
+def test_default_process_group_options(
+    monkeypatch, backend, nccl2_available, use_nccl2, expected_lazy
+):
+    if nccl2_available:
+        monkeypatch.setattr(
+            torch.distributed, "ProcessGroupNCCL2", object(), raising=False
+        )
+    else:
+        monkeypatch.delattr(torch.distributed, "ProcessGroupNCCL2", raising=False)
+
+    if use_nccl2 is None:
+        monkeypatch.delenv("TORCH_DIST_USE_NCCL2", raising=False)
+    else:
+        monkeypatch.setenv("TORCH_DIST_USE_NCCL2", use_nccl2)
+
+    options = parallel_state._default_group_options(backend, None)
+    assert (options is not None and options.lazy_init) is expected_lazy
+
+
+@pytest.mark.parametrize(
+    ("resolved_backend", "expected"),
+    [("nccl2", "nccl-lazy"), ("nccl", "nccl")],
+)
+def test_diffusion_pipeline_parallel_backend_selection(
+    monkeypatch, resolved_backend, expected
+):
+    diffusion_parallel_state = pytest.importorskip(
+        "sglang.multimodal_gen.runtime.distributed.parallel_state"
+    )
+    backend = Mock()
+    backend.name.return_value = resolved_backend
+    default_group = Mock()
+    default_group._get_backend.return_value = backend
+    monkeypatch.setattr(
+        torch.distributed.distributed_c10d,
+        "_get_default_group",
+        lambda: default_group,
+    )
+
+    assert diffusion_parallel_state._pipeline_parallel_backend("nccl") == expected
+
+    monkeypatch.setattr(torch.distributed, "ProcessGroupNCCL2", Mock(), raising=False)
+    monkeypatch.delenv("TORCH_DIST_USE_NCCL2", raising=False)
+    default_options = diffusion_parallel_state._default_group_options("nccl")
+    assert default_options.lazy_init
+
+    group_coordinator = pytest.importorskip(
+        "sglang.multimodal_gen.runtime.distributed.group_coordinator"
+    )
+    new_group = Mock()
+    monkeypatch.setattr(torch.distributed, "new_group", new_group)
+    group_coordinator.new_device_group([0], "nccl")
+    kwargs = new_group.call_args.kwargs
+    if resolved_backend == "nccl2":
+        assert kwargs["backend"] == "nccl"
+        assert kwargs["pg_options"].lazy_init
+    else:
+        assert kwargs == {"backend": "gloo"}
+
+
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize("inplace_allreduce", [False, True])
 @pytest.mark.parametrize("alias_output", [False, True])
