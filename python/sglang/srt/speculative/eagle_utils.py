@@ -525,6 +525,7 @@ def eagle_sample(
     grammar_mask: Optional[GrammarMask] = None,
     uno_target_max_top_k: Optional[int] = None,
     *,
+    force_greedy: bool = False,
     watermark_state: Optional[WatermarkState] = None,
     watermark_full_mask: bool = True,
 ):
@@ -639,7 +640,7 @@ def eagle_sample(
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     if _verify_uses_greedy(
-        is_all_greedy=sampling_info.is_all_greedy,
+        is_all_greedy=sampling_info.is_all_greedy or force_greedy,
         is_cpu=_is_cpu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
