@@ -494,12 +494,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, req: Req, allocated_tokens: int, prefix_len: int, retractable_tokens: int
     ) -> int:
         return max(
-            allocated_tokens + self.num_reserved_decode_tokens,
+            allocated_tokens + self._decode_reserve_tokens(req),
             self._rebootstrap_prefill_len(req)
             - prefix_len
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
             - retractable_tokens,
         )
+
+    def _decode_reserve_tokens(self, req: Req) -> int:
+        # Intake fit the prompt plus max_new_tokens into the pool. Reserving the
+        # full decode headroom past what the request can still decode would not
+        # fit even an empty pool, and the queue stops at the first such request.
+        remaining_decode_slots = (
+            req.sampling_params.max_new_tokens - len(req.output_ids) + 1
+        )
+        return min(self.num_reserved_decode_tokens, max(remaining_decode_slots, 0))
 
     def _prealloc_reservation_fits(
         self,
@@ -582,11 +591,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Match the allocator, which charges whole pages for both pools.
             full_len = ceil_align(full_len, page_size)
             swa_len = ceil_align(swa_len, page_size)
-        swa_reserved = self.num_reserved_decode_tokens
+        decode_reserved = self._decode_reserve_tokens(req)
+        swa_reserved = decode_reserved
         if get_memory().disable_radix_cache:
             swa_reserved = 0
         return (
-            full_len + self.num_reserved_decode_tokens,
+            full_len + decode_reserved,
             swa_len + swa_reserved,
         )
 
