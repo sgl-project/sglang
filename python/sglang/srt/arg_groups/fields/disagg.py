@@ -73,7 +73,9 @@ class Disagg(msgspec.Struct):
         bool,
         "Compute an Adler-32 checksum over each request's KV pages on prefill "
         "and verify it on decode. Enable on both prefill and decode engines. "
-        "A mismatch aborts the request, or raises in CI. Disabled by default.",
+        "A mismatch aborts the request, or raises in CI. A prefill whose KV "
+        "layout differs (TP width, PP stage, page size) is admitted unverified "
+        "with one warning. Disabled by default.",
     ] = False
     disaggregation_bootstrap_port: A[
         int, "Bootstrap server port on the prefill server. Default is 8998."
