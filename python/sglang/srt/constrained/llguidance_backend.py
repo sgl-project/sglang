@@ -37,6 +37,12 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
     register_vocab_mask_buffer,
 )
+from sglang.srt.constrained.json_schema_validation import (
+    JSONSchemaCircularRef,
+    JSONSchemaDepthExceeded,
+    JSONSchemaStateExplosion,
+    validate_schema_bounds,
+)
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import get_int_env_var
 
@@ -271,6 +277,8 @@ class GuidanceBackend(BaseGrammarBackend):
 
     def dispatch_json(self, key_string: str) -> BaseGrammarObject:
         try:
+            schema = json.loads(key_string)
+            validate_schema_bounds(schema)
             serialized_grammar = LLMatcher.grammar_from_json_schema(
                 key_string,
                 defaults={
@@ -278,7 +286,12 @@ class GuidanceBackend(BaseGrammarBackend):
                     "whitespace_pattern": self.whitespace_pattern,
                 },
             )
-        except Exception as e:
+        except (
+            JSONSchemaDepthExceeded,
+            JSONSchemaStateExplosion,
+            json.decoder.JSONDecodeError,
+            Exception,
+        ) as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
         return self._from_serialized(serialized_grammar)
@@ -299,6 +312,11 @@ class GuidanceBackend(BaseGrammarBackend):
         try:
             structural_tag = json.loads(key_string)
             assert is_legacy_structural_tag(structural_tag)
+            # Validate each schema in legacy structural tag
+            for structure in structural_tag["structures"]:
+                schema = structure.get("schema")
+                if schema is not None:
+                    validate_schema_bounds(schema)
             # Pair each structure with a trigger that prefixes its own
             # ``begin`` — StructTag asserts begin.startswith(trigger), and
             # detectors with per-tool triggers (e.g. Inkling's
@@ -320,6 +338,12 @@ class GuidanceBackend(BaseGrammarBackend):
             ]
             g = StructTag.to_grammar(tags)
             return self._from_serialized(g)
-        except Exception as e:
+        except (
+            JSONSchemaDepthExceeded,
+            JSONSchemaStateExplosion,
+            JSONSchemaCircularRef,
+            json.decoder.JSONDecodeError,
+            Exception,
+        ) as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
