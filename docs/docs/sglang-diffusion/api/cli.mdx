@@ -492,6 +492,11 @@ export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
 
 See [Environment Variables](/docs/sglang-diffusion/environment_variables) for the full set of storage options.
 
+Cancellation waits for active uploads to finish before request cleanup can remove
+their source files. Allow for the storage SDK's timeouts and retries in your
+shutdown grace period. Cancellation does not roll back objects already uploaded;
+use your bucket's lifecycle rules for object retention.
+
 ## Component Path Overrides
 
 Override individual pipeline components such as `vae`, `transformer`, or `text_encoder` with `--<component>-path`.
