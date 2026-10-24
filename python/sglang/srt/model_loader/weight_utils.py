@@ -1808,6 +1808,9 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
              if no remapping is needed.
         None: If the remapped name is not found in params_dict.
     """
+    if name in params_dict:
+        return name
+
     if name.endswith(".kv_scale"):
         print_warning_once(
             "DEPRECATED. Found kv_scale in the checkpoint. "
@@ -1862,11 +1865,20 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
         ".q_proj.output_scale": ".attn.q_scale",
         ".k_proj.output_scale": ".attn.k_scale",
         ".v_proj.output_scale": ".attn.v_scale",
-        "self_attn.prob_output_scale": ".attn.prob_scale",
+        ".prob_output_scale": ".attn.prob_scale",
     }
     for quark_scale_name, sglang_scale_name in quark_scale_names.items():
         if name.endswith(quark_scale_name):
-            return name.replace(quark_scale_name, sglang_scale_name)
+            remapped_name = name.replace(quark_scale_name, sglang_scale_name)
+            if remapped_name not in params_dict:
+                print_warning_once(
+                    f"Found {quark_scale_name} in the checkpoint (e.g. {name}), "
+                    "but not found the expected name in the model "
+                    f"(e.g. {remapped_name}). {quark_scale_name} is "
+                    "not loaded."
+                )
+                return None
+            return remapped_name
 
     # If there were no matches, return the untouched param name
     return name
@@ -2053,7 +2065,7 @@ def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
     if total_output_size > raw_output_size:
         loaded_weight_pad = []
         weight_split_size = [
-            int(output_size / total_output_size * raw_output_size)
+            (output_size * raw_output_size) // total_output_size
             for output_size in output_sizes
         ]
         assert sum(weight_split_size) == raw_output_size, (
@@ -2065,7 +2077,11 @@ def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
             pad_size = output_size - weight_split_size[i]
             target_pad_shape = list(loaded_weight.size())
             target_pad_shape[output_dim] = pad_size
-            pad_tensor = torch.zeros(target_pad_shape).to(loaded_weight.dtype)
+            pad_tensor = torch.zeros(
+                target_pad_shape,
+                dtype=loaded_weight.dtype,
+                device=loaded_weight.device,
+            )
             loaded_weight_pad.append(
                 torch.cat([split_weight[i], pad_tensor], dim=output_dim)
             )
