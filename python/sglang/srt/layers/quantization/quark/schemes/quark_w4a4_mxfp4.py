@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import csv
+import functools
 import logging
 import threading
 from typing import Any, Callable, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -19,6 +20,7 @@ from sglang.srt.layers.quantization.dequantization import (
     dequantize_fp8,
     dequantize_nvfp4,
 )
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
@@ -37,10 +39,30 @@ _ASM_FP4_SCALE_COL_MULTIPLE = 8
 # TODO(vorapolsiloai): link the AITER issue; drop once the heuristic is fixed.
 _ASM_FP4_UNSAFE_MAX_N = 128
 
-# Keep this path opt-in while the AITER ASM integration is validated across the
-# Quark model matrix. Unlike the Triton fallback, it consumes AITER's
-# a4w4_blockscale_tuned_gemm CSVs.
-_use_aiter_asm_fp4_gemm = _is_hip and envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.get()
+
+def _read_tuned_fp4_gemm_shapes(
+    csv_path: str, gfx: str, cu_num: int
+) -> frozenset[tuple[int, int]]:
+    """Return the (N, K) shapes that have a row for this GPU in an a4w4 tuned CSV."""
+    # gemm_a4w4 looks configs up by (gfx, cu_num, M, N, K), or by (cu_num, M, N, K)
+    # in CSVs without a gfx column. It pads M before the lookup, so any M counts.
+    with open(csv_path, newline="") as f:
+        return frozenset(
+            (int(row["N"]), int(row["K"]))
+            for row in csv.DictReader(f)
+            if int(row["cu_num"]) == cu_num and row.get("gfx", gfx) == gfx
+        )
+
+
+@functools.lru_cache(maxsize=1)
+def _aiter_tuned_fp4_gemm_shapes() -> frozenset[tuple[int, int]]:
+    # The CSV that gemm_a4w4 reads: AITER_CONFIG_GEMM_A4W4 if set, else AITER's
+    # base table merged with its per-model tables.
+    return _read_tuned_fp4_gemm_shapes(
+        csv_path=AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE,
+        gfx=get_gfx_runtime(),
+        cu_num=get_cu_num(),
+    )
 
 
 def _asm_fp4_scale_swizzle_supported(weight_scale: torch.Tensor) -> bool:
@@ -96,8 +118,8 @@ def _asm_fp4_prequantized_input(
     if len(x) != 2:
         raise NotImplementedError(
             "AITER ASM FP4 GEMM only supports the (x_fp4, x_scales) tuple input; "
-            f"got a {len(x)}-tuple. Disable SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM "
-            "for models that use this projection."
+            f"got a {len(x)}-tuple. Set requires_triton_mxfp4_gemm on the "
+            "projection that receives it, or use --fp4-gemm-backend triton."
         )
     x_q, x_scales = x
     # Only B is preshuffled (bpreshuffle=True), so the packed FP4 activation is
@@ -162,6 +184,8 @@ def _dequant_mxfp4_to_bf16(
 if _is_hip:
     from aiter import gemm_a4w4 as _gemm_a4w4_orig
     from aiter import per_1x32_f4_quant_hip as _per_1x32_f4_quant_hip_orig
+    from aiter.jit.core import AITER_CONFIGS
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
     from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
@@ -391,6 +415,14 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.input_quant_spec = input_quant_spec
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.dequantization_config = dequantization_config
+        # Unlike the Triton path, AITER's gemm_a4w4 consumes the
+        # a4w4_blockscale_tuned_gemm CSVs. --fp4-gemm-backend aiter uses it for
+        # every eligible layer; auto (gfx95 only) for the shapes those CSVs tune.
+        backend = get_fp4_gemm_runner_backend()
+        self.use_aiter_fp4_gemm = _is_hip and (
+            backend.is_aiter() or (backend.is_auto() and is_gfx95_supported())
+        )
+        self.aiter_fp4_gemm_tuned_shapes_only = backend.is_auto()
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not is_gfx95_supported():
@@ -420,7 +452,19 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
             return
 
         layer.use_aiter_asm_fp4_gemm = False
-        if not _use_aiter_asm_fp4_gemm or not is_gfx95_supported():
+        if not self.use_aiter_fp4_gemm or getattr(
+            layer, "requires_triton_mxfp4_gemm", False
+        ):
+            return
+
+        # Under auto, use the ASM GEMM only where AITER has tuned the shape for
+        # this GPU: an untuned shape gets AITER's default kernel choice, which is
+        # not validated against the Triton GEMM.
+        n, k = layer.weight.shape[0], layer.weight.shape[1] * 2
+        if (
+            self.aiter_fp4_gemm_tuned_shapes_only
+            and (n, k) not in _aiter_tuned_fp4_gemm_shapes()
+        ):
             return
 
         if not _asm_fp4_scale_swizzle_supported(layer.weight_scale.data):
@@ -468,6 +512,9 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.output_size_per_partition = output_size_per_partition
 
         layer.logical_widths = output_partition_sizes
+        # Models set this on projections that receive the Triton-only fused
+        # epilogue tuples (see apply_weights) to keep them off the ASM GEMM.
+        layer.requires_triton_mxfp4_gemm = False
 
         # If dequantization_config is provided, we dequantize the source
         # checkpoint and re-quantize to MXFP4 at load time. The source may be
