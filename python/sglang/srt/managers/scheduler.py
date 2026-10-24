@@ -1647,6 +1647,13 @@ class Scheduler(
             )
 
     def init_overlap(self):
+        if (
+            envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.get() > 0
+            or envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.get() > 0
+        ) and get_parallel().attn_dp_size != 1:
+            raise ValueError(
+                "Prefill overlap resource budgets currently require attention DP size 1"
+            )
         self.device_module = torch.get_device_module(self.device)
 
         # FutureMap is always-on: input_ids relay used in both modes.
@@ -2118,6 +2125,27 @@ class Scheduler(
             and batch_is_extend
             and last_batch_is_extend
         )
+
+        if batch_is_extend and last_batch_is_extend:
+            token_budget = envs.SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET.get()
+            if token_budget > 0:
+                disable_overlap_for_batch |= (
+                    batch.extend_num_tokens + last_batch.extend_num_tokens
+                    > token_budget
+                )
+            min_free_gb = envs.SGLANG_PREFILL_OVERLAP_MIN_FREE_GB.get()
+            if min_free_gb > 0:
+                # DP>1 is rejected at initialization: its rank-local prefill
+                # counts need a different consensus protocol. All ranks in this
+                # TP/CP group query the same minimum without clearing caches.
+                free_gb = get_available_gpu_memory(
+                    self.device,
+                    get_device().gpu_id,
+                    distributed=True,
+                    empty_cache=False,
+                    cpu_group=self.tp_cpu_group,
+                )
+                disable_overlap_for_batch |= free_gb < min_free_gb
 
         # Sync so the FSM advance lands before the next batch's bitmask. Permanent
         # path for host-draft algorithms, not a pending migration.

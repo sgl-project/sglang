@@ -478,3 +478,19 @@ Decisions the preset already makes:
 <Note>
 No preset has a full serving round on final weights; the constants derive from measured single- and dual-node rounds plus a 64-GPU sweep. Validate throughput and accuracy on your workload before committing a fleet.
 </Note>
+## Limit consecutive prefill overlap
+
+Two overlapping prefill batches can keep their temporary workspaces live at the
+same time. Optional resource budgets can defer the next batch until the previous
+one finishes:
+
+| Environment variable | Meaning | Default |
+| --- | --- | --- |
+| `SGLANG_OVERLAP_PREFILL_TOKEN_BUDGET` | Maximum combined new-token count of consecutive prefill batches | `0` (disabled) |
+| `SGLANG_PREFILL_OVERLAP_MIN_FREE_GB` | Minimum free GPU memory across the TP group before overlapping consecutive prefill batches | `0` (disabled) |
+
+These limits leave decode overlap unchanged and do not clear allocator caches.
+They currently require attention DP size 1; enabling them with attention DP is
+rejected at startup. They complement the per-batch `--max-prefill-tokens` limit
+and can reduce overlap, so measure throughput for your workload before enabling
+them.
