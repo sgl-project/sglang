@@ -111,6 +111,7 @@ from sglang.srt.speculative.spec_utils import (
     fast_sample,
     get_plan_stream,
     load_token_map,
+    prune_quantized_lm_head,
     renorm_draft_probs,
     sample_draft_proposal,
     select_top_k_tokens,
@@ -363,8 +364,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None and head is not None:
-                head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
+                # FR-Spec over a QUANTIZED target lm_head (e.g. compressed-tensors
+                # FP8 per-channel, whose weight is stored transposed [K, V]):
+                # indexing `head.data[hot]` would slice K, not the vocab, and
+                # leave the per-row scale full-size. Build a pruned head module
+                # that slices weight AND scale along the vocab axis instead.
+                pruned_head = prune_quantized_lm_head(target_lm_head, self.hot_token_id)
+                if pruned_head is not None:
+                    if not hasattr(self.draft_runner.model, "set_lm_head_from_target"):
+                        raise NotImplementedError(
+                            "--speculative-token-map with a quantized lm_head needs a draft "
+                            "model that can take the target lm_head (set_lm_head_from_target)"
+                        )
+                    self.draft_runner.model.set_embed_and_head(embed, None)
+                    self.draft_runner.model.set_lm_head_from_target(pruned_head)
+                    logger.info(
+                        "FR-Spec: draft lm_head pruned to %d rows (quantized, weight %s %s)",
+                        int(self.hot_token_id.numel()),
+                        tuple(pruned_head.weight.shape),
+                        pruned_head.weight.dtype,
+                    )
+                    return
+                head = head.clone()
                 head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head

@@ -1286,3 +1286,90 @@ def get_plan_stream(
         return plan_stream, plan_stream_ctx
     else:
         return None, contextlib.nullcontext()
+
+
+_FR_SPEC_UNQUANTIZED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+# Per-vocab-row tensors that FR-Spec must prune together with the weight.
+# Only layouts that are plain row-sliceable are accepted: a swizzled/blocked
+# scale (NVFP4 block scales, FP8 128x128 blocks) cannot be sliced per row.
+_FR_SPEC_ROW_PARAMS = ("weight", "weight_scale", "weight_scale_inv", "bias")
+
+
+def _prune_vocab_rows(
+    t: torch.Tensor, hot: torch.Tensor, vocab: int, name: str
+) -> torch.Tensor:
+    """Keep only the hot vocab rows of ``t``, preserving its storage layout.
+
+    Accepts ``[V, ...]`` (row-major vocab) and ``[K, V]`` views of a contiguous
+    ``[V, K]`` tensor (SGLang's W8A8 FP8 keeps ``weight.t()``).
+    """
+    if t.dim() >= 1 and t.shape[0] == vocab:
+        return t.index_select(0, hot).contiguous()
+    if t.dim() == 2 and t.shape[1] == vocab and t.stride(1) != 1:
+        # [K, V] transposed view: prune the contiguous [V, K] storage, then
+        # hand back the same transposed view the GEMM expects ([K, H], stride (1, K)).
+        return t.t().index_select(0, hot).contiguous().t()
+    raise NotImplementedError(
+        f"FR-Spec: cannot prune lm_head param '{name}' of shape {tuple(t.shape)} "
+        f"stride {t.stride()} along a vocab of {vocab} rows"
+    )
+
+
+def prune_quantized_lm_head(lm_head, hot_token_id: torch.Tensor):
+    """FR-Spec draft head for a QUANTIZED target lm_head.
+
+    Returns a shallow copy of ``lm_head`` (same quant method / scheme) whose
+    weight and per-row scale keep only ``hot_token_id`` rows, in the original
+    dtype and layout; or ``None`` when ``lm_head`` is unquantized (the caller
+    keeps the plain ``head.data[hot]`` path). The target lm_head is untouched.
+    """
+    import copy
+    from collections import OrderedDict
+
+    weight = getattr(lm_head, "weight", None) if lm_head is not None else None
+    if weight is None or weight.dtype in _FR_SPEC_UNQUANTIZED_DTYPES:
+        return None
+    vocab = int(
+        getattr(lm_head, "num_embeddings_padded", 0)
+        or getattr(lm_head, "num_embeddings_per_partition", 0)
+        or getattr(lm_head, "num_embeddings", 0)
+    )
+    if vocab <= 0 or vocab not in tuple(weight.shape):
+        raise NotImplementedError(
+            f"FR-Spec: quantized lm_head weight {tuple(weight.shape)} has no "
+            f"vocab axis of {vocab} rows (packed/sharded layout not supported)"
+        )
+    hot = hot_token_id.to(device=weight.device, dtype=torch.long)
+    if int(hot.max()) >= vocab or int(hot.min()) < 0:
+        raise ValueError("FR-Spec: token map has ids outside the target vocab")
+
+    pruned = copy.copy(lm_head)
+    pruned._parameters = OrderedDict(lm_head._parameters)
+    pruned._buffers = OrderedDict(lm_head._buffers)
+    pruned._modules = OrderedDict(lm_head._modules)
+    for name, param in lm_head._parameters.items():
+        if param is None:
+            continue
+        if name in _FR_SPEC_ROW_PARAMS and param.numel() > 1:
+            new_data = _prune_vocab_rows(param.data, hot, vocab, name)
+        elif param.numel() <= 1:
+            continue  # per-tensor scales are shared as-is
+        else:
+            raise NotImplementedError(
+                f"FR-Spec: unknown multi-element lm_head param '{name}' "
+                f"{tuple(param.shape)}; refusing to guess its vocab layout"
+            )
+        pruned._parameters[name] = torch.nn.Parameter(new_data, requires_grad=False)
+    n_hot = int(hot.numel())
+    for attr in (
+        "num_embeddings",
+        "num_embeddings_padded",
+        "num_embeddings_per_partition",
+        "org_vocab_size",
+        "org_vocab_size_padded",
+    ):
+        if hasattr(lm_head, attr):
+            setattr(pruned, attr, n_hot)
+    if hasattr(lm_head, "logical_widths"):
+        pruned.logical_widths = [n_hot]
+    return pruned
