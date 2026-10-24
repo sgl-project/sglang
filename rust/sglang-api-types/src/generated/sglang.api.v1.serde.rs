@@ -1113,6 +1113,9 @@ impl ::serde::Serialize for SamplingParams {
         if !self.choice.is_empty() {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "choice", &self.choice)?;
         }
+        if let Some(v) = &self.ngram_corpus_ids {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "ngram_corpus_ids", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1148,6 +1151,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
             "beam_width",
             "watermark",
             "choice",
+            "ngram_corpus_ids",
         ];
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
@@ -1187,6 +1191,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                 let mut f_beam_width = None;
                 let mut f_watermark = None;
                 let mut f_choice = None;
+                let mut f_ngram_corpus_ids = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "max_new_tokens" => {
@@ -1408,6 +1413,14 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                                     .unwrap_or_default(),
                             );
                         }
+                        "ngram_corpus_ids" => {
+                            if f_ngram_corpus_ids.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "ngram_corpus_ids",
+                                ));
+                            }
+                            f_ngram_corpus_ids = Some(map.next_value::<Option<StringList>>()?);
+                        }
                         other => {
                             return Err(::serde::de::Error::unknown_field(other, FIELDS));
                         }
@@ -1443,6 +1456,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                     beam_width: f_beam_width.flatten(),
                     watermark: f_watermark.flatten(),
                     choice: f_choice.unwrap_or_default(),
+                    ngram_corpus_ids: f_ngram_corpus_ids.flatten(),
                 })
             }
         }

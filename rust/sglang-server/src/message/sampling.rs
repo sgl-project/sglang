@@ -233,6 +233,10 @@ pub struct SamplingParams {
     pub custom_params: Option<BTreeMap<String, CustomParamValue>>,
     #[serde(default)]
     pub watermark: Option<WatermarkRequestConfig>,
+    /// NGRAM speculative decoding: external corpus ids to draft from. `None`
+    /// uses every loaded corpus; an empty list uses none.
+    #[serde(default)]
+    pub ngram_corpus_ids: Option<Vec<String>>,
 
     // Normalized internal fields.
     //
@@ -295,6 +299,7 @@ impl Default for SamplingParams {
             no_stop_trim: bool_false::default(),
             custom_params: None,
             watermark: None,
+            ngram_corpus_ids: None,
             stream_interval: None,
             logit_bias: None,
             sampling_seed: None,
@@ -508,6 +513,17 @@ impl SamplingParams {
                     )));
                 }
             }
+        }
+        // Corpus ids cross to the ngram corpus newline-joined (Python `verify`
+        // has the same rule).
+        if let Some(ids) = &self.ngram_corpus_ids
+            && ids
+                .iter()
+                .any(|id| id.is_empty() || id.contains('\n') || id.contains('\t'))
+        {
+            return Err(bad(format!(
+                "ngram_corpus_ids must be a list of non-empty corpus id strings, got {ids:?}."
+            )));
         }
         if let Some(value) = self
             .custom_params
@@ -750,6 +766,7 @@ mod tests {
         "sampling_seed",
         "custom_params",
         "watermark",
+        "ngram_corpus_ids",
         "stop_strs",
         "stop_regex_strs",
         "stop_str_max_len",
@@ -830,6 +847,7 @@ mod tests {
         assert!(arr[at("logit_bias")].is_nil());
         assert!(arr[at("custom_params")].is_nil());
         assert!(arr[at("watermark")].is_nil());
+        assert!(arr[at("ngram_corpus_ids")].is_nil());
         // `normalize` outputs occupy the tail.
         assert!(arr[at("stop_strs")].is_array());
         assert_eq!(arr[at("is_normalized")].as_bool(), Some(false));
@@ -872,6 +890,7 @@ mod tests {
             (r#"{"n": 2}"#, "n must be 1"),
             (r#"{"beam_width": 2}"#, "beam_width must be 1"),
             (r#"{"beam_width": 0}"#, "beam_width must be at least 1"),
+            (r#"{"ngram_corpus_ids": [""]}"#, "ngram_corpus_ids"),
         ] {
             let err = norm_err(json).to_string();
             assert!(

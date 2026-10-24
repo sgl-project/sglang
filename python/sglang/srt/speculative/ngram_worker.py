@@ -293,8 +293,9 @@ class NGRAMWorker(BaseSpecWorker):
             )
             batch_tokens.append(check_token)
             total_lens.append(base_lens[i] + len(prev_tokens))
+        corpus_ids = [req.sampling_params.ngram_corpus_ids for req in batch.reqs]
         req_drafts, mask = self.ngram_corpus.batch_get(
-            req_ids, batch_tokens, total_lens
+            req_ids, batch_tokens, total_lens, corpus_ids
         )
         total_draft_token_num = len(req_drafts)
 
