@@ -19,7 +19,10 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.layers.parameter import PerTensorScaleParameter
-from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+from sglang.srt.models.qwen3_5 import (
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5GatedDeltaNet,
+)
 
 
 def _make_mock_module(output_sizes):
@@ -210,6 +213,22 @@ class TestMakePackedWeightLoader(unittest.TestCase):
             # .view(-1) should flatten to [1]
             self.assertEqual(chunk.shape, torch.Size([1]))
             self.assertAlmostEqual(chunk.item(), 0.75, places=5)
+
+
+class TestGraphCapturePrepareForwarding(unittest.TestCase):
+    def test_dense_vl_entry_forwards_to_backbone(self):
+        """The model runner calls prepare_before_cuda_graph_capture on the
+        entry class only. Without a forwarder on the dense VL entry class
+        (dense Qwen3.5-family checkpoints) the GDN in_proj packing in the text
+        backbone silently never ran."""
+        model = object.__new__(Qwen3_5ForConditionalGeneration)
+        object.__setattr__(model, "model", MagicMock())
+        runner = object()
+
+        prepare = getattr(model, "prepare_before_cuda_graph_capture", None)
+        self.assertIsNotNone(prepare)
+        prepare(runner)
+        model.model.prepare_before_cuda_graph_capture.assert_called_once_with(runner)
 
 
 if __name__ == "__main__":
