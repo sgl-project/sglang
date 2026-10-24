@@ -436,19 +436,20 @@ impl ResponseProcessor {
                 None
             };
 
-            // Build GenerateResponse struct
+            // Build GenerateResponse struct (clamp worker-reported counts:
+            // negative sentinels must not surface as ~4.29e9 after the cast)
             let meta_info = GenerateMetaInfo {
                 id: dispatch.request_id.clone(),
                 finish_reason,
-                prompt_tokens: complete.prompt_tokens() as u32,
+                prompt_tokens: complete.prompt_tokens().max(0) as u32,
                 weight_version: dispatch
                     .weight_version
                     .clone()
                     .unwrap_or_else(|| "default".to_string()),
                 input_token_logprobs,
                 output_token_logprobs,
-                completion_tokens: complete.completion_tokens() as u32,
-                cached_tokens: complete.cached_tokens() as u32,
+                completion_tokens: complete.completion_tokens().max(0) as u32,
+                cached_tokens: complete.cached_tokens().max(0) as u32,
                 e2e_latency: start_time.elapsed().as_secs_f64(),
                 matched_stop,
             };

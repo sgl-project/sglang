@@ -36,6 +36,7 @@ use crate::{
         common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
         context,
         proto_wrapper::{ProtoResponseVariant, ProtoStream},
+        utils::{clamp_worker_token_count, saturate_to_usage_u32},
     },
 };
 
@@ -207,13 +208,15 @@ impl HarmonyStreamingProcessor {
         let start_time = Instant::now();
         let mut first_token_time: Option<Instant> = None;
 
-        // Per-index state management (for n>1 support)
+        // Per-index state management (for n>1 support); token counts are
+        // accumulated in u64 (clamped at ingestion) so worker misreports and
+        // multi-choice sums cannot wrap the accounting.
         let mut parsers: HashMap<u32, HarmonyParserAdapter> = HashMap::new();
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
         let mut finish_reasons: HashMap<u32, Option<String>> = HashMap::new();
         let mut matched_stops: HashMap<u32, Option<serde_json::Value>> = HashMap::new();
-        let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
-        let mut completion_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut prompt_tokens: HashMap<u32, u64> = HashMap::new();
+        let mut completion_tokens: HashMap<u32, u64> = HashMap::new();
 
         let stream_options = &original_request.stream_options;
 
@@ -286,9 +289,9 @@ impl HarmonyStreamingProcessor {
                             }
                         }),
                     );
-                    prompt_tokens.insert(index, complete.prompt_tokens as u32);
+                    prompt_tokens.insert(index, clamp_worker_token_count(complete.prompt_tokens));
                     *completion_tokens.entry(index).or_insert(0) =
-                        complete.completion_tokens as u32;
+                        clamp_worker_token_count(complete.completion_tokens);
 
                     // Finalize parser and emit final chunk
                     if let Some(parser) = parsers.get_mut(&index) {
@@ -314,9 +317,9 @@ impl HarmonyStreamingProcessor {
             }
         }
 
-        // Compute totals once for both usage chunk and metrics
-        let total_prompt: u32 = prompt_tokens.values().sum();
-        let total_completion: u32 = completion_tokens.values().sum();
+        // Compute totals once for both usage chunk and metrics (exact u64; no wrap)
+        let total_prompt: u64 = prompt_tokens.values().sum();
+        let total_completion: u64 = completion_tokens.values().sum();
 
         // Emit final usage if requested
         if let Some(true) = stream_options.as_ref().and_then(|so| so.include_usage) {
@@ -340,8 +343,8 @@ impl HarmonyStreamingProcessor {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: first_token_time.map(|t| t.duration_since(start_time)),
             generation_duration: start_time.elapsed(),
-            input_tokens: Some(total_prompt as u64),
-            output_tokens: total_completion as u64,
+            input_tokens: Some(total_prompt),
+            output_tokens: total_completion,
         });
 
         Ok(())
@@ -360,14 +363,17 @@ impl HarmonyStreamingProcessor {
         let mut first_token_time: Option<Instant> = None;
 
         // Phase 1: Process prefill stream (collect metadata)
-        let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut prompt_tokens: HashMap<u32, u64> = HashMap::new();
 
         while let Some(result) = prefill_stream.next().await {
             let response = result.map_err(|e| format!("Prefill stream error: {}", e))?;
 
             if let ProtoResponseVariant::Complete(complete_wrapper) = response.into_response() {
                 let complete = complete_wrapper.as_sglang();
-                prompt_tokens.insert(complete.index, complete.prompt_tokens as u32);
+                prompt_tokens.insert(
+                    complete.index,
+                    clamp_worker_token_count(complete.prompt_tokens),
+                );
             }
         }
 
@@ -376,7 +382,7 @@ impl HarmonyStreamingProcessor {
         let mut is_firsts: HashMap<u32, bool> = HashMap::new();
         let mut finish_reasons: HashMap<u32, Option<String>> = HashMap::new();
         let mut matched_stops: HashMap<u32, Option<serde_json::Value>> = HashMap::new();
-        let mut completion_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut completion_tokens: HashMap<u32, u64> = HashMap::new();
 
         let stream_options = &original_request.stream_options;
 
@@ -445,7 +451,7 @@ impl HarmonyStreamingProcessor {
                         }),
                     );
                     *completion_tokens.entry(index).or_insert(0) =
-                        complete.completion_tokens as u32;
+                        clamp_worker_token_count(complete.completion_tokens);
 
                     if let Some(parser) = parsers.get_mut(&index) {
                         let matched_stop = matched_stops.get(&index).and_then(|m| m.clone());
@@ -476,9 +482,9 @@ impl HarmonyStreamingProcessor {
         // This ensures that if client disconnects during decode, BOTH streams send abort
         prefill_stream.mark_completed();
 
-        // Compute totals once for both usage chunk and metrics
-        let total_prompt: u32 = prompt_tokens.values().sum();
-        let total_completion: u32 = completion_tokens.values().sum();
+        // Compute totals once for both usage chunk and metrics (exact u64; no wrap)
+        let total_prompt: u64 = prompt_tokens.values().sum();
+        let total_completion: u64 = completion_tokens.values().sum();
 
         // Emit final usage if requested
         if let Some(true) = stream_options.as_ref().and_then(|so| so.include_usage) {
@@ -499,8 +505,8 @@ impl HarmonyStreamingProcessor {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: first_token_time.map(|t| t.duration_since(start_time)),
             generation_duration: start_time.elapsed(),
-            input_tokens: Some(total_prompt as u64),
-            output_tokens: total_completion as u64,
+            input_tokens: Some(total_prompt),
+            output_tokens: total_completion,
         });
 
         Ok(())
@@ -604,8 +610,8 @@ impl HarmonyStreamingProcessor {
 
     /// Emit usage chunk at the end
     fn emit_usage_chunk(
-        prompt_tokens: u32,
-        completion_tokens: u32,
+        prompt_tokens: u64,
+        completion_tokens: u64,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
@@ -614,9 +620,9 @@ impl HarmonyStreamingProcessor {
             ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
                 .created(dispatch.created)
                 .usage(Usage {
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens: prompt_tokens + completion_tokens,
+                    prompt_tokens: saturate_to_usage_u32(prompt_tokens),
+                    completion_tokens: saturate_to_usage_u32(completion_tokens),
+                    total_tokens: saturate_to_usage_u32(prompt_tokens + completion_tokens),
                     completion_tokens_details: None,
                 })
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
@@ -736,8 +742,8 @@ impl HarmonyStreamingProcessor {
         // Metadata from Complete message
         let mut finish_reason = String::from("stop");
         let mut matched_stop: Option<serde_json::Value> = None;
-        let mut prompt_tokens: u32 = 0;
-        let mut completion_tokens: u32 = 0;
+        let mut prompt_tokens: u64 = 0;
+        let mut completion_tokens: u64 = 0;
         let mut reasoning_token_count: u32 = 0;
 
         // Process stream
@@ -931,8 +937,8 @@ impl HarmonyStreamingProcessor {
                             json!(s)
                         }
                     });
-                    prompt_tokens = complete.prompt_tokens as u32;
-                    completion_tokens = complete.completion_tokens as u32;
+                    prompt_tokens = clamp_worker_token_count(complete.prompt_tokens);
+                    completion_tokens = clamp_worker_token_count(complete.completion_tokens);
 
                     // Finalize parser and get complete output
                     let final_output = parser
@@ -1139,9 +1145,9 @@ impl HarmonyStreamingProcessor {
                     analysis: analysis_content,
                     partial_text: accumulated_final_text,
                     usage: Usage {
-                        prompt_tokens,
-                        completion_tokens,
-                        total_tokens: prompt_tokens + completion_tokens,
+                        prompt_tokens: saturate_to_usage_u32(prompt_tokens),
+                        completion_tokens: saturate_to_usage_u32(completion_tokens),
+                        total_tokens: saturate_to_usage_u32(prompt_tokens + completion_tokens),
                         completion_tokens_details: if reasoning_token_count > 0 {
                             Some(CompletionTokensDetails {
                                 reasoning_tokens: Some(reasoning_token_count),
@@ -1163,9 +1169,9 @@ impl HarmonyStreamingProcessor {
                 ResponsesResponse::builder(&emitter.response_id, "")
                     .status(ResponseStatus::Completed)
                     .usage(ResponsesUsage::Modern(ResponseUsage {
-                        input_tokens: prompt_tokens,
-                        output_tokens: completion_tokens,
-                        total_tokens: prompt_tokens + completion_tokens,
+                        input_tokens: saturate_to_usage_u32(prompt_tokens),
+                        output_tokens: saturate_to_usage_u32(completion_tokens),
+                        total_tokens: saturate_to_usage_u32(prompt_tokens + completion_tokens),
                         input_tokens_details: None,
                         output_tokens_details: if reasoning_token_count > 0 {
                             Some(OutputTokensDetails {
@@ -1178,9 +1184,9 @@ impl HarmonyStreamingProcessor {
                     .build(),
             ),
             usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
+                prompt_tokens: saturate_to_usage_u32(prompt_tokens),
+                completion_tokens: saturate_to_usage_u32(completion_tokens),
+                total_tokens: saturate_to_usage_u32(prompt_tokens + completion_tokens),
                 completion_tokens_details: if reasoning_token_count > 0 {
                     Some(CompletionTokensDetails {
                         reasoning_tokens: Some(reasoning_token_count),

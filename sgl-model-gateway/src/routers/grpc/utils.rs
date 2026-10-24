@@ -1015,6 +1015,30 @@ pub(crate) fn parse_finish_reason(
 }
 
 // ============================================================================
+// Usage accounting helpers
+// ============================================================================
+
+/// Clamp a worker-reported token count into a `u64` usage accumulator.
+///
+/// Token counts arrive as proto `int32` fields from backend workers and are
+/// trusted input for usage/billing accounting. Negative values (error
+/// sentinels or misreports) are clamped to zero, mirroring the convention the
+/// embedding and classify response processors already apply.
+pub(crate) fn clamp_worker_token_count(count: i32) -> u64 {
+    count.max(0) as u64
+}
+
+/// Narrow a `u64` usage sum into the `u32` fields of the OpenAI usage schema.
+///
+/// The wire schema stores token counts as `u32`, but sums over many
+/// completions (`n > 1`) or long streams can exceed that range. Saturate at
+/// `u32::MAX` instead of wrapping around so a reported total can never
+/// silently drop below the true value.
+pub(crate) fn saturate_to_usage_u32(sum: u64) -> u32 {
+    sum.min(u32::MAX as u64) as u32
+}
+
+// ============================================================================
 // Metrics helper functions (shared by HTTP routers and gRPC pipeline)
 // ============================================================================
 
