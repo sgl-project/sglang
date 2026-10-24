@@ -70,6 +70,7 @@ except ImportError:
 
 # Constants
 MiB = 1024 * 1024
+_NUM_OPS_PER_CUDAGRAPH = 10
 
 # FlashInfer max sizes per world size
 # Enable 64MB for 2, 4, 8 world sizes to verify large input sizes
@@ -566,10 +567,25 @@ def create_test_tensors(
     )
 
 
+def _validate_benchmark_iterations(warmup: int, trials: int) -> None:
+    if warmup < 0:
+        raise ValueError(f"warmup must be non-negative, got {warmup}")
+    if trials < _NUM_OPS_PER_CUDAGRAPH:
+        raise ValueError(
+            f"trials must be at least {_NUM_OPS_PER_CUDAGRAPH}, got {trials}"
+        )
+    if trials % _NUM_OPS_PER_CUDAGRAPH != 0:
+        raise ValueError(
+            f"trials must be a multiple of {_NUM_OPS_PER_CUDAGRAPH}, got {trials}"
+        )
+
+
 def benchmark_operation(
     operation_func, *args, warmup: int = 5, trials: int = 20, **kwargs
 ):
     """Benchmark a single operation using CUDA graphs."""
+    _validate_benchmark_iterations(warmup, trials)
+
     # Warmup before graph capture
     for _ in range(warmup):
         operation_func(*args, **kwargs)
@@ -577,7 +593,7 @@ def benchmark_operation(
 
     # Create CUDA graph
     graph = torch.cuda.CUDAGraph()
-    num_op_per_cudagraph = 10
+    num_op_per_cudagraph = _NUM_OPS_PER_CUDAGRAPH
 
     # Use sglang's graph_capture to make tensor_model_parallel_all_reduce graph-safe
     with graph_capture() as graph_capture_context:
@@ -594,14 +610,16 @@ def benchmark_operation(
     torch.cuda.synchronize()
     start_time = time.perf_counter()
 
-    for _ in range(trials // num_op_per_cudagraph):
+    num_graph_replays = trials // num_op_per_cudagraph
+    for _ in range(num_graph_replays):
         # operation_func(*args, **kwargs)
         graph.replay()
 
     torch.cuda.synchronize()
     end_time = time.perf_counter()
 
-    avg_time_ms = ((end_time - start_time) / trials) * 1000
+    num_measured_ops = num_graph_replays * num_op_per_cudagraph
+    avg_time_ms = ((end_time - start_time) / num_measured_ops) * 1000
     return avg_time_ms
 
 
@@ -613,12 +631,21 @@ def run_benchmarks(
     allreduce_params: Optional[FlashInferFusedAllReduceParams],
     quant_mode: str = "all",
     disable_oneshot: bool = False,
+    warmup: int = 5,
+    trials: int = 20,
 ):
     """Run all benchmarks for given configuration.
 
     Args:
         quant_mode: "none", "fp8_only", "fp4_only", or "all"
+        warmup: Warmup calls before capture and warmup graph replays.
+        trials: Measured operations; must be a multiple of the graph's ten ops.
     """
+    _validate_benchmark_iterations(warmup, trials)
+
+    def benchmark(*args, **kwargs):
+        return benchmark_operation(*args, warmup=warmup, trials=trials, **kwargs)
+
     (
         input_tensor,
         norm_out,
@@ -641,7 +668,7 @@ def run_benchmarks(
     if quant_mode in ["all", "none"]:
         # Standard AllReduce + RMSNorm
         try:
-            time_ms = benchmark_operation(
+            time_ms = benchmark(
                 standard_allreduce_rmsnorm,
                 input_tensor,
                 norm_out=norm_out,
@@ -656,7 +683,7 @@ def run_benchmarks(
 
         # Standard AllReduce + RMSNorm Native Compiled
         try:
-            time_ms = benchmark_operation(
+            time_ms = benchmark(
                 standard_allreduce_rmsnorm_native_compiled,
                 input_tensor,
                 residual=residual,
@@ -672,7 +699,7 @@ def run_benchmarks(
         if flashinfer_comm is not None and allreduce_params is not None:
             try:
                 if not disable_oneshot:
-                    time_ms = benchmark_operation(
+                    time_ms = benchmark(
                         flashinfer_fused_allreduce_rmsnorm,
                         input_tensor,
                         residual=residual,
@@ -689,7 +716,7 @@ def run_benchmarks(
 
             # FlashInfer Fused AllReduce + RMSNorm Two-shot
             try:
-                time_ms = benchmark_operation(
+                time_ms = benchmark(
                     flashinfer_fused_allreduce_rmsnorm,
                     input_tensor,
                     residual=residual,
@@ -709,7 +736,7 @@ def run_benchmarks(
     if quant_mode in ["all", "fp8_only"]:
         # Standard AllReduce + RMSNorm + FP8 Quant
         try:
-            time_ms = benchmark_operation(
+            time_ms = benchmark(
                 standard_allreduce_rmsnorm_fp8_quant,
                 input_tensor,
                 norm_out=norm_out,
@@ -726,7 +753,7 @@ def run_benchmarks(
 
         # Standard AllReduce + RMSNorm + FP8 Quant Native Compiled
         try:
-            time_ms = benchmark_operation(
+            time_ms = benchmark(
                 standard_allreduce_rmsnorm_fp8_quant_native_compiled,
                 input_tensor,
                 residual=residual,
@@ -747,7 +774,7 @@ def run_benchmarks(
         if flashinfer_comm is not None and allreduce_params is not None:
             try:
                 if not disable_oneshot:
-                    time_ms = benchmark_operation(
+                    time_ms = benchmark(
                         flashinfer_fused_allreduce_rmsnorm_fp8_quant,
                         input_tensor,
                         norm_out=norm_out,
@@ -772,7 +799,7 @@ def run_benchmarks(
                 )
             # FlashInfer Fused AllReduce + RMSNorm + FP8 Quant Two-shot
             try:
-                time_ms = benchmark_operation(
+                time_ms = benchmark(
                     flashinfer_fused_allreduce_rmsnorm_fp8_quant,
                     input_tensor,
                     norm_out=norm_out,
@@ -799,7 +826,7 @@ def run_benchmarks(
     if quant_mode in ["all", "fp4_only"]:
         # Standard AllReduce + RMSNorm + FP4 Quant
         try:
-            time_ms = benchmark_operation(
+            time_ms = benchmark(
                 standard_allreduce_rmsnorm_fp4_quant,
                 input_tensor,
                 norm_out=norm_out,
@@ -817,7 +844,7 @@ def run_benchmarks(
 
         # Standard AllReduce + RMSNorm + FP4 Quant Native Compiled
         try:
-            time_ms = benchmark_operation(
+            time_ms = benchmark(
                 standard_allreduce_rmsnorm_fp4_quant_native_compiled,
                 input_tensor,
                 residual=residual,
@@ -838,7 +865,7 @@ def run_benchmarks(
         if flashinfer_comm is not None and allreduce_params is not None:
             try:
                 if not disable_oneshot:
-                    time_ms = benchmark_operation(
+                    time_ms = benchmark(
                         flashinfer_fused_allreduce_rmsnorm_fp4_quant,
                         input_tensor,
                         residual=residual,
@@ -866,7 +893,7 @@ def run_benchmarks(
         # FlashInfer Fused AllReduce + RMSNorm + FP4 Quant Two-shot
         if flashinfer_comm is not None and allreduce_params is not None:
             try:
-                time_ms = benchmark_operation(
+                time_ms = benchmark(
                     flashinfer_fused_allreduce_rmsnorm_fp4_quant,
                     input_tensor,
                     residual=residual,
@@ -1147,7 +1174,10 @@ def main():
         "--warmup", type=int, default=5, help="Number of warmup iterations"
     )
     parser.add_argument(
-        "--trials", type=int, default=20, help="Number of benchmark trials"
+        "--trials",
+        type=int,
+        default=20,
+        help="Number of measured operations (at least 10 and divisible by 10)",
     )
     parser.add_argument(
         "--output-file",
@@ -1158,6 +1188,7 @@ def main():
     )
 
     args = parser.parse_args()
+    _validate_benchmark_iterations(args.warmup, args.trials)
 
     # Check if running with torchrun (required for collective operations)
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
@@ -1274,6 +1305,8 @@ def main():
                 allreduce_params,
                 quant_mode=quant_mode,
                 disable_oneshot=args.disable_oneshot,
+                warmup=args.warmup,
+                trials=args.trials,
             )
 
             # Store results for markdown export
