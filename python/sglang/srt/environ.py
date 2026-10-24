@@ -1559,6 +1559,10 @@ class Envs:
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # DFLASH sampled verify on each row's top-k support, all-gathered from the
+    # target's vocab shards instead of the full logits; batches the support
+    # cannot reproduce (max top_k > 64, top-p, penalties, ...) keep the dense path.
+    SGLANG_OPT_DFLASH_SPARSE_VERIFY = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing

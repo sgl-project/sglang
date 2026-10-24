@@ -844,6 +844,7 @@ class TestGraphPoolBorrow(CustomTestCase):
         worker = object.__new__(DFlashWorkerV2)
         worker.block_size = 4
         worker.device = "cuda"
+        worker._sparse_verify = False
         worker._target_worker = SimpleNamespace(
             model_runner=SimpleNamespace(
                 max_running_requests=2,
