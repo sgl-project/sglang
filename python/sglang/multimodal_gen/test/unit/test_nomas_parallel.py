@@ -130,9 +130,10 @@ def _launch(world_size, tp_size, backend, output_dir):
     )
 
 
-_BACKENDS = ["sdpa", "flex"]
-if torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0):
-    _BACKENDS.append("fa3")
+# SDPA in FP32 is the tight reference; the other backend is the one this GPU
+# serves with (FA3 on Hopper, FlexAttention elsewhere).
+_HOPPER = torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
+_BACKENDS = ["sdpa", "fa3" if _HOPPER else "flex"]
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA GPUs")
