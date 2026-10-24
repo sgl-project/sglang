@@ -143,7 +143,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import is_hip, is_npu, make_pp_layers
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -158,6 +158,7 @@ logger = logging.getLogger(__name__)
 # key FusedMoE.make_expert_params_mapping entries match on.
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
@@ -2327,6 +2328,89 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             return AttnForwardMethod.MLA
         return method
 
+    def fused_absorb_v_epilogue(
+        self, attn_output: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """gfx950: absorbed-V bmm and output gate in one kernel
+        (kernels/ops/attention/mla_v_up_gate.py), or, when the backend deferred
+        its split-KV combine, combine + bmm + gate in one kernel
+        (mla_decode_epilogue.py). Consumes the pending gate, so the o_proj
+        wrapper below finds none and passes x through."""
+        from sglang.srt.layers.attention import mla_epilogue_handoff
+
+        deferred = mla_epilogue_handoff.take(attn_output)
+        # A bf16 w_vc with a unit scale is what the plain bmm reads as is.
+        if not (
+            _is_gfx95
+            and self.use_output_gate
+            and self._gate_hidden_states is not None
+            and self._unit_w_vc_scale()
+        ):
+            if deferred is not None:
+                deferred.finish()
+            return super().fused_absorb_v_epilogue(attn_output)
+        from sglang.kernels.ops.attention import mla_decode_epilogue, mla_v_up_gate
+
+        rows = attn_output.shape[0]
+        if deferred is not None and mla_decode_epilogue.covered(rows, self.w_vc, None):
+            gate = self._take_output_gate()
+            if mla_decode_epilogue.covered(rows, self.w_vc, gate):
+                return mla_decode_epilogue.mla_decode_epilogue(
+                    deferred.partial_output,
+                    deferred.partial_lse,
+                    deferred.reduce_indptr,
+                    deferred.reduce_final_map,
+                    deferred.reduce_partial_map,
+                    deferred.o,
+                    self.w_vc,
+                    gate,
+                    max_q=deferred.max_q,
+                    max_splits=deferred.max_splits,
+                )
+            deferred.finish()
+            return self._absorb_v_then_gate(attn_output, gate)
+        if deferred is not None:
+            deferred.finish()
+        if not mla_v_up_gate.covered(attn_output, self.w_vc, None):
+            return None
+        gate = self._take_output_gate()
+        if not mla_v_up_gate.covered(attn_output, self.w_vc, gate):
+            # Shape mismatch after all: apply the gate the unfused way.
+            return self._absorb_v_then_gate(attn_output, gate)
+        return mla_v_up_gate.mla_v_up_gate(attn_output, self.w_vc, gate)
+
+    def _unit_w_vc_scale(self) -> bool:
+        return isinstance(self.w_scale, (int, float)) and self.w_scale == 1.0
+
+    def _take_output_gate(self) -> torch.Tensor:
+        gate_input = self._gate_hidden_states
+        self._gate_hidden_states = None
+        return self._compute_output_gate(gate_input)
+
+    def _absorb_v_then_gate(self, attn_output, gate):
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla_rocm import (
+            rocm_absorb_v_bmm,
+        )
+
+        return rocm_absorb_v_bmm(self, attn_output) * torch.sigmoid(gate)
+
+    def _defers_mla_epilogue(self) -> bool:
+        """Whether this call's absorbed-V epilogue certainly runs, so the
+        backend may hand it the split-KV combine (forward_mla_rocm skips the
+        epilogue under the kv_b LoRA paths)."""
+        if not (_is_gfx95 and envs.SGLANG_ROCM_K3_FUSED_MLA_EPILOGUE.get()):
+            return False
+        from sglang.srt.lora.deepseek_mla_correction import is_kv_b_lora_active
+        from sglang.srt.models.deepseek_common.attention_forward_methods import (
+            forward_mla_rocm,
+        )
+
+        return (
+            not forward_mla_rocm._SGLANG_EXPERIMENTAL_LORA_OPTI
+            and not is_kv_b_lora_active(self)
+            and not self.use_deep_gemm_bmm
+        )
+
     def _fork_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Fork early, but record the gate after attention to limit replay streams."""
         self._gate_pending_stream = None
@@ -2362,9 +2446,14 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         if self.use_output_gate:
             self._gate_hidden_states = hidden_states
             self._fork_output_gate(hidden_states)
-        return super().forward(
-            positions, hidden_states, forward_batch, zero_allocator, **kwargs
-        )
+        from sglang.srt.layers.attention import mla_epilogue_handoff
+
+        with mla_epilogue_handoff.expecting(
+            self.attn_mqa if self._defers_mla_epilogue() else None
+        ):
+            return super().forward(
+                positions, hidden_states, forward_batch, zero_allocator, **kwargs
+            )
 
 
 def _is_moe_layer(config: KimiLinearConfig, layer_idx: int) -> bool:
@@ -3372,6 +3461,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                 pass
             elif hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+            self_attn.fused_q_norm_proj = (
+                _is_gfx95
+                and envs.SGLANG_ROCM_K3_MLA_Q_NORM_PROJ.get()
+                and self_attn.q_lora_rank is not None
+                and self_attn.q_b_proj.weight.dtype == torch.bfloat16
+                and self_attn.q_b_proj.weight.is_contiguous()
+            )
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the

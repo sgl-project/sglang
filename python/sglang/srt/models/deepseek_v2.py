@@ -2224,6 +2224,9 @@ class DeepseekV2AttentionMLA(
         # pre-CUDA-graph-capture by the model runner; None unless replicate is on.
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
+        # One launch for the q_a / kv_a RMSNorms and q_b_proj on gfx950 decode-sized
+        # batches (kernels/ops/attention/mla_q_norm_proj.py); a model sets it after loading.
+        self.fused_q_norm_proj = False
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -2285,6 +2288,14 @@ class DeepseekV2AttentionMLA(
                     self.num_local_heads = orig_num_local_heads
             else:
                 yield
+
+    def fused_absorb_v_epilogue(
+        self, attn_output: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Override point for a model that folds its post-attention epilogue
+        (e.g. an output gate) into the absorbed-V projection: return the
+        [T, heads * v_head_dim] o_proj input, or None to take the plain bmm."""
+        return None
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch

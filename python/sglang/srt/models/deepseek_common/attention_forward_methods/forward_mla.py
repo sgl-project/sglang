@@ -763,6 +763,21 @@ class DeepseekMLAForwardMixin:
                         else {}
                     ),
                 )
+        elif (
+            llama_4_scaling is None
+            and topk_indices is None
+            and get_attn_backend().supports_split_mla_qk(forward_batch, self.attn_mqa)
+        ):
+            # The backend assembles q / k with its KV write in one kernel.
+            attn_output = self.attn_mqa(
+                q_nope_out,
+                k_nope,
+                k_nope,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_pe,
+                k_rope=k_pe,
+            )
         else:
             q = torch.cat([q_nope_out, q_pe], dim=-1)
             k = torch.cat([k_nope, k_pe], dim=-1)

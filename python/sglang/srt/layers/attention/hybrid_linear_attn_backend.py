@@ -1236,6 +1236,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             and self.linear_attn_backend.supports_ragged_verify_graph
         )
 
+    def supports_split_mla_qk(
+        self, forward_batch: ForwardBatch, layer: RadixAttention
+    ) -> bool:
+        return self._is_full_attn(
+            layer
+        ) and self.full_attn_backend.supports_split_mla_qk(forward_batch, layer)
+
     @property
     def use_mha(self) -> bool:
         return getattr(self.full_attn_backend, "use_mha", False)

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention import mla_q_norm_proj
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
@@ -45,7 +46,10 @@ from sglang.srt.lora.deepseek_mla_correction import (
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -509,6 +513,7 @@ class DeepseekMLARocmForwardMixin:
         )
         q_lora = None
         topk_indices = None
+        q_projected = False
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -581,6 +586,22 @@ class DeepseekMLARocmForwardMixin:
                         q = view_aiter_fused_rms_transposed_fp8_scale_tuple(q)
                     elif _use_aiter_bpreshuffle_gfx95:
                         q = materialize_bpreshuffle_fp8_scale_tuple(q)
+            elif (
+                self.fused_q_norm_proj
+                and not q_replicate_active
+                and mla_q_norm_proj.covered(q, k_nope, self.q_b_proj.weight)
+            ):
+                q, k_nope = mla_q_norm_proj.mla_q_norm_proj(
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    k_nope,
+                    self.kv_a_layernorm.weight,
+                    self.kv_a_layernorm.variance_epsilon,
+                    self.q_b_proj.weight,
+                )
+                q = q.view(-1, self.num_local_heads, self.qk_head_dim)
+                q_projected = True
             elif _use_aiter:
                 q, k_nope = fused_qk_rmsnorm_bf16(
                     q,
@@ -606,6 +627,7 @@ class DeepseekMLARocmForwardMixin:
                 and forward_batch.forward_mode.is_decode_or_idle()
                 and q_lora is not None
                 and not q_replicate_active
+                and not q_projected
             ):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
@@ -635,7 +657,7 @@ class DeepseekMLARocmForwardMixin:
                         self.num_local_heads * self.dcp_size,
                         self.qk_head_dim,
                     )
-                else:
+                elif not q_projected:
                     q = self.q_b_proj_forward(q)
 
                 if q_lora is not None:
@@ -971,6 +993,22 @@ class DeepseekMLARocmForwardMixin:
                 save_kv_cache=False,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
+        elif (
+            llama_4_scaling is None
+            and topk_indices is None
+            and not self._skip_rope_for_aiter_fused_mla()
+            and get_attn_backend().supports_split_mla_qk(forward_batch, self.attn_mqa)
+        ):
+            # The backend assembles q / k with its KV write in one kernel.
+            attn_output = self.attn_mqa(
+                q_nope_out,
+                k_nope,
+                k_nope,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_pe,
+                k_rope=k_pe,
+            )
         else:
             if self._skip_rope_for_aiter_fused_mla():
                 q, _, _, k = _fused_rope_cat_and_cache(
@@ -1071,7 +1109,13 @@ class DeepseekMLARocmForwardMixin:
                 attn_bmm_output[:, :expected_m, :].transpose(0, 1).flatten(1, 2)
             )
         else:
-            attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
+            attn_bmm_output = (
+                None
+                if _SGLANG_EXPERIMENTAL_LORA_OPTI or is_kv_b_lora_active(self)
+                else self.fused_absorb_v_epilogue(attn_output)
+            )
+            if attn_bmm_output is None:
+                attn_bmm_output = rocm_absorb_v_bmm(self, attn_output)
 
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             from sglang.srt.lora.trtllm_lora_temp.deepseek_mla_correction import (
