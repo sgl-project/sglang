@@ -52,6 +52,9 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.response_format_text_json_schema_config import (
     ResponseFormatTextJSONSchemaConfig,
 )
+from openai.types.responses.response_function_tool_call_param import (
+    ResponseFunctionToolCallParam,
+)
 from openai.types.shared.response_format_json_object import ResponseFormatJSONObject
 from pydantic import (
     AfterValidator,
@@ -742,6 +745,8 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    # DeepSeek API prefix completion: continue this final assistant message.
+    prefix: Optional[bool] = None
 
     @field_validator("role", mode="before")
     @classmethod
@@ -835,9 +840,10 @@ class ToolChoice(BaseModel):
 
 
 # OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
-# none/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
+# none/minimal/low/medium/high/xhigh/max, plus DeepSeek's ultra. Used as-is by
+# /v1/responses.
 ReasoningEffortTier = Literal[
-    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"
 ]
 # The typed /v1/responses stream events validate against OpenAI's narrower
 # ``Reasoning.effort``; echoing a tier outside this set kills the stream.
@@ -903,6 +909,10 @@ class ChatCompletionRequest(PDRoutingFields):
     top_p: Optional[float] = None
     user: Optional[str] = None
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    # Set by /v1/responses when the request has namespace tools: the chat template
+    # renders these, while ``tools`` (flattened to ``<namespace>.<function>``) still
+    # drives tool-call parsing.
+    _template_tools: Optional[List[Dict[str, Any]]] = PrivateAttr(default=None)
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
@@ -927,7 +937,7 @@ class ChatCompletionRequest(PDRoutingFields):
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
-        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
+        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra', 'max') or a "
         "float in [0.0, 0.99] for fine-grained control. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
@@ -1056,6 +1066,7 @@ class ChatCompletionRequest(PDRoutingFields):
                 "medium",
                 "high",
                 "xhigh",
+                "ultra",
                 "max",
             }:
                 values["reasoning_effort"] = effort
@@ -1771,7 +1782,7 @@ class ResponseReasoningParam(BaseModel):
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
         "Accepts the OpenAI string tiers "
-        "('none','minimal','low','medium','high','xhigh','max').",
+        "('none','minimal','low','medium','high','xhigh','ultra','max').",
     )
     summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
         default=None,
@@ -1807,6 +1818,7 @@ class ResponseTool(BaseModel):
     strict: bool = False
     # Inner schemas for ``namespace`` tools.
     tools: Optional[List[Dict[str, Any]]] = None
+    defer_loading: Optional[bool] = None
     # Input format of a ``custom`` tool: {"type": "text"} or
     # {"type": "grammar", "syntax": ..., "definition": ...}.
     format: Optional[Dict[str, Any]] = None
@@ -1822,12 +1834,18 @@ class ResponseInputMessageParam(EasyInputMessageParam, total=False):
     phase: Optional[Literal["commentary", "final_answer"]]
 
 
+class ResponseFunctionCallInputParam(ResponseFunctionToolCallParam, total=False):
+    # Set when the call targets a member of a ``namespace`` tool.
+    namespace: str
+
+
 class ResponseOutputMessage(OpenAIResponseOutputMessage):
     phase: Optional[Literal["commentary", "final_answer"]] = None
 
 
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputMessageParam,
+    ResponseFunctionCallInputParam,
     ResponseOutputMessage,
     ResponseInputItemParam,
     "ResponseReasoningItem",
@@ -2351,6 +2369,7 @@ class ResponseReasoningTextContent(BaseModel):
 
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputMessageParam,
+    ResponseFunctionCallInputParam,
     ResponseOutputMessage,
     ResponseInputItemParam,
     "ResponseReasoningItem",
