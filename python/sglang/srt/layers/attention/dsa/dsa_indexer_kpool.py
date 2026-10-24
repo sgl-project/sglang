@@ -1675,9 +1675,11 @@ class IndexerKPool(MultiPlatformOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
+        on_logits_start: Optional[Callable[[], None]] = None,
     ) -> Optional[torch.Tensor]:
         if (
-            is_in_breakable_cuda_graph()
+            on_logits_start is None
+            and is_in_breakable_cuda_graph()
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             from sglang.srt.layers.attention.dsa.kpool_prefill_cuda_graph import (
@@ -1700,35 +1702,18 @@ class IndexerKPool(MultiPlatformOp):
             )
             return output if return_indices else None
         return self._forward_cuda_impl(
-            x, q_lora, positions, forward_batch, layer_id, return_indices
+            x,
+            q_lora,
+            positions,
+            forward_batch,
+            layer_id,
+            return_indices,
+            on_logits_start,
         )
 
-    def forward_with_cp_kv(
-        self, x, q_lora, positions, forward_batch, layer_id, kv_local
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """KPool prefill plus overlapped replication of no-RoPE MLA KV."""
-        from sglang.srt.layers.cp.interleave_kpool import run_indexer_with_kv_gather
-
-        if is_in_breakable_cuda_graph():
-            from sglang.srt.layers.attention.dsa.kpool_prefill_cuda_graph import (
-                bcg_kpool_indexer_prefill_with_output,
-            )
-
-            output = torch.empty(
-                (x.shape[0], self.index_topk + self.index_kpool - 1),
-                dtype=torch.int32,
-                device=x.device,
-            )
-            kv_output = kv_local.new_empty(
-                (forward_batch.extend_num_tokens, kv_local.shape[-1])
-            )
-            bcg_kpool_indexer_prefill_with_output(
-                self, x, q_lora, positions, output, layer_id, kv_local, kv_output
-            )
-            return output, kv_output
-        return run_indexer_with_kv_gather(
-            self, x, q_lora, positions, forward_batch, layer_id, kv_local
-        )
+    @property
+    def topk_output_width(self):
+        return self.index_topk + self.index_kpool - 1
 
     def _forward_cuda_impl(
         self,

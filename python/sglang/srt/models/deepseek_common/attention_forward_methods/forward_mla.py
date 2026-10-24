@@ -16,6 +16,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
 from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
+from sglang.srt.layers.cp.indexer_overlap import indexer_with_cp_kv
 from sglang.srt.layers.cp.interleave import is_interleave_extend
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
@@ -313,6 +314,9 @@ class DeepseekMLAForwardMixin:
         fuse_bmm_attention = (
             self.q_lora_rank is not None
             and self._can_fuse_bmm_into_attention(forward_batch)
+            and not (
+                self.rotary_emb is not None and is_interleave_extend(forward_batch)
+            )
         )
         # --dcp-replicate-q-proj: project full-head Q locally from pre-gathered
         # weights and skip the per-layer Q all-gather (bf16 decode absorb only).
@@ -327,6 +331,7 @@ class DeepseekMLAForwardMixin:
             fuse_bmm_attention = False
         q_lora = None
         cp_kv = None
+        defer_cp_indexer = False
         topk_indices = None
         q_nope = None
         q_pe = None
@@ -452,28 +457,40 @@ class DeepseekMLAForwardMixin:
                     if self.should_run_indexer(prev_topk_indices):
                         if (
                             _is_cuda
-                            and self.rotary_emb is None
                             and is_interleave_extend(forward_batch)
-                            and hasattr(self.indexer, "forward_with_cp_kv")
+                            and hasattr(self.indexer, "topk_output_width")
+                            and (
+                                not self._fuse_rope_for_trtllm_mla(forward_batch)
+                                or (
+                                    getattr(
+                                        get_attn_backend(), "dsa_prefill_impl", None
+                                    )
+                                    == "trtllm"
+                                    and not get_attn_backend().use_mha
+                                )
+                            )
                         ):
-                            # No-RoPE KPool MLA has its final local KV already.
-                            # Replicate it alongside the already-enqueued
-                            # indexer scoring and top-k kernels.
-                            kv_local = torch.cat(
-                                (
-                                    k_nope.squeeze(1),
-                                    latent_cache[..., self.kv_lora_rank :],
-                                ),
-                                dim=-1,
-                            )
-                            topk_indices, cp_kv = self.indexer.forward_with_cp_kv(
-                                hidden_states,
-                                q_lora,
-                                positions,
-                                forward_batch,
-                                self.layer_id,
-                                kv_local,
-                            )
+                            if self.rotary_emb is None:
+                                kv_local = torch.cat(
+                                    (
+                                        k_nope.squeeze(1),
+                                        latent_cache[..., self.kv_lora_rank :],
+                                    ),
+                                    dim=-1,
+                                )
+                                topk_indices, cp_kv = indexer_with_cp_kv(
+                                    self.indexer,
+                                    hidden_states,
+                                    q_lora,
+                                    positions,
+                                    forward_batch,
+                                    self.layer_id,
+                                    kv_local,
+                                )
+                            else:
+                                # Ordinary DSA needs the final RoPE/FP8 KV first.
+                                # The indexer does not depend on absorbed Q.
+                                defer_cp_indexer = True
                         else:
                             topk_indices = self.indexer(
                                 x=hidden_states,
@@ -662,6 +679,44 @@ class DeepseekMLAForwardMixin:
                 num_tokens, self.num_local_heads, self.kv_lora_rank, q_nope.device
             )
 
+        if defer_cp_indexer:
+            if fuse_rope_for_trtllm_mla:
+                from sglang.kernels.ops.attention.utils import (
+                    mla_quantize_and_rope_for_fp8,
+                )
+
+                # Use the same fused operator as TRT-LLM attention, while Q/K
+                # still have local rows and share the same local positions.
+                q_nope_out, k_nope, k_pe = mla_quantize_and_rope_for_fp8(
+                    q_nope_out,
+                    q_pe,
+                    k_nope.squeeze(1),
+                    k_pe.squeeze(1),
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.rotary_emb.is_neox_style,
+                    self.kv_lora_rank,
+                    self.qk_rope_head_dim,
+                )
+                # The backend consumes already merged/quantized Q and final KV.
+                q_pe = None
+            kv_local = torch.cat(
+                (
+                    k_nope.reshape(-1, self.kv_lora_rank),
+                    k_pe.reshape(-1, self.qk_rope_head_dim),
+                ),
+                dim=-1,
+            )
+            topk_indices, cp_kv = indexer_with_cp_kv(
+                self.indexer,
+                hidden_states,
+                q_lora,
+                positions,
+                forward_batch,
+                self.layer_id,
+                kv_local,
+            )
+
         if cp_kv is not None:
             k_nope = cp_kv[..., : self.kv_lora_rank].unsqueeze(1)
             k_pe = cp_kv[..., self.kv_lora_rank :].unsqueeze(1)
@@ -740,7 +795,7 @@ class DeepseekMLAForwardMixin:
             extra_args = {}
             if getattr(self, "learnable_sink_param", None) is not None:
                 extra_args["attn_sink"] = self.learnable_sink_param
-            if self._fuse_rope_for_trtllm_mla(forward_batch):
+            if q_pe is not None and self._fuse_rope_for_trtllm_mla(forward_batch):
                 extra_args.update(
                     cos_sin_cache=self.rotary_emb.cos_sin_cache,
                     is_neox=self.rotary_emb.is_neox_style,
