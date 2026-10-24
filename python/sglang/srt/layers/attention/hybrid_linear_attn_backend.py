@@ -1214,6 +1214,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             and not full_attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         )
         if self.use_captured_forward_metadata_for_breakable_cuda_graph:
+            self.breakable_graph_reads_captured_state = True
             self.prefill_cuda_graph_max_batch_size = (
                 linear_attn_backend.prefill_graph_max_seqs
             )
