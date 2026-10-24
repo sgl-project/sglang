@@ -24,6 +24,7 @@ class TboAttnBackend(AttentionBackend):
         self.token_to_kv_pool = primary.token_to_kv_pool
         self.req_to_token_pool = primary.req_to_token_pool
         self.kv_index_translator = primary.kv_index_translator
+        self.prefill_chunk_align = primary.prefill_chunk_align
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             primary, "extend_dummy_seqs_capped_by_req_pool", False
         )

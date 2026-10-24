@@ -73,6 +73,10 @@ class AttentionBackend(ABC):
     data_type: Optional[torch.dtype] = None
     kv_cache_dtype: Optional[torch.dtype] = None
 
+    # Grid a prefill chunk must start on to reproduce the unchunked prefill bit
+    # for bit; None for backends that tile keys at absolute positions.
+    prefill_chunk_align: Optional[int] = None
+
     # Wrapper backends (e.g. HybridLinearAttnBackend) set this to their child
     # backends; leaves keep None. Lets generic code (metadata glue graph)
     # enumerate every backend whose python-side forward_metadata must be
