@@ -5299,6 +5299,10 @@ class Scheduler(
             self.metrics_reporter.record_scheduler_idle()
         else:
             self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+        if self.idle_sleeper is not None:
+            self.maybe_sleep_on_idle()
+        else:
+            time.sleep(0.005)
 
     def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
         # Health check piggybacks on running requests in process_output.
