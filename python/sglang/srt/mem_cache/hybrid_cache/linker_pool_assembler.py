@@ -167,6 +167,7 @@ class DevicePoolGroup:
         page_size: int,
         *,
         rank_replicated: bool = False,
+        cp_replicated: bool = False,
     ):
         self.entries = list(entries)
         self.entry_map = {entry.name: entry for entry in entries}
@@ -176,6 +177,7 @@ class DevicePoolGroup:
         self.num_layers = num_layers
         self.page_size = page_size
         self.rank_replicated = rank_replicated
+        self.cp_replicated = cp_replicated
         self.kv_buffer = None
 
     def resolve_transfers(
@@ -405,6 +407,7 @@ def _build_deepseek_v4_device_pool_group(
         mappings.transfer_layer_id_max,
         page_size,
         rank_replicated=True,
+        cp_replicated=True,
     )
 
 
