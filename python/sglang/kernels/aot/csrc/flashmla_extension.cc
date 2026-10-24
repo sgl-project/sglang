@@ -44,7 +44,8 @@ std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::
     const std::optional<at::Tensor>& extra_topk_length,
     int d_v,
     float sm_scale,
-    const std::optional<std::string>& kv_format);
+    const std::optional<std::string>& kv_format,
+    const std::optional<at::Tensor>& kv_global_scale);
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_sparse_decode_fwd(
     const at::Tensor& q,
@@ -73,7 +74,38 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       extra_topk_length,
       static_cast<int>(d_v),
       static_cast<float>(sm_scale),
-      kv_format);
+      kv_format,
+      std::nullopt);
+}
+
+// The native GLM-5.2 cache has its own ABI; never infer it from the FP8 entry point.
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sgl_sparse_decode_fwd_nvfp4(
+    const at::Tensor& q,
+    const at::Tensor& packed_kv,
+    const at::Tensor& kv_global_scale,
+    const at::Tensor& indices,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& attn_sink,
+    std::optional<at::Tensor> tile_scheduler_metadata,
+    std::optional<at::Tensor> num_splits,
+    int64_t d_v,
+    double sm_scale) {
+  return sparse_attn_decode_interface(
+      q,
+      packed_kv,
+      indices,
+      topk_length,
+      attn_sink,
+      tile_scheduler_metadata,
+      num_splits,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      static_cast<int>(d_v),
+      static_cast<float>(sm_scale),
+      std::optional<std::string>{"GLM52_NVFP4"},
+      kv_global_scale);
 }
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_dense_decode_fwd(
@@ -124,6 +156,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "cumulative_seqlen_kv, Tensor o, Tensor lse, int mask_mode_code, float softmax_scale, int max_seqlen_q, int "
       "max_seqlen_kv, bool is_varlen) -> ()");
   m.impl("dense_prefill_fwd", torch::kCUDA, &FMHACutlassSM100FwdRun);
+
+  m.def(
+      "sparse_decode_fwd_nvfp4(Tensor q, Tensor packed_kv, Tensor kv_global_scale, Tensor indices, Tensor? "
+      "topk_length, Tensor? attn_sink, Tensor? tile_scheduler_metadata, Tensor? num_splits, int d_v, float "
+      "sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
+  m.impl("sparse_decode_fwd_nvfp4", torch::kCUDA, &sgl_sparse_decode_fwd_nvfp4);
+
 #endif
 
   m.def(

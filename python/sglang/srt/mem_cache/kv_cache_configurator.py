@@ -32,8 +32,12 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
+    NVFP4_BYTES_PER_TOKEN as DSA_NVFP4_BYTES_PER_TOKEN,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
+    get_kv_scale_attention_layers,
     resolve_kv_cache_quant,
 )
 from sglang.srt.mem_cache.allocation_sizing import (
@@ -2345,7 +2349,27 @@ class KVCacheConfigurator:
             max_running_requests=max_running_requests,
             **pool_kwargs,
         )
+        if token_to_kv_pool.dsa_kv_cache_store_nvfp4:
+            self._load_dsa_nvfp4_global_scales(token_to_kv_pool)
         return token_to_kv_pool
+
+    def _load_dsa_nvfp4_global_scales(self, pool: KVCache) -> None:
+        """Copy calibrated per-layer K scales into the graph-stable NVFP4 pool."""
+        local_layer_ids = range(pool.start_layer, pool.start_layer + pool.layer_num)
+
+        initialized = 0
+        for attention in get_kv_scale_attention_layers(self.model):
+            layer_id = attention.layer_id
+            if layer_id not in local_layer_ids:
+                continue
+            scale = attention.k_scale_float
+            pool.set_mla_kv_global_scale(layer_id, 1.0 if scale is None else scale)
+            initialized += 1
+        logger.info(
+            "Initialized DSA NVFP4 global scales for %d/%d local layers",
+            initialized,
+            pool.layer_num,
+        )
 
     def _build_hybrid_mla_swa_kv_pool(
         self,
@@ -3362,6 +3386,14 @@ def calculate_mla_kv_cache_dim(
     # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
     if not is_dsa_model:
         return kv_cache_dim
+
+    if is_float4_e2m1fn_x2(kv_cache_dtype):
+        if kv_lora_rank != 512 or qk_rope_head_dim != 64:
+            raise ValueError(
+                "DSA packed FP4 is specialized for GLM-5.2 QK=512+64, got "
+                f"{kv_lora_rank=} and {qk_rope_head_dim=}"
+            )
+        return DSA_NVFP4_BYTES_PER_TOKEN
 
     # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
     # backend for the local role determines the local pool layout; the

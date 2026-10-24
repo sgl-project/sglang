@@ -679,7 +679,7 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
             slot = self._slots[layer_id % 2]
             rows = self._translate_loc_cached(loc)
             self._write_mla_kv_buffer(
-                slot.tensors["kv"], rows, cache_k_nope, cache_k_rope
+                layer_id, slot.tensors["kv"], rows, cache_k_nope, cache_k_rope
             )
         owned_idx, local_rows = self._get_write_plan(loc)
         if owned_idx.numel() == 0:

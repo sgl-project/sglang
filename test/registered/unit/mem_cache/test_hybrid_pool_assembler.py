@@ -346,6 +346,23 @@ class TestMambaInfoRouting(CustomTestCase):
                             host.destroy()
 
 
+class TestHybridPoolCapabilities(CustomTestCase):
+    def test_full_pool_inherits_default_capabilities(self):
+        pool = object.__new__(HybridLinearKVPool)
+        pool.full_kv_pool = object.__new__(DSATokenToKVPool)
+
+        self.assertFalse(pool.dsa_kv_cache_store_fp8)
+        self.assertFalse(pool.dsa_kv_cache_store_nvfp4)
+
+    def test_capabilities_follow_the_full_pool(self):
+        pool = object.__new__(HybridLinearKVPool)
+        pool.full_kv_pool = object.__new__(DSATokenToKVPool)
+        pool.full_kv_pool.dsa_kv_cache_store_fp8 = True
+
+        self.assertTrue(pool.dsa_kv_cache_store_fp8)
+        self.assertFalse(pool.dsa_kv_cache_store_nvfp4)
+
+
 class TestDraftSidecarPoolDispatch(CustomTestCase):
     def test_full_builder_unwraps_empty_hybrid_linear_pool(self):
         draft_kv_pool = object.__new__(HybridLinearKVPool)
