@@ -70,7 +70,9 @@ class TestTrtllmMlaSm120Decode(CustomTestCase):
                         timeout=120,
                     )
                     self.assertEqual(response.status_code, 200, response.text)
-                    for output in response.json():
+                    outputs = response.json()
+                    self.assertEqual(len(outputs), 2)
+                    for output in outputs:
                         self.assertEqual(
                             output["meta_info"]["completion_tokens"], MAX_NEW_TOKENS
                         )
