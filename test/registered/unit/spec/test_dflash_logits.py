@@ -253,6 +253,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         draft_model=SimpleNamespace(lm_head=None),
         device="cpu",
         _selector_sampling_enabled=True,
+        _acceptance_estimator=None,
         _target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=quant_head))
         ),
@@ -317,6 +318,7 @@ def test_disabled_selector_sampling_forces_greedy_draft():
         block_size=2,
         _selector_sampling_enabled=False,
         _selector_sample=None,
+        _acceptance_estimator=None,
     )
     draft_logits_output = SimpleNamespace(hidden_states=torch.zeros((2, 4)))
 
@@ -373,11 +375,12 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         bs=1,
     )
 
-    accept_len, commit_lens, bonus, out_tokens, _ = result
+    accept_len, commit_lens, bonus, out_tokens, _, cap_trim_lens = result
     assert accept_len.tolist() == [0]
     assert commit_lens.tolist() == [1]
     assert bonus.tolist() == [7]
     assert out_tokens.tolist() == [[7, 0]]
+    assert cap_trim_lens is None
     assert observed["target_predict"].tolist() == [[1, 0]]
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
 
