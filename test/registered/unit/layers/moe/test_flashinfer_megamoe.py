@@ -48,6 +48,9 @@ def _load_megamoe_module(monkeypatch):
         SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
             get=lambda: 0
         ),
+        SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK=types.SimpleNamespace(
+            get=lambda: 0
+        ),
         SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE=types.SimpleNamespace(
             get=lambda: "bf16"
         ),
@@ -121,6 +124,7 @@ def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
         topk_weights: torch.Tensor
         fc1_alpha: torch.Tensor
         scales: torch.Tensor | None = None
+        output: torch.Tensor | None = None
 
         @property
         def num_tokens(self):
@@ -249,6 +253,8 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
 
         def warmup(self, inputs, workspace=None):
             if self.auto:
+                # FlashInfer's output-view backends reject a sweep without one.
+                assert inputs.output.shape == inputs.hidden_states.shape
                 events.append("tune")
                 Path(os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"]).write_text(
                     json.dumps(payload)
@@ -452,6 +458,72 @@ def test_adapter_requests_workspace_output_view(monkeypatch, supports_output_vie
     assert mega.tensors.topk_ids.data_ptr() == topk_ids.data_ptr()
     assert mega.tensors.topk_ids.dtype == torch.int32
     assert mega.return_workspace_view is supports_output_view
+
+
+def test_decode_workspace_is_untuned_only_and_chosen_in_lockstep(monkeypatch):
+    """The decode profile exists only without startup tuning, and a forward uses
+    it only when every DP rank's batch fits and none extends, so EP ranks agree."""
+    module = _load_megamoe_module(monkeypatch)
+    autotune = sys.modules["sglang.srt.layers.moe.flashinfer_megamoe_autotune"]
+
+    class Mega:
+        supports_output_view = True
+
+        def create_workspace(self, capacity):
+            return types.SimpleNamespace(max_tokens_per_rank=capacity)
+
+        def forward(self, tensors, *, workspace=None, return_workspace_view=False):
+            self.workspace = workspace
+            return tensors.hidden_states
+
+    def set_decode_capacity(value):
+        module.envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK = (
+            types.SimpleNamespace(get=lambda: value)
+        )
+
+    mega = Mega()
+    set_decode_capacity(4)
+    monkeypatch.setattr(autotune, "_active_context", object())
+    assert module._maybe_create_decode_workspace(mega, 2048) is None
+    monkeypatch.setattr(autotune, "_active_context", None)
+    workspace = module._maybe_create_decode_workspace(mega, 2048)
+    assert workspace.max_tokens_per_rank == 4
+    for invalid in (-1, 2048):
+        set_decode_capacity(invalid)
+        with pytest.raises(ValueError, match="DECODE_MAX_TOKENS_PER_RANK"):
+            module._maybe_create_decode_workspace(mega, 2048)
+
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.MoEEpTensors = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    fake_flashinfer = types.ModuleType("flashinfer")
+    fake_flashinfer.moe_ep = fake_moe_ep
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+    dp = types.ModuleType("sglang.srt.layers.dp_attention")
+    monkeypatch.setitem(sys.modules, dp.__name__, dp)
+    quant_info = module.FlashInferMegaMoeQuantInfo(
+        mega=mega, mega_decode_workspace=workspace
+    )
+    dispatch_output = types.SimpleNamespace(
+        hidden_states=torch.zeros((1, 4), dtype=torch.bfloat16),
+        topk_output=types.SimpleNamespace(
+            topk_ids=torch.zeros((1, 2), dtype=torch.int32),
+            topk_weights=torch.ones((1, 2)),
+        ),
+    )
+    for counts, extend, expected in (
+        ([1, 4, 2, 0], False, workspace),
+        ([1, 5, 0, 0], False, None),
+        ([1, 1, 1, 1], True, None),
+    ):
+        dp.get_dp_global_num_tokens = lambda counts=counts: counts
+        dp.get_is_extend_in_batch = lambda extend=extend: extend
+        module.run_flashinfer_megamoe(
+            dispatch_output,
+            quant_info,
+            types.SimpleNamespace(routed_scaling_factor=1.0),
+        )
+        assert mega.workspace is expected
 
 
 def test_capture_safe_ue8m0_pack_is_scoped(monkeypatch):

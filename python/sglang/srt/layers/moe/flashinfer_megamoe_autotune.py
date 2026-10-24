@@ -76,6 +76,11 @@ def megamoe_autotune_context(
                 tuner.publish_namespaced_records(_CACHE_NAMESPACE, context.records)
 
 
+def megamoe_autotune_active() -> bool:
+    """Whether startup tuning is preparing MegaMoE capacity profiles now."""
+    return _active_context is not None
+
+
 @contextmanager
 def _native_cache(path: Path):
     # Native AUTO exposes its winner through this file; generic autotune owns
@@ -245,7 +250,14 @@ class MegaMoeTunedForward:
         )
         payload = None
         try:
-            temporary.warmup(tensors)
+            # The knobs="auto" sweep needs a caller-owned output buffer; without
+            # one, output-view backends run compute(output=None) and reject it.
+            output = torch.empty(
+                (tensors.num_tokens, self.fleet_params.token_hidden_size),
+                dtype=torch.bfloat16,
+                device=tensors.hidden_states.device,
+            )
+            temporary.warmup(replace(tensors, output=output))
             if self.bootstrap.rank == 0:
                 try:
                     payload = json.loads(native_path.read_text())
