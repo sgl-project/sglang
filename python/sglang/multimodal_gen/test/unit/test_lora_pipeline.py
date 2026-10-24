@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from prometheus_client import CollectorRegistry
+from safetensors.torch import save_file
 
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
@@ -17,6 +18,9 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
+from sglang.multimodal_gen.runtime.pipelines_core.lora.lora_merge_cache import (
+    LoraMergeCache,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 
@@ -44,6 +48,7 @@ def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline.lora_initialized = True
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {"adapter": "/adapter"}
+    pipeline.loaded_adapter_files = {}
     pipeline.loaded_adapter_alphas = {"adapter": None}
     pipeline.cur_adapter_name = {}
     pipeline.cur_adapter_path = {}
@@ -119,16 +124,30 @@ def test_lora_mutations_preserve_independent_conditioning(operation):
     assert cache.misses == 3
 
 
-def test_merge_cache_only_accepts_cpu_backed_weights():
+def test_merge_cache_only_accepts_cpu_backed_weights(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_DIFFUSION_CACHE_ROOT", str(tmp_path / "cache"))
     pipeline = _make_pipeline(_make_layer())
-    cpu_cache = pipeline._merge_cache_for(
-        "transformer",
-        pipeline.lora_layers,
-        ["/adapter"],
-        [1.0],
-        enabled=True,
-    )
-    assert cpu_cache is not None
+    for name in ("high.safetensors", "low.safetensors"):
+        save_file({"linear.lora_A.weight": torch.ones(1, 2)}, tmp_path / name)
+    pipeline.loaded_adapter_files["adapter"] = str(tmp_path / "high.safetensors")
+
+    def cache_root():
+        cache = pipeline._merge_cache_for(
+            "transformer", pipeline.lora_layers, ["adapter"], [1.0], enabled=True
+        )
+        assert cache is not None
+        return cache.root
+
+    # Another file from the same repo, the adapter's alpha and its PEFT config
+    # all change the merged delta, so each must change the key.
+    roots = {cache_root()}
+    pipeline.loaded_adapter_files["adapter"] = str(tmp_path / "low.safetensors")
+    roots.add(cache_root())
+    pipeline.loaded_adapter_alphas["adapter"] = 16
+    roots.add(cache_root())
+    (tmp_path / "adapter_config.json").write_text('{"use_rslora": true}')
+    roots.add(cache_root())
+    assert len(roots) == 4
 
     resident_layer = BaseLayerWithLoRA(
         torch.nn.Linear(2, 2, bias=False, device="meta"), snapshot_base=False
@@ -136,7 +155,7 @@ def test_merge_cache_only_accepts_cpu_backed_weights():
     resident_cache = pipeline._merge_cache_for(
         "transformer",
         {"linear": resident_layer},
-        ["/adapter"],
+        ["adapter"],
         [1.0],
         enabled=True,
     )
@@ -442,3 +461,29 @@ def test_unmerge_restores_base_even_when_lora_disabled():
 
     assert not layer.merged
     torch.testing.assert_close(layer.base_layer.weight, base)
+
+
+def test_merge_cache_merges_layers_the_last_adapter_skips(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_DIFFUSION_CACHE_ROOT", str(tmp_path))
+    layer_x, layer_y = _make_layer(), _make_layer()
+    base_x = layer_x.base_layer.weight.detach().clone()
+    pipeline = _make_pipeline(layer_x)
+    pipeline.lora_layers = {"x": layer_x, "y": layer_y}
+    pipeline.lora_adapters["a"]["x.lora_A"] = torch.ones(1, 2)
+    pipeline.lora_adapters["a"]["x.lora_B"] = torch.ones(2, 1)
+    pipeline.lora_adapters["b"]["y.lora_A"] = torch.ones(1, 2)
+    pipeline.lora_adapters["b"]["y.lora_B"] = torch.ones(2, 1)
+
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline._apply_lora_to_layers(
+            pipeline.lora_layers,
+            ["a", "b"],
+            ["/a", "/b"],
+            0,
+            [1.0, 1.0],
+            merge_cache=LoraMergeCache("k", expected_bytes=1),
+        )
+
+    assert layer_x.merged
+    x = torch.randn(3, 2)
+    torch.testing.assert_close(layer_x(x), x @ (base_x + 1).T)

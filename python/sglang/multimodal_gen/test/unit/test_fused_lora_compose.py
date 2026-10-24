@@ -287,6 +287,7 @@ def _make_loader_pipeline() -> _TestLoRAPipeline:
     pipeline = object.__new__(_TestLoRAPipeline)
     pipeline.lora_adapters = defaultdict(dict)
     pipeline.loaded_adapter_paths = {}
+    pipeline.loaded_adapter_files = {}
     pipeline.loaded_adapter_alphas = {}
     pipeline.device = "cpu"
     pipeline.modules = {"transformer": torch.nn.Module()}
