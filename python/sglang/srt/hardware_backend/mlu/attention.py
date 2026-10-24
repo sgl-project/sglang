@@ -36,12 +36,6 @@ class MLUAttnBackend(AttentionBackend):
         self.forward_metadata = None
         self._graph_metadata = {}
 
-    def _block_tables(self, req_pool_indices):
-        return (
-            self.req_to_token[req_pool_indices, : self.max_context_len : self.page_size]
-            // self.page_size
-        )
-
     @staticmethod
     def _cumulative(lengths):
         out = torch.zeros(lengths.numel() + 1, dtype=torch.int32, device=lengths.device)
@@ -52,7 +46,12 @@ class MLUAttnBackend(AttentionBackend):
         fb = forward_batch
         if fb.forward_mode.is_idle():
             return
-        tables = self._block_tables(fb.req_pool_indices)
+        tables = (
+            self.req_to_token[
+                fb.req_pool_indices, : self.max_context_len : self.page_size
+            ]
+            // self.page_size
+        )
         seq_lens = fb.seq_lens.to(torch.int32)
         if fb.forward_mode.is_decode():
             bs = fb.batch_size
