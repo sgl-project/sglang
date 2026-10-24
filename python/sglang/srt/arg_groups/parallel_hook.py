@@ -545,10 +545,7 @@ def handle_elastic_ep(server_args: Any):
                 "_handle_elastic_ep",
                 mooncake_ib_device=validate_ib_devices(cfg.mooncake_ib_device),
             )
-            # Only for a deployment that opted into runtime width changes. A
-            # fault-tolerance-only deployment leaves --max-ep-size unset (it defaults
-            # to the launch width) and never retires a rank, so it must keep booting
-            # on configurations that only a scale would break.
+            # A fault-tolerance-only deployment (no --max-ep-size) never retires a rank.
             scalable = cfg.max_ep_size is not None
             # Raw-NCCL fast paths that bypass active_ranks.
             for name, enabled in (
@@ -568,11 +565,7 @@ def handle_elastic_ep(server_args: Any):
                     "so this deployment does not change width.",
                     message,
                 )
-            # The shm broadcaster deadlocks on a retiree's exit (fixed-size, no
-            # remove_reader), and only a scale retires a rank. Not disabled by writing
-            # the env var here: a resolution hook declares values, and a process-global
-            # write leaks into the caller under Engine. parallel_state resolves it at
-            # group construction instead; see _use_message_queue_broadcaster.
+            # Hooks must not write env vars; see _use_message_queue_broadcaster.
             if scalable and envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get():
                 logger.warning(
                     "[Elastic EP] mooncake: the shm message-queue broadcaster is "
@@ -593,7 +586,6 @@ def handle_elastic_ep(server_args: Any):
                 "effective EP size."
             )
     if cfg.ep_join_rank_offset != 0:
-        # Non-zero offset is scale or recover-with-offset; fault recovery is offset=0.
         assert cfg.ep_join_mode in ("scale", "recover"), (
             "--elastic-ep-join-rank-offset is only valid with "
             "--elastic-ep-join-mode scale or recover."

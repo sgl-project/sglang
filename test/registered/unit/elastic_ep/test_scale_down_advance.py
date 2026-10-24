@@ -1,21 +1,21 @@
-"""Unit tests for the per-tick scale-down coordinator — no server, no ModelRunner.
-
-``advance_scale_down`` owns the tick: it builds the machine on the first pending
-tick, hands back whatever the caller should keep, and returns None once the cycle is
-over. ``ScaleDownDriver`` takes its two runner-owned tails as callables, so both can
-be exercised here with plain functions standing in for the runner.
-"""
+"""Unit tests for the per-tick scale-down coordinator — no server, no ModelRunner."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+import sys
 import time
 import unittest
+from pathlib import Path
+from unittest.mock import Mock
 
 from sglang.srt.elastic_ep.scale_down_driver import ScaleDownDriver, advance_scale_down
 from sglang.srt.elastic_ep.scale_down_state import ScaleDownState
 from sglang.test.test_utils import CustomTestCase
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _fakes import RecordingDriver  # noqa: E402
 
 PENDING_SIZE = 3
 EFFECTIVE_SIZE = 4
@@ -23,105 +23,27 @@ RETIREE_RANK = 3
 SURVIVOR_RANK = 0
 
 
-class StubDriver:
-    """Opens every gate, so one advance_scale_down call runs a full stage."""
-
-    def __init__(self):
-        self.consumed = []
-        self._seq = 0
-        self.reconfigured = False
-        self.exited = False
-
-    def _handle(self, tag):
-        self._seq += 1
-        return f"{tag}-{self._seq}"
-
-    def on_prepare(self, sm):
-        pass
-
-    def local_idle(self, sm):
-        return True
-
-    def post_drain_barrier(self, sm):
-        return self._handle("drain")
-
-    def announce_departure(self, sm):
-        pass
-
-    def departure_cleared(self, sm):
-        return True
-
-    def on_depart_drain(self, sm):
-        pass
-
-    def check_barrier(self, handle, *, block_s=None, keep_serving=False):
-        return True
-
-    def consume_barrier(self, handle):
-        self.consumed.append(handle)
-
-    def on_retiree_quiesce(self, sm):
-        pass
-
-    def on_nixl_retire_pre(self, sm):
-        pass
-
-    def post_nixl_retire_barrier(self, sm):
-        return self._handle("nixl")
-
-    def on_flip_mask(self, sm):
-        pass
-
-    def on_reconfig(self, sm):
-        self.reconfigured = True
-
-    def on_local_cleanup(self, sm):
-        pass
-
-    def on_exit(self, sm):
-        self.exited = True
-
-
-class StuckDriver(StubDriver):
-    """Never clears the drain barrier, so the machine stays mid-cycle holding it."""
-
-    def check_barrier(self, handle, *, block_s=None, keep_serving=False):
-        return False
-
-
-class FailingDriver(StubDriver):
-    def on_prepare(self, sm):
-        raise RuntimeError("prepare blew up")
-
-
-def advance(sm, driver, *, pending_since=None, scale_timeout=60.0, failures=None):
-    def fail_scale(error, effective_size):
-        if failures is not None:
-            failures.append(error)
-
+def advance(sm, driver, failures=None, *, timed_out=False):
+    failures = [] if failures is None else failures
     return advance_scale_down(
         sm=sm,
         driver=driver,
         pending_size=PENDING_SIZE,
         effective_size=EFFECTIVE_SIZE,
-        pending_since=time.monotonic() if pending_since is None else pending_since,
+        pending_since=0.0 if timed_out else time.monotonic(),
         my_global_rank=SURVIVOR_RANK,
-        scale_timeout=scale_timeout,
-        fail_scale=fail_scale,
+        scale_timeout=1.0 if timed_out else 60.0,
+        fail_scale=lambda error, effective_size: failures.append(error),
     )
 
 
 class TestAdvanceScaleDown(CustomTestCase):
-    def test_builds_the_machine_on_the_first_tick(self):
-        sm = advance(None, StubDriver())
-        self.assertIsNotNone(sm)
+    def test_hands_back_the_same_machine_until_it_is_terminal(self):
+        driver = RecordingDriver()
+        sm = advance(None, driver)
         # Retiring the tail slots is derived from the width pair, not passed in.
         self.assertEqual(sm.ranks_to_retire, [RETIREE_RANK])
         self.assertFalse(sm.is_retiree)
-
-    def test_hands_back_the_same_machine_until_it_is_terminal(self):
-        driver = StubDriver()
-        sm = advance(None, driver)
         for _ in range(20):
             nxt = advance(sm, driver)
             if nxt is None:
@@ -130,46 +52,35 @@ class TestAdvanceScaleDown(CustomTestCase):
         # None means the caller drops it, and the survivor got its reconfig.
         self.assertIsNone(nxt)
         self.assertEqual(sm.state, ScaleDownState.COMPLETE)
-        self.assertTrue(driver.reconfigured)
+        self.assertIn("on_reconfig", driver.calls)
 
     def test_timeout_fails_the_scale_and_releases_a_held_barrier(self):
-        driver, failures = StuckDriver(), []
+        driver, failures = RecordingDriver(barrier_ready=False), []
         sm = advance(None, driver)
         for _ in range(3):
             sm = advance(sm, driver)
         # Parked in DRAIN with the barrier it posted still outstanding.
         self.assertEqual(sm.state, ScaleDownState.DRAIN)
         self.assertEqual(driver.consumed, [])
-
-        dropped = advance(
-            sm, driver, pending_since=0.0, scale_timeout=1.0, failures=failures
-        )
-        self.assertIsNone(dropped)
+        self.assertIsNone(advance(sm, driver, failures, timed_out=True))
         self.assertEqual(len(failures), 1)
         self.assertIn("retire barrier", failures[0])
         # Abandoned, not leaked: the epoch this rank posted is reset.
         self.assertEqual(len(driver.consumed), 1)
 
-    def test_timeout_before_any_machine_exists_is_not_an_error(self):
-        failures = []
-        self.assertIsNone(
-            advance(
-                None,
-                StubDriver(),
-                pending_since=0.0,
-                scale_timeout=1.0,
-                failures=failures,
-            )
-        )
-        self.assertEqual(len(failures), 1)
-
-    def test_a_driver_exception_surfaces_as_a_failed_scale(self):
-        failures = []
-        dropped = advance(None, FailingDriver(), failures=failures)
-        # FAILED is terminal, so the machine is dropped in the same tick.
-        self.assertIsNone(dropped)
-        self.assertEqual(len(failures), 1)
-        self.assertIn("prepare blew up", failures[0])
+    def test_a_failure_before_any_machine_exists_still_fails_the_scale(self):
+        """A timeout, or a driver exception: FAILED is terminal, so dropped at once."""
+        failing = RecordingDriver()
+        failing.on_prepare = Mock(side_effect=RuntimeError("prepare blew up"))
+        for driver, timed_out, error in (
+            (RecordingDriver(), True, "retire barrier"),
+            (failing, False, "prepare blew up"),
+        ):
+            with self.subTest(error=error):
+                failures = []
+                self.assertIsNone(advance(None, driver, failures, timed_out=timed_out))
+                self.assertEqual(len(failures), 1)
+                self.assertIn(error, failures[0])
 
 
 class TestScaleDownDriverNeedsNoRunner(CustomTestCase):
@@ -179,10 +90,9 @@ class TestScaleDownDriverNeedsNoRunner(CustomTestCase):
             lambda **kw: calls.append(("finalize", kw)),
             lambda: calls.append(("retire", {})),
         )
-        sm = advance(None, StubDriver())
+        sm = advance(None, RecordingDriver())
         driver.on_reconfig(sm)
         driver.on_exit(sm)
-
         self.assertEqual([name for name, _ in calls], ["finalize", "retire"])
         self.assertEqual(
             calls[0][1],
@@ -198,7 +108,6 @@ class TestScaleDownDriverNeedsNoRunner(CustomTestCase):
         # retiree that reported busy forever would hold the whole cohort.
         unwired = ScaleDownDriver(lambda **kw: None, lambda: None)
         self.assertTrue(unwired.local_idle(sm=None))
-
         busy = ScaleDownDriver(lambda **kw: None, lambda: None, lambda: False)
         self.assertFalse(busy.local_idle(sm=None))
 

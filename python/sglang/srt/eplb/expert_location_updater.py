@@ -486,15 +486,13 @@ def update_expert_weights_single_layer(
                         p2p_op_infos[i] = (logical_expert_id, [])
                         unreceived_slots.add(recv_dst_by_info_index[i])
 
-                # Dropping a recv leaves its buffer->weight copy behind, and
-                # temp_buffers is empty_like reused across layers, so publishing one
-                # overwrites a live slot. Free-riders share it, so key on the source.
-            if unreceived_slots:
-                buffer2weight_copy_infos[:] = [
-                    (src, dst)
-                    for src, dst in buffer2weight_copy_infos
-                    if src not in unreceived_slots
-                ]
+            # A dropped recv's copy would publish a stale reused buffer over a live
+            # slot. Free-riders share the buffer, so key on the source.
+            buffer2weight_copy_infos[:] = [
+                (src, dst)
+                for src, dst in buffer2weight_copy_infos
+                if src not in unreceived_slots
+            ]
 
     def _execute_p2p_ops(p2p_op_infos):
         sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])

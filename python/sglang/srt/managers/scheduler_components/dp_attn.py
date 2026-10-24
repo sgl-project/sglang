@@ -189,10 +189,7 @@ class MLPSyncBatchInfo:
                 int(self.can_run_draft_cuda_graph),
                 int(self.is_health_check),
                 self.attention_pairs,
-                # Appended, so the column indices read elsewhere do not shift.
-                # Stays behind attention_pairs: that one is read by index
-                # (tp0_info_cpu[:, 10]) while this one is read as the last
-                # column, so anything new belongs between them, not after.
+                # Read as the last column; new fields go before it.
                 int(departure_pending()),
             ],
             device=device,
@@ -263,9 +260,7 @@ class MLPSyncBatchInfo:
             rank = torch.distributed.get_rank(group)
             if 0 <= rank < flat_info.shape[0]:
                 flat_info[rank] = local_info_tensor
-                # The post-scale settle probe converges Mooncake's bitmap, not here:
-                # retrying on the one rank that sees the transient deadlocks it
-                # against peers that completed without it.
+            # No retry here: one rank retrying deadlocks against peers that completed.
             from sglang.srt.elastic_ep.elastic_ep import mooncake_all_reduce_strict
 
             mooncake_all_reduce_strict(
@@ -273,19 +268,13 @@ class MLPSyncBatchInfo:
                 op=torch.distributed.ReduceOp.SUM,
                 group=group,
             )
-            # No scalar sync here: tick N+1's collective must not fire before
-            # Mooncake settles N, and the D2H copy below already blocks on this
-            # stream before this function returns.
+            # No scalar sync: tick N+1's collective must wait for Mooncake to settle N,
+            # and the D2H copy below already blocks on this stream.
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
-            # Mooncake refuses this while it digests a rank fault, and this gather is
-            # the first thing a tick does, so the refusal lands before anything has
-            # converged the view. Non-Mooncake backends re-raise unchanged.
-            # The retry is safe only for one collective. exchange_sync_rows posts a
-            # gather then a broadcast on a CPU group wider than two ranks, and a retry
-            # after the gather completed would repost it against peers already in the
-            # broadcast, so Mooncake keeps the single all-gather.
+            # Retried: Mooncake refuses this mid rank-fault. Retry is safe only for one
+            # collective, so Mooncake skips exchange_sync_rows (gather then broadcast).
             from sglang.srt.elastic_ep.elastic_ep import (
                 is_mooncake_pg,
                 mooncake_all_gather_settling,
@@ -321,22 +310,16 @@ class MLPSyncBatchInfo:
         # attn_tp * attn_cp > 1, adding a gather kernel inside the wait.
         tp0_info_cpu = global_info_tensor.cpu()[:, 0, :]
         self.tp0_info_cpu = tp0_info_cpu
-        # Retire-departure poll, off the copy above for no extra sync and after
-        # inactive rows are normalised, so a stale retired row cannot hold the
-        # cohort in DRAIN. A draining rank contributes 1; all ready reads zero.
+        # Post-normalisation, so a stale retired row cannot hold the cohort in DRAIN.
         departure_observe(int(tp0_info_cpu[:, -1].sum()) == 0)
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
         if use_all_reduce:
             # Retiree slots can carry all-reduce garbage across a mask flip.
-            _MAX = 1 << 30
-            self.global_num_tokens = [
-                0 if (t < 0 or t > _MAX) else t for t in self.global_num_tokens
-            ]
-            self.global_num_tokens_for_logprob = [
-                0 if (t < 0 or t > _MAX) else t
-                for t in self.global_num_tokens_for_logprob
-            ]
+            self.global_num_tokens, self.global_num_tokens_for_logprob = (
+                [t if 0 <= t <= 1 << 30 else 0 for t in col]
+                for col in (self.global_num_tokens, self.global_num_tokens_for_logprob)
+            )
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())

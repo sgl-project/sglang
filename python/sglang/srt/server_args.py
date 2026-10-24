@@ -832,13 +832,8 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + num_dp_ranks_of(cfg)
-            is_joiner = ep_joiner_of(resolving_view(server_args))
-            if is_joiner:
-                # Every joiner stands up its own IPC endpoints against a cohort
-                # whose node 0 is already running, so deriving from the shared
-                # dist_init_port collides whenever the two land on one host.
-                # Keyed on any joiner rather than an offset one: a bare fault
-                # recovery sits at offset 0 and co-locates just the same.
+            if is_joiner := ep_joiner_of(resolving_view(server_args)):
+                # Any joiner may share node 0's host, so skip the shared dist_init_port.
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA

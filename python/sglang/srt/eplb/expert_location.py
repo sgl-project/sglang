@@ -51,11 +51,8 @@ def _prefer_same_node_experts() -> bool:
     from sglang.srt.elastic_ep.elastic_ep import elastic_expanded_world_enabled
 
     # Offset joiners: single-rank subprocess -> divide-by-zero in _find_nearest_expert.
-    if get_exec().moe.is_ep_offset_joiner:
-        return False
-    # A scale-published width no longer tiles the launch nodes: ep_size // nnodes is a
-    # nonexistent split, or zero when ep_size < nnodes; reshuffle_for_scale likewise.
-    if _scale_published_ep_size():
+    # A scale-published width no longer tiles the launch nodes (ep_size // nnodes).
+    if get_exec().moe.is_ep_offset_joiner or _scale_published_ep_size():
         return False
     return not elastic_expanded_world_enabled()
 
@@ -77,8 +74,7 @@ def _compute_elastic_expert_layout(
 class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     physical_to_logical_map_cpu: torch.Tensor
-    # (layers, num_logical_experts, X), X padded to physical_capacity
-    logical_to_all_physical_map: torch.Tensor
+    logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
     logical_to_all_physical_map_cpu: torch.Tensor  # CPU copy for performance
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     ep_size: int
@@ -109,7 +105,7 @@ class ExpertLocationMetadata:
 
     def __post_init__(self):
         num_layers_0, num_physical_experts_0 = self.physical_to_logical_map.shape
-        num_layers_1, num_logical_experts_0, physical_capacity = (
+        num_layers_1, num_logical_experts_0, num_physical_experts_1 = (
             self.logical_to_all_physical_map.shape
         )
         num_layers_2, num_logical_experts_1 = (
@@ -117,8 +113,8 @@ class ExpertLocationMetadata:
         )
         assert num_layers_0 == num_layers_1 == num_layers_2
         assert num_logical_experts_0 == num_logical_experts_1
-        assert physical_capacity >= num_physical_experts_0, (
-            f"fan-out {physical_capacity} narrower than the live width "
+        assert num_physical_experts_1 >= num_physical_experts_0, (
+            f"fan-out {num_physical_experts_1} narrower than the live width "
             f"{num_physical_experts_0}"
         )
 
@@ -272,16 +268,12 @@ class ExpertLocationMetadata:
                     ep_size,
                 )
             )
+            # Fixed per process: captured graphs hold the dispatch tensors' pointers.
+            physical_capacity = num_local_physical_experts * get_parallel().max_ep_size
         else:
             assert num_physical_experts % ep_size == 0
             num_local_physical_experts = num_physical_experts // ep_size
-
-            # Fixed for the process lifetime so a scale rewrites the dispatch
-            # tensors in place: captured CUDA graphs hold their data pointers.
-            # Per-rank width is scale-invariant -- whole ranks join and retire.
-        physical_capacity = num_physical_experts
-        if initial_ep_size is not None:
-            physical_capacity = num_local_physical_experts * get_parallel().max_ep_size
+            physical_capacity = num_physical_experts
 
         return dict(
             model_config_for_expert_location=model_config_for_expert_location,
@@ -300,11 +292,10 @@ class ExpertLocationMetadata:
         physical_capacity: int,
         moe_ep_rank: Optional[int] = None,
     ):
+
         _, num_physical_experts = physical_to_logical_map.shape
 
-        # Pad the replica fan-out, not physical_to_logical_map: that indexes
-        # expert weights, and a -1 tail faults the EPLB reshuffle's gather.
-        # These -1 columns never get drawn -- dispatch is modulo num_valid.
+        # Pad the fan-out, not physical_to_logical_map: a -1 there faults the gather.
         logical_to_all_physical_map_padded = F.pad(
             logical_to_all_physical_map,
             (0, physical_capacity - logical_to_all_physical_map.shape[-1]),
@@ -379,12 +370,7 @@ class ExpertLocationMetadata:
                 logical_count.copy_(self.logical_to_all_physical_map_num_valid)
 
     def adopt_scaled_in_place(self, other: ExpertLocationMetadata) -> None:
-        """Take ``other``'s placement and width without moving any storage.
-
-        Unlike ``update``, which merges a rebalance at a constant width, this
-        replaces all layers and does move ``ep_size``. ``copy_`` below raises if a
-        scale ever resized the fixed-capacity dispatch tensors.
-        """
+        """Adopt ``other``'s layout and ep_size; dispatch tensors stay in place."""
         # Held still: a captured graph replays against exactly these.
         for field in [
             "logical_to_all_physical_map",
@@ -441,22 +427,20 @@ class ExpertLocationMetadata:
         # rebalancing for those layers) instead of indexing out of range.
         if layer_id >= cpu_map.shape[0]:
             if require_global_experts:
+                num_physical_experts = self.num_physical_experts
                 return list(
                     range(
                         logical_expert_id,
-                        self.num_physical_experts,
+                        num_physical_experts,
                         self.num_logical_experts,
                     )
                 )
             return [logical_expert_id]
         if require_global_experts:
             # Live width, not cpu_map.shape[-1]: the fan-out is padded to capacity.
+            num_physical_experts = self.num_physical_experts
             return list(
-                range(
-                    logical_expert_id,
-                    self.num_physical_experts,
-                    self.num_logical_experts,
-                )
+                range(logical_expert_id, num_physical_experts, self.num_logical_experts)
             )
         if not 0 <= logical_expert_id < self.num_logical_experts:
             raise IndexError(
@@ -608,26 +592,11 @@ def build_trivial_physical_to_logical_map(
     num_layers: int,
     num_logical_experts: int,
 ) -> torch.Tensor:
-    """Lay out logical expert i at physical slot i, at whichever width is narrower.
-
-    Building at the base width and appending the rest only works while the cohort is at
-    least as wide as the base. A recover joiner regrowing into a slot below the launch
-    width wants fewer physical experts than the base, append_trivial_expert_slots no-ops
-    on the negative count, and the map stays base-wide while ep_size says otherwise.
-
-    Its own function so a test can reach it: init_trivial needs a ModelConfig and the
-    global exec context, which is more than this layout decision depends on.
-    """
-    physical_to_logical_map = (
-        torch.arange(0, min(base_num_physical_experts, num_physical_experts)).repeat(
-            num_layers, 1
-        )
-        % num_logical_experts
-    )
+    """Trivial layout at ``num_physical_experts``, which may be below the base width."""
+    base = min(base_num_physical_experts, num_physical_experts)
+    p2l = torch.arange(base).repeat(num_layers, 1) % num_logical_experts
     return append_trivial_expert_slots(
-        physical_to_logical_map,
-        num_physical_experts - physical_to_logical_map.shape[-1],
-        num_logical_experts,
+        p2l, num_physical_experts - base, num_logical_experts
     )
 
 
@@ -643,8 +612,7 @@ def broadcast_global_expert_location_metadata(
     from sglang.srt.elastic_ep.elastic_ep import share_expert_map_via_store
 
     metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
-    # Both callers are elastic EP, where the group's own broadcast can wedge the
-    # cohort; see share_expert_map_via_store. Without a store this is the old path.
+    # A group broadcast can wedge an elastic cohort; see share_expert_map_via_store.
     rank_in_group = torch.distributed.get_rank(group=group)
     if not share_expert_map_via_store(
         metadata.physical_to_logical_map,
@@ -658,7 +626,7 @@ def broadcast_global_expert_location_metadata(
         )
 
     # Src already rebuilt: skip redundant O(layers*experts*ep_size) recomputation.
-    if torch.distributed.get_rank(group=group) == src_rank:
+    if rank_in_group == src_rank:
         return metadata
 
     metadata = ExpertLocationMetadata.init_by_mapping(
