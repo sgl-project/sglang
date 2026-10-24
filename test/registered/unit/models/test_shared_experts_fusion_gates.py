@@ -340,7 +340,7 @@ class TestGlm5NextGate(_FusionGateCase):
         base.update(kw)
         return SimpleNamespace(**base)
 
-    def _reason_on_gfx950(self, *, tp_size=4, config=None, quant=None, ep_size=1):
+    def _reason_on_gfx950(self, *, tp_size=2, config=None, quant=None, ep_size=1):
         import sglang.srt.models.glm5_next as glm5_next
 
         self._seed()
@@ -356,13 +356,19 @@ class TestGlm5NextGate(_FusionGateCase):
                 tp_size=tp_size,
             )
 
-    def test_exact_tp4_and_tp8_contract_is_admitted(self):
-        for tp_size in (4, 8):
+    def test_exact_tp2_tp4_and_tp8_contract_is_admitted(self):
+        for tp_size in (2, 4, 8):
             with self.subTest(tp_size=tp_size):
                 self.assertIsNone(self._reason_on_gfx950(tp_size=tp_size))
 
-    def test_unvalidated_tp_and_expert_geometry_are_rejected(self):
-        self.assertIn("TP4 and TP8", self._reason_on_gfx950(tp_size=2))
+    def test_unvalidated_tp_sizes_are_rejected(self):
+        for tp_size in (1, 16):
+            with self.subTest(tp_size=tp_size):
+                self.assertIn(
+                    "TP2, TP4 and TP8", self._reason_on_gfx950(tp_size=tp_size)
+                )
+
+    def test_unvalidated_expert_geometry_is_rejected(self):
         self.assertIn(
             "E=288/topk=8",
             self._reason_on_gfx950(config=self._config(n_routed_experts=256)),
@@ -438,7 +444,19 @@ class TestGlm5NextGate(_FusionGateCase):
 
     def test_quark_mxfp4_is_admitted(self):
         config = self._config(num_hidden_layers=45)
-        self.assertIsNone(self._reason_on_gfx950(config=config, quant=self._quark()))
+        for tp_size in (4, 8):
+            with self.subTest(tp_size=tp_size):
+                self.assertIsNone(
+                    self._reason_on_gfx950(
+                        tp_size=tp_size, config=config, quant=self._quark()
+                    )
+                )
+
+    def test_quark_mxfp4_at_tp2_is_rejected(self):
+        self.assertIn(
+            "HIP Quark shared experts fusion is validated only for TP4 and TP8",
+            self._reason_on_gfx950(tp_size=2, quant=_quant("quark")),
+        )
 
     def test_quark_target_layer_experts_must_share_one_mxfp4_spec(self):
         config = self._config(num_hidden_layers=45)
@@ -462,17 +480,19 @@ class TestGlm5NextGate(_FusionGateCase):
             with self.subTest(name):
                 self.assertIn(
                     "same Quark MXFP4 layout",
-                    self._reason_on_gfx950(config=config, quant=quant),
+                    self._reason_on_gfx950(tp_size=4, config=config, quant=quant),
                 )
 
     def test_ep_and_a2a_topologies_are_rejected(self):
         import sglang.srt.models.glm5_next as glm5_next
         from sglang.srt.layers.moe.utils import MoeA2ABackend
 
-        self.assertIn(
-            "expert parallelism",
-            self._reason_on_gfx950(tp_size=4, ep_size=2),
-        )
+        for tp_size in (2, 4, 8):
+            with self.subTest(tp_size=tp_size):
+                self.assertIn(
+                    "expert parallelism",
+                    self._reason_on_gfx950(tp_size=tp_size, ep_size=2),
+                )
         with unittest.mock.patch.object(
             glm5_next, "get_moe_a2a_backend", return_value=MoeA2ABackend.MORI
         ):
@@ -490,7 +510,7 @@ class TestGlm5NextGate(_FusionGateCase):
                 glm5_next.Glm5NextForConditionalGeneration,
                 self._config(),
                 self._fp8(),
-                tp_size=4,
+                tp_size=2,
             )
         self.assertIn("AITER on a gfx950", reason)
 
