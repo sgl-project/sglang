@@ -1391,6 +1391,23 @@ TWO_GPU_CASES = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
+        "flux3_image_t2i_2_gpus",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/flux-3-image-klein",
+            tp_size=2,
+            extras=["--component-residency all=resident --attention-backend fa"],
+        ),
+        DiffusionSamplingParams(
+            prompt="A red fox in snow",
+            output_size="512x512",
+            output_format="png",
+            extras={"seed": 42},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",

@@ -6,6 +6,9 @@ who runs what without talking to each other.
 """
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +45,37 @@ def _expected_work(suite: str) -> tuple[list[str], list[str]]:
         for case in case_group
     ]
     return case_ids, list(STANDALONE_FILES.get(suite, []))
+
+
+@pytest.mark.parametrize("suite", ["1-gpu", "2-gpu"])
+def test_ci_plan_preserves_registered_standalone_files(tmp_path, suite):
+    """The CI planner must retain standalone tests imported by the suite adapter."""
+    repo_root = Path(__file__).resolve().parents[5]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(
+                repo_root / "scripts/ci/utils/diffusion/compute_diffusion_partitions.py"
+            ),
+        ],
+        env={**os.environ, "GITHUB_OUTPUT": str(tmp_path / "outputs")},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    output_name = {"1-gpu": "1gpu", "2-gpu": "2gpu"}[suite]
+    prefix = f"plan-{output_name}="
+    plan = next(
+        json.loads(line.removeprefix(prefix))
+        for line in result.stdout.splitlines()
+        if line.startswith(prefix)
+    )
+    scheduled = [
+        filename
+        for partition in plan["partitions"]
+        for filename in partition["standalone_files"]
+    ]
+    assert sorted(scheduled) == sorted(STANDALONE_FILES[suite])
 
 
 def test_assign_partition_covers_every_item_once():

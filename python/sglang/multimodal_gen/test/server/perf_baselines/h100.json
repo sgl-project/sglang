@@ -49,6 +49,9 @@
         ]
     },
     "scenarios": {
+        "flux3_image_t2i_2_gpus": {
+            "estimated_full_test_time_s": 180.0
+        },
         "sana_wm_ti2v": {
             "expected_load_ms": 32834.99,
             "stages_ms": {},
