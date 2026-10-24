@@ -256,6 +256,10 @@ def is_dspark_draft(config) -> bool:
     return _hf_arch(config) == "DSparkDraftModel"
 
 
+def is_llama_eagle3_draft(config) -> bool:
+    return _hf_arch(config) == "LlamaForCausalLMEagle3"
+
+
 # The decision_config.json attention mode whose full-attention layers read the whole prompt.
 NONCAUSAL_FULL_ATTENTION = "noncausal_full_attention"
 

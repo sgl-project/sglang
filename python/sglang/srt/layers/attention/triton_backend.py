@@ -16,6 +16,8 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     is_dspark_draft,
     is_kimi_k3,
+    is_llama_eagle3_draft,
+    is_minimax_sparse,
     is_qwen3_5,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -99,7 +101,11 @@ def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv
         return use_verify_splitkv
     return (
         use_verify_splitkv
-        and is_qwen3_5(model_config.hf_config)
+        and (
+            is_qwen3_5(model_config.hf_config)
+            or is_minimax_sparse(model_config.hf_config)
+            or is_llama_eagle3_draft(model_config.hf_config)
+        )
         and model_config.get_num_kv_heads(
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
@@ -241,13 +247,18 @@ class TritonAttnBackend(AttentionBackend):
             and self.topk == 1
         )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
-        # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
-        # GQA with exactly one TP-local KV head.
+        # The grouped-head verify kernel is tuned for Kimi-K3 MLA and GQA with
+        # exactly one TP-local KV head (Qwen3.5, MiniMax-M3, Llama EAGLE3 drafts).
         self.use_verify_shared_kv = _should_use_verify_shared_kv(
             model_runner.model_config,
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+        )
+        # A Llama EAGLE3 draft's v2 draft extend is the same constant-length chain
+        self.use_shared_kv_for_draft_extend = (
+            self.use_verify_shared_kv
+            and is_llama_eagle3_draft(model_runner.model_config.hf_config)
         )
         # TODO: this logic should be fixed in non-hip platform
         self.is_hip_dspark_draft = (
@@ -1857,7 +1868,13 @@ class TritonAttnBackend(AttentionBackend):
         if (
             verify_fwd is not None
             and score_mod is None
-            and forward_batch.forward_mode.is_target_verify()
+            and (
+                forward_batch.forward_mode.is_target_verify()
+                or (
+                    self.use_shared_kv_for_draft_extend
+                    and forward_batch.forward_mode.is_draft_extend_v2()
+                )
+            )
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),

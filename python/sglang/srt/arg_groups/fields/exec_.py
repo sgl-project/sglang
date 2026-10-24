@@ -190,7 +190,10 @@ class ExecKernel(msgspec.Struct):
     ] = None
     enable_lean_attention: A[
         Optional[bool],
-        "Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.",
+        Arg(
+            help="Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.",
+            resolvable=True,
+        ),
     ] = None
     enable_nvidia_megakernel: A[
         bool,

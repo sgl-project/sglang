@@ -214,6 +214,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_aiter_allreduce_fusion_in_prefill",
                     "disable_aiter_allreduce_fusion_in_decode",
                     "enable_symm_mem",
+                    "enable_lean_attention",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
                     "watermark_context_window",
@@ -3362,6 +3363,42 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ov = _minimax_m3_overrides(_m3_args(kv_cache_dtype="fp8_e4m3"), hf)
             self.assertEqual(ov["attention_backend"], "fa4")
             self.assertEqual(ov["page_size"], 128)
+
+    def test_m3_rocm_speculative_decode_uses_lean(self):
+        """Lean's capture policy skips the 1-KV-head EAGLE3 draft, so M3 forces it on."""
+        from sglang.srt.arg_groups.model_overrides.minimax_m3 import (
+            _minimax_m3_overrides,
+        )
+
+        def _overrides(**kw):
+            args = dict(
+                quantization=None,
+                _quantization_explicitly_unset=True,
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                moe_runner_backend="auto",
+                kv_cache_dtype="auto",
+                ep_size=1,
+                moe_a2a_backend="none",
+                enable_aiter_allreduce_fusion=False,
+                speculative_algorithm="EAGLE3",
+                enable_lean_attention=None,
+            )
+            args.update(kw)
+            return _minimax_m3_overrides(SimpleNamespace(**args), SimpleNamespace())
+
+        with (
+            override_platform(is_hip=True),
+            envs.USE_ROCM_AITER_ROPE_BACKEND.override("0"),
+        ):
+            self.assertTrue(_overrides()["enable_lean_attention"])
+            self.assertNotIn(
+                "enable_lean_attention", _overrides(speculative_algorithm=None)
+            )
+            self.assertNotIn(
+                "enable_lean_attention", _overrides(enable_lean_attention=False)
+            )
 
     def test_page_constraint_passes_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import (
