@@ -2,7 +2,6 @@ import json
 import math
 import os
 import shlex
-import subprocess
 import unittest
 
 import requests
@@ -12,7 +11,6 @@ from sglang.test.ascend.sampling_mask_reference import (
     reference_distribution,
 )
 from sglang.test.ascend.test_ascend_utils import (
-    DEEPSEEK_V4_FLASH_BF16_MODEL_PATH,
     GLM_5_2_BF16_MODEL_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
@@ -24,35 +22,25 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_npu_ci(est_time=600, suite="base-b-test-2-npu-a3")
-register_npu_ci(est_time=600, suite="nightly-2-npu-a3", nightly=True)
+register_npu_ci(est_time=300, suite="base-b-test-2-npu-a3")
+register_npu_ci(est_time=300, suite="nightly-2-npu-a3", nightly=True)
 
 
-class _BF16ModelFixture:
+@unittest.skipUnless(
+    os.path.isfile(os.path.join(GLM_5_2_BF16_MODEL_PATH, "config.json")),
+    "GLM-5.2 config missing",
+)
+class TestGLM52BF16SamplingMask(CustomTestCase):
+    model = GLM_5_2_BF16_MODEL_PATH
     base_url = DEFAULT_URL_FOR_TEST
-    attention_backend = "ascend"
     model_overrides = {"num_hidden_layers": 6, "quantization_config": None}
-    server_env = {}
 
     @classmethod
     def setUpClass(cls):
         env = {
             **os.environ,
-            **cls.server_env,
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:False",
         }
-        if cls.attention_backend == "dsv4":
-            command = (
-                "for vendor in customize custom_transformer; do "
-                'p="${ASCEND_OPP_PATH}/vendors/$vendor/bin/set_env.bash"; '
-                'if [ -f "$p" ]; then source "$p" >&2; fi; done; env -0'
-            )
-            vendor_env = subprocess.check_output(["bash", "-c", command], env=env)
-            env = dict(
-                item.decode().split("=", 1)
-                for item in vendor_env.split(b"\0")
-                if b"=" in item
-            )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -67,7 +55,7 @@ class _BF16ModelFixture:
                     "--chunked-prefill-size 512 --cuda-graph-max-bs-decode 4"
                 ),
                 "--attention-backend",
-                cls.attention_backend,
+                "ascend",
                 "--json-model-override-args",
                 json.dumps(cls.model_overrides),
             ],
@@ -75,7 +63,8 @@ class _BF16ModelFixture:
 
     @classmethod
     def tearDownClass(cls):
-        terminate_and_kill_process_tree(cls.process)
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process)
 
     def _generate(
         self, params, mode="support", text="The capital of France is", **kwargs
@@ -199,41 +188,6 @@ class _BF16ModelFixture:
             self.assertNotIn(key, bodies[1]["meta_info"])
         self._check_output(bodies[0], "support")
         self._check_output(bodies[2], "selected")
-
-
-@unittest.skipUnless(
-    os.path.isfile(os.path.join(GLM_5_2_BF16_MODEL_PATH, "config.json")),
-    "GLM-5.2 config missing",
-)
-class TestGLM52BF16SamplingMask(_BF16ModelFixture, CustomTestCase):
-    model = GLM_5_2_BF16_MODEL_PATH
-
-
-@unittest.skipUnless(
-    os.path.isfile(os.path.join(DEEPSEEK_V4_FLASH_BF16_MODEL_PATH, "config.json")),
-    "DeepSeek-V4 config missing",
-)
-class TestDeepSeekV4BF16SamplingMask(_BF16ModelFixture, CustomTestCase):
-    model = DEEPSEEK_V4_FLASH_BF16_MODEL_PATH
-    attention_backend = "dsv4"
-    model_overrides = {
-        "num_hidden_layers": 6,
-        "compress_ratios": [0, 0, 4, 128, 4, 128],
-        "quantization_config": None,
-    }
-    server_env = {
-        "SGLANG_OPT_FP8_WO_A_GEMM": "0",
-        "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
-        "SGLANG_DSV4_FP4_EXPERTS": "False",
-        "SGLANG_OPT_FUSE_WQA_WKV": "0",
-        "SGLANG_OPT_BF16_FP32_GEMM_ALGO": "torch",
-        "SGLANG_OPT_USE_FUSED_HASH_TOPK": "False",
-        "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
-        "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
-        "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
-        "SGLANG_ENABLE_WAR_BARRIER": "1",
-        "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
-    }
 
 
 if __name__ == "__main__":

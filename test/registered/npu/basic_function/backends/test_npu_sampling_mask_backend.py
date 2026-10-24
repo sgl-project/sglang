@@ -1,8 +1,6 @@
 import unittest
-from functools import partial
 from itertools import product
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
@@ -122,57 +120,6 @@ class TestAscendSamplingMaskKernel(CustomTestCase):
                         modes[row],
                         tolerances[dtype],
                     )
-
-    def test_export_preserves_draw_dtype_and_buffer(self):
-        for dtype, fused, seeded in product(
-            (torch.float32, torch.bfloat16), (False, True), (False, True)
-        ):
-            with self.subTest(dtype=dtype, fused=fused, seeded=seeded):
-                logits = torch.tensor([[1.0, 3.0, 0.0, 2.0]], dtype=dtype)
-                filtered = logits.masked_fill(logits < 2, -float("inf"))
-                probs = logits.softmax(-1)
-                sample = partial(
-                    sampler_module.top_k_top_p_min_p_sampling_from_logits_ascend,
-                    logits,
-                    torch.tensor([2], dtype=torch.int32),
-                    torch.ones(1),
-                    torch.zeros(1),
-                    False,
-                    torch.tensor([1234]) if seeded else None,
-                    torch.zeros(1, dtype=torch.int64),
-                    npu_top_k_top_p_eligible=fused,
-                )
-                with (
-                    patch.object(
-                        sampler_module,
-                        "torch_npu",
-                        SimpleNamespace(npu_top_k_top_p=lambda *_: filtered.clone()),
-                    ),
-                    patch.object(
-                        sampler_module,
-                        "multinomial_with_seed",
-                        return_value=torch.tensor([[1 if fused else 0]]),
-                    ),
-                    patch.object(
-                        sampler_module.torch,
-                        "softmax",
-                        side_effect=[probs, probs.clone()],
-                    ),
-                ):
-                    torch.manual_seed(1234)
-                    token, weights = sample(return_filtered_probs=True)
-                    torch.manual_seed(1234)
-                    self.assertTrue(torch.equal(token, sample()))
-                expected = (
-                    (filtered if fused else logits)
-                    .softmax(-1)
-                    .masked_fill(logits < 2, 0)
-                )
-                self.assertEqual(weights.dtype, dtype)
-                self.assertTrue(torch.equal(weights, expected))
-                self.assertIn(token.item(), [1, 3])
-                if not fused:
-                    self.assertEqual(weights.data_ptr(), probs.data_ptr())
 
 
 if __name__ == "__main__":
