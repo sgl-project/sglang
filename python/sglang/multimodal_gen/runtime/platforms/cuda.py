@@ -529,17 +529,28 @@ class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
         return AttentionBackendEnum.FA
 
 
+# The fp8_fa_sm120 kernel needs only FP8 mma.sync and cp.async: SM120 adds the
+# block-scaled MMA encoding, SM89 (Ada) runs the plain one. Shared with the backend.
+FP8_FA_SM120_CAPABILITIES = frozenset({(8, 9), (12, 0)})
+
+
 class _FP8FlashAttentionSM120BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FP8_FA_SM120
+    supported_capabilities = FP8_FA_SM120_CAPABILITIES
 
-    # CuTe-DSL mma.sync FP8 kernel written for SM120 (GeForce RTX 50 / RTX PRO
-    # Blackwell). Dense non-causal head_dim 128 only; the backend itself falls
-    # back to cuDNN SDPA for other calls.
+    # CuTe-DSL mma.sync FP8 kernel for SM120 (GeForce RTX 50 / RTX PRO Blackwell)
+    # and SM89 (RTX 40 / L4 / L40). Dense non-causal head_dim 128 only; the
+    # backend itself falls back to cuDNN SDPA for other calls.
     @classmethod
     def resolve(cls, platform) -> str | AttentionBackendEnum:
-        if platform.get_device_capability() != (12, 0):
+        capability = platform.get_device_capability()
+        capability_tuple = (
+            (capability.major, capability.minor) if capability is not None else None
+        )
+        if capability_tuple not in cls.supported_capabilities:
             logger.warning(
-                "fp8_fa_sm120 attention needs an SM120 device; falling back to cuDNN SDPA."
+                "fp8_fa_sm120 attention needs an SM89 or SM120 device; "
+                "falling back to cuDNN SDPA."
             )
             return AttentionBackendEnum.TORCH_CUDNN_SDPA
         try:
