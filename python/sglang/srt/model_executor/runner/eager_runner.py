@@ -452,6 +452,13 @@ class EagerRunner(BaseRunner):
             if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
+            # Layers read the ForwardContext backend, which can differ from
+            # model_runner.attn_backend (EAGLE v2 idle draft steps run under the
+            # per-step decode backend); init it too so it does not keep a
+            # previous batch's forward_metadata.
+            active_backend = get_forward_context().attn_backend
+            if active_backend is not model_runner.attn_backend:
+                active_backend.init_forward_metadata(forward_batch)
         else:
             model_runner.attn_backend.forward_metadata = None
 
