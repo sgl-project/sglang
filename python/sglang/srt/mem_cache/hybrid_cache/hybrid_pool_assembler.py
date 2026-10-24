@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -185,7 +186,22 @@ def build_kv_host_pool(
         check_packed_kv_rows(
             kv_pool=kv_pool, drafts=mtp_draft_device_pools, use_mla=use_mla
         )
+    parallel = get_parallel()
+    geometry = resolve_kv_host_geometry(
+        kv_pool,
+        page_size=page_size // parallel.attn_dcp_size
+        if use_mla and parallel.dcp_enabled
+        else page_size,
+        layout=get_memory().hicache_mem_layout,
+        use_mla=use_mla,
+        draft_layer_num=len(mtp_draft_device_pools),
+        override_kv_cache_dim=override_kv_cache_dim,
+    )
     kwargs = {}
+    if geometry.page_unified_layout is not None:
+        kwargs["page_unified_layout"] = geometry.page_unified_layout
+        if not use_mla:
+            kwargs["head_group_num"] = geometry.page_unified_layout.head_group_num
     if override_kv_cache_dim is not None:
         kwargs["override_kv_cache_dim"] = override_kv_cache_dim
     if use_mla:
@@ -200,16 +216,11 @@ def build_kv_host_pool(
                 for pool in mtp_draft_device_pools
             ),
             layer_shard_enabled=kv_pool.layer_shard_enabled,
-            target_layer_num=(
-                (kv_pool.layer_num + kv_pool.layer_shard_size - 1)
-                // kv_pool.layer_shard_size
-                if kv_pool.layer_shard_enabled
-                else kv_pool.layer_num
-            ),
+            write_back_staging=kv_pool.hicache_write_back_staging,
+            target_layer_num=geometry.target_layer_num,
         )
     else:
         kwargs.update(mha_kwargs)
-    parallel = get_parallel()
     if parallel.dcp_enabled:
         assert use_mla, (
             "HiCache + DCP is only wired for the MLA host pool; the MHA host "
@@ -1603,6 +1614,7 @@ def _build_mha_mla_host_pool(
         end_layer=pool.end_layer,
         target_layer_num=pool.layer_num,
         override_kv_cache_dim=pool.kv_cache_dim,
+        write_back_staging=pool.hicache_write_back_staging,
         **kwargs,
     )
 

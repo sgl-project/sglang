@@ -838,7 +838,10 @@ class HybridCacheController(BaseHiCacheController):
         self, op: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
         host_group = self.mem_pool_host
-        if self.io_backend != "kernel" or host_group.layout != "page_first":
+        if self.io_backend != "kernel" or host_group.layout not in (
+            "page_first",
+            "page_unified",
+        ):
             return self.move_hybrid_indices(op)
         if not host_group.supports_per_pool_backup_indices:
             if not host_group.can_use_write_back_jit:

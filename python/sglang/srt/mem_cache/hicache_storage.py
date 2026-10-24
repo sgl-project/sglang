@@ -40,6 +40,10 @@ class HiCacheStorageConfig:
     # with dp-attention, tp_rank is attention-group-local; dp_rank disambiguates
     dp_rank: int = 0
     extra_config: Optional[dict] = None
+    # Unified key scheme: the topology-free chunk coordinates this rank owns,
+    # layer-major / head-minor. When set, backends MUST key objects by these
+    # instead of by the writer's rank.
+    unified_suffixes: Optional[List[str]] = None
     dcp_size: int = 1
     dcp_rank: int = 0
     logical_page_size: Optional[int] = None
@@ -426,6 +430,49 @@ class MetadataCache:
 
 
 class HiCacheFile(HiCacheStorage):
+    def _init_config_suffix(self, storage_config: HiCacheStorageConfig) -> None:
+        """Derive the per-deployment key suffix from the storage config."""
+        if storage_config.unified_suffixes is not None:
+            # The chunk coordinate replaces the whole rank/pp/cp suffix family;
+            # model identity lives inside the namespace digest. This backend
+            # stores one object per page, so a fan-out plan is refused here
+            # rather than silently storing only its first chunk.
+            if len(storage_config.unified_suffixes) != 1:
+                raise NotImplementedError(
+                    f"the file backend stores one object per page, so it cannot "
+                    f"serve a {len(storage_config.unified_suffixes)}-chunk "
+                    f"unified grid; drop --hicache-storage-head-partition and "
+                    f"--hicache-storage-layer-partition."
+                )
+            self.config_suffix = f"_{storage_config.unified_suffixes[0]}"
+            # Unified keys currently support only a single KV pool, without
+            # TP-sharded sidecars. Keep all key lookups in its chunk namespace.
+            self.tp_config_suffix = self.config_suffix
+            return
+        model_name = storage_config.model_name
+        model_name = "-".join(model_name.split("/")) if model_name else ""
+        shard_suffix = ""
+        if storage_config.pp_size > 1:
+            shard_suffix += f"_{storage_config.pp_size}_{storage_config.pp_rank}"
+        # Under NSA context parallel each CP rank holds a disjoint slice of
+        # every page, so give each rank its own file key to avoid a cross-rank
+        # write race.
+        if storage_config.attn_cp_size > 1:
+            shard_suffix += (
+                f"_cp{storage_config.attn_cp_rank}_{storage_config.attn_cp_size}"
+            )
+        # MLA KV is replicated across TP ranks and shares one file per page;
+        # TP-sharded state is keyed by tp_config_suffix instead.
+        self.tp_config_suffix = (
+            f"_{model_name}_{storage_config.tp_rank}_{storage_config.tp_size}"
+            f"{shard_suffix}"
+        )
+        self.config_suffix = (
+            f"_{model_name}{shard_suffix}"
+            if storage_config.is_mla_model
+            else self.tp_config_suffix
+        )
+
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
@@ -435,36 +482,16 @@ class HiCacheFile(HiCacheStorage):
             or file_path
         )
 
-        tp_rank, tp_size, pp_rank, pp_size, model_name, is_mla_model = (
-            storage_config.tp_rank,
-            storage_config.tp_size,
-            storage_config.pp_rank,
-            storage_config.pp_size,
-            storage_config.model_name,
-            storage_config.is_mla_model,
-        )
+        self._init_config_suffix(storage_config)
+        tp_rank = storage_config.tp_rank
         attn_cp_rank = storage_config.attn_cp_rank
-        attn_cp_size = storage_config.attn_cp_size
-        model_name = "-".join(model_name.split("/")) if model_name else ""
-        enable_pp = pp_size > 1
-        shard_suffix = f"_{pp_size}_{pp_rank}" if enable_pp else ""
-        # Under NSA context parallel each CP rank holds a disjoint slice of every
-        # page, so give each rank its own file key to avoid a cross-rank write race.
-        if attn_cp_size > 1:
-            shard_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
-        # MLA KV is replicated across TP ranks and shares one file per page;
-        # TP-sharded state is keyed by tp_config_suffix instead.
-        self.tp_config_suffix = f"_{model_name}_{tp_rank}_{tp_size}{shard_suffix}"
-        self.config_suffix = (
-            f"_{model_name}{shard_suffix}" if is_mla_model else self.tp_config_suffix
-        )
 
         # TODO: Include KV dtype and stored layout in keys for both DCP and
         # non-DCP caches; raw file payloads do not describe their format.
         if storage_config.dcp_size > 1:
             # Equivalent MLA shards in different DCP groups share a file.
             dcp_suffix = (
-                f"_tp{tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
+                f"_tp{storage_config.tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
                 f"_page{storage_config.logical_page_size}"
             )
             self.config_suffix += dcp_suffix
@@ -504,11 +531,17 @@ class HiCacheFile(HiCacheStorage):
         # module, so a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
-        # Each rank owns its TP-sharded state; selected DCP writers also own
-        # their shared MLA shard files.
-        owned_suffixes = (self.tp_config_suffix,)
-        if is_mla_model and storage_config.is_storage_writer:
-            owned_suffixes += (self.config_suffix,)
+        if storage_config.unified_suffixes is not None:
+            # Match the controller's writer election: unified full-page CP
+            # replicas share keys, and MLA also replicates across TP ranks.
+            owns_unified = attn_cp_rank == 0 and storage_config.is_storage_writer
+            owned_suffixes = (self.config_suffix,) if owns_unified else ()
+        else:
+            # Each rank owns its TP-sharded state; selected DCP writers
+            # also own their shared MLA shard files.
+            owned_suffixes = (self.tp_config_suffix,)
+            if storage_config.is_mla_model and storage_config.is_storage_writer:
+                owned_suffixes += (self.config_suffix,)
         self._evictor = LRUFileEvictor(
             self.file_path,
             owned_suffixes=owned_suffixes,
