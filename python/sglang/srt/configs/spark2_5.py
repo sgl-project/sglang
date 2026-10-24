@@ -16,6 +16,7 @@ class Spark2_5Config(PretrainedConfig):
         num_hidden_layers: int = 28,
         head_dim: int = 256,
         headwise_attn_output_gate: bool = True,
+        gate_attn_act_mode: str = "sigmoid",
         sliding_window: int = 512,
         vocab_size: int = 133120,
         rms_norm_eps: float = 1e-6,
@@ -32,6 +33,7 @@ class Spark2_5Config(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.head_dim = head_dim
         self.headwise_attn_output_gate = headwise_attn_output_gate
+        self.gate_attn_act_mode = gate_attn_act_mode
         self.sliding_window = sliding_window
         self.vocab_size = vocab_size
         self.rms_norm_eps = rms_norm_eps
