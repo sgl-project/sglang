@@ -166,10 +166,11 @@ def _allocate_decode_buffers(
             encoder_lens = None
 
         if require_mlp_tp_gather:
-            dp_capacity = dp_capacity_for(parallel.num_dp_ranks)
-            global_num_tokens_gpu = torch.zeros((dp_capacity,), dtype=torch.int32)
+            global_num_tokens_gpu = torch.zeros(
+                (dp_capacity_for(parallel.num_dp_ranks),), dtype=torch.int32
+            )
             global_num_tokens_for_logprob_gpu = torch.zeros(
-                (dp_capacity,), dtype=torch.int32
+                (dp_capacity_for(parallel.num_dp_ranks),), dtype=torch.int32
             )
         else:
             global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
@@ -633,8 +634,7 @@ class BaseRunner(ABC):
             assert require_mlp_tp_gather_ or require_attn_tp_gather_
 
         if require_mlp_tp_gather_:
-            # Capture at the ceiling so the length baked into the graph covers every
-            # slot the pool can hold; slots with no live rank replay as zero.
+            # Capture at the ceiling; slots with no live rank replay as zero.
             global_num_tokens_cpu = [num_tokens] * dp_capacity_for(
                 get_parallel().num_dp_ranks
             )

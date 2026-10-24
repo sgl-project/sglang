@@ -1,23 +1,5 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Expert-map repair for an elastic shrink.
-
-Truncating ``physical_to_logical_map`` to the surviving slots can drop the last replica
-of a logical expert. This module is the rule every survivor applies independently to
-put those back, which is why it has to be deterministic: the survivors do not exchange
-the repaired map, they each recompute it and must agree.
-"""
+"""Expert-map repair for an elastic shrink. Survivors repair independently without
+exchanging maps, so the rule must be deterministic."""
 
 from __future__ import annotations
 
@@ -46,9 +28,8 @@ def local_relabelled_logicals(
     num_local: int,
     ep_rank: int,
 ) -> Dict[int, List[int]]:
-    """Logicals this rank's own slots now hold but did not before, per layer. Local
-    slots only, since a rank can only write its own; slots past the old width count as
-    changed, which on a grow is the freshly appended ones."""
+    """Per layer, logicals this rank's own slots now hold but did not before; slots
+    past the old width count as changed."""
     lo = num_local * ep_rank
     hi = min(lo + num_local, new_p2l.shape[1])
     if hi <= lo:
@@ -59,7 +40,6 @@ def local_relabelled_logicals(
     if overlap > 0:
         changed[:, :overlap] = window[:, :overlap] != old_p2l[:, lo : lo + overlap]
     changed &= window >= 0
-
     return {
         layer_id: sorted(set(logicals))
         for layer_id in range(window.shape[0])
@@ -70,12 +50,8 @@ def local_relabelled_logicals(
 def repair_orphan_logicals(
     *, shrunk_p2l: torch.Tensor, num_logical: int
 ) -> Dict[int, List[int]]:
-    """Ensure every logical has >= 1 physical replica by reassigning duplicated slots.
-
-    Mutates ``shrunk_p2l`` in place. Returns the logicals relabelled onto a donor slot,
-    keyed by layer id. Relabelling moves the mapping only and the p2p diffs labels, so
-    the caller must reload these from backup.
-    """
+    """Give every logical a replica by relabelling duplicated slots of ``shrunk_p2l``
+    in place. Returns the relabelled logicals per layer; the caller must reload them."""
     num_layers, new_num_physical = shrunk_p2l.shape
     if new_num_physical < num_logical:
         raise RuntimeError(
@@ -94,7 +70,7 @@ def repair_orphan_logicals(
         orphans = [l for l in range(num_logical) if counts[l] == 0]
         if not orphans:
             continue
-        repaired[layer_id] = list(orphans)
+        repaired[layer_id] = orphans
         for orphan in orphans:
             for slot_idx, value in enumerate(row):
                 if 0 <= value < num_logical and counts[value] >= 2:
@@ -117,7 +93,7 @@ def repair_orphan_logicals(
             "reloading their weights (the donor slots hold the wrong ones): %s",
             sum(len(v) for v in repaired.values()),
             len(repaired),
-            {k: v for k, v in list(repaired.items())[:4]},
+            dict(list(repaired.items())[:4]),
         )
     return repaired
 
@@ -135,8 +111,7 @@ def shrink_expert_metadata(
     if metadata is None:
         return
     old_num_physical = metadata.num_physical_experts
-    num_local = old_num_physical // from_ep_size
-    new_num_physical = num_local * effective_size
+    new_num_physical = old_num_physical // from_ep_size * effective_size
     if new_num_physical >= old_num_physical:
         return
 
@@ -147,14 +122,13 @@ def shrink_expert_metadata(
     relabelled = repair_orphan_logicals(
         shrunk_p2l=shrunk_p2l, num_logical=metadata.num_logical_experts
     )
-    new_metadata = ExpertLocationMetadata.init_by_mapping(
-        model_config,
-        physical_to_logical_map=shrunk_p2l,
-        moe_ep_rank=moe_ep_rank,
+    metadata.adopt_scaled_in_place(
+        ExpertLocationMetadata.init_by_mapping(
+            model_config, physical_to_logical_map=shrunk_p2l, moe_ep_rank=moe_ep_rank
+        )
     )
-    metadata.adopt_scaled_in_place(new_metadata)
-    # After the map is installed, so the loader follows it. Fatal on failure: the map
-    # claims a slot holds the orphan while it still holds its donor.
+    # After install so the loader follows the map. Fatal on failure: the map says a
+    # slot holds the orphan while it still holds its donor.
     try:
         reload_relabelled(relabelled)
     except Exception as exc:

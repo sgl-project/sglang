@@ -89,18 +89,14 @@ def dp_slot_in(per_rank) -> int:
     takes part in, so its length is the gather width. Length one is the
     all-gather-skipped batch, which carries this process's entry alone.
 
-    Under elastic EP a graph-facing sequence is instead sized to the pool
-    ceiling (see dp_capacity_for), so it stays wider than the live gather.
-    Retirees are the contiguous tail, so every live slot keeps its offset and
-    the unfilled tail reads as ranks with no tokens: the same index applies.
+    Under elastic EP it may be wider (dp_capacity_for); retirees are the tail.
     """
     if len(per_rank) == 1:
         return 0
     width = dp_gather_width()
-    ceiling_sized = (
+    if len(per_rank) != width and not (
         len(per_rank) > width and get_exec().moe.elastic_ep_backend is not None
-    )
-    if len(per_rank) != width and not ceiling_sized:
+    ):
         raise ValueError(
             f"a per-replica sequence of {len(per_rank)} entries does not "
             f"belong to a DP gather of width {width}"
@@ -480,8 +476,7 @@ def initialize_dp_attention_flags(server_args: ServerArgs):
     dp.enabled = get_parallel().attn_dp_enabled
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
-        # Resolution, not a bag: callers reach this from processes whose
-        # publish may not have happened. Offset covers a recover joiner too.
+        # Resolved, since this process's publish may not have happened yet.
         if ep_offset_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
 
@@ -593,20 +588,9 @@ def is_allocation_symmetric() -> bool:
 
 
 def dp_capacity_for(dp_size: int) -> int:
-    """DP width graph-facing buffers are sized to: the pool ceiling, not the live width.
+    """Graph-facing DP buffer width: the max_ep_size pool ceiling, not the live width.
 
-    Retirees are the contiguous tail, so a shrink leaves surviving rank offsets put
-    and a retired slot reads as a rank with zero tokens. Takes the width as an
-    argument so the buffer allocators can call it before DP attention is
-    initialized.
-
-    The ceiling is max_ep_size: a replica never spans less than one EP rank, so no
-    gather can hold more slots than the pool holds ranks. Scaling it by the calling
-    process's own tp_size instead made a joiner, which holds one slice of the
-    deployment, size against a different ceiling than the server -- 24 against 12
-    for a tp-2 joiner into a tp-4 pool. Over-sizing is inert (the tail fills with
-    ranks contributing nothing); disagreeing across processes is not.
-    """
+    Same in every process, joiners included; callable before DP attention is set up."""
     max_ep_size = get_parallel().max_ep_size
     if not max_ep_size or get_exec().moe.elastic_ep_backend is None:
         return dp_size
