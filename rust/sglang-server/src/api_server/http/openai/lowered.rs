@@ -297,7 +297,7 @@ pub(super) async fn chat(
     };
     Some(
         (
-            [(CONTENT_TYPE, "text/event-stream")],
+            [(CONTENT_TYPE, "text/event-stream; charset=utf-8")],
             Body::from_stream(events),
         )
             .into_response(),
@@ -473,6 +473,10 @@ mod tests {
             let body = json!({"model": "model", "messages": messages, "stream": true});
             let response = post_json(app, "/v1/chat/completions", body).await;
             assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[CONTENT_TYPE],
+                "text/event-stream; charset=utf-8"
+            );
             let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
                 .await
                 .unwrap();
