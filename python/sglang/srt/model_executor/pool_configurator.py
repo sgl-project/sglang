@@ -1367,7 +1367,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         """Compressed KV (+ indexer) bytes one full token adds per layer of `ratio`;
         compress state is priced per SWA slot (c4) or as fixed bytes (c128, ratio 2)."""
         if ratio in (1, 2):
-            return (self.kv_bytes + self.low_ratio_index_bytes) / ratio
+            # The entry in the pool's own layout: KVLayout.V41_FP4 is 288 bytes, not
+            # the 584 of a V4 FlashMLA slot.
+            return (
+                self._get_paged_kv_bytes_per_token(ratio) + self.low_ratio_index_bytes
+            ) / ratio
         if ratio == 4:
             c4_frac = 1 / (4 * self.c4_shrink_factor)
             return (
