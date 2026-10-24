@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import math
 import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -1757,10 +1758,37 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 
+        # Fixed-width hybrid verify kernels consume complete request groups.
+        # Align the globally agreed token counts before selecting MAX_LEN/SUM_LEN
+        # so active and synchronized idle ranks retain the same collective domain.
+        token_alignment = attn_tp_size
+        if (
+            self.dp_spec_prefill_coordination_applied
+            and not model_runner.is_draft_worker
+            and mambaish_config(model_runner.model_config) is not None
+        ):
+            # Coordinated target steps can be EXTEND on one DP rank and VERIFY
+            # on another. Use the shared target width on both, so every rank
+            # derives the same padded counts for the collective.
+            token_alignment = math.lcm(
+                token_alignment, model_runner.decode_num_tokens_per_req()
+            )
+        elif (
+            self.spec_info is not None
+            and not self.spec_info.is_draft_input()
+            and self.spec_info.ragged_verify_layout is None
+            and self.spec_info.num_tokens_per_req > 0
+            and (self.forward_mode.is_target_verify() or self.forward_mode.is_idle())
+            and mambaish_config(model_runner.model_config) is not None
+        ):
+            token_alignment = math.lcm(
+                token_alignment, self.spec_info.num_tokens_per_req
+            )
+
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], token_alignment)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -2223,7 +2251,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():
-            num_tokens = self.seq_lens_sum
+            # Cached prefixes contribute to seq_lens_sum, but only this
+            # forward's query rows may be passed to the draft model.
+            num_tokens = self._original_num_tokens
             logits_output.next_token_logits = logits_output.next_token_logits[
                 :num_tokens
             ]
