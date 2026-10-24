@@ -305,7 +305,13 @@ class CanonicalStrategy:
 
         channel_type = self._extract_channel_type(channel_header)
         if not channel_type:
-            return None  # Unknown or malformed channel
+            # Harmony defines analysis, commentary and final, but a model
+            # sometimes opens a block on another name. Returning None here held
+            # the rest of the response, including a later valid final block,
+            # and the client saw an empty answer. Parse the block instead and
+            # keep going: its content is reasoning, or the answer when it ends
+            # with <|return|>.
+            channel_type = "unknown"
 
         pos = message_pos + 1  # Skip MESSAGE token
 
@@ -319,6 +325,13 @@ class CanonicalStrategy:
                 end_pos += 1
         elif channel_type == "analysis":
             while end_pos < len(tokens) and tokens[end_pos].type not in ("END", "CALL"):
+                end_pos += 1
+        elif channel_type == "unknown":
+            while end_pos < len(tokens) and tokens[end_pos].type not in (
+                "END",
+                "CALL",
+                "RETURN",
+            ):
                 end_pos += 1
         else:  # commentary
             while end_pos < len(tokens) and tokens[end_pos].type not in ("END", "CALL"):
@@ -349,6 +362,10 @@ class CanonicalStrategy:
                 return Event("tool_call", content.strip(), raw_text), end_pos + 1
             else:
                 return Event("normal", content), end_pos + 1
+        elif channel_type == "unknown":
+            if end_token.type == "RETURN":
+                return Event("normal", content), end_pos + 1
+            return Event("reasoning", content), end_pos + 1
         elif channel_type == "final":
             # For final blocks, include any trailing TEXT immediately after <|return|>
             final_content = content
