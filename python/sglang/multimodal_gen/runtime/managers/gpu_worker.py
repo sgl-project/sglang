@@ -837,20 +837,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         deferred: bool,
     ) -> None:
         req_label = req.request_id[:8] if req.request_id else "unnamed"
-        with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
-            self._materialize_output_transport(output_batch, req, save_output_paths)
-        if req.is_warmup and not current_platform.is_cpu():
-            # A warmup saves no output, so nothing waits for its device work;
-            # drain it here or the next request's first blocking op pays for it.
-            torch.get_device_module().synchronize()
-
-        self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
-
-        collect_perf = (
-            req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
-        )
-        if collect_perf and not req.is_warmup:
-            self._record_replica_peak_memory(output_metrics)
+        try:
+            with maybe_record_function(f"SAVE_OUTPUTS {req_label}"):
+                self._materialize_output_transport(output_batch, req, save_output_paths)
+            if req.is_warmup and not current_platform.is_cpu():
+                # A warmup saves no output, so nothing waits for its device work;
+                # drain it here or the next request's first blocking op pays for it.
+                torch.get_device_module().synchronize()
+        finally:
+            self._record_output_peak_memory(output_batch, is_warmup=req.is_warmup)
+            # saving can fail only on the output rank; it must still join the
+            # metrics collective, or its peers cannot serve the next request
+            collect_perf = (
+                req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
+            )
+            if collect_perf and not req.is_warmup:
+                self._record_replica_peak_memory(output_metrics)
 
         if (
             self.is_output_rank
@@ -924,17 +926,22 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 )
             stream.synchronize()
 
-    def release_cache_if_idle(self) -> None:
+    def release_cache_if_idle(self) -> float | None:
         """Release the allocator cache once no request has finished for a while.
 
-        The scheduler calls this only with nothing queued or in flight.
+        The scheduler calls this only with nothing queued or in flight. Returns
+        the seconds until a pending release is due, or None when none is pending.
         """
         due = self._cache_release_due
-        if due is None or time.monotonic() < due:
-            return
+        if due is None:
+            return None
+        wait_s = due - time.monotonic()
+        if wait_s > 0:
+            return wait_s
         self._cache_release_due = None
         with maybe_record_function("EMPTY_CACHE"):
             torch.get_device_module().empty_cache()
+        return None
 
     def take_deferred_finalize(self) -> Callable[[], None] | None:
         deferred = self._deferred_finalize

@@ -497,7 +497,9 @@ class DecoderReplayTail:
     def _bridge_outputs(
         self, block_rows: int, outputs: List[Optional[torch.Tensor]]
     ) -> Tuple[Optional[torch.Tensor], ...]:
-        """Block-sized bridge views of the tail rows; rows past the tail are zero."""
+        """Block-sized bridge views of the tail rows. Rows past the tail hold stale
+        values, which reach only rows that _scatter_tail_rows and the
+        real_rows_count cut drop."""
         key = tuple(None if t is None else (t.dtype, t.shape[1:]) for t in outputs)
         sets = self._bridge_buffers.setdefault(key, [])
         if not sets or sets[0][0].shape[0] < block_rows:
@@ -515,7 +517,6 @@ class DecoderReplayTail:
                 continue
             view = buf[:block_rows]
             view[: t.shape[0]].copy_(t)
-            view[t.shape[0] :].zero_()
             views.append(view)
         return tuple(views)
 

@@ -401,6 +401,33 @@ class TestHandlerRequestSemantics(CustomTestCase):
             {"city": "Paris"},
         )
 
+    def test_native_endpoints_parse_through_recipe(self):
+        from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+            native_text_parser,
+        )
+        from sglang.srt.entrypoints.openai.protocol import Tool
+
+        chat = _serving(self, self.tokenizer)
+        adapter = native_text_parser(
+            "deepseek-v41",
+            chat_encoding_spec=chat.chat_encoding_spec,
+            adapter=chat.encoding_adapter,
+        )
+        # V4 output never opens with <think>; the text parsers left it unsplit.
+        self.assertEqual(adapter.separate_reasoning_text("a</think>b"), ("a", "b"))
+        call = (
+            '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="f">\n'
+            '<｜DSML｜ parameter name="x" string="true">1</｜DSML｜ parameter>\n'
+            "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+        )
+        tool = Tool(type="function", function={"name": "f", "parameters": {}})
+        text, (item,) = adapter.parse_function_call_text("Sure." + call, [tool])
+        self.assertEqual(
+            (text, item.name, item.parameters), ("Sure.", "f", '{"x": "1"}')
+        )
+        with self.assertRaises(ValueError):
+            native_text_parser("deepseek-v41", chat_encoding_spec=None, adapter=None)
+
 
 if __name__ == "__main__":
     unittest.main()

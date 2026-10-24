@@ -117,6 +117,15 @@ Existing `try_*` entry points return `None` for an unsupported specialization.
 Keep that convention explicit at their call sites; do not add it to direct
 kernel entry points.
 
+A kernel that is only built or validated for one architecture generation gates
+on `common.platform.is_cuda_sm_at_least(min_sm, x.device)` inside its
+`can_use_*` predicate. That predicate checks for a CUDA build before comparing
+the compute capability, because ROCm reports a gfx-derived capability that
+would otherwise clear a plain `>= (10, 0)` test. Kernel-level predicates stop
+at the tensor contract, the architecture floor and
+`torch.compiler.is_compiling()`; grad mode and stream capture are the model
+gate's business.
+
 ## Selection matrix
 
 Several norms look interchangeable and are not. Start here.
@@ -204,6 +213,24 @@ tensor copy at each residual site.
 | `vdn_frame_stats_prep`, `vdn_gather_linear_state` | Triton | bit-exact (same products, fp32 gather) |
 | `vdn_temporal_conv_act`, `vdn_silu_l2norm`, `vdn_linear_epilogue` | Triton | one rounding at the store, within one bf16 ulp of the eager chain; the model's own inference kernels, mounted unconditionally by the VDN-H3 branch |
 | `vdn_delta_factors` | JIT CUDA | `(alpha * inv(I + A), B @ inv(I + A))` in one launch; same fp32 accuracy class as the cholesky + solve_triangular chain (cond-dominated); head_dim 128 |
+
+### MiniMax-H3 VAE output
+
+| Entry point | Backend | Contract |
+|---|---|---|
+| `minimax_h3_vae_temporal_blend_write` | JIT CUDA | bit-exact vs `blend(overlap, part, frame_overlap, dim=-3)` followed by the slice copy, written straight into the destination frames |
+| `minimax_h3_vae_denorm_clamp` | JIT CUDA | bit-exact vs torchvision `Normalize` + `clamp_(0, 1)`, NaN preserved |
+
+The blend write spells klvae's `a * (1 - w) + b * w` with one fp32 rounding
+per op and `w = k * (1 / n)` rounded the way aten evaluates a tensor divided
+by a Python int (reciprocal first); the denorm spells `(x - mean) / std` as
+two roundings; both hold on the strided and the 128-bit path alike. The
+ramp blend is the common tiled-VAE pattern and the interface carries no H3
+constants, but only the MiniMax-H3 VAE is wired to it today. SM100+. Not
+quality-gated: each site verifies its kernel against the eager chain on
+first sight (`sites/bitexact_gate.py`) and falls back for good on a
+mismatch; both run at every level. `minimax_h3_vae_denorm_clamp` also takes
+`out=value` to rewrite a contiguous input in place.
 
 ### Rowwise E4M3 producers (SM89+)
 
