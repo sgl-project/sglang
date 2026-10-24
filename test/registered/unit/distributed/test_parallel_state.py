@@ -463,24 +463,4 @@ def test_group_desc_none_normalized_to_anonymous():
 
 
 if __name__ == "__main__":
-    # Run tests without requiring GPUs
-    import sys
-
-    try:
-        test_parallel_group_construction_tp8_attn_cp2(False)
-        test_parallel_group_construction_tp8_attn_cp2(True)
-        test_parallel_group_construction_tp8_moe_ep4_cp2()
-        test_group_desc_propagated_via_real_new_group("tp")
-        test_group_desc_propagated_via_real_new_group("pp")
-        test_group_desc_none_normalized_to_anonymous()
-
-        sys.exit(0)
-    except AssertionError as e:
-        print(f"\n Test failed: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n Unexpected error: {e}")
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
+    sys.exit(pytest.main([__file__]))
