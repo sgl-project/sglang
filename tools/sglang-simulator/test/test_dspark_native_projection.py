@@ -820,6 +820,12 @@ def stage_policy_metadata(case, *, failure=None):
     assets["_meta/kernel_identity.json"] = canonical_json_bytes(
         {"schema_version": 1, "identities": identities}
     )
+    write_source_slice(case)
+
+
+def write_source_slice(case):
+    """Retain source metadata custody only; never add a cost or passed decision."""
+    assets = case.assets
     stack_raw = canonical_json_bytes(case.stack)
     from infercast.schema import SLICE_MANIFEST_SCHEMA_VERSION
 
@@ -855,6 +861,207 @@ def stage_policy_metadata(case, *, failure=None):
     (case.slice_dir / "_meta/slice_manifest.json").write_bytes(
         canonical_json_bytes(manifest)
     )
+
+
+@pytest.fixture
+def cohort_case(source_case):
+    """Two complete source epochs sharing material identity, without timing rows."""
+    if not hasattr(NativeSegmentSourcePolicy, "from_cohort"):
+        pytest.skip("requires the SDK profile2 source-cohort API")
+    from infercast.sdk.perf_database.dsv41_native_segment import (
+        build_native_segment_cohort,
+        native_segment_stack_identity,
+    )
+
+    case = source_case
+    assets = case.assets
+    old_profile = json.loads(assets[case.profile_ref["path"]])
+    old_source = json.loads(assets[old_profile["source"]["path"]])
+    physical = json.loads(assets[old_source["physical_source"]["path"]])
+    originals = {
+        name: [json.loads(assets[ref["path"]]) for ref in refs]
+        for name, refs in case.descriptors.items()
+    }
+    for role in physical["roles"]:
+        capture = next(
+            row
+            for row in originals["captures"]
+            if row["topology"]["tp_rank"] == role["parallel"]["tp_rank"]
+            and row["is_draft_worker"] == (role["role"] == "draft")
+        )
+        role["graph"] = {
+            name: capture[name]
+            for name in (
+                "capture_batches",
+                "captured_req_width",
+                "graph_keys",
+                "ragged_verify_mode",
+                "request_pool_size",
+            )
+        }
+    driver = {"version": "CPU-source-only", "srcversion": "a" * 23}
+    stack = {**case.stack, "schema_version": 1}
+    stack["operator_libs"] = {**stack["operator_libs"], "amd_driver": driver["version"]}
+    physical_ref = retain(assets, "physical", physical)
+    material_source = {
+        "schema_version": 2,
+        "physical_source": physical_ref,
+        "implementation_sha256": old_source["implementation_sha256"],
+    }
+    case.profile_ref = retain(
+        assets,
+        "profile",
+        build_native_segment_profile(
+            source=retain(assets, "source", material_source),
+            stack=retain(assets, "stack", native_segment_stack_identity(stack)),
+            schema_version=2,
+            driver=driver,
+        ),
+    )
+    case.stack = stack
+    (case.slice_dir / "_meta/stack.json").write_bytes(canonical_json_bytes(stack))
+    case.database = PerfDatabase.open_fidb(
+        "mi355x",
+        "sglang",
+        "0.5.22",
+        systems_root=str(case.systems),
+        database_mode="SILICON",
+    )
+    case.cohorts, case.native_by_cohort = [], []
+    for epoch in range(2):
+        rows = copy.deepcopy(originals)
+        shift = epoch * 1000
+        for name in ("captures", "startup", "proposal"):
+            for row in rows[name]:
+                row["pid"] += epoch * 100
+                row["time_ns"] += shift
+                if name == "startup":
+                    row["exec_runtime"].setdefault("moe", {}).update(
+                        kt_weight_path=None, mooncake_ib_device=None
+                    )
+                    row["exec_runtime"].setdefault("offload", {})["ple_offload_dir"] = (
+                        None
+                    )
+                if name == "proposal":
+                    row["facts"]["sampler"]["max_bs"] = 64
+                    row["allocated_runtime_artifact"] = (
+                        f"allocated-runtime-pid-{row['pid']}.json"
+                    )
+        for window in rows["windows"]:
+            window["pid"] += epoch * 100
+            for row in window["metadata"]:
+                row["pid"] = window["pid"]
+                row["time_ns"] += shift
+                row["cpu_batch"]["source_sampling_before_worker"]["observed_ns"] += (
+                    shift
+                )
+                for selector in row["source_graph_selection_inputs"]:
+                    selector["observed_before_select_ns"] += shift
+        refs = {
+            name: tuple(retain(assets, name, row) for row in values)
+            for name, values in rows.items()
+        }
+        proof = retain(assets, "driver-proof", {"driver": driver, "epoch": epoch})
+        original_source = retain(
+            assets,
+            "source",
+            {
+                **material_source,
+                "schema_version": 1,
+                "evidence": [*refs["captures"], *refs["startup"], proof],
+            },
+        )
+        case.cohorts.append(
+            retain(
+                assets,
+                "cohort",
+                build_native_segment_cohort(
+                    source=original_source,
+                    stack=retain(
+                        assets, "stack", {**stack, "collection": {"epoch": epoch}}
+                    ),
+                    driver_proof=proof,
+                    startup=refs["startup"],
+                    captures=refs["captures"],
+                    capture_profile=retain(
+                        assets, "capture-profile", case.capture_profile.to_dict()
+                    ),
+                    policy_windows=refs["windows"],
+                    proposal_paths=refs["proposal"],
+                ),
+            )
+        )
+        # Measurement originals need not equal the distinct policy windows.
+        for window in rows["windows"]:
+            for row in window["metadata"]:
+                row["time_ns"] += 10
+                row["cpu_batch"]["source_sampling_before_worker"]["observed_ns"] += 10
+                for selector in row["source_graph_selection_inputs"]:
+                    selector["observed_before_select_ns"] += 10
+        case.native_by_cohort.append(
+            [retain(assets, "measurement-window", row) for row in rows["windows"]]
+        )
+    case.policy = NativeSegmentSourcePolicy.from_cohort(
+        case.profile_ref,
+        case.cohorts[0],
+        lambda path, digest: assets[path],
+        stack_meta=stack,
+    )
+    return case
+
+
+def stage_cohort_metadata(case, *, cohorts=None):
+    """Declare unqualified measurement2 metadata, retaining each original cohort."""
+    cohorts = case.cohorts if cohorts is None else cohorts
+    model = UMDDSparkCostModel(case.database, native_source_policy=case.policy)
+    execution = json.loads(resolve(model, case, "EXTEND").step.groups[0].execution_json)
+    identities = []
+    for index, cohort_ref in enumerate(cohorts):
+        cohort = json.loads(case.assets[cohort_ref["path"]])
+        measurement = retain(
+            case.assets,
+            "measurement",
+            {
+                "schema_version": 2,
+                "execution_profile_id": case.policy.execution_profile_id,
+                "timing_method": TIMING_METHOD,
+                "reduction": REDUCTION,
+                "qualification": retain(
+                    case.assets, "qualification", {"status": "not_admitted"}
+                ),
+                "causal_inputs": retain(
+                    case.assets, "causal", {"scope": "CPU source only"}
+                ),
+                "native": case.native_by_cohort[index],
+                "proposal_paths": cohort["proposal_paths"],
+                "cells": [],
+                "cohort": cohort_ref,
+            },
+        )
+        query = NativeSegmentQuery(
+            case.policy.execution_profile_id,
+            ("prefill_preamble", "prefill_tail")[index],
+            execution["native_segment_module_variant"],
+        )
+        identities.append(
+            {
+                "op": OP,
+                "config_token": case.policy.execution_profile_id,
+                "shape_key": canonical_json_bytes(query.to_shape()).decode(),
+                "kernel_source": "sglang",
+                "exec_mode": query.to_shape()["kernel_impl"],
+                "kernel_name": BOUNDARY,
+                "extra": {
+                    "execution_profile": case.profile_ref,
+                    "measurement_manifest": measurement,
+                },
+            }
+        )
+    case.assets["_meta/kernel_identity.json"] = canonical_json_bytes(
+        {"schema_version": 1, "identities": identities}
+    )
+    write_source_slice(case)
+    return identities
 
 
 @pytest.fixture
@@ -1081,3 +1288,247 @@ def test_factory_native_policy_rejects_unbound_runtime_profile_or_epoch(
     with pytest.raises(PredictorError, match=expected[failure]):
         real_factory.build(**changes)
     assert not real_factory.progress_calls and not real_factory.progress_reads
+
+
+def load_cohort_policy(case, *, profile_id=None, capture_profile=None):
+    from sglang_simulator.time_predictor.infercast_dspark import _native_source_policy
+
+    return _native_source_policy(
+        case.database,
+        case.profile_ref["sha256"] if profile_id is None else profile_id,
+        case.capture_profile if capture_profile is None else capture_profile,
+    )
+
+
+def test_legacy_profile1_source_loader_retains_the_original_sdk_path(source_case):
+    from sglang_simulator.time_predictor.infercast_dspark import _native_source_policy
+
+    stage_policy_metadata(source_case)
+    assert (
+        _native_source_policy(
+            source_case.database,
+            source_case.policy.execution_profile_id,
+            source_case.capture_profile,
+        )
+        == source_case.policy
+    )
+
+
+def change_measurement(case, identities, index, change):
+    extra = identities[index]["extra"]
+    value = json.loads(case.assets[extra["measurement_manifest"]["path"]])
+    change(value)
+    extra["measurement_manifest"] = retain(case.assets, "measurement", value)
+    case.assets["_meta/kernel_identity.json"] = canonical_json_bytes(
+        {"schema_version": 1, "identities": identities}
+    )
+    write_source_slice(case)
+
+
+def test_profile2_loads_each_complete_cohort_and_verifies_distinct_native_custody(
+    cohort_case, monkeypatch
+):
+    from infercast.sdk.perf_database import slice_manifest
+
+    case = cohort_case
+    identities = stage_cohort_metadata(case)
+    original_validate = NativeSegmentSourcePolicy.from_cohort
+    original_read = slice_manifest.read_verified_slice_artifact
+    cohorts, reads = [], []
+
+    def validate(profile, cohort, read, *, stack_meta):
+        cohorts.append(cohort)
+        return original_validate(profile, cohort, read, stack_meta=stack_meta)
+
+    def read(root, path, **kwargs):
+        reads.append(path)
+        return original_read(root, path, **kwargs)
+
+    monkeypatch.setattr(NativeSegmentSourcePolicy, "from_cohort", validate)
+    monkeypatch.setattr(slice_manifest, "read_verified_slice_artifact", read)
+    assert load_cohort_policy(case) == case.policy
+    assert cohorts == case.cohorts and len(cohorts) == len(identities) == 2
+    for cohort_ref, native in zip(case.cohorts, case.native_by_cohort, strict=True):
+        cohort = json.loads(case.assets[cohort_ref["path"]])
+        assert native != cohort["policy_windows"]
+        assert all(ref["path"] in reads for ref in native)
+
+
+@pytest.fixture
+def cohort_factory(cohort_case, tmp_path, monkeypatch):
+    return real_factory.__wrapped__(cohort_case, tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("mode", ["EXTEND", "DECODE"])
+def test_profile2_factory_source_validation_still_requires_qualified_cost_before_progress(
+    cohort_case, cohort_factory, mode
+):
+    case = cohort_case
+    stage_cohort_metadata(case)
+    predictor = cohort_factory.build()
+    runtime = predictor.dspark_runtime
+    assert runtime.session.cost_model.native_source_policy == case.policy
+    step = resolve(runtime.session.cost_model, case, mode).step
+    if mode == "DECODE":
+        for req in step.requests:
+            runtime.session.record_history(
+                req.rid,
+                CommittedHistory(
+                    req.target_prefix_len, req.draft_valid_from, req.draft_valid_to
+                ),
+            )
+    previous = dict(runtime.session._history)
+    with pytest.raises(PredictorError, match="missing qualified DSPark cost"):
+        runtime.session.predict(step)
+    assert not cohort_factory.progress_calls
+    assert runtime.session._history == previous and runtime._forward_id == 0
+
+
+@pytest.mark.parametrize("version", [True, 0, 1, 3])
+def test_profile2_rejects_unknown_or_mixed_measurement_versions(cohort_case, version):
+    case = cohort_case
+    identities = stage_cohort_metadata(case)
+    change_measurement(
+        case, identities, 1, lambda value: value.update(schema_version=version)
+    )
+    with pytest.raises(PredictorError, match="another profile or schema"):
+        load_cohort_policy(case)
+
+
+@pytest.mark.parametrize("version", [True, 0, 3])
+def test_native_source_loader_rejects_unknown_profile_versions(cohort_case, version):
+    case = cohort_case
+    identities = stage_cohort_metadata(case)
+    value = json.loads(case.assets[case.profile_ref["path"]])
+    value["schema_version"] = version
+    changed = retain(case.assets, "profile", value)
+    for row in identities:
+        shape = json.loads(row["shape_key"])
+        shape["execution_profile_id"] = changed["sha256"]
+        row.update(
+            config_token=changed["sha256"],
+            shape_key=canonical_json_bytes(shape).decode(),
+        )
+        row["extra"]["execution_profile"] = changed
+    case.assets["_meta/kernel_identity.json"] = canonical_json_bytes(
+        {"schema_version": 1, "identities": identities}
+    )
+    write_source_slice(case)
+    with pytest.raises(PredictorError, match="schema must be explicitly 1 or 2"):
+        load_cohort_policy(case, profile_id=changed["sha256"])
+
+
+@pytest.mark.parametrize(
+    "failure", ["cohort", "native", "duplicate_native", "proposal", "other_proposal"]
+)
+def test_profile2_rejects_missing_repeated_or_cross_cohort_measurement_inputs(
+    cohort_case, failure
+):
+    case = cohort_case
+    identities = stage_cohort_metadata(case)
+
+    def change(value):
+        if failure == "cohort":
+            value.pop("cohort")
+        elif failure == "native":
+            value["native"] = []
+        elif failure == "duplicate_native":
+            value["native"].append(value["native"][0])
+        elif failure == "proposal":
+            value.pop("proposal_paths")
+        else:
+            peer = json.loads(case.assets[case.cohorts[1]["path"]])
+            value["proposal_paths"] = peer["proposal_paths"]
+
+    change_measurement(case, identities, 0, change)
+    with pytest.raises(
+        PredictorError, match="cohort|original native|original proposal"
+    ):
+        load_cohort_policy(case)
+
+
+@pytest.mark.parametrize(
+    "failure", ["partial", "cross_epoch", "driver", "capture_profile"]
+)
+def test_profile2_never_unions_partial_or_mixed_source_epochs(cohort_case, failure):
+    case = cohort_case
+    identities = stage_cohort_metadata(case)
+
+    def change(value):
+        cohort = json.loads(case.assets[value["cohort"]["path"]])
+        if failure == "partial":
+            cohort["captures"] = cohort["captures"][:2]
+        elif failure == "cross_epoch":
+            peer = json.loads(case.assets[case.cohorts[0]["path"]])
+            cohort["startup"] = peer["startup"]
+        elif failure == "driver":
+            peer = json.loads(case.assets[case.cohorts[0]["path"]])
+            cohort["driver_proof"] = peer["driver_proof"]
+        else:
+            capture = json.loads(case.assets[cohort["capture_profile"]["path"]])
+            capture["runtime_compatibility_id"] = "different CPU source declaration"
+            cohort["capture_profile"] = retain(case.assets, "capture-profile", capture)
+        value["cohort"] = retain(case.assets, "cohort", cohort)
+
+    change_measurement(case, identities, 1, change)
+    with pytest.raises(
+        (PredictorError, ValueError), match="capture|source-bound|driver|profile"
+    ):
+        load_cohort_policy(case)
+
+
+@pytest.mark.parametrize("failure", ["manifest", "sha256"])
+def test_profile2_actual_measurement_native_requires_manifest_and_sha(
+    cohort_case, failure
+):
+    case = cohort_case
+    stage_cohort_metadata(case)
+    ref = case.native_by_cohort[1][0]
+    if failure == "manifest":
+        case.assets.pop(ref["path"])
+        write_source_slice(case)
+    else:
+        (case.slice_dir / ref["path"]).write_bytes(b'{"changed":true}')
+    with pytest.raises((ValueError, OSError), match="manifest|digest|sha256"):
+        load_cohort_policy(case)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "runtime_profile_json",
+        "_capture_keys",
+        "_sampler_capacity",
+        "reference_needs_cpu_seq_lens",
+    ],
+)
+def test_profile2_compares_every_sdk_policy_field_after_independent_validation(
+    cohort_case, monkeypatch, field
+):
+    case = cohort_case
+    if field not in case.policy.__dataclass_fields__:
+        pytest.skip("requires the SDK verified reference-mirror addendum")
+    stage_cohort_metadata(case)
+    original_validate = NativeSegmentSourcePolicy.from_cohort
+    calls = []
+
+    def validate(*args, **kwargs):
+        candidate = original_validate(*args, **kwargs)
+        calls.append(candidate)
+        if len(calls) == 2:
+            # Fault-inject SDK-returned state after its real source validation;
+            # no caller override or qualified-performance object is constructed.
+            value = getattr(candidate, field)
+            changed = {
+                "runtime_profile_json": "{}",
+                "_capture_keys": (),
+                "_sampler_capacity": 65,
+                "reference_needs_cpu_seq_lens": value is not True,
+            }[field]
+            object.__setattr__(candidate, field, changed)
+        return candidate
+
+    monkeypatch.setattr(NativeSegmentSourcePolicy, "from_cohort", validate)
+    with pytest.raises(PredictorError, match="inconsistent prospective policies"):
+        load_cohort_policy(case)
+    assert len(calls) == 2

@@ -192,15 +192,23 @@ For the native-region path, replace `proposal_profile_id` with both fields:
 ```
 
 The capture artifact is the existing SDK `DecodeExecutionProfile.to_dict()`
-document, parsed with its strict serializer. Native-region metadata does not
-retain this document, so it must be supplied explicitly; capture buckets alone
-cannot reconstruct its compatibility fields. The selected slice's existing
-kernel identities provide profile/measurement references. Their retained source
-inventory supplies startup/capture originals, and measurement references supply
-native windows/proposal paths. The SDK validates all roles, actual captures,
-source policy and process correspondence. Conflicting epochs reject rather
-than selecting the latest receipt. Runtime bytes must exactly match the policy's
-canonical physical-source document and the independently bound progress artifact.
+document, parsed with its strict serializer and supplied explicitly; capture
+buckets cannot reconstruct its compatibility fields. The selected slice's
+existing kernel identities provide profile/measurement references. Legacy
+profile1 metadata retains its original source-inventory path. Profile2 requires
+measurement2 and each measurement's explicit source cohort. The SDK independently
+validates every cohort's startup, capture, driver, proposal and policy-window
+receipts. The configured capture document must exactly match each cohort's
+canonical capture profile, and all verified prospective policies must be equal.
+Partial epochs cannot be combined to establish one policy. Runtime bytes must
+exactly match the policy's canonical physical-source document and the
+independently bound progress artifact.
+
+Measurement `native` windows are separately checked against the slice manifest
+and their SHA256; they need not equal the cohort's policy windows. Measurement
+proposal paths must match that cohort. Factory source validation admits no cost:
+the existing SDK cost reader still validates original measurement frames, cells
+and independent timing qualification before progress can be queried.
 
 This first native projection domain is TP2/ADP1/PP1, B1-B8. Its seven logical
 preparers select nine mode-specific regions; costs still use the ordinary UMD

@@ -152,6 +152,77 @@ def _native_source_policy(database, profile_id, capture_profile):
     )
     profile_ref = next(iter(profiles.values()))
     profile = document(profile_ref)
+    _require(
+        isinstance(profile, dict)
+        and type(profile.get("schema_version")) is int
+        and profile["schema_version"] in (1, 2),
+        "native source profile schema must be explicitly 1 or 2",
+        code="invalid_execution_profile",
+    )
+    if profile["schema_version"] == 2:
+        _require(
+            callable(getattr(NativeSegmentSourcePolicy, "from_cohort", None)),
+            "native profile2 requires SDK cohort validation",
+        )
+        policy = None
+        for ref in measurements.values():
+            value = document(ref)
+            _require(
+                isinstance(value, dict)
+                and type(value.get("schema_version")) is int
+                and value["schema_version"] == 2
+                and value.get("execution_profile_id") == profile_id,
+                "native source measurement belongs to another profile or schema",
+                code="invalid_execution_profile",
+            )
+            _require(
+                "cohort" in value,
+                "native profile2 measurement omits original cohort",
+                code="data_unavailable",
+            )
+            candidate = NativeSegmentSourcePolicy.from_cohort(
+                profile_ref, value["cohort"], read, stack_meta=database.stack_meta
+            )
+            cohort = document(value["cohort"])
+            _require(
+                canonical_json_bytes(capture_profile.to_dict())
+                == canonical_json_bytes(document(cohort["capture_profile"])),
+                "configured native capture profile differs from its source cohort",
+                code="invalid_execution_profile",
+            )
+            for name in ("native", "proposal_paths"):
+                refs = value.get(name)
+                _require(
+                    isinstance(refs, list)
+                    and bool(refs)
+                    and (name != "proposal_paths" or len(refs) == 2),
+                    "native source metadata omits original " + name,
+                    code="data_unavailable",
+                )
+                identities = [artifact_descriptor(original) for original in refs]
+                _require(
+                    len(set(identities)) == len(identities),
+                    "native source metadata repeats original " + name,
+                    code="invalid_execution_profile",
+                )
+                for original in refs:
+                    read(*artifact_descriptor(original))
+            _require(
+                sorted(value["proposal_paths"], key=artifact_descriptor)
+                == cohort["proposal_paths"],
+                "native source measurement proposal cohort differs",
+                code="invalid_execution_profile",
+            )
+            # Each original epoch must independently establish this entire
+            # immutable SDK policy. Never union partial process receipts.
+            _require(
+                policy is None or candidate == policy,
+                "native source cohorts establish inconsistent prospective policies",
+                code="invalid_execution_profile",
+            )
+            policy = candidate
+        _require(policy is not None, "native profile2 omits source measurements")
+        return policy
     source = document(profile["source"])
     captures, startup = {}, {}
     for ref in source["evidence"]:
