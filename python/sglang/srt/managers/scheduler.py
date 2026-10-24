@@ -5521,11 +5521,9 @@ class Scheduler(
         if rejection is not None:
             return DetachHiCacheStorageReqOutput(success=False, message=rejection)
 
-        try:
-            message = self.tree_cache.detach_cache_linker()
-        except Exception as e:
-            logger.exception("Detach external linker failed with exception.")
-            return DetachHiCacheStorageReqOutput(success=False, message=str(e))
+        # Detach failures are fatal: ranks may now have different linker states.
+        # Let run_scheduler_process notify the parent and terminate the workers.
+        message = self.tree_cache.detach_cache_linker()
         get_context().override(
             "scheduler.detach_cache_linker",
             unified_cache_external_linker_backend=None,

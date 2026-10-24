@@ -621,7 +621,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
-        self.detach_cache_linker()
+        self.detach_cache_linker(synchronize=False)
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
@@ -3403,10 +3403,10 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_backend, storage_backend_extra_config
         )
 
-    def detach_cache_linker(self) -> str:
+    def detach_cache_linker(self, *, synchronize: bool = True) -> str:
         if self._linker_attachment is None:
             return "External linker is not enabled."
-        return self._linker_attachment.detach()
+        return self._linker_attachment.detach(synchronize=synchronize)
 
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""

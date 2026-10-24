@@ -125,7 +125,32 @@ class CacheLinkerAttachment:
         )
         return f"External linker attached to {storage_backend!r}."
 
-    def detach(self) -> str:
+    def detach(self, *, synchronize: bool = True) -> str:
+        if not synchronize:
+            # Process teardown must not wait for peers that may have exited.
+            return self._detach_local()
+
+        error = None
+        message = ""
+        try:
+            message = self._detach_local()
+        except Exception as e:
+            logger.exception("Failed to detach the external linker.")
+            error = e
+
+        # Even an already-detached rank must participate. A failed close can
+        # leave peers detached and this rank holding a partially stopped linker.
+        # Never resume scheduler collectives in that state.
+        detached = torch.tensor([int(error is None)], dtype=torch.int)
+        self._cache._all_reduce_attn_groups(detached, torch.distributed.ReduceOp.MIN)
+        if not detached.item():
+            raise RuntimeError(
+                "External linker detach failed; scheduler must stop: "
+                f"{error or 'failed on another rank'}"
+            ) from error
+        return message
+
+    def _detach_local(self) -> str:
         if self.storage_backend is None:
             return "External linker is not attached."
         self._cache.close_cache_linker()
