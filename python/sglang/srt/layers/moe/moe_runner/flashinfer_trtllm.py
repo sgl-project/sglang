@@ -817,14 +817,18 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     )
     use_shuffled_weight = quant_info.use_mxfp8
     defer_finalize = _deferred_finalize_enabled.get()
-    if defer_finalize and (
-        not quant_info.block_quant
-        or use_routed_topk
-        or not TopKOutputChecker.format_is_bypassed(topk_output)
+    if defer_finalize and not (
+        quant_info.block_quant
+        and (
+            quant_info.use_mxfp8
+            if use_routed_topk
+            else TopKOutputChecker.format_is_bypassed(topk_output)
+        )
     ):
         raise RuntimeError(
-            "FP8 deferred finalize requires block quantization, the logits-based "
-            "FlashInfer TRTLLM backend, and bypassed TopK"
+            "FP8 deferred finalize requires MXFP8 experts on the routed FlashInfer "
+            "TRTLLM backend, or block quantization with bypassed TopK on the "
+            "logits-based one"
         )
 
     if quant_info.block_quant:
@@ -882,13 +886,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 "runner_config.top_k is required for flashinfer_trtllm_routed."
             )
             routing = _get_routing_for_flashinfer_routed(topk_output)
-            topk_ids, topk_weights = (
-                routing if isinstance(routing, tuple) else (routing, None)
-            )
-
-            trtllm_fp8_block_scale_routed_moe_out_wrapper(
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
+            routed_kwargs = dict(
                 routing_bias=None,
                 hidden_states=a_q,
                 hidden_states_scale=a_sf_t,
@@ -917,12 +915,52 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     else routing_method_type
                 ),
                 use_shuffled_weight=use_shuffled_weight,
-                output=symm_output,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
-                fp8_quantization_type=int(fp8_quantization_type),
-                activation_type=quant_info.activation_type,
             )
-            output = cast(torch.Tensor, symm_output)
+            if defer_finalize:
+                from flashinfer.fused_moe import trtllm_fp8_block_scale_routed_moe
+
+                deferred_kwargs = dict(
+                    topk_ids=routing,
+                    **routed_kwargs,
+                    do_finalize=False,
+                    # Workaround for flashinfer-ai/flashinfer#6077;
+                    # the ignored buffer's shape keeps autotune on the tuned entry;
+                    # drop once fixed upstream.
+                    output=torch.empty(
+                        a_q.shape[0],
+                        a_q.shape[1],
+                        dtype=torch.bfloat16,
+                        device=a_q.device,
+                    ),
+                    fp8_quantization_type=fp8_quantization_type,
+                    enable_pdl=trtllm_moe_enable_pdl(a_q.shape[0]),
+                )
+                if quant_info.activation_type is not None:
+                    from flashinfer.fused_moe.core import ActivationType
+
+                    deferred_kwargs["activation_type"] = ActivationType(
+                        quant_info.activation_type
+                    )
+                # Precomputed routing returns the caller's top-k weights as-is;
+                # they carry the routed scaling, so the finalize applies it once.
+                output = _make_deferred_finalize_output(
+                    trtllm_fp8_block_scale_routed_moe(**deferred_kwargs),
+                    top_k=runner_config.top_k,
+                )
+            else:
+                topk_ids, topk_weights = (
+                    routing if isinstance(routing, tuple) else (routing, None)
+                )
+                trtllm_fp8_block_scale_routed_moe_out_wrapper(
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                    **routed_kwargs,
+                    output=symm_output,
+                    fp8_quantization_type=int(fp8_quantization_type),
+                    activation_type=quant_info.activation_type,
+                )
+                output = cast(torch.Tensor, symm_output)
         else:
             assert TopKOutputChecker.format_is_bypassed(topk_output)
             common_kwargs = dict(

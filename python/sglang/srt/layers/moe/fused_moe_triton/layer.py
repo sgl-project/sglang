@@ -518,11 +518,18 @@ class FusedMoE(torch.nn.Module):
             get_moe_runner_backend().is_flashinfer_trtllm()
             and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
         )
+        mxfp8_routed_deferred = (
+            envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
+            and isinstance(self.quant_method, Fp8MoEMethod)
+            and self.quant_method.use_mxfp8
+            # Converted experts load as block FP8, which the routed op cannot defer.
+            and not self.quant_method.convert_mxfp8_to_block
+        )
         # The routed kernel defers the same way; the standard dispatcher passes
         # the deferred triple through, an A2A combine cannot.
         self.supports_routed_deferred_finalize = (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            and nvfp4_deferred
+            and (nvfp4_deferred or mxfp8_routed_deferred)
             and get_moe_a2a_backend().is_none()
             # No deferred consumer rescales, so the top-k weights must carry it.
             and _fuses_routed_scaling_factor_in_topk(self.quant_method)
