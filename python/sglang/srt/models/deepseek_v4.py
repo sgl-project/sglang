@@ -1603,7 +1603,6 @@ class MQALayer(MqaAttentionBase):
         )
 
     def _mega_mxfp8_output(self, rows: int) -> bool:
-        """Whether the mega attention hands wo_b its fused MXFP8 input."""
         return self.wo_b.deepgemm_mxfp8_input and mhc.fused_mxfp8_rows(rows)
 
     def _mega_core(
