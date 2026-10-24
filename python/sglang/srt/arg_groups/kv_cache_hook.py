@@ -31,6 +31,12 @@ _NVFP4_PREFILL_DEQUANT_DTYPE = {
 }
 
 
+def _require_nvfp4_dsa_platform() -> None:
+    platform = get_platform()
+    if not (platform.is_cuda and platform.is_sm100):
+        raise ValueError("NVFP4 DSA KV cache currently requires CUDA SM100/SM103.")
+
+
 def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
     """Resolve the public prefill dequantization dtype to attention backends."""
 
@@ -41,6 +47,21 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
             raise ValueError(
                 "--prefill-kv-cache-dequant-dtype applies only with "
                 "--kv-cache-dtype=nvfp4."
+            )
+        return
+
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    # DSA materializes compact FP8 through its own gather, not the MHA
+    # workspace/native-FP4 selector. Do not replace its split TRTLLM route.
+    if use_mla_backend(server_args) and is_deepseek_dsa(
+        model_config_of(server_args).hf_config
+    ):
+        _require_nvfp4_dsa_platform()
+        if requested_dtype != "auto":
+            raise ValueError(
+                "--prefill-kv-cache-dequant-dtype is an MHA option; NVFP4 DSA "
+                "uses a compact FP8 gather for TRTLLM-GEN."
             )
         return
 
@@ -116,6 +137,17 @@ def handle_kv4_compatibility(server_args: Any) -> None:
 
     if cfg.kv_cache_dtype not in ("nvfp4", "fp4_mx_block16"):
         return
+
+    # DSA owns a dedicated NVFP4 pool and validates its split TRTLLM backends
+    # in overrides.py. It does not use the generic MLA FP4 pool/backend matrix.
+    if cfg.kv_cache_dtype == "nvfp4":
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        if use_mla_backend(server_args) and is_deepseek_dsa(
+            model_config_of(server_args).hf_config
+        ):
+            _require_nvfp4_dsa_platform()
+            return
 
     uses_mla = use_mla_backend(server_args)
     prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))

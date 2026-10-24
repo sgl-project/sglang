@@ -400,6 +400,105 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(fused._cell_size, 77777)
 
 
+class TestHybridLinearQuantization(CustomTestCase):
+    def test_dsa_scale_capacity_covers_global_layer_ids(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.kv_cache_dtype = object()
+        configurator.kv_cache_dtype_str = "nvfp4"
+        configurator.device = "cpu"
+        configurator.layer_info = SimpleNamespace(end_layer=8)
+        quant_method = MagicMock()
+        module = "sglang.srt.mem_cache.kv_cache_configurator"
+        with (
+            patch(f"{module}.is_float4_e2m1fn_x2", return_value=True),
+            patch(f"{module}.resolve_kv_cache_quant", return_value="nvfp4"),
+            patch(
+                f"{module}.get_kv_cache_quant_method", return_value=quant_method
+            ) as builder,
+        ):
+            result = configurator._build_dsa_fp4_quant_method(num_layers=2)
+
+        self.assertIs(result, quant_method)
+        builder.assert_called_once_with("nvfp4", num_layers=8, device="cpu")
+        quant_method.configure_dsa_mla_scales.assert_called_once_with()
+
+    def test_dsa_uses_dsa_scale_recipe(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = object.__new__(KVCacheConfigurator)
+        dsa_quant_method = object()
+        mha_quant_method = object()
+        # KVCacheConfigurator is slotted; patch the class, not read-only
+        # instance method attributes.
+        with (
+            patch.object(
+                KVCacheConfigurator,
+                "_build_dsa_fp4_quant_method",
+                return_value=dsa_quant_method,
+            ) as dsa_builder,
+            patch.object(
+                KVCacheConfigurator,
+                "_build_mha_quant_method",
+                return_value=mha_quant_method,
+            ) as mha_builder,
+        ):
+            result = configurator._build_hybrid_quant_method(num_layers=2, use_dsa=True)
+
+        self.assertIs(result, dsa_quant_method)
+        dsa_builder.assert_called_once_with(num_layers=2)
+        mha_builder.assert_not_called()
+
+    def test_non_dsa_keeps_mha_scale_recipe(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = object.__new__(KVCacheConfigurator)
+        with (
+            patch.object(KVCacheConfigurator, "_build_dsa_fp4_quant_method") as dsa,
+            patch.object(KVCacheConfigurator, "_build_mha_quant_method") as mha,
+        ):
+            result = configurator._build_hybrid_quant_method(
+                num_layers=3, use_dsa=False
+            )
+        self.assertIs(result, mha.return_value)
+        mha.assert_called_once_with(num_layers=3)
+        dsa.assert_not_called()
+
+    def test_hybrid_dsa_pool_selection_preserves_nvfp4_and_platform_class(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.mem_cache.memory_pool import DSANVFP4TokenToKVPool
+
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.use_mla_backend = True
+        configurator.model_config = SimpleNamespace(hf_config=object())
+        configurator.kv_cache_dtype = object()
+        platform_dsa_pool = type("PlatformDSAPool", (), {})
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator.is_deepseek_dsa",
+            return_value=True,
+        ):
+            for is_fp4, expected in (
+                (True, DSANVFP4TokenToKVPool),
+                (False, platform_dsa_pool),
+            ):
+                with (
+                    self.subTest(is_fp4=is_fp4),
+                    patch(
+                        "sglang.srt.mem_cache.kv_cache_configurator.is_float4_e2m1fn_x2",
+                        return_value=is_fp4,
+                    ),
+                ):
+                    self.assertIs(
+                        configurator._hybrid_full_attention_pool_class(
+                            mha_pool_class=object,
+                            mla_pool_class=object,
+                            dsa_pool_class=platform_dsa_pool,
+                        ),
+                        expected,
+                    )
+
+
 class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
 
