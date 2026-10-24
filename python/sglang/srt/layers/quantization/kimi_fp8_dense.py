@@ -41,7 +41,7 @@ def prepare_weights(layer, block_size) -> bool:
     if not (
         deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
     ):
-        raise RuntimeError("Kimi FP8 dense shape dispatch requires UE8M0 DeepGEMM")
+        return False
 
     # Convert once at load time. Preserve original weights/scales for other M,
     # pre-quantized inputs, and the original prefill/FlashInfer path.

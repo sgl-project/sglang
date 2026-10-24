@@ -3236,6 +3236,13 @@ class KVCacheConfigurator:
             replayssm_active
             and self.hybrid_kda_config is not None
             and envs.SGLANG_K3_KDA_PENDING_REPLAY.get()
+            and not get_memory().enable_unified_memory
+            and get_spec().speculative_algorithm == "DFLASH"
+            and get_spec().speculative_dflash_block_size == 8
+            and config.mamba2_cache_params.shape.temporal == (12, 128, 128)
+            and config.mamba2_cache_params.dtype.temporal == torch.float32
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] == 10
         ):
             heads, value_dim, key_dim = config.mamba2_cache_params.shape.temporal
             # Capacity8: bf16 V/K, fp32 per-K decay and beta, int32/head

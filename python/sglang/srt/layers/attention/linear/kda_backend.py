@@ -488,22 +488,19 @@ class KDAAttnBackend(MambaAttnBackendBase):
         super().__init__(model_runner)
         self.prefill_graph_max_seqs = envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get()
         pool = self.req_to_token_pool.mamba_pool
+        args = model_runner.server_args
         if (
             envs.SGLANG_K3_KDA_PENDING_REPLAY.get()
             and getattr(pool, "replayssm_is_kda", False)
             and getattr(pool, "replayssm_spec_fold", False)
+            and type(pool).__name__ == "MambaPool"
+            and args.speculative_algorithm == "DFLASH"
+            and args.speculative_dflash_block_size == 8
+            and pool.mamba_cache.temporal.shape[2:] == (12, 128, 128)
+            and pool.mamba_cache.temporal.dtype == torch.float32
+            and pool.mamba_cache.temporal.is_cuda
+            and torch.cuda.get_device_capability()[0] == 10
         ):
-            args = model_runner.server_args
-            if type(pool).__name__ != "MambaPool":
-                raise ValueError("KDA pending replay currently requires a fixed MambaPool")
-            if (
-                args.speculative_algorithm != "DFLASH"
-                or args.speculative_dflash_block_size != 8
-                or pool.mamba_cache.temporal.shape[2] != 12
-            ):
-                raise ValueError(
-                    "KDA pending replay experiment requires TP8 Kimi DFlash block8"
-                )
             if pool.kda_pending_replay is None:
                 from sglang.kernels.ops.attention.linear.kda_pending_replay import (
                     KdaPendingReplay,
