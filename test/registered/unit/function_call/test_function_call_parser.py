@@ -3310,7 +3310,6 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
 
-
     def test_anyof_string_null_preserves_json_null(self):
         """anyOf[string,null] with bare null must not become the string 'None'."""
         tools = [
@@ -3332,11 +3331,11 @@ class TestGlm4MoeDetector(unittest.TestCase):
             )
         ]
         text = (
-            "<tool_call>api_fetch"
-            "<arg_key>body</arg_key><arg_value>null</arg_value>"
-            "<arg_key>method</arg_key><arg_value>GET</arg_value>"
-            "<arg_key>params</arg_key><arg_value>null</arg_value>"
-            "<arg_key>url</arg_key><arg_value>https://example.com</arg_value>"
+            "<tool_call>api_fetch\n"
+            "<arg_key>body</arg_key>\n<arg_value>null</arg_value>\n"
+            "<arg_key>method</arg_key>\n<arg_value>GET</arg_value>\n"
+            "<arg_key>params</arg_key>\n<arg_value>null</arg_value>\n"
+            "<arg_key>url</arg_key>\n<arg_value>https://example.com</arg_value>\n"
             "</tool_call>"
         )
         calls = self.detector.detect_and_parse(text, tools).calls

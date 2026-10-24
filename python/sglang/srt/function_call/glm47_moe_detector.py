@@ -887,10 +887,6 @@ class Glm47MoeDetector(BaseFormatDetector):
             if arg_type == "string":
                 if isinstance(parsed_value, str):
                     arguments[arg_key] = parsed_value
-                elif parsed_value is None:
-                    # JSON null must survive; falling back to raw text would
-                    # yield the string "null" when schema is anyOf[string,null].
-                    arguments[arg_key] = None
                 else:
                     arguments[arg_key] = arg_value
             elif arg_type is None:
