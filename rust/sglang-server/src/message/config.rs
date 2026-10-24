@@ -5,8 +5,7 @@
 //! pipeline handoff ([`MmSpec`]).
 //!
 //! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] /
-//! [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
-//! [`MmFamily`] / [`MmResample`] are
+//! [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] are
 //! also `#[pyclass]`es: the Python scheduler (`RustServer._build_server_args`
 //! / `_build_mm_spec`) constructs them directly by keyword and hands them to
 //! `Server`. There is one schema — this file — and
@@ -630,113 +629,60 @@ impl DefaultSamplingParams {
     }
 }
 
-/// The Rust MM pipeline handoff, built by `RustServer._build_mm_spec` from
-/// the resolved `RustMmSpec` and passed to `Server.start_mm_workers`. Same
-/// contract as [`ServerArgs`]: every field is a required, typed constructor
-/// keyword, so a drifted Python caller fails at boot.
+/// The Rust MM pipeline handoff, built by `RustServer._build_mm_spec` and passed
+/// to `Server.start_mm_workers`. Construction resolves the model's image
+/// pipeline from its HF config files (`sglang_processor::select_mm_processor`),
+/// so a model SGLang cannot serve bit-exactly fails when Python builds this,
+/// before the listener binds.
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MmSpec {
     /// Park feature buffers in POSIX shm rather than inline. Set by the Python
     /// launcher (`RustMmProcessor._use_feature_shm`) exactly when the scheduler
     /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
-    /// The family pipeline and its resolved processor parameters.
-    pub pipeline: sglang_mm::registry::PipelineSpec,
+    pub processor: Arc<sglang_processor::MmProcessor>,
 }
 
 #[pyo3::pymethods]
 impl MmSpec {
-    /// The parameter list is flat because every family so far shares the
-    /// Qwen-VL processor geometry; a family with different knobs adds its own
-    /// keywords and match arm here.
+    /// `image_overrides` is `--mm-process-config`'s `image` object as JSON.
     #[new]
     #[pyo3(signature = (*,
-        family,
         feature_shm,
-        image_token_id,
-        patch_size,
-        merge_size,
-        temporal_patch_size,
-        min_pixels,
-        max_pixels,
-        image_mean,
-        image_std,
-        resample,
+        model_path,
+        tokenizer_path,
+        revision,
+        image_processor_backend,
+        image_overrides,
     ))]
-    #[allow(clippy::too_many_arguments)]
     fn py_new(
-        family: MmFamily,
         feature_shm: bool,
-        image_token_id: i64,
-        patch_size: usize,
-        merge_size: usize,
-        temporal_patch_size: usize,
-        min_pixels: usize,
-        max_pixels: usize,
-        image_mean: [f32; 3],
-        image_std: [f32; 3],
-        resample: MmResample,
-    ) -> Self {
-        use sglang_mm::registry::PipelineSpec;
-        let pipeline = match family {
-            MmFamily::QwenVl => PipelineSpec::QwenVl(sglang_mm::qwen_vl::QwenVlSpec {
-                image_token_id,
-                patch_size,
-                merge_size,
-                temporal_patch_size,
-                min_pixels,
-                max_pixels,
-                image_mean,
-                image_std,
-                resample: resample.into(),
-            }),
+        model_path: String,
+        tokenizer_path: String,
+        revision: Option<String>,
+        image_processor_backend: String,
+        image_overrides: Option<String>,
+    ) -> pyo3::PyResult<Self> {
+        use crate::utils::startup::value_error;
+
+        let image_overrides = image_overrides
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|e| value_error("mm image overrides", e))?;
+        let options = sglang_processor::MmProcessorOptions {
+            model_path,
+            tokenizer_path,
+            revision,
+            image_processor_backend: Some(image_processor_backend),
+            image_overrides,
         };
-        Self {
+        let processor = sglang_processor::select_mm_processor(&options)
+            .map_err(|e| value_error("mm pipeline", e))?;
+        Ok(Self {
             feature_shm,
-            pipeline,
-        }
-    }
-}
-
-/// Which `sglang_mm` family pipeline serves the model — one variant per
-/// [`sglang_mm::registry::PipelineSpec`] arm. Exposed to Python as an enum
-/// (`MmFamily.QwenVl`); `RustMmFamily.name` maps onto it at handoff.
-#[pyo3::pyclass(
-    eq,
-    frozen,
-    from_py_object,
-    module = "sglang.srt.rust_extensions._server"
-)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MmFamily {
-    QwenVl,
-}
-
-/// The HF image processor the Rust resize must reproduce bit-exactly (see
-/// [`sglang_mm::qwen_vl::Resampler`]). Exposed to Python as an enum
-/// (`MmResample.AtenU8` / `.Pil`); `RustMmFamily.image_processors` maps each
-/// processor class onto it.
-#[pyo3::pyclass(
-    eq,
-    frozen,
-    from_py_object,
-    module = "sglang.srt.rust_extensions._server"
-)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MmResample {
-    /// `Qwen2VLImageProcessor` / `…Fast` — torchvision on a uint8 tensor.
-    AtenU8,
-    /// `Qwen2VLImageProcessorPil`, behind `--disable-fast-image-processor`.
-    Pil,
-}
-
-impl From<MmResample> for sglang_mm::qwen_vl::Resampler {
-    fn from(r: MmResample) -> Self {
-        match r {
-            MmResample::AtenU8 => Self::AtenU8,
-            MmResample::Pil => Self::Pil,
-        }
+            processor: Arc::new(processor),
+        })
     }
 }
 

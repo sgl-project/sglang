@@ -105,7 +105,6 @@ class RustServer:
         mm_spec = RustMmProcessor(
             server_args=scheduler.server_args,
             model_config=scheduler.model_config,
-            processor=scheduler.processor,
         ).resolve_spec()
         if mm_spec is None:
             supported = sorted(
@@ -117,6 +116,9 @@ class RustServer:
                 f"(supported: {', '.join(supported)}; "
                 "images only). Unset SGLANG_RUST_SERVER to serve this model."
             )
+        # Building the extension's MmSpec resolves the pipeline in Rust; do it
+        # here so a model Rust cannot serve bit-exactly is refused before bind.
+        cls._build_mm_spec(mm_spec)
         return mm_spec
 
     def _start_multimodal(self, scheduler: Scheduler) -> None:
@@ -553,25 +555,15 @@ class RustServer:
     @classmethod
     def _build_mm_spec(cls, spec: RustMmSpec) -> MmSpec:
         """The typed MM configuration for ``Server.start_mm_workers``: the
-        :class:`RustMmSpec` fields the Rust pipeline consumes, as the Rust
+        :class:`RustMmSpec` sources the Rust pipeline resolves from, as the Rust
         extension's own ``MmSpec`` class (same required-keyword contract as
-        :func:`_build_server_args`; ``family`` / ``resample`` become the
-        extension's ``MmFamily`` / ``MmResample`` enums)."""
-        ext = cls._load_extension()
-        family = {"qwen_vl": ext.MmFamily.QwenVl}[spec.family]
-        resample = {"aten_u8": ext.MmResample.AtenU8, "pil": ext.MmResample.Pil}[
-            spec.resample
-        ]
-        return ext.MmSpec(
-            family=family,
+        :func:`_build_server_args`). Raises ``ValueError`` when Rust cannot
+        serve the model's images bit-exactly."""
+        return cls._load_extension().MmSpec(
             feature_shm=spec.feature_shm,
-            image_token_id=spec.image_token_id,
-            patch_size=spec.patch_size,
-            merge_size=spec.merge_size,
-            temporal_patch_size=spec.temporal_patch_size,
-            min_pixels=spec.min_pixels,
-            max_pixels=spec.max_pixels,
-            image_mean=spec.image_mean,
-            image_std=spec.image_std,
-            resample=resample,
+            model_path=spec.model_path,
+            tokenizer_path=spec.tokenizer_path,
+            revision=spec.revision,
+            image_processor_backend=spec.image_processor_backend,
+            image_overrides=spec.image_overrides,
         )

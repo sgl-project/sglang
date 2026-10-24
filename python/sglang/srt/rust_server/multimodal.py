@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 from typing import TYPE_CHECKING, Any, Dict, FrozenSet, Optional, Tuple
 
 import msgspec
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_mm, get_parallel, get_serving
+from sglang.srt.runtime_context import get_mm, get_model, get_parallel, get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -19,48 +20,32 @@ logger = logging.getLogger(__name__)
 
 
 class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
-    """Resolved parameters of the Rust MM pipeline for one model,
-    consumed by the Rust worker pool (as the typed extension ``MmSpec``, see
-    :meth:`RustServer._build_mm_spec`), the ``_multimodal`` parity API
-    (:meth:`rust_json`) and the drain adapter
-    (:meth:`RustMmProcessor.wrap_encoded`)."""
+    """The Rust MM pipeline for one model: the sources Rust resolves it from
+    (`sglang_processor::select_mm_processor`, reached through the extension's
+    ``MmSpec``, see :meth:`RustServer._build_mm_spec`) and the token ids the
+    drain adapter (:meth:`RustMmProcessor.wrap_encoded`) reads."""
 
     family: str
     feature_shm: bool
+    # Where Rust reads config.json and the HF processor config, as Python's
+    # `get_processor` does.
+    model_path: str
+    tokenizer_path: str
+    revision: Optional[str]
+    image_processor_backend: str
+    # `--mm-process-config`'s `image` object as JSON, or None when unset.
+    image_overrides: Optional[str]
     image_token_id: int
-    patch_size: int
-    merge_size: int
-    temporal_patch_size: int
-    min_pixels: int
-    max_pixels: int
-    image_mean: Tuple[float, ...]
-    image_std: Tuple[float, ...]
-    # Which HF processor the Rust resize must reproduce bit-exactly.
-    resample: str
     vision_start_token_id: Optional[int]
     vision_end_token_id: Optional[int]
     video_token_id: Optional[int]
 
-    # Used by the drain adapter only; every other field goes to Rust.
-    DRAIN_ONLY = ("vision_start_token_id", "vision_end_token_id", "video_token_id")
-
-    @property
-    def feature_dim(self) -> int:
-        return 3 * self.temporal_patch_size * self.patch_size * self.patch_size
-
-    def rust_json(self) -> str:
-        """The subset `sglang_mm::registry::pipeline_from_spec` parses — the
-        JSON form the ``_multimodal`` parity API takes; the server itself is
-        handed the typed ``MmSpec`` instead."""
-        fields = (f for f in self.__struct_fields__ if f not in self.DRAIN_ONLY)
-        return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
-
 
 class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
-    """The Python half of one Rust MM family (an arm of
-    `sglang_mm::registry::pipeline_from_spec`): which models it serves.
-    Supporting a new model family = one entry in :data:`RUST_MM_FAMILIES`
-    plus its Rust arm — the launch gate is data-driven."""
+    """The Python half of one Rust MM family (a `dynamo-multimodal` family
+    behind `sglang_processor::mm`): which models it serves. Supporting a new
+    model family = one entry in :data:`RUST_MM_FAMILIES` plus its Rust family
+    (the `processor-mm-parity` skill) — the launch gate is data-driven."""
 
     name: str
     # The registered Python MM processor the Rust pipeline replaces, as
@@ -69,9 +54,6 @@ class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
     mm_processor: str
     # Model types whose image-only M-RoPE matches the family's fast path.
     model_types: FrozenSet[str]
-    # HF image processors the Rust resize reproduces bit-exactly, each mapped
-    # to the `resample` the Rust pipeline must use (see `RustMmSpec.resample`).
-    image_processors: Dict[str, str]
 
     def serves(self, mm_processor_cls: Any, model_type: Optional[str]) -> bool:
         module_name, _, class_name = self.mm_processor.partition(":")
@@ -93,11 +75,6 @@ RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
                 "qwen3_5_moe",
             )
         ),
-        image_processors={
-            "Qwen2VLImageProcessor": "aten_u8",
-            "Qwen2VLImageProcessorFast": "aten_u8",
-            "Qwen2VLImageProcessorPil": "pil",
-        },
     ),
 )
 
@@ -193,14 +170,13 @@ MM_TRANSPORT_STATS = MmTransportStats()
 
 
 class RustMmProcessor:
-    """Builds and validates the Rust MM pipeline for one model.
+    """Selects the Rust MM pipeline for one model.
 
     Construction registers the same ``mm_processor`` mapping the Python
     TokenizerManager would build — not to process requests (the Rust worker pool
-    does that, GIL-free) but as the source of truth
-    :meth:`resolve_spec` resolves the pipeline parameters from. At drain
-    time :meth:`wrap_encoded` wraps the Rust-produced buffers into the
-    scheduler's ``MultimodalProcessorOutput``.
+    does that, GIL-free) but so :meth:`resolve_spec` can tell whether a Rust
+    family serves the model. At drain time :meth:`wrap_encoded` wraps the
+    Rust-produced buffers into the scheduler's ``MultimodalProcessorOutput``.
 
     There is no Python fallback: a model without a Rust MM spec fails at launch,
     and inputs outside the pipeline's scope are rejected per request.
@@ -210,17 +186,10 @@ class RustMmProcessor:
     # GIL-free, so unlike the Python processor pool more than one always helps.
     AUTO_MM_WORKERS = 8
 
-    def __init__(
-        self,
-        *,
-        server_args: ServerArgs,
-        model_config: ModelConfig,
-        processor: Any = None,
-    ):
+    def __init__(self, *, server_args: ServerArgs, model_config: ModelConfig):
         # Lazy: this class exists only for multimodal models under
         # SGLANG_RUST_SERVER.
         from sglang.srt.managers.multimodal_processor import import_processors
-        from sglang.srt.managers.tokenizer_manager import get_processor_wrapper
 
         self.server_args = server_args
         self.model_config = model_config
@@ -228,22 +197,22 @@ class RustMmProcessor:
         self.mm_workers = get_mm().mm_processor_worker_num or self.AUTO_MM_WORKERS
 
         # The mapping the Python TokenizerManager builds in
-        # init_tokenizer_and_processor. The caller's already-loaded HF
-        # AutoProcessor is reused when available (identical construction args).
+        # init_tokenizer_and_processor.
         import_processors("sglang.srt.multimodal.processors")
         if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
             import_processors(mm_process_pkg, overwrite=True)
-        self._processor = processor or get_processor_wrapper()
 
     def resolve_spec(self) -> Optional[RustMmSpec]:
-        """The :class:`RustMmSpec` for this model, or ``None`` when it has no
-        Rust pipeline (the launch gate turns that into a hard error).
+        """The :class:`RustMmSpec` for this model, or ``None`` when no Rust
+        family serves it (the launch gate turns that into a hard error).
 
-        Carries only resolved settings — patch geometry, pixel limits,
-        normalization, token ids — never the HF config, and is conservative by
-        design: an unrecognized knob disables the Rust path rather than being
-        approximated."""
+        Only eligibility is decided here. Rust resolves the processor parameters
+        from the model's HF config files and refuses, when ``MmSpec`` is built,
+        any it cannot reproduce bit for bit."""
         from sglang.srt.managers.multimodal_processor import get_mm_processor_cls
+        from sglang.srt.utils.hf_transformers.processor import (
+            resolve_image_processor_backend,
+        )
 
         hf_config = self.model_config.hf_config
         mm_processor_cls = get_mm_processor_cls(
@@ -254,53 +223,22 @@ class RustMmProcessor:
         )
         if family is None:
             return None
-        image_processor = getattr(self._processor, "image_processor", None)
-        resample = family.image_processors.get(type(image_processor).__name__)
-        if resample is None:
-            return None
-        # The Rust pipeline always resizes, rescales by 1/255 and normalizes;
-        # Rust's fused normalize constants assume that factor. Anything else
-        # would silently produce different features.
-        stages = ("do_resize", "do_rescale", "do_normalize")
-        if not all(getattr(image_processor, stage, True) for stage in stages):
-            return None
-        if getattr(image_processor, "rescale_factor", None) != 1 / 255:
-            return None
-
-        # `--mm-process-config {"image": {...}}`: only pixel-limit overrides are
-        # mirrored by Rust; anything else disables the pipeline.
-        image_overrides = dict((get_mm().mm_process_config or {}).get("image", {}))
-        if not set(image_overrides) <= {"min_pixels", "max_pixels"}:
-            return None
-
-        size = getattr(image_processor, "size", None) or {}
-        min_pixels = image_overrides.get(
-            "min_pixels",
-            getattr(image_processor, "min_pixels", None) or size.get("shortest_edge"),
+        image_overrides = (get_mm().mm_process_config or {}).get("image")
+        spec = RustMmSpec(
+            family=family.name,
+            feature_shm=self._use_feature_shm(),
+            model_path=get_model().model_path,
+            tokenizer_path=get_serving().tokenizer_path,
+            revision=get_model().revision,
+            image_processor_backend=resolve_image_processor_backend(get_mm()),
+            image_overrides=(
+                None if image_overrides is None else json.dumps(image_overrides)
+            ),
+            image_token_id=hf_config.image_token_id,
+            vision_start_token_id=getattr(hf_config, "vision_start_token_id", None),
+            vision_end_token_id=getattr(hf_config, "vision_end_token_id", None),
+            video_token_id=getattr(hf_config, "video_token_id", None),
         )
-        max_pixels = image_overrides.get(
-            "max_pixels",
-            getattr(image_processor, "max_pixels", None) or size.get("longest_edge"),
-        )
-        try:
-            spec = RustMmSpec(
-                family=family.name,
-                feature_shm=self._use_feature_shm(),
-                image_token_id=hf_config.image_token_id,
-                patch_size=image_processor.patch_size,
-                merge_size=image_processor.merge_size,
-                temporal_patch_size=image_processor.temporal_patch_size,
-                min_pixels=int(min_pixels),
-                max_pixels=int(max_pixels),
-                image_mean=tuple(float(x) for x in image_processor.image_mean),
-                image_std=tuple(float(x) for x in image_processor.image_std),
-                resample=resample,
-                vision_start_token_id=getattr(hf_config, "vision_start_token_id", None),
-                vision_end_token_id=getattr(hf_config, "vision_end_token_id", None),
-                video_token_id=getattr(hf_config, "video_token_id", None),
-            )
-        except (AttributeError, TypeError):  # missing/odd processor attrs
-            return None
         logger.info("rust server: Rust MM pipeline enabled (family=%s)", family.name)
         return spec
 

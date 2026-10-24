@@ -1,4 +1,4 @@
-//! Stage 1 of the server MM pipeline: resolve one media source to raw bytes.
+//! Resolve one media source to raw bytes.
 //!
 //! Mirrors the Python `get_image_bytes` source handling (and its precedence):
 //! raw bytes, `http(s)://` (bounded download, `REQUEST_TIMEOUT` and the proxy
@@ -9,6 +9,13 @@ use std::io::Read;
 use std::sync::OnceLock;
 
 use base64::Engine;
+
+/// Per-request media byte bound. Every source consumes this aggregate budget;
+/// [`MAX_FETCH_BYTES`] additionally caps each remote I/O stream. There is
+/// deliberately no item-count bound: like the Python frontend, a request may
+/// carry any number of items within the byte budget (per-modality counts are
+/// the server's `--limit-mm-data-per-request`).
+pub const MAX_REQUEST_BYTES: u64 = 1280 << 20;
 
 /// Cap on one remotely fetched payload. Inline base64 and trusted local files
 /// use their caller's whole-request budget instead.
@@ -58,6 +65,7 @@ impl ByteBudget {
 /// Resolve one string-typed image source into raw encoded-image bytes.
 /// An `Err` rejects the request, matching the Python per-request
 /// exception → 400.
+#[cfg(test)]
 pub fn fetch_bytes(src: &str) -> Result<Vec<u8>, String> {
     fetch_bytes_budgeted(src, &ByteBudget::new(MAX_FETCH_BYTES))
 }

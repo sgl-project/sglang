@@ -27,19 +27,15 @@ register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 class TestWrapEncoded(CustomTestCase):
     def setUp(self):
-        # feature_dim == 3 * temporal_patch_size * patch_size**2 == 6.
         self.spec = RustMmSpec(
             family="qwen_vl",
             feature_shm=False,
+            model_path="model",
+            tokenizer_path="model",
+            revision=None,
+            image_processor_backend="auto",
+            image_overrides=None,
             image_token_id=10,
-            patch_size=1,
-            merge_size=1,
-            temporal_patch_size=2,
-            min_pixels=1,
-            max_pixels=1 << 30,
-            image_mean=(0.0, 0.0, 0.0),
-            image_std=(1.0, 1.0, 1.0),
-            resample="aten_u8",
             vision_start_token_id=11,
             vision_end_token_id=12,
             video_token_id=13,

@@ -18,8 +18,8 @@ mod tokenizer_manager;
 mod utils;
 
 pub use message::config::{
-    DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
-    ModelConfig, RustServerServerArgs, ServerArgs,
+    DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmSpec, ModelConfig,
+    RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
 pub use message::request::MmData;
@@ -28,8 +28,8 @@ pub use multi_modality::encoded::{
     MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
 };
 pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
+pub use multi_modality::tensor::{Tensor, TensorData};
 pub use multi_modality::worker::{MmProcessOutput, MmProcessor};
-pub use sglang_mm::pipeline::{Tensor, TensorData};
 
 use std::sync::Arc;
 
@@ -268,16 +268,13 @@ impl Server {
         self.push_frame(py, crate::message::response::frame_health_ack())
     }
 
-    /// Spawn the MM worker pool for the pipeline in `spec` (built from the
-    /// resolved processor config; see `RustMmProcessor.resolve_spec` and
+    /// Spawn the MM worker pool for the pipeline `spec` resolved (see
     /// `RustServer._build_mm_spec`). Image-only requests are processed entirely
     /// in Rust; their buffers ride the ring with the request (the `mm.*` set of
     /// [`IngressRequest::buffers`]). Anything the pipeline cannot serve is
     /// rejected back to the client -- there is no Python fallback.
-    pub fn start_mm_workers(&self, spec: MmSpec, workers: usize) -> PyResult<()> {
-        self.rt
-            .start_mm_workers(spec, workers)
-            .map_err(|e| value_error("mm spec", e))
+    pub fn start_mm_workers(&self, spec: MmSpec, workers: usize) {
+        self.rt.start_mm_workers(spec, workers);
     }
 
     /// Signal all threads to stop (best effort).
@@ -367,8 +364,6 @@ pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ModelConfig>()?;
     m.add_class::<MetricsConfig>()?;
     m.add_class::<ServerArgs>()?;
-    m.add_class::<MmFamily>()?;
-    m.add_class::<MmResample>()?;
     m.add_class::<MmSpec>()?;
     m.add_class::<IngressRequest>()?;
     m.add_class::<ShmBuffer>()?;

@@ -22,24 +22,17 @@ features = ["python", "parallel"]
 # which renames the built artifact.
 name = "sglang_mm_core"
 # cdylib: the PyO3 module (`sglang.srt.rust_extensions._multimodal`).
-# rlib:   pure-Rust core linked by sglang-server's Rust MM path.
+# rlib:   the pure-Rust core, for the crate's own Rust tests.
 crate-type = ["cdylib", "rlib"]
 
 [features]
-# Both features are deliberately NOT default: cargo unifies a package's
-# features across everything selected in one invocation, so anything default-on
-# here would leak back into sglang-server's copy of this crate under
-# `cargo build --workspace` even though the server depends on it with
-# `default-features = false`. Opting in explicitly keeps the pure-Rust core
-# pure no matter how the workspace is built; the wheel asks for both via
-# `[package.metadata.sglang] features` above.
+# Both features are opt-in, so `cargo test` covers the pure-Rust core; the wheel
+# asks for both via `[package.metadata.sglang] features` above.
 default = []
 # Every PyO3 binding.
 python = ["dep:pyo3", "dep:numpy"]
-# Fan work out onto crate-owned rayon pools (see `common::par`). Off for the
-# rlib: sglang-server provides concurrency across requests and owns its core
-# budget, so preprocessing runs inline on the calling thread and rayon is not
-# linked at all. Orthogonal to `python` so both shapes stay testable.
+# Fan work out onto crate-owned rayon pools (see `common::par`). Orthogonal to
+# `python` so both shapes stay testable.
 parallel = ["dep:rayon"]
 
 [dependencies]
@@ -60,6 +53,3 @@ image = { version = "0.25", default-features = false, features = [
 rayon = { version = "1.10", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Native media fetch (stage 1 of the server MM pipeline); rustls so the
-# extension never links the system OpenSSL.
-ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }

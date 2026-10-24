@@ -64,14 +64,9 @@ impl Runtime {
     /// MM preprocessing floats over that whole set (rather than owning cores
     /// that idle between bursts) and never preempts the scheduler's reserved
     /// cores.
-    pub fn start_mm_workers(
-        &self,
-        spec: crate::message::config::MmSpec,
-        workers: usize,
-    ) -> Result<(), String> {
-        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(spec)?);
+    pub fn start_mm_workers(&self, spec: crate::message::config::MmSpec, workers: usize) {
+        let ctx = Arc::new(crate::multi_modality::worker::MmContext::new(spec));
         self.spawn_mm_pool(workers, ctx);
-        Ok(())
     }
 
     /// Start the shared worker pool with a processor supplied by an external

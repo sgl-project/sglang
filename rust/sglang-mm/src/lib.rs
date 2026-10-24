@@ -3,15 +3,13 @@
 //! Built two ways:
 //! * PyO3 extension `sglang.srt.rust_extensions._multimodal` (feature `python`),
 //!   used by Python processors (e.g. Inkling) and by parity tests.
-//! * Pure-Rust `rlib` (`default-features = false`), linked by `sglang-server`'s
-//!   MM worker path — no pyo3 in that dependency graph.
+//! * Pure-Rust `rlib` (`default-features = false`) for the crate's own tests.
+//!
+//! The Rust server's multimodal pipeline lives in `sglang-processor` (`mm`).
 
 pub mod common;
-pub mod driver;
 pub mod dsv41;
 pub mod inkling;
-pub mod pipeline;
-pub mod qwen_vl;
 pub mod registry;
 
 #[cfg(feature = "python")]
@@ -23,6 +21,5 @@ fn _multimodal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     common::register(m)?;
     inkling::register(m)?;
     dsv41::register(m)?;
-    qwen_vl::register(m)?;
     Ok(())
 }

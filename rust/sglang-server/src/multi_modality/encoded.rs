@@ -7,8 +7,8 @@
 
 use std::collections::BTreeMap;
 
+use super::tensor::Tensor;
 use serde::Serialize;
-use sglang_mm::pipeline::Tensor;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]

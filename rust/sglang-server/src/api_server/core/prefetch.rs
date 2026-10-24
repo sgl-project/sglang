@@ -3,20 +3,21 @@
 //! The MM worker pool is fixed, core-pinned CPU capacity: a slow image host — or
 //! a file on a hanging network mount — must never occupy it, and a request's
 //! images must download concurrently, not in `n * REQUEST_TIMEOUT`. Remote and
-//! inline sources resolve through `sglang-mm`'s `fetch_bytes_budgeted` (one
-//! owner for proxy/timeout/cap semantics); trusted local files skip the remote
+//! inline sources resolve through `multi_modality::fetch` (one owner for
+//! proxy/timeout/cap semantics); trusted local files skip the remote
 //! per-source cap but share the whole-request budget. Resolved bytes ride out-of-band as
 //! [`crate::message::request::MmData::prefetched`], which
-//! [`crate::multi_modality::payload::to_mm_input`] swaps back in.
+//! [`crate::multi_modality::payload::resolve_media_work`] swaps back in.
 
 use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
-use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted, fetch_local_file_budgeted};
-use sglang_mm::driver::MAX_REQUEST_BYTES;
 use tokio::sync::Semaphore;
 
 use crate::message::request::{GenerateRequest, MmData};
+use crate::multi_modality::fetch::{
+    ByteBudget, MAX_REQUEST_BYTES, fetch_bytes_budgeted, fetch_local_file_budgeted,
+};
 use crate::multi_modality::payload::io_sources;
 
 /// Global bound on concurrent media fetches across all in-flight requests;
@@ -31,11 +32,10 @@ static PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::
 /// (`TokenizerManager._validate_mm_limits`). Unset means no per-modality limit,
 /// as in Python. Python has no fixed item cap, and neither does this.
 ///
-/// [`MAX_REQUEST_BYTES`] is enforced while fetching, here rather than in
-/// `sglang_mm::driver::process`, where every source would already be resident.
-/// It bounds buffered media bytes regardless of the item count. The driver
-/// keeps its own byte check as the backstop for callers without a prefetch
-/// layer.
+/// [`MAX_REQUEST_BYTES`] is enforced while fetching, here rather than on the
+/// MM worker, where every source would already be resident. It bounds
+/// buffered media bytes regardless of the item count; `resolve_media_work`
+/// charges the same budget again as the backstop for inline sources.
 pub async fn prefetch_all(
     requests: &mut [GenerateRequest],
     modality_limits: &[(String, usize)],
