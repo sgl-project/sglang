@@ -634,6 +634,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    # A one-request batch's committed KV length, which can lag one verify: a host-side
+    # lower bound attention graph variants select on; None for several requests
+    attention_kv_len_lower_bound: Optional[int] = None
     watermark_prompt_tail_ids: Optional[List[Optional[List[int]]]] = None
     watermark_context_hash_history: Optional[List[Optional[List[int]]]] = None
 
@@ -1094,6 +1097,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            attention_kv_len_lower_bound=(
+                batch.reqs[0].kv.kv_committed_len if len(batch.reqs) == 1 else None
+            ),
             watermark_prompt_tail_ids=(
                 watermark_state.prompt_tails(batch)
                 if watermark_state is not None

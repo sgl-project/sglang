@@ -6,7 +6,7 @@ from __future__ import annotations
 import functools
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Optional
 
 import msgspec
 import torch
@@ -14,9 +14,12 @@ import torch.distributed as dist
 
 from sglang.srt.environ import envs
 from sglang.srt.megakernels.binding import MegakernelBinding
+from sglang.srt.megakernels.eagle_binding import EagleBinding
 from sglang.srt.megakernels.guards import deadline_s, device_isa
 from sglang.srt.megakernels.spec import (
+    ENTRIES,
     FLAG,
+    GRAPH_VARIANT_RUNNERS,
     BuildContext,
     BuiltMegakernel,
     Feature,
@@ -37,12 +40,26 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
 
 logger = logging.getLogger(__name__)
+
+# HF architecture -> the binding its megakernel gets; every other architecture gets
+# MegakernelBinding
+_BINDINGS: dict[str, type] = {
+    arch: EagleBinding
+    for arch in (
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForCausalLMMTP",
+    )
+}
 
 
 def megakernel_enabled() -> bool:
@@ -73,7 +90,7 @@ def install_megakernel(
     _refuse(_gather_reasons(reasons))
 
     tokens = _tokens_per_request()
-    binding = MegakernelBinding(model=model)
+    binding = _binding_class(hf_config.architectures)(model=model)
     context = BuildContext(
         widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
         tokens_per_request=tokens,
@@ -84,8 +101,25 @@ def install_megakernel(
     built = spec.build(model, hf_config, context)
     # not setattr: a built object that is an nn.Module must not join the state dict
     model.__dict__["_megakernel"] = built
-    # Different widths would leave ranks waiting in different collectives.
+    # Different widths would leave ranks waiting in different collectives, and
+    # different entries would run different code around them.
     megakernel_agree(tuple(built.widths), what=f"widths {spec.name} built")
+    entries = _offered_entries(built)
+    megakernel_agree(entries, what=f"entries {spec.name} offers")
+    # a runner captures one graph per label, so ranks offering others would hang
+    variants = _offered_graph_variants(built)
+    megakernel_agree(
+        sorted((runner, tuple(v.capture_labels)) for runner, v in variants.items()),
+        what=f"graph variants {spec.name} offers",
+    )
+    _refuse(
+        [
+            f"graph_variants names {runner!r}, not a runner of "
+            f"{list(GRAPH_VARIANT_RUNNERS)}"
+            for runner in sorted(variants)
+            if runner not in GRAPH_VARIANT_RUNNERS
+        ]
+    )
     if spec.max_rows > 0 and not built.widths:
         _refuse([f"{spec.name} built no width of {list(context.widths)}"])
     # Captured kernels keep state derived from the weights that updates cannot refresh.
@@ -95,14 +129,14 @@ def install_megakernel(
     built_s = time.perf_counter() - start
     used_mib = (free_before - torch.cuda.mem_get_info()[0]) / 2**20
     if not built.widths:
-        # a spec that covers no step, e.g. a draft spec offering draft_sampler only
-        logger.info(
-            "NVIDIA megakernel: %s: %s",
-            spec.name,
-            "draft sampler"
-            if built.draft_sampler is not None
-            else "no step and no draft sampler",
-        )
+        # a spec that covers no step, e.g. a draft spec offering only its entries
+        if built.draft_sampler is not None:
+            offers = "draft sampler"
+        elif entries:
+            offers = "entries " + ", ".join(entries)
+        else:
+            offers = "no step and no draft sampler"
+        logger.info("NVIDIA megakernel: %s: %s", spec.name, offers)
         return
     logger.info(
         "NVIDIA megakernel: active (%s: %s; widths %s; %s numerics; built in %.1f s, "
@@ -141,6 +175,70 @@ def megakernel_draft_sampler(draft_model: torch.nn.Module) -> Optional[Callable]
     """The built draft spec's draft_sampler factory, or None for SGLang's proposal."""
     built = built_megakernel(draft_model)
     return None if built is None else built.draft_sampler
+
+
+def megakernel_entry(model: torch.nn.Module, name: str) -> Optional[Callable]:
+    """The entry (spec.ENTRIES) the model's built megakernel offers, or None for
+    SGLang's own path."""
+    assert name in ENTRIES, name
+    built = built_megakernel(model)
+    # optional members: a built object written before an entry existed lacks it
+    return None if built is None else getattr(built, name, None)
+
+
+def megakernel_graph_variants(
+    model: torch.nn.Module, runner: str, *, batch_sizes: Collection[int]
+) -> Optional[AttentionGraphVariants]:
+    """The attention graph variants the model's built megakernel offers the graph runner
+    (spec.GRAPH_VARIANT_RUNNERS) for its graphs of batch_sizes, the ones that run the
+    megakernel; None when it offers none or batch_sizes is empty."""
+    assert runner in GRAPH_VARIANT_RUNNERS, runner
+    variants = _offered_graph_variants(built_megakernel(model)).get(runner)
+    if variants is None or not batch_sizes:
+        return None
+    logger.info(
+        "NVIDIA megakernel: the %s graphs of batch sizes %s capture the attention "
+        "variants %s",
+        runner,
+        sorted(batch_sizes),
+        list(variants.capture_labels),
+    )
+    return variants
+
+
+def megakernel_verify_variants(
+    model: torch.nn.Module, *, capture_bs: Collection[int], tokens_per_request: int
+) -> tuple[Optional[AttentionGraphVariants], Optional[frozenset[int]]]:
+    """A target's verify graph variants and the batch sizes that capture them, the ones
+    whose rows its megakernel built (plan covers no other); (None, None) if none."""
+    built = built_megakernel(model)
+    if built is None:
+        return None, None
+    sizes = frozenset(
+        bs for bs in capture_bs if bs * tokens_per_request in built.widths
+    )
+    variants = megakernel_graph_variants(model, "target_verify", batch_sizes=sizes)
+    return (None, None) if variants is None else (variants, sizes)
+
+
+def _offered_entries(built: BuiltMegakernel) -> tuple[str, ...]:
+    return tuple(name for name in ENTRIES if getattr(built, name, None) is not None)
+
+
+def _offered_graph_variants(
+    built: Optional[BuiltMegakernel],
+) -> Mapping[str, AttentionGraphVariants]:
+    # an optional member, as the entries are
+    offered = None if built is None else getattr(built, "graph_variants", None)
+    return offered or {}
+
+
+def _binding_class(architectures: Optional[list[str]]) -> type:
+    """The binding SGLang hands the megakernel of a model of these architectures."""
+    for arch in architectures or ():
+        if arch in _BINDINGS:
+            return _BINDINGS[arch]
+    return MegakernelBinding
 
 
 def _find_spec_on_every_rank(
@@ -235,9 +333,8 @@ def _model_disable_reasons(
 class _Dispatch:
     """The installed forward: covered steps run the built megakernel."""
 
-    def __init__(
-        self, *, built: BuiltMegakernel, original: Callable, binding: MegakernelBinding
-    ):
+    def __init__(self, *, built: BuiltMegakernel, original: Callable, binding: Any):
+        # MegakernelBinding, or the binding _BINDINGS names for the architecture
         self.built, self.original, self.binding = built, original, binding
         # batch size -> the step planned while capturing its decode graphs; plan reads
         # only the mode and rows, so every graph variant of a batch size plans alike

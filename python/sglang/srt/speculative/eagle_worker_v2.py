@@ -69,6 +69,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative import eagle_megakernel
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
@@ -171,6 +172,11 @@ def _qsa_index_share_requested(hf_config) -> bool:
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
+    # SGLang's side of the megakernel's EAGLE entries when it offers one
+    # (init_attention_backends sets it); a class default, since unit-test harnesses
+    # build workers without __init__.
+    megakernel: Optional[eagle_megakernel.EagleMegakernel] = None
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -275,6 +281,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ):
             self.draft_worker.init_attention_backends()
             self.init_attention_backend()
+        # the pools and both attention backends exist, no graph is captured yet
+        self.megakernel = eagle_megakernel.init_eagle_megakernel(draft_worker=self)
 
     def init_cuda_graphs(self):
         with (
@@ -670,6 +678,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and draft_input.dsa_topk_indices is None
         ):
             can_run_decode_cuda_graph = False
+        if (
+            self.megakernel is not None
+            and can_run_decode_cuda_graph
+            and not forward_batch.forward_mode.is_idle()
+        ):
+            self.megakernel.begin_draft_round(
+                runner=self.cuda_graph_runner, batch=batch, draft_input=draft_input
+            )
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -969,6 +985,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             kv_loc_plan: The target prefill's plan; the draft writes the same
                 slots.
         """
+        if self.megakernel is not None:
+            self.megakernel.note_draft_extend()
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
@@ -1107,6 +1125,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         *,
         kv_loc_plan: Optional[KVLocPlan] = None,
     ):
+        if self.megakernel is not None:
+            self.megakernel.note_draft_extend()
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
         if batch_result.prepared_draft_extend_inputs is not None:
@@ -1234,9 +1254,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                     select_index
                 ]
+        # A graph whose draft extend the megakernel's draft_extend ran kept its own
+        # top-1
+        served_top1 = (
+            self.megakernel.extend_tokens(
+                runner=self.cuda_graph_runner_for_draft_extend, batch=batch
+            )
+            if self.megakernel is not None and can_run_decode_cuda_graph
+            else None
+        )
         # Selected-row top-k remains worker-owned for both graph and eager
         # paths; the graph runner only moves the row selection before lm_head.
-        if get_spec().speculative_use_rejection_sampling:
+        if served_top1 is not None:
+            ret_topk_p, ret_topk_index = served_top1
+            ret_draft_probs = None
+        elif get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,

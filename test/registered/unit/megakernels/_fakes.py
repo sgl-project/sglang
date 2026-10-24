@@ -71,6 +71,13 @@ DRAFT = replace(
         widths=(), summary=lambda: "draft sampler", draft_sampler=print
     ),
 )
+# a draft spec offering two of the EAGLE entries
+EAGLE_DRAFT = replace(
+    DRAFT,
+    build=lambda model, hf, ctx: SimpleNamespace(
+        widths=(), draft_sampler=None, draft_loop=print, begin_draft_round=repr
+    ),
+)
 
 
 class Lm(torch.nn.Module):
