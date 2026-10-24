@@ -15,7 +15,7 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
 from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -77,6 +77,33 @@ def test_wo_a_partial_quant_matches_quantize():
             q.view(torch.uint8), eq.view(torch.uint8), rtol=0, atol=0
         )
         torch.testing.assert_close(s, es, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("groups", [2, 8])
+def test_wo_a_strided_bmm_matches_einsum(groups):
+    """The strided bmm returns the einsum's values in the token-major layout wo_b reads."""
+    from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
+
+    torch.manual_seed(0)
+    wo_a = torch.randn(groups, 1024, 4096, device=DEVICE, dtype=torch.bfloat16) * 0.02
+    cases = [("is_target_verify", rows) for rows in (9, 64, 100, 128, 384)]
+    cases += [("is_prefill", rows) for rows in (4096, 8192, 16384)]
+    if groups == 8:
+        # 2 groups run 1-8 rows through the gemv and small-batch kernels instead
+        cases += [("is_decode", 1)]
+        cases += [("is_target_verify", rows) for rows in range(1, 9)]
+    for mode, rows in cases:
+        # attention may hand over a head slice of a padded buffer
+        for padded_heads in (groups * 8, 128):
+            x = torch.randn(
+                rows, padded_heads, 512, device=DEVICE, dtype=torch.bfloat16
+            )[:, : groups * 8].view(rows, groups, 4096)
+            flags = dict(is_decode=False, is_target_verify=False, is_prefill=False)
+            flags[mode] = True
+            out = _apply_wo_a_bf16_matmul(x, wo_a, fast_path=True, **flags)
+            case = (groups, mode, rows, padded_heads)
+            assert out.is_contiguous(), case
+            assert torch.equal(out, torch.einsum("tgd,grd->tgr", x, wo_a)), case
 
 
 if __name__ == "__main__":

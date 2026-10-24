@@ -486,7 +486,8 @@ def _apply_wo_a_bf16_matmul(
     emit_fp8: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput | Fp8GridActivation | Mxfp8Activation:
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
-    # on the exact validated TP4 shapes and write token-major output directly.
+    # on the exact validated TP4 (G=2) and CUDA attention-TP1 (G=8) shapes and
+    # write token-major output directly.
     global _wo_a_aiter_batched_gemm_disabled
     # the gfx950 routes, like the CUDA ones, are V4.1's (fast_path); DSv4 keeps the
     # aiter batched GEMM / einsum below
@@ -524,17 +525,18 @@ def _apply_wo_a_bf16_matmul(
         or hip_decode_verify
         or (hip_fast_path and is_prefill and 4096 <= o.shape[0] <= 65536)
     ) and (
-        o.shape[1:] == (2, 4096)
-        and wo_a.shape == (2, 1024, 4096)
+        # 8 groups take only the strided bmm; HIP routes them to its GEMMs below
+        (o.shape[1:] == (2, 4096) or (_is_cuda and o.shape[1:] == (8, 4096)))
+        and wo_a.shape == (o.shape[1], 1024, 4096)
         and o.dtype == wo_a.dtype == torch.bfloat16
         and o.stride(2) == 1
         and o.stride(1) == 4096
-        and o.stride(0) >= 8192
+        and o.stride(0) >= o.shape[1] * 4096
         and wo_a.is_contiguous()
     ):
-        if is_decode and o.shape[0] == 1:
+        if o.shape[1] == 2 and is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
-        if 2 <= o.shape[0] <= 8:
+        if o.shape[1] == 2 and 2 <= o.shape[0] <= 8:
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
