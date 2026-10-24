@@ -12,6 +12,7 @@ use crate::unified_tree_core::{
     PoolTransferResult, UnifiedTreeCore,
 };
 
+pub(crate) mod checkpoint_window;
 mod full;
 mod mamba;
 mod swa;
@@ -508,6 +509,33 @@ pub trait TreeComponent<K: ChildKeyType> {
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _cache_actions: &mut CacheActions,
+    ) {
+    }
+
+    /// Called after UnifiedTreeCore::set_component_device_value_ stores a value.
+    fn on_device_value_set(&self, _tree_core: &mut UnifiedTreeCore<K>, _node_id: NodeIdx_) {}
+
+    /// Called after the core frees another component's value on this node, on device or on host.
+    #[allow(clippy::too_many_arguments)]
+    fn on_peer_value_freed(
+        &self,
+        _tree_core: &mut UnifiedTreeCore<K>,
+        _node_id: NodeIdx_,
+        _component_type: ComponentType,
+        _host: bool,
+        _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
+        _cache_actions: &mut CacheActions,
+        _tracker: Option<&mut HashMap<ComponentType, usize>>,
+    ) {
+    }
+
+    /// Report violations of invariants this component keeps across nodes.
+    fn validate_component_state(
+        &self,
+        _tree_core: &UnifiedTreeCore<K>,
+        _nodes: &[NodeIdx_],
+        _errors: &mut Vec<String>,
     ) {
     }
 }

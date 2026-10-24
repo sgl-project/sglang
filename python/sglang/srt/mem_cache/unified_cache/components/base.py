@@ -73,6 +73,9 @@ class ComponentData:
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     host_value: Optional[torch.Tensor] = None
     host_lock_ref: int = 0
+    # Number of cached checkpoints whose window includes this node, on device and on host.
+    cover_ref: int = 0
+    host_cover_ref: int = 0
     session_ref: int = 0
     session_ids: Optional[set[str]] = None
 
@@ -331,6 +334,13 @@ class TreeComponent(ABC):
             if fallback is not None:
                 self._mark_session_leaf(session_id, fallback)
 
+    def validate_component_state(
+        self,
+        reachable_nodes: set[UnifiedTreeNode],
+        report_error: Callable[[str], None],
+    ) -> None:
+        """Report violations of invariants this component keeps across nodes."""
+
     def validate_session_state(
         self,
         reachable_nodes: set[UnifiedTreeNode],
@@ -387,6 +397,21 @@ class TreeComponent(ABC):
         component whose per-node figure changes in place reports the delta
         through ``UnifiedTreeCore.adjust_component_size``."""
         return self.value_len(node)
+
+    def on_device_value_set(self, node: UnifiedTreeNode) -> None:
+        """Called after UnifiedTreeCore.set_component_device_value stores a value."""
+
+    def on_peer_value_freed(
+        self,
+        node: UnifiedTreeNode,
+        component_type: ComponentType,
+        layer: EvictLayer,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
+        tracker: Optional[dict[ComponentType, int]],
+    ) -> None:
+        """Called after the core frees another component's value on this node, on device or on host."""
 
     def has_host_value_only(self, node: UnifiedTreeNode) -> bool:
         """Whether this component's data is evicted from device but host-backed."""

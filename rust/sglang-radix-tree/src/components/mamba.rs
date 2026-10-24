@@ -8,6 +8,7 @@ use tch::Tensor;
 
 use crate::cache_action::{FreeComponentHostSlot, MambaEvictExcessPathStates};
 use crate::components::TreeComponent;
+use crate::components::checkpoint_window;
 use crate::components::{ComponentType, FULL, Family, MAMBA};
 use crate::node::ChildKeyType;
 use crate::node::Node;
@@ -180,6 +181,9 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             let tokens = tree_core.component_reclaimable_value_len_(node_id, MAMBA);
             tree_core.inc_evictable_size(MAMBA, tokens);
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
+            if tree_core.checkpoint_windows() {
+                checkpoint_window::store_checkpoint(tree_core, node_id, cache_actions);
+            }
             return;
         }
         if !tree_core.arena.has_device_value(node_id, MAMBA) {
@@ -187,6 +191,9 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             let tick = tree_core.arena.get_and_bump_access_counter();
             tree_core.arena.node_mut(node_id).last_access_counter = tick;
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
+            if tree_core.checkpoint_windows() {
+                checkpoint_window::store_checkpoint(tree_core, node_id, cache_actions);
+            }
             return;
         }
         tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
@@ -653,6 +660,9 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     let node = tree_core.arena.node_mut(node_id);
                     if !node.has_host_value(MAMBA) {
                         node.set_host_value(MAMBA, host_indices.copy());
+                        if tree_core.checkpoint_windows() {
+                            checkpoint_window::acquire_window(tree_core, node_id, true);
+                        }
                     }
                 }
             }
@@ -664,11 +674,18 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
                     // The materialization primitive owns the ledger/LRU moves,
                     // including crediting protected when restored under lock.
                     tree_core.set_component_device_value_(node_id, MAMBA, device_indices.copy());
+                    if tree_core.checkpoint_windows() {
+                        checkpoint_window::acquire_window(tree_core, node_id, false);
+                    }
                 }
             }
             // The python elif chain has no BACKUP_STORAGE arm.
             CacheTransferPhase::BackupStorage => {}
             CacheTransferPhase::Prefetch => {
+                assert!(
+                    !tree_core.checkpoint_windows(),
+                    "checkpoint windows do not support storage prefetch"
+                );
                 let Some(transfer) = transfers.first() else {
                     return;
                 };

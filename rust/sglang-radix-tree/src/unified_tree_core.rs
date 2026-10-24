@@ -518,6 +518,8 @@ pub struct ComponentState {
     pub(crate) evict_device_pending_num_tokens: usize,
     /// Token budget for the current eviction walk.
     pub(crate) evict_device_request_cnt: usize,
+    /// Device and host queues of unlocked nodes whose SWA KV is outside every window, oldest first.
+    pub(crate) uncovered: [NodeSet; 2],
 }
 
 /// Tree-construction parameters: the tree-consumed slice of the cache's init params.
@@ -544,6 +546,8 @@ pub struct CacheInitParams {
     pub swa_sliding_window_size: Option<usize>,
     /// Whether SWA lives in a per-request ring rather than cached paged slots.
     pub swa_req_ring: bool,
+    /// Whether SWA KV is kept only for the window before each cached Mamba checkpoint.
+    pub swa_checkpoint_windows: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub has_swa_host_pool: bool,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
@@ -570,6 +574,7 @@ impl Default for CacheInitParams {
             device: Device::Cpu,
             swa_sliding_window_size: None,
             swa_req_ring: false,
+            swa_checkpoint_windows: false,
             has_swa_host_pool: false,
             enable_kv_cache_events: false,
             dynamo_kv_event_format: false,
@@ -645,6 +650,8 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) enable_external_cache_linker: bool,
     /// Whether the cache wired a host SWA pool (HiCache).
     pub(crate) has_swa_host_pool: bool,
+    /// Page-aligned SWA window per Mamba checkpoint, None when disabled.
+    pub(crate) checkpoint_window_tokens: Option<usize>,
     /// Whether tree mutations emit BlockStored/BlockRemoved events.
     pub(crate) enable_kv_cache_events: bool,
     /// If true, events use the dynamo format: namespaced block hashes and extra_key.
@@ -807,6 +814,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         )
     }
 
+    pub(crate) fn checkpoint_windows(&self) -> bool {
+        self.checkpoint_window_tokens.is_some()
+    }
+
     /// The component's tree-wide bookkeeping state.
     pub(crate) fn component_state(&self, component_type: ComponentType) -> &ComponentState {
         &self.component_states[component_type.idx()]
@@ -932,6 +943,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if params.page_size == 0 {
             return Err("page_size must be at least 1".to_owned());
         }
+        if params.swa_checkpoint_windows
+            && !(families.contains(&Family::Window) && families.contains(&Family::State))
+        {
+            return Err("checkpoint windows need the window and state slots".to_owned());
+        }
         let eviction_policy = params.eviction_policy.to_lowercase();
         if !matches!(
             eviction_policy.as_str(),
@@ -986,6 +1002,16 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> Self {
         let component_types: Vec<_> = components.iter().map(|c| c.component_type()).collect();
         Self::validate_components_(&component_types, params.page_size);
+        let checkpoint_window_tokens = params.swa_checkpoint_windows.then(|| {
+            assert!(
+                component_types.contains(&SWA) && component_types.contains(&MAMBA),
+                "checkpoint windows need the SWA and Mamba components"
+            );
+            let window = params
+                .swa_sliding_window_size
+                .expect("the SWA component requires swa_sliding_window_size");
+            window.div_ceil(params.page_size) * params.page_size
+        });
         let arena = NodeArena::new(component_types.clone(), params.page_size);
         let mut tree_core = UnifiedTreeCore {
             arena,
@@ -1015,6 +1041,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             enable_storage: false,
             enable_external_cache_linker: false,
             has_swa_host_pool: params.has_swa_host_pool,
+            checkpoint_window_tokens,
             enable_kv_cache_events: params.enable_kv_cache_events,
             dynamo_kv_event_format: params.dynamo_kv_event_format,
             kv_event_queue: Vec::new(),
@@ -2647,7 +2674,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// The component driver for `component_type`; panics if not enabled.
-    fn component_by_type_(
+    pub(crate) fn component_by_type_(
         &self,
         component_type: ComponentType,
     ) -> Arc<dyn TreeComponent<K> + Send + Sync> {
@@ -3111,7 +3138,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 host_frees,
                 cache_actions,
                 EvictLayer::All,
-                None,
+                Some(&mut *tracker),
             );
             *tracker.entry(component_type).or_insert(0) += host_freed;
         }
@@ -3322,6 +3349,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let node_handle = self.arena.node(node_id).id;
         // Arena slots are reused, so discard tracking before freeing the node.
         self.full_coexisting_host_nodes.discard(node_id);
+        for uncovered in &mut self.component_state_mut(SWA).uncovered {
+            uncovered.discard(node_id);
+        }
         self.namespaced_event_hashes
             .remove(&self.arena.node(node_id).id);
         // The arena is the registry: freeing detaches by page key and recycles the slot.
@@ -3342,8 +3372,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         cache_actions: &mut CacheActions,
         target: EvictLayer,
-        tracker: Option<&mut HashMap<ComponentType, usize>>,
+        mut tracker: Option<&mut HashMap<ComponentType, usize>>,
     ) -> (usize, usize) {
+        let had_device_value = self.arena.has_device_value(node_id, component_type);
         let had_host_copy = self.arena.has_host_value(node_id, component_type);
         let component = self.component_by_type_(component_type);
         let (device_freed, host_freed) = component.evict_component(
@@ -3354,7 +3385,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             cache_actions,
             target,
         );
-        if let Some(tracker) = tracker {
+        if let Some(tracker) = tracker.as_deref_mut() {
             let freed = if target.contains(EvictLayer::Device) {
                 device_freed
             } else {
@@ -3380,6 +3411,31 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let lru = self.host_lru_list_mut(component_type);
             if lru.in_list(Some(node_id)) {
                 lru.remove_node(node_id);
+            }
+        }
+        for (host, had_value) in [(false, had_device_value), (true, had_host_copy)] {
+            let freed = if host {
+                !self.arena.has_host_value(node_id, component_type)
+            } else {
+                !self.arena.has_device_value(node_id, component_type)
+            };
+            if !(had_value && freed) {
+                continue;
+            }
+            for i in 0..self.components.len() {
+                let peer = Arc::clone(&self.components[i]);
+                if peer.component_type() != component_type {
+                    peer.on_peer_value_freed(
+                        self,
+                        node_id,
+                        component_type,
+                        host,
+                        device_frees,
+                        host_frees,
+                        cache_actions,
+                        tracker.as_deref_mut(),
+                    );
+                }
             }
         }
         (device_freed, host_freed)
@@ -5008,6 +5064,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         } else {
             self.inc_evictable_size(component_type, tokens);
         }
+        self.component_by_type_(component_type)
+            .on_device_value_set(self, node_id);
     }
 
     /// Logical radix-key lengths for transfer nodes, preserving caller order.
@@ -5514,6 +5572,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                      has no live load-back"
                 ));
             }
+        }
+
+        for component in &self.components {
+            component.validate_component_state(self, &all_nodes, &mut errors);
         }
 
         if !errors.is_empty() {

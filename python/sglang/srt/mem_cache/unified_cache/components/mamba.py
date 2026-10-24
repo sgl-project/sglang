@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
     MambaEvictExcessPathStates,
 )
+from sglang.srt.mem_cache.unified_cache.components import checkpoint_window
 from sglang.srt.mem_cache.unified_cache.components.base import (
     BASE_COMPONENT_TYPE,
     BufferLoadBackContext,
@@ -243,6 +244,8 @@ class MambaComponent(TreeComponent):
                 self.reclaimable_value_len(node)
             )
             self._emit_excess_path_states_eviction(node, cache_actions)
+            if self.tree_core.checkpoint_windows:
+                checkpoint_window.store_checkpoint(self.tree_core, node, cache_actions)
             return
         if node.component_data[self.component_type].value is None:
             self.tree_core.set_component_device_value(
@@ -250,6 +253,8 @@ class MambaComponent(TreeComponent):
             )
             node.last_access_time = get_and_increase_time_counter()
             self._emit_excess_path_states_eviction(node, cache_actions)
+            if self.tree_core.checkpoint_windows:
+                checkpoint_window.store_checkpoint(self.tree_core, node, cache_actions)
             return
         self.tree_core.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
@@ -600,6 +605,9 @@ class MambaComponent(TreeComponent):
         if cache_len <= token_ids_len:
             return cache_len, keep_idx
 
+        # The SWA retain floor keeps only the latest checkpoint's window.
+        if self.cache.swa_checkpoint_windows:
+            return None
         # Overshoot: the latest state ran past the key. The other slot always
         # holds a tensor; only this seqlen says whether a key can name it.
         previous_cache_len = req.kv.mamba_prev_track_seqlen
@@ -957,6 +965,8 @@ class MambaComponent(TreeComponent):
                 cd = node.component_data[ct]
                 if cd.host_value is None:
                     cd.host_value = transfers[0].host_indices.clone()
+                    if self.tree_core.checkpoint_windows:
+                        checkpoint_window.acquire_window(self.tree_core, node, True)
 
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers:
@@ -968,8 +978,13 @@ class MambaComponent(TreeComponent):
                 self.tree_core.set_component_device_value(
                     node.id, ct, transfer.device_indices.clone()
                 )
+                if self.tree_core.checkpoint_windows:
+                    checkpoint_window.acquire_window(self.tree_core, node, False)
 
         elif phase == CacheTransferPhase.PREFETCH:
+            assert not self.tree_core.checkpoint_windows, (
+                "checkpoint windows do not support storage prefetch"
+            )
             if not transfers:
                 return
             transfer = transfers[0]
