@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import threading
 from queue import Empty, Queue
@@ -19,9 +18,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
-from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
-    LinkerMLADedupBroadcaster,
-)
+from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import LinkerLoadBroadcast
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
     UnifiedCacheLinker,
@@ -125,19 +122,20 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
 
         self.register_buffers()
-        self.mla_broadcaster = None
-        self.tp_group = tp_group
-        self.broadcast_loads = {}
+        self.load_broadcast = None
         if server_args.enable_linker_mla_dedup and rank_replicated and tp_size > 1:
-            self.mla_broadcaster = LinkerMLADedupBroadcaster.build(
-                self.pool_group, params.tp_cache_group, params.attn_tp_cache_group
+            self.load_broadcast = LinkerLoadBroadcast.build(
+                self.pool_group,
+                params.tp_cache_group,
+                params.attn_tp_cache_group,
+                tp_group,
             )
             logger.info(
                 "MLA linker rank-0 loading enabled: tp_rank=%d/%d", tp_rank, tp_size
             )
         self.layer_done_counter = LayerWiseLoadCounter(
             self.num_layers,
-            self._broadcast_loaded_layers if self.mla_broadcaster else None,
+            self.load_broadcast.broadcast_until if self.load_broadcast else None,
         )
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
@@ -233,21 +231,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.gc_frozen = True
 
     def start_layer_wise_loading(self) -> int:
-        broadcaster = self.mla_broadcaster
-        if broadcaster is not None:
-            # Compare the logical load order (not local slots), including empty
-            # batches, before deciding collectively whether this batch can
-            # broadcast.
-            plan = [
-                (rid, [(t.name, list(t.keys)) for t in transfers])
-                for rid, transfers in self.pending_loads.items()
-            ]
-            digest = hashlib.sha256(repr(plan).encode()).digest()
-            digests = [None] * torch.distributed.get_world_size(self.tp_group)
-            torch.distributed.all_gather_object(digests, digest, group=self.tp_group)
-            if any(other != digest for other in digests):
-                logger.warning("MLA linker load plans differ; using all-rank reads.")
-                broadcaster = None
+        broadcast = self.load_broadcast
+        if broadcast is not None and not broadcast.plans_agree(self.pending_loads):
+            logger.warning("MLA linker load plans differ; using all-rank reads.")
+            broadcast = None
         if not self.pending_loads:
             return -1
         self.freeze_gc_once()
@@ -255,46 +242,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads = {}
 
         counter_index = self.layer_done_counter.update_producer()
-        if broadcaster is not None:
-            indices = {}
-            for transfers in pending.values():
-                for transfer in transfers:
-                    indices.setdefault(transfer.name, []).append(transfer.host_indices)
-            prepared = broadcaster.prepare_broadcast(
-                {name: torch.cat(parts) for name, parts in indices.items()},
-                device_module.current_stream(),
-            )
-            if not broadcaster.is_src:
+        if broadcast is not None:
+            broadcast.begin(counter_index, pending)
+            if not broadcast.is_src:
                 for layer in range(self.num_layers):
                     self.layer_done_counter.complete(counter_index, layer)
-        ready_event = device_module.Event()
-        ready_event.record()
-        if broadcaster is not None:
-            self.broadcast_loads[counter_index] = (0, prepared, ready_event)
-        if broadcaster is None or broadcaster.is_src:
+        if broadcast is None or broadcast.is_src:
+            ready_event = device_module.Event()
+            ready_event.record()
             self.load_queue.put((counter_index, pending, ready_event))
         self.stats["load"] += len(pending)
         return counter_index
-
-    def _broadcast_loaded_layers(self, index: int, threshold: int) -> None:
-        batch = self.broadcast_loads.get(index)
-        if batch is None:
-            return
-        first, prepared, ready_event = batch
-        if first == 0:
-            device_module.current_stream().wait_event(ready_event)
-        # KV access may wait several times per layer, or skip sparse layers.
-        # Launch each broadcast exactly once, in order, on the forward stream.
-        for layer in range(first, threshold + 1):
-            self.mla_broadcaster.broadcast_loaded_layer(layer, prepared)
-        if threshold == self.num_layers - 1:
-            del self.broadcast_loads[index]
-        else:
-            self.broadcast_loads[index] = (
-                max(first, threshold + 1),
-                prepared,
-                ready_event,
-            )
 
     def load_thread_func(self) -> None:
         while True:
@@ -422,7 +380,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads.clear()
         self.load_queue.join()
         self.offload_queue.join()
-        self.broadcast_loads.clear()
+        if self.load_broadcast is not None:
+            self.load_broadcast.reset()
         while True:
             try:
                 self.offload_results.get_nowait()
@@ -438,5 +397,5 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_thread.join()
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()
-        if self.mla_broadcaster is not None:
-            self.mla_broadcaster.destroy()
+        if self.load_broadcast is not None:
+            self.load_broadcast.destroy()
