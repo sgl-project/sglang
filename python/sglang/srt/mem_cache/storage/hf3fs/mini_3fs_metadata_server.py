@@ -1,5 +1,4 @@
 import argparse
-import atexit
 import json
 import logging
 import threading
@@ -176,17 +175,30 @@ class GlobalMetadataState:
             logging.error(f"Failed to save metadata to disk: {e}", exc_info=True)
 
     def schedule_save(self):
-        if self.is_shutting_down or not self.persistence_path:
-            return
+        with self.global_lock:
+            if self.is_shutting_down or not self.persistence_path:
+                return
         self.save_to_disk()
-        self.save_timer = threading.Timer(self.save_interval, self.schedule_save)
-        self.save_timer.start()
+        with self.global_lock:
+            # Shutdown may have started while this callback was saving.
+            if not self.is_shutting_down:
+                timer = threading.Timer(self.save_interval, self.schedule_save)
+                timer.start()
+                self.save_timer = timer
 
     def shutdown(self):
+        with self.global_lock:
+            if self.is_shutting_down:
+                return
+            self.is_shutting_down = True
+            timer = self.save_timer
         logging.info("Shutting down metadata server...")
-        self.is_shutting_down = True
-        if self.save_timer:
-            self.save_timer.cancel()
+        if timer:
+            timer.cancel()
+            if timer is not threading.current_thread():
+                # Wait outside global_lock so a running save can finish. It must
+                # release the temporary file before the final save uses it.
+                timer.join()
         self.save_to_disk()
         logging.info("Shutdown complete.")
 
@@ -315,22 +327,26 @@ class Hf3fsMetadataServer:
 
     def run(self, host: str = "0.0.0.0", port: int = 18000):
         """Run the metadata server."""
-        self.state.load_from_disk()
-        if self.state.persistence_path:
-            self.state.schedule_save()
-            atexit.register(self.state.shutdown)
-
         import uvicorn
 
-        logging.info(f"Starting metadata server on http://{host}:{port}")
-        if self.state.persistence_path:
-            logging.info(
-                f"Persistence is ENABLED. Saving to '{self.state.persistence_path}' every {self.state.save_interval} seconds."
-            )
-        else:
-            logging.info("Persistence is DISABLED.")
+        self.state.load_from_disk()
+        try:
+            if self.state.persistence_path:
+                self.state.schedule_save()
 
-        uvicorn.run(self.app, host=host, port=port)
+            logging.info(f"Starting metadata server on http://{host}:{port}")
+            if self.state.persistence_path:
+                logging.info(
+                    f"Persistence is ENABLED. Saving to '{self.state.persistence_path}' every {self.state.save_interval} seconds."
+                )
+            else:
+                logging.info("Persistence is DISABLED.")
+
+            uvicorn.run(self.app, host=host, port=port)
+        finally:
+            # Non-daemon persistence timers must stop before interpreter exit,
+            # which waits for them before running atexit callbacks.
+            self.state.shutdown()
 
 
 # --- Client implementation ---
