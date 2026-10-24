@@ -52,6 +52,7 @@ from sglang.srt.layers.layer_boundary.output import (
 from sglang.srt.layers.layer_boundary.residual import bind_update
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     aiter_ar_fusion_applies,
+    b12x_ar_fusion_applies,
     flashinfer_ar_fusion_applies,
 )
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
@@ -459,7 +460,7 @@ def _batch_allows_deferred_sum(
 ) -> bool:
     """Admit ordinary single-sum outputs, plus LoRA and TP1 shared-expert
     outputs when a fused consumer (the backend's can_defer_all_reduce,
-    FlashInfer or aiter) can take them.
+    FlashInfer, b12x or aiter) can take them.
 
     A fused-kernel fallback completes the partial-output contract selected
     before the producer ran, without recomputing the producer's LoRA path.
@@ -476,7 +477,8 @@ def _batch_allows_deferred_sum(
         and boundary.fusions.can_defer_all_reduce(boundary, forward_batch)
     ):
         return True
-    if flashinfer_ar_fusion_applies(forward_batch.input_ids.shape[0]):
+    batch_size = forward_batch.input_ids.shape[0]
+    if flashinfer_ar_fusion_applies(batch_size) or b12x_ar_fusion_applies(batch_size):
         return True
     # Aiter also checks width and bytes, so use the actual residual storage.
     residual = forward_batch.residual_stream.residual
