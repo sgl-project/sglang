@@ -60,11 +60,15 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsFusedMoEMethod,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
+from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4MoE
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -414,6 +418,7 @@ class FusedMoE(torch.nn.Module):
         # Set by the quant method when it repacks experts for MegaMoE.
         self._mega_moe_weights_built = False
         self._mega_moe_nvfp4 = False
+        self._mega_moe_trtllm_layout = False
         # Read at construction: draft_model_build_scope applies the draft's own value.
         self._mega_moe_w4a4 = get_exec().moe.enable_w4a4_mxfp4_megamoe
         self._pending_fp8_shared_weights: dict[tuple[int, str], torch.Tensor] = {}
@@ -537,6 +542,13 @@ class FusedMoE(torch.nn.Module):
             and isinstance(self.quant_method, Fp8MoEMethod)
             and self.quant_method.block_quant
         )
+        # Packed NVFP4 experts on the routed TRT-LLM runner also return the
+        # do_finalize=False triple; their compressed-tensors method holds the scheme.
+        packed_nvfp4_routed_deferred = (
+            isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+            and isinstance(self.scheme, MiniMaxM3Nvfp4MoE)
+            and self.scheme.use_flashinfer_trtllm
+        )
         qwen4_bf16_deferred = (
             isinstance(self.quant_method, UnquantizedFusedMoEMethod)
             and params_dtype == torch.bfloat16
@@ -569,7 +581,7 @@ class FusedMoE(torch.nn.Module):
             self.runner_backend is not None
             and self.runner_backend.is_flashinfer_trtllm()
             and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
-        )
+        ) or packed_nvfp4_routed_deferred
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
             _deferred_finalize_info_logged = True
