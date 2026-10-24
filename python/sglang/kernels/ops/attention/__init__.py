@@ -278,6 +278,14 @@ for _mod, _fn, _backend, _device in [
         )
     )
 del _mod, _fn, _backend, _device
+register_kernel(
+    KernelSpec(
+        op="attention.kimi_k3_mla_q_cache",
+        backend=KernelBackend.AITER,
+        target="sglang.kernels.ops.attention.mla_q_cache_aiter_hip:run",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 
 
 # Public entry points inventoried by logical operator group (RFC #29630).
