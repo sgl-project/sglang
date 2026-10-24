@@ -129,6 +129,13 @@ class Observability(msgspec.Struct):
         "[984.0, 992.0, 996.0, 998.0, 1000.0, 1002.0, 1004.0, 1008.0, 1016.0]).); 'custom <value1> "
         "<value2> ...' uses custom bucket values (e.g., 'custom 10 50 100 500').",
     ] = None
+    goodput_slo: A[
+        Optional[Dict[str, float]],
+        Arg(
+            help='Latency SLOs in milliseconds for sglang:num_good_requests_total, as a JSON dict with keys from ttft, tpot and e2el, e.g. \'{"ttft": 500, "tpot": 50}\'. A request is good if it finishes normally and meets every given SLO.',
+            type_parser=json.loads,
+        ),
+    ] = None
     gc_warning_threshold_secs: A[
         float,
         "The threshold for long GC warning. If a GC takes longer than this, a warning will be logged. Set to 0 to disable.",

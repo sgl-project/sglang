@@ -115,6 +115,8 @@ class TestEnableMetrics(CustomTestCase):
         ):
             launch_args = [
                 "--enable-metrics",
+                "--goodput-slo",
+                '{"e2el": 600000}',
                 "--cuda-graph-max-bs-decode",
                 2,
                 *other_args,
@@ -259,6 +261,7 @@ class TestEnableMetrics(CustomTestCase):
                 "sglang:request_time_per_output_token_seconds_count",
                 {"is_streaming": "true"},
             ),
+            ("sglang:num_good_requests_total", {"is_streaming": "true"}),
         ]
         _check_metrics_positive(self, metrics, metrics_to_check)
 

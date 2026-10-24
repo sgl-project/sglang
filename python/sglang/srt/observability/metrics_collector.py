@@ -32,7 +32,11 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     FORWARD_OVERLAP_NONE,
     SCHEDULER_STAGE_CATEGORIES,
 )
-from sglang.srt.observability.utils import exponential_buckets, generate_buckets
+from sglang.srt.observability.utils import (
+    exponential_buckets,
+    generate_buckets,
+    meets_goodput_slo,
+)
 from sglang.srt.runtime_context import (
     exports_expert_balancedness_to_prometheus,
     get_context,
@@ -1783,6 +1787,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         bucket_time_to_first_token: Optional[List[float]] = None,
         bucket_inter_token_latency: Optional[List[float]] = None,
         bucket_e2e_request_latency: Optional[List[float]] = None,
+        goodput_slo: Optional[Dict[str, float]] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter as _PromCounter
@@ -1794,6 +1799,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels or {}
+        self.goodput_slo = goodput_slo
 
         self.startup_time_seconds = Gauge(
             name="sglang:startup_time_seconds",
@@ -1896,6 +1902,12 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.num_requests_total = Counter(
             name="sglang:num_requests_total",
             documentation="Number of requests processed.",
+            labelnames=list(labels.keys()) + ["is_streaming"],
+        )
+
+        self.num_good_requests_total = Counter(
+            name="sglang:num_good_requests_total",
+            documentation="Number of requests that finished normally and met every SLO in --goodput-slo.",
             labelnames=list(labels.keys()) + ["is_streaming"],
         )
 
@@ -2057,6 +2069,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         spec_verify_ct: int = 0,
         is_streaming: bool = False,
         time_per_output_token: Optional[float] = None,
+        time_to_first_token: Optional[float] = None,
     ):
         stream_labels = {
             **labels,
@@ -2090,6 +2103,16 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
 
         self.num_requests_total.labels(**stream_labels).inc(1)
+        # time_to_first_token is None for aborted requests and on PD prefill workers.
+        if self.goodput_slo and time_to_first_token is not None:
+            if meets_goodput_slo(
+                goodput_slo=self.goodput_slo,
+                ttft=time_to_first_token,
+                # Without a decode interval, e.g. one token, the TPOT SLO counts as met.
+                tpot=time_per_output_token or 0.0,
+                e2el=e2e_latency,
+            ):
+                self.num_good_requests_total.labels(**stream_labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
         self.histogram_e2e_request_latency.labels(**stream_labels).observe(

@@ -861,6 +861,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bucket_time_to_first_token=get_observability().bucket_time_to_first_token,
                 bucket_e2e_request_latency=get_observability().bucket_e2e_request_latency,
                 bucket_inter_token_latency=get_observability().bucket_inter_token_latency,
+                goodput_slo=get_observability().goodput_slo,
             )
 
             start_cpu_monitor_thread("tokenizer")
@@ -3292,12 +3293,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Aborts have a truncated decode period; PD prefill workers have none.
             finish_reason = recv_obj.finished_reasons[i] or {}
-            time_per_output_token = (
-                state.time_stats.get_time_per_output_token(completion_tokens)
-                if self.disaggregation_mode != DisaggregationMode.PREFILL
+            time_to_first_token = None
+            time_per_output_token = None
+            if (
+                self.disaggregation_mode != DisaggregationMode.PREFILL
                 and finish_reason.get("type") in ("stop", "length")
-                else None
-            )
+            ):
+                time_to_first_token = state.time_stats.get_first_token_latency()
+                time_per_output_token = state.time_stats.get_time_per_output_token(
+                    completion_tokens
+                )
 
             self.metrics_collector.observe_one_finished_request(
                 labels,
@@ -3310,6 +3315,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 spec_verify_ct=spec_verify_ct,
                 is_streaming=getattr(state.obj, "stream", False),
                 time_per_output_token=time_per_output_token,
+                time_to_first_token=time_to_first_token,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

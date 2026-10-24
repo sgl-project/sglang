@@ -2,6 +2,7 @@ import unittest
 
 from sglang.srt.observability.utils import (
     generate_buckets,
+    meets_goodput_slo,
     two_sides_exponential_buckets,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -81,6 +82,18 @@ class TestMetricsUtils(unittest.TestCase):
         # All values should be floats
         for value in result:
             self.assertIsInstance(value, float)
+
+    def test_meets_goodput_slo_requires_every_listed_slo(self):
+        slo = {"ttft": 500, "tpot": 50, "e2el": 3000}
+        met = {"ttft": 0.5, "tpot": 0.04, "e2el": 2.0}
+        self.assertTrue(meets_goodput_slo(goodput_slo=slo, **met))
+        for name, late in (("ttft", 0.6), ("tpot", 0.06), ("e2el", 4.0)):
+            with self.subTest(name):
+                observed = {**met, name: late}
+                self.assertFalse(meets_goodput_slo(goodput_slo=slo, **observed))
+                # An SLO that is not listed is not checked.
+                others = {k: v for k, v in slo.items() if k != name}
+                self.assertTrue(meets_goodput_slo(goodput_slo=others, **observed))
 
 
 if __name__ == "__main__":
