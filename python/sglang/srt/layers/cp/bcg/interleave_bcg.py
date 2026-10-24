@@ -1,8 +1,7 @@
-"""Experimental, exact-shape interleave BCG adapter for GLM-5.3 Flash.
+"""Interleave BCG adapter for GLM-5.3 Flash text prefills.
 
 Keep full-sequence KPool positions separate from the local DSA positions.
-Prefix-free text batches replay when their total token count matches a capture,
-independently of request boundaries. Other batches retain eager CP, including MM.
+Graph row capacity is fixed while live token counts and prefix state can change.
 """
 
 import torch
@@ -27,16 +26,14 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
         result.input_ids_global = torch.zeros(
             capacity, dtype=torch.int64, device=runner.device
         )
+        # Graphs must read the live count from the same address on each replay.
+        result.moe_local_token_count = torch.zeros(
+            (), dtype=torch.int32, device=runner.device
+        )
         return result
 
     def allows_replay(self, batch_size, num_tokens, prefix_lens, contains_mm_inputs):
-        return (
-            batch_size > 0
-            and num_tokens in self.bucket_local_tokens
-            and not contains_mm_inputs
-            and prefix_lens is not None
-            and not any(prefix_lens)
-        )
+        return batch_size > 0 and not contains_mm_inputs and prefix_lens is not None
 
     @staticmethod
     def supports(server_args):
@@ -63,17 +60,21 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
             runner, forward_batch, static_num_tokens=static_num_tokens, capture=capture
         )
         metadata = forward_batch.attn_cp_metadata
-        cp_size = len(metadata.per_rank_actual_token)
-        base, remainder = divmod(static_num_tokens, cp_size)
-        metadata.total_seq_lens = static_num_tokens
-        metadata.per_rank_logical_token = [
-            base + int(rank < remainder) for rank in range(cp_size)
-        ]
+        # KDA projections/reorders retain the captured shape. Eager KPool
+        # compression, KV writes and the output gather use the live lengths
+        # produced by prepare_cp_forward, never the bucket's padded tail.
+        metadata.graph_num_tokens = static_num_tokens
+        self.moe_local_token_count.fill_(
+            metadata.per_rank_logical_token[get_parallel().attn_cp_rank]
+        )
+        metadata.moe_local_token_count = self.moe_local_token_count
         forward_batch.out_cache_loc = out_cache_loc
         # KPool compresses consecutive global tokens; only the model argument
         # (DSA RoPE) is local. Do not replace ForwardBatch's global positions.
         forward_batch.positions = global_positions
-        ids = cp_interleave_input_ids(forward_batch.input_ids, forward_batch)
+        ids = cp_interleave_input_ids(
+            forward_batch.input_ids[: forward_batch.extend_num_tokens], forward_batch
+        )
         self.input_ids_global[: ids.shape[0]].copy_(ids)
         forward_batch.input_ids_global = self.input_ids_global[: ids.shape[0]]
 

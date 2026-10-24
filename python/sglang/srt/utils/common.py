@@ -2988,8 +2988,9 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        if is_npu():
+        if is_npu() or current_platform.is_out_of_tree():
             # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            # Out-of-tree devices are torch PrivateUse1 backends too.
             my_lib.impl(op_name, op_func, "PrivateUse1")
         elif is_xpu():
             my_lib.impl(op_name, op_func, "XPU")
