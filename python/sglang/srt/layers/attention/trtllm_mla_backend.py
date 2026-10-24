@@ -1579,16 +1579,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_cu_seqlens_q = cu_seqlens_q
                     unpad_sum_seq_lens_q = total_tokens
             else:
-                # Divisibility alone does not imply uniform request lengths.
+                # The sum equals bs * max only when all request lengths match.
                 total_tokens = q.shape[0]
                 tokens_per_seq = total_tokens // bs if bs > 0 else 0
                 can_direct_view = (
                     bs > 0
-                    and total_tokens % bs == 0
-                    and all(
-                        length == tokens_per_seq
-                        for length in forward_batch.extend_seq_lens_cpu
-                    )
+                    and total_tokens
+                    == metadata.sum_seq_lens_q
+                    == bs * metadata.max_seq_len_q
                 )
 
                 if can_direct_view:
@@ -1597,14 +1595,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     needs_unpad = False
                 else:
                     # Varying lengths: pad q to (bs, max_seq_len_q, ...)
-                    actual_seq_lens_q = forward_batch.extend_seq_lens
-                    actual_max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                    actual_seq_lens_q = metadata.seq_lens_q
+                    actual_max_seq_len_q = metadata.max_seq_len_q
                     max_seq_len = metadata.max_seq_len_k + actual_max_seq_len_q
 
-                    actual_cu_seqlens_q = torch.nn.functional.pad(
-                        torch.cumsum(actual_seq_lens_q, dim=0, dtype=torch.int32),
-                        (1, 0),
-                    )
+                    actual_cu_seqlens_q = metadata.cu_seqlens_q
 
                     if self.padded_q_buffer is not None:
                         padded_q = self.padded_q_buffer[
