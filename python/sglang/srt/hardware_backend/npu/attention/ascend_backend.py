@@ -1124,8 +1124,6 @@ class AscendAttnBackend(AttentionBackend):
             num_pages = block_tables.shape[1]
             metadata.block_tables[:bs, :num_pages].copy_(block_tables)
             metadata.block_tables[:bs, num_pages:].fill_(0)
-            if in_capture:
-                metadata.seq_lens_cpu_list = local_seq_lens_cpu.tolist()
 
         if self.dsa_dcp_target:
             if "dcp_origin_out_cache_loc" in self.graph_metadata:
@@ -1186,6 +1184,9 @@ class AscendAttnBackend(AttentionBackend):
             seq_lens = seq_lens + self.speculative_step_offset_npu
 
         if self.dense_mla_dcp_target:
+            # Capture consumes the list; NPUGraphRunner patches FIA's lengths on replay.
+            if in_capture:
+                metadata.seq_lens_cpu_list = local_seq_lens_cpu.tolist()
             if forward_mode.is_target_verify():
                 query_len = self.speculative_num_draft_tokens
                 local_query_lens = get_dcp_chain_spec_lens(
