@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -146,6 +146,39 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
             parallel.tp_group.cpu_group,
             src=parallel.tp_group.ranks[0],
         )
+
+    def test_tp_request_broadcast_skips_shm_queue_on_sleep_on_idle(self):
+        """The TP request broadcast goes through the group's shared-memory queue,
+        except with sleep-on-idle: queue readers would busy-poll while rank 0 sleeps."""
+        req = SimpleNamespace(kind="work")
+        for sleep_on_idle in (False, True):
+            with self.subTest(sleep_on_idle=sleep_on_idle):
+                tp_group = SimpleNamespace(
+                    rank=0,
+                    ranks=[0, 1],
+                    cpu_group=object(),
+                    broadcast_object=Mock(side_effect=lambda r: r),
+                )
+                parallel = SimpleNamespace(
+                    attn_dp_enabled=False, tp_size=2, tp_group=tp_group
+                )
+                mod = "sglang.srt.managers.scheduler_components.request_receiver."
+                with (
+                    patch(mod + "get_parallel", return_value=parallel),
+                    patch(
+                        mod + "get_device",
+                        return_value=SimpleNamespace(sleep_on_idle=sleep_on_idle),
+                    ),
+                    patch(
+                        mod + "broadcast_pyobj",
+                        side_effect=lambda r, *_args, **_kwargs: r,
+                    ) as gloo,
+                ):
+                    result = _make_receiver()._broadcast_reqs_across_ranks([req])
+
+                self.assertEqual(result, [req])
+                self.assertEqual(tp_group.broadcast_object.called, not sleep_on_idle)
+                self.assertEqual(gloo.called, sleep_on_idle)
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
