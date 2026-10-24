@@ -1139,11 +1139,52 @@ inline void transfer_kv_page_first_direct_impl(
   }
   static const bool use_v13_signature = runtime_version >= 13000;
 
+  struct DirectCopyWorkspace {
+    std::vector<void*> srcs;
+    std::vector<void*> dsts;
+    std::vector<size_t> sizes;
+    std::vector<const char*> host_layer_bases;
+    std::vector<char*> device_layer_bases;
+
+    void clear() {
+      srcs.clear();
+      dsts.clear();
+      sizes.clear();
+      host_layer_bases.clear();
+      device_layer_bases.clear();
+    }
+  };
+  DirectCopyWorkspace local_workspace;
+  auto* workspace = &local_workspace;
+  if constexpr (!IsLf2Pf) {
+    constexpr size_t kMaxRetainedCopies = 65536;
+    const bool is_mla = src_ptrs.size() == 1;
+    const size_t layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
+    const size_t copies = static_cast<size_t>(num_pages) * layers * (is_mla ? 1 : 2);
+    // Retain capacity only; every call rebuilds its addresses and descriptors.
+    // Oversized calls use local storage to keep the thread's cache bounded.
+    if (copies <= kMaxRetainedCopies && dst_ptrs.size() <= kMaxRetainedCopies) {
+      static thread_local DirectCopyWorkspace cached_workspace;
+      workspace = &cached_workspace;
+    }
+  }
+  struct ClearWorkspace {
+    DirectCopyWorkspace& workspace;
+    ~ClearWorkspace() {
+      if constexpr (!IsLf2Pf) {
+        workspace.clear();
+      }
+    }
+  } clear_workspace{*workspace};
+
   size_t num_copies = 0;
-  std::vector<void*> batch_srcs;
-  std::vector<void*> batch_dsts;
-  std::vector<size_t> batch_sizes;
-  std::vector<size_t> attrs_idxs(1, 0);
+  auto& batch_srcs = workspace->srcs;
+  auto& batch_dsts = workspace->dsts;
+  auto& batch_sizes = workspace->sizes;
+  // Preserve D2H's local storage; H2D needs just one stack attribute index.
+  std::vector<size_t> attrs_idxs(IsLf2Pf ? 1 : 0, 0);
+  size_t first_attr_index = 0;
+  size_t* attrs_indices = IsLf2Pf ? attrs_idxs.data() : &first_attr_index;
   cudaMemcpyAttributes attrs{};
   const int device_id = at::cuda::current_device();
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -1216,20 +1257,39 @@ inline void transfer_kv_page_first_direct_impl(
     batch_dsts.reserve(num_copies);
     batch_sizes.reserve(num_copies);
 
+    auto& host_layer_bases = workspace->host_layer_bases;
+    auto& device_layer_bases = workspace->device_layer_bases;
+    host_layer_bases.reserve(dst_ptrs.size());
+    device_layer_bases.reserve(dst_ptrs.size());
+    if (num_copies > 0) {
+      const char* src_k_base = static_cast<const char*>(src_ptrs[0].data_ptr());
+      const char* src_v_base = is_mla ? nullptr : static_cast<const char*>(src_ptrs[1].data_ptr());
+      for (int64_t j = 0; j < num_layers; ++j) {
+        const int64_t layer_offset = (start_layer_id + j) * src_stride1 * elem_size;
+        host_layer_bases.push_back(src_k_base + layer_offset);
+        device_layer_bases.push_back(static_cast<char*>(dst_ptrs[j].data_ptr()));
+        if (!is_mla) {
+          host_layer_bases.push_back(src_v_base + layer_offset);
+          device_layer_bases.push_back(static_cast<char*>(dst_ptrs[j + num_layers].data_ptr()));
+        }
+      }
+    }
+
     for (const auto i : c10::irange(num_pages)) {
       auto s_index = src_indices_ptr[i * page_size] / page_size;
       auto d_index = dst_indices_ptr[i * page_size];
+      const int64_t src_offset = s_index * src_stride0 * elem_size;
+      const int64_t dst_offset = d_index * dst_stride0 * elem_size;
 
       for (int64_t j = 0; j < num_layers; ++j) {
-        const char* src_k_ptr = static_cast<const char*>(src_ptrs[0].data_ptr()) + s_index * src_stride0 * elem_size +
-                                (start_layer_id + j) * src_stride1 * elem_size;
-        char* dst_k_ptr = static_cast<char*>(dst_ptrs[j].data_ptr()) + d_index * dst_stride0 * elem_size;
+        const size_t k = static_cast<size_t>(j) * (is_mla ? 1 : 2);
+        const char* src_k_ptr = host_layer_bases[k] + src_offset;
+        char* dst_k_ptr = device_layer_bases[k] + dst_offset;
         append_copy(const_cast<char*>(src_k_ptr), dst_k_ptr, copy_size_bytes);
 
         if (!is_mla) {
-          const char* src_v_ptr = static_cast<const char*>(src_ptrs[1].data_ptr()) + s_index * src_stride0 * elem_size +
-                                  (start_layer_id + j) * src_stride1 * elem_size;
-          char* dst_v_ptr = static_cast<char*>(dst_ptrs[j + num_layers].data_ptr()) + d_index * dst_stride0 * elem_size;
+          const char* src_v_ptr = host_layer_bases[k + 1] + src_offset;
+          char* dst_v_ptr = device_layer_bases[k + 1] + dst_offset;
           append_copy(const_cast<char*>(src_v_ptr), dst_v_ptr, copy_size_bytes);
         }
       }
@@ -1251,8 +1311,7 @@ inline void transfer_kv_page_first_direct_impl(
           size_t,
           cudaStream_t);
       auto fn = reinterpret_cast<FnV13>(cuda_memcpy_batch_async_sym);
-      err = fn(
-          batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), num_copies, &attrs, attrs_idxs.data(), 1, stream);
+      err = fn(batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), num_copies, &attrs, attrs_indices, 1, stream);
     } else {
       using FnV12 = cudaError_t (*)(
           void**, void**, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
@@ -1263,7 +1322,7 @@ inline void transfer_kv_page_first_direct_impl(
              batch_sizes.data(),
              num_copies,
              &attrs,
-             attrs_idxs.data(),
+             attrs_indices,
              1,
              &fail_idx,
              stream);
