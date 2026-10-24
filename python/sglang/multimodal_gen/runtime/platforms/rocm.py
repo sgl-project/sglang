@@ -7,6 +7,7 @@ This file is a platform abstraction for ROCm GPUs,
 adjusted to match the structure and interface of `cuda.py`.
 """
 
+import os
 import types
 from functools import lru_cache
 from typing import Any
@@ -244,6 +245,15 @@ class RocmPlatform(Platform):
         use_bf16 = envs.SGLANG_USE_ROCM_VAE_CONV2D_BF16
         use_conv2d = envs.SGLANG_USE_ROCM_VAE_CONV2D or use_bf16
         if use_conv2d:
+            # The rewrite creates shapes MIOpen has never seen (C_in becomes
+            # Kt*C_in at full resolution). Default find stalls for minutes on the
+            # first decode of each new shape; FAST bounds it to ~1.4x warm state.
+            if os.environ.get("MIOPEN_FIND_MODE") is None:
+                os.environ["MIOPEN_FIND_MODE"] = "FAST"
+                logger.info(
+                    "Set MIOPEN_FIND_MODE=FAST: MIOpen's full find costs "
+                    "minutes per new Conv2d VAE shape on the first decode"
+                )
             count = cls._replace_conv3d_with_conv2d(vae, use_bf16=use_bf16)
             if count > 0:
                 mode = "BF16" if use_bf16 else "same dtype"
