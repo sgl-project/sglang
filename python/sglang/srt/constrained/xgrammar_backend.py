@@ -16,11 +16,12 @@
 import dataclasses
 import json
 import logging
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
 from xgrammar import (
     CompiledGrammar,
+    Grammar,
     GrammarCompiler,
     GrammarMatcher,
     StructuralTag,
@@ -39,9 +40,11 @@ from sglang.srt.constrained.base_grammar_backend import (
 )
 from sglang.srt.constrained.json_schema_validation import (
     UnsupportedJSONSchemaFeature,
+    iter_subschemas,
     validate_xgrammar_json_schema,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_pin_memory_available
 
@@ -203,6 +206,71 @@ class XGrammarGrammar(BaseGrammarObject):
         return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=}, {self.current_token=})"
 
 
+_SCHEMA_FORMAT_TYPES = frozenset({"json_schema", "qwen_xml_parameter"})
+# Arbitrary; checking is quadratic in a schema's patterns, which a user tag controls.
+_MAX_PATTERNS_PER_SCHEMA = 64
+
+
+def _iter_schema_formats(node: Any, label: str = "") -> Iterator[Tuple[str, Dict]]:
+    # Yields (enclosing tag begin, format node); walks every value so that new
+    # container formats (optional, repeat, dispatch, ...) are covered too.
+    if isinstance(node, list):
+        for item in node:
+            yield from _iter_schema_formats(item, label=label)
+    elif isinstance(node, dict):
+        if node.get("type") in _SCHEMA_FORMAT_TYPES:
+            yield label, node
+            return
+        if node.get("type") == "tag":
+            label = node.get("begin", label)
+        for value in node.values():
+            yield from _iter_schema_formats(value, label=label)
+
+
+def _schema_compiles(*, fmt: Dict, schema: Any) -> bool:
+    # Tokenizer-free: converts the schema in the format's own style, builds no masks.
+    tag = {"type": "structural_tag", "format": {**fmt, "json_schema": schema}}
+    try:
+        Grammar.from_structural_tag(json.dumps(tag))
+    except RuntimeError:
+        return False
+    return True
+
+
+def _drop_uncompilable_patterns(structural_tag: Dict) -> List[str]:
+    # Workaround for mlc-ai/xgrammar#1001; drop once XGrammar compiles these patterns.
+    # Mutates structural_tag in place; returns one log entry per dropped pattern.
+    # An empty result may leave the tag partly modified; discard it then.
+    if is_legacy_structural_tag(structural_tag):
+        slots = [
+            (s["begin"], {"type": "json_schema", "json_schema": s["schema"]})
+            for s in structural_tag["structures"]
+        ]
+    else:
+        slots = _iter_schema_formats(structural_tag.get("format"))
+    changes = []
+    for label, fmt in slots:
+        schema = fmt.get("json_schema")
+        if not isinstance(schema, dict) or _schema_compiles(fmt=fmt, schema=schema):
+            continue
+        # Check each pattern in place; XML styles compile nested values in JSON style.
+        patterned = [
+            (subschema, pointer, subschema.pop("pattern"))
+            for subschema, pointer in list(iter_subschemas(schema))
+            if isinstance(subschema.get("pattern"), str)
+        ]
+        if len(patterned) > _MAX_PATTERNS_PER_SCHEMA:
+            return []  # Too many to check one by one; keep the original error.
+        if not _schema_compiles(fmt=fmt, schema=schema):
+            return []  # Not a pattern problem; keep the original error.
+        for subschema, pointer, pattern in patterned:
+            subschema["pattern"] = pattern
+            if not _schema_compiles(fmt=fmt, schema=schema):
+                del subschema["pattern"]
+                changes.append(f"{label!r}: dropped pattern at {pointer}")
+    return changes
+
+
 class TokenizerNotSupportedError(Exception):
     """Raised when tokenizer is not supported by XGrammar backend."""
 
@@ -249,6 +317,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
         self.max_whitespace_cnt = max_whitespace_cnt
+        self.relax_structural_tag_patterns = (
+            envs.SGLANG_ENABLE_STRUCTURAL_TAG_PATTERN_RELAXATION.get()
+        )
 
     @property
     def is_support_token_filter(self):
@@ -423,35 +494,61 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="regex"))
 
+    def _compile_structural_tag(self, structural_tag: Dict) -> CompiledGrammar:
+        if is_legacy_structural_tag(structural_tag):
+            self._sanitize_structural_tag_structures(structural_tag)
+            tags = [
+                StructuralTagItem(
+                    begin=structure["begin"],
+                    schema=json.dumps(structure["schema"]),
+                    end=structure["end"],
+                )
+                for structure in structural_tag["structures"]
+            ]
+            new_tag = StructuralTag.from_legacy_structural_tag(
+                tags, structural_tag["triggers"]
+            )
+            new_tag.format.at_least_one = structural_tag.get("at_least_one", False)
+            return self.grammar_compiler.compile_structural_tag(new_tag)
+        self._sanitize_structural_format(structural_tag.get("format"))
+        return self.grammar_compiler.compile_structural_tag(json.dumps(structural_tag))
+
+    def _compile_relaxed_structural_tag(
+        self, *, structural_tag: Dict, error: RuntimeError
+    ) -> Optional[CompiledGrammar]:
+        changes = _drop_uncompilable_patterns(structural_tag)
+        if not changes:
+            return None
+        try:
+            ctx = self._compile_structural_tag(structural_tag)
+        except RuntimeError:
+            return None
+        logger.warning(
+            "Dropped structural tag patterns that XGrammar cannot compile "
+            f"(error: {str(error)[:200]!r}): {'; '.join(changes)}"
+        )
+        return ctx
+
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         try:
             # TODO(dark): it's REALLY stupid to construct object from string and decode it again
             structural_tag = json.loads(key_string)
-            if is_legacy_structural_tag(structural_tag):
-                self._sanitize_structural_tag_structures(structural_tag)
-                tags = [
-                    StructuralTagItem(
-                        begin=structure["begin"],
-                        schema=json.dumps(structure["schema"]),
-                        end=structure["end"],
-                    )
-                    for structure in structural_tag["structures"]
-                ]
-                new_tag = StructuralTag.from_legacy_structural_tag(
-                    tags, structural_tag["triggers"]
-                )
-                new_tag.format.at_least_one = structural_tag.get("at_least_one", False)
-                ctx = self.grammar_compiler.compile_structural_tag(new_tag)
-            else:
-                format_dict = structural_tag.get("format")
-                if isinstance(format_dict, dict):
-                    self._sanitize_structural_format(format_dict)
-                    structural_tag["format"] = format_dict
-                    key_string = json.dumps(structural_tag)
-                ctx = self.grammar_compiler.compile_structural_tag(key_string)
-        except (RuntimeError, json.decoder.JSONDecodeError) as e:
+        except json.decoder.JSONDecodeError as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
+        try:
+            ctx = self._compile_structural_tag(structural_tag)
+        except RuntimeError as e:
+            ctx = None
+            if self.relax_structural_tag_patterns:
+                ctx = self._compile_relaxed_structural_tag(
+                    structural_tag=structural_tag, error=e
+                )
+            if ctx is None:
+                logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
+                return InvalidGrammarObject(str(e))
+            # Show the enforced (relaxed) schemas in matcher error messages.
+            key_string = json.dumps(structural_tag)
         return self._from_context(
             ctx, key_string, GrammarStats(dispatch_type="structural_tag")
         )

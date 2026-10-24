@@ -1268,6 +1268,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_STRUCTURAL_TAG_PATTERN_RELAXATION</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When a structural tag fails to compile in XGrammar because of a <code>pattern</code> it cannot handle (for example a lookbehind or backreference, or a lookahead under <code>qwen3_coder</code>), drop only those <code>pattern</code> values, compile again and log a warning. Other schema errors still fail the request, and so does a <code>patternProperties</code> key XGrammar cannot compile, since only <code>pattern</code> values are dropped. Dropped patterns are not enforced, so arguments of a <code>strict</code> tool may no longer match its schema: validate them yourself. Applies to tool call constraints and to user-supplied <code>structural_tag</code> response formats. When off, the request fails as before.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DEFAULT_THINKING</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable model thinking/reasoning output by default.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
