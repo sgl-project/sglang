@@ -451,7 +451,7 @@ class SchedulePolicy:
     def _uncached_len(r: Req) -> int:
         """Number of tokens that must actually be prefilled for this req
         (all cache levels — device + host via hicache — counted as cached)."""
-        return max(0, len(r.origin_input_ids) - r.num_matched_prefix_tokens)
+        return max(0, r.seqlen - r.num_matched_prefix_tokens)
 
     @staticmethod
     def _sort_by_hrrn(
