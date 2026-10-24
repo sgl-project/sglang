@@ -82,6 +82,40 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_R3_RESTORE_STATS = {"reqs": 0, "rows": 0, "pairs": 0, "changed": 0}
+
+
+def _r3_restore_kept_routing(req, start_len: int) -> None:
+    """Overwrite re-prefill routing rows with the rows kept at retraction time."""
+    kept = getattr(req, "r3_kept_routed_experts", None)
+    if kept is None:
+        return
+    req.r3_kept_routed_experts = None
+    if req.routed_experts is None:
+        return
+    n = min(kept.shape[0], start_len + req.routed_experts.shape[0])
+    if n <= start_len:
+        return
+    old = kept[start_len:n]
+    cur = req.routed_experts[: n - start_len]
+    # Layers that route; dense / non-MoE rows are all zero.
+    moe = old.ne(0).any(dim=-1)
+    changed = old.sort(dim=-1).values.ne(cur.sort(dim=-1).values).any(dim=-1) & moe
+    req.routed_experts[: n - start_len] = old
+    stats = _R3_RESTORE_STATS
+    stats["reqs"] += 1
+    stats["rows"] += n - start_len
+    stats["pairs"] += int(moe.sum())
+    stats["changed"] += int(changed.sum())
+    if stats["reqs"] % 64 == 1:
+        logger.info(
+            "[r3-keep-routing] restored %d reqs, %d token rows; "
+            "re-prefill changed %.4f of (token, MoE layer) expert sets",
+            stats["reqs"],
+            stats["rows"],
+            stats["changed"] / max(1, stats["pairs"]),
+        )
+
 
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     """Return the padded per-request width in flattened speculative output."""
@@ -159,6 +193,7 @@ class SchedulerBatchResultProcessor:
             req_to_token_pool=self.req_to_token_pool,
             start_len=start_len,
         )
+        _r3_restore_kept_routing(req, start_len)
 
         expected_rows = max(0, seqlen - 1 - start_len)
         if (

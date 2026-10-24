@@ -2355,6 +2355,47 @@ def set_mamba_track_indices_from_reqs(
         batch.mamba_track_indices[freed_rows] = -1
 
 
+def _r3_keep_routing_before_release(req: Req, req_to_token_pool) -> None:
+    """Copy captured routing for computed positions to host before KV is freed.
+
+    Active only when SGLANG_R3_KEEP_ROUTING_ON_RETRACT=1. The snapshot is merged
+    with rows kept by earlier retracts of the same request.
+    """
+    if not envs.SGLANG_R3_KEEP_ROUTING_ON_RETRACT.get():
+        return
+    if not req.return_routed_experts or req.kv.req_pool_idx is None:
+        return
+    # input_embeds retraction discards output_ids and restarts generation, so
+    # the previous routing no longer belongs to the request.
+    if req.input_embeds is not None:
+        req.r3_kept_routed_experts = None
+        return
+
+    from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+
+    capturer = get_global_experts_capturer()
+    if capturer is None:
+        return
+    # Positions [0, n) have been forwarded: the last sampled token has no KV
+    # yet, and a retracted chunked prefill has only computed up to
+    # kv_committed_len.
+    n = min(
+        len(req.origin_input_ids) + len(req.output_ids) - 1,
+        req.kv.kv_committed_len,
+    )
+    kept = getattr(req, "r3_kept_routed_experts", None)
+    if n <= (0 if kept is None else kept.shape[0]):
+        return
+    rows = capturer.get_topk(
+        req_pool_idx=req.kv.req_pool_idx,
+        seqlen=n + 1,
+        req_to_token_pool=req_to_token_pool,
+    ).clone()
+    if kept is not None:
+        rows[: kept.shape[0]] = kept
+    req.r3_kept_routed_experts = rows
+
+
 def release_req(
     *,
     req: Req,
@@ -2383,6 +2424,7 @@ def release_req(
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
+    _r3_keep_routing_before_release(req, req_to_token_pool)
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, checkpoint=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.

@@ -641,6 +641,10 @@ class Envs:
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
+    # When rollout routing replay retracts a request, keep the routed-expert
+    # rows captured for tokens that already have logprobs. Re-prefill after a
+    # weight update would otherwise overwrite those rows. Default off.
+    SGLANG_R3_KEEP_ROUTING_ON_RETRACT = EnvBool(False)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
