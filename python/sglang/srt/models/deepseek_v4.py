@@ -201,6 +201,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    ceil_align,
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx942_supported,
@@ -830,6 +831,38 @@ def deepseek_v4_mega_attention_with_output(layer, query, output, attn_sink) -> N
 
 bcg_deepseek_v4_mega_attention_with_output = eager_on_graph(True)(
     deepseek_v4_mega_attention_with_output
+)
+
+
+def deepseek_v4_mega_attention_with_mxfp8_output(
+    layer, query, data, scale, attn_sink
+) -> None:
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    real_num_tokens = forward_batch.global_num_token_non_padded_cpu
+    if real_num_tokens:
+        # DeepGEMM writes the scales at the TMA-aligned stride of the live rows,
+        # while the captured wo_b reads them at the stride of the padded rows.
+        restride = scale.stride(-1) != ceil_align(real_num_tokens, 4)
+        live_scale = (
+            mhc.empty_deepgemm_mxfp8_scales(real_num_tokens, data.shape[1], data.device)
+            if restride
+            else scale[:real_num_tokens]
+        )
+        layer._mega_core(
+            query[:real_num_tokens],
+            attn_sink,
+            forward_batch,
+            get_attn_backend(),
+            out=(data[:real_num_tokens], live_scale),
+        )
+        if restride:
+            scale[:real_num_tokens].copy_(live_scale)
+    data[real_num_tokens:].zero_()
+    scale[real_num_tokens:].zero_()
+
+
+bcg_deepseek_v4_mega_attention_with_mxfp8_output = eager_on_graph(True)(
+    deepseek_v4_mega_attention_with_mxfp8_output
 )
 
 
@@ -1553,12 +1586,24 @@ class MQALayer(MqaAttentionBase):
         if not self.mega_wq_b_permuted:
             q = pack_query(q, kernel_num_heads)
         if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
-            o = q.new_empty((q.shape[0], self.n_local_groups, self.o_lora_rank))
+            rows = q.shape[0]
+            if self._mega_mxfp8_output(rows):
+                y, y_sf = mhc.empty_deepgemm_mxfp8_pair(
+                    rows, self.n_local_groups * self.o_lora_rank, q.device
+                )
+                bcg_deepseek_v4_mega_attention_with_mxfp8_output(
+                    self, q, y, y_sf, attn_sink
+                )
+                return y, y_sf
+            o = q.new_empty((rows, self.n_local_groups, self.o_lora_rank))
             bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
             return o
         return self._mega_core(
             q, attn_sink, forward_batch, attn_backend, allow_mxfp8_output=True
         )
+
+    def _mega_mxfp8_output(self, rows: int) -> bool:
+        return self.wo_b.deepgemm_mxfp8_input and mhc.fused_mxfp8_rows(rows)
 
     def _mega_core(
         self,
@@ -1567,8 +1612,9 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         attn_backend,
         allow_mxfp8_output: bool = False,
-        out: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor | Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        """``out`` is a bf16 tensor or an (fp8, DeepGEMM-packed scale) pair."""
         data, scale = attn_backend.forward(
             q=q,
             k=q,
@@ -1583,14 +1629,12 @@ class MQALayer(MqaAttentionBase):
         groups = self.n_local_groups
         rows = data.shape[0]
         o_fp8, o_s = data[:, :groups], scale[:, :groups]
-        if (
-            allow_mxfp8_output
-            and self.wo_b.deepgemm_mxfp8_input
-            and mhc.fused_mxfp8_rows(rows)
-        ):
-            y, y_sf = mhc.empty_deepgemm_mxfp8_pair(
+        if out is None and allow_mxfp8_output and self._mega_mxfp8_output(rows):
+            out = mhc.empty_deepgemm_mxfp8_pair(
                 rows, groups * self.o_lora_rank, data.device
             )
+        if isinstance(out, tuple):
+            y, y_sf = out
             _fp8_wo_a_einsum(
                 o_fp8,
                 o_s,

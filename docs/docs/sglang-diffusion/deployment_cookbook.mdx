@@ -77,6 +77,14 @@ livenessProbe:
 See [Health endpoints](/docs/sglang-diffusion/api/cli#health-endpoints) for the
 status-code contract and warmup-mode behavior.
 
+## Checkpoint read failures
+
+Safetensors header validation fails without deleting checkpoint files, symlinks,
+or shared cache blobs. A read error can indicate permissions or storage I/O
+problems, not just an incomplete download. Check the underlying error before
+repairing or re-downloading weights. Do not remove shared cache files while other
+replicas may be using them.
+
 ## Stable Model Identity
 
 Use `--served-model-name` when the public model name must remain stable across replicas, hosts, or checkpoint mount paths:
