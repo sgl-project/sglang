@@ -5,6 +5,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_int8 import (
+    ComfyInt8EmbeddingMethod,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers import layerwise_offload
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     _host_resident_tables,
@@ -36,6 +39,18 @@ class _Nested(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.language_model = _Undeclared()
+
+
+class _Int8Embedding(torch.nn.Module):
+    def __init__(self, tensorwise: bool):
+        super().__init__()
+        self.quant_method = ComfyInt8EmbeddingMethod(tensorwise=tensorwise)
+        self.quant_method.create_weights(self, 4, [2], 4, 2, torch.bfloat16)
+        self.weight.copy_(torch.arange(8, dtype=torch.int8).reshape(2, 4))
+        self.weight_scale.fill_(0.5)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.quant_method.embedding(self, input_ids)
 
 
 class TestSelection:
@@ -117,3 +132,30 @@ class TestDetachAndRestore:
         assert model.embed.weight.device.type == "cpu"
         assert actual.device.type == "cuda"
         assert torch.equal(actual, expected)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize(
+        "tensorwise", [False, True], ids=["rowwise-int8", "scalar-int8"]
+    )
+    def test_quantized_table_scales_follow_the_host_lookup(self, tensorwise):
+        model = _Declared(num_embeddings=2, dim=4)
+        model.embed = _Int8Embedding(tensorwise)
+        ids = torch.tensor([[0, 1], [1, 0]])
+        with torch.no_grad():
+            expected = model.embed(ids)
+
+        model.to("cuda")
+        ids = ids.to("cuda")
+        with patch(THRESHOLD_PATH, 1):
+            detached = detach_host_resident_tables(model)
+            assert model.embed.weight.numel() == 0
+            model.to("cuda")
+            restore_host_resident_tables(detached, "cuda")
+
+        with torch.no_grad():
+            actual = model.embed(ids)
+        assert model.embed.weight.device.type == "cpu"
+        assert model.embed.weight_scale.device.type == "cpu"
+        assert model.proj.weight.device.type == "cuda"
+        assert actual.device.type == "cuda"
+        assert torch.equal(actual.cpu(), expected)

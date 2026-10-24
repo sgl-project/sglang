@@ -191,6 +191,7 @@ def restore_host_resident_tables(
 ) -> None:
     for module, data in detached:
         module.weight.data = data
+        module.to("cpu")
         _install_host_gather_hooks(module, device)
         logger.info(
             "Keeping %s (%.2f GiB) in host memory: a gather reads one row per "
