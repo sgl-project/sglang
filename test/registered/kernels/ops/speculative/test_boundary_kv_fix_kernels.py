@@ -49,6 +49,8 @@ def _ref_stash_append(
 ):
     front = stash_t.shape[1]
     for i, rpi in enumerate(rpis.tolist()):
+        if rpi == 0:
+            continue
         m = min(int(avail[i]), front)
         end = int(ends[i])
         keep = front - m
@@ -74,6 +76,8 @@ def _ref_fill_and_locs(
     pos = torch.zeros(bs * width, dtype=torch.int64, device=DEV)
     loc = torch.zeros(bs * width, dtype=torch.int64, device=DEV)
     for i, rpi in enumerate(rpis.tolist()):
+        if rpi == 0:
+            continue
         seq_len = int(seq_lens[i])
         first_valid = max(front - int(valid[rpi]), front - seq_len, 0)
         # Sacrificial zone is capped at the front: original rows always write.
@@ -112,10 +116,119 @@ class TestBoundaryKvFixKernels(CustomTestCase):
             with self.subTest(case=case_i):
                 self._run_case(bs, W, front, warmup, hidden, seq_lens, valid, accept)
 
+    def test_padding_fp32_and_graph_replay(self):
+        front, width, hidden = 2, 4, 32
+        mapping = torch.arange(4 * 128, device=DEV, dtype=torch.int32).reshape(4, 128)
+        slots = torch.tensor([2, 0, 0, 1], device=DEV)
+        lengths = torch.tensor([64, 80, 90, 65], device=DEV)
+        valid = torch.tensor([2, 2, 2, 0], device=DEV, dtype=torch.int32)
+        tokens = torch.arange(8, device=DEV).reshape(4, 2)
+        hiddens = torch.randn(4, front, hidden, device=DEV, dtype=torch.float32)
+        predict = torch.arange(16, device=DEV)
+        verify = torch.randn(16, hidden, device=DEV, dtype=torch.float32)
+        output = torch.empty(24, device=DEV, dtype=torch.int64)
+        output_h = torch.empty(24, hidden, device=DEV)
+        accept = torch.tensor([1, 4, 4, 3], device=DEV, dtype=torch.int32)
+        ends = torch.arange(4, device=DEV) * width + accept
+
+        def run():
+            fill_widened_draft_extend_inputs_triton(
+                output,
+                output_h,
+                predict,
+                verify,
+                tokens,
+                hiddens,
+                valid,
+                lengths,
+                slots,
+                width,
+            )
+            locs, positions = compute_widened_draft_extend_locs_positions(
+                lengths,
+                slots,
+                mapping,
+                valid,
+                width,
+                front,
+                0,
+            )
+            stash_append_boundary_state_triton(
+                predict,
+                verify,
+                ends,
+                accept,
+                slots,
+                tokens,
+                hiddens,
+                valid,
+                False,
+            )
+            return locs, positions
+
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            locs, positions = run()
+        for request_slots in ([1, 0, 0, 2], [0, 0, 0, 0], [2, 0, 0, 1]):
+            slots.copy_(torch.tensor(request_slots, device=DEV))
+            lengths.add_(1)
+            predict.add_(17)
+            old_t, old_h, old_v = tokens.clone(), hiddens.clone(), valid.clone()
+            expected = _ref_fill_and_locs(
+                predict,
+                verify,
+                old_t,
+                old_h,
+                old_v,
+                lengths,
+                slots,
+                mapping,
+                width,
+                0,
+            )
+            _ref_stash_append(
+                old_t, old_h, old_v, predict, verify, ends, accept, slots, False
+            )
+            graph.replay()
+            for actual, ref in zip((output, output_h, positions, locs), expected):
+                torch.testing.assert_close(actual, ref, atol=0, rtol=0)
+            for actual, ref in zip((tokens, hiddens, valid), (old_t, old_h, old_v)):
+                torch.testing.assert_close(actual, ref, atol=0, rtol=0)
+
+    def test_request_alloc_resets_stash_and_preserves_other_hooks(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+            MultiLayerEagleDraftWorker,
+        )
+
+        pool = ReqToTokenPool(2, 64, DEV, enable_memory_saver=False)
+        valid = torch.full((3,), 2, device=DEV, dtype=torch.int32)
+        worker = SimpleNamespace(boundary_kv_stash_valid_lens=valid)
+        notified = []
+        pool.register_on_alloc_rows(lambda slots: notified.extend(slots))
+        pool.register_on_alloc_rows(
+            lambda slots: MultiLayerEagleDraftWorker._reset_boundary_kv_stash(
+                worker, slots
+            )
+        )
+        self.assertEqual(pool.get_mtp_boundary_warmup_tokens(), 0)
+        slot = pool.alloc_rows(1)
+        self.assertEqual(valid[slot].item(), 0)
+        valid[slot] = 2
+        pool.free_rows(slot)
+        reused = pool.alloc_rows(1)
+        self.assertEqual(reused, slot)
+        self.assertEqual(valid[slot].item(), 0)
+        self.assertEqual(valid[0].item(), 2)
+        self.assertEqual(notified, slot + slot)
+
     def _run_case(self, bs, W, front, warmup, hidden, seq_lens, valid, accept):
         torch.manual_seed(0)
         pool, max_ctx = 32, 512
-        rpis = torch.randperm(pool, device=DEV)[:bs].to(torch.int64)
+        rpis = (torch.randperm(pool - 1, device=DEV)[:bs] + 1).to(torch.int64)
         req_to_token = (
             torch.arange(pool * max_ctx, device=DEV, dtype=torch.int32).reshape(
                 pool, max_ctx

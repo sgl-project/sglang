@@ -10,7 +10,7 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from sglang.srt.runtime_context import get_model, get_serving
 
@@ -1150,6 +1150,36 @@ class OpenAIServingChat(OpenAIServingBase):
             f"received unsupported content type '{media_type}'."
         )
 
+    def _mm_processor_accepts_chat_prompt_ids(self) -> bool:
+        mm_processor = self.tokenizer_manager.mm_processor
+        return mm_processor is not None and mm_processor.accepts_chat_prompt_ids
+
+    def _media_for_prompt_ids(self, request: ChatCompletionRequest):
+        image_data, video_data, audio_data, modalities = [], [], [], []
+        messages = [msg.model_dump() for msg in request.messages]
+        if self.template_manager.jinja_template_may_reorder_tool_results:
+            messages = self._canonicalize_tool_message_order(messages)
+        for message in messages:
+            process_content_for_template_format(
+                message,
+                self.template_manager.jinja_template_content_format,
+                image_data,
+                video_data,
+                audio_data,
+                modalities,
+            )
+        if image_data and not video_data:
+            image_token_id = (
+                self.tokenizer_manager.mm_processor.mm_tokens.image_token_id
+            )
+            placeholders = request.input_ids.count(image_token_id)
+            if placeholders != len(image_data):
+                raise ValueError(
+                    f"prompt has {placeholders} image placeholder(s) "
+                    f"but {len(image_data)} image(s)"
+                )
+        return image_data or None, video_data or None, audio_data or None, modalities
+
     def _engine_prompt(
         self, processed_messages: MessageProcessingResult, is_multimodal: bool
     ) -> tuple[str, Any]:
@@ -1157,7 +1187,10 @@ class OpenAIServingChat(OpenAIServingBase):
         the MM processor to tokenize. Token-first encoders instead produce
         pre-rendered input_ids with single placeholder ids and leave the text
         empty; pass those through rather than re-tokenizing an empty prompt.
+        A processor that accepts chat prompt_ids gets them as rendered, so the
+        prompt is not decoded and re-tokenized with a second BOS.
         """
+        prompt_ids = processed_messages.prompt_ids
         # A lossy text round-trip makes the rendered prompt unusable, so send the
         # ids instead. Only when nothing needs placeholder expansion: with media
         # attached the MM processor still has to tokenize the text itself.
@@ -1175,11 +1208,16 @@ class OpenAIServingChat(OpenAIServingBase):
             is_multimodal
             and not chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)
             and not prefers_prompt_ids
+            and not (
+                isinstance(prompt_ids, list)
+                and prompt_ids
+                and self._mm_processor_accepts_chat_prompt_ids()
+            )
         ):
             return "text", processed_messages.prompt
-        if isinstance(processed_messages.prompt_ids, str):
-            return "text", processed_messages.prompt_ids
-        return "input_ids", processed_messages.prompt_ids
+        if isinstance(prompt_ids, str):
+            return "text", prompt_ids
+        return "input_ids", prompt_ids
 
     def _can_reuse_text_only_prompt_ids(
         self, processed_messages: MessageProcessingResult, is_multimodal: bool
@@ -1468,15 +1506,21 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_constraint = ("json_schema", json_schema)
 
         # When input_ids are provided, skip template tokenization entirely;
-        # only stop tokens and tool_call_constraint are needed.
+        # only stop tokens and tool_call_constraint are needed, plus the media
+        # for a processor that expands placeholders in the given ids.
         if request.input_ids is not None:
+            image_data, video_data, audio_data, modalities = (
+                self._media_for_prompt_ids(request)
+                if is_multimodal and self._mm_processor_accepts_chat_prompt_ids()
+                else (None, None, None, [])
+            )
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
-                image_data=None,
-                audio_data=None,
-                video_data=None,
-                modalities=[],
+                image_data=image_data,
+                audio_data=audio_data,
+                video_data=video_data,
+                modalities=modalities,
                 stop=request.stop or [],
             )
         elif self.template_manager.chat_template_name is None:
@@ -1746,6 +1790,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self._tokenizer_auto_adds_specials
                 else {}
             )
+            needs_text_prompt = (
+                is_multimodal and not self._mm_processor_accepts_chat_prompt_ids()
+            )
             try:
                 prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
                     openai_compatible_messages,
@@ -1753,6 +1800,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     template_kwargs=extra_template_kwargs,
                     encode_kwargs=encode_kwargs,
                     use_cache=is_multimodal,
+                    decode_prompt=needs_text_prompt,
                 )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
@@ -1769,6 +1817,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         template_kwargs=extra_template_kwargs,
                         encode_kwargs=encode_kwargs,
                         use_cache=is_multimodal,
+                        decode_prompt=needs_text_prompt,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -1784,7 +1833,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 # The cached decode corresponds to prompt_ids before the prefix.
                 decoded_prompt = None
 
-            if is_multimodal:
+            if needs_text_prompt:
                 prompt = (
                     decoded_prompt
                     if decoded_prompt is not None
@@ -1814,6 +1863,7 @@ class OpenAIServingChat(OpenAIServingBase):
         template_kwargs: Dict[str, Any],
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
+        decode_prompt: bool = True,
     ) -> tuple[List[int], Optional[str]]:
         cache_key = None
         if use_cache:
@@ -1866,7 +1916,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
-            if cache_key is not None
+            if cache_key is not None and decode_prompt
             else None
         )
 
@@ -2022,10 +2072,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 and raw_request.headers.get("x-sglext-ids-framed") == "1"
             )
 
+            stream_chunk_id: Optional[str] = None
+
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
+
+                if stream_chunk_id is None:
+                    stream_chunk_id = content["meta_info"]["id"]
+                content["meta_info"]["id"] = stream_chunk_id
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
                     content["meta_info"]

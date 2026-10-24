@@ -61,6 +61,7 @@ from sglang.srt.beam_search.output import (
     try_build_beam_search_out_dict,
 )
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.step5 import get_step5_text_config
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -1374,6 +1375,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
+        if input_ids and get_step5_text_config(self.model_config.hf_config) is not None:
+            vocab_size = self.model_config.vocab_size
+            sequences = input_ids if isinstance(input_ids[0], list) else [input_ids]
+            if any(
+                token_id < 0 or token_id >= vocab_size
+                for seq in sequences
+                for token_id in seq
+            ):
+                raise ValueError(
+                    f"The input_ids {input_ids} contains values outside [0, {vocab_size})."
+                )
         # FIXME: unify the length validation logic with the one in the scheduler.
         if get_exec().features.enable_encoder_swa_bounded_replay:
             if any(
@@ -1941,7 +1953,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
-            for tokenized_obj in tokenized_objs:
+            for index, tokenized_obj in enumerate(tokenized_objs):
+                tokenized_obj = wrap_shm_features(tokenized_obj)
+                tokenized_objs[index] = tokenized_obj
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):

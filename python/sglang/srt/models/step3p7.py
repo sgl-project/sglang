@@ -6,6 +6,7 @@ from torch import nn
 from transformers.activations import ACT2FN
 
 from sglang.srt.configs.step3p7 import Step3p7Config
+from sglang.srt.configs.step5 import get_step5_text_config
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -21,7 +22,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.step3_vl_10b import PerceptionEncoder
 from sglang.srt.models.step3p5 import Step3p5ForCausalLM
+from sglang.srt.models.step5 import Step5ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix
 
 
@@ -40,7 +43,12 @@ class Step3p7ForConditionalGeneration(nn.Module):
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
-        return Step3p5ForCausalLM.get_model_config_for_expert_location(
+        language_model_cls = (
+            Step5ForCausalLM
+            if get_step5_text_config(config) is not None
+            else Step3p5ForCausalLM
+        )
+        return language_model_cls.get_model_config_for_expert_location(
             config.text_config
         )
 
@@ -49,29 +57,55 @@ class Step3p7ForConditionalGeneration(nn.Module):
         config: Step3p7Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        *,
+        valid_vocab_size: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
 
+        use_data_parallel = (
+            get_mm().mm_enable_dp_encoder or get_parallel().attn_dp_size > 1
+        )
         self.vision_model = PerceptionEncoder(
             config.vision_config,
             ACT2FN[config.vision_config.hidden_act],
             quant_config=None,  # Vision weights are not quantized
             prefix=add_prefix("vision_model", prefix),
+            use_data_parallel=use_data_parallel,
         )
         self.vit_large_projector = ColumnParallelLinear(
             config.vision_config.width * 4,
             config.text_config.hidden_size,
             bias=config.projector_bias,
-            gather_output=True,
+            gather_output=not use_data_parallel,
             quant_config=None,  # Projector weights are bf16
             prefix=add_prefix("vit_large_projector", prefix),
+            parallel_group="replicated" if use_data_parallel else "tp",
         )
-        self.language_model = Step3p5ForCausalLM(
+        language_model_cls = Step3p5ForCausalLM
+        language_kwargs = {}
+        if get_step5_text_config(config) is not None:
+            language_model_cls = Step5ForCausalLM
+            language_kwargs["valid_vocab_size"] = valid_vocab_size
+        self.language_model = language_model_cls(
             config=config.text_config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
+            **language_kwargs,
         )
+
+    @property
+    def layer_selection(self):
+        # The Step5 runner consumes the backbone's exact FULL/SWA partition.
+        return self.language_model.layer_selection
+
+    @property
+    def start_layer(self):
+        return self.language_model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.language_model.end_layer
 
     def _get_vision_model_output(self, input_tensor: torch.Tensor) -> torch.Tensor:
         return self.vision_model(input_tensor)
@@ -86,47 +120,129 @@ class Step3p7ForConditionalGeneration(nn.Module):
         return torch.cat(tuple(self._flatten_embeddings(t) for t in embeddings))
 
     def _process_image_features(self, image_features: torch.Tensor) -> torch.Tensor:
-        image_features, _ = self.vit_large_projector(image_features)
+        # Batched vision outputs may be strided after patch packing. Keep the
+        # projector on the optimized CuTeDSL BF16 GEMM path with K-major input.
+        image_features, _ = self.vit_large_projector(image_features.contiguous())
         return image_features
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        assert len(items) == 1
+        if not items:
+            raise ValueError("Step3.7 get_image_feature requires at least one item.")
 
-        item = items[0]
-        pixel_values = item.feature.type(self.vision_model.dtype)
-        num_patches = item.model_specific_data.get("num_patches")
-        patch_pixel_values = item.model_specific_data.get("patch_pixel_values", None)
-        if patch_pixel_values is not None:
-            patch_pixel_values = patch_pixel_values.type(self.vision_model.dtype).to(
-                self.device
-            )
+        # Thumbnails and local patches have different semantics, so batch each
+        # group independently and restore the original item/image order below.
+        all_thumbnails = []
+        all_patches = []
+        # Per-item metadata: (thumbnail count, patch counts per image, patch count)
+        item_metadata = []
 
-        image_features = self._get_vision_model_output(pixel_values)
-        patch_image_features = (
-            self._get_vision_model_output(patch_pixel_values)
-            if patch_pixel_values is not None
-            else None
-        )
-        image_features = self._process_image_features(image_features)
-        patch_image_features = (
-            self._process_image_features(patch_image_features)
-            if patch_image_features is not None
-            else None
-        )
-        merged_image_features = []
-        cur_patch_idx = 0
-        for i, num_patch in enumerate(num_patches):
-            cur_feature = []
-            if num_patch > 0:
-                patch_slice = patch_image_features[
-                    cur_patch_idx : cur_patch_idx + num_patch
+        for item in items:
+            pixel_values = item.feature.type(self.vision_model.dtype)
+            num_patches = item.model_specific_data.get("num_patches")
+            if num_patches is None:
+                raise ValueError("Step3.7 image item is missing num_patches.")
+            if isinstance(num_patches, torch.Tensor):
+                num_patches = [int(x) for x in num_patches.flatten().cpu().tolist()]
+            elif isinstance(num_patches, (list, tuple)):
+                num_patches = [
+                    int(x.item()) if isinstance(x, torch.Tensor) else int(x)
+                    for x in num_patches
                 ]
-                cur_feature.append(patch_slice.view(-1, patch_slice.shape[-1]))
-            cur_feature.append(image_features[i].view(-1, image_features.shape[-1]))
-            cur_patch_idx += num_patch
-            merged_image_features.append(
-                torch.cat(cur_feature) if len(cur_feature) > 1 else cur_feature[0]
+            else:
+                num_patches = [int(num_patches)]
+            if any(count < 0 for count in num_patches):
+                raise ValueError("Step3.7 image item has a negative num_patches value.")
+
+            thumbnail_count = pixel_values.shape[0]
+            if len(num_patches) != thumbnail_count:
+                raise ValueError(
+                    "Step3.7 image item has mismatched thumbnail and num_patches "
+                    f"counts: {thumbnail_count} != {len(num_patches)}."
+                )
+
+            patch_pixel_values = item.model_specific_data.get(
+                "patch_pixel_values", None
             )
+            if patch_pixel_values is not None and patch_pixel_values.shape[0] == 0:
+                patch_pixel_values = None
+            if patch_pixel_values is not None:
+                patch_pixel_values = patch_pixel_values.type(
+                    self.vision_model.dtype
+                ).to(self.device)
+
+            patch_count = (
+                patch_pixel_values.shape[0] if patch_pixel_values is not None else 0
+            )
+            expected_patch_count = sum(num_patches)
+            if patch_count != expected_patch_count:
+                raise ValueError(
+                    "Step3.7 image item has mismatched patch_pixel_values and "
+                    f"num_patches counts: {patch_count} != {expected_patch_count}."
+                )
+
+            all_thumbnails.append(pixel_values)
+            if patch_pixel_values is not None:
+                all_patches.append(patch_pixel_values)
+            item_metadata.append((thumbnail_count, num_patches, patch_count))
+
+        # Use one ViT/projector pass for all thumbnails and one for all local
+        # patches. Avoid a redundant allocation on the single-item path.
+        thumbnail_batch = (
+            all_thumbnails[0]
+            if len(all_thumbnails) == 1
+            else torch.cat(all_thumbnails, dim=0)
+        )
+        all_thumbnail_features = self._process_image_features(
+            self._get_vision_model_output(thumbnail_batch)
+        )
+
+        all_patch_features = None
+        if all_patches:
+            patch_batch = (
+                all_patches[0]
+                if len(all_patches) == 1
+                else torch.cat(all_patches, dim=0)
+            )
+            all_patch_features = self._process_image_features(
+                self._get_vision_model_output(patch_batch)
+            )
+
+        # Split the batched output back into item/image order. The flattened
+        # result must align with the multimodal placeholders in input_ids.
+        merged_image_features = []
+        thumbnail_offset = 0
+        patch_offset = 0
+        for thumbnail_count, num_patches, patch_count in item_metadata:
+            item_thumbnail_features = all_thumbnail_features[
+                thumbnail_offset : thumbnail_offset + thumbnail_count
+            ]
+            thumbnail_offset += thumbnail_count
+            item_patch_features = (
+                all_patch_features[patch_offset : patch_offset + patch_count]
+                if patch_count > 0
+                else None
+            )
+            patch_offset += patch_count
+
+            current_patch_index = 0
+            for image_index, num_patch in enumerate(num_patches):
+                current_features = []
+                if num_patch > 0:
+                    patch_slice = item_patch_features[
+                        current_patch_index : current_patch_index + num_patch
+                    ]
+                    current_features.append(patch_slice.view(-1, patch_slice.shape[-1]))
+                current_features.append(
+                    item_thumbnail_features[image_index].view(
+                        -1, item_thumbnail_features.shape[-1]
+                    )
+                )
+                current_patch_index += num_patch
+                merged_image_features.append(
+                    torch.cat(current_features)
+                    if len(current_features) > 1
+                    else current_features[0]
+                )
         return self._flatten_embeddings(merged_image_features)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
@@ -157,8 +273,13 @@ class Step3p7ForConditionalGeneration(nn.Module):
     def set_embed_and_head(self, embed, head):
         self.language_model.set_embed_and_head(embed, head)
 
+    def post_load_weights(self) -> None:
+        if isinstance(self.language_model, Step5ForCausalLM):
+            self.language_model.post_load_weights()
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        weights = list(weights)
+        if get_step5_text_config(self.config) is not None:
+            return self._load_step5_weights(weights)
 
         vision_weights = []
         language_weights = []
@@ -195,6 +316,51 @@ class Step3p7ForConditionalGeneration(nn.Module):
         # Load language model weights
         if language_weights:
             self.language_model.load_weights(language_weights)
+
+    def _load_step5_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """Load the checkpoint with strict coverage in both towers; later calls are
+        weight updates and, as in the language model, may stream any subset."""
+        checkpoint_load = not self.language_model._checkpoint_loaded
+        vision_params = {
+            name: param
+            for name, param in self.named_parameters(remove_duplicate=False)
+            if name.startswith(("vision_model.", "vit_large_projector."))
+        }
+        seen = set()
+
+        def language_weights():
+            for name, weight in weights:
+                name = name.replace("language_model.", "", 1)
+                vision_name = name.removeprefix("model.")
+                if not vision_name.startswith(
+                    ("vision_model.", "vit_large_projector.")
+                ):
+                    yield name, weight
+                    continue
+                for old, new in (
+                    (".attn.in_proj_weight", ".attn.qkv_proj.weight"),
+                    (".attn.in_proj_bias", ".attn.qkv_proj.bias"),
+                    (".attn.out_proj.", ".attn.proj."),
+                    (".mlp.c_fc", ".mlp.fc1"),
+                    (".mlp.c_proj", ".mlp.fc2"),
+                ):
+                    vision_name = vision_name.replace(old, new)
+                if vision_name not in vision_params or vision_name in seen:
+                    raise ValueError(
+                        f"Unknown or duplicate Step5 vision weight: {name}"
+                    )
+                if weight.dtype != torch.bfloat16:
+                    raise ValueError(f"Step5 vision weight must be BF16: {name}")
+                param = vision_params[vision_name]
+                loader = getattr(param, "weight_loader", default_weight_loader)
+                loader(param, weight)
+                seen.add(vision_name)
+
+        loaded = self.language_model.load_weights(language_weights())
+        missing = vision_params.keys() - seen
+        if checkpoint_load and missing:
+            raise ValueError(f"Step5 vision is missing weights: {sorted(missing)[:16]}")
+        return seen | {"language_model." + name for name in loaded}
 
 
 EntryClass = Step3p7ForConditionalGeneration

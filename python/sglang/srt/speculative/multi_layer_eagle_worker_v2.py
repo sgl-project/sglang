@@ -33,7 +33,6 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -58,6 +57,7 @@ from sglang.srt.speculative.eagle_info import (
 )
 from sglang.srt.speculative.eagle_utils import (
     default_tree_mask_mode,
+    get_draft_hidden_state_dtype,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
 )
@@ -73,6 +73,7 @@ from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner imp
 )
 from sglang.srt.speculative.multi_layer_eagle_utils import (
     boundary_kv_fix_enabled,
+    compute_mtp_topk,
     compute_widened_draft_extend_locs_positions,
     fill_widened_draft_extend_inputs_triton,
     rotate_input_ids,
@@ -98,7 +99,6 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.nvtx_utils import profile_range
 from sglang.srt.utils.profile_utils import build_step_span_name
 
@@ -184,8 +184,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         # Chain-style MTP: each step propagates its own output hidden states to the
         # next step.  Non-chain: each step uses the target model's hidden states.
         draft_arch = self.draft_worker.model_config.hf_config.architectures[0]
+        self.is_step5_mtp = draft_arch == "Step5MTP"
         self.chain_mtp_hidden_states = draft_arch in [
             "Step3p5MTP",
+            "Step5MTP",
             "InklingForConditionalGenerationMTP",
             "GigaChat35ForCausalLMNextN",
         ]
@@ -246,9 +248,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             boundary_kv_fix_enabled()
             and self.topk == 1
             and self.speculative_num_steps > 1
-            # The fix stashes the mamba/sconv boundary state, so it only applies
-            # to hybrid models; non-hybrid MTP drafts (e.g. MiMoV2) must skip it.
-            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            and self.chain_mtp_hidden_states
         ):
             return
         draft_model_runner = self.draft_runner_list[0]
@@ -262,9 +262,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 target_hidden_size,
             )
             return
-        if isinstance(self.req_to_token_pool, HybridReqToTokenPool):
-            conv_state = self.req_to_token_pool.mamba_pool.mamba_cache.conv
-            self.draft_extend_num_warmup_tokens = min(conv_state[0].shape[2:])
+        self.draft_extend_num_warmup_tokens = (
+            self.req_to_token_pool.get_mtp_boundary_warmup_tokens()
+        )
         self.draft_extend_num_front_tokens = (
             self.speculative_num_steps - 1 + self.draft_extend_num_warmup_tokens
         )
@@ -276,17 +276,21 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             )
             self.boundary_kv_stash_hiddens = torch.zeros(
                 (req_pool_size, front, draft_hidden_size),
-                dtype=draft_model_runner.dtype,
+                dtype=get_draft_hidden_state_dtype(draft_model_runner.model_config),
             )
             self.boundary_kv_stash_valid_lens = torch.zeros(
                 (req_pool_size,), dtype=torch.int32
             )
+        self.req_to_token_pool.register_on_alloc_rows(self._reset_boundary_kv_stash)
         logger.info(
             "SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX on: draft-extend windows widened by "
             "%d front rows (%d conv warm-up).",
             front,
             self.draft_extend_num_warmup_tokens,
         )
+
+    def _reset_boundary_kv_stash(self, slots):
+        self.boundary_kv_stash_valid_lens[slots] = 0
 
     def _compute_boundary_kv_locs_positions(self, batch):
         if self.draft_extend_num_front_tokens == 0 or batch.forward_mode.is_idle():
@@ -322,7 +326,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             self.boundary_kv_stash_tokens,
             self.boundary_kv_stash_hiddens,
             self.boundary_kv_stash_valid_lens,
-            set_valid=True,
+            # Allocation clears new slots; short continuation chunks must
+            # retain the preceding committed tail.
+            set_valid=False,
         )
 
     def _fill_boundary_kv_front_and_update_stash(
@@ -646,7 +652,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         else:
             draft_capture_hidden_mode = CaptureHiddenMode.LAST
 
-        # Run forward
         forward_batch = ForwardBatch.init_new(
             batch,
             self.draft_runner_list[0],
@@ -654,12 +659,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             return_hidden_states_before_norm=True,
             kv_loc_plan=kv_loc_plan,
         )
-
         self._apply_deferred_mamba_init_to_draft_pools(forward_batch)
-
-        # Construct input_ids
-        # TODO: same chunked-prefill chain divergence as PR #26329.
         if not batch.forward_mode.is_idle():
+            # Use the common chain input rotation.
             rotate_input_ids(
                 forward_batch.input_ids,
                 forward_batch.extend_start_loc,
@@ -681,7 +683,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             ].token_to_kv_pool
             # DP/MLP-sync padding mutates ForwardBatch fields in place. Keep
             # those per-runner mutations from leaking into the next MTP step.
-            step_forward_batch = replace(forward_batch)
+            step_forward_batch = replace(
+                forward_batch, spec_info=replace(forward_batch.spec_info)
+            )
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 step_forward_batch
             )
@@ -701,8 +705,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 )
                 draft_probs_list.append(probs)
             else:
-                probs = torch.softmax(output.logits_output.next_token_logits, dim=-1)
-                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                topk_p, topk_index = compute_mtp_topk(
+                    output.logits_output.next_token_logits,
+                    self.topk,
+                    greedy_chain=(
+                        getattr(self, "is_step5_mtp", False)
+                        and not self.use_rejection_sampling
+                        and self.speculative_num_draft_tokens
+                        == self.speculative_num_steps + 1
+                    ),
+                )
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
             # Chain-style: use this step's output hidden_states as next step's input
@@ -727,7 +739,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             topk_index=torch.cat(topk_index_list, dim=1),
             # Chain-style left the last step's hidden_states on the extend
             # input; non-chain keeps the target hidden states.
-            hidden_states=extend_input.hidden_states,
+            hidden_states=forward_batch.spec_info.hidden_states,
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
@@ -803,16 +815,21 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
         staged: bool = False,
         kv_loc_plan: Optional[KVLocPlan] = None,
     ):
+        # Packing consumes the original verify chain and places the sampled
+        # correction at its valid end. The scheduler batch remains the source;
+        # Step5 prepares a private final window before ForwardBatch construction.
+        target_tokens = batch.input_ids
         # Batch 2: Draft extend
+        draft_extend_width = (
+            self.speculative_num_steps + 1 + self.draft_extend_num_front_tokens
+        )
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # Actual width: the multi-layer chain fills num_steps + 1 rows/req,
             # plus the boundary-KV front rows when the widened window is active
             # (must match the capture width in the draft-extend graph runner).
-            num_tokens_per_req=self.speculative_num_steps
-            + 1
-            + self.draft_extend_num_front_tokens,
-            num_tokens_for_logprob_per_req=1,
+            num_tokens_per_req=draft_extend_width,
+            num_tokens_for_logprob_per_req=draft_extend_width,
             num_front_tokens=self.draft_extend_num_front_tokens,
         )
 
@@ -841,7 +858,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 batch_result.next_token_ids,
                 self.speculative_num_draft_tokens,
                 self.draft_runner_list[0],
-                self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=True,
                 widened_out_cache_loc=boundary_kv_locs,
                 widened_positions=boundary_kv_positions,
@@ -949,8 +965,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 )
             else:
                 prune_logits = not require_gathered_buffer()
-            if prune_logits:
-                forward_batch.spec_info.select_index = select_index
+            forward_batch.spec_info.select_index = (
+                select_index if prune_logits else None
+            )
             # Left unmarked on every platform: each de-tied runner has its own
             # attn backend, and only runner[0]'s was pre-planned, so each step's
             # forward must init its own metadata post-pad (mirrors NPU behavior).
@@ -961,14 +978,11 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 forward_batch.token_to_kv_pool = self.draft_runner_list[
                     step
                 ].token_to_kv_pool
-                if not forward_batch.forward_mode.is_idle():
-                    # An idle round (DP attention: this rank has no requests) has nothing
-                    # to plan pre-pad. Avoid raising when seq_lens is empty here.
-                    self.draft_runner_list[step].attn_backend.init_forward_metadata(
-                        forward_batch
-                    )
+                step_forward_batch = replace(
+                    forward_batch, spec_info=replace(forward_batch.spec_info)
+                )
                 draft_logits_output = self.draft_runner_list[step].forward(
-                    forward_batch
+                    step_forward_batch
                 )
                 if prune_logits:
                     logits_sel = draft_logits_output.logits_output.next_token_logits
@@ -982,8 +996,16 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     )
                     ret_draft_probs_list.append(probs)
                 else:
-                    probs = torch.softmax(logits_sel, dim=-1)
-                    ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+                    ret_topk_p, ret_topk_index = compute_mtp_topk(
+                        logits_sel,
+                        self.topk,
+                        greedy_chain=(
+                            getattr(self, "is_step5_mtp", False)
+                            and not self.use_rejection_sampling
+                            and self.speculative_num_draft_tokens
+                            == self.speculative_num_steps + 1
+                        ),
+                    )
                 # Chain-style: use this step's output hidden_states as next step's input
                 if (
                     self.chain_mtp_hidden_states
@@ -1072,12 +1094,25 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+    def clear_cache_pool(self):
+        # Scheduler calls this at its drained flush boundary after clearing the
+        # shared request pool. Invalidate the worker-owned boundary stash too.
+        valid_lens = self.draft_worker.boundary_kv_stash_valid_lens
+        if valid_lens is not None:
+            valid_lens.zero_()
+
     @property
     def last_shared_read_runner(self):
-        if self.draft_worker.last_draft_extend_staged:
+        if (
+            self.draft_worker.last_draft_extend_staged
+            and self.draft_worker.draft_extend_num_front_tokens == 0
+        ):
             return self.target_worker.model_runner
-        # Multi-layer eagle has no draft forward, only draft extend.
-        return self._draft_worker.draft_runner
+        # Request allocation also clears the boundary stash. Its reads/writes
+        # happen after target metadata staging, before the draft forwards.
+        # Draft extend runs every depth in order. An event from the first depth
+        # cannot fence later depths' reads of shared request and KV mappings.
+        return self._draft_worker.draft_runner_list[-1]
 
     @property
     def spec_v2_attn_backends(self) -> tuple:

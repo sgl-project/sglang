@@ -59,6 +59,7 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
 logger = logging.getLogger(__name__)
+from sglang.srt.configs.step5 import Step5Config, get_step5_text_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
@@ -306,13 +307,71 @@ def collect_model_override_declarations(
 import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
 
+@_register_for("Step5ForCausalLM")
+def _step5_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    if cfg.moe_runner_backend not in (
+        "auto",
+        "triton",
+        "deep_gemm",
+        "flashinfer_cutlass",
+        "flashinfer_trtllm_routed",
+        "flashinfer_trtllm",
+    ):
+        raise ValueError(
+            "Step5 routed MoE supports Triton, DeepGEMM, FlashInfer CUTLASS or "
+            "FlashInfer TRT-LLM (routed or logits)."
+        )
+    if cfg.moe_runner_backend != "auto":
+        backend = cfg.moe_runner_backend
+    elif model_config_of(cfg).quantization == "modelopt_fp4":
+        backend = "flashinfer_cutlass"
+    else:
+        backend = "triton"
+    return {"moe_runner_backend": backend}
+
+
 @register_model_override_predicate(
     lambda arch: (
-        "Step3p5ForCausalLM" in arch or "Step3p7ForConditionalGeneration" in arch
+        "Step3p5ForCausalLM" in arch
+        or "Step3p7ForConditionalGeneration" in arch
+        or "Step5ForCausalLM" in arch
+        or "Step5ForConditionalGeneration" in arch
     )
 )
 def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
+    if get_step5_text_config(hf_config) is not None:
+        overrides = _step5_moe_runner_overrides(server_args, hf_config)
+        if cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16", "fp8_e4m3"):
+            raise ValueError(
+                "Step5 supports --kv-cache-dtype auto, bf16 or fp8_e4m3 "
+                "(fp8_e4m3 applies to full-attention layers only)"
+            )
+        if cfg.speculative_draft_kv_cache_dtype not in (
+            None,
+            "auto",
+            "bf16",
+            "bfloat16",
+        ):
+            raise ValueError("Step5 keeps the MTP draft KV cache in BF16")
+        if cfg.disaggregation_decode_retraction_backup == "host_pool":
+            raise ValueError(
+                "Step5 retraction requires cpu_tensor to preserve request-owned index rings"
+            )
+        overrides["disaggregation_decode_retraction_backup"] = "cpu_tensor"
+        if cfg.moe_a2a_backend == "megamoe":
+            logger.info(
+                "Step5 Mega MoE uses local experts with TP-replicated tokens; "
+                "attention DP uses the model's explicit gather/reduce/scatter."
+            )
+            overrides["moe_runner_backend"] = "deep_gemm"
+            overrides["disable_attn_tp_gather"] = True
+        if is_attention_backend_not_set(cfg):
+            overrides["attention_backend"] = "fa4"
+        if cfg.speculative_algorithm == "EAGLE":
+            overrides["enable_multi_layer_eagle"] = True
+        return overrides
     overrides: Dict[str, Any] = {}
     if is_attention_backend_not_set(cfg):
         if get_platform().is_blackwell:
@@ -1249,6 +1308,11 @@ def _fa4_page_constraint(view: Any) -> dict:
         # page_size==1, so skip the 128 auto-force for it and keep the default.
         and (view.speculative_eagle_topk or 0) <= 1
     ):
+        if view.page_size == 64 and isinstance(
+            model_config_of(view).hf_text_config, Step5Config
+        ):
+            # Step5's hd192 non-TMA kernel and shared DSA allocator require page64.
+            return {}
         if (
             "DiffusionGemmaForBlockDiffusion"
             in model_config_of(view).hf_config.architectures

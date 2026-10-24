@@ -136,6 +136,7 @@ def _backend(translator, req_to_token, page_size):
     b.speculative_step_id = 0
     b.has_swa = False
     b.use_sliding_window_kv_pool = False
+    b.swa_fa4_window_align = False
     b.is_prefill_aware_swa = False
     b.token_to_kv_pool = None
     b._kv_shard_pool = None

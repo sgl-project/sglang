@@ -354,6 +354,23 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         assert self.config.activation in ("silu", "situ")
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
+        # Match the public Triton limit-only SwiGLU contract: clamp AFTER SiLU.
+        # swiglu_limit is a separate pre-SiLU contract used by DSV4.
+        self.silu_clamp = None
+        if (
+            config.activation == "silu"
+            and config.gemm1_alpha is None
+            and config.gemm1_clamp_limit is not None
+        ):
+            from sglang.kernels.ops.activation.silu_clamp_and_mul import (
+                SiluClampAndMulOp,
+            )
+
+            if config.swiglu_limit is not None or config.gate_up_interleaved:
+                raise ValueError(
+                    "Post-SiLU clamp requires split gate/up and no pre-SiLU limit"
+                )
+            self.silu_clamp = SiluClampAndMulOp(limit=config.gemm1_clamp_limit)
         # SM120's contiguous GEMM only consumes standard-layout activations, so
         # it opts out of swizzle regardless of the a2a backend.
         self.use_swizzle = (
@@ -370,6 +387,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         weight_dtype = quant_info.w13_weight.dtype
         if self.config.silu_mul_keep_fp32 and weight_dtype != torch.float8_e4m3fn:
             raise ValueError("silu_mul_keep_fp32 requires FP8 expert weights")
+        if self.silu_clamp is not None and weight_dtype == torch.bfloat16:
+            raise ValueError("BF16 post-SiLU clamp must use the Triton MoE runner")
         alignment = (
             running_state.get("contiguous_layout_alignment")
             if not runner_input.use_masked_gemm
@@ -522,6 +541,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     scale_ue8m0=False,
                 )
                 del down_input
+        elif self.silu_clamp is not None:
+            down_input = self.silu_clamp(gateup_output.view(-1, N))
+            del gateup_output
+            down_input_fp8, down_input_scale = per_token_group_quant(
+                down_input,
+                group_size=scale_block_size,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+            del down_input
         elif self.use_swizzle or self.config.silu_mul_keep_fp32:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
             use_contig_swizzle = self.use_swizzle and not running_state.get(
@@ -804,8 +833,21 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if self.swiglu_limit is not None:
             swiglu_limit_arg = self.swiglu_limit
 
-        # Act.
-        if self.config.activation == "situ":
+        # Act. Keep the BF16 product rounding before FP8 quantization.
+        if self.silu_clamp is not None:
+            activation = self.silu_clamp(
+                gateup_output.view(-1, gateup_output.shape[-1])
+            )
+            activation = activation.view(*gateup_output.shape[:-1], -1)
+            down_input, down_input_scale = per_token_group_quant(
+                activation,
+                group_size=scale_block_size,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                masked_m=masked_m,
+                column_major_scales=True,
+            )
+            del activation
+        elif self.config.activation == "situ":
             scale_block_size = 128
             down_input, down_input_scale = _varlen_deep_gemm_situ_mul_quant(
                 gateup_output,

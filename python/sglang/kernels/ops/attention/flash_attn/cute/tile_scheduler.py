@@ -293,7 +293,10 @@ class SingleTileScheduler:
         for obj, n_items in zip([self.params, self._blk_coord], self._values_pos):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
-        return SingleTileScheduler(*(tuple(obj_list)), loc=self._loc)
+        scheduler = SingleTileScheduler(*(tuple(obj_list)), loc=self._loc)
+        # _is_first_block is a Python-only attribute omitted from MLIR values.
+        scheduler._is_first_block = self._is_first_block
+        return scheduler
 
 
 class StaticPersistentTileScheduler:
@@ -1165,7 +1168,9 @@ class SingleTileVarlenScheduler:
         for obj, n_items in zip(objs, self._values_pos):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
-        return self.__class__(*obj_list, loc=self._loc)
+        scheduler = self.__class__(*obj_list, loc=self._loc)
+        scheduler._is_first_block = self._is_first_block
+        return scheduler
 
 
 # -----------------------------------------------------------------------------
@@ -1420,9 +1425,11 @@ class Sm100FmhaStaticTileScheduler:
         )
         new_blk_coord = new_from_mlir_values(self._blk_coord, values[4:7])
         new_grid_shape = new_from_mlir_values(self._grid_shape, values[7:])
-        return Sm100FmhaStaticTileScheduler(
+        scheduler = Sm100FmhaStaticTileScheduler(
             new_params, new_current_work_linear_idx, new_blk_coord, new_grid_shape
         )
+        scheduler._is_first_block = self._is_first_block
+        return scheduler
 
 
 def compute_sm100_fmha_grid(

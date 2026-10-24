@@ -432,6 +432,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return self.full_attn_allocator.alloc_decode(
                 seq_lens, seq_lens_cpu, last_loc
             )
+        # A decode needs at most one new page per request in each pool.
+        # Check both pools before either allocator can consume any pages.
+        if not self.new_pages_available(len(seq_lens), len(seq_lens)):
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                decode=True,
+            )
+            if not self.new_pages_available(num_new_pages, num_new_pages):
+                return None
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 

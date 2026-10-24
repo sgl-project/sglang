@@ -49,7 +49,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import available_and_evictable_str, release_kv_cache
+from sglang.srt.mem_cache.common import (
+    available_and_evictable_str,
+    match_kv_cache,
+    release_kv_cache,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -3038,11 +3042,11 @@ class UnifiedRadixCacheSuite:
             cache.checkpoint(req, up_to=req.extend_end)
 
         cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
-        expected_evicted = (pre_len - 1) - cushion
+        expected_evicted = pre_len - cushion
         self.assertEqual(
             req.kv.get_evicted_seqlen(ComponentType.SWA),
             expected_evicted,
-            f"swa_evicted_seqlen should advance to (pre_len-1) - cushion = "
+            f"swa_evicted_seqlen should advance to pre_len - cushion = "
             f"{expected_evicted}, got {req.kv.get_evicted_seqlen(ComponentType.SWA)}",
         )
 
@@ -3102,7 +3106,7 @@ class UnifiedRadixCacheSuite:
             self.skipTest("requires page_size=1, sliding_window_size=4")
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 
-        cushion = self.cfg.sliding_window_size + self.cfg.page_size  # = 5
+        cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
         pre_len = cushion  # exactly at the boundary, nothing slid out
         req = self._make_req(req_to_token_pool)
         tokens = self._make_seq(1, pre_len)
@@ -7224,7 +7228,18 @@ class UnifiedRadixCacheSuite:
             if pool is None:
                 continue
             available_before = pool.available_size()
-            evicted = cache.evict_host(pool.size, ct)
+            collector = mock.Mock()
+            with mock.patch.object(cache, "metrics_collector", collector):
+                evicted = cache.evict_host(pool.size, ct)
+            pool_name = "kv" if ct == ComponentType.FULL else ct.name.lower()
+            reported = sum(
+                call.kwargs["num_tokens"]
+                for call in collector.increment_host_evicted_tokens.call_args_list
+                if call.kwargs["pool"] == pool_name
+            )
+            self.assertEqual(reported, pool.available_size() - available_before)
+            for call in collector.increment_host_evicted_tokens.call_args_list:
+                self.assertEqual(call.kwargs["trigger"], pool_name)
             if evicted == 0:
                 continue
             # the drain must return every freed host value to the pool
@@ -7489,6 +7504,27 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, _node_key_length(cache, leaf))
 
+    def _assert_swa_prefix_metrics(self, cache, tokens, expected_gap):
+        req = SimpleNamespace(
+            origin_input_ids=array("q", tokens + [99999]),
+            output_ids=array("q"),
+            extra_key=None,
+            cache_salt=None,
+            _cache_breakdown_computed=False,
+            retracted_stain=False,
+            kv=SimpleNamespace(cache_protected_len=0),
+            _compute_max_prefix_len=lambda n: n - 1,
+        )
+        with envs.SGLANG_RADIX_FORCE_MISS.override(False):
+            match_kv_cache(req, cache)
+        self.assertEqual(req.full_kv_hit_length, len(tokens))
+        self.assertEqual(req.prefix_swa_truncated_tokens, expected_gap)
+        collector = mock.Mock()
+        Req.record_prefix_swa_metrics(req, req.num_matched_prefix_tokens, collector)
+        collector.increment_prefix_swa_truncated_tokens.assert_called_once_with(
+            expected_gap
+        )
+
     def test_swa_branching_seqlen_uses_device_full_hit(self):
         if (
             not self.cfg.has_swa
@@ -7516,6 +7552,9 @@ class UnifiedRadixCacheSuite:
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
         self.assertEqual(result.full_kv_hit_length, len(tokens))
+        gap = len(tokens) - result.device_prefix_len - result.host_hit_length
+        self.assertGreater(gap, 0)
+        self._assert_swa_prefix_metrics(cache, tokens, gap)
         self.assertEqual(result.swa_branching_seqlen, len(tokens))
         self.assertEqual(result.swa_branching_seqlen % self.cfg.page_size, 0)
 
@@ -7571,6 +7610,9 @@ class UnifiedRadixCacheSuite:
         result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
 
         self.assertEqual(result.full_kv_hit_length, len(tokens))
+        gap = len(tokens) - result.device_prefix_len - result.host_hit_length
+        self.assertGreater(gap, 0)
+        self._assert_swa_prefix_metrics(cache, tokens, gap)
         self.assertEqual(result.swa_branching_seqlen, len(tokens))
 
         self._insert(

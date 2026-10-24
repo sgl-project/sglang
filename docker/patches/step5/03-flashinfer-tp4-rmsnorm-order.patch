@@ -1,0 +1,31 @@
+--- a/data/csrc/trtllm_mnnvl_allreduce.cu
++++ b/data/csrc/trtllm_mnnvl_allreduce.cu
+@@ -205,3 +205,7 @@
+ }
+
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mnnvl_allreduce_fusion, trtllm_mnnvl_allreduce_fusion);
++// Identifies the matching Step5 multiplication order in the loaded binary.
++int64_t step5_tp4_rmsnorm_order_version() { return 2; }
++
++TVM_FFI_DLL_EXPORT_TYPED_FUNC(step5_tp4_rmsnorm_order_version, step5_tp4_rmsnorm_order_version);
+--- a/data/include/flashinfer/comm/trtllm_mnnvl_allreduce.cuh
++++ b/data/include/flashinfer/comm/trtllm_mnnvl_allreduce.cuh
+@@ -1474,8 +1474,16 @@
+       PackedVec<PackedType, T> out;
+ #pragma unroll
+       for (int j = 0; j < kELTS_PER_LOAD; j++) {
+-        float normVal = (params.weightBias + toFloat<T>(gamma.elements[j])) *
+-                        rInput[i * kELTS_PER_LOAD + j] * rcpRms;
++        float normVal;
++        if (std::is_same_v<T, __nv_bfloat16> && QType == QuantType::kNone &&
++            params.nRanks == 4 && params.tokenDim == 4096 && params.weightBias == 0.F) {
++          // Match the standard TP4 RMSNorm multiplication order.
++          normVal = rInput[i * kELTS_PER_LOAD + j] * rcpRms *
++                    toFloat<T>(gamma.elements[j]);
++        } else {
++          normVal = (params.weightBias + toFloat<T>(gamma.elements[j])) *
++                    rInput[i * kELTS_PER_LOAD + j] * rcpRms;
++        }
+         rNorm[i * kELTS_PER_LOAD + j] = normVal;
+         threadMax = fmaxf(threadMax, fabsf(normVal));
+         out.elements[j] = fromFloat<T>(normVal);

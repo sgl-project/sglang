@@ -571,7 +571,12 @@ def get_dp_local_slice_cpu(
     return local_start_pos, counts[dp_rank]
 
 
-from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
+from sglang.kernels.ops.memory.memcpy_triton import (
+    copy_bf16_canonical_zero,
+    copy_region_and_zero,
+    memcpy_triton,
+)
+from sglang.srt.distributed.parallel_state import outplace_all_reduce
 from sglang.srt.distributed.utils import all_gather_single
 
 
@@ -625,10 +630,12 @@ def _dp_gather_via_all_reduce(
     forward_batch: ForwardBatch,
     is_partial: bool,
     cp_shard_counts: Optional[Sequence[int]] = None,
+    *,
+    fuse_zero_copy: bool = False,
+    use_custom_all_reduce: bool = False,
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
@@ -638,18 +645,46 @@ def _dp_gather_via_all_reduce(
         cp_shard_counts is not None or get_parallel().attn_cp_rank == 0
     )
 
-    if local_tokens.shape[0] > 0 and writes:
+    copy_enabled = local_tokens.shape[0] > 0 and writes
+    if copy_enabled:
         assert local_tokens.untyped_storage() is not global_tokens.untyped_storage(), (
             "aliasing between global_tokens and local_tokens not allowed"
         )
-
-        if cp_shard_counts is None:
-            memcpy(
-                global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
-            )
-        else:
-            start, length = _cp_shard_rows(forward_batch, cp_shard_counts)
-            global_tokens[start : start + length].copy_(local_tokens[:length])
+    if fuse_zero_copy and cp_shard_counts is None:
+        copy_region_and_zero(
+            global_tokens,
+            local_tokens,
+            local_start_pos,
+            local_num_tokens,
+            offset_src=False,
+            copy_enabled=copy_enabled,
+        )
+    else:
+        global_tokens.fill_(0)
+        if copy_enabled:
+            if cp_shard_counts is None:
+                memcpy(
+                    global_tokens,
+                    local_tokens,
+                    0,
+                    local_start_pos,
+                    local_num_tokens,
+                    False,
+                )
+            else:
+                start, length = _cp_shard_rows(forward_batch, cp_shard_counts)
+                global_tokens[start : start + length].copy_(local_tokens[:length])
+    if use_custom_all_reduce:
+        assert not is_partial and not world_dp_gather_enabled()
+        assert cp_shard_counts is None and get_parallel().attn_cp_size == 1
+        assert global_tokens.dtype == torch.bfloat16
+        reduced = outplace_all_reduce(
+            global_tokens,
+            group_name=get_parallel().tp_group.unique_name,
+            outplace_all_reduce_method="ca",
+        )
+        copy_bf16_canonical_zero(global_tokens, reduced)
+        return
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     if world_dp_gather_enabled():
@@ -1022,7 +1057,21 @@ def dp_gather_replicate(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     cp_shard_counts: Optional[Sequence[int]] = None,
+    *,
+    use_all_reduce: bool = False,
 ):
+    if use_all_reduce:
+        _note_dp_gather_in_prefill_graph()
+        _dp_gather_via_all_reduce(
+            global_tokens,
+            local_tokens,
+            forward_batch,
+            is_partial=False,
+            cp_shard_counts=cp_shard_counts,
+            fuse_zero_copy=True,
+            use_custom_all_reduce=True,
+        )
+        return
     _dp_gather(
         global_tokens,
         local_tokens,
@@ -1037,6 +1086,8 @@ def dp_scatter(
     global_tokens: torch.Tensor,  # input
     forward_batch: ForwardBatch,
     cp_shard_counts: Optional[Sequence[int]] = None,
+    *,
+    fuse_zero_copy: bool = False,
 ):
     """Copy this DP group's slot of the global buffer back to the rank. With
     ``cp_shard_counts`` (as in dp_gather_partial) the rank takes back only its
@@ -1046,6 +1097,16 @@ def dp_scatter(
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
+    if fuse_zero_copy and cp_shard_counts is None:
+        assert local_tokens.untyped_storage() is not global_tokens.untyped_storage()
+        copy_region_and_zero(
+            local_tokens,
+            global_tokens,
+            local_start_pos,
+            local_num_tokens,
+            offset_src=True,
+        )
+        return
     local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()

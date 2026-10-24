@@ -1,0 +1,346 @@
+--- a/data/csrc/trtllm_fused_moe_runner.cu
++++ b/data/csrc/trtllm_fused_moe_runner.cu
+@@ -15,6 +15,7 @@
+  */
+
+ #include <algorithm>
++#include <cuda_bf16.h>
+ #include <iostream>
+
+ #include "flashinfer/exception.h"
+@@ -150,6 +151,13 @@
+   FLASHINFER_CHECK(
+       0 <= actTypeInt && actTypeInt < static_cast<int64_t>(ActivationType::InvalidType),
+       "Unknown activation type", serializeActivationType(activationType), "of enum", actTypeInt);
++  bool const stepBf16 = activationType == ActivationType::SwigluStep;
++  if (stepBf16) {
++    FLASHINFER_CHECK(dtypeAct == btg::Dtype::Bfloat16 &&
++                     dtypeWeights == btg::Dtype::Bfloat16 && !useDeepSeekFp8,
++                     "SwigluStep requires BF16 activations and weights");
++    activationType = ActivationType::Identity;
++  }
+   bool isGatedAct = isGatedActivation(activationType);
+   bool useBiasMn = biasType == batchedGemm::gemm::BiasType::Mn;
+   // ReorderAndShuffle is only supported on fused-act (gated) paths in trtllm-gen.
+@@ -205,7 +213,7 @@
+         .eltwiseActType = actType,
+         .deepSeekFp8 = useDeepSeekFp8,
+         .fusedAct = false,
+-        .routeAct = true,
++        .routeAct = !stepBf16,
+         .staticBatch = false,
+         .transposeMmaOutput = true,
+         .tileSize = tileTokensDim,
+@@ -421,6 +429,26 @@
+ namespace MoE {
+
+ namespace {
++
++// FC1 is deliberately materialized in BF16 before applying the Step activation.
++// Its logical rows are [up, gate], without fused-SwiGLU row interleaving.
++__global__ void stepBf16Activation(__nv_bfloat16 const* input, __nv_bfloat16* output,
++                                  int32_t const* paddedTokens, int32_t width,
++                                  float const* limits, int32_t const* ctaToExpert,
++                                  int32_t tileTokens) {
++  int32_t row = blockIdx.x;
++  if (row >= *paddedTokens) return;
++  float limit = limits ? limits[ctaToExpert[row / tileTokens]] : 7.0f;
++  for (int32_t col = threadIdx.x; col < width; col += blockDim.x) {
++    int64_t base = static_cast<int64_t>(row) * (2 * width);
++    float up = __bfloat162float(input[base + col]);
++    float gate = __bfloat162float(input[base + width + col]);
++    float silu = gate / (1.0f + expf(-gate));
++    output[static_cast<int64_t>(row) * width + col] =
++        __float2bfloat16_rn(fminf(silu, limit) * fmaxf(-limit, fminf(up, limit)));
++  }
++}
++
+
+ // GEMM2's N dimension, i.e. the row width of the gemm2_output workspace.
+ //
+@@ -704,18 +732,20 @@
+                                          : nullptr;
+   // DeepSeek FP8 activates in a separate kernel (see below), which owns the SwiGLU OAI controls.
+   // Keep them out of the FC1 GEMM there so they can only ever be applied once.
++  bool const stepBf16 = args.activation_type == ActivationType::SwigluStep;
+   bool const useUnfusedActivation = args.mDtypeElt == btg::Dtype::E4m3 && args.mUseDeepSeekFp8;
+-  float* const gemm1Alpha = useUnfusedActivation ? nullptr : args.gemm1_alpha;
+-  float* const gemm1Beta = useUnfusedActivation ? nullptr : args.gemm1_beta;
+-  float* const gemm1ClampLimit = useUnfusedActivation ? nullptr : args.gemm1_clamp_limit;
++  float* const gemm1Alpha = (useUnfusedActivation || stepBf16) ? nullptr : args.gemm1_alpha;
++  float* const gemm1Beta = (useUnfusedActivation || stepBf16) ? nullptr : args.gemm1_beta;
++  float* const gemm1ClampLimit = (useUnfusedActivation || stepBf16) ? nullptr : args.gemm1_clamp_limit;
+   bool const fc1Bf16Output = args.fc1_output_dtype == 1;
+-  if (fc1Bf16Output) {
++  bool const prepermute = fc1Bf16Output || stepBf16;
++  if (prepermute) {
+     // The BF16-output DeepSeekFp8 FC1 cubins are RouteImpl::NoRoute: they cannot gather
+     // activations in-kernel, so pre-permute tokens + block scales with the dev permute kernel.
+     moe::dev::permute::Data permuteData;
+     permuteData.mDtypeElt = args.mDtypeElt;
+     permuteData.mUsePdl = enable_pdl;
+-    permuteData.mUseDeepSeekFp8 = true;
++    permuteData.mUseDeepSeekFp8 = !stepBf16;
+     permuteData.inPtr = args.hidden_states;
+     permuteData.outPtr = workspace.permuted_hidden_states;
+     permuteData.inDqSfsPtr = static_cast<float*>(args.hidden_states_scale);
+@@ -728,8 +758,8 @@
+     moe::dev::permute::run(permuteData, stream);
+   }
+   mPermuteGemm1.run(
+-      fc1Bf16Output ? workspace.permuted_hidden_states : args.hidden_states,
+-      fc1Bf16Output ? static_cast<void*>(workspace.permuted_hidden_states_scale)
++      prepermute ? workspace.permuted_hidden_states : args.hidden_states,
++      prepermute ? static_cast<void*>(workspace.permuted_hidden_states_scale)
+                     : hidden_states_scale_linear,
+       args.gemm1_weights, args.gemm1_weights_scale,
+       args.gemm1_per_channel_weight_scale == nullptr ? workspace.token_scales
+@@ -747,7 +777,19 @@
+   void* gemm2_input = workspace.gemm1_output;
+   void* gemm2_input_scale = workspace.gemm1_output_scale;
+   // We do activation only for DeepSeek FP8, as cubins do not have fused activation.
+-  if (useUnfusedActivation) {
++  if (stepBf16) {
++    // Ordinary stream launch waits for FC1 completion even when surrounding GEMMs use PDL.
++    if (workspace.total_max_padded_tokens > 0) {
++      stepBf16Activation<<<workspace.total_max_padded_tokens, 256, 0, stream>>>(
++          static_cast<__nv_bfloat16 const*>(workspace.gemm1_output),
++          static_cast<__nv_bfloat16*>(workspace.activation_output),
++          workspace.total_num_padded_tokens, args.intermediate_size, args.gemm1_clamp_limit,
++          workspace.cta_idx_xy_to_batch_idx, workspace.ProjUpTileN);
++      FLASHINFER_CHECK(cudaGetLastError() == cudaSuccess, "Step BF16 activation launch failed");
++    }
++    gemm2_input = workspace.activation_output;
++    gemm2_input_scale = nullptr;
++  } else if (useUnfusedActivation) {
+     // Run activation
+     moe::dev::activation::run(activationData, stream);
+     gemm2_input = workspace.activation_output;
+--- a/data/csrc/trtllm_fused_moe_kernel_launcher.cu
++++ b/data/csrc/trtllm_fused_moe_kernel_launcher.cu
+@@ -1785,6 +1785,7 @@
+     FusedMoeLauncher::init_common(std::move(args), tile_tokens_dim, routing_method_type,
+                                   use_shuffled_weight, weight_layout, activation_type,
+                                   gemm1_bias_type, norm_topk_prob);
++    this->args->activation_type = activation_type;
+   }
+
+   void check_routing() const override {
+@@ -1865,9 +1866,15 @@
+     check_optional_per_expert_float_tensor(gemm1_beta, "gemm1_beta");
+     check_optional_per_expert_float_tensor(gemm1_clamp_limit, "gemm1_clamp_limit");
+     if (gemm1_alpha.has_value() || gemm1_beta.has_value() || gemm1_clamp_limit.has_value()) {
+-      TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu)
++      TVM_FFI_ICHECK(activation_type == ActivationType::Swiglu ||
++                       activation_type == ActivationType::SwigluStep)
+           << "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported for "
+              "ActivationType::Swiglu.";
++    }
++
++    if (activation_type == ActivationType::SwigluStep) {
++      TVM_FFI_ICHECK(!gemm1_alpha.has_value() && !gemm1_beta.has_value())
++          << "SwigluStep does not accept alpha or beta";
+     }
+
+     TVM_FFI_ICHECK_EQ(args->intermediate_size % 128, 0)
+@@ -1891,7 +1898,9 @@
+     int32_t max_num_padded_tokens_gemm2 =
+         tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
+             max_num_padded_tokens, hidden_size_output, btg::dtypeGetNumBits(btg::Dtype::Bfloat16));
+-    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size}, dl_bfloat16,
++    bool const stepBf16 = activation_type == ActivationType::SwigluStep;
++    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1,
++                                args->intermediate_size * (stepBf16 ? 2 : 1)}, dl_bfloat16,
+                                 hidden_states.device());
+     gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, hidden_size_output}, dl_bfloat16,
+                                 hidden_states.device());
+@@ -1899,7 +1908,18 @@
+     workspace.hidden_states_scale_linear = nullptr;
+     workspace.gemm1_output = gemm1_output.data_ptr();
+     workspace.gemm1_output_scale = nullptr;
+-    workspace.activation_output = nullptr;
++    if (stepBf16) {
++      int32_t input_rows = tensorrt_llm::kernels::trtllmgen_moe::Routing::maybeGetMinTokenCount(
++          workspace.total_max_padded_tokens, args->hidden_size,
++          btg::dtypeGetNumBits(btg::Dtype::Bfloat16));
++      step_permuted_input = alloc_tensor({input_rows, args->hidden_size},
++                                         dl_bfloat16, hidden_states.device());
++      workspace.permuted_hidden_states = step_permuted_input.data_ptr();
++      workspace.permuted_hidden_states_scale = nullptr;
++      step_activation_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
++                                            dl_bfloat16, hidden_states.device());
++    }
++    workspace.activation_output = stepBf16 ? step_activation_output.data_ptr() : nullptr;
+     workspace.activation_output_scale = nullptr;
+     workspace.gemm2_output = gemm2_output.data_ptr();
+     workspace.gemm2_output_scale = nullptr;
+@@ -1925,6 +1945,8 @@
+   /** Allocate graph-stable BF16 body buffers without launching routing or GEMMs. */
+   BF16DABodyBuffers prepare_da_body(RoutingMetadataBuffers const& routing_metadata,
+                                     int64_t moe_tactic) {
++    TVM_FFI_ICHECK(activation_type != ActivationType::SwigluStep)
++        << "SwigluStep is not supported by BF16 DA bodies";
+     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+     TVM_FFI_ICHECK(args->do_finalize) << "BF16 DA bodies require finalized output.";
+     bind_routing_metadata(routing_metadata);
+@@ -1938,6 +1960,8 @@
+   /** Launch one BF16 body from prepared routing metadata and exact ABI buffers. */
+   void run_da_body(RoutingMetadataBuffers const& routing_metadata,
+                    BF16DABodyBuffers const& prepared, int64_t moe_tactic, bool enable_pdl) {
++    TVM_FFI_ICHECK(activation_type != ActivationType::SwigluStep)
++        << "SwigluStep is not supported by BF16 DA bodies";
+     ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
+     TVM_FFI_ICHECK(args->do_finalize) << "BF16 DA bodies require finalized output.";
+     bind_routing_metadata(routing_metadata);
+@@ -1991,6 +2015,8 @@
+   Optional<TensorView> gemm1_alpha;
+   Optional<TensorView> gemm1_beta;
+   Optional<TensorView> gemm1_clamp_limit;
++  Tensor step_activation_output;
++  Tensor step_permuted_input;
+ };
+
+ // Staged MoE: routing + external GEMM workspace + finalize (no cubin BMM).
+--- a/fused_moe/core.py
++++ b/fused_moe/core.py
+@@ -4971,7 +4971,11 @@
+     tune_max_num_tokens : int
+         Maximum number of tokens for autotuning (default ``8192``).
+     activation_type : int
+-        Activation type (default ``3`` — Swiglu).  ``3`` Swiglu;
++        Activation type (default ``3`` — Swiglu). ``7`` (SwigluStep) uses
++        separate BF16 FC1, post-SiLU clamp, and BF16 FC2. FC1 weights must
++        use ordinary (non-gated) row shuffling, with logical rows [up, gate].
++        The clamp defaults to 7, or uses the per-expert gemm1_clamp_limit.
++        SwiGLUStep does not accept gemm1_alpha or gemm1_beta.  ``3`` Swiglu;
+         ``6`` Relu2 (non-gated).
+     norm_topk_prob : bool
+         Whether to normalize the top-k probabilities (default ``True``).
+@@ -5076,6 +5080,9 @@
+     return topk_ids, None, RoutingInputMode.PackedPrecomputed
+
+
++TRTLLM_BF16_SWIGLU_STEP_SUPPORTED = True
++
++
+ @flashinfer_api(trace=trtllm_bf16_routed_moe_trace)
+ def trtllm_bf16_routed_moe(
+     topk_ids: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+@@ -5186,7 +5193,11 @@
+     tune_max_num_tokens : int
+         Maximum number of tokens for autotuning (default ``8192``).
+     activation_type : int
+-        Activation type (default ``3`` — Swiglu).
++        Activation type (default ``3`` — Swiglu). ``7`` (SwigluStep) uses
++        separate BF16 FC1, post-SiLU clamp, and BF16 FC2. FC1 weights must
++        use ordinary (non-gated) row shuffling, with logical rows [up, gate].
++        The clamp defaults to 7, or uses the per-expert gemm1_clamp_limit.
++        SwiGLUStep does not accept gemm1_alpha or gemm1_beta.
+     routing_replay_out : Optional[torch.Tensor]
+         Optional ``int16`` tensor of shape ``(num_tokens_or_larger, top_k)``
+         used to capture the selected expert IDs during routing.  Column
+@@ -5386,7 +5397,11 @@
+     tune_max_num_tokens : int
+         Maximum number of tokens for autotuning (default ``8192``).
+     activation_type : int
+-        Activation type (default ``3`` — Swiglu).  ``0`` Gelu; ``3`` Swiglu;
++        Activation type (default ``3`` — Swiglu). ``7`` (SwigluStep) uses
++        separate BF16 FC1, post-SiLU clamp, and BF16 FC2. FC1 weights must
++        use ordinary (non-gated) row shuffling, with logical rows [up, gate].
++        The clamp defaults to 7, or uses the per-expert gemm1_clamp_limit.
++        SwiGLUStep does not accept gemm1_alpha or gemm1_beta.  ``0`` Gelu; ``3`` Swiglu;
+         ``4`` Geglu; ``6`` Relu2; ``9`` Identity.
+     norm_topk_prob : bool
+         Whether to normalize the top-k probabilities (default ``True``).
+@@ -5534,7 +5549,11 @@
+     tune_max_num_tokens : int
+         Maximum number of tokens for autotuning (default ``8192``).
+     activation_type : int
+-        Activation type (default ``3`` — Swiglu).
++        Activation type (default ``3`` — Swiglu). ``7`` (SwigluStep) uses
++        separate BF16 FC1, post-SiLU clamp, and BF16 FC2. FC1 weights must
++        use ordinary (non-gated) row shuffling, with logical rows [up, gate].
++        The clamp defaults to 7, or uses the per-expert gemm1_clamp_limit.
++        SwiGLUStep does not accept gemm1_alpha or gemm1_beta.
+     routing_replay_out : Optional[torch.Tensor]
+         Optional ``int16`` tensor of shape ``(num_tokens_or_larger, top_k)``
+         used to capture the selected expert IDs during routing.
+@@ -5793,7 +5812,11 @@
+     tune_max_num_tokens : int
+         Maximum number of tokens for autotuning (default ``8192``).
+     activation_type : int
+-        Activation type (default ``3`` — Swiglu).
++        Activation type (default ``3`` — Swiglu). ``7`` (SwigluStep) uses
++        separate BF16 FC1, post-SiLU clamp, and BF16 FC2. FC1 weights must
++        use ordinary (non-gated) row shuffling, with logical rows [up, gate].
++        The clamp defaults to 7, or uses the per-expert gemm1_clamp_limit.
++        SwiGLUStep does not accept gemm1_alpha or gemm1_beta.
+
+     Returns
+     -------
+@@ -5975,7 +5998,11 @@
+         and ``local_num_experts == num_experts`` (all routed experts local),
+         otherwise a ``ValueError`` is raised.
+     activation_type : int
+-        Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
++        Activation type (default ``3`` — Swiglu). ``7`` (SwigluStep) uses
++        separate BF16 FC1, post-SiLU clamp, and BF16 FC2. FC1 weights must
++        use ordinary (non-gated) row shuffling, with logical rows [up, gate].
++        The clamp defaults to 7, or uses the per-expert gemm1_clamp_limit.
++        SwiGLUStep does not accept gemm1_alpha or gemm1_beta.  ``3`` Swiglu; ``4`` Geglu;
+         ``6`` Relu2; ``9`` Identity.
+     norm_topk_prob : bool
+         Whether to normalize the top-k probabilities (default ``True``).
+@@ -6271,7 +6298,11 @@
+     fp8_quantization_type : Fp8QuantizationType
+         FP8 quantization scheme (default ``Fp8QuantizationType.DeepSeekFp8``).
+     activation_type : int
+-        Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
++        Activation type (default ``3`` — Swiglu). ``7`` (SwigluStep) uses
++        separate BF16 FC1, post-SiLU clamp, and BF16 FC2. FC1 weights must
++        use ordinary (non-gated) row shuffling, with logical rows [up, gate].
++        The clamp defaults to 7, or uses the per-expert gemm1_clamp_limit.
++        SwiGLUStep does not accept gemm1_alpha or gemm1_beta.  ``3`` Swiglu; ``4`` Geglu;
+         ``6`` Relu2; ``9`` Identity.
+     gemm1_alpha : Optional[torch.Tensor]
+         Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
+@@ -6533,7 +6564,11 @@
+     enable_pdl : Optional[bool]
+         Whether to enable Programmatic Dependent Launch.
+     activation_type : int
+-        Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
++        Activation type (default ``3`` — Swiglu). ``7`` (SwigluStep) uses
++        separate BF16 FC1, post-SiLU clamp, and BF16 FC2. FC1 weights must
++        use ordinary (non-gated) row shuffling, with logical rows [up, gate].
++        The clamp defaults to 7, or uses the per-expert gemm1_clamp_limit.
++        SwiGLUStep does not accept gemm1_alpha or gemm1_beta.  ``3`` Swiglu; ``4`` Geglu;
+         ``6`` Relu2; ``7`` SwigluStep; ``9`` Identity.  ``10`` SiTU computes
+         ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
+     per_token_scale : Optional[torch.Tensor]
+@@ -6813,7 +6848,11 @@
+     enable_pdl : Optional[bool]
+         Whether to enable Programmatic Dependent Launch.
+     activation_type : int
+-        Activation type (default ``3`` — Swiglu).
++        Activation type (default ``3`` — Swiglu). ``7`` (SwigluStep) uses
++        separate BF16 FC1, post-SiLU clamp, and BF16 FC2. FC1 weights must
++        use ordinary (non-gated) row shuffling, with logical rows [up, gate].
++        The clamp defaults to 7, or uses the per-expert gemm1_clamp_limit.
++        SwiGLUStep does not accept gemm1_alpha or gemm1_beta.
+         ``10`` SiTU computes
+         ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
+     per_token_scale : Optional[torch.Tensor]
+--- a/fused_moe/shared/validation.py
++++ b/fused_moe/shared/validation.py
+@@ -35,7 +35,10 @@
+ ) -> None:
+     if gemm1_alpha is None and gemm1_beta is None and gemm1_clamp_limit is None:
+         return
+-    if int(activation_type) != int(ActivationType.Swiglu):
++    if int(activation_type) == int(ActivationType.SwigluStep):
++        if gemm1_alpha is not None or gemm1_beta is not None:
++            raise ValueError("SwigluStep does not accept gemm1_alpha or gemm1_beta")
++    elif int(activation_type) != int(ActivationType.Swiglu):
+         raise ValueError(
+             "gemm1_alpha, gemm1_beta, and gemm1_clamp_limit are only supported "
+             "for ActivationType.Swiglu."

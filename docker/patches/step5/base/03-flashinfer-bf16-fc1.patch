@@ -1,0 +1,714 @@
+--- a/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
++++ b/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu
+@@ -109,7 +109,8 @@
+
+ template <typename KernelParams>
+ __global__ void activationKernel(KernelParams params) {
+-  using Type = typename KernelParams::Type;
++  using TypeIn = typename KernelParams::TypeIn;
++  using TypeOut = typename KernelParams::TypeOut;
+
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+   // immediately trigger the secondary kernel when using PDL, then wait on primary
+@@ -135,7 +136,7 @@
+         float x1 = (float)params.inPtr[baseIdx];
+         float x2 = (float)params.inPtr[baseIdx + params.innerDim / 2];
+
+-        Type out = (Type)gatedSilu(params, permutedIdx, x1, x2);
++        TypeOut out = (TypeOut)gatedSilu(params, permutedIdx, x1, x2);
+
+         int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
+         params.outPtr[outIdx] = out;
+@@ -247,7 +248,8 @@
+
+ template <typename KernelParams>
+ __global__ void activationDeepSeekKernel(KernelParams params) {
+-  using Type = typename KernelParams::Type;
++  using TypeIn = typename KernelParams::TypeIn;
++  using TypeOut = typename KernelParams::TypeOut;
+   int32_t constexpr NumTokensPerCta = KernelParams::NumTokensPerCta;
+   using KernelTraits = KernelTraits<NumTokensPerCta>;
+   using MaxOp = typename KernelTraits::MaxOp;
+@@ -321,8 +323,11 @@
+               (int64_t)permutedIdx +
+               (int64_t)totalNumPaddedTokens * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
+
+-          scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
+-          scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
++          // In explicit BF16 FC1 mode inDqSfsPtr is nullptr: read BF16 directly (scale 1).
++          scale1Arr[tokenInCtaIdx] =
++              params.inDqSfsPtr != nullptr ? params.inDqSfsPtr[scale1Idx] : 1.0f;
++          scale2Arr[tokenInCtaIdx] =
++              params.inDqSfsPtr != nullptr ? params.inDqSfsPtr[scale2Idx] : 1.0f;
+           dataX1Arr[tokenInCtaIdx] = static_cast<float>(params.inPtr[baseIdx]);
+           dataX2Arr[tokenInCtaIdx] =
+               static_cast<float>(params.inPtr[baseIdx + params.innerDim / 2]);
+@@ -379,7 +384,7 @@
+           }
+           float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
+           int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
+-          params.outPtr[outIdx] = static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
++          params.outPtr[outIdx] = static_cast<TypeOut>(outArr[tokenInCtaIdx] / scaleOut);
+         }
+       }
+     }
+@@ -425,8 +430,15 @@
+
+     const dim3 grid(gridSizeX, gridSizeY, data.topK);
+
+-    LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid,
+-                      DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
++    if (data.mUseBf16Input) {
++      // Explicit BF16 FC1 mode: BF16 in (no dequant scales) -> E4M3 out, contract unchanged.
++      LAUNCH_ACTIVATION_TYPED(data, cutlass::bfloat16_t, cutlass::float_e4m3_t, numTokensPerCta,
++                              activationDeepSeekKernel, grid,
++                              DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
++    } else {
++      LAUNCH_ACTIVATION(data, activationDeepSeekKernel, numTokensPerCta, grid,
++                        DEEP_SEEK_ACTIVATION_NUM_THREADS_PER_CTA, 0, stream);
++    }
+   } else {
+     int const numThreads = 256;
+     const dim3 grid(data.innerDim / 128, data.topK, std::min(8192, data.numTokens));
+@@ -642,6 +654,7 @@
+       for (int k = 0; k < params.topK; k++) {
+         int const expandedIdx = tokenIdx * params.topK + k;
+         int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
++        if (permutedIdx < 0) continue;
+         params.outPtr[permutedIdx * params.hiddenDim + hiddenIdx] = data;
+       }
+     }
+@@ -651,6 +664,7 @@
+         for (int k = 0; k < params.topK; k++) {
+           int const expandedIdx = tokenIdx * params.topK + k;
+           int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
++          if (permutedIdx < 0) continue;
+
+           int const idx_in = tokenIdx + params.numTokens * scaleIdx;
+           int const idx_out = permutedIdx + params.totalNumPaddedTokens[0] * scaleIdx;
+--- a/data/csrc/trtllm_fused_moe_kernel_launcher.cu
++++ b/data/csrc/trtllm_fused_moe_kernel_launcher.cu
+@@ -1532,6 +1532,7 @@
+                                usePerChannelScalingGemm1,
+                                usePerChannelScalingGemm2,
+                                useWeightsOnlyConstructor,
++                               static_cast<int64_t>(args->fc1_output_dtype),
+                                std::get<0>(device_version),
+                                std::get<1>(device_version),
+                                hidden_states.device().device_id};
+@@ -1546,7 +1547,8 @@
+                 .try_emplace(runnerKey, this->mDtypeWeights, args->mUseDeepSeekFp8,
+                              static_cast<int32_t>(tile_tokens_dim), this->use_shuffled_weight,
+                              this->weight_layout, usePerTokenScalingGemm1, usePerTokenScalingGemm2,
+-                             usePerChannelScalingGemm1, usePerChannelScalingGemm2)
++                             usePerChannelScalingGemm1, usePerChannelScalingGemm2,
++                             args->fc1_output_dtype == 1)
+                 .first;
+       } else {
+         runnerIt =
+@@ -1555,7 +1557,8 @@
+                              static_cast<int32_t>(tile_tokens_dim), this->activation_type,
+                              this->use_shuffled_weight, this->weight_layout, args->gemm1_bias_type,
+                              usePerTokenScalingGemm1, usePerTokenScalingGemm2,
+-                             usePerChannelScalingGemm1, usePerChannelScalingGemm2)
++                             usePerChannelScalingGemm1, usePerChannelScalingGemm2,
++                             args->fc1_output_dtype == 1)
+                 .first;
+       }
+     }
+@@ -4259,10 +4262,29 @@
+     auto const gemm1_output_hidden = quantization_type == Fp8QuantizationType::DeepSeekFp8
+                                          ? intermediate_size_factor * args->intermediate_size
+                                          : args->intermediate_size;
+-    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
+-                                hidden_states.device());
+-
+-    if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
++    bool const fc1Bf16 = args->fc1_output_dtype == 1;
++    if (fc1Bf16) {
++      TVM_FFI_ICHECK(quantization_type == Fp8QuantizationType::DeepSeekFp8)
++          << "BF16 FC1 output (fc1_output_dtype=1) is only supported for DeepSeekFp8.";
++      // Explicit BF16 FC1 mode: the NoRoute dsFp8 cubins emit Bfloat16 directly (no scale
++      // buffer), and need pre-permuted activations + block scales as inputs.
++      gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
++                                  dl_bfloat16, hidden_states.device());
++      gemm1_output_scale = alloc_tensor({0}, dl_float32, hidden_states.device());
++      permuted_hidden_states =
++          alloc_tensor({workspace.total_max_padded_tokens, args->hidden_size}, dl_uint8,
++                       hidden_states.device());
++      permuted_hidden_states_scale =
++          alloc_tensor({args->hidden_size / 128, workspace.total_max_padded_tokens}, dl_float32,
++                       hidden_states.device());
++    } else {
++      gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden}, dl_uint8,
++                                  hidden_states.device());
++    }
++
++    if (fc1Bf16) {
++      // No FP32 scale buffer in BF16 FC1 mode.
++    } else if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
+       gemm1_output_scale = alloc_tensor({intermediate_size_factor * args->intermediate_size / 128,
+                                          workspace.total_max_padded_tokens},
+                                         dl_float32, hidden_states.device());
+@@ -4290,7 +4312,13 @@
+
+     workspace.hidden_states_scale_linear = nullptr;
+     workspace.gemm1_output = gemm1_output.data_ptr();
+-    workspace.gemm1_output_scale = static_cast<float*>(gemm1_output_scale.data_ptr());
++    workspace.gemm1_output_scale =
++        fc1Bf16 ? nullptr : static_cast<float*>(gemm1_output_scale.data_ptr());
++    if (fc1Bf16) {
++      workspace.permuted_hidden_states = permuted_hidden_states.data_ptr();
++      workspace.permuted_hidden_states_scale =
++          static_cast<float*>(permuted_hidden_states_scale.data_ptr());
++    }
+     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
+       workspace.activation_output = activation_output.data_ptr();
+       workspace.activation_output_scale = static_cast<float*>(activation_output_scale.data_ptr());
+@@ -4422,6 +4450,8 @@
+   Fp8QuantizationType quantization_type;
+   bool diag_return_fc1_{false};
+   bool diag_return_activation_{false};
++  Tensor permuted_hidden_states;
++  Tensor permuted_hidden_states_scale;
+
+  public:
+   // Override to handle pre-computed routing.
+@@ -4493,7 +4523,11 @@
+       cudaStream_t diag_stream = get_stream(hidden_states.device());
+       if (diag_return_fc1_) {
+         result.diag_fc1_output = cloneLauncherTensor2D(gemm1_output, diag_stream);
+-        result.diag_fc1_output_scale = cloneLauncherTensor2D(gemm1_output_scale, diag_stream);
++        // BF16 FC1 mode carries no scale buffer: return an empty placeholder instead.
++        result.diag_fc1_output_scale =
++            args->fc1_output_dtype == 1
++                ? alloc_tensor({0}, dl_float32, hidden_states.device())
++                : cloneLauncherTensor2D(gemm1_output_scale, diag_stream);
+       }
+       if (diag_return_activation_) {
+         result.diag_activation_output = cloneLauncherTensor2D(activation_output, diag_stream);
+@@ -4509,7 +4543,7 @@
+       int64_t num_local_experts, int64_t num_tokens, bool use_shuffled_weight,
+       int64_t weight_layout, btg::Dtype dtype_act, btg::Dtype dtype_weights,
+       Fp8QuantizationType quantization_type, int64_t act_type,
+-      batchedGemm::gemm::BiasType gemm1_bias_type) {
++      batchedGemm::gemm::BiasType gemm1_bias_type, int64_t fc1_output_dtype = 0) {
+     Array<Array<int64_t>> valid_configs;
+     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
+     auto activation_type = validateAndCastActivationType(act_type);
+@@ -4532,7 +4566,10 @@
+             << static_cast<int>(activation_type) << ".";
+         moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
+             dtype_weights, true /* useDeepSeekFp8 */, tile_N, use_shuffled_weight,
+-            static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout));
++            static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout),
++            false /* usePerTokenScalingGemm1 */, false /* usePerTokenScalingGemm2 */,
++            false /* usePerChannelScalingGemm1 */, false /* usePerChannelScalingGemm2 */,
++            fc1_output_dtype == 1);
+       } else {
+         // Under current trtllm_get_valid_moe_configs() dispatch rules, this else-path is
+         // reached by FP8 block-scale MXFP8 (dtype_act=dtype_weights=MxE4m3) and by
+@@ -4542,7 +4579,10 @@
+             dtype_weights,                                          // dtypeWeights
+             quantization_type == Fp8QuantizationType::DeepSeekFp8,  // useDeepSeekFp8
+             tile_N, activation_type, use_shuffled_weight,
+-            static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout), gemm1_bias_type);
++            static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout), gemm1_bias_type,
++            false /* usePerTokenScalingGemm1 */, false /* usePerTokenScalingGemm2 */,
++            false /* usePerChannelScalingGemm1 */, false /* usePerChannelScalingGemm2 */,
++            fc1_output_dtype == 1);
+       }
+
+       auto cfgs = moe_runner->getValidConfigIndices(
+@@ -5644,7 +5684,8 @@
+     int64_t act_type, bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+     Array<Tensor> da_routing_metadata, Array<Tensor> da_body_workspace, bool is_da_body_preparation,
+     Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
+-    int64_t silu_clamp_mode, bool diag_return_fc1, bool diag_return_activation) {
++    int64_t silu_clamp_mode, bool diag_return_fc1, bool diag_return_activation,
++    int64_t fc1_output_dtype) {
+   auto activation_type = validateAndCastActivationType(act_type);
+   validateFp8BlockScaleGemm1ActivationParams(gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                                              quantization_type, activation_type);
+@@ -5663,6 +5704,15 @@
+     FLASHINFER_CHECK(
+         quantization_type == Fp8QuantizationType::DeepSeekFp8,
+         "diag_return_fc1/diag_return_activation only supported for DeepSeekFp8");
++  }
++  FLASHINFER_CHECK(fc1_output_dtype == 0 || fc1_output_dtype == 1,
++                   "fc1_output_dtype must be 0 (E4M3) or 1 (Bfloat16), got ", fc1_output_dtype);
++  if (fc1_output_dtype == 1) {
++    FLASHINFER_CHECK(quantization_type == Fp8QuantizationType::DeepSeekFp8,
++                     "BF16 FC1 output (fc1_output_dtype=1) only supported for DeepSeekFp8");
++    FLASHINFER_CHECK(activation_type == ActivationType::Swiglu,
++                     "BF16 FC1 output (fc1_output_dtype=1) only supported for "
++                     "ActivationType::Swiglu");
+   }
+   // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
+   // Fail for any other activation to avoid silently running incorrect activation behavior.
+@@ -5774,6 +5824,7 @@
+     args->output_scale = nullptr;
+     set_valid_moe_dims(*args, output.size(1), valid_hidden_size, valid_intermediate_size);
+     args->silu_clamp_mode = silu_clamp_mode;
++    args->fc1_output_dtype = fc1_output_dtype;
+
+     // Create and initialize launcher for this tile size
+     auto launcher = std::make_unique<Fp8BlockScaleLauncher>(
+@@ -6156,7 +6207,7 @@
+     int64_t const hidden_size_output, int64_t const intermediate_size,
+     int64_t const num_local_experts, int64_t const act_type, bool const use_shuffled_weight,
+     int64_t const weight_layout, bool const use_per_token_scaling, int64_t const num_tokens,
+-    bool has_gemm1_lora_delta) {
++    bool has_gemm1_lora_delta, int64_t fc1_output_dtype) {
+   auto activation_type = validateAndCastActivationType(act_type);
+   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
+   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
+@@ -6186,7 +6237,7 @@
+     return Fp8BlockScaleLauncher::getValidConfigs(
+         top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_tokens,
+         use_shuffled_weight, weight_layout, dtype_act, dtype_weights, fp8_quantization_type,
+-        act_type, gemm1_bias_type_enum);
++        act_type, gemm1_bias_type_enum, fc1_output_dtype);
+   } else if (fp8_quantization_type == Fp8QuantizationType::PerChannelFp8 &&
+              dtype_act == btg::Dtype::E4m3 && dtype_weights == btg::Dtype::E4m3) {
+     // FP8 per-channel scale
+@@ -6199,7 +6250,7 @@
+     return Fp8BlockScaleLauncher::getValidConfigs(
+         top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_tokens,
+         use_shuffled_weight, weight_layout, dtype_act, dtype_weights, fp8_quantization_type,
+-        act_type, gemm1_bias_type_enum);
++        act_type, gemm1_bias_type_enum, 0);
+   } else if ((fp8_quantization_type == Fp8QuantizationType::PerTensorFp8 ||
+               fp8_quantization_type == Fp8QuantizationType::NoneFp8) &&
+              dtype_weights == btg::Dtype::E4m3) {
+@@ -6239,12 +6290,12 @@
+     int64_t const hidden_size_output, int64_t const intermediate_size,
+     int64_t const num_local_experts, int64_t const act_type, bool const use_shuffled_weight,
+     int64_t const weight_layout, bool const use_per_token_scaling, int64_t const num_tokens,
+-    bool has_gemm1_lora_delta) {
++    bool has_gemm1_lora_delta, int64_t fc1_output_dtype) {
+   // Start from complete valid tactics so every factorized coordinate remains executable.
+   auto const completeTactics = trtllm_get_valid_moe_configs(
+       dtype_act_, dtype_weights_, fp8_quantization_type, top_k, hidden_size, hidden_size_output,
+       intermediate_size, num_local_experts, act_type, use_shuffled_weight, weight_layout,
+-      use_per_token_scaling, num_tokens, has_gemm1_lora_delta);
++      use_per_token_scaling, num_tokens, has_gemm1_lora_delta, fc1_output_dtype);
+   auto const dtypeAct = static_cast<btg::Dtype>(dtype_act_);
+   auto const dtypeWeights = static_cast<btg::Dtype>(dtype_weights_);
+   auto const activationType = validateAndCastActivationType(act_type);
+@@ -6276,12 +6327,12 @@
+         runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
+             dtypeWeights, useDeepSeekFp8, static_cast<int>(tileN), use_shuffled_weight,
+             matrixLayout, usePerTokenScalingGemm1, usePerTokenScalingGemm2, useFp8PerChannelScaling,
+-            useFp8PerChannelScaling);
++            useFp8PerChannelScaling, fc1_output_dtype == 1);
+       } else {
+         runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
+             dtypeAct, dtypeWeights, useDeepSeekFp8, static_cast<int>(tileN), activationType,
+             use_shuffled_weight, matrixLayout, gemm1BiasType, usePerTokenScalingGemm1,
+-            usePerTokenScalingGemm2, useFp8PerChannelScaling, useFp8PerChannelScaling);
++            usePerTokenScalingGemm2, useFp8PerChannelScaling, useFp8PerChannelScaling, fc1_output_dtype == 1);
+       }
+       runnerIt = runners.emplace(tileN, std::move(runner)).first;
+     }
+--- a/data/csrc/trtllm_fused_moe_runner.cu
++++ b/data/csrc/trtllm_fused_moe_runner.cu
+@@ -176,7 +176,10 @@
+         .actType = actType,
+         .deepSeekFp8 = useDeepSeekFp8,
+         .fusedAct = !useDeepSeekFp8,
+-        .routeAct = true,
++        // BF16-output DeepSeekFp8 FC1 cubins exist only as RouteImpl::NoRoute (measured on
++        // flashinferMetaInfo.h: 0 entries with RouteImpl(2)+Bfloat16, 264 with NoRoute).
++        // The runner pre-permutes activations for them via moe::dev::permute.
++        .routeAct = !(useDeepSeekFp8 && dtypeOutput == btg::Dtype::Bfloat16),
+         .staticBatch = false,
+         .transposeMmaOutput = true,
+         .tileSize = tileTokensDim,
+@@ -443,13 +446,14 @@
+                batchedGemm::gemm::MatrixLayout weightLayout,
+                batchedGemm::gemm::BiasType gemm1BiasType, bool usePerTokenScalingGemm1,
+                bool usePerTokenScalingGemm2, bool usePerChannelScalingGemm1,
+-               bool usePerChannelScalingGemm2)
++               bool usePerChannelScalingGemm2, bool fc1OutputBf16)
+     : mUsePerTokenScalingGemm1(usePerTokenScalingGemm1),
+       mUsePerTokenScalingGemm2(usePerTokenScalingGemm2),
+       mUsePerChannelScalingGemm1(usePerChannelScalingGemm1),
+       mUsePerChannelScalingGemm2(usePerChannelScalingGemm2),
+       mPermuteGemm1(PermuteGemm1::Runner(
+-          dtypeAct, dtypeWeights, usePerTokenScalingGemm2 ? btg::Dtype::Bfloat16 : dtypeAct,
++          dtypeAct, dtypeWeights,
++          fc1OutputBf16 || usePerTokenScalingGemm2 ? btg::Dtype::Bfloat16 : dtypeAct,
+           useDeepSeekFp8, tileTokensDim, activationType, useShuffledMatrix, weightLayout,
+           gemm1BiasType, usePerTokenScalingGemm1, usePerChannelScalingGemm1)),
+       mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
+@@ -473,11 +477,12 @@
+ Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
+                bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weightLayout,
+                bool usePerTokenScalingGemm1, bool usePerTokenScalingGemm2,
+-               bool usePerChannelScalingGemm1, bool usePerChannelScalingGemm2)
++               bool usePerChannelScalingGemm1, bool usePerChannelScalingGemm2,
++               bool fc1OutputBf16)
+     : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, ActivationType::Swiglu,
+              useShuffledMatrix, weightLayout, batchedGemm::gemm::BiasType::None,
+              usePerTokenScalingGemm1, usePerTokenScalingGemm2, usePerChannelScalingGemm1,
+-             usePerChannelScalingGemm2) {}
++             usePerChannelScalingGemm2, fc1OutputBf16) {}
+
+ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
+                         bool const enablePdl, moe::dev::convertsf::Data& convertSfData,
+@@ -519,6 +524,7 @@
+   activationData.ctaIdxXyToBatchIdx = workspace.cta_idx_xy_to_batch_idx;
+   activationData.tileTokensDim = workspace.ProjUpTileN;
+   activationData.siluClampMode = args.silu_clamp_mode;
++  activationData.mUseBf16Input = args.fc1_output_dtype == 1;
+
+   // Setup finalize data
+   if (args.do_finalize) {
+@@ -702,8 +708,30 @@
+   float* const gemm1Alpha = useUnfusedActivation ? nullptr : args.gemm1_alpha;
+   float* const gemm1Beta = useUnfusedActivation ? nullptr : args.gemm1_beta;
+   float* const gemm1ClampLimit = useUnfusedActivation ? nullptr : args.gemm1_clamp_limit;
++  bool const fc1Bf16Output = args.fc1_output_dtype == 1;
++  if (fc1Bf16Output) {
++    // The BF16-output DeepSeekFp8 FC1 cubins are RouteImpl::NoRoute: they cannot gather
++    // activations in-kernel, so pre-permute tokens + block scales with the dev permute kernel.
++    moe::dev::permute::Data permuteData;
++    permuteData.mDtypeElt = args.mDtypeElt;
++    permuteData.mUsePdl = enable_pdl;
++    permuteData.mUseDeepSeekFp8 = true;
++    permuteData.inPtr = args.hidden_states;
++    permuteData.outPtr = workspace.permuted_hidden_states;
++    permuteData.inDqSfsPtr = static_cast<float*>(args.hidden_states_scale);
++    permuteData.outDqSfsPtr = workspace.permuted_hidden_states_scale;
++    permuteData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
++    permuteData.hiddenDim = args.hidden_size;
++    permuteData.numTokens = args.num_tokens;
++    permuteData.topK = totalExpertsPerToken;
++    permuteData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
++    moe::dev::permute::run(permuteData, stream);
++  }
+   mPermuteGemm1.run(
+-      args.hidden_states, hidden_states_scale_linear, args.gemm1_weights, args.gemm1_weights_scale,
++      fc1Bf16Output ? workspace.permuted_hidden_states : args.hidden_states,
++      fc1Bf16Output ? static_cast<void*>(workspace.permuted_hidden_states_scale)
++                    : hidden_states_scale_linear,
++      args.gemm1_weights, args.gemm1_weights_scale,
+       args.gemm1_per_channel_weight_scale == nullptr ? workspace.token_scales
+                                                      : args.hidden_states_scale,
+       args.gemm1_per_channel_weight_scale, args.output1_scales_scalar,
+--- a/data/include/flashinfer/trtllm/fused_moe/DevKernel.h
++++ b/data/include/flashinfer/trtllm/fused_moe/DevKernel.h
+@@ -102,16 +102,31 @@
+     FLASHINFER_WARN("Unsupported numTokensPerCta");                                                \
+   }
+
++#define LAUNCH_ACTIVATION_TYPED(data, typeIn, typeOut, numTokensPerCta, kernel, numBlocks,   \
++                                      numThreads, smemSize, stream)                               \
++  if (numTokensPerCta == 4) {                                                                     \
++    LAUNCH_PDL(data, false, LAUNCH_ESC(typeIn, typeOut, 4), kernel, numBlocks, numThreads,        \
++               smemSize, stream);                                                                 \
++  } else if (numTokensPerCta == 2) {                                                              \
++    LAUNCH_PDL(data, false, LAUNCH_ESC(typeIn, typeOut, 2), kernel, numBlocks, numThreads,        \
++               smemSize, stream);                                                                 \
++  } else if (numTokensPerCta == 1) {                                                              \
++    LAUNCH_PDL(data, false, LAUNCH_ESC(typeIn, typeOut, 1), kernel, numBlocks, numThreads,        \
++               smemSize, stream);                                                                 \
++  } else {                                                                                        \
++    FLASHINFER_WARN("Unsupported numTokensPerCta");                                               \
++  }
++
+ #define LAUNCH_ACTIVATION(data, kernel, numTokensPerCta, numBlocks, numThreads, smemSize, stream) \
+   if (data.mDtypeElt == tg::Dtype::Fp16) {                                                        \
+-    LAUNCH_NUM_TOKENS_PER_CTA(data, cutlass::half_t, numTokensPerCta, kernel, numBlocks,          \
+-                              numThreads, smemSize, stream);                                      \
++    LAUNCH_ACTIVATION_TYPED(data, cutlass::half_t, cutlass::half_t, numTokensPerCta, kernel,      \
++                            numBlocks, numThreads, smemSize, stream);                             \
+   } else if (data.mDtypeElt == tg::Dtype::E4m3) {                                                 \
+-    LAUNCH_NUM_TOKENS_PER_CTA(data, cutlass::float_e4m3_t, numTokensPerCta, kernel, numBlocks,    \
+-                              numThreads, smemSize, stream);                                      \
++    LAUNCH_ACTIVATION_TYPED(data, cutlass::float_e4m3_t, cutlass::float_e4m3_t, numTokensPerCta,  \
++                            kernel, numBlocks, numThreads, smemSize, stream);                     \
+   } else if (data.mDtypeElt == tg::Dtype::Bfloat16) {                                             \
+-    LAUNCH_NUM_TOKENS_PER_CTA(data, cutlass::bfloat16_t, numTokensPerCta, kernel, numBlocks,      \
+-                              numThreads, smemSize, stream);                                      \
++    LAUNCH_ACTIVATION_TYPED(data, cutlass::bfloat16_t, cutlass::bfloat16_t, numTokensPerCta,      \
++                            kernel, numBlocks, numThreads, smemSize, stream);                     \
+   } else {                                                                                        \
+     FLASHINFER_WARN("Unsupported dtypeElt");                                                      \
+   }
+@@ -192,16 +207,20 @@
+   int32_t tileTokensDim{0};
+   // 0 = legacy pre-SiLU clamp; 1 = post-SiLU clamp (clamp the SiLU output instead).
+   int32_t siluClampMode{0};
+-};
+-
+-template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
++  // When true (explicit BF16 FC1 mode), inPtr holds Bfloat16 values and inDqSfsPtr is
++  // nullptr; the DeepSeek activation kernel skips the E4M3 dequant and reads BF16 directly.
++  bool mUseBf16Input{false};
++};
++
++template <typename TypeIn_, typename TypeOut_, int32_t NumTokensPerCta_, bool UsePdl_>
+ struct KernelParams {
+-  using Type = Type_;
++  using TypeIn = TypeIn_;
++  using TypeOut = TypeOut_;
+   static constexpr int32_t NumTokensPerCta = NumTokensPerCta_;
+   static constexpr bool UsePdl = UsePdl_;
+
+-  Type const* inPtr;
+-  Type* outPtr;
++  TypeIn const* inPtr;
++  TypeOut* outPtr;
+
+   float* inDqSfsPtr = nullptr;
+   float* outDqSfsPtr = nullptr;
+@@ -223,8 +242,8 @@
+   static KernelParams setKernelParams(Data const& data) {
+     KernelParams params;
+
+-    params.inPtr = (Type*)data.inPtr;
+-    params.outPtr = (Type*)data.outPtr;
++    params.inPtr = (TypeIn*)data.inPtr;
++    params.outPtr = (TypeOut*)data.outPtr;
+     params.inDqSfsPtr = data.inDqSfsPtr;
+     params.outDqSfsPtr = data.outDqSfsPtr;
+
+--- a/data/include/flashinfer/trtllm/fused_moe/runner.h
++++ b/data/include/flashinfer/trtllm/fused_moe/runner.h
+@@ -337,6 +337,9 @@
+   float* gemm1_clamp_limit = nullptr;
+   // 0 = legacy pre-SiLU clamp, 1 = post-SiLU clamp (DeepSeekFp8 unfused activation only).
+   int64_t silu_clamp_mode{0};
++  // 0 = E4M3 FC1 output (default), 1 = explicit Bfloat16 FC1 output (DeepSeekFp8+Swiglu only;
++  // uses the NoRoute dsFp8 cubins with a pre-permuted activation input).
++  int64_t fc1_output_dtype{0};
+   float* gemm2_bias = nullptr;
+
+   ActivationType activation_type = ActivationType::Swiglu;
+@@ -469,12 +472,13 @@
+          bool useShuffledMatrix, batchedGemm::gemm::MatrixLayout weight_layout,
+          batchedGemm::gemm::BiasType gemm1BiasType, bool usePerTokenScalingGemm1 = false,
+          bool usePerTokenScalingGemm2 = false, bool usePerChannelScalingGemm1 = false,
+-         bool usePerChannelScalingGemm2 = false);
++         bool usePerChannelScalingGemm2 = false, bool fc1OutputBf16 = false);
+   Runner(batchedGemm::trtllm::gen::Dtype dtypeElt, bool useDeepSeekFp8, int tileTokensDim = 8,
+          bool useShuffledMatrix = false,
+          batchedGemm::gemm::MatrixLayout weight_layout = batchedGemm::gemm::MatrixLayout::MajorK,
+          bool usePerTokenScalingGemm1 = false, bool usePerTokenScalingGemm2 = false,
+-         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false);
++         bool usePerChannelScalingGemm1 = false, bool usePerChannelScalingGemm2 = false,
++         bool fc1OutputBf16 = false);
+
+   void run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
+            cudaStream_t stream, int64_t configIndex, bool enable_pdl);
+--- a/fused_moe/backends/trtllm/sm100_runner.py
++++ b/fused_moe/backends/trtllm/sm100_runner.py
+@@ -76,6 +76,7 @@
+         use_per_token_scaling: bool = False,
+         num_experts: Optional[int] = None,
+         num_fused_shared_experts: int = 0,
++        fc1_output_dtype: int = 0,
+     ):
+         self.moe_op = moe_op
+         self.num_local_experts = num_local_experts
+@@ -94,6 +95,7 @@
+         self.weight_layout = WeightLayout(weight_layout)
+         self.use_packed_weights = use_packed_weights
+         self.use_per_token_scaling = use_per_token_scaling
++        self.fc1_output_dtype = fc1_output_dtype
+         self.num_experts = num_experts if num_experts is not None else num_local_experts
+         # Runtime routing tensors and their initializer closures carry object
+         # identity, so keep them in an attribute excluded by
+@@ -128,6 +130,7 @@
+             int(self.weight_layout),
+             bool(self.use_packed_weights),
+             bool(self.use_per_token_scaling),
++            int(self.fc1_output_dtype),
+         )
+
+     def _make_tuning_config(
+@@ -226,6 +229,7 @@
+             self.use_per_token_scaling,
+             num_tokens,
+             has_gemm1_lora_delta,
++            self.fc1_output_dtype,
+         )
+         instance_key = (id(self.moe_op), query_key)
+         if instance_key not in MoERunner.valid_tactics_dict:
+@@ -266,6 +270,7 @@
+             self.use_per_token_scaling,
+             moe_inputs.hidden_states.shape[0],
+             moe_inputs.gemm1_lora_delta is not None,
++            self.fc1_output_dtype,
+         )
+         tactics = []
+         anchors = {}
+@@ -461,6 +466,7 @@
+                     kwargs.get("silu_clamp_mode", 0),
+                     kwargs.get("diag_return_fc1", False),
+                     kwargs.get("diag_return_activation", False),
++                    kwargs.get("fc1_output_dtype", 0),
+                 )
+             elif self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
+                 result = self.moe_op.trtllm_fp8_per_channel_scale_moe(
+--- a/fused_moe/core.py
++++ b/fused_moe/core.py
+@@ -3013,6 +3013,7 @@
+         silu_clamp_mode: int = 0,
+         diag_return_fc1: bool = False,
+         diag_return_activation: bool = False,
++        fc1_output_dtype: int = 0,
+     ) -> List[torch.Tensor]:
+         # Determine routing mode: compute from logits or use pre-computed
+         if routing_logits is None:
+@@ -3113,6 +3114,7 @@
+         _normalize_diag_return(
+             diag_return_fc1, diag_return_activation, do_finalize, fp8_quantization_type
+         )
++        _check_fc1_output_dtype_int(fc1_output_dtype, fp8_quantization_type, activation_type)
+
+         moe_runner = TrtllmMoERunner(
+             moe_op,
+@@ -3137,6 +3139,7 @@
+             use_shuffled_weight=use_shuffled_weight,
+             num_experts=num_experts,
+             num_fused_shared_experts=num_fused_shared_experts,
++            fc1_output_dtype=fc1_output_dtype,
+         )
+
+         moe_inputs = MoeRunnerInputs(
+@@ -3188,6 +3191,7 @@
+             "silu_clamp_mode": silu_clamp_mode,
+             "diag_return_fc1": diag_return_fc1,
+             "diag_return_activation": diag_return_activation,
++            "fc1_output_dtype": fc1_output_dtype,
+         }
+         _, tactic = tuner.choose_one(
+             "flashinfer::trtllm_fp8_block_scale_moe",
+@@ -3247,6 +3251,7 @@
+                 silu_clamp_mode,
+                 diag_return_fc1,
+                 diag_return_activation,
++                fc1_output_dtype,
+             )
+             # Reconstruct the public result without exposing dtype-specific body workspaces.
+             return _unpack_trtllm_moe_output(
+@@ -3352,6 +3357,7 @@
+         silu_clamp_mode: int = 0,
+         diag_return_fc1: bool = False,
+         diag_return_activation: bool = False,
++        fc1_output_dtype: int = 0,
+     ) -> List[torch.Tensor]:
+         # Acknowledge mutation-only and fallback-only controls without executing the native op.
+         _ = routing_replay_out, valid_intermediate_size
+@@ -4802,6 +4808,56 @@
+             "diag_return_fc1/diag_return_activation are only supported for "
+             f"fp8_quantization_type=DeepSeekFp8, got {Fp8QuantizationType(fp8_quantization_type)}."
+         )
++
++
++def _normalize_fc1_output_dtype(
++    fc1_output_dtype: Optional[str],
++    fp8_quantization_type: Fp8QuantizationType,
++    activation_type: int,
++) -> int:
++    """Validate the public ``fc1_output_dtype`` selector and map it to the kernel mode.
++
++    ``None`` (default) and ``"e4m3"`` select the legacy E4M3 FC1 intermediate;
++    ``"bf16"`` selects the explicit Bfloat16 FC1 output (DeepSeekFp8 + Swiglu only).
++    """
++    if fc1_output_dtype is None or fc1_output_dtype == "e4m3":
++        return 0
++    if fc1_output_dtype != "bf16":
++        raise ValueError(
++            f"fc1_output_dtype must be None, 'e4m3', or 'bf16'; got {fc1_output_dtype!r}."
++        )
++    if Fp8QuantizationType(fp8_quantization_type) != Fp8QuantizationType.DeepSeekFp8:
++        raise ValueError(
++            "fc1_output_dtype='bf16' is only supported for "
++            f"fp8_quantization_type=DeepSeekFp8, got {Fp8QuantizationType(fp8_quantization_type)}."
++        )
++    if int(activation_type) != int(ActivationType.Swiglu):
++        raise ValueError(
++            "fc1_output_dtype='bf16' is only supported for activation_type=Swiglu, "
++            f"got activation_type={activation_type}."
++        )
++    return 1
++
++
++def _check_fc1_output_dtype_int(
++    fc1_output_dtype: int,
++    fp8_quantization_type: Fp8QuantizationType,
++    activation_type: int,
++) -> None:
++    """Op-level validation for the integer fc1_output_dtype (direct op callers)."""
++    if fc1_output_dtype not in (0, 1):
++        raise ValueError(f"fc1_output_dtype must be 0 (e4m3) or 1 (bf16), got {fc1_output_dtype}.")
++    if fc1_output_dtype == 1:
++        if Fp8QuantizationType(fp8_quantization_type) != Fp8QuantizationType.DeepSeekFp8:
++            raise ValueError(
++                "fc1_output_dtype=1 (BF16 FC1) is only supported for "
++                f"fp8_quantization_type=DeepSeekFp8, got {Fp8QuantizationType(fp8_quantization_type)}."
++            )
++        if int(activation_type) != int(ActivationType.Swiglu):
++            raise ValueError(
++                "fc1_output_dtype=1 (BF16 FC1) is only supported for activation_type=Swiglu, "
++                f"got activation_type={activation_type}."
++            )
+
+
+ @flashinfer_api(trace=trtllm_bf16_moe_trace)
+@@ -5832,6 +5888,7 @@
+     silu_clamp_mode: Optional[str] = None,
+     diag_return_fc1: bool = False,
+     diag_return_activation: bool = False,
++    fc1_output_dtype: Optional[str] = None,
+ ) -> Union[List[torch.Tensor], torch.Tensor]:
+     r"""FP8 block-scaled MoE operation.
+
+@@ -6013,6 +6070,9 @@
+     _normalize_diag_return(
+         diag_return_fc1, diag_return_activation, do_finalize, fp8_quantization_type
+     )
++    fc1_output_dtype_int = _normalize_fc1_output_dtype(
++        fc1_output_dtype, fp8_quantization_type, activation_type
++    )
+     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+         RoutingInputMode.FromLogits,
+         routing_logits,
+@@ -6056,6 +6116,7 @@
+         silu_clamp_mode_int,
+         diag_return_fc1,
+         diag_return_activation,
++        fc1_output_dtype_int,
+     )
+
+     if do_finalize:
+@@ -6103,6 +6164,7 @@
+     silu_clamp_mode: Optional[str] = None,
+     diag_return_fc1: bool = False,
+     diag_return_activation: bool = False,
++    fc1_output_dtype: Optional[str] = None,
+ ) -> Union[List[torch.Tensor], torch.Tensor]:
+     r"""Pre-routed FP8 block-scaled MoE operation.
+
+@@ -6269,6 +6331,9 @@
+     _normalize_diag_return(
+         diag_return_fc1, diag_return_activation, do_finalize, fp8_quantization_type
+     )
++    fc1_output_dtype_int = _normalize_fc1_output_dtype(
++        fc1_output_dtype, fp8_quantization_type, activation_type
++    )
+     topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
+
+     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
+@@ -6314,6 +6379,7 @@
+         silu_clamp_mode_int,
+         diag_return_fc1,
+         diag_return_activation,
++        fc1_output_dtype_int,
+     )
+
+     if do_finalize and gemm1_lora_delta is None:

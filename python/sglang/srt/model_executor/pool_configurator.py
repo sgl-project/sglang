@@ -29,6 +29,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
     is_minimax_sparse,
 )
+from sglang.srt.configs.step5 import get_step5_text_config
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -976,6 +977,10 @@ class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):
             return False
         return len(kvc.layer_info.full_attention_layer_ids) > 0
 
+    @property
+    def swa_token_cap(self) -> int:
+        return self._swa_cap
+
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
@@ -1629,6 +1634,12 @@ def create_memory_pool_configurator(
 ) -> MemoryPoolConfigurator:
     if is_deepseek_v4(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
         return DSV4PoolConfigurator(kvc)
+    if get_step5_text_config(kvc.model_config.hf_config) is not None:
+        from sglang.srt.model_executor.step5_pool_configurator import (
+            Step5PoolConfigurator,
+        )
+
+        return Step5PoolConfigurator(kvc)
     if kvc.is_hybrid_swa:
         if SWARequestCapPoolConfigurator.is_applicable(kvc):
             return SWARequestCapPoolConfigurator(kvc)
