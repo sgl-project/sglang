@@ -3187,7 +3187,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
                 if (
-                    getattr(recv_obj, "spec_num_cap_tokens", None) is not None
+                    recv_obj.spec_num_cap_tokens is not None
                     and len(recv_obj.spec_num_cap_tokens) > i
                     and recv_obj.spec_num_cap_tokens[i] > 0
                 ):
@@ -3196,8 +3196,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 if (
                     _ragged_verify_cap_accept()
-                    and getattr(recv_obj, "spec_num_block_accept_tokens", None)
-                    is not None
+                    and recv_obj.spec_num_block_accept_tokens is not None
                     and len(recv_obj.spec_num_block_accept_tokens) > i
                 ):
                     meta_info["spec_block_accept_length"] = (
@@ -3215,7 +3214,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     recv_obj.spec_correct_drafts_histogram[i]
                 )
             if (
-                getattr(recv_obj, "spec_cap_lens_histogram", None)
+                recv_obj.spec_cap_lens_histogram
                 and len(recv_obj.spec_cap_lens_histogram) > i
                 and recv_obj.spec_cap_lens_histogram[i]
             ):
@@ -3233,9 +3232,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
         completion_tokens = (
-            recv_obj.completion_tokens[i]
-            if getattr(recv_obj, "completion_tokens", None)
-            else 0
+            recv_obj.completion_tokens[i] if recv_obj.completion_tokens else 0
         )
 
         custom_labels = getattr(state.obj, "custom_labels", None)
