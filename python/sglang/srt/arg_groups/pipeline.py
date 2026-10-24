@@ -159,11 +159,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_decode_context_parallelism,
         handle_dwdp,
         handle_elastic_ep,
+        handle_elastic_ep_auto_bootstrap,
         handle_eplb_and_dispatch,
         handle_expert_distribution_metrics,
         handle_shared_experts_tp,
     )
 
+    # Resolve automatic geometry before CUDA-graph, DP, and EPLB consumers.
+    run_hook(handle_elastic_ep_auto_bootstrap, server_args)
     run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
     run_hook(handle_decode_context_parallelism, server_args)
 
@@ -291,9 +294,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_moe_kernel_config, server_args)
     run_hook(handle_a2a_moe, server_args)
     run_hook(handle_shared_experts_tp, server_args)
+    # Validate Elastic EP before EPLB consumes the resolved topology.
+    run_hook(handle_elastic_ep, server_args)
     run_hook(handle_eplb_and_dispatch, server_args)
     run_hook(handle_expert_distribution_metrics, server_args)
-    run_hook(handle_elastic_ep, server_args)
     run_hook(validate_experimental_sgl_marlin, server_args)
 
     run_post_process_pass(server_args, _pipeline_parallel_overlap_disable)
