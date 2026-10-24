@@ -4,14 +4,6 @@ from typing import Dict, List, Optional, Tuple, Type
 
 from transformers import PreTrainedTokenizerBase
 
-from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
-from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
-from sglang.srt.entrypoints.openai.encoding_dsv4 import (
-    thinking_end_token as dsv4_thinking_end_token,
-)
-from sglang.srt.entrypoints.openai.encoding_dsv4 import (
-    thinking_start_token as dsv4_thinking_start_token,
-)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ResponsesRequest,
@@ -1525,6 +1517,12 @@ class _DeepSeekV3Detector(Qwen3Detector):
         self.reasoning_default = "explicit_thinking"
 
 
+DSV4_EOS_TOKEN = "<｜end▁of▁sentence｜>"
+DSV4_THINK_START_TOKEN = "<think>"
+DSV4_THINK_END_TOKEN = "</think>"
+DSV4_DSML_TOKEN = "｜DSML｜"
+
+
 class DeepSeekV4Detector(BaseReasoningFormatDetector):
     def __init__(
         self,
@@ -1535,14 +1533,9 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         force_nonempty_content: bool = False,
     ):
         super().__init__(
-            dsv4_thinking_start_token,
-            dsv4_thinking_end_token,
-            think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
-            # The reference parser splits reasoning at `\n\n<｜DSML｜tool_calls`;
-            # anchoring on the full tag at a line start keeps a mid-sentence
-            # mention of the tag inside reasoning from ending the block.
-            tool_start_token=f"<{dsv4_dsml_token}tool_calls>",
-            tool_start_at_line_start=True,
+            DSV4_THINK_START_TOKEN,
+            DSV4_THINK_END_TOKEN,
+            think_excluded_tokens=[DSV4_EOS_TOKEN, DSV4_DSML_TOKEN],
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
@@ -1551,15 +1544,6 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             reasoning_default="explicit_thinking",
             force_nonempty_content=force_nonempty_content,
         )
-
-
-class DeepSeekV41ReasoningDetector(DeepSeekV4Detector):
-    """V4.1 emits the calls block with a spaced tag name (`<｜DSML｜ calls>`),
-    so the unspaced V4 tool-start anchor never interrupts its reasoning."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.tool_start_token = f"<{dsv4_dsml_token} calls>"
 
 
 class _MimoDetector(Qwen3Detector):
@@ -2273,7 +2257,7 @@ class ReasoningParser:
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
         "deepseek-v4": DeepSeekV4Detector,
-        "deepseek-v41": DeepSeekV41ReasoningDetector,
+        "deepseek-v41": DeepSeekV4Detector,
         "dots": Qwen3Detector,
         "glm45": Glm45Detector,
         "ling3": Ling3Detector,

@@ -608,7 +608,17 @@ field defaults to the conservative answer.
     <tr>
       <td><code>get_graph_runner_cls()</code></td>
       <td><code>return None</code></td>
-      <td>Graph Runner class</td>
+      <td>Graph Runner class. Adaptive speculative decoding also builds one target verify runner per step count from it, passing <code>attn_backend</code>, <code>speculative_num_steps</code> and <code>speculative_num_draft_tokens</code> as keyword arguments.</td>
+    </tr>
+    <tr>
+      <td><code>get_speculative_graph_runner_cls(algorithm, phase)</code></td>
+      <td><code>return None</code></td>
+      <td>EAGLE draft graph runner for <code>"draft_decode"</code> or <code>"draft_extend"</code> on the built-in worker, constructed like the built-in runner for that phase. <code>None</code> runs the phase eagerly; not consulted when <code>capabilities.graph_capture</code> is False.</td>
+    </tr>
+    <tr>
+      <td><code>get_speculative_worker_cls(algorithm)</code></td>
+      <td><code>return None</code></td>
+      <td>Worker class that replaces the built-in speculative worker, for any algorithm. It is constructed with the built-in worker&#39;s keyword arguments, must expose the same scheduler-facing interface, and must reject flags it cannot serve (such as multi-layer EAGLE). <code>--speculative-adaptive</code> falls back to static parameters with a platform worker, since only the built-in worker implements it. EAGLE, EAGLE3, NEXTN (asked as <code>"EAGLE"</code>) and STANDALONE also require <code>supports_speculative_algorithm(algorithm)</code> to return True.</td>
     </tr>
     <tr>
       <td><code>get_kv_pool_cls(kind=...)</code></td>

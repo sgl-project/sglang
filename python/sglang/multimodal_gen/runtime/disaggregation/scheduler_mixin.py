@@ -1569,8 +1569,8 @@ class SchedulerDisaggMixin:
         self: Scheduler, req: Req, request_id: str
     ) -> None:
         """Run local preparation, DiT, and VAE, then return decoded pixels."""
+        # the head owns image encoding and persistence; this hop carries tensors
         req.save_output = False
-        # The head encodes images; this transport carries pixels, not image bytes.
         req.return_file_paths_only = False
         start_time = time.monotonic()
         with self._disagg_trace_dispatch(req):
