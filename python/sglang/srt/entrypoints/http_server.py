@@ -92,6 +92,7 @@ from sglang.srt.entrypoints.ollama.protocol import (
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.chat_encoding_adapters import native_text_parser
+from sglang.srt.entrypoints.openai.errors import openai_error
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
@@ -577,11 +578,11 @@ def _anthropic_error_response(*, status_code: int, error_type: str, message: str
 async def validation_exception_handler(request: Request, exc: HTTPException):
     """Enrich HTTP exception with status code and other details.
 
-    For /v1/responses, emit OpenAI-style nested error envelope:
-    {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
+    For OpenAI /v1 endpoints, emit the same error envelope as serving handlers.
     For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
     """
-    if request.url.path.startswith("/v1/messages"):
+    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+    if route_path.startswith("/v1/messages"):
         # Map HTTP status to Anthropic error.type; fall back to api_error.
         anthropic_type = {
             400: "invalid_request_error",
@@ -608,16 +609,11 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
             message=message,
         )
 
-    # adjust fmt for responses api
-    if request.url.path.startswith("/v1/responses"):
-        nested_error = {
-            "message": exc.detail,
-            "type": HTTPStatus(exc.status_code).phrase,
-            "param": None,
-            "code": exc.status_code,
-        }
+    if route_path.startswith("/v1/") and route_path != "/v1/systemone":
         return ORJSONResponse(
-            content={"error": nested_error}, status_code=exc.status_code
+            content=openai_error(str(exc.detail), exc.status_code),
+            status_code=exc.status_code,
+            headers=exc.headers,
         )
 
     error = ErrorResponse(
@@ -636,18 +632,18 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
     For /v1/messages, emit Anthropic-style envelope and scrub the message so
     file paths or Python internals from the default ``str(exc)`` representation
-    never reach the client. For /v1/responses, keep OpenAI-style. For
+    never reach the client. For OpenAI /v1 endpoints, use the shared envelope. For
     /v1/systemone, keep the 422 detail list that the System One API documents.
     Otherwise use the legacy ErrorResponse shape.
     """
-    if request.url.path.startswith("/v1/messages"):
+    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+    if route_path.startswith("/v1/messages"):
         return _anthropic_error_response(
             status_code=HTTPStatus.BAD_REQUEST.value,
             error_type="invalid_request_error",
             message=_anthropic_validation_message(exc.errors()),
         )
 
-    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
     if route_path == "/v1/systemone":
         # The System One API documents FastAPI's default 422 detail list. The
         # optional input echo is left out, since it can be any client value.
@@ -668,15 +664,19 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     else:
         message = exc_str
 
-    if request.url.path.startswith("/v1/responses"):
-        # adapt specially, for v1/responses API only (notice the error key is different)
-        nested_error = {
-            "message": message,
-            "type": HTTPStatus.BAD_REQUEST.phrase,
-            "param": None,
-            "code": HTTPStatus.BAD_REQUEST.value,
-        }
-        return ORJSONResponse(status_code=400, content={"error": nested_error})
+    if route_path.startswith("/v1/"):
+        errors = exc.errors()
+        location = errors[0].get("loc", ()) if errors else ()
+        location = (
+            location[1:]
+            if location and location[0] in ("body", "query", "path")
+            else location
+        )
+        param = ".".join(str(part) for part in location) or None
+        return ORJSONResponse(
+            status_code=400,
+            content=openai_error(_anthropic_validation_message(errors), param=param),
+        )
 
     err = ErrorResponse(
         message=message,

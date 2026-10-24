@@ -84,6 +84,15 @@ ERROR_TYPE_MAP = {
 }
 
 
+_OPENAI_ERROR_CODE_TYPES = {
+    "not_found": "not_found_error",
+    "model_not_found": "not_found_error",
+    "request_timeout": "request_timeout_error",
+    "request_too_large": "request_too_large",
+    "service_unavailable": "overloaded_error",
+}
+
+
 def _cached_prompt_tokens(usage) -> int:
     prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
     return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
@@ -970,12 +979,8 @@ class AnthropicServing:
         def _parse_upstream_error(data_str: str) -> Optional[tuple[str, str]]:
             """Detect an OpenAI handler streaming-error envelope.
 
-            ``OpenAIServingChat.create_streaming_error_response`` emits
-            ``data: {"error": {"object":"error","message":"...",
-            "type":"BadRequestError","code":400}}``; the regular
-            ChatCompletionStreamResponse validator rejects it. Pull the
-            type/message out so the Anthropic client sees the real
-            failure instead of a generic 'Stream processing error'.
+            Read the protocol type/string code first, while accepting the old
+            numeric-code envelope from compatible upstream handlers.
             """
             try:
                 payload = json.loads(data_str)
@@ -988,11 +993,17 @@ class AnthropicServing:
                 return None
             upstream_message = err.get("message") or "Upstream error"
             code = err.get("code")
-            error_type = (
-                ERROR_TYPE_MAP.get(code, "api_error")
-                if isinstance(code, int)
-                else "api_error"
-            )
+            upstream_type = err.get("type")
+            if isinstance(code, str) and code in _OPENAI_ERROR_CODE_TYPES:
+                error_type = _OPENAI_ERROR_CODE_TYPES[code]
+            elif isinstance(upstream_type, str) and upstream_type in set(
+                ERROR_TYPE_MAP.values()
+            ):
+                error_type = upstream_type
+            elif isinstance(code, int):
+                error_type = ERROR_TYPE_MAP.get(code, "api_error")
+            else:
+                error_type = "api_error"
             return error_type, str(upstream_message)
 
         # Pre-first-chunk errors from the OpenAI generator (e.g. tokenization
@@ -1362,11 +1373,15 @@ class AnthropicServing:
                     upstream_message = error_payload.get("message") or payload.get(
                         "message"
                     )
-                    # Honor the upstream error.type only for 4xx; 5xx is
-                    # normalized below.
+                    # Shared OpenAI envelopes carry specific 4xx meanings in
+                    # code; their generic type must not hide those from Messages.
+                    # Keep 5xx normalized from HTTP status and scrubbed below.
                     if status_code < 500:
+                        code = error_payload.get("code")
                         upstream_type = error_payload.get("type")
-                        if isinstance(upstream_type, str) and upstream_type:
+                        if isinstance(code, str) and code in _OPENAI_ERROR_CODE_TYPES:
+                            error_type = _OPENAI_ERROR_CODE_TYPES[code]
+                        elif isinstance(upstream_type, str) and upstream_type:
                             error_type = upstream_type
                 elif isinstance(error_payload, str):
                     upstream_message = error_payload

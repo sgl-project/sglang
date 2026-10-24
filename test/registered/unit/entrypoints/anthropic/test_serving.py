@@ -17,6 +17,7 @@ from sglang.srt.entrypoints.anthropic.protocol import (  # noqa: E402
     AnthropicMessagesRequest,
 )
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E402
+from sglang.srt.entrypoints.openai.errors import openai_error  # noqa: E402
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -130,6 +131,56 @@ async def _collect_anthropic_events(serving, anthropic_request):
 
 
 class TestAnthropicServing(unittest.TestCase):
+    def test_shared_openai_errors_keep_http_and_streaming_types_aligned(self):
+        for status, expected_type in (
+            (400, "invalid_request_error"),
+            (404, "not_found_error"),
+            (408, "request_timeout_error"),
+            (413, "request_too_large"),
+            (429, "rate_limit_error"),
+            (503, "overloaded_error"),
+        ):
+            with self.subTest(status=status):
+                payload = openai_error("request failed", status)
+                serving = self._serving([f"data: {json.dumps(payload)}\n\n"])
+                events = asyncio.run(
+                    _collect_anthropic_events(serving, self._anthropic_request())
+                )
+                stream_error = next(e for e in events if e["type"] == "error")
+                response = serving._convert_openai_error_response(
+                    JSONResponse(status_code=status, content=payload)
+                )
+                self.assertEqual(response.status_code, status)
+                self.assertEqual(
+                    json.loads(response.body)["error"]["type"], expected_type
+                )
+                self.assertEqual(stream_error["error"]["type"], expected_type)
+                self.assertEqual(events[-1]["type"], "message_stop")
+
+    def test_stream_error_string_code_keeps_overload_semantics(self):
+        for code in (503, "service_unavailable"):
+            with self.subTest(code=code):
+                line = (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "error": {
+                                "message": "busy",
+                                "type": "server_error",
+                                "code": code,
+                            }
+                        }
+                    )
+                    + "\n\n"
+                )
+                serving = self._serving([line])
+                events = asyncio.run(
+                    _collect_anthropic_events(serving, self._anthropic_request())
+                )
+                error = next(e for e in events if e["type"] == "error")
+                self.assertEqual(error["error"]["type"], "overloaded_error")
+                self.assertEqual(events[-1]["type"], "message_stop")
+
     # Renders system at any position (GLM/Kimi/Qwen3) → can pass through.
     INLINE_SYSTEM_TEMPLATE = (
         "{%- for message in messages %}"

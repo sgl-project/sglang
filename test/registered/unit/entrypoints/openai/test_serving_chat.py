@@ -586,8 +586,8 @@ class ServingChatTestCase(CustomTestCase):
                 )
                 error = json.loads(response.body)
                 self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
-                self.assertEqual(error["type"], "BadRequestError")
-                self.assertIn(media_type, error["message"])
+                self.assertEqual(error["error"]["type"], "invalid_request_error")
+                self.assertIn(media_type, error["error"]["message"])
         self.tm.generate_request.assert_not_called()
 
     def test_media_validation_does_not_reject_supported_content(self):
@@ -3150,7 +3150,7 @@ class ServingChatTestCase(CustomTestCase):
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
         err_msg = "Aborted by scheduler"
-        err_code = HTTPStatus.INTERNAL_SERVER_ERROR
+        err_code = HTTPStatus.INTERNAL_SERVER_ERROR.value
 
         async def _mock_generate_abort():
             yield {
@@ -3217,7 +3217,8 @@ class ServingChatTestCase(CustomTestCase):
                 break
         self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+        self.assertIsNone(error_chunk_data["error"]["code"])
+        self.assertEqual(error_chunk_data["error"]["type"], "server_error")
 
         # Ensure the stream stops after the abort error
         # The last chunk should be "data: [DONE]\n\n"
@@ -3300,7 +3301,8 @@ class ServingChatTestCase(CustomTestCase):
 
         error_chunk_data = json.loads(chunks[0][len("data: ") :])
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+        self.assertIsNone(error_chunk_data["error"]["code"])
+        self.assertEqual(error_chunk_data["error"]["type"], "server_error")
 
     def test_streaming_error_abort_still_finalizes_other_choices(self):
         """An error abort ends generation but still runs finalization, so a
