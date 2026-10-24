@@ -749,6 +749,12 @@ def handle_elastic_ep(server_args: Any):
 
 def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.eplb_max_rebalance_count < 0:
+        raise ValueError(
+            "--eplb-max-rebalance-count must be >= 0 (0 means no limit), "
+            f"got {cfg.eplb_max_rebalance_count}."
+        )
+
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
         declare_resolution(
             server_args,

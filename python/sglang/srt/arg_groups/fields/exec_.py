@@ -890,6 +890,10 @@ class ExecMoe(msgspec.Struct):
     eplb_rebalance_num_iterations: A[
         int, "Number of iterations to automatically trigger a EPLB re-balance."
     ] = 1000
+    eplb_max_rebalance_count: A[
+        int,
+        "Stop rebalancing after this many EPLB rebalances and keep the last expert layout for the rest of the server's lifetime; 0 means no limit.",
+    ] = 0
     eplb_rebalance_layers_per_chunk: A[
         Optional[int],
         "Number of layers to rebalance per forward pass.",
