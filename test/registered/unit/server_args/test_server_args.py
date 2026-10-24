@@ -4876,19 +4876,40 @@ class TestTrtllmMlaArchGuard(CustomTestCase):
     def test_trtllm_mla_accepts_bfloat16_kv_cache_dtype(self):
         for backends in (
             {"attention_backend": "trtllm_mla"},
-            {
-                "attention_backend": "triton",
-                "prefill_attention_backend": "trtllm_mla",
-                "decode_attention_backend": "triton",
-            },
+            {"attention_backend": "triton", "decode_attention_backend": "trtllm_mla"},
         ):
             with self.subTest(**backends):
                 handle_attention_backend_compatibility(
                     self._make_args(kv_cache_dtype="bfloat16", **backends)
                 )
 
+    @override_platform(is_sm100=True, is_sm120=False, is_blackwell=True)
+    def test_trtllm_mla_prefill_only_keeps_kv_cache_dtype_unchecked(self):
+        args = self._make_args(
+            attention_backend="triton",
+            prefill_attention_backend="trtllm_mla",
+            decode_attention_backend="triton",
+            kv_cache_dtype="fp8_e5m2",
+        )
+
+        handle_attention_backend_compatibility(args)
+
+        self.assertEqual(
+            resolution_result(args, "prefill_attention_backend"), "trtllm_mla"
+        )
+
     @override_platform(is_sm100=False, is_sm120=False, is_blackwell=False)
-    def test_unused_global_backend_does_not_trigger_mla_checks(self):
+    def test_trtllm_mla_prefill_rejected_off_blackwell(self):
+        with self.assertRaisesRegex(ValueError, "TRTLLM MLA prefill requires SM10x"):
+            handle_attention_backend_compatibility(
+                self._make_args(
+                    attention_backend="triton",
+                    prefill_attention_backend="trtllm_mla",
+                )
+            )
+
+    @override_platform(is_sm100=False, is_sm120=True, is_blackwell=True)
+    def test_global_trtllm_mla_overridden_in_both_phases_allowed_on_sm120(self):
         handle_attention_backend_compatibility(
             self._make_args(
                 attention_backend="trtllm_mla",
