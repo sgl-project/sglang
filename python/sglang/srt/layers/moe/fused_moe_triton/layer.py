@@ -734,6 +734,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         is_bias: bool = False,
+        load_full_w2: bool = False,
     ):
         # Load grouped weight scales for group quantization
         # or model weights
@@ -744,6 +745,7 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 is_bias=is_bias,
+                load_full=load_full_w2,
             )
         elif shard_id in ("w1", "w3", "w13"):
             self._load_w13(
@@ -869,6 +871,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.Tensor,
         is_bias: bool = False,
+        load_full: bool = False,
     ):
         """Load w2 weights for down projection.
 
@@ -877,6 +880,7 @@ class FusedMoE(torch.nn.Module):
             shard_dim: The dimension to shard along
             shard_id: The shard ID (must be "w2")
             loaded_weight: The weight tensor to load from
+            load_full: Whether to load the complete w2 tensor without TP sharding.
         """
         if not isinstance(expert_data, torch.Tensor) or not isinstance(
             loaded_weight, torch.Tensor
@@ -907,20 +911,20 @@ class FusedMoE(torch.nn.Module):
             # for w2 in TP, it shards the input_features, i.e., shard_dim=2
             shard_size = expert_data.shape[shard_dim]
 
-        if self.use_padded_loading:
-            if _is_cpu and is_bias:
-                shard_dim = 1
-            expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
-                expert_data,
-                loaded_weight,
-                0,  # param_data_start
-                shard_size * self.moe_tp_rank,
-                shard_dim,
-                shard_size,
-                not self.use_presharded_weights,
-            )
-        else:
-            if not is_bias and not self.use_presharded_weights:
+        if not load_full:
+            if self.use_padded_loading:
+                if _is_cpu and is_bias:
+                    shard_dim = 1
+                expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                    expert_data,
+                    loaded_weight,
+                    0,  # param_data_start
+                    shard_size * self.moe_tp_rank,
+                    shard_dim,
+                    shard_size,
+                    not self.use_presharded_weights,
+                )
+            elif not is_bias and not self.use_presharded_weights:
                 if self.use_triton_kernels:
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 # Derive shard size from the loaded weight so padded buffers
@@ -1377,6 +1381,7 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
+                    load_full_w2=getattr(param, "load_full_w2", False),
                 )
             return
 
@@ -1408,6 +1413,7 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
+                    load_full_w2=getattr(param, "load_full_w2", False),
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
@@ -1441,6 +1447,7 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
+                load_full_w2=getattr(param, "load_full_w2", False),
             )
             return
 
