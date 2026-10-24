@@ -159,6 +159,25 @@ mod tests {
     use super::super::{ChatFormatterOptions, select_chat_formatter};
     use super::{ChatFormatter, load_chat_formatter};
 
+    /// A valid request the parity renderer declines is `EngineOnly`, for the
+    /// host to render another way rather than reject.
+    #[test]
+    fn declined_requests_are_engine_only() {
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "developer", "content": "Be brief."},
+            {"role": "user", "content": "Hi"}
+        ]});
+        let rendered =
+            ChatFormatter::DeepSeekV41.render_request(body, &std::collections::HashMap::new());
+        assert!(
+            matches!(
+                rendered,
+                Err(super::super::TemplateError::EngineOnly { .. })
+            ),
+            "{rendered:?}"
+        );
+    }
+
     fn request() -> CreateChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
             "model": "test",

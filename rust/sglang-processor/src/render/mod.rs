@@ -159,7 +159,13 @@ impl ChatFormatter {
             } => render_qwen38(formatter, *content_parts, request, default_kwargs).map(text),
             _ => Err("this formatter renders through render_prompt".into()),
         }
-        .map_err(|message| TemplateError::Renderer { message })
+        .map_err(|message| {
+            if message.ends_with(ENGINE_ONLY) {
+                TemplateError::EngineOnly { message }
+            } else {
+                TemplateError::Renderer { message }
+            }
+        })
     }
 
     /// DeepSeek-V4 or V4.1 through deepseek-recipe; `tokenizer_json`, the
@@ -324,6 +330,11 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
     }
 }
 
+/// How the SGLang-parity renderers end the message refusing a valid request:
+/// [`ChatFormatter::render_request`] maps such messages to
+/// [`TemplateError::EngineOnly`], so a renderer's refusal must keep it.
+const ENGINE_ONLY: &str = "on the engine";
+
 #[derive(Debug, Error)]
 pub enum TemplateError {
     #[error("failed to read {kind} `{path}`: {source}")]
@@ -365,6 +376,12 @@ pub enum TemplateError {
 
     #[error("invalid chat template: {message}")]
     Renderer { message: String },
+
+    /// [`ChatFormatter::render_request`] declines a valid request it cannot
+    /// render byte-for-byte as SGLang does ("... renders on the engine"); the
+    /// host should render it another way, not reject it.
+    #[error("{message}")]
+    EngineOnly { message: String },
 
     #[error("legacy chat template `{path}` must be a JSON object")]
     LegacyNotObject { path: PathBuf },
