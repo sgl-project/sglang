@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
-from sglang.srt.runtime_context import get_context, get_device, get_disagg
+from sglang.srt.runtime_context import get_context, get_device, get_disagg, get_parallel
 from sglang.srt.utils import get_available_gpu_memory
 
 if TYPE_CHECKING:
@@ -60,7 +60,15 @@ def handle_pd_role_switch(
             safe_to_restore=safe_to_restore,
         )
 
-    rejection = _reject_reason(scheduler, new_role)
+    try:
+        rejection = _reject_reason(scheduler, new_role)
+        if rejection is None and new_role != old_role:
+            rejection = _preflight_reason(scheduler, recv_req, new_role)
+    except Exception as e:
+        # A local check must not skip the collective entered by the other ranks.
+        logger.exception("PD role switch preflight failed")
+        rejection = (f"role switch preflight failed; restart required: {e}", False)
+    rejection = _agree_switch_rejection(scheduler, rejection)
     if rejection is not None:
         return _fail(*rejection)
     if new_role == old_role:
@@ -70,46 +78,6 @@ def handle_pd_role_switch(
             old_role=old_role,
             new_role=new_role,
         )
-    if not scheduler.is_fully_idle():
-        return _fail(
-            "instance is not idle; drain all requests before switching",
-            safe_to_restore=True,
-        )
-
-    required_graph_gb = recv_req.decode_cuda_graph_memory_gb
-    # Same condition ensure_decode_cuda_graphs skips on, so the check cannot be
-    # bypassed while the capture still runs.
-    will_capture_graphs = (
-        new_role == "decode" and not scheduler.tp_worker.get_decode_cuda_graph_bs()
-    )
-    if will_capture_graphs and required_graph_gb is None:
-        return _fail(
-            "decode_cuda_graph_memory_gb is required before capturing decode graphs",
-            safe_to_restore=True,
-        )
-    if will_capture_graphs and required_graph_gb is not None:
-        if required_graph_gb < 0:
-            return _fail(
-                "decode_cuda_graph_memory_gb must be non-negative",
-                safe_to_restore=True,
-            )
-        try:
-            available_graph_gb = get_available_gpu_memory(
-                scheduler.device, get_device().gpu_id
-            )
-        except Exception as e:
-            return _fail(
-                f"failed to check decode CUDA graph headroom: {e}",
-                safe_to_restore=True,
-            )
-        if available_graph_gb < required_graph_gb:
-            return _fail(
-                "insufficient decode CUDA graph headroom: "
-                f"required={required_graph_gb:.3f} GB, "
-                f"available={available_graph_gb:.3f} GB",
-                safe_to_restore=True,
-            )
-
     if recv_req.prepare_only:
         # The tokenizer checks every DP worker before allowing any teardown.
         return PdRoleSwitchReqOutput(
@@ -126,6 +94,7 @@ def handle_pd_role_switch(
         # them raises, the instance is left half-torn-down (old role released,
         # new role not up) and isn't safe to serve, so mark it unhealthy. There
         # is no in-place rollback.
+        failure = None
         try:
             teardown_disaggregation(scheduler)
             get_context().override("role_switch.flip", disaggregation_mode=new_role)
@@ -140,9 +109,18 @@ def handle_pd_role_switch(
                 new_role,
                 e,
             )
-            return _fail(
-                f"role switch failed; instance unhealthy, restart required: {e}"
+            failure = (
+                f"role switch failed; instance unhealthy, restart required: {e}",
+                False,
             )
+
+        failure = _agree_switch_rejection(scheduler, failure)
+        if failure is not None:
+            scheduler._pd_role_switch_unhealthy = True
+            resource = getattr(scheduler, "_pd_staging_resource", None)
+            if resource is not None:
+                resource.poison(failure[0])
+            return _fail(*failure)
 
         if new_role == "decode":
             # Best-effort deferred capture; a failure only degrades to eager.
@@ -164,6 +142,76 @@ def handle_pd_role_switch(
         return _fail(f"role switch raised: {e}")
     finally:
         scheduler._pd_role_switch_in_progress = False
+
+
+def _preflight_reason(scheduler: Scheduler, recv_req, new_role):
+    def reject(message, safe_to_restore=True):
+        return message, safe_to_restore
+
+    if not scheduler.is_fully_idle():
+        return reject(
+            "instance is not idle; drain all requests before switching",
+            safe_to_restore=True,
+        )
+
+    km = _current_kv_manager(scheduler)
+    resource = getattr(km, "staging_resource", None)
+    if resource is not None:
+        if reason := km.check_staging_role_switch_ready():
+            return reason, resource.unsafe_reason is None
+
+    required_graph_gb = recv_req.decode_cuda_graph_memory_gb
+    # Same condition ensure_decode_cuda_graphs skips on, so the check cannot be
+    # bypassed while the capture still runs.
+    will_capture_graphs = (
+        new_role == "decode" and not scheduler.tp_worker.get_decode_cuda_graph_bs()
+    )
+    if will_capture_graphs and required_graph_gb is None:
+        return reject(
+            "decode_cuda_graph_memory_gb is required before capturing decode graphs",
+            safe_to_restore=True,
+        )
+    if will_capture_graphs and required_graph_gb is not None:
+        if required_graph_gb < 0:
+            return reject(
+                "decode_cuda_graph_memory_gb must be non-negative",
+                safe_to_restore=True,
+            )
+        try:
+            available_graph_gb = get_available_gpu_memory(
+                scheduler.device, get_device().gpu_id
+            )
+        except Exception as e:
+            return reject(
+                f"failed to check decode CUDA graph headroom: {e}",
+                safe_to_restore=True,
+            )
+        if available_graph_gb < required_graph_gb:
+            return reject(
+                "insufficient decode CUDA graph headroom: "
+                f"required={required_graph_gb:.3f} GB, "
+                f"available={available_graph_gb:.3f} GB",
+                safe_to_restore=True,
+            )
+
+    return None
+
+
+def _agree_switch_rejection(scheduler, rejection):
+    """Every TP rank must decide before any rank tears down shared staging."""
+    if getattr(scheduler, "_pd_staging_resource", None) is None:
+        return rejection
+    parallel = get_parallel()
+    if parallel.tp_size == 1:
+        return rejection
+    import torch.distributed as dist
+
+    rejections = [None] * parallel.tp_size
+    dist.all_gather_object(rejections, rejection, group=parallel.tp_group.cpu_group)
+    failures = [r for r in rejections if r is not None]
+    if not failures:
+        return None
+    return "; ".join(dict.fromkeys(r[0] for r in failures)), all(r[1] for r in failures)
 
 
 def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, bool]]:
@@ -211,7 +259,12 @@ def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, b
             ),
         ),
         (
-            getattr(km, "enable_staging", False),
+            getattr(km, "enable_staging", False)
+            and not (
+                get_disagg().disaggregation_transfer_backend == "mooncake"
+                and get_parallel().pp_size == 1
+                and getattr(km, "staging_resource", None) is not None
+            ),
             True,
             lambda: (
                 "staging buffer (SGLANG_DISAGG_STAGING_BUFFER) is not "

@@ -164,6 +164,33 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         # Reject features whose role-specific state is not rebuilt on a flip.
         if cfg.enable_pd_role_switch:
             view = resolved_view(server_args)
+            if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+                if cfg.disaggregation_transfer_backend != "mooncake":
+                    raise ValueError("Shared staging role switching requires Mooncake")
+                if not envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get():
+                    raise ValueError(
+                        "Shared staging role switching requires "
+                        "SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE=True"
+                    )
+                chunk_size = cfg.chunked_prefill_size or 8192
+                if chunk_size <= 0 or (
+                    cfg.page_size is not None
+                    and (cfg.page_size <= 0 or chunk_size % cfg.page_size)
+                ):
+                    raise ValueError(
+                        "Shared staging requires a positive, page-aligned "
+                        f"chunked_prefill_size; got {cfg.chunked_prefill_size} "
+                        f"with page_size={cfg.page_size}"
+                    )
+                if (
+                    envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get() <= 0
+                    or envs.SGLANG_DISAGG_STAGING_POOL_SIZE_MB.get() <= 0
+                ):
+                    raise ValueError(
+                        "Shared staging requires positive "
+                        "SGLANG_DISAGGREGATION_QUEUE_SIZE and "
+                        "SGLANG_DISAGG_STAGING_POOL_SIZE_MB"
+                    )
             unsupported = []
             if view.ep_size > 1:
                 unsupported.append(f"expert parallelism (--ep-size {view.ep_size})")

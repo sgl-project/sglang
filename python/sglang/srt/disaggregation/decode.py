@@ -748,11 +748,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = get_device().gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
+        kv_manager_kwargs = {}
+        if (
+            self.transfer_backend == TransferBackend.MOONCAKE
+            and get_disagg().enable_pd_role_switch
+            and self.enable_staging
+        ):
+            kv_manager_kwargs["staging_resource"] = (
+                self.scheduler.get_or_create_pd_staging_resource(kv_args)
+            )
         kv_manager = kv_manager_class(
             kv_args,
             DisaggregationMode.DECODE,
             self.scheduler.server_args,
             self.is_mla_backend,
+            **kv_manager_kwargs,
         )
         if (
             get_disagg().disaggregation_decode_host_receive_threshold < 1
@@ -3038,7 +3048,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # leave a released entry in the list (double-free / None receiver on retry).
         self._deferred_releases = still_held
         for decode_req, start_time, idx, room, drained in to_release:
+            resource = getattr(decode_req.kv_receiver.kv_mgr, "staging_resource", None)
             if not drained:
+                if resource is not None:
+                    resource.poison(f"decode drain ACK timed out for room {room}")
                 logger.warning(
                     f"Deferred KV release for room {room} timed out after "
                     f"{self.deferred_kv_release_timeout}s without a full drain "
@@ -3049,6 +3062,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._do_release(decode_req, idx)
             except Exception:
                 # Isolate a failed release so the rest still run; entry already dropped.
+                if resource is not None:
+                    resource.poison(f"decode release failed for room {room}")
                 logger.exception(f"Deferred KV release failed for room {room}")
                 outcome = "error"
             self._observe_deferred_kv_release(

@@ -146,6 +146,29 @@ class DecodeStagingHandler:
         pp_writers = prefill_info.pp_size // self.kv_manager.pp_size
         return tp_writers * pp_writers
 
+    def check_idle(self):
+        # Preflight is a snapshot; teardown checks again after workers join.
+        # Registered rooms cover active writers. An arrival racing with
+        # unregister may leave orphan writer entries; these do not keep a
+        # retired room active.
+        if self._room_to_decode_req or self._room_to_receiver:
+            return "staging rooms are still active"
+        return None
+
+    def close(self):
+        """Detach a drained role's handler without resetting its shared allocator."""
+        if reason := self.check_idle():
+            raise RuntimeError(reason)
+        if self.staging_allocator is not None:
+            stream = self.staging_allocator._scatter_stream
+            if stream is not None:
+                stream.synchronize()
+        self._wm_subscribers.clear()
+        self.kv_manager = None
+        self.scheduler = None
+        self.kv_buffer_info = None
+        self.staging_allocator = None
+
     @classmethod
     def create(cls, kv_manager, scheduler, tp_rank: int) -> DecodeStagingHandler:
         """Factory: create handler. Raises if staging infra is missing."""
@@ -966,6 +989,7 @@ def prefetch_staging_reqs(
     staging_requested: set,
     prefetch_sockets: dict,
     requester_pp_rank: Optional[int] = None,
+    reuse_session_sockets: bool = False,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -999,12 +1023,25 @@ def prefetch_staging_reqs(
             try:
                 na = NetworkAddress(tinfo.endpoint, tinfo.dst_port)
                 ep = na.to_tcp()
-                if ep not in prefetch_sockets:
+                socket_key = session_id if reuse_session_sockets else ep
+                old_socket = prefetch_sockets.get(socket_key)
+                if (
+                    reuse_session_sockets
+                    and old_socket is not None
+                    and old_socket.getsockopt_string(zmq.LAST_ENDPOINT) != ep
+                ):
+                    # A drained decode can rebuild its control endpoint while
+                    # keeping the same transfer engine session and staging region.
+                    old_context = old_socket.context
+                    old_socket.close(linger=0)
+                    old_context.term()
+                    del prefetch_sockets[socket_key]
+                if socket_key not in prefetch_sockets:
                     sock = zmq.Context().socket(zmq.PUSH)
                     if na.is_ipv6:
                         sock.setsockopt(zmq.IPV6, 1)
                     sock.connect(ep)
-                    prefetch_sockets[ep] = sock
+                    prefetch_sockets[socket_key] = sock
                 request = [
                     b"STAGING_REQ",
                     str(room).encode("ascii"),
@@ -1014,6 +1051,6 @@ def prefetch_staging_reqs(
                 ]
                 if requester_pp_rank is not None:
                     request.append(str(requester_pp_rank).encode("ascii"))
-                prefetch_sockets[ep].send_multipart(request)
+                prefetch_sockets[socket_key].send_multipart(request)
             except Exception:
                 staging_requested.discard(stg_key)

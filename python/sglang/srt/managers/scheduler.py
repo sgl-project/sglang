@@ -683,6 +683,7 @@ class Scheduler(
         self.maybe_init_rust_server()
 
         # Init prefill-decodedisaggregation
+        self._pd_staging_resource = None
         self.init_disaggregation()
 
         # Init overlap schedule
@@ -1486,6 +1487,35 @@ class Scheduler(
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
+
+    def get_or_create_pd_staging_resource(self, kv_args):
+        from sglang.srt.disaggregation.mooncake.staging_resource import (
+            MooncakeStagingResource,
+        )
+        from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
+
+        chunk_size = get_schedule().chunked_prefill_size
+        count = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
+        decode_bytes = envs.SGLANG_DISAGG_STAGING_POOL_SIZE_MB.get() * 1024 * 1024
+        resource = self._pd_staging_resource
+        if resource is None:
+            resource = MooncakeStagingResource(
+                get_mooncake_transfer_engine(), kv_args, chunk_size, count, decode_bytes
+            )
+            # Publish ownership before registration can fail.
+            self._pd_staging_resource = resource
+            resource.initialize()
+        else:
+            resource.validate_layout(kv_args, chunk_size, count, decode_bytes)
+        return resource
+
+    def close_pd_staging_resource(self):
+        resource = self._pd_staging_resource
+        if resource is not None:
+            manager = role_switch._current_kv_manager(self)
+            if manager is not None:
+                manager.teardown()
+            resource.close()
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -6304,6 +6334,11 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
+                try:
+                    scheduler.close_pd_staging_resource()
+                except Exception:
+                    # Unsettled writes must keep their storage until process exit.
+                    logger.exception("Shared staging shutdown failed")
                 scheduler.release_host_resources()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()

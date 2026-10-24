@@ -235,6 +235,25 @@ class StagingBuffer:
     def get_ptr(self) -> int:
         return self.data_ptr
 
+    @classmethod
+    def from_tensor(cls, tensor: torch.Tensor, gpu_id: int) -> StagingBuffer:
+        """Borrow a contiguous byte view without allocating or registering it."""
+        if (
+            tensor.dtype != torch.uint8
+            or tensor.ndim != 1
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("A staging view must be a contiguous 1-D uint8 tensor")
+        buf = cls.__new__(cls)
+        buf.buffer = tensor
+        buf.size_bytes = tensor.numel()
+        buf.device = tensor.device
+        buf.device_module = torch.get_device_module(buf.device)
+        buf.gpu_id = gpu_id
+        buf.data_ptr = tensor.data_ptr()
+        buf._gather_stream = None
+        return buf
+
     def get_size(self) -> int:
         return self.size_bytes
 
@@ -274,8 +293,16 @@ class StagingAllocator:
         device: str,
         gpu_id: int,
         custom_mem_pool=None,
+        *,
+        buffer: Optional[StagingBuffer] = None,
     ):
-        self.buffer = StagingBuffer(total_size_bytes, device, gpu_id, custom_mem_pool)
+        if buffer is not None and buffer.get_size() != total_size_bytes:
+            raise ValueError("Staging allocator view must match its logical size")
+        self.buffer = (
+            buffer
+            if buffer is not None
+            else StagingBuffer(total_size_bytes, device, gpu_id, custom_mem_pool)
+        )
         self.total_size = total_size_bytes
         self.base_ptr = self.buffer.data_ptr
         self.head = 0
