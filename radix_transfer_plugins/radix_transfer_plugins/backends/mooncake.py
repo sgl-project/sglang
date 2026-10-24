@@ -13,7 +13,8 @@ Mooncake 0.3.13 this relies on (probed against a live master):
   allocator's size class (at most 1/8 more), and returns ``None`` for a part that
   finds no room, as it does for a missing part or a failed transfer.
 - A read leaves a lease on the key, and a remove without ``force`` fails (-706) while
-  the lease lasts.
+  the lease lasts. A batch read fails each part whose lease ran out before the whole
+  batch finished, though its bytes arrived.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from typing import Callable, Mapping, NoReturn, Sequence, Union
+from typing import Callable, Iterator, Mapping, NoReturn, Sequence, Union
 
 import msgspec
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig
@@ -36,6 +37,9 @@ _OBJECT_NOT_FOUND = -704
 # power-of-two units, at most this many, and rounds each allocation up to a size class.
 _ALLOCATOR_MAX_UNITS = 4026531840
 _ALLOCATOR_MANTISSA_BITS = 3
+# Lets a batch read finish well inside its lease (the master's default_kv_lease_ttl, 10 s by
+# default) over TCP; two readers on one host read 2 GiB batches as fast as larger ones.
+_READ_BATCH_BYTES = 2 * 1024**3
 
 _SIZE_UNITS = {
     "kb": 1024,
@@ -120,7 +124,12 @@ class MooncakeBackend(StorageBackend):
         part_keys = [
             _part_key(key, name) for key, named in zip(keys, parts) for name, _ in named
         ]
-        handles = self._store.batch_get_buffer(part_keys) if part_keys else []
+        part_bytes = [nbytes for named in parts for _, nbytes in named]
+        handles = [
+            handle
+            for batch in _read_batches(part_keys, part_bytes)
+            for handle in self._store.batch_get_buffer(batch)
+        ]
         unread = [key for key, handle in zip(part_keys, handles) if handle is None]
         if unread:
             self._raise_unread(unread)
@@ -217,6 +226,21 @@ class _LocalBufferGate:
                 if exclusive:
                     self._exclusive = False
                 self._cond.notify_all()
+
+
+def _read_batches(keys: Sequence[str], sizes: Sequence[int]) -> Iterator[list[str]]:
+    """Consecutive keys whose parts add up to at most ``_READ_BATCH_BYTES``; a larger part
+    goes alone."""
+    batch: list[str] = []
+    used = 0
+    for key, nbytes in zip(keys, sizes):
+        if batch and used + nbytes > _READ_BATCH_BYTES:
+            yield batch
+            batch, used = [], 0
+        batch.append(key)
+        used += nbytes
+    if batch:
+        yield batch
 
 
 def _allocator_unit_shift(buffer_bytes: int) -> int:

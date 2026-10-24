@@ -5,6 +5,7 @@ import pytest
 from conftest import USING_FAKE_MOONCAKE, FakeMooncakeStore
 
 from radix_transfer_plugins import available_backends, create_backend
+from radix_transfer_plugins.backends import mooncake as mooncake_backend
 from radix_transfer_plugins.backends.mooncake import (
     MooncakeBackend,
     MooncakeConfig,
@@ -94,6 +95,21 @@ def test_a_stored_part_that_was_not_read_is_not_reported_missing():
         backend.get_many([key], parts=[[("f0", 3), ("f1", 5)]])
     with pytest.raises(KeyError, match="f9"):
         backend.get_many([key], parts=[[("f0", 3), ("f9", 5)]])
+
+
+def test_reads_go_in_batches_of_bounded_bytes(monkeypatch):
+    monkeypatch.setattr(mooncake_backend, "_READ_BATCH_BYTES", 8)
+    backend, store = make_backend()
+    (small, large) = backend.put_many([parts(3, 5, 7), parts(10)])
+    got = backend.get_many(
+        [small, large], parts=[[("f0", 3), ("f1", 5), ("f2", 7)], [("f0", 10)]]
+    )
+    assert store.get_calls == [
+        [f"{small}/f0", f"{small}/f1"],
+        [f"{small}/f2"],
+        [f"{large}/f0"],  # larger than a batch: alone
+    ]
+    assert [bytes(got[0]["f2"]), bytes(got[1]["f0"])] == [bytes([2]) * 7, bytes(10)]
 
 
 def test_reads_are_counted_in_the_allocator_size_classes():

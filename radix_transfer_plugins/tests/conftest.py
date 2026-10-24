@@ -25,6 +25,7 @@ class FakeMooncakeStore:
         self.setup_config = None
         self.put_calls: list[tuple[list[str], object]] = []
         self.remove_calls: list[tuple[list[str], bool]] = []
+        self.get_calls: list[list[str]] = []
         # Statuses for the next put_batch calls; each may keep the first N keys stored.
         self.put_script: list[tuple[int, int]] = []
         self.closed = False
@@ -42,6 +43,7 @@ class FakeMooncakeStore:
         return status
 
     def batch_get_buffer(self, keys):
+        self.get_calls.append(list(keys))
         return [
             np.frombuffer(self.objects[key], dtype=np.int8).copy()
             if key in self.objects
