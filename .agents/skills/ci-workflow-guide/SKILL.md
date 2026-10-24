@@ -21,8 +21,11 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 
 | File | Role |
 |------|------|
-| `.github/workflows/pr-test.yml` | Main workflow — all stages, jobs, conditions, matrix definitions |
-| `.github/workflows/pr-test-extra.yml` | Extra workflow — gated by BOTH `run-ci` and `run-ci-extra` labels |
+| `.github/workflows/pr-test.yml` | Default NVIDIA base workflow, including supporting CPU jobs |
+| `.github/workflows/pr-test-extra.yml` | NVIDIA extra workflow, gated by `run-ci` and `run-ci-extra` |
+| `.github/workflows/pr-test-amd.yml` | AMD base workflow, gated by `run-ci` and `run-ci-amd` |
+| `.github/workflows/pr-test-amd-extra.yml` | AMD extra workflow, gated by `run-ci` and `run-ci-amd-extra` |
+| `scripts/ci/opt_in_ci_tiers.json` | Opt-in CI tiers: tier name → `run-ci-<tier>` label + the workflows that gate on it |
 | `.github/workflows/pr-gate.yml` | PR gating: draft check, `run-ci` label, per-user rate limiting |
 | `.github/actions/check-pr-test-health/action.yml` | Cross-job fail-fast: queries API for any failed job |
 | `.github/actions/wait-for-jobs/action.yml` | Stage gating: polls API until stage jobs complete |
@@ -390,25 +393,40 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | Command | Effect |
 |---------|--------|
 | `/tag-run-ci-label` | Adds `run-ci` label to PR |
-| `/tag-run-ci-label extra` | Adds both `run-ci` and `run-ci-extra` labels |
-| `/rerun-failed-ci` | Reruns failed jobs in the latest workflow run |
-| `/tag-and-rerun-ci` | Adds `run-ci` label + reruns failed |
-| `/tag-and-rerun-ci extra` | Adds both `run-ci` and `run-ci-extra` labels + reruns failed |
-| `/run-full-ci` | Short form of `/tag-and-rerun-ci extra` (baseline + extra). Alias: `/rerun-full-ci` |
-| `/run-extra-ci` | Adds both labels + reruns **only** `PR Test Extra`, leaving baseline runs alone. Alias: `/rerun-extra-ci` |
+| `/tag-run-ci-label <tier> [<tier> ...]` | Also adds each tier's `run-ci-<tier>` label (e.g. `extra`); unknown tiers are rejected |
+| `/run-ci` | With no arguments, an alias of `/tag-and-rerun-ci`: unsuccessful NVIDIA base and shared-check retries, with independent label/retry permissions. `/run-base-ci` and `/rerun-base-ci` behave the same way |
+| `/run-ci <tier>` | One registered tier: equivalent to `/run-<tier>-ci`, selecting only that tier, including successful runs, and requiring both permissions. Base aliases behave the same way. Existing `extra` and `amd-extra` arguments remain supported |
+| `/run-extra-ci [<hardware>]` | No argument selects NVIDIA extra. One hardware argument selects its registered `<hardware>-extra` tier: `/run-extra-ci amd` equals `/run-amd-extra-ci`, including permissions and successful reruns. Alias: `/rerun-extra-ci [<hardware>]` |
+| `/rerun-failed-ci` | Retries unsuccessful NVIDIA base and extra workflows for the current head; adds no labels |
+| `/rerun-failed-ci <tier> [<tier> ...]` | Retries unsuccessful NVIDIA base and explicitly named tiers; adds no labels |
+| `/tag-and-rerun-ci` | Adds `run-ci` and retries unsuccessful NVIDIA base workflows |
+| `/tag-and-rerun-ci <tier> [<tier> ...]` | Adds `run-ci` and the tier labels, then retries unsuccessful NVIDIA base and named tier workflows |
+| `/run-full-ci [<tier> ...]` | Adds labels and retries unsuccessful NVIDIA base, NVIDIA extra, and any explicitly named tiers. Alias: `/rerun-full-ci` |
+| `/run-<tier>-ci` | Adds `run-ci` and the tier label, then reruns only that tier, including successful runs. `/run-extra-ci`: NVIDIA extra; `/run-amd-ci`: AMD base; `/run-amd-extra-ci`: AMD extra. Alias: `/rerun-<tier>-ci` |
 | `/rerun-test <test-file> [<test-file> ...]` | Reruns specific test file(s) via `rerun-test.yml`. A file arg containing a glob metacharacter (`*`, `?`, `[...]`) expands against `test/registered/` and the multimodal test dir to every matching `test_*.py` (e.g. `/rerun-test test_*backend*.py` — wrap in backticks so GitHub doesn't italicize the `*`); matches are deduped, grouped by dispatch shape, and can't carry a `::test` selector. No match → single ⛔ reply, nothing dispatched. |
 | `/rerun-group <group> [<group> ...]` | Expands registered test groups, then reuses `/rerun-test` |
 | `/run-cpu-ci` | Dispatches `run-cpu-ci.yml` on main: only the `base-a-test-cpu` suite, at the PR head SHA, no caches saved. Same gate as `/rerun-test`. Alias: `/rerun-cpu-ci` |
 
+The `/rerun-failed-ci`, `/tag-and-rerun-ci`, no-argument base commands, and `/run-full-ci` selections also include shared checks such as lint and router tests. `/run-ci amd` equals `/run-amd-ci`: AMD base only, including successful runs. Likewise, `/run-ci extra` equals `/run-extra-ci` for NVIDIA extra, while `/run-extra-ci amd` equals `/run-amd-extra-ci` for AMD extra. `/tag-and-rerun-ci <tiers>` and `/run-full-ci <tiers>` retain their broader NVIDIA base/shared-check plus selected-tier scope and accept multiple tiers.
+
+Unsuccessful runs have conclusion `failure`, `skipped`, `cancelled`, or `timed_out`; in-flight runs are left alone. Existing labels never broaden command scope. Base commands and `/run-extra-ci` (including `/rerun-extra-ci`) accept at most one argument. Fully specified tier commands such as `/run-amd-extra-ci` accept none. For extra coverage, prefer the structured `/run-extra-ci amd` spelling. Existing `/run-amd-extra-ci`, `/run-ci amd-extra`, and its base-alias forms remain equivalent; the new spelling does not change their behavior. Legacy tag/full/failed commands still accept registered tier names such as `amd-extra`, including multiple tiers. An extra command whose `<hardware>-extra` tier is absent rejects without adding labels or rerunning workflows; only `amd-extra` is currently registered.
+
+`/tag-and-rerun-ci`, no-argument base commands, and `/run-full-ci` check label and retry permissions independently. A PR author may retry existing workflows without permission to add labels. A tier-scoped command, whether `/run-<tier>-ci`, a base command with one tier argument, or `/run-extra-ci <hardware>`, requires both permissions.
+
 Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`.
 
-### Label-gated workflow dispatch (pr-test, pr-test-extra)
+### Opt-in CI tiers (pr-test-extra and friends)
 
-`pr-test.yml` and `pr-test-extra.yml` both listen for `pull_request.labeled` (in addition to `opened`/`synchronize`/`reopened`). The `check-changes.if` gate has two clauses:
+An opt-in tier is a set of workflows a PR enters by carrying `run-ci-<tier>` on top of `run-ci`. Each tier is one entry in `scripts/ci/opt_in_ci_tiers.json`. The current entries are `extra` (NVIDIA extra), `amd` (AMD base), `amd-extra` (AMD extra), `npu`, `xpu`, `musa`, `mlx`, `xeon`, and `arm64`. Each hardware tier gates its corresponding `pr-test-<hardware>.yml` on `run-ci-<hardware>` as well as `run-ci`. The `extra` tier affects NVIDIA only. AMD extra requires only `run-ci` and `run-ci-amd-extra`; it does not require either of the other tier labels. NVIDIA base is a built-in workflow selection outside this registry.
 
-1. **For `labeled` events**: the just-added label must be one of the gating labels (`run-ci` for pr-test, `run-ci` or `run-ci-extra` for pr-test-extra) — otherwise every unrelated label addition would dispatch a full CI run.
-2. **All events**: the PR must currently carry the required labels.
+Labels persist for future pushes, which can run every enabled tier. A command scoped to AMD does not disable NVIDIA base on later commits. Scheduled and manual workflow runs retain their label bypasses.
 
-This is what lets `/tag-run-ci-label` (and the `extra` variant) trigger a fresh CI run without an extra push.
+The slash handler reads the registry for tier arguments and `/run-<tier>-ci`. The pre-commit linter `scripts/lint/check_opt_in_ci_tiers.py` checks tier names, label/workflow mappings, and trigger compatibility. Each registered workflow must follow these conventions:
 
-**Caveat — skipped runs cannot be un-skipped by `run.rerun()`:** GitHub's rerun API reuses the original event payload, so rerunning a `pull_request`-event run that was skipped because of missing labels will skip again (label set in the frozen payload doesn't update). The only way to recover a label-skipped run is to add the missing label, which fires a fresh `labeled` event with the current label set. `handle_rerun_failed_ci` in the slash handler is for rerunning failed/non-label-skipped runs; it cannot revive label-skipped ones.
+1. **Gate through `pr-gate.yml` with `require-label: run-ci-<tier>` and require `run-ci` in the same gate call.** `require-run-ci` may be explicitly `true` or omitted to use the default. The gate live-fetches labels, so a missing label fails the gate job and a rerun after labeling passes.
+2. **No `labeled` trigger.** GitHub's rerun API reuses the original event payload, so a run started by an unrelated label event and skipped by an `if` on that payload stays skipped on rerun. Adding a label after a push takes a rerun instead (`/tag-and-rerun-ci <tier>` or `/run-<tier>-ci`).
+3. **List every workflow that gates on the label, and assign each workflow to exactly one tier.** This keeps `/run-<tier>-ci` scoped to that tier.
+
+Tier names `base`, `cpu`, `failed`, and `full` are reserved for built-in commands.
+
+Equivalent tier spellings require a registered tier. The registry's rerun lookup currently selects runs by PR head SHA. Existing MLU/PPU opt-in workflows are not registered here, so neither spelling enables them: their `labeled` triggers need separate handling, and MLU's `pull_request_target` runs need PR-aware lookup rather than a PR-head-SHA filter.

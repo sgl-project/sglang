@@ -31,8 +31,25 @@ PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regress
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
 CHANGED_TESTS_FLAG = "--changed"
 CHANGED_TESTS_SHORT_FLAG = "-c"
-# Workflow `name:` field, which is what the runs API reports (not the filename).
-EXTRA_WORKFLOW_NAME = "PR Test Extra"
+# Opt-in CI tiers: tier name -> the `run-ci-<tier>` label and the workflows
+# that gate on it. Resolved next to this script so it loads from any cwd;
+# scripts/lint/check_opt_in_ci_tiers.py keeps it in sync with the workflows.
+OPT_IN_TIERS_FILE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "opt_in_ci_tiers.json"
+)
+# Default retries cover the NVIDIA base pipeline and shared checks.
+# Other hardware is selected explicitly through the opt-in registry.
+DEFAULT_CI_WORKFLOW_FILES = (
+    ".github/workflows/pr-test.yml",
+    ".github/workflows/lint.yml",
+    ".github/workflows/pr-test-sgl-router.yml",
+    ".github/workflows/pr-test-sgl-processor.yml",
+    ".github/workflows/pr-test-rust.yml",
+    ".github/workflows/pr-test-rust-exts.yml",
+    ".github/workflows/pr-test-rust-workspace.yml",
+    ".github/workflows/pr-benchmark-rust.yml",
+    ".github/workflows/ci-model-inventory.yml",
+)
 
 
 MAINTENANCE_ISSUE_NUMBER = 21065
@@ -311,22 +328,70 @@ def has_sgl_kernel_changes(pr):
         return False
 
 
+def _load_opt_in_tiers():
+    with open(OPT_IN_TIERS_FILE_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _parse_opt_in_tiers(args, tiers):
+    """Split command arguments into (known tier names, unknown arguments)."""
+    known = [arg for arg in args if arg in tiers]
+    unknown = [arg for arg in args if arg not in tiers]
+    return list(dict.fromkeys(known)), unknown
+
+
+def _selected_workflow_files(tiers, tier_names=()):
+    """Default NVIDIA/shared checks plus explicitly selected opt-in tiers."""
+    return tuple(
+        dict.fromkeys(
+            [*DEFAULT_CI_WORKFLOW_FILES]
+            + [path for name in tier_names for path in tiers[name]["workflows"]]
+        )
+    )
+
+
+def _reject_unknown_tier_args(pr, comment, command, unknown, tiers):
+    """
+    Fail closed on arguments that name no opt-in tier.
+
+    Dropping a misspelled tier would leave the PR with only `run-ci` and no
+    hint that the requested tier was never labeled.
+    """
+    print(f"Unknown arguments for {command}: {unknown}")
+    valid = ", ".join(f"`{name}`" for name in sorted(tiers))
+    pr.create_issue_comment(
+        f"⛔ `{command}` doesn't recognize "
+        f"{', '.join(f'`{arg}`' for arg in unknown)}. "
+        f"Valid opt-in CI tiers: {valid}. No labels were added."
+    )
+    comment.create_reaction("confused")
+
+
+def _reject_run_tier_args(pr, comment, command, tiers):
+    choices = ", ".join(f"`/run-{name}-ci`" for name in sorted(tiers))
+    pr.create_issue_comment(
+        f"⛔ `{command}` doesn't accept arguments. "
+        f"Use `/run-base-ci` for NVIDIA base, or select a tier with {choices}. "
+        "No labels were added and no workflows were re-run."
+    )
+    comment.create_reaction("confused")
+
+
 def handle_tag_run_ci(
-    gh_repo, pr, comment, user_perms, react_on_success=True, tag_extra=False
+    gh_repo, pr, comment, user_perms, react_on_success=True, tier_labels=()
 ):
     """
     Handles the /tag-run-ci-label command.
 
-    When tag_extra is True (triggered by the `extra` argument), also adds the
-    `run-ci-extra` label. pr-test-extra.yml gates on BOTH `run-ci` and
-    `run-ci-extra`, so both must be present for the extra workflow to run —
-    we always add `run-ci` alongside `run-ci-extra`. Reuses the same
-    `can_tag_run_ci_label` permission.
+    tier_labels are the `run-ci-<tier>` labels of the opt-in tiers named in
+    the command (e.g. `extra`). Opt-in workflows gate on BOTH `run-ci` and
+    their own label, so `run-ci` is always added alongside. Reuses the same
+    `can_tag_run_ci_label` permission for every tier.
 
     Labels added here do not start a run: GITHUB_TOKEN label events do not
-    trigger workflows, and no PR workflow listens to `labeled`. The label
-    gate in pr-gate.yml reads the live label set, so the next push, or a
-    rerun of the gated run (/tag-and-rerun-ci), picks the labels up.
+    trigger workflows, and opt-in workflows don't listen to `labeled`. The
+    label gate in pr-gate.yml reads the live label set, so the next push, or
+    a rerun of the gated run (/tag-and-rerun-ci), picks the labels up.
 
     Returns True if action was taken, False otherwise.
     """
@@ -334,9 +399,7 @@ def handle_tag_run_ci(
         print("Permission denied: can_tag_run_ci_label is false.")
         return False
 
-    labels = ["run-ci"]
-    if tag_extra:
-        labels.append("run-ci-extra")
+    labels = ["run-ci", *tier_labels]
     print(f"Permission granted. Adding labels: {labels}.")
     for label in labels:
         pr.add_to_labels(label)
@@ -368,18 +431,24 @@ def _latest_run_per_workflow(runs):
     return list(latest.values())
 
 
-def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
+def handle_rerun_failed_ci(
+    gh_repo, pr, comment, user_perms, react_on_success=True, workflow_files=None
+):
     """
     Handles the /rerun-failed-ci command.
-    Reruns workflows that ended in 'failure', 'skipped', 'cancelled' or
-    'timed_out', restarting only the jobs that didn't succeed.
+    Reruns selected workflows that ended in 'failure', 'skipped', 'cancelled'
+    or 'timed_out', restarting only the jobs that didn't succeed. The default
+    scope is NVIDIA base + extra, regardless of labels already on the PR.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
         print("Permission denied: can_rerun_failed_ci is false.")
         return False
 
-    print("Permission granted. Triggering rerun of unsuccessful workflows.")
+    if workflow_files is None:
+        workflow_files = _selected_workflow_files(_load_opt_in_tiers(), ("extra",))
+    workflow_files = set(workflow_files)
+    print(f"Permission granted. Retrying unsuccessful workflows: {workflow_files}")
 
     # Check if PR has sgl-kernel changes - if so, we may need full reruns
     # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts.
@@ -448,7 +517,11 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   builds are success yet, full-rerun failure runs too — Build Wheel
     #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
     #   rerun_failed_jobs() is scoped to a single workflow run.
-    runs = _latest_run_per_workflow(gh_repo.get_workflow_runs(head_sha=head_sha))
+    runs = _latest_run_per_workflow(
+        run
+        for run in gh_repo.get_workflow_runs(head_sha=head_sha)
+        if _workflow_file(run) in workflow_files
+    )
 
     rerun_count = 0
     for run in runs:
@@ -488,50 +561,17 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         return False
 
 
-def _run_extra_ci(gh_repo, pr):
-    """
-    Make `PR Test Extra` run for the current head SHA.
+def _workflow_file(run):
+    # The runs API may suffix `path` with `@<ref>`.
+    return run.path.split("@", 1)[0]
 
-    Assumes `run-ci` + `run-ci-extra` are already on the PR. pr-test-extra.yml
-    gates on them through call-gate -> pr-gate.yml, which live-fetches the
-    label set at run time, so re-running a run that was red at the gate picks
-    up labels added seconds earlier.
 
-    Deliberately rerun-only, with no workflow_dispatch fallback: the extra
-    workflow's dispatch inputs carry no `pr_head_sha`, so a fork PR could only
-    be dispatched against `main` — testing the wrong tree. A pull_request run
-    exists at essentially every head SHA anyway, so the missing-run case is
-    reported rather than papered over.
-
-    Returns (acted, message).
-    """
-    extra_runs = [
-        run
-        for run in gh_repo.get_workflow_runs(head_sha=pr.head.sha)
-        if run.name == EXTRA_WORKFLOW_NAME
-    ]
-    if not extra_runs:
-        return (
-            False,
-            f"No `{EXTRA_WORKFLOW_NAME}` run exists for this commit, so there is "
-            "nothing to re-run. Push a commit to create one.",
-        )
-
-    # Same newest-wins rule handle_rerun_failed_ci uses: older runs at this SHA
-    # are superseded and re-running them fights the live run for runners.
-    run = _latest_run_per_workflow(extra_runs)[0]
-
-    if run.status != "completed":
-        return (
-            True,
-            f"⏳ [`{EXTRA_WORKFLOW_NAME}`]({run.html_url}) is already "
-            f"{run.status} for this commit; left it alone.",
-        )
-
+def _rerun_workflow_run(run):
+    """Re-run one completed run, green ones included. Returns (acted, message)."""
     try:
         if run.conclusion == "success":
             # Nothing failed, so there are no jobs for rerun_failed_jobs() to
-            # target — the ask is an explicit re-run of green work.
+            # target; the ask is an explicit re-run of green work.
             print(f"  Full rerun of successful run {run.id}")
             run.rerun()
         else:
@@ -542,19 +582,74 @@ def _run_extra_ci(gh_repo, pr):
                 print(f"  rerun_failed_jobs rejected ({e}) - full rerun")
                 run.rerun()
     except Exception as e:
-        return False, f"Failed to re-run [`{EXTRA_WORKFLOW_NAME}`]({run.html_url}): {e}"
+        return False, f"⛔ Failed to re-run [`{run.name}`]({run.html_url}): {e}"
+    return True, f"🚀 Re-running [`{run.name}`]({run.html_url})."
 
-    return True, f"🚀 Re-running [`{EXTRA_WORKFLOW_NAME}`]({run.html_url})."
 
-
-def handle_run_extra_ci(gh_repo, pr, comment, user_perms):
+def _rerun_tier_workflows(gh_repo, pr, workflow_files):
     """
-    Handles /run-extra-ci: label the PR for extra CI and re-run only
-    `PR Test Extra`. Baseline CI runs are left untouched.
+    Make every workflow of one opt-in tier run for the current head SHA.
 
-    Gated on the same two permissions as the steps it performs — the label add
-    (can_tag_run_ci_label) and the re-run (can_rerun_failed_ci) — rather than a
-    new key, so every user who can already drive CI can drive extra CI.
+    Assumes `run-ci` + the tier label are already on the PR. Each workflow
+    gates on them through pr-gate.yml, which live-fetches the label set at run
+    time, so re-running a run that was red at the gate picks up labels added
+    seconds earlier.
+
+    Deliberately rerun-only, with no workflow_dispatch fallback: the opt-in
+    workflows' dispatch inputs carry no `pr_head_sha`, so a fork PR could only
+    be dispatched against `main`, testing the wrong tree. A pull_request run
+    exists at essentially every head SHA anyway, so the missing-run case is
+    reported rather than papered over.
+
+    Returns (acted, message); acted is True if any workflow was re-run or is
+    already in flight.
+    """
+    runs = [
+        run
+        for run in gh_repo.get_workflow_runs(head_sha=pr.head.sha)
+        if _workflow_file(run) in workflow_files
+    ]
+    # Same newest-wins rule handle_rerun_failed_ci uses: older runs at this SHA
+    # are superseded and re-running them fights the live run for runners.
+    latest_by_file = {
+        _workflow_file(run): run for run in _latest_run_per_workflow(runs)
+    }
+
+    results = []
+    for workflow_file in workflow_files:
+        run = latest_by_file.get(workflow_file)
+        if run is None:
+            results.append(
+                (
+                    False,
+                    f"⛔ No `{os.path.basename(workflow_file)}` run exists for "
+                    "this commit, so there is nothing to re-run. Push a commit "
+                    "to create one.",
+                )
+            )
+        elif run.status != "completed":
+            results.append(
+                (
+                    True,
+                    f"⏳ [`{run.name}`]({run.html_url}) is already "
+                    f"{run.status} for this commit; left it alone.",
+                )
+            )
+        else:
+            results.append(_rerun_workflow_run(run))
+
+    acted = any(ok for ok, _ in results)
+    return acted, "\n".join(message for _, message in results)
+
+
+def handle_run_tier_ci(gh_repo, pr, comment, user_perms, tier):
+    """
+    Label and rerun only the selected tier's workflows, including successful runs.
+    Adds run-ci and the opt-in tier's label.
+
+    Gated on the same two permissions as the steps it performs (the label add
+    needs can_tag_run_ci_label, the re-run can_rerun_failed_ci) rather than a
+    new key, so every user who can already drive CI can drive opt-in CI.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
@@ -562,7 +657,12 @@ def handle_run_extra_ci(gh_repo, pr, comment, user_perms):
         return False
 
     tagged = handle_tag_run_ci(
-        gh_repo, pr, comment, user_perms, react_on_success=False, tag_extra=True
+        gh_repo,
+        pr,
+        comment,
+        user_perms,
+        react_on_success=False,
+        tier_labels=[tier["label"]],
     )
     if not tagged:
         return False
@@ -570,8 +670,8 @@ def handle_run_extra_ci(gh_repo, pr, comment, user_perms):
     print("Waiting 5 seconds for labels to propagate...")
     time.sleep(5)
 
-    acted, message = _run_extra_ci(gh_repo, pr)
-    pr.create_issue_comment(message if acted else f"⛔ {message}")
+    acted, message = _rerun_tier_workflows(gh_repo, pr, tier["workflows"])
+    pr.create_issue_comment(message)
     comment.create_reaction("+1" if acted else "confused")
     return acted
 
@@ -1721,22 +1821,26 @@ KNOWN_COMMANDS = (
     "/rerun-failed-ci",
     "/rerun-group",
     "/rerun-test",
+    "/run-ci",
+    "/run-base-ci",
     "/run-full-ci",
-    "/run-extra-ci",
     "/run-cpu-ci",
 )
+
+# `/run-<tier>-ci` for each opt-in tier; `/rerun-<tier>-ci` is a silent alias.
+RUN_TIER_COMMAND = re.compile(r"^/(?:re)?run-([\w-]+)-ci$")
 
 # Removed commands, kept because they were documented long enough that muscle
 # memory still sends them and difflib would suggest something unrelated.
 RETIRED_COMMANDS = {
     "/rerun-stage": (
         "`/rerun-stage` was removed. Use `/rerun-test <test-spec>` for specific "
-        "tests, or `/rerun-failed-ci` for everything that didn't pass."
+        "tests, or `/rerun-failed-ci` for NVIDIA workflows that didn't pass."
     ),
 }
 
 
-def handle_unknown_command(pr, comment, first_line):
+def handle_unknown_command(pr, comment, first_line, tiers):
     """
     Answer a comment addressed to this handler that matched no command.
 
@@ -1758,7 +1862,8 @@ def handle_unknown_command(pr, comment, first_line):
 
     hint = RETIRED_COMMANDS.get(command)
     if hint is None:
-        close = difflib.get_close_matches(command, KNOWN_COMMANDS, n=1, cutoff=0.6)
+        known = KNOWN_COMMANDS + tuple(f"/run-{name}-ci" for name in tiers)
+        close = difflib.get_close_matches(command, known, n=1, cutoff=0.6)
         hint = f"Did you mean `{close[0]}`?" if close else None
 
     if hint is None:
@@ -1820,40 +1925,110 @@ def main():
 
     # 4. Parse Command and Execute
     first_line = comment_body.split("\n")[0].strip()
-    # `extra` argument opts in to also tagging `run-ci-extra`. Both
-    # `/tag-run-ci-label extra` and `/tag-and-rerun-ci extra` share this
-    # parser so the surface is symmetric.
     tokens = first_line.split()
-    tag_extra = len(tokens) > 1 and "extra" in tokens[1:]
+    command = tokens[0] if tokens else ""
+    tiers = _load_opt_in_tiers()
 
+    is_tag = command == "/tag-run-ci-label"
+    is_tag_and_rerun = command == "/tag-and-rerun-ci"
+    # With no argument, base commands share the combined tag/retry default.
+    # With one tier, they are exact aliases of /run-<tier>-ci instead.
+    is_base_ci = command in ("/run-ci", "/run-base-ci", "/rerun-base-ci")
     # /run-full-ci is the short, spelled-out form of `/tag-and-rerun-ci extra`
     # and shares its branch below. /rerun-* spellings are accepted silently as
     # aliases: they sit one keystroke from the documented name and from the
     # neighbouring /rerun-* commands, and failing them closed would just look
     # like the bot ignoring the comment.
-    is_full_ci = first_line.startswith(("/run-full-ci", "/rerun-full-ci"))
-    is_extra_ci = first_line.startswith(("/run-extra-ci", "/rerun-extra-ci"))
-    if is_full_ci:
-        tag_extra = True
+    is_full_ci = command in ("/run-full-ci", "/rerun-full-ci")
+    is_extra_ci = command in ("/run-extra-ci", "/rerun-extra-ci")
+    is_failed_ci = command == "/rerun-failed-ci"
+    run_tier_match = RUN_TIER_COMMAND.match(command)
+    run_tier = run_tier_match and tiers.get(run_tier_match.group(1))
 
-    if first_line.startswith("/tag-run-ci-label"):
-        handle_tag_run_ci(repo, pr, comment, user_perms, tag_extra=tag_extra)
+    # Tier arguments (`/tag-run-ci-label extra`) are shared by both labeling
+    # commands so the surface is symmetric.
+    tier_names, unknown_args = [], []
+    if is_tag or is_tag_and_rerun or is_base_ci or is_full_ci or is_failed_ci:
+        tier_names, unknown_args = _parse_opt_in_tiers(tokens[1:], tiers)
+    if is_full_ci and "extra" not in tier_names:
+        tier_names.insert(0, "extra")
+    tier_labels = [tiers[name]["label"] for name in tier_names]
+    if is_base_ci and len(tokens) == 2:
+        run_tier = tiers.get(tokens[1])
 
-    elif is_extra_ci:
-        handle_run_extra_ci(repo, pr, comment, user_perms)
+    # Add a suite-first spelling without changing existing tier commands:
+    # /run-extra-ci amd selects the same registered tier as /run-amd-extra-ci.
+    extra_arg_error = None
+    if is_extra_ci and tokens[1:]:
+        run_tier = None
+        if len(tokens) != 2:
+            extra_arg_error = (
+                f"`{command}` accepts at most one hardware argument. "
+                f"Use `{command} <hardware>` to run that hardware's extra tier."
+            )
+        else:
+            hardware = tokens[1]
+            run_tier = tiers.get(f"{hardware}-extra")
+            if run_tier is None:
+                extra_arg_error = (
+                    f"No extra CI tier is configured for `{hardware}`. "
+                    f"`{command} {hardware}` requires the registered "
+                    f"`{hardware}-extra` tier."
+                )
+
+    can_drive_ci = user_perms.get("can_tag_run_ci_label", False) or user_perms.get(
+        "can_rerun_failed_ci", False
+    )
+    if extra_arg_error and can_drive_ci:
+        pr.create_issue_comment(
+            f"⛔ {extra_arg_error} No labels were added and no workflows were re-run."
+        )
+        comment.create_reaction("confused")
+
+    elif unknown_args and can_drive_ci:
+        _reject_unknown_tier_args(pr, comment, command, unknown_args, tiers)
+
+    elif is_base_ci and len(tokens) > 2 and can_drive_ci:
+        pr.create_issue_comment(
+            f"⛔ `{command}` accepts at most one tier. "
+            f"Use `{command} <tier>` to run that tier only. "
+            "No labels were added and no workflows were re-run."
+        )
+        comment.create_reaction("confused")
+
+    elif (
+        run_tier and not is_base_ci and not is_extra_ci and tokens[1:] and can_drive_ci
+    ):
+        _reject_run_tier_args(pr, comment, command, tiers)
+
+    elif is_tag:
+        handle_tag_run_ci(repo, pr, comment, user_perms, tier_labels=tier_labels)
+
+    elif run_tier:
+        handle_run_tier_ci(repo, pr, comment, user_perms, run_tier)
 
     elif first_line.startswith(("/run-cpu-ci", "/rerun-cpu-ci")):
         handle_run_cpu_ci(repo, pr, comment, user_perms, token)
 
-    elif first_line.startswith("/rerun-failed-ci"):
-        handle_rerun_failed_ci(repo, pr, comment, user_perms)
+    elif is_failed_ci:
+        workflow_files = _selected_workflow_files(
+            tiers, tier_names if tokens[1:] else ("extra",)
+        )
+        handle_rerun_failed_ci(
+            repo, pr, comment, user_perms, workflow_files=workflow_files
+        )
 
-    elif first_line.startswith("/tag-and-rerun-ci") or is_full_ci:
+    elif is_tag_and_rerun or is_base_ci or is_full_ci:
         # Perform both actions, but suppress individual reactions
-        print(f"Processing combined command: {first_line} (tag_extra={tag_extra})")
+        print(f"Processing combined command: {first_line} (tiers={tier_names})")
 
         tagged = handle_tag_run_ci(
-            repo, pr, comment, user_perms, react_on_success=False, tag_extra=tag_extra
+            repo,
+            pr,
+            comment,
+            user_perms,
+            react_on_success=False,
+            tier_labels=tier_labels,
         )
 
         # Wait for the label to propagate before triggering rerun
@@ -1862,7 +2037,12 @@ def main():
             time.sleep(5)
 
         rerun = handle_rerun_failed_ci(
-            repo, pr, comment, user_perms, react_on_success=False
+            repo,
+            pr,
+            comment,
+            user_perms,
+            react_on_success=False,
+            workflow_files=_selected_workflow_files(tiers, tier_names),
         )
 
         # If at least one action was successful, add the reaction here
@@ -1904,7 +2084,7 @@ def main():
         )
 
     else:
-        handle_unknown_command(pr, comment, first_line)
+        handle_unknown_command(pr, comment, first_line, tiers)
 
 
 if __name__ == "__main__":

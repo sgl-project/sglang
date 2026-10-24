@@ -2,7 +2,7 @@ name: PR Test Extra (AMD)
 # Label-gated AMD extra CI workflow — the AMD mirror of pr-test-extra.yml.
 #
 # Adds AMD runtime to a PR only when the author opts in: the PR must carry
-# BOTH `run-ci` (basic-CI prerequisite) and `run-ci-extra` (explicit opt-in).
+# BOTH `run-ci` (basic-CI prerequisite) and `run-ci-amd-extra` (explicit opt-in).
 # The label check happens at runtime in pr-gate.yml via a live
 # `gh pr view`-style fetch, so reruns after adding the labels (e.g. via a
 # slash command) pick up the new label set — a workflow-level `if` would read
@@ -120,14 +120,14 @@ permissions:
 jobs:
   # =============================================== PR Gate ====================================================
   # Runtime live-fetch label gate (mirrors pr-test-extra.yml's call-gate):
-  # requires both `run-ci` and `run-ci-extra`. A failure here cascades to
+  # requires both `run-ci` and `run-ci-amd-extra`. A failure here cascades to
   # every test job via `needs`, so a PR without the labels ends in one red
   # ~30s gate job plus a row of skipped jobs instead of consuming AMD runners.
   call-gate:
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true
-      require-run-ci-extra: true
+      require-label: run-ci-amd-extra
     secrets: inherit
 
   # =============================================== extra-a (1-gpu-small) ===============================================
