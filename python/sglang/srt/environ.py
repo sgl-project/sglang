@@ -696,6 +696,13 @@ class Envs:
     # Force the WAR barrier to wait for the whole forward instead of the
     # read-done fastpath event.
     SGLANG_FORCE_COARSE_WAR_BARRIER = EnvBool(False)
+    # Overlap scheduler: queue the scheduler's own GPU work on the forward stream
+    # instead of a separate schedule stream. The schedule/forward stream waits
+    # then stay in order on one stream rather than crossing hardware queues.
+    # Scheduler GPU work no longer overlaps the forward on the GPU; with the
+    # coarse WAR barrier it already waits for the whole forward. Ignored with
+    # pipeline parallelism.
+    SGLANG_SHARE_SCHEDULE_FORWARD_STREAM = EnvBool(False)
     # Enable prefill read-done publication after compliant metadata initialization.
     SGLANG_ENABLE_PREFILL_WAR_READ_DONE = EnvBool(True)
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,

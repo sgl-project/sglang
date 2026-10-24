@@ -52,6 +52,22 @@ def allocate_distinct_stream(device_module, avoid_streams):
     raise RuntimeError("Unable to allocate a distinct stream")
 
 
+def select_schedule_stream(
+    device_module, schedule_stream, forward_stream, share_forward_stream: bool
+):
+    """The stream the overlap scheduler queues its own GPU work on.
+
+    By default a stream distinct from ``forward_stream``, so the scheduler's GPU
+    work can overlap the forward. With ``share_forward_stream``, ``forward_stream``
+    itself, so every schedule/forward wait stays in order on one stream.
+    """
+    if share_forward_stream:
+        return forward_stream
+    if schedule_stream.cuda_stream == forward_stream.cuda_stream:
+        return allocate_distinct_stream(device_module, (forward_stream,))
+    return schedule_stream
+
+
 @dataclasses.dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None

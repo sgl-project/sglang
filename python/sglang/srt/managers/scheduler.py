@@ -286,8 +286,8 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
-    allocate_distinct_stream,
     is_health_check_generate_req,
+    select_schedule_stream,
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
@@ -1960,12 +1960,21 @@ class Scheduler(
         ):
             # CUDA/HIP streams come from a fixed round-robin pool. Redraw if this
             # stream aliases forward_stream, which would eliminate scheduler
-            # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
+            # overlap, unless SGLANG_SHARE_SCHEDULE_FORWARD_STREAM asks for one
+            # stream. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
             # other accelerators (e.g. NPU/XPU) skip the alias check.
-            if self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:
-                self.schedule_stream = allocate_distinct_stream(
-                    self.device_module, (self.forward_stream,)
-                )
+            share_forward_stream = (
+                envs.SGLANG_SHARE_SCHEDULE_FORWARD_STREAM.get()
+                and get_parallel().pp_size == 1
+            )
+            if share_forward_stream:
+                logger.info("Scheduler GPU work shares the forward stream.")
+            self.schedule_stream = select_schedule_stream(
+                self.device_module,
+                self.schedule_stream,
+                self.forward_stream,
+                share_forward_stream=share_forward_stream,
+            )
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
