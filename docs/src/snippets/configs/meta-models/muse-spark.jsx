@@ -1,4 +1,4 @@
-// Muse Spark Open Deployment recipes preserve the original default commands.
+// Muse Spark Open Deployment recipes select unified KV memory by strategy.
 // Deployment selects hardware, quantization, and strategy; further tuning lives
 // in Playground. NVIDIA uses FA4, MI355X uses Triton for DFlash draft attention.
 // Xeon keeps its CPU-engine INT4 recipe. H200 runs NVFP4 on one node with
@@ -193,6 +193,18 @@ export const config = {
       },
     },
     flagSelects: [
+      {
+        id: "unifiedMemory", title: "Unified Memory",
+        stripPrefixes: ["--enable-unified-memory"],
+        options: [
+          {
+            id: "enable", label: "Enable", flags: ["--enable-unified-memory"],
+            disable: { hw: ["mi355x", "xeon"] },
+            disableReason: "The aiter and intel_amx attention backends do not support the unified KV layout.",
+          },
+          { id: "disable", label: "Disable" },
+        ],
+      },
       {
         id: "prefillSp", title: "Prefill Sequence Parallel",
         showWhen: (s) => s.pdMode !== "decode",
@@ -619,7 +631,11 @@ export const config = {
       ...cell,
       match: { ...cell.match, strategy: "high-throughput" },
       verified: false,
-      flags: cell.flags.filter((flag) => !flag.startsWith("--speculative-")),
+      flags: [
+        ...cell.flags.filter((flag) => !flag.startsWith("--speculative-")),
+        ...(["b300", "gb300", "b200", "h200"].includes(cell.match.hw)
+          ? ["--enable-unified-memory"] : []),
+      ],
     },
   ]),
 };
