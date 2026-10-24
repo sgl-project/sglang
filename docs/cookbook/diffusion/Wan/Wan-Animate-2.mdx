@@ -223,6 +223,7 @@ acceleration features and their runtime requirements.
 | 1 GPU, memory priority | `--performance-mode memory` | Layerwise offload for supported components. On the measured H200 workload, 31.7 GiB peak versus 68.9 GiB with auto, at nearly the same latency and identical RGB output. |
 | 1x RTX 4090, 24 GB | `--performance-mode memory` with `PYTORCH_ALLOC_CONF=expandable_segments:True` | Short-video recipe with little spare VRAM. The default allocator OOMed on the measured workload; offload also requires sufficient host RAM. |
 | 2+ GPUs, long sequences | `--num-gpus N --ulysses-degree N` | Sequence parallel across ranks (ring degree stays 1). |
+| 1 GPU, INT8 DiT | `--quantization convrot_int8 --quantization-ignored-layers proj_out` | Data-free ConvRot INT8 for the DiT linears, `proj_out` in BF16. On GB200 it reduces peak VRAM from 86.5 to 71.9 GiB on the 81-frame workload (77.3 to 62.7 GiB on the 24-frame CI workload) at 1.07x, with same-seed PSNR 29.4 dB / LPIPS 0.049 to BF16 on that workload (long chained-clip requests drift more, see 4.4); the same 1.07x to 1.08x and a 14 to 15 GiB per-GPU saving on the 2-GPU CFG-parallel and 4-GPU presets below. Kernels available on H100/H200/B200/GB200, measured on GB200 (not the B300 or RTX 4090 presets, see 4.4). See [section 4.4](#4-4-convrot-int8-quantization). |
 | 2+ GPUs, large DiT | `--num-gpus N --tp-size N` | Tensor parallel across attention heads. With `--tp-size` smaller than `--num-gpus` (or than half of it with `--enable-cfg-parallel`), the leftover GPUs are auto-assigned to Ulysses sequence parallelism (last row). |
 | 2 GPUs, split CFG | `--num-gpus 2 --enable-cfg-parallel` | Splits the guided/unguided branches. |
 | 2x B300, recommended | **CFG parity** in the picker: `--num-gpus 2 --enable-cfg-parallel --dit-layerwise-offload --layerwise-offload-components transformer --encoder-parallel replicate --vae-config.use-parallel-decode false` with `SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D=1` | 54.03 s, 39.53 GiB peak per GPU, and RGB identical to the single-B300 baseline. Only 0.50 s slower than plain CFG, with substantially less GPU memory. |
@@ -244,6 +245,7 @@ the request-phase and whole-run peaks defined, are in
 | Distilled, 1 GPU, 80 to 96 GB | `--dit-layerwise-offload --layerwise-offload-components transformer` | Streams the DiT layer by layer at the same speed, with the output identical to the resident DiT, at about 40 GiB peak per GPU during the request (65 GiB over the whole run) versus 69.5 GiB resident. |
 | Distilled, 2 GPUs | `--num-gpus 2 --ulysses-degree 2` | The fastest 2-GPU layout, 1.73x one GPU; the automatic 2-GPU assignment resolves to it. On 80 GB cards add `--dit-layerwise-offload --layerwise-offload-components transformer` (same speed, identical output); `--tp-size 2` is the resident lower-memory alternative. |
 | Distilled, 4 GPUs | `--num-gpus 4 --ulysses-degree 4` | The fastest 4-GPU layout, 2.69x one GPU; the automatic 4-GPU assignment resolves to it. Lower-memory alternatives, fastest first: layerwise offload on top (identical output), `--tp-size 2 --ulysses-degree 2` and `--tp-size 4`. |
+| Distilled, INT8 DiT | `--quantization convrot_int8 --quantization-ignored-layers proj_out` on top of the rows above | Data-free ConvRot INT8 for the DiT linears, `proj_out` in BF16, as for the base checkpoint. On GB200 it reduces the runtime peak VRAM from 65.3 to 50.7 GiB at 1 GPU (1.07x), from 48.3 to 33.6 GiB per GPU at 2 GPUs with Ulysses 2 (1.06x) and from 41.3 to 26.3 GiB per GPU at 4 GPUs with Ulysses 4 (1.04x), at 33.9 to 36.2 dB same-seed PSNR to BF16; same GPU classes as the base row. See [section 4.4](#4-4-convrot-int8-quantization). |
 | Distilled, CFG parallel | `--enable-cfg-parallel` / `--cfg-parallel-size 2` are **rejected** | The server refuses to start with `Wan_Animate_2_14B_Distilled_Config does not support CFG parallelism`: the distilled model runs one branch per step, so there is nothing to split; use `--ulysses-degree` or `--tp-size`. |
 
 ## 4. Model Invocation
@@ -353,6 +355,89 @@ Lowering `clip_len` also reduces memory, but shortens each clip's temporal conte
 The distilled checkpoint has the same DiT, so the same flags apply with the same
 effect; its layerwise-offload rows are in
 [section 5.3](#5-3-distilled-checkpoint-on-gb200).
+
+### 4.4 ConvRot INT8 quantization
+
+`--quantization convrot_int8` quantizes the DiT online at load time (data-free
+W8A8 [ConvRot](/docs/sglang-diffusion/quantization#convrot-int8)) from the stock
+BF16 checkpoint: with `--quantization-ignored-layers proj_out`, 480 of the 481
+eligible linears go to INT8 (30.08 -> 15.04 GiB) and the output head stays in
+BF16. No calibration data and no quantized checkpoint are needed. The gain is
+smaller than on the A14B models because most of the step is attention, which
+stays BF16, and the per-GPU saving is the single expert's INT8 weights.
+
+```bash Command
+sglang serve \
+  --model-path Wan-AI/Wan2.2-Animate-2-14B-Diffusers \
+  --quantization convrot_int8 \
+  --quantization-ignored-layers proj_out \
+  --port 30010
+```
+
+Base checkpoint: native inference at [SGLang `c5bf3aafbc22`](https://github.com/sgl-project/sglang/commit/c5bf3aafbc229e887eb6a6f01045b8f90a7dee13)
+on GB200 with the cookbook defaults (640x800 budget, `clip_len` 37, 40 steps,
+CFG 3, seed 42, audio off), on a reference image with an 81-frame driving
+video and on the CI reference with the 24-frame CI video. The 1-GPU rows run
+everything resident (`--performance-mode manual`, no offload); E2E is the mean
+of three requests per round over two GPU-swapped rounds. The 2- and 4-GPU rows
+use the parallel presets of [section 3.3](#3-3-multi-gpu-and-memory-presets)
+with the text encoder CPU-offloaded: 2-GPU rows as swapped same-time pairs,
+4-GPU rows BF16 then ConvRot, each averaged over two rounds of one warm-up and
+two requests. Loading is excluded; same-seed outputs are bit-identical across
+runs on one build; peak is the runtime peak per GPU, not a minimum VRAM
+requirement.
+
+| Input | GPUs | Flags | BF16 E2E (s) | ConvRot INT8 E2E (s) | Speedup | Peak per GPU (GiB) |
+| --- | ---: | --- | ---: | ---: | ---: | --- |
+| reference + 81-frame driving video (3 clips) | 1 | none (text encoder resident) | 388.2 | 362.3 | 1.07x | 86.5 -> 71.9 |
+| CI reference + 24-frame CI video (1 clip) | 1 | none (text encoder resident) | 124.6 | 116.7 | 1.07x | 77.3 -> 62.7 |
+| reference + 81-frame driving video (3 clips) | 2 | `--enable-cfg-parallel --text-encoder-cpu-offload` | 203.4 | 189.9 | 1.07x | 58.6 -> 44.5 |
+| reference + 81-frame driving video (3 clips) | 4 | `--enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload` | 114.9 | 106.8 | 1.08x | 48.2 -> 32.8 |
+
+On the 81-frame input at 1 GPU it reduces peak VRAM from 86.5 to 71.9 GiB.
+Same-seed PSNR / SSIM / LPIPS to BF16 is 29.4 dB / 0.946 / 0.049 on the
+81-frame input and 24.6 dB / 0.908 / 0.078 on the 24-frame CI input at 1 GPU,
+30.4 dB / 0.950 / 0.041 at 2 GPUs and 30.9 dB / 0.956 / 0.037 at 4 GPUs. On a
+7-clip, 237-frame request the base checkpoint's ConvRot output measured 28.4 dB
+/ 0.784 / 0.118 against BF16, with the two runs drifting apart in framing from
+clip 5; the distilled checkpoint on the same request measured 32.1 dB / 0.964 /
+0.015 with no drift.
+
+Hardware: the fused INT8 kernels are JIT-compiled once per machine (about a
+minute, needs nvcc) and run on CC 9.0 (H100/H200), 10.0 (B200/GB200) and
+12.0 / 12.1 (RTX PRO 6000 Blackwell, RTX 50 series, DGX Spark); the figures
+above were measured on GB200. CC 10.3 (B300/GB300) is refused by the JIT
+backend on purpose (Blackwell Ultra's INT8 tensor-core rate makes W8A8 a
+slowdown) and the RTX 4090 preset above (CC 8.9) is outside its list; on both,
+`--quantization convrot_int8` takes the `comfy-kitchen` INT8 kernels when that
+package is installed and otherwise refuses to load. See
+[ConvRot INT8](/docs/sglang-diffusion/quantization#convrot-int8).
+
+The distilled checkpoint (`Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers`,
+[section 2](#2-model-capabilities)) has the same transformer and quantizes the
+same way (480 of the 481 linears, `proj_out` in BF16). Native inference at the
+[#44085 head `8d46addc2b73`](https://github.com/sgl-project/sglang/commit/8d46addc2b73cd72f1edff6800342643a237217c),
+since merged, with the same inputs and seed at its defaults (10 steps,
+DPM-Solver++ 2M, `log_scale` -1.3, `guidance_scale` 1.0), the DiT and VAE
+resident and the text encoder CPU-offloaded as in the
+[section 5.3](#5-3-distilled-checkpoint-on-gb200) command. The 1-GPU rows
+follow the base protocol. The 2- and 4-GPU rows use its Ulysses presets of
+[section 3.3](#3-3-multi-gpu-and-memory-presets) (CFG parallel does not apply
+to the distilled checkpoint): 2-GPU rows as swapped same-time pairs, 4-GPU
+rows BF16 then ConvRot, each averaged over two rounds. Peak is the runtime
+peak per GPU.
+
+| Input | GPUs | Flags | BF16 E2E (s) | ConvRot INT8 E2E (s) | Speedup | Peak per GPU (GiB) |
+| --- | ---: | --- | ---: | ---: | ---: | --- |
+| reference + 81-frame driving video (3 clips) | 1 | `--text-encoder-cpu-offload` | 61.0 | 57.2 | 1.07x | 65.3 -> 50.7 |
+| CI reference + 24-frame CI video (1 clip) | 1 | `--text-encoder-cpu-offload` | 19.4 | 18.3 | 1.06x | 60.8 -> 47.6 |
+| reference + 81-frame driving video (3 clips) | 2 | `--ulysses-degree 2 --text-encoder-cpu-offload` | 37.2 | 35.0 | 1.06x | 48.3 -> 33.6 |
+| reference + 81-frame driving video (3 clips) | 4 | `--ulysses-degree 4 --text-encoder-cpu-offload` | 20.5 | 19.8 | 1.04x | 41.3 -> 26.3 |
+
+On the 81-frame input at 1 GPU it reduces peak VRAM from 65.3 to 50.7 GiB.
+Same-seed PSNR / SSIM / LPIPS to BF16 is 33.9 dB / 0.971 / 0.021 on the
+81-frame input and 36.2 dB / 0.981 / 0.009 on the 24-frame CI input at 1 GPU,
+35.9 dB / 0.977 / 0.016 at 2 GPUs and 36.0 dB / 0.978 / 0.015 at 4 GPUs.
 
 ## 5. Benchmark
 

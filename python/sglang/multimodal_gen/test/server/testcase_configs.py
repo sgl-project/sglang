@@ -886,6 +886,17 @@ TI2V_sampling_params = DiffusionSamplingParams(
     direct_url_test=True,
 )
 
+# Wan I2V keeps the input image's aspect ratio inside the pixel budget: the square CI image
+# at the 640x384 budget of the T2V smoke comes back as 496x496.
+CONVROT_INT8_I2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=TI2V_sampling_params.prompt,
+    image_path=TI2V_sampling_params.image_path,
+    direct_url_test=True,
+    output_size="496x496",
+    num_frames=17,
+    extras={"num_inference_steps": 12, "seed": 0},
+)
+
 SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=TI2V_sampling_params.prompt,
     image_path=TI2V_sampling_params.image_path,
