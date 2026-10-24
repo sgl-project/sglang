@@ -656,13 +656,17 @@ def run_benchmark(args, tp):
     nc = args.new_tokens
     rng = np.random.default_rng(args.seed)
 
-    def ids(n):  # plain vocabulary ids, clear of special tokens
-        return rng.integers(1000, 100000, size=n).tolist()
+    def ids(n, generator=rng):  # plain vocabulary ids, clear of special tokens
+        return generator.integers(1000, 100000, size=n).tolist()
 
     prefixes = [ids(args.context - nc) for _ in range(args.dp)]
 
+    # Rank semaphores admit requests independently. Keep suffix assignment
+    # reproducible when their completion order changes between runs.
+    suffix_rngs = [np.random.default_rng([args.seed, r, 1]) for r in range(args.dp)]
+
     def prompt(r):
-        return prefixes[r] + ids(nc)
+        return prefixes[r] + ids(nc, suffix_rngs[r])
 
     info = tp.server_info()
     args.num_gpus = gpu_count(info, args.dp, args.num_gpus)

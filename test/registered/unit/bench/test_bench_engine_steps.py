@@ -22,6 +22,61 @@ bench = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bench)
 
 
+class TestPromptInputs(unittest.TestCase):
+    def inputs(self, order, seed=17):
+        class Collected(Exception):
+            pass
+
+        seen = [[], []]
+
+        async def skip_warmup(*args, **kwargs):
+            pass
+
+        async def collect(args, tp, prompt):
+            for rank in order:
+                seen[rank].append(prompt(rank))
+            raise Collected
+
+        args = SimpleNamespace(
+            seed=seed,
+            new_tokens=4,
+            context=16,
+            dp=2,
+            num_gpus=2,
+            mode="prefill",
+            no_flush=False,
+            sample_gpu=False,
+        )
+        tp = SimpleNamespace(
+            server_info=lambda: {"tp_size": 2, "dp_size": 1, "attn_dp_size": 2},
+            flush_cache=lambda: None,
+            run=asyncio.run,
+        )
+        with (
+            patch.object(bench, "batch", skip_warmup),
+            patch.object(bench, "prefill", collect),
+            self.assertRaises(Collected),
+        ):
+            bench.run_benchmark(args, tp)
+        return seen
+
+    def test_rank_inputs_do_not_depend_on_interleaving(self):
+        # Each rank's semaphore can admit its next request first. A shared RNG
+        # must not change which suffix that rank receives between A/B runs.
+        self.assertEqual(
+            self.inputs([0, 1, 0, 1, 0, 1]),
+            self.inputs([1, 1, 0, 1, 0, 0]),
+        )
+
+    def test_prefix_is_shared_and_suffixes_are_distinct(self):
+        seen = self.inputs([0, 1, 0, 1, 0, 1])
+        for prompts in seen:
+            self.assertTrue(all(p[:12] == prompts[0][:12] for p in prompts))
+            self.assertEqual(len({tuple(p[12:]) for p in prompts}), 3)
+        self.assertNotEqual(seen[0][0], seen[1][0])
+        self.assertNotEqual(seen, self.inputs([0, 1, 0, 1, 0, 1], seed=18))
+
+
 class TestStepWindow(unittest.TestCase):
     def test_window_spans_whole_steps(self):
         # 30 steps of 100 ms with two completions each; a 1 s stall precedes step 3,
