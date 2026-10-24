@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import itertools
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -141,6 +142,7 @@ class AutoWeightsLoader:
         skip_substrs: list[str] | None = None,
         ignore_unexpected_prefixes: list[str] | None = None,
         ignore_unexpected_suffixes: list[str] | None = None,
+        ignore_unexpected_patterns: Iterable[str] | None = None,
     ) -> None:
         self.module = module
         self.skip_prefixes = list(skip_prefixes or [])
@@ -150,6 +152,10 @@ class AutoWeightsLoader:
         ]
         self.ignore_unexpected_prefixes = list(ignore_unexpected_prefixes or [])
         self.ignore_unexpected_suffixes = list(ignore_unexpected_suffixes or [])
+        self.ignore_unexpected_patterns = [
+            re.compile(p) for p in ignore_unexpected_patterns or ()
+        ]
+        self._checkpoint_names: dict[str, str] = {}  # mapped name -> checkpoint name
 
     def _groupby_prefix(
         self,
@@ -186,6 +192,11 @@ class AutoWeightsLoader:
             qualname.startswith(p) for p in self.ignore_unexpected_prefixes
         ) or any(qualname.endswith(s) for s in self.ignore_unexpected_suffixes)
 
+    def _hf_ignores(self, qualname: str) -> bool:
+        # HF matches these against complete checkpoint keys, before any renaming.
+        names = (qualname, self._checkpoint_names.get(qualname, qualname))
+        return any(p.search(n) for p in self.ignore_unexpected_patterns for n in names)
+
     def _load_param(
         self,
         base_prefix: str,
@@ -197,7 +208,9 @@ class AutoWeightsLoader:
             if self._can_skip(weight_qualname):
                 continue
             if weight_name != "":
-                if self._can_ignore_unexpected(weight_qualname):
+                if self._can_ignore_unexpected(weight_qualname) or self._hf_ignores(
+                    weight_qualname
+                ):
                     continue
                 raise ValueError(
                     f"Attempted to load nested weight {weight_qualname!r} "
@@ -265,6 +278,11 @@ class AutoWeightsLoader:
                 prefix + "."
             ):
                 continue
+            if self.ignore_unexpected_patterns and all(
+                self._hf_ignores(self._get_qualname(prefix, rest))
+                for rest, _ in child_weights
+            ):
+                continue
             raise ValueError(
                 f"No module or parameter named {prefix!r} in {self.module._get_name()}."
             )
@@ -275,12 +293,23 @@ class AutoWeightsLoader:
         *,
         mapper: WeightsMapper | None = None,
     ) -> set[str]:
+        self._checkpoint_names = {}
         if mapper is not None:
-            weights = mapper.apply(weights)
+            weights = self._map_weights(weights, mapper)
         weights = (
             (name, weight) for name, weight in weights if not self._can_skip(name)
         )
         return set(self._load_module("", self.module, weights))
+
+    def _map_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]], mapper: WeightsMapper
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        for name, weight in weights:
+            if (mapped := mapper._map_name(name)) is None:
+                continue
+            if self.ignore_unexpected_patterns:
+                self._checkpoint_names[mapped] = name
+            yield mapped, weight
 
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
