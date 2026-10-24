@@ -283,7 +283,14 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
     if not isinstance(quant_method, Fp8MoEMethod):
         reason = f"selected {type(quant_method).__name__}"
     elif quant_method.is_fp4_expert:
-        reason = "selected FP4 experts"
+        # FP4 (1x32 UE8M0) experts run DeepGEMM's FP8 x FP4 grouped GEMM on
+        # 1x128 FP8 activations, which needs the UE8M0 (Blackwell) scale layout.
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        if not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            reason = "selected FP4 experts without DeepGEMM UE8M0 scales"
+        elif config.activation_scheme != "dynamic":
+            reason = f"has activation_scheme={config.activation_scheme!r}"
     elif list(quant_method.weight_block_size or []) != (
         [1, 32] if quant_method.use_mxfp8 else [128, 128]
     ):
@@ -294,8 +301,9 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
 
     if reason is not None:
         raise ValueError(
-            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 or 1x32 MXFP8 "
-            "experts with dynamic activation scaling or unquantized BF16 "
+            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8, 1x32 MXFP8 "
+            "or FP4 (DeepGEMM UE8M0) experts with dynamic activation scaling or "
+            "unquantized BF16 "
             f"experts, but this layer {reason}. Use a compatible checkpoint or "
             "--moe-a2a-backend deepep."
         )

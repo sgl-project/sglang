@@ -442,6 +442,13 @@ def get_deepep_v2_dispatcher_output_dtype(
     return required
 
 
+def get_deepep_v2_masked_tokens_per_rank() -> int:
+    """Per-rank row capacity of a masked (decode/verify) DeepEP v2 dispatch."""
+    dispatch = envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+    masked = envs.SGLANG_DEEPEP_V2_NUM_MAX_MASKED_TOKENS_PER_RANK.get()
+    return dispatch if masked is None else min(masked, dispatch)
+
+
 def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
     """Resolve the FP8 scale layout DeepEP v2 must pre-quantize into."""
     from sglang.srt.layers import deep_gemm_wrapper

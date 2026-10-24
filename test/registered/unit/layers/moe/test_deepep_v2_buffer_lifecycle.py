@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher import deepep_v2
 from sglang.srt.runtime_context import get_resources, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -19,11 +20,13 @@ class _FakeGroup:
 
 class _FakeBuffer:
     instances = []
+    num_rdma_ranks = 1
 
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
         self.num_bytes = 1 << 20
+        self.num_rdma_ranks = type(self).num_rdma_ranks
         type(self).instances.append(self)
 
 
@@ -31,6 +34,7 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
     def setUp(self):
         reset_context()
         _FakeBuffer.instances = []
+        _FakeBuffer.num_rdma_ranks = 1
         self._patches = [
             patch.object(deepep_v2, "use_deepep_v2", True),
             patch.object(deepep_v2, "ElasticBuffer", _FakeBuffer, create=True),
@@ -75,6 +79,98 @@ class TestDeepEPv2BufferLifecycle(CustomTestCase):
         self.assertIsNot(first, second)
         self.assertIsNot(second, third)
         self.assertEqual(len(_FakeBuffer.instances), 3)
+
+    def test_draft_topk_shares_target_buffer(self):
+        """Alternating target/draft layers with different top-k must not rebuild.
+
+        A rebuild is a collective ElasticBuffer construction, so one per
+        target/draft switch stalls every DSpark step (and breaks graph replay).
+        """
+        group = _FakeGroup()
+        target = self._get(group, router_topk=6)
+        for _ in range(3):
+            self.assertIs(self._get(group, router_topk=3), target)
+            self.assertIs(self._get(group, router_topk=6), target)
+        self.assertEqual([b.kwargs["num_topk"] for b in _FakeBuffer.instances], [6])
+
+    def test_larger_topk_rebuilds_once_at_the_max(self):
+        """A smaller top-k built first is outgrown once, then stays shared."""
+        group = _FakeGroup()
+        self._get(group, router_topk=3)
+        grown = self._get(group, router_topk=6)
+        self.assertIs(self._get(group, router_topk=3), grown)
+        self.assertEqual([b.kwargs["num_topk"] for b in _FakeBuffer.instances], [3, 6])
+
+    def test_multi_node_without_ibstat_uses_explicit_sms(self):
+        """DeepEP's own SM sizing divides by zero without `ibstat` once RDMA is used."""
+        _FakeBuffer.num_rdma_ranks = 2
+        with patch.object(deepep_v2.shutil, "which", return_value=None):
+            self._get()
+            self.assertEqual(deepep_v2.DeepEPv2Buffer.num_sms(), 32)
+            deepep_v2.DeepEPv2Buffer.destroy()
+            with envs.SGLANG_DEEPEP_V2_NUM_SMS.override(24):
+                self._get()
+                self.assertEqual(deepep_v2.DeepEPv2Buffer.num_sms(), 24)
+        deepep_v2.DeepEPv2Buffer.destroy()
+        _FakeBuffer.num_rdma_ranks = 1
+        with patch.object(deepep_v2.shutil, "which", return_value=None):
+            self._get()
+            self.assertEqual(deepep_v2.DeepEPv2Buffer.num_sms(), 0)
+
+    def test_deepep_2_5_epbuffer_is_preferred(self):
+        """DeepEP 2.5 renamed ElasticBuffer to EPBuffer; 2.1 only has ElasticBuffer."""
+        import importlib
+        import sys
+        import types
+
+        def _reload_with(**names):
+            fake = types.ModuleType("deep_ep")
+            fake.__dict__.update(names)
+            with patch.dict(sys.modules, {"deep_ep": fake}):
+                return importlib.reload(deepep_v2).ElasticBuffer
+
+        class _EP25:
+            pass
+
+        class _Elastic21:
+            pass
+
+        try:
+            self.assertIs(_reload_with(EPBuffer=_EP25, ElasticBuffer=_Elastic21), _EP25)
+            self.assertIs(_reload_with(ElasticBuffer=_Elastic21), _Elastic21)
+        finally:
+            importlib.reload(deepep_v2)
+
+    def test_masked_capacity_defaults_to_and_is_capped_by_dispatch(self):
+        """Decode slabs are sized by the masked capacity, never above the buffer's."""
+        from sglang.srt.layers.moe.utils import get_deepep_v2_masked_tokens_per_rank
+
+        with envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(8192):
+            self.assertEqual(get_deepep_v2_masked_tokens_per_rank(), 8192)
+            with envs.SGLANG_DEEPEP_V2_NUM_MAX_MASKED_TOKENS_PER_RANK.override(768):
+                self.assertEqual(get_deepep_v2_masked_tokens_per_rank(), 768)
+            with envs.SGLANG_DEEPEP_V2_NUM_MAX_MASKED_TOKENS_PER_RANK.override(10000):
+                self.assertEqual(get_deepep_v2_masked_tokens_per_rank(), 8192)
+
+    def test_masked_dispatch_rejects_rows_over_masked_capacity(self):
+        """A decode batch above the masked capacity must fail, not overflow the slab."""
+        impl = object.__new__(deepep_v2._DeepEPv2Impl)
+        impl._handle = None
+        impl.num_max_dispatch_tokens_per_rank = 64
+        impl.num_max_masked_tokens_per_rank = 8
+        impl.hidden_size = 128
+        impl.activation_scale_block_size = 128
+        impl.router_topk = 2
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        out = StandardTopKOutput(
+            topk_weights=torch.ones(9, 2),
+            topk_ids=torch.zeros(9, 2, dtype=torch.int32),
+            router_logits=None,
+        )
+        with patch.object(deepep_v2, "get_is_extend_in_batch", return_value=False):
+            with self.assertRaisesRegex(ValueError, "NUM_MAX_MASKED_TOKENS_PER_RANK"):
+                impl.dispatch(torch.empty(9, 128), out)
 
     def test_key_keeps_process_group_object(self):
         group = _FakeGroup()

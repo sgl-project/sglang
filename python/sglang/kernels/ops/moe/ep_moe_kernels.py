@@ -390,6 +390,7 @@ def _silu_and_mul_post_quant_kernel(
     SCALE_UE8M0: tl.constexpr,
     GEMM1_ALPHA: tl.constexpr,
     GEMM1_CLAMP_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr = 0.0,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -433,6 +434,9 @@ def _silu_and_mul_post_quant_kernel(
             up = tl.clamp(up, -GEMM1_CLAMP_LIMIT, GEMM1_CLAMP_LIMIT)
             gate_up = gate * tl.sigmoid(gate * GEMM1_ALPHA) * (up + 1)
         else:
+            if SWIGLU_LIMIT > 0:
+                gate = tl.minimum(gate, SWIGLU_LIMIT)
+                up = tl.clamp(up, -SWIGLU_LIMIT, SWIGLU_LIMIT)
             gate = gate / (1 + tl.exp(-gate))
             gate = gate.to(input_ptr.dtype.element_ty)
             gate_up = up * gate
@@ -472,6 +476,7 @@ def silu_and_mul_masked_post_quant_fwd(
     gemm1_clamp_limit: float = 0.0,
     num_real_tokens: Optional[int] = None,
     topk: Optional[int] = None,
+    swiglu_limit: Optional[float] = None,
 ):
     """Masked (EP-MoE) fused silu_and_mul + per-token-group fp8 quant.
 
@@ -489,6 +494,8 @@ def silu_and_mul_masked_post_quant_fwd(
 
     ``gemm1_alpha > 0`` switches the activation to the gpt-oss swiglu
     ``min(gate, limit) * sigmoid(alpha * gate) * (clamp(up, +-limit) + 1)``.
+    Otherwise ``swiglu_limit`` (DeepSeek-V4) computes
+    ``silu(min(gate, limit)) * clamp(up, +-limit)``; only the float32 schedule supports it.
     """
 
     assert input.is_contiguous()
@@ -508,6 +515,7 @@ def silu_and_mul_masked_post_quant_fwd(
     gemm1_clamp_limit = gemm1_clamp_limit if gemm1_clamp_limit is not None else 0.0
 
     if output_scale.dtype == torch.int32:
+        assert swiglu_limit is None, "swiglu_limit needs the float32 scale schedule"
         assert scale_ue8m0, "packed int32 scales are UE8M0 by definition"
         assert num_real_tokens is not None and topk is not None, (
             "the packed schedule sizes its grid from num_real_tokens * topk"
@@ -588,6 +596,7 @@ def silu_and_mul_masked_post_quant_fwd(
         SCALE_UE8M0=scale_ue8m0,
         GEMM1_ALPHA=gemm1_alpha,
         GEMM1_CLAMP_LIMIT=gemm1_clamp_limit,
+        SWIGLU_LIMIT=0.0 if swiglu_limit is None else float(swiglu_limit),
     )
     return
 

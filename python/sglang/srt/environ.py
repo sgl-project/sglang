@@ -1419,6 +1419,9 @@ class Envs:
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # Per-rank rows of a masked (decode/verify) dispatch; unset uses the dispatch
+    # capacity. The masked GEMM slab is num_local_experts x (this x EP size) rows.
+    SGLANG_DEEPEP_V2_NUM_MAX_MASKED_TOKENS_PER_RANK = EnvInt(None)
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(None)
