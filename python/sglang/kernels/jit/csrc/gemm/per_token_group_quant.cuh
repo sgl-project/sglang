@@ -467,6 +467,19 @@ __global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_flat_
   PDLTriggerSecondary<kUsePDL>();
 }
 
+// Row schedule for packed UE8M0: a warp quantizes four adjacent groups,
+// while neighboring warps write neighboring rows of the column-major scales.
+template <typename Trait, bool kUsePDL>
+__global__ __launch_bounds__(Trait::kBlockSize) void per_token_group_quant_rows_kernel(
+    const __grid_constant__ QuantKernelParams params) {
+  const uint32_t token_idx = blockIdx.y * (Trait::kBlockSize / 32) + threadIdx.x / 32;
+  if (token_idx >= params.num_tokens) return;
+  const uint32_t group_idx = blockIdx.x * 4 + (threadIdx.x % 32) / 8;
+  device::PDLWaitPrimary<kUsePDL>();
+  Trait::run(params, 0, token_idx, group_idx, threadIdx.x % 8);
+  device::PDLTriggerSecondary<kUsePDL>();
+}
+
 // ---------------------------------------------------------------------------
 // Masked schedule (EP-MoE): grid (groups, token_blocks, experts); the token
 // axis grid-strides up to the device-side masked_m[e].
@@ -641,6 +654,18 @@ struct PerTokenGroupQuantFlatKernel {
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
     launch_flat_kernel<Trait, kUsePDL, /*kSortedRows=*/false>(ctx, ctx.params);
+  }
+
+  static void run_rows(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
+    static_assert(kGroupSize == 128 && kUe8m0 && !kRowMajor && kAligned && !kFuseSiluAndMul);
+    const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);
+    CHECK_HOST(ctx.params.scale.num_groups % 4 == 0) << "Row schedule requires K divisible by 512";
+    if (ctx.params.num_tokens == 0) return;
+    host::LaunchKernel(
+        {ctx.params.scale.num_groups / 4, host::div_ceil(ctx.params.num_tokens, Trait::kBlockSize / 32)},
+        Trait::kBlockSize,
+        ctx.device)
+        .config({.use_pdl = kUsePDL})(per_token_group_quant_rows_kernel<Trait, kUsePDL>, ctx.params);
   }
 };
 

@@ -1907,6 +1907,87 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
+        kwargs = dict(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+            extend_lens=extend_lens,
+        )
+        if self._try_append_target_hidden_graph(kwargs):
+            return
+        self._append_target_hidden_eager(**kwargs)
+
+    def _try_append_target_hidden_graph(self, kwargs) -> bool:
+        # Experimental decode-only buckets. Prefill and changing TP/DP layouts
+        # retain the eager path. Lilicorr publishes a Python-side anchor and
+        # therefore cannot be replayed by this graph.
+        if not envs.SGLANG_K3_DFLASH_PREP_GRAPH.get():
+            return False
+        hidden = kwargs["target_hidden"]
+        if (
+            not hidden.is_cuda
+            or hidden.shape[0] not in (8, 128)
+            or kwargs["cache_loc_2d"] is None
+            or kwargs["commit_lens"] is None
+            or self.lilicorr is not None
+            or get_parallel().attn_dp_enabled
+            or torch.cuda.is_current_stream_capturing()
+            or not self._use_fused_kv_materialize
+            or self._fused_kv_helper is None
+        ):
+            return False
+        from sglang.srt.distributed.parallel_state import graph_capture
+
+        key = tuple(
+            (name, tuple(value.shape), value.dtype, value.device)
+            for name, value in kwargs.items()
+            if value is not None
+        )
+        graphs = getattr(self, "_context_prepare_graphs", None)
+        if graphs is None:
+            graphs = self._context_prepare_graphs = {}
+        entry = graphs.get(key)
+        if entry is None:
+            static = {
+                name: value.clone() if value is not None else None
+                for name, value in kwargs.items()
+            }
+            graph = torch.cuda.CUDAGraph()
+            # Warmup uses the actual write locations. Repeated materialization
+            # is idempotent: this path only replaces the same prefix-valid KV.
+            with draft_tp_context(self.draft_owns_attention), graph_capture() as ctx:
+                for _ in range(2):
+                    self._append_target_hidden_eager(**static)
+                ctx.stream.synchronize()
+                with torch.cuda.graph(graph, stream=ctx.stream):
+                    self._append_target_hidden_eager(**static)
+            torch.cuda.current_stream().wait_stream(ctx.stream)
+            entry = graphs[key] = (graph, static)
+            logger.info(
+                "DFLASH context preparation graph captured: rows=%d, bs=%d",
+                hidden.shape[0],
+                kwargs["commit_lens"].numel(),
+            )
+        graph, static = entry
+        with torch.profiler.record_function("k3_dflash_context_prepare_graph"):
+            for name, value in kwargs.items():
+                if value is not None:
+                    static[name].copy_(value)
+            graph.replay()
+        return True
+
+    def _append_target_hidden_eager(
+        self,
+        *,
+        target_hidden,
+        cache_loc,
+        positions,
+        cache_loc_2d,
+        commit_lens,
+        extend_lens,
+    ) -> None:
         # `cache_loc` arrives in the draft pool's id space (`_draft_write_ids`);
         # the callers' window buffers stay virtual for the compact
         # req_to_token rebuild.
@@ -2834,7 +2915,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
             batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
+        verify_forward_batch, pending_can_run_graph = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
@@ -2856,6 +2937,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         # eager, symmetric with the idle guard above.
         if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
+
+        # On the forward stream after metadata planning, before any verify
+        # graph reads recurrent state. Do not put this mutation on a plan stream.
+        pending_pool = getattr(
+            self.target_worker.model_runner.req_to_token_pool, "mamba_pool", None
+        )
+        pending = getattr(pending_pool, "kda_pending_replay", None)
+        if pending is not None:
+            runner = self.target_worker.model_runner.decode_cuda_graph_runner
+            pending_bs = (
+                runner.bs if pending_can_run_graph else batch.req_pool_indices.numel()
+            )
+            pending.before_verify(batch_size=pending_bs, block_size=block_size)
 
         target_out = self.target_worker.forward_batch_generation(
             batch=None,

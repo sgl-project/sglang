@@ -3232,6 +3232,29 @@ class KVCacheConfigurator:
         extra_per_slot = replayssm_ring_per_slot + int(
             self.extra_mamba_cache_bytes_per_req * pp_layer_scale
         )
+        if (
+            replayssm_active
+            and self.hybrid_kda_config is not None
+            and envs.SGLANG_K3_KDA_PENDING_REPLAY.get()
+            and not get_memory().enable_unified_memory
+            and get_spec().speculative_algorithm == "DFLASH"
+            and get_spec().speculative_dflash_block_size == 8
+            and config.mamba2_cache_params.shape.temporal == (12, 128, 128)
+            and config.mamba2_cache_params.dtype.temporal == torch.float32
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] == 10
+        ):
+            heads, value_dim, key_dim = config.mamba2_cache_params.shape.temporal
+            # Capacity8: bf16 V/K, fp32 per-K decay and beta, int32/head
+            # counters, plus one int32 physical-slot index shared by all layers.
+            pending_bytes = (
+                max_stage_mamba_layers
+                * heads
+                * (8 * (2 * value_dim + 6 * key_dim + 4) + 4)
+                + 4
+            )
+            extra_per_slot += pending_bytes
+
         reserves_spec_state = (
             has_spec_dec
             and not replayssm_active

@@ -550,6 +550,11 @@ class MambaComponent(TreeComponent):
             self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             assert slot is not None, "Can not alloc mamba cache"
+        pool = self.cache.req_to_token_pool.mamba_pool
+        if pool.kda_pending_replay is not None:
+            pool.kda_pending_replay.reset_slots(
+                self.cache.req_to_token_pool.translate_mamba_indices(slot)
+            )
         return slot
 
     @property
@@ -608,6 +613,13 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        pool = self.cache.req_to_token_pool.mamba_pool
+        if pool.kda_pending_replay is not None and req.kv.mamba_pool_idx is not None:
+            pool.flush_kda_pending(
+                self.cache.req_to_token_pool.translate_mamba_indices(
+                    req.kv.mamba_pool_idx.reshape(-1)
+                )
+            )
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
         else:
@@ -738,6 +750,11 @@ class MambaComponent(TreeComponent):
             value = node.component_data[self.component_type].value
             if value is None:
                 return None
+            pool = self.cache.req_to_token_pool.mamba_pool
+            if pool.kda_pending_replay is not None:
+                pool.flush_kda_pending(
+                    self.cache.req_to_token_pool.translate_mamba_indices(value)
+                )
             # One state per node, valid only at the node's end boundary.
             return PoolTransfer(
                 name=PoolName.MAMBA,

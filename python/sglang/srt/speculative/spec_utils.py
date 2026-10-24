@@ -1216,6 +1216,13 @@ def commit_mamba_states_after_verify(
                 to_track_mask, candidate, torch.full_like(candidate, -1)
             )
         commit_kda_replayssm_after_verify(
+            pending_replay=(
+                getattr(mamba_pool, "kda_pending_replay", None)
+                if 1 <= state_batch_indices.numel() <= 64
+                and draft_token_num == 8
+                and src_indices_raw is None
+                else None
+            ),
             spec_state=spec_state,
             state_batch_indices=state_batch_indices,
             accept_lens=accept_lens,  # incl. bonus token

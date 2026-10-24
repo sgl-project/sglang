@@ -610,7 +610,7 @@ if get_platform().is_blackwell and is_flashinfer_available():
     @register_custom_op(
         op_name="flashinfer_gemm_fp8_nt_groupwise",
         mutates_args=[],
-        fake_impl=lambda q_input, weight, x_scale, weight_scale, out_dtype: (
+        fake_impl=lambda q_input, weight, x_scale, weight_scale, out_dtype, backend=None: (
             q_input.new_empty((q_input.shape[0], weight.shape[0]), dtype=out_dtype)
         ),
     )
@@ -620,8 +620,10 @@ if get_platform().is_blackwell and is_flashinfer_available():
         x_scale: torch.Tensor,
         weight_scale: torch.Tensor,
         out_dtype: torch.dtype,
+        backend: Optional[str] = None,
     ) -> torch.Tensor:
-        backend = _get_flashinfer_groupwise_backend()
+        if backend is None:
+            backend = _get_flashinfer_groupwise_backend()
         if backend == "cutlass":
             # FlashInfer CUTLASS groupwise kernel requires contiguous scale tensors
             x_scale = x_scale.contiguous()
@@ -1245,6 +1247,20 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
 
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
+    # Kimi K3 TP8 KV expansion: choose the runner before arranging its scales.
+    # Unaligned warmup tails cannot use this CUTLASS tactic.
+    if (
+        backend == "trtllm"
+        and envs.SGLANG_K3_KV_B_PROJ_CUTLASS.get()
+        and get_device_capability() == (10, 3)
+        and input_2d.dtype == torch.bfloat16
+        and tuple(block_size) == (128, 128)
+        and (weight.shape[0], input_2d.shape[1]) == (3072, 512)
+        and 1536 <= input_2d.shape[0] <= 131072
+        and input_2d.shape[0] % 128 == 0
+    ):
+        backend = "cutlass"
+
     # TRTLLM uses the existing SGLang column-major scale layout.
     # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we normalize below.
     q_input, x_scale = sglang_per_token_group_quant_fp8(
@@ -1289,6 +1305,7 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         x_scale,
         weight_scale,
         out_dtype=input_2d.dtype,
+        backend=backend,
     )
 
     if bias is not None:

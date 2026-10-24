@@ -207,6 +207,7 @@ def _k3_bf16_gemm(
     weight: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    split_front_tgv: bool = False,
 ) -> torch.Tensor:
     """F.linear / torch.mm with the same TGV dispatch module-level GEMMs get
     through UnquantizedLinearMethod. The fused MoE front and the deferred
@@ -226,7 +227,17 @@ def _k3_bf16_gemm(
                 use_cutedsl_bf16_gemm,
             )
 
-            if use_cutedsl_bf16_gemm(x.shape[0], weight.shape[0], weight.shape[1]):
+            # These are the measured split-front shapes. Keep this override
+            # local to the experimental MoE fork, not the global GEMM policy.
+            # M8 wins in isolation but regresses the combined verify trace.
+            measured_split_front = (
+                split_front_tgv
+                and x.shape[0] == 128
+                and tuple(weight.shape) in ((4480, 7168), (1536, 7168))
+            )
+            if measured_split_front or use_cutedsl_bf16_gemm(
+                x.shape[0], weight.shape[0], weight.shape[1]
+            ):
                 if out is None:
                     return cutedsl_bf16_gemm(x, weight)
                 return cutedsl_bf16_gemm_out(x, weight, out)
@@ -1286,6 +1297,58 @@ class KimiK3MoE(nn.Module):
         )
 
     @cached_property
+    def _nvfp4_route_quant_eligible(self) -> bool:
+        method = self.experts.quant_method
+        return (
+            envs.SGLANG_K3_NVFP4_ROUTE_QUANT.get()
+            and not envs.SGLANG_K3_NVFP4_CAKE.get()
+            and get_moe_runner_backend().is_flashinfer_trtllm()
+            and getattr(method, "use_flashinfer_trtllm_weight_layout", False)
+            and not getattr(method.quant_config, "use_per_token_activation", False)
+            and getattr(self.experts, "trtllm_padded_hidden_size", None) is None
+            and not self._ep_a2a
+            and self.experts.moe_ep_size == 1
+            and torch.cuda.get_device_capability() == (10, 3)
+            and not any(
+                os.environ.get(name, "0").lower() in ("1", "true")
+                for name in (
+                    "FLASHINFER_NVFP4_4OVER6",
+                    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+                    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+                )
+            )
+        )
+
+    def _nvfp4_route_quant_shape(self, x: torch.Tensor) -> bool:
+        return (
+            self._nvfp4_route_quant_eligible
+            and x.ndim == 2
+            and 0 < x.shape[0] <= 64
+            and x.shape[1] == 3584
+            and x.dtype in (torch.bfloat16, torch.float32)
+            and x.stride(1) == 1
+            and x.data_ptr() % 32 == 0
+            and x.stride(0) * x.element_size() % 32 == 0
+        )
+
+    def _stage_route_quant(self, routed_input: torch.Tensor) -> bool:
+        if self._nvfp4_route_quant_shape(routed_input):
+            route_quant_handoff.stage_nvfp4(
+                routed_input, self.experts.w13_input_scale_quant
+            )
+            return True
+        if self._route_quant_fuse_eligible:
+            route_quant_handoff.stage(routed_input)
+        return False
+
+    def _repair_nvfp4_prep_miss(self, routed_input, attempted):
+        if attempted and not route_quant_handoff.has_nvfp4(
+            routed_input, self.experts.w13_input_scale_quant
+        ):
+            return routed_input.to(torch.bfloat16).contiguous()
+        return routed_input
+
+    @cached_property
     def _route_quant_fuse_eligible(self) -> bool:
         """Whether to stage routed_input for the fused route+pack+quant launch
         (route_quant_handoff). Only the trtllm-gen SiTU runner with mxfp8
@@ -1302,10 +1365,15 @@ class KimiK3MoE(nn.Module):
         )
 
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
-        if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+        nv_attempt = self._stage_route_quant(routed_input)
         try:
             topk_output = self.topk(hidden_states, router_logits)
+            routed_input = self._repair_nvfp4_prep_miss(routed_input, nv_attempt)
+            if envs.SGLANG_K3_NVFP4_CAKE.get():
+                from sglang.srt.layers.moe.k3_nvfp4_cake import try_cake_situ
+
+                if try_cake_situ(self.experts, routed_input, topk_output, latent):
+                    return
             with zero_copy_context.set_moe_output(latent):
                 expert_output = self.experts(routed_input, topk_output)
         finally:
@@ -1318,10 +1386,10 @@ class KimiK3MoE(nn.Module):
         FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
-        if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+        nv_attempt = self._stage_route_quant(routed_input)
         try:
             topk_output = self.topk(hidden_states, router_logits)
+            routed_input = self._repair_nvfp4_prep_miss(routed_input, nv_attempt)
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -1365,20 +1433,13 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
+        early_shared = (
+            envs.SGLANG_K3_EARLY_SHARED_FORK.get()
+            and num_tokens in (8, 128)
+            and self.alt_stream is not None
+            and k3_ar_fusion.enabled()
+            and not _is_hip
         )
-        gate_up, router_logits, routed_input = torch.split(
-            fused, self._front_sizes, dim=-1
-        )
-        if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
-            router_logits = router_logits.contiguous()
-        if self._moe_front_needs_dense_bf16:
-            # off an fp32 front the cast allocates the dense buffer, so the
-            # contiguous() behind it is free; off a bf16 front it is the copy
-            routed_input = routed_input.to(hidden_states.dtype).contiguous()
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
@@ -1397,6 +1458,54 @@ class KimiK3MoE(nn.Module):
 
         latent = buf[:latent_numel].view(num_tokens, self.moe_hidden_size)
         shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
+        if early_shared:
+            # The merged weight is row-contiguous, so both slices are views.
+            # Fork before the shared gate/up GEMM, preserving FP32 front output
+            # for routing and SiTU. The routed AR still waits for the shared AR
+            # below: both collectives reuse the same pull semaphores.
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            shared_rows = self._front_sizes[0]
+            front_dtype = torch.float32 if self._front_fp32 else None
+            with torch.cuda.stream(self.alt_stream):
+                gate_up = _k3_bf16_gemm(
+                    hidden_states,
+                    self._front_w[:shared_rows],
+                    out_dtype=front_dtype,
+                    split_front_tgv=envs.SGLANG_K3_SPLIT_FRONT_TGV.get(),
+                )
+                self._forward_shared(gate_up, shared_output)
+                k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
+            routed_front = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w[shared_rows:],
+                out_dtype=front_dtype,
+                split_front_tgv=envs.SGLANG_K3_SPLIT_FRONT_TGV.get(),
+            )
+            router_logits, routed_input = torch.split(
+                routed_front, self._front_sizes[1:], dim=-1
+            )
+            if self._moe_front_needs_dense_bf16 and not self._nvfp4_route_quant_shape(
+                routed_input
+            ):
+                routed_input = routed_input.to(hidden_states.dtype).contiguous()
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
+            gate_up, router_logits, routed_input = torch.split(
+                fused, self._front_sizes, dim=-1
+            )
+            if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
+                router_logits = router_logits.contiguous()
+            if self._moe_front_needs_dense_bf16 and not self._nvfp4_route_quant_shape(
+                routed_input
+            ):
+                # off an fp32 front the cast allocates the dense buffer, so the
+                # contiguous() behind it is free; off a bf16 front it is the copy
+                routed_input = routed_input.to(hidden_states.dtype).contiguous()
         fused_norm = False
         if self.alt_stream is not None and k3_ar_fusion.enabled():
             defer_finalize = (
@@ -1405,18 +1514,21 @@ class KimiK3MoE(nn.Module):
                 and k3_ar_fusion.finalize_push_fits(num_tokens)
             )
             current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
+            if not early_shared:
+                self.alt_stream.wait_stream(current_stream)
             if defer_finalize:
                 deferred = self._forward_routed_deferred(
                     hidden_states, router_logits, routed_input
                 )
             else:
                 self._forward_routed(hidden_states, router_logits, routed_input, latent)
-            with torch.cuda.stream(self.alt_stream):
-                self._forward_shared(gate_up, shared_output)
-                # low-SM pull so the side-stream AR leaves the SMs to the
-                # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
-                k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
+            if not early_shared:
+                with torch.cuda.stream(self.alt_stream):
+                    self._forward_shared(gate_up, shared_output)
+                    # Keep the shared collective small while routed GEMMs run.
+                    k3_ar_fusion.all_reduce_low_sm(
+                        shared_output, num_blocks=4, unroll=8
+                    )
             current_stream.wait_stream(self.alt_stream)
             # The latent AR must stay serialized after the shared AR (both
             # reuse the v2 pull semaphores); the join above does it.
@@ -1454,8 +1566,33 @@ class KimiK3MoE(nn.Module):
                     prefix_sum,
                 )
         else:  # single collective over the flat [latent | shared] pair
-            self._forward_shared(gate_up, shared_output)
-            self._forward_routed(hidden_states, router_logits, routed_input, latent)
+            overlap_shared = (
+                envs.SGLANG_K3_NVFP4_TP_SHARED_OVERLAP.get()
+                and self.alt_stream is not None
+                and self.tp_size == 8
+                and 0 < num_tokens <= 64
+                and get_moe_runner_backend().is_flashinfer_trtllm()
+                and getattr(
+                    self.experts.quant_method,
+                    "use_flashinfer_trtllm_weight_layout",
+                    False,
+                )
+                and self.experts.moe_ep_size == 1
+                and not envs.SGLANG_K3_NVFP4_CAKE.get()
+            )
+            if overlap_shared:
+                # Both branches read the merged front and write disjoint slices
+                # of buf. Join before the existing single collective; no
+                # communicator state or symmetric allocation runs on alt_stream.
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    self._forward_shared(gate_up, shared_output)
+                self._forward_routed(hidden_states, router_logits, routed_input, latent)
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                self._forward_shared(gate_up, shared_output)
+                self._forward_routed(hidden_states, router_logits, routed_input, latent)
             if self.fuse_ar_norm and k3_ar_fusion.enabled():
                 fused_norm = True
                 k3_ar_fusion.all_reduce_norm(

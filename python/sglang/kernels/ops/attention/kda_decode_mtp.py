@@ -154,10 +154,16 @@ def kda_decode_mtp_kernel(
     ring_rawk: cute.Tensor,
     ring_g: cute.Tensor,
     ring_beta: cute.Tensor,
+    replay_rawv: cute.Tensor,
+    replay_rawk: cute.Tensor,
+    replay_g: cute.Tensor,
+    replay_beta: cute.Tensor,
+    replay_lens: cute.Tensor,
     onorm_g: cute.Tensor,
     onorm_weight: cute.Tensor,
     smem_qk_layout: cute.Layout,
     smem_state_layout: cute.Layout,
+    smem_replay_layout: cute.Layout,
     ssm_state_indices: cute.Tensor,
     cu_seqlens: cute.Tensor,
     scale: cutlass.Constexpr[float],
@@ -166,6 +172,8 @@ def kda_decode_mtp_kernel(
     P2_LANES_K: cutlass.Constexpr[int],
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
+    HAS_REPLAY: cutlass.Constexpr[bool],
+    REPLAY_LEN: cutlass.Constexpr[int],
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
 ):
@@ -215,6 +223,17 @@ def kda_decode_mtp_kernel(
         cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
     )
     sState = smem.allocate_tensor(cutlass.Float32, smem_state_layout, 16)
+    if cutlass.const_expr(HAS_REPLAY):
+        sReplayK = smem.allocate_tensor(cutlass.Float32, smem_replay_layout, 16)
+        sReplayG = smem.allocate_tensor(cutlass.Float32, smem_replay_layout, 16)
+        sReplayV = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((REPLAY_LEN * HEAD_DIM,)), 16
+        )
+        sReplayBeta = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((REPLAY_LEN,)), 16
+        )
+    else:
+        sReplayK, sReplayG, sReplayV, sReplayBeta = sK, sG, sVall, sBeta
     if cutlass.const_expr(APPLY_ONORM):
         sOall = smem.allocate_tensor(
             cutlass.Float32, cute.make_layout((T_LOOP * HEAD_DIM,)), 16
@@ -282,6 +301,9 @@ def kda_decode_mtp_kernel(
 
     # int64: `slot * stride` overflows int32 on envelope-strided pools.
     slot = cutlass.Int64(slot)
+    replay_count = cutlass.Int32(0)
+    if cutlass.const_expr(HAS_REPLAY):
+        replay_count = replay_lens[slot, i_hv]
 
     # q/k/g each run on P1_JOB_WARPS warps split by token parity and the v-conv
     # takes the rest. Each token's conv is an independent window over globals,
@@ -616,6 +638,35 @@ def kda_decode_mtp_kernel(
                         cutlass.BFloat16(_win[_t + 1 + _w])
                     )
 
+    if cutlass.const_expr(HAS_REPLAY):
+        # Normalize each previous key and compute decay once per head/token.
+        # Reuse phase-1 registers; the existing precompute barrier below makes
+        # these shared inputs visible to every value-row group in phase 2.
+        for replay_t in cutlass.range(warp_idx, replay_count, NUM_WARPS):
+            sum_k = cutlass.Float32(0.0)
+            for j in range(VEC_SIZE):
+                k_idx = j * WARP_SIZE + in_warp_tid
+                r_k[j] = cutlass.Float32(replay_rawk[slot, i_hv, replay_t, k_idx])
+                sum_k += r_k[j] * r_k[j]
+            for offset in [16, 8, 4, 2, 1]:
+                sum_k += cute.arch.shuffle_sync_bfly(
+                    sum_k, offset=offset, mask=-1, mask_and_clamp=31
+                )
+            rnorm_k = cute.math.rsqrt(sum_k + 1e-6, fastmath=True)
+            for j in range(VEC_SIZE):
+                k_idx = j * WARP_SIZE + in_warp_tid
+                group = k_idx % P2_LANES_K
+                item = k_idx // P2_LANES_K
+                sReplayK[replay_t, group, item // 4, item % 4] = r_k[j] * rnorm_k
+                sReplayG[replay_t, group, item // 4, item % 4] = cute.math.exp(
+                    replay_g[slot, i_hv, replay_t, k_idx], fastmath=True
+                )
+                sReplayV[replay_t * HEAD_DIM + k_idx] = cutlass.Float32(
+                    replay_rawv[slot, i_hv, replay_t, k_idx]
+                )
+            if in_warp_tid == 0:
+                sReplayBeta[replay_t] = replay_beta[slot, i_hv, replay_t]
+
     k_grp = in_warp_tid % P2_LANES_K
     row_grp = in_warp_tid // P2_LANES_K
 
@@ -661,8 +712,69 @@ def kda_decode_mtp_kernel(
             if cutlass.const_expr(not staged):
                 # State loads can precede the cross-warp precompute barrier.
                 cute.arch.barrier()
-            # Every global read this block makes has now landed in registers.
+            # Current and replay inputs have all landed in registers or SMEM.
             cute.arch.griddepcontrol_launch_dependents()
+
+        if cutlass.const_expr(HAS_REPLAY):
+            if replay_count > 0:
+                # Previous accepted inputs occupy separate storage: phase 1
+                # has already written the current verify window into the ring.
+                # Fold into the state tile that is already in registers, then
+                # preserve that committed checkpoint before speculative work.
+                for replay_t in cutlass.range(replay_count):
+                    for j in range(P2_VEC):
+                        r_k[j] = sReplayK[replay_t, k_grp, j // 4, j % 4]
+                        r_decay[j] = sReplayG[replay_t, k_grp, j // 4, j % 4]
+                    r_beta_val = sReplayBeta[replay_t]
+                    for i_l in range(TILES_PER_PASS):
+                        v_base = (i_p * TILES_PER_PASS + i_l) * TILE_V
+                        for b in range(P2_BATCHES):
+                            _st = (i_l * P2_BATCHES + b) * P2_VEC
+                            v_row = warp_idx * NUM_V_ROWS + b * P2_ROWS_LANE + row_grp
+                            dot_lo, dot_hi = cutlass.Float32(0.0), cutlass.Float32(0.0)
+                            for jp in range(P2_VEC // 2):
+                                j = jp * 2
+                                r_state[_st + j], r_state[_st + j + 1] = (
+                                    cute.arch.mul_packed_f32x2(
+                                        (r_decay[j], r_decay[j + 1]),
+                                        (r_state[_st + j], r_state[_st + j + 1]),
+                                    )
+                                )
+                                dot_lo, dot_hi = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_state[_st + j], r_state[_st + j + 1]),
+                                    src_b=(r_k[j], r_k[j + 1]),
+                                    src_c=(dot_lo, dot_hi),
+                                )
+                            dot_hk = dot_lo + dot_hi
+                            for offset in [16, 8, 4, 2, 1]:
+                                if cutlass.const_expr(offset < P2_LANES_K):
+                                    dot_hk += cute.arch.shuffle_sync_bfly(
+                                        dot_hk,
+                                        offset=offset,
+                                        mask=-1,
+                                        mask_and_clamp=31,
+                                    )
+                            delta = (
+                                sReplayV[replay_t * HEAD_DIM + v_base + v_row] - dot_hk
+                            ) * r_beta_val
+                            for jp in range(P2_VEC // 2):
+                                j = jp * 2
+                                r_state[_st + j], r_state[_st + j + 1] = (
+                                    cute.arch.fma_packed_f32x2(
+                                        src_a=(delta, delta),
+                                        src_b=(r_k[j], r_k[j + 1]),
+                                        src_c=(r_state[_st + j], r_state[_st + j + 1]),
+                                    )
+                                )
+                for i_l in range(TILES_PER_PASS):
+                    v_base = (i_p * TILES_PER_PASS + i_l) * TILE_V
+                    for b in range(P2_BATCHES):
+                        _st = (i_l * P2_BATCHES + b) * P2_VEC
+                        v_row = warp_idx * NUM_V_ROWS + b * P2_ROWS_LANE + row_grp
+                        for j in range(P2_VEC):
+                            h0[slot, i_hv, v_base + v_row, j * P2_LANES_K + k_grp] = (
+                                r_state[_st + j]
+                            )
 
         for i_t in cutlass.range(T_LOOP):
             if cutlass.const_expr(STREAM_STATE):
@@ -783,6 +895,13 @@ def kda_decode_mtp_kernel(
                         raw_o * rms * weight * gate
                     )
 
+    if cutlass.const_expr(HAS_REPLAY):
+        # One CTA owns one (slot, head); consume only its counter after every
+        # thread has read it and the committed checkpoint has been written.
+        cute.arch.barrier()
+        if tidx == 0:
+            replay_lens[slot, i_hv] = 0
+
 
 @cute.jit
 def _run_kda_decode_mtp_dspark(
@@ -812,6 +931,11 @@ def _run_kda_decode_mtp_dspark(
     ring_rawk: cute.Tensor,
     ring_g: cute.Tensor,
     ring_beta: cute.Tensor,
+    replay_rawv: cute.Tensor,
+    replay_rawk: cute.Tensor,
+    replay_g: cute.Tensor,
+    replay_beta: cute.Tensor,
+    replay_lens: cute.Tensor,
     onorm_g: cute.Tensor,
     onorm_weight: cute.Tensor,
     scale: cutlass.Constexpr[float],
@@ -821,6 +945,8 @@ def _run_kda_decode_mtp_dspark(
     BLOCK_THREADS: cutlass.Constexpr[int],
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
+    HAS_REPLAY: cutlass.Constexpr[bool],
+    REPLAY_LEN: cutlass.Constexpr[int],
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
     stream: cuda.CUstream,
@@ -832,6 +958,9 @@ def _run_kda_decode_mtp_dspark(
     qk_stride, qk_elems = _qk_smem(block_threads=BLOCK_THREADS, num_spec=NUM_SPEC)
     smem_qk_layout = cute.make_layout(
         (1 + NUM_SPEC, p2_lanes, p2_vec // 4, 4), stride=qk_stride
+    )
+    smem_replay_layout = cute.make_layout(
+        (REPLAY_LEN, p2_lanes, p2_vec // 4, 4), stride=qk_stride
     )
     # Padding by the subgroup width shifts concurrent v-rows onto disjoint bank
     # groups: +8 tiles four eight-bank windows; +16 tiles two half-warps.
@@ -866,6 +995,11 @@ def _run_kda_decode_mtp_dspark(
     smem_bytes = (
         # sQ, sK, sG, sBeta, and sVall.
         (3 * t_loop * qk_elems + t_loop + t_loop * TILE_K) * 4
+        + (
+            (2 * REPLAY_LEN * qk_elems + REPLAY_LEN + REPLAY_LEN * TILE_K) * 4
+            if HAS_REPLAY
+            else 0
+        )
         # State stages and the raw output tile for normalization.
         + state_smem_elems * 4
         + (t_loop * TILE_K * 4 if cutlass.const_expr(APPLY_ONORM) else 0)
@@ -898,10 +1032,16 @@ def _run_kda_decode_mtp_dspark(
         ring_rawk,
         ring_g,
         ring_beta,
+        replay_rawv,
+        replay_rawk,
+        replay_g,
+        replay_beta,
+        replay_lens,
         onorm_g,
         onorm_weight,
         smem_qk_layout,
         smem_state_layout,
+        smem_replay_layout,
         ssm_state_indices,
         cu_seqlens,
         scale,
@@ -910,6 +1050,8 @@ def _run_kda_decode_mtp_dspark(
         p2_lanes,
         lower_bound,
         CACHE_RING,
+        HAS_REPLAY,
+        REPLAY_LEN,
         APPLY_ONORM,
         onorm_eps,
     ).launch(
@@ -1019,6 +1161,11 @@ def fused_kda_decode_mtp_dspark(
     replayssm_rawk=None,
     replayssm_g=None,
     replayssm_beta=None,
+    replay_rawv=None,
+    replay_rawk=None,
+    replay_g=None,
+    replay_beta=None,
+    replay_lens=None,
     onorm_gate=None,
     onorm_weight=None,
     onorm_eps=None,
@@ -1074,6 +1221,39 @@ def fused_kda_decode_mtp_dspark(
             "cp.async recurrent state requires fp32 contiguous [H, V, K] "
             "inner layout and 16-byte-aligned slot offsets"
         )
+    previous = (replay_rawv, replay_rawk, replay_g, replay_beta, replay_lens)
+    has_replay = all(tensor is not None for tensor in previous)
+    if any(tensor is not None for tensor in previous) and not has_replay:
+        raise ValueError(
+            "Deferred replay requires all four inputs and per-head lengths"
+        )
+    if has_replay:
+        slots = recurrent_state.shape[0]
+        replay_len = replay_rawv.shape[2]
+        if (
+            replay_rawv.shape != (slots, H, replay_len, TILE_K)
+            or replay_rawk.shape != replay_rawv.shape
+            or replay_g.shape != replay_rawv.shape
+            or replay_beta.shape != (slots, H, replay_len)
+            or replay_lens.shape != (slots, H)
+            or replay_rawv.dtype != torch.bfloat16
+            or replay_rawk.dtype != torch.bfloat16
+            or replay_g.dtype != torch.float32
+            or replay_beta.dtype != torch.float32
+            or replay_lens.dtype != torch.int32
+            or any(t.device != x_q.device for t in previous)
+        ):
+            raise ValueError("Invalid deferred KDA replay buffer layout/dtype/device")
+        # Phase 1 writes current inputs before phase 2 reads previous inputs.
+        current_rings = (replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta)
+        previous_storage = {t.untyped_storage().data_ptr() for t in previous[:4]}
+        if any(
+            t is not None and t.untyped_storage().data_ptr() in previous_storage
+            for t in current_rings
+        ):
+            raise ValueError(
+                "Deferred replay inputs must not alias current ring storage"
+            )
     rings = (replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_beta)
     cache_ring = all(ring is not None for ring in rings)
     if any(ring is not None for ring in rings) and not cache_ring:
@@ -1157,6 +1337,11 @@ def fused_kda_decode_mtp_dspark(
         replayssm_rawk if cache_ring else intermediate_conv_q,
         replayssm_g if cache_ring else intermediate_conv_q,
         replayssm_beta if cache_ring else intermediate_conv_q[..., 0],
+        replay_rawv if has_replay else intermediate_conv_q,
+        replay_rawk if has_replay else intermediate_conv_q,
+        replay_g if has_replay else intermediate_conv_q,
+        replay_beta if has_replay else intermediate_conv_q[..., 0],
+        replay_lens if has_replay else recurrent_state[:, :, 0, 0],
         onorm_gate if apply_onorm else x_v,
         onorm_weight if apply_onorm else dt_bias,
     )
@@ -1168,6 +1353,7 @@ def fused_kda_decode_mtp_dspark(
         num_spec,
         block_threads,
         cache_ring,
+        has_replay,
         apply_onorm,
         float(onorm_eps) if apply_onorm else 0.0,
         float(scale),
@@ -1191,6 +1377,8 @@ def fused_kda_decode_mtp_dspark(
             BLOCK_THREADS=block_threads,
             lower_bound=float(lower_bound),
             CACHE_RING=cache_ring,
+            HAS_REPLAY=has_replay,
+            REPLAY_LEN=replay_rawv.shape[2] if has_replay else 1,
             APPLY_ONORM=apply_onorm,
             onorm_eps=float(onorm_eps) if apply_onorm else 0.0,
             stream=stream,

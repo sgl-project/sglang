@@ -1132,6 +1132,16 @@ class UnifiedRadixCache(BasePrefixCache):
         self.session.take(req)
 
     def claim_kv_row(self, req: Req) -> bool:
+        pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if (
+            getattr(pool, "kda_pending_replay", None) is not None
+            and req.kv.mamba_pool_idx is not None
+        ):
+            pool.flush_kda_pending(
+                self.req_to_token_pool.translate_mamba_indices(
+                    req.kv.mamba_pool_idx.reshape(-1)
+                )
+            )
         # Retraction also enters here: retain its ticket until actual finish.
         if (
             self.cache_controller is not None

@@ -1053,7 +1053,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo in _BLOCK_FP8_ALGOS:
-                return Fp8LinearMethod(self.fp8_block_config)
+                method = Fp8LinearMethod(self.fp8_block_config)
+                method.k3_dense_shape_dispatch = (
+                    envs.SGLANG_K3_FP8_DENSE_SHAPE_DISPATCH.get()
+                    and ".self_attn." in prefix
+                )
+                return method
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":

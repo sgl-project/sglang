@@ -502,6 +502,12 @@ class ReqToTokenPool:
 
 
 class MambaPool:
+    kda_pending_replay = None
+
+    def flush_kda_pending(self, indices=None):
+        if self.kda_pending_replay is not None:
+            self.kda_pending_replay.flush(indices=indices)
+
     host_capacity_tokens: Optional[int] = None
 
     # Axis of each two-dimensional conv state that represents the sliding window.
@@ -1145,6 +1151,8 @@ class MambaPool:
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        if self.kda_pending_replay is not None:
+            self.kda_pending_replay.reset_slots(indices)
         for sibling in self._slot_siblings:
             sibling.reset_slots(indices)
         idx64 = indices.to(torch.int64)
@@ -1170,6 +1178,9 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
+        self.flush_kda_pending(src_indices)
+        if self.kda_pending_replay is not None:
+            self.kda_pending_replay.reset_slots(dst_indices)
         if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
@@ -1205,6 +1216,7 @@ class MambaPool:
             sibling.copy_slots(src_indices, dst_indices)
 
     def get_cpu_copy(self, indices):
+        self.flush_kda_pending(indices)
         current_platform.synchronize()
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
@@ -1220,6 +1232,8 @@ class MambaPool:
         return conv_cpu, temporal_cpu
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
+        if self.kda_pending_replay is not None:
+            self.kda_pending_replay.reset_slots(indices)
         # The trailing element exists exactly when this instance registered siblings:
         # the pool that saved the copy is the pool that loads it.
         siblings_cpu = None
@@ -1348,7 +1362,10 @@ class MambaPool:
         return subdims_per_tensor
 
     def get_kv_size_bytes(self):
-        return self.mamba_cache.mem_usage_bytes()
+        pending = self.kda_pending_replay
+        return self.mamba_cache.mem_usage_bytes() + (
+            pending.mem_usage_bytes() if pending is not None else 0
+        )
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -1597,6 +1614,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 assert mid is not None, (
                     f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
                 )
+                if self.mamba_pool.kda_pending_replay is not None:
+                    self.mamba_pool.kda_pending_replay.reset_slots(
+                        self.translate_mamba_indices(mid)
+                    )
                 req.kv.mamba_pool_idx = mid[0]
                 req.kv.mamba_needs_clear = True
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty

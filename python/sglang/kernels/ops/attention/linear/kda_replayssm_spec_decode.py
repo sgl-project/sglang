@@ -71,6 +71,9 @@ def kda_replayssm_exact_fold_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
+    ACCEPT_LAYER_STRIDE: tl.constexpr = 0,
+    ACCEPT_HEAD_STRIDE: tl.constexpr = 0,
+    ACCEPT_BY_SLOT: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -92,7 +95,13 @@ def kda_replayssm_exact_fold_kernel(
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
     if state_idx <= NULL_BLOCK_ID:
         return
-    n_commit = tl.load(accept_lens + i_n * stride_accept).to(tl.int32)
+    accept_row = state_idx if ACCEPT_BY_SLOT else i_n
+    n_commit = tl.load(
+        accept_lens
+        + i_layer * ACCEPT_LAYER_STRIDE
+        + accept_row * stride_accept
+        + i_hv * ACCEPT_HEAD_STRIDE
+    ).to(tl.int32)
     if n_commit <= 0:
         return
 
@@ -343,6 +352,7 @@ def commit_kda_replayssm_after_verify(
     mamba_steps_to_track: torch.Tensor | None = None,
     src_indices_raw: torch.Tensor | None = None,
     null_block_id: int = -1,
+    pending_replay=None,
 ) -> None:
     """Fold each layer's accepted window into `temporal` and roll back conv.
 
@@ -358,20 +368,40 @@ def commit_kda_replayssm_after_verify(
 
     L = spec_state.replayssm_rawv.shape[-2]
     num_k_heads = spec_state.replayssm_rawk.shape[2]
-    commit_kda_replayssm_spec_all_layers(
-        checkpoint_state=spec_state.temporal,
-        rawv_cache=spec_state.replayssm_rawv,
-        rawk_cache=spec_state.replayssm_rawk,
-        gk_cache=spec_state.replayssm_g,
-        beta_cache=spec_state.replayssm_beta,
-        ssm_state_indices=state_batch_indices,
-        accept_lens=accept_lens,
-        max_cache_len=L,
-        num_k_heads=num_k_heads,
-        mamba_track_indices=mamba_track_indices,
-        mamba_steps_to_track=mamba_steps_to_track,
-        null_block_id=null_block_id,
-    )
+    fold_accept = accept_lens
+    if pending_replay is not None:
+        # Interval snapshots still materialize immediately; other accepted rows
+        # are consumed by the next fused verify. Conv rollback is unchanged.
+        if mamba_track_indices is not None and mamba_steps_to_track is not None:
+            track = (mamba_steps_to_track >= 0) & (mamba_track_indices >= 0)
+            deferred_accept = torch.where(track, 0, accept_lens)
+            fold_accept = torch.where(track, accept_lens, 0)
+        else:
+            deferred_accept = accept_lens
+            fold_accept = None
+        pending_replay.stage(
+            spec_state.replayssm_rawv,
+            spec_state.replayssm_rawk,
+            spec_state.replayssm_g,
+            spec_state.replayssm_beta,
+            state_batch_indices,
+            deferred_accept,
+        )
+    if fold_accept is not None:
+        commit_kda_replayssm_spec_all_layers(
+            checkpoint_state=spec_state.temporal,
+            rawv_cache=spec_state.replayssm_rawv,
+            rawk_cache=spec_state.replayssm_rawk,
+            gk_cache=spec_state.replayssm_g,
+            beta_cache=spec_state.replayssm_beta,
+            ssm_state_indices=state_batch_indices,
+            accept_lens=fold_accept,
+            max_cache_len=L,
+            num_k_heads=num_k_heads,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=null_block_id,
+        )
     # Conv rollback + track-slot conv snapshot, per conv group (fold already did
     # the ssm side via HAS_TRACK). Loop mirrors the recurrent commit's zip; track
     # scatter is mask-gated (step -1 => skip).

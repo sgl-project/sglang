@@ -507,6 +507,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: Union[Fp8Config, W4AFp8Config]):
         self.quant_config = quant_config
+        self.k3_dense_shape_dispatch = False
         self.cutlass_fp8_supported = cutlass_fp8_supported()
 
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
@@ -1129,6 +1130,12 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
+            if self.k3_dense_shape_dispatch:
+                from sglang.srt.layers.quantization.kimi_fp8_dense import (
+                    prepare_weights,
+                )
+
+                layer._k3_dense_ready = prepare_weights(layer, self.weight_block_size)
             if layer.deepgemm_mxfp8_input:
                 layer.deepgemm_mxfp8_input = self.prepare_deepgemm_mxfp8_input(layer)
         else:
@@ -1297,6 +1304,12 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.k3_dense_shape_dispatch and getattr(layer, "_k3_dense_ready", False):
+            from sglang.srt.layers.quantization.kimi_fp8_dense import try_apply
+
+            output = try_apply(layer, x, bias)
+            if output is not None:
+                return output
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
