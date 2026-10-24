@@ -37,6 +37,12 @@ class TestMLADraftExtendPacking(unittest.TestCase):
                 metadata = SimpleNamespace(
                     batch_size=len(lengths),
                     max_seq_len_k=16,
+                    max_seq_len_q=max(lengths),
+                    sum_seq_lens_q=sum(lengths),
+                    seq_lens_q=torch.tensor(lengths, dtype=torch.int32),
+                    cu_seqlens_q=torch.tensor([0] + lengths, dtype=torch.int32).cumsum(
+                        0, dtype=torch.int32
+                    ),
                     block_kv_indices=None,
                     seq_lens_k=None,
                 )
@@ -55,8 +61,6 @@ class TestMLADraftExtendPacking(unittest.TestCase):
                 batch = SimpleNamespace(
                     forward_mode=ForwardMode.DRAFT_EXTEND_V2,
                     batch_size=len(lengths),
-                    extend_seq_lens=torch.tensor(lengths, dtype=torch.int32),
-                    extend_seq_lens_cpu=lengths,
                 )
                 layer = SimpleNamespace(
                     tp_q_head_num=1, head_dim=1, v_head_dim=1, layer_id=0
