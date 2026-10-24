@@ -260,12 +260,14 @@ def gather_height_sizes(
     if world_size <= 1:
         return [x.shape[-2]]
     parallel_group = parallel_group or get_decode_parallel_group_coordinator()
-    local_height = torch.tensor([x.shape[-2]], device=x.device, dtype=torch.int64)
+    # heights are host metadata: a device gather would make the host wait for
+    # every kernel queued before it, idling the GPU while it relaunches
+    local_height = torch.tensor([x.shape[-2]], dtype=torch.int64)
     gathered = [torch.empty_like(local_height) for _ in range(world_size)]
     dist.all_gather(
         gathered,
         local_height,
-        group=parallel_group.device_group,
+        group=parallel_group.cpu_group,
     )
     return [int(height.item()) for height in gathered]
 
