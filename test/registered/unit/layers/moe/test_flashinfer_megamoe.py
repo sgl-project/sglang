@@ -121,6 +121,7 @@ def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
         topk_weights: torch.Tensor
         fc1_alpha: torch.Tensor
         scales: torch.Tensor | None = None
+        output: torch.Tensor | None = None
 
         @property
         def num_tokens(self):
@@ -249,6 +250,8 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
 
         def warmup(self, inputs, workspace=None):
             if self.auto:
+                # FlashInfer's output-view backends reject a sweep without one.
+                assert inputs.output.shape == inputs.hidden_states.shape
                 events.append("tune")
                 Path(os.environ["FLASHINFER_MOE_EP_KNOB_CACHE"]).write_text(
                     json.dumps(payload)

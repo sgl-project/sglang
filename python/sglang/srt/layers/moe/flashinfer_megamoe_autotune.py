@@ -245,7 +245,14 @@ class MegaMoeTunedForward:
         )
         payload = None
         try:
-            temporary.warmup(tensors)
+            # The knobs="auto" sweep needs a caller-owned output buffer; without
+            # one, output-view backends run compute(output=None) and reject it.
+            output = torch.empty(
+                (tensors.num_tokens, self.fleet_params.token_hidden_size),
+                dtype=torch.bfloat16,
+                device=tensors.hidden_states.device,
+            )
+            temporary.warmup(replace(tensors, output=output))
             if self.bootstrap.rank == 0:
                 try:
                     payload = json.loads(native_path.read_text())
