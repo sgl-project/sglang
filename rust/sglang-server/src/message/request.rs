@@ -427,6 +427,7 @@ pub fn into_requests(
                 rid,
                 text,
                 input_ids,
+                append_text: None,
                 // Plain text prompts keep the post-processor specials; the
                 // chat flow sets this explicitly.
                 skip_special_tokens: false,
@@ -567,6 +568,8 @@ pub struct GenerateRequest {
     /// detok sink, which is now unrepresentable.
     pub rid: Rid,
     pub text: Option<String>,
+    /// Assistant continuation encoded separately, then appended without a leading BOS.
+    pub append_text: Option<String>,
     /// Client-supplied token ids, or filled by the Tokenizer stage.
     pub input_ids: Option<TokenIds>,
     /// Template-rendered prompts (chat) already contain their role/special

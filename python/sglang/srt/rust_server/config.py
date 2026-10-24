@@ -184,6 +184,10 @@ def _build_server_args(
         tokenizer_model_max_length=_tokenizer_model_max_length(
             scheduler.tokenizer, mc.context_len
         ),
+        # Class defaults and post-load fixes are already resolved by Python.
+        # Keep a known absence of BOS distinct from standalone Rust fallback.
+        tokenizer_bos_token_id_resolved=scheduler.tokenizer is not None,
+        tokenizer_bos_token_id=getattr(scheduler.tokenizer, "bos_token_id", None),
         # Launch-time facts Python's /server_info reports from
         # scheduler_info / the package — stamped here so the rust endpoint
         # can serve them statically (no scheduler round-trip).

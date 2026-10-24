@@ -192,6 +192,10 @@ pub struct ServerArgs {
     /// `model_max_length` (`-1` when it has none), or the context length when
     /// that is not a 64-bit integer.
     pub tokenizer_model_max_length: i64,
+    /// Whether Python supplied the actual tokenizer's BOS result. A known
+    /// `None` disables BOS removal; false retains standalone metadata lookup.
+    pub tokenizer_bos_token_id_resolved: bool,
+    pub tokenizer_bos_token_id: Option<i64>,
     /// Launch-time stamps (not `server_args` fields): sglang package version
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
@@ -256,6 +260,8 @@ impl ServerArgs {
         enable_return_hidden_states,
         num_reserved_tokens,
         tokenizer_model_max_length,
+        tokenizer_bos_token_id_resolved,
+        tokenizer_bos_token_id,
         version,
         max_total_num_tokens,
         deployment_info,
@@ -308,6 +314,8 @@ impl ServerArgs {
         enable_return_hidden_states: bool,
         num_reserved_tokens: u64,
         tokenizer_model_max_length: i64,
+        tokenizer_bos_token_id_resolved: bool,
+        tokenizer_bos_token_id: Option<i64>,
         version: String,
         max_total_num_tokens: u64,
         deployment_info: DeploymentInfo,
@@ -358,6 +366,8 @@ impl ServerArgs {
             enable_return_hidden_states,
             num_reserved_tokens,
             tokenizer_model_max_length,
+            tokenizer_bos_token_id_resolved,
+            tokenizer_bos_token_id,
             version,
             max_total_num_tokens,
             deployment_info,
@@ -416,6 +426,8 @@ impl Default for ServerArgs {
             enable_return_hidden_states: false,
             num_reserved_tokens: 0,
             tokenizer_model_max_length: -1,
+            tokenizer_bos_token_id_resolved: false,
+            tokenizer_bos_token_id: None,
             version: String::new(),
             max_total_num_tokens: 0,
             deployment_info: DeploymentInfo::default(),

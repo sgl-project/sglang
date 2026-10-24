@@ -9,7 +9,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
+use dynamo_protocols::types::{
+    ChatCompletionRequestMessage, ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
+};
 use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter, TextInput};
 use thiserror::Error;
 
@@ -24,6 +26,18 @@ pub(super) use super::template_legacy::LegacySpec;
 use super::template_loader::infer_legacy_template_from_model_path;
 pub(super) use super::template_loader::load_chat_formatter;
 
+#[path = "template_content.rs"]
+mod template_content;
+pub(super) use template_content::requires_content_arrays;
+
+#[path = "template_tools.rs"]
+mod template_tools;
+pub(super) use template_tools::{normalize_prompt_tools, python_bool};
+
+#[path = "template_reasoning.rs"]
+mod template_reasoning;
+pub(super) use template_reasoning::prepare_reasoning;
+
 /// Extra variables for the chat template (`chat_template_kwargs`).
 pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 
@@ -32,7 +46,8 @@ pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
 /// conversation template.
 #[derive(Clone)]
 pub enum ChatFormatter {
-    HuggingFace(PromptFormatter),
+    HuggingFace(PromptFormatter, bool),
+    Native(PromptFormatter),
     Legacy(Box<LegacyFormatter>),
 }
 
@@ -43,9 +58,160 @@ impl ChatFormatter {
         request: &CreateChatCompletionRequest,
         kwargs: Option<&ChatTemplateKwargs>,
     ) -> Result<String, TemplateError> {
+        if matches!(self, ChatFormatter::HuggingFace(..))
+            && kwargs.is_some_and(|extra| extra.contains_key("_sglang_prompt_messages"))
+        {
+            let mut extra = kwargs.cloned().unwrap_or_default();
+            extra.remove("_sglang_prompt_messages");
+            return self.render_context(request, Some(&extra), None, None);
+        }
+        self.render_context(request, kwargs, None, None)
+    }
+
+    pub(super) fn render_chat(
+        &self,
+        request: &CreateChatCompletionRequest,
+        kwargs: Option<&ChatTemplateKwargs>,
+        prompt_tools: Option<&serde_json::Value>,
+        continue_final_message: bool,
+    ) -> Result<(String, Option<String>), TemplateError> {
+        let selected = prompt_tools
+            .and_then(|value| value.as_array())
+            .map(|tools| {
+                serde_json::Value::Array(
+                    tools
+                        .iter()
+                        .filter(|tool| match &request.tool_choice {
+                            Some(ChatCompletionToolChoiceOption::Named(choice)) => {
+                                tool["function"]["name"].as_str()
+                                    == Some(choice.function.name.as_str())
+                            }
+                            _ => true,
+                        })
+                        .cloned()
+                        .collect(),
+                )
+            });
+        let mut append_text = None;
+        let mut extra = kwargs.cloned().unwrap_or_default();
+        let mut messages = None;
+        if let ChatFormatter::HuggingFace(_, arrays) = self {
+            if let Some(effort) = &request.reasoning_effort {
+                extra
+                    .entry("reasoning_effort".into())
+                    .or_insert_with(|| serde_json::json!(effort));
+            }
+            {
+                let mut value =
+                    serde_json::to_value(&request.messages).expect("messages serialize");
+                for message in value.as_array_mut().expect("messages are an array") {
+                    if let Some(calls) = message
+                        .get_mut("tool_calls")
+                        .and_then(serde_json::Value::as_array_mut)
+                    {
+                        for call in calls {
+                            let arguments = &mut call["function"]["arguments"];
+                            let parsed: serde_json::Value = serde_json::from_str(
+                                arguments.as_str().unwrap_or(""),
+                            )
+                            .map_err(|error| TemplateError::Renderer {
+                                message: format!(
+                                    "assistant tool arguments must be a JSON object: {error}"
+                                ),
+                            })?;
+                            if !parsed.is_object() {
+                                return Err(TemplateError::Renderer {
+                                    message: "assistant tool arguments must be a JSON object"
+                                        .into(),
+                                });
+                            }
+                            *arguments = parsed;
+                        }
+                    }
+                    if message
+                        .get("content")
+                        .is_none_or(serde_json::Value::is_null)
+                    {
+                        message["content"] = serde_json::Value::String(String::new());
+                    }
+                    if (!*arrays || message["role"] == "tool")
+                        && let Some(parts) =
+                            message.get("content").and_then(serde_json::Value::as_array)
+                        && parts.iter().all(|part| part["type"] == "text")
+                    {
+                        let text = parts
+                            .iter()
+                            .filter_map(|part| part["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        message["content"] = serde_json::Value::String(text);
+                    }
+                }
+                if let Some(last) = value
+                    .as_array_mut()
+                    .and_then(|messages| messages.last_mut())
+                    && last["role"] == "assistant"
+                    && let Some(text) = last["content"].as_str()
+                {
+                    if continue_final_message {
+                        append_text = Some(text.to_owned());
+                        value.as_array_mut().unwrap().pop();
+                    } else {
+                        *last = serde_json::json!({"role":"user", "content":text});
+                    }
+                }
+                if value.as_array().is_some_and(Vec::is_empty) {
+                    return Err(TemplateError::Renderer {
+                        message: "messages cannot be empty after continuation".into(),
+                    });
+                }
+                extra.insert("_sglang_prompt_messages".into(), value.clone());
+                messages = Some(minijinja::Value::from_serialize(value));
+            }
+        }
+        let kwargs = if matches!(self, ChatFormatter::HuggingFace(..)) {
+            Some(&extra)
+        } else {
+            kwargs
+        };
+        self.render_context(request, kwargs, messages.as_ref(), selected.as_ref())
+            .or_else(|error| {
+                // Python retries generic Jinja with function-only tools when
+                // a template rejects the OpenAI tool wrapper (e.g. Mistral).
+                if let ChatFormatter::HuggingFace(..) = self
+                    && let Some(tools) = selected.as_ref().and_then(serde_json::Value::as_array)
+                    && !tools.is_empty()
+                {
+                    let flat = serde_json::Value::Array(
+                        tools
+                            .iter()
+                            .map(|tool| tool.get("function").unwrap_or(tool).clone())
+                            .collect(),
+                    );
+                    self.render_context(request, kwargs, messages.as_ref(), Some(&flat))
+                } else {
+                    Err(error)
+                }
+            })
+            .map(|prompt| (prompt, append_text))
+    }
+
+    fn render_context(
+        &self,
+        request: &CreateChatCompletionRequest,
+        kwargs: Option<&ChatTemplateKwargs>,
+        messages: Option<&minijinja::Value>,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace(PromptFormatter::OAI(formatter)) => formatter
-                .render(&TemplateRequest { request, kwargs })
+            ChatFormatter::HuggingFace(PromptFormatter::OAI(formatter), _)
+            | ChatFormatter::Native(PromptFormatter::OAI(formatter)) => formatter
+                .render(&TemplateRequest {
+                    request,
+                    kwargs,
+                    messages,
+                    tools,
+                })
                 .map_err(|error| TemplateError::Renderer {
                     message: error.to_string(),
                 }),
@@ -59,7 +225,7 @@ impl ChatFormatter {
     /// Python's jinja path, which keeps only the request's own stops.
     pub(super) fn stop_strs(&self) -> Option<OneOrMany<String>> {
         match self {
-            ChatFormatter::HuggingFace(_) => None,
+            ChatFormatter::HuggingFace(..) | ChatFormatter::Native(_) => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -70,6 +236,8 @@ impl ChatFormatter {
 struct TemplateRequest<'a> {
     request: &'a CreateChatCompletionRequest,
     kwargs: Option<&'a ChatTemplateKwargs>,
+    messages: Option<&'a minijinja::Value>,
+    tools: Option<&'a serde_json::Value>,
 }
 
 impl OAIChatLikeRequest for TemplateRequest<'_> {
@@ -77,13 +245,25 @@ impl OAIChatLikeRequest for TemplateRequest<'_> {
         self.request.model()
     }
     fn messages(&self) -> minijinja::Value {
-        self.request.messages()
+        self.messages
+            .cloned()
+            .unwrap_or_else(|| self.request.messages())
     }
     fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
-        self.request.typed_messages()
+        if self.messages.is_some() {
+            None
+        } else {
+            self.request.typed_messages()
+        }
     }
     fn tools(&self) -> Option<minijinja::Value> {
-        self.request.tools()
+        match self.tools {
+            Some(tools) => tools
+                .as_array()
+                .filter(|tools| !tools.is_empty())
+                .map(minijinja::Value::from_serialize),
+            None => self.request.tools(),
+        }
     }
     fn tool_choice(&self) -> Option<minijinja::Value> {
         self.request.tool_choice()
@@ -734,6 +914,30 @@ mod tests {
     }
 
     #[test]
+    fn malformed_hf_config_does_not_fall_back_to_native_formatter() {
+        for contents in [
+            "[]",
+            "null",
+            r#"{"chat_template":7}"#,
+            r#"{"chat_template":{}}"#,
+            r#"{"chat_template":[]}"#,
+        ] {
+            let config = temp_config(contents);
+            let result = load_chat_formatter(
+                Some(config.to_str().unwrap()),
+                None,
+                Some("deepseek_v4"),
+                None,
+            );
+            assert!(
+                result.is_err(),
+                "malformed config silently selected native: {contents}"
+            );
+            std::fs::remove_dir_all(config.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
     fn missing_template_falls_back_to_native_formatter() {
         let config = temp_config("{}");
         let config = config.to_str().unwrap();
@@ -742,7 +946,7 @@ mod tests {
         };
 
         let formatter = load(Some(config), Some("deepseek_v4"), None).unwrap();
-        assert!(matches!(formatter, ChatFormatter::HuggingFace(_)));
+        assert!(matches!(formatter, ChatFormatter::Native(_)));
         let kwargs = HashMap::from([("thinking".into(), serde_json::json!(false))]);
         assert_eq!(
             formatter.render(&request(), Some(&kwargs)).unwrap(),
@@ -750,7 +954,7 @@ mod tests {
         );
         assert!(matches!(
             load(None, Some("deepseek_v4"), None),
-            Ok(ChatFormatter::HuggingFace(_))
+            Ok(ChatFormatter::Native(_))
         ));
 
         // A template, `--chat-template`, or an unknown architecture wins.

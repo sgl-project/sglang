@@ -76,7 +76,7 @@ pub(super) fn load_chat_formatter(
             &model_type.map(str::to_lowercase),
             &model_path.unwrap_or_default().to_lowercase(),
         )
-        .map(ChatFormatter::HuggingFace),
+        .map(ChatFormatter::Native),
         Some(_) => None,
     };
 
@@ -268,11 +268,40 @@ fn set_chat_template(config: &mut Value, chat_template: Value) -> Result<(), Tem
 }
 
 fn formatter_from_config(config: &Value) -> Result<ChatFormatter, TemplateError> {
-    let template: ChatTemplate = serde_json::from_value(config.clone())
-        .map_err(|source| TemplateError::Config { source })?;
-    if template.chat_template.is_none() {
-        return Err(TemplateError::Missing);
+    let object = config.as_object().ok_or(TemplateError::ConfigNotObject)?;
+    let source = object
+        .get("chat_template")
+        .filter(|source| !source.is_null())
+        .ok_or(TemplateError::Missing)?;
+    // Python TemplateManager selects one named source at startup. HF stores
+    // named templates as {name, template} entries; also retain the renderer's
+    // older [{name: source}] input format. Insertion order is significant.
+    let source = match source {
+        Value::Object(templates) => templates.values().next(),
+        Value::Array(templates) => templates.first().and_then(|entry| {
+            entry
+                .get("template")
+                .or_else(|| entry.as_object()?.values().next())
+        }),
+        source => Some(source),
     }
+    .unwrap_or(source);
+    let source: String = serde_json::from_value(source.clone())
+        .map_err(|source| TemplateError::Config { source })?;
+    let arrays = super::template::requires_content_arrays(&source);
+    // Renderer 7.1.1 rewrites message content before rendering. Bind the
+    // prepared view inside Jinja through its public interface. trim_blocks
+    // consumes only the injected newline, preserving initial source whitespace.
+    // Plain render()/tokenize calls do not provide the private variable.
+    let mut config = config.clone();
+    set_chat_template(
+        &mut config,
+        Value::String(format!(
+            "{{% set messages = _sglang_prompt_messages | default(messages) %}}\n{source}"
+        )),
+    )?;
+    let template: ChatTemplate =
+        serde_json::from_value(config).map_err(|source| TemplateError::Config { source })?;
     let formatter = PromptFormatter::from_parts(
         template,
         ContextMixins::new(&[PromptContextMixin::OaiChat]),
@@ -281,7 +310,7 @@ fn formatter_from_config(config: &Value) -> Result<ChatFormatter, TemplateError>
     .map_err(|error| TemplateError::Renderer {
         message: error.to_string(),
     })?;
-    Ok(ChatFormatter::HuggingFace(formatter))
+    Ok(ChatFormatter::HuggingFace(formatter, arrays))
 }
 
 /// Port of Python `_load_json_chat_template`: fields mirror `Conversation`

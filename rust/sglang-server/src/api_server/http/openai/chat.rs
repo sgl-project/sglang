@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
+    extract::{FromRequest, State, rejection::JsonRejection},
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -58,19 +58,116 @@ pub(super) struct ChatRequest {
     routing: PDRoutingFields,
 }
 
+// Keep the original typed HTTP boundary for native/legacy formatters. Only
+// Jinja needs the wire view to preserve Python's prompt-tool serialization.
+enum ChatBody {
+    Typed(Box<ChatRequest>),
+    Jinja(serde_json::Value),
+}
+
+impl FromRequest<Arc<AppState>> for ChatBody {
+    type Rejection = JsonRejection;
+
+    async fn from_request(
+        request: axum::extract::Request,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        if matches!(state.chat_formatter, Some(ChatFormatter::HuggingFace(..))) {
+            Json::<serde_json::Value>::from_request(request, state)
+                .await
+                .map(|Json(raw)| Self::Jinja(raw))
+        } else {
+            Json::<ChatRequest>::from_request(request, state)
+                .await
+                .map(|Json(typed)| Self::Typed(Box::new(typed)))
+        }
+    }
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<ChatRequest>, JsonRejection>,
+    body: Result<ChatBody, JsonRejection>,
 ) -> Response {
+    let (mut raw, typed) = match body {
+        Ok(ChatBody::Jinja(raw)) => (raw, None),
+        Ok(ChatBody::Typed(typed)) => (serde_json::Value::Null, Some(typed)),
+        Err(rejection) => {
+            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
+        }
+    };
+    if typed.is_none() && !raw.is_object() {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "chat request must be an object",
+            false,
+        );
+    }
+    let jinja = matches!(state.chat_formatter, Some(ChatFormatter::HuggingFace(..)));
+    let continue_final_message = if jinja {
+        match raw
+            .get("continue_final_message")
+            .map(super::template::python_bool)
+            .transpose()
+        {
+            Ok(value) => value.unwrap_or(false),
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+        }
+    } else {
+        false
+    };
+    let prompt_tools = if jinja {
+        match super::template::normalize_prompt_tools(
+            raw.get("tools").unwrap_or(&serde_json::Value::Null),
+        ) {
+            Ok(tools) => tools,
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error, false),
+        }
+    } else {
+        None
+    };
+    if let (Some(raw_tools), Some(tools)) = (
+        raw.get_mut("tools")
+            .and_then(serde_json::Value::as_array_mut),
+        prompt_tools.as_ref().and_then(serde_json::Value::as_array),
+    ) {
+        for (raw_tool, tool) in raw_tools.iter_mut().zip(tools) {
+            raw_tool["type"] = serde_json::json!("function");
+            if raw_tool["function"].get("strict").is_some() {
+                raw_tool["function"]["strict"] = tool["function"]["strict"].clone();
+            }
+        }
+    }
+    if jinja {
+        if let Err(error) = super::template::prepare_reasoning(&mut raw) {
+            return openai_error(StatusCode::BAD_REQUEST, error, false);
+        }
+        let extra: ChatTemplateKwargs = match serde_json::from_value::<Option<ChatTemplateKwargs>>(
+            raw.get("chat_template_kwargs").cloned().unwrap_or_default(),
+        ) {
+            Ok(extra) => extra.unwrap_or_default(),
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+        };
+        if ["messages", "tools", "add_generation_prompt"]
+            .iter()
+            .any(|key| extra.contains_key(*key))
+        {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "chat_template_kwargs duplicates a template argument",
+                false,
+            );
+        }
+    }
     let ChatRequest {
         request,
         chat_template_kwargs,
         routing,
-    } = match body {
-        Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
-        }
+    } = match typed {
+        Some(request) => *request,
+        None => match serde_json::from_value(raw) {
+            Ok(request) => request,
+            Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
+        },
     };
     if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
@@ -145,11 +242,18 @@ async fn chat_completions(
     let tools = (!tools.is_empty()).then_some(tools);
     let tools_slice = tools.as_deref().unwrap_or_default();
 
-    let (request, prompt) =
-        match prepare_chat_request(&state, request, chat_template_kwargs.as_ref()).await {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
-        };
+    let (request, prompt, append_text) = match prepare_chat_request(
+        &state,
+        request,
+        chat_template_kwargs.as_ref(),
+        prompt_tools.as_ref(),
+        continue_final_message,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
 
     let sampling = match chat_sampling(
         &request,
@@ -206,6 +310,7 @@ async fn chat_completions(
         let native = GenerateRequest {
             rid: rid.clone(),
             text: Some(choice_prompt),
+            append_text: append_text.clone().filter(|prefix| !prefix.is_empty()),
             // Rendered templates own their special tokens — the pool must not
             // add another BOS/EOS (Python's `add_special_tokens=False`).
             skip_special_tokens: true,
@@ -274,7 +379,9 @@ pub(super) async fn prepare_chat_request(
     state: &AppState,
     mut request: CreateChatCompletionRequest,
     kwargs: Option<&ChatTemplateKwargs>,
-) -> Result<(CreateChatCompletionRequest, String), Response> {
+    prompt_tools: Option<&serde_json::Value>,
+    continue_final_message: bool,
+) -> Result<(CreateChatCompletionRequest, String, Option<String>), Response> {
     let Some(formatter) = state.chat_formatter.clone() else {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
@@ -287,14 +394,16 @@ pub(super) async fn prepare_chat_request(
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request, kwargs).map_err(|error| {
-        openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("chat template render failed: {error}"),
-            false,
-        )
-    })?;
-    Ok((request, prompt))
+    let (prompt, append_text) = formatter
+        .render_chat(&request, kwargs, prompt_tools, continue_final_message)
+        .map_err(|error| {
+            openai_error(
+                StatusCode::BAD_REQUEST,
+                format!("chat template render failed: {error}"),
+                false,
+            )
+        })?;
+    Ok((request, prompt, append_text))
 }
 
 /// Full sampling resolution for an OpenAI request, mirroring the Python
@@ -1256,7 +1365,7 @@ mod tests {
                 core,
                 generation_policy: crate::message::request::GenerationPolicy::from(args.as_ref()),
                 server_args: args,
-                chat_formatter: Some(super::super::ChatFormatter::HuggingFace(formatter)),
+                chat_formatter: Some(super::super::ChatFormatter::Native(formatter)),
             });
             let responder = tokio::spawn(async move {
                 let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
@@ -1325,3 +1434,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "chat/parity_tests.rs"]
+mod parity_tests;

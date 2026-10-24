@@ -198,6 +198,36 @@ def test_tokenizer_model_max_length_matches_python_tokenize(tokenizer, expected)
 
 
 @pytest.mark.parametrize(
+    "tokenizer,resolved,bos_token_id",
+    [
+        (SimpleNamespace(bos_token_id=3), True, 3),
+        (SimpleNamespace(bos_token_id=0), True, 0),
+        (SimpleNamespace(bos_token_id=None), True, None),
+        (None, False, None),
+    ],
+    ids=["class-default", "zero-id", "resolved-no-bos", "skip-tokenizer-init"],
+)
+def test_typed_config_forwards_resolved_tokenizer_bos(
+    tokenizer, resolved, bos_token_id
+):
+    extension = MagicMock()
+    scheduler = _scheduler_for_typed_config()
+    scheduler.tokenizer = tokenizer
+    with (
+        get_context().override_server_args(),
+        get_parallel().override(attn_dp_rank=0, dp_rank=None),
+        patch.object(rust_extensions, "load_rust_extension", return_value=extension),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        rust_config._build_server_args(scheduler)
+
+    kwargs = extension.ServerArgs.call_args.kwargs
+    assert kwargs["tokenizer_bos_token_id_resolved"] is resolved
+    assert kwargs["tokenizer_bos_token_id"] == bos_token_id
+
+
+@pytest.mark.parametrize(
     "nnodes,tp_size,attn_dp_size,ep_join_mode,ranks,expected",
     [
         (2, 4, 4, None, (0, 1, 2, 3), [0, 1, 0, 1]),
