@@ -63,6 +63,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,
     OutputBatch,
 )
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    slice_rollout_trajectory_range,
+)
 from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin import (
     SchedulerPostTrainingMixin,
 )
@@ -1187,6 +1190,9 @@ class Scheduler(
                 metrics=metrics,
                 noise_pred=self._slice_batched_value(
                     output_batch.noise_pred, start, end, total_items
+                ),
+                rollout_trajectory_data=slice_rollout_trajectory_range(
+                    output_batch.rollout_trajectory_data, start, end
                 ),
                 peak_memory_mb=output_batch.peak_memory_mb,
             )
