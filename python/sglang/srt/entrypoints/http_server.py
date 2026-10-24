@@ -91,6 +91,7 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaShowRequest,
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
+from sglang.srt.entrypoints.openai.chat_encoding_adapters import native_text_parser
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
@@ -109,7 +110,6 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
-from sglang.srt.entrypoints.openai.serving_deepseek_recipe import recipe_text_parser
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
@@ -1717,15 +1717,17 @@ async def parse_function_call_request(
     """
     A native API endpoint to parse function calls from a text.
     """
+    chat = request.app.state.openai_serving_chat
     try:
-        recipe_parser = recipe_text_parser(
-            request.app.state.openai_serving_chat.encoding_adapter,
+        text_parser = native_text_parser(
             obj.tool_call_parser,
+            chat_encoding_spec=chat.chat_encoding_spec,
+            adapter=chat.encoding_adapter,
         )
     except ValueError as error:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
-    if recipe_parser is not None:
-        normal_text, calls = recipe_parser.parse_function_call_text(obj.text, obj.tools)
+    if text_parser is not None:
+        normal_text, calls = text_parser.parse_function_call_text(obj.text, obj.tools)
     else:
         # 1) Initialize the parser based on the request body
         parser = FunctionCallParser(
@@ -1755,15 +1757,17 @@ async def separate_reasoning_request(
     """
     A native API endpoint to separate reasoning from a text.
     """
+    chat = request.app.state.openai_serving_chat
     try:
-        recipe_parser = recipe_text_parser(
-            request.app.state.openai_serving_chat.encoding_adapter,
+        text_parser = native_text_parser(
             obj.reasoning_parser,
+            chat_encoding_spec=chat.chat_encoding_spec,
+            adapter=chat.encoding_adapter,
         )
     except ValueError as error:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
-    if recipe_parser is not None:
-        reasoning_text, normal_text = recipe_parser.separate_reasoning_text(obj.text)
+    if text_parser is not None:
+        reasoning_text, normal_text = text_parser.separate_reasoning_text(obj.text)
         blocks = [
             {"type": kind, "text": text}
             for kind, text in (("reasoning", reasoning_text), ("text", normal_text))

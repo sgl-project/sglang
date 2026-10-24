@@ -14,7 +14,6 @@ except ImportError:
     get_model_structural_tag = None
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
-from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
@@ -24,6 +23,8 @@ from sglang.srt.function_call.utils import (
     _find_common_prefix,
     _is_complete_json,
     _partial_json_loads,
+    called_tool_index,
+    tool_indices,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,26 +71,23 @@ class BaseFormatDetector(ABC):
         Returns:
             Dictionary mapping tool names to their indices
         """
-        return {
-            tool.function.name: i for i, tool in enumerate(tools) if tool.function.name
-        }
+        return tool_indices(tools)
 
     def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
-        tool_indices = self._get_tool_indices(tools)
+        indices = self._get_tool_indices(tools)
         if not isinstance(action, list):
             action = [action]
 
         results = []
         for act in action:
             name = act.get("name")
-            if not (name and name in tool_indices):
-                logger.warning(f"Model attempted to call undefined function: {name}")
-                if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                    continue  # Skip unknown tools (default legacy behavior)
+            tool_index = called_tool_index(name, indices)
+            if tool_index is None:
+                continue
 
             results.append(
                 ToolCallItem(
-                    tool_index=tool_indices.get(name, -1),
+                    tool_index=tool_index,
                     name=name,
                     parameters=json.dumps(
                         act.get("parameters") or act.get("arguments", {}),

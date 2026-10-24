@@ -402,13 +402,16 @@ class TestHandlerRequestSemantics(CustomTestCase):
         )
 
     def test_native_endpoints_parse_through_recipe(self):
-        from sglang.srt.entrypoints.openai.protocol import Tool
-        from sglang.srt.entrypoints.openai.serving_deepseek_recipe import (
-            recipe_text_parser,
+        from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+            native_text_parser,
         )
+        from sglang.srt.entrypoints.openai.protocol import Tool
 
-        adapter = recipe_text_parser(
-            _serving(self, self.tokenizer).encoding_adapter, "deepseek-v41"
+        chat = _serving(self, self.tokenizer)
+        adapter = native_text_parser(
+            "deepseek-v41",
+            chat_encoding_spec=chat.chat_encoding_spec,
+            adapter=chat.encoding_adapter,
         )
         # V4 output never opens with <think>; the text parsers left it unsplit.
         self.assertEqual(adapter.separate_reasoning_text("a</think>b"), ("a", "b"))
@@ -423,7 +426,7 @@ class TestHandlerRequestSemantics(CustomTestCase):
             (text, item.name, item.parameters), ("Sure.", "f", '{"x": "1"}')
         )
         with self.assertRaises(ValueError):
-            recipe_text_parser(None, "deepseek-v41")
+            native_text_parser("deepseek-v41", chat_encoding_spec=None, adapter=None)
 
 
 if __name__ == "__main__":

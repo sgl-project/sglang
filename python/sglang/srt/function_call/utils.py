@@ -1,4 +1,5 @@
 import ast
+import logging
 import threading
 import warnings
 from json import JSONDecodeError, JSONDecoder
@@ -10,6 +11,9 @@ import partial_json_parser
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 _STANDARD_JSON_SCHEMA_TYPES = {
     "null",
@@ -67,6 +71,19 @@ _PREFIX_RULES: Tuple[Tuple[Tuple[str, ...], str], ...] = (
     (("list",), "array"),
     (("dict",), "object"),
 )
+
+
+def tool_indices(tools: List[Tool]) -> Dict[str, int]:
+    return {tool.function.name: i for i, tool in enumerate(tools) if tool.function.name}
+
+
+def called_tool_index(name: Optional[str], indices: Dict[str, int]) -> Optional[int]:
+    """The called tool's position in `tools`; a call to an undefined tool is dropped
+    (None), or forwarded as -1 when SGLANG_FORWARD_UNKNOWN_TOOLS is set."""
+    if name and name in indices:
+        return indices[name]
+    logger.warning(f"Model attempted to call undefined function: {name}")
+    return -1 if envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get() else None
 
 
 def _matches_type_prefix(base: str, prefixes: Tuple[str, ...]) -> bool:
