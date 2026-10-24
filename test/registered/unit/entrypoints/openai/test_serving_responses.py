@@ -836,6 +836,24 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
 
 
 class InputItemNormalizationTestCase(CustomTestCase):
+    def test_function_call_rejects_invalid_or_non_object_arguments(self):
+        for arguments in ('{"unfinished":', "", "[]", "null", "1", None):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                OpenAIServingResponses._normalize_response_message_for_chat(
+                    {"type": "function_call", "name": "lookup", "arguments": arguments}
+                )
+
+    def test_function_call_preserves_valid_empty_and_dict_arguments(self):
+        for arguments in ("{}", {}, {"key": "value"}):
+            normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+                {"type": "function_call", "name": "lookup", "arguments": arguments}
+            )
+            parsed = orjson.loads(normalized["tool_calls"][0]["function"]["arguments"])
+            self.assertEqual(
+                parsed,
+                orjson.loads(arguments) if isinstance(arguments, str) else arguments,
+            )
+
     def test_function_call_becomes_assistant_tool_call(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
             {

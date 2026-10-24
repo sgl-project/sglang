@@ -4,7 +4,7 @@ import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
@@ -127,6 +127,62 @@ async def _collect_anthropic_events(serving, anthropic_request):
             if line.startswith("data: "):
                 events.append(json.loads(line[6:]))
     return events
+
+
+class TestToolArgumentIntegrity(CustomTestCase):
+    def test_invalid_model_tool_arguments_return_an_error(self):
+        for arguments in ('{"unfinished":', "[]", "null", "1"):
+            with self.subTest(arguments=arguments):
+                response = ChatCompletionResponse(
+                    id="chatcmpl-test",
+                    created=1,
+                    model="test-model",
+                    choices=[
+                        {
+                            "index": 0,
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": arguments,
+                                        },
+                                    }
+                                ],
+                            },
+                        }
+                    ],
+                    usage={
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                )
+
+                class Backend(_FakeNonStreamingErrorOpenAI):
+                    async def _handle_non_streaming_request(self, *args):
+                        return response
+
+                serving = AnthropicServing(Backend())
+                request = AnthropicMessagesRequest(
+                    model="test-model",
+                    max_tokens=16,
+                    messages=[{"role": "user", "content": "Hi"}],
+                )
+                chat = ChatCompletionRequest(
+                    model="test-model", messages=[{"role": "user", "content": "Hi"}]
+                )
+                result = asyncio.run(
+                    serving._handle_non_streaming(chat, request, object())
+                )
+                self.assertEqual(result.status_code, 502)
+                body = json.loads(result.body)
+                self.assertEqual(body["error"]["type"], "api_error")
+                self.assertNotIn("content", body)
 
 
 class TestAnthropicServing(unittest.TestCase):
