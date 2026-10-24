@@ -1,6 +1,7 @@
 use super::*;
+use crate::cache_action::{BackupKV, FreeComponentHostSlot, MambaEvictExcessPathStates};
 use crate::components::{ComponentSet, FULL, MAMBA, SWA};
-use crate::test_utils::{accumulate_step, action_kinds};
+use crate::test_utils::{accumulate_step, action_kinds, expect_action};
 use crate::unified_lru_list::UnifiedLRUList;
 
 fn mamba_core(page_size: usize) -> UnifiedTreeCore<Vec<i64>> {
@@ -381,6 +382,7 @@ fn swa_only_release_spares_another_holders_mamba_lock() {
         &holder_params,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     )
     .expect("live test node");
 
@@ -559,10 +561,7 @@ fn reinsert_full_backed_target_schedules_mamba_only_backup() {
     let backups = result
         .cache_actions
         .iter()
-        .filter_map(|action| match action {
-            CacheAction::BackupKV(backup) => Some(backup),
-            _ => None,
-        })
+        .filter_map(|action| action.as_any().downcast_ref::<BackupKV>())
         .collect::<Vec<_>>();
     assert_eq!(backups.len(), 1);
     assert_eq!(backups[0].node_ids, vec![leaf]);
@@ -586,7 +585,7 @@ fn reinsert_full_backed_target_schedules_mamba_only_backup() {
         !pending
             .cache_actions
             .iter()
-            .any(|action| matches!(action, CacheAction::BackupKV(_)))
+            .any(|action| action.as_any().is::<BackupKV>())
     );
 }
 
@@ -606,7 +605,7 @@ fn write_back_reinsert_defers_the_mamba_backup_to_eviction() {
         !result
             .cache_actions
             .iter()
-            .any(|action| matches!(action, CacheAction::BackupKV(_)))
+            .any(|action| action.as_any().is::<BackupKV>())
     );
 }
 
@@ -740,6 +739,7 @@ fn evict_component_device_frees_and_tombstones_the_slot() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert_eq!((freed, host_freed), (1, 0));
@@ -764,6 +764,7 @@ fn evict_component_device_moves_a_host_backed_node_into_the_host_lru() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert!(tc.arena.node(a).has_host_value(MAMBA));
@@ -783,6 +784,7 @@ fn evict_component_host_frees_and_leaves_the_host_lru() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Host,
     );
     assert_eq!((freed, host_freed), (0, 1));
@@ -804,6 +806,7 @@ fn evict_component_all_frees_both_tiers_without_the_host_lru() {
         a,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::All,
     );
     assert_eq!((freed, host_freed), (1, 1));
@@ -979,7 +982,7 @@ fn check_mamba_restored_during_expanded_swa_backup(pin_ancestor: bool) {
         !inserted
             .cache_actions
             .iter()
-            .any(|action| matches!(action, CacheAction::BackupKV(_)))
+            .any(|action| action.as_any().is::<BackupKV>())
     );
     assert!(
         tc.arena
@@ -1295,6 +1298,7 @@ fn host_eviction_tombstones_internal_host_values() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
     assert!(!tc.arena.node(a).has_host_value(MAMBA));
     assert!(!tc.host_lru_list(MAMBA).in_list(Some(a)));
@@ -1334,6 +1338,7 @@ fn host_eviction_takes_a_host_leaf_atomically() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
     );
     // The atomic host-leaf eviction frees both components and the node.
     assert_eq!(tracker[&MAMBA], 1);
@@ -1358,6 +1363,7 @@ fn host_drive_panics_on_an_lru_member_without_a_mamba_host_value() {
         &mut tracker,
         &mut HashMap::new(),
         &mut HashMap::new(),
+        &mut Vec::new(),
     );
 }
 
@@ -1384,6 +1390,7 @@ fn swa_triggered_cascade_takes_the_mamba_slot() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     assert!(!tc.arena.node(a).has_device_value(MAMBA));
@@ -1415,6 +1422,7 @@ fn mamba_triggered_cascade_spares_the_higher_tiers() {
         &mut tracker,
         &mut device_frees,
         &mut host_frees,
+        &mut Vec::new(),
         EvictLayer::Device,
     );
     // FULL (2) and SWA (1) both outrank the mamba trigger (0).
@@ -2113,13 +2121,10 @@ fn prefetch_commit_frees_the_buffer_when_it_cannot_attach() {
             .has_host_value(MAMBA)
     );
     assert!(insert_result.mamba_exist);
-    let CacheAction::FreeComponentHostSlot {
+    let FreeComponentHostSlot {
         component_type,
         host_indices,
-    } = &cache_actions[0]
-    else {
-        panic!("expected a FreeComponentHostSlot action");
-    };
+    } = expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
     assert_eq!(*component_type, MAMBA);
     assert!(host_indices[0].equal(&Tensor::from_slice(&[50i64])));
 
@@ -2250,14 +2255,14 @@ fn insert_commit_emits_the_path_cap_action_only_when_capped() {
     let leaf = tc
         .match_prefix(&match_params(&vec![1, 2]))
         .best_match_node_id;
-    let [CacheAction::MambaEvictExcessPathStates { tail_node_id }] =
-        result.cache_actions.as_slice()
-    else {
+    let [action] = result.cache_actions.as_slice() else {
         panic!(
             "expected one MambaEvictExcessPathStates, got {:?}",
             action_kinds(&result.cache_actions)
         );
     };
+    let MambaEvictExcessPathStates { tail_node_id } =
+        expect_action::<MambaEvictExcessPathStates>(action.as_ref());
     assert_eq!(*tail_node_id, leaf);
 
     let mut uncapped = mamba_core(/* page_size = */ 1);

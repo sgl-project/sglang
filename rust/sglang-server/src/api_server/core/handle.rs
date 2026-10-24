@@ -3,9 +3,9 @@
 //! (model info, model list, server info, flush cache, weights check, tokenize,
 //! detokenize, health probe).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -22,6 +22,7 @@ use crate::message::request::{GenerateRequest, Request, RequestKind};
 use crate::message::response::{ResponseItem, ResponseSink};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::TokenIds;
+use crate::multi_modality::worker::{MediaError, MmProcessor};
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
 use crate::utils::error::Error;
@@ -39,7 +40,7 @@ pub(crate) struct CoreConfig {
     pub(crate) response_activity: ActivityCounter,
     pub(crate) startup_ready: bool,
     pub(crate) is_disaggregation: bool,
-    pub(crate) mm_limits: BTreeMap<String, usize>,
+    pub(crate) mm_limits: Vec<(String, usize)>,
     pub(crate) metadata: CoreMetadata,
 }
 
@@ -107,7 +108,10 @@ struct CoreInner {
     response_activity: ActivityCounter,
     startup_ready: AtomicBool,
     is_disaggregation: bool,
-    mm_limits: BTreeMap<String, usize>,
+    mm_limits: Vec<(String, usize)>,
+    /// The MM pool's processor, whose media hooks admission runs; set once
+    /// when the pool starts (after the listeners are up).
+    mm_processor: OnceLock<Arc<dyn MmProcessor>>,
     metadata: CoreMetadata,
     generations: Generations,
 }
@@ -127,10 +131,17 @@ impl CoreHandle {
                 startup_ready: AtomicBool::new(config.startup_ready),
                 is_disaggregation: config.is_disaggregation,
                 mm_limits: config.mm_limits,
+                mm_processor: OnceLock::new(),
                 metadata: config.metadata,
                 generations: Generations::default(),
             }),
         }
+    }
+
+    /// Run `processor`'s media hooks during admission. The first processor
+    /// installed wins; `false` if one already was.
+    pub(crate) fn set_mm_processor(&self, processor: Arc<dyn MmProcessor>) -> bool {
+        self.inner.mm_processor.set(processor).is_ok()
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -242,9 +253,16 @@ impl CoreHandle {
     }
 
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
-        prefetch::prefetch_all(requests, &self.inner.mm_limits)
-            .await
-            .map_err(CoreError::InvalidArgument)
+        prefetch::prefetch_all(
+            requests,
+            &self.inner.mm_limits,
+            self.inner.mm_processor.get(),
+        )
+        .await
+        .map_err(|error| match error {
+            MediaError::Client(message) => CoreError::InvalidArgument(message),
+            MediaError::Server(message) => CoreError::Internal(message),
+        })
     }
 
     /// Return static model metadata without exposing the full launch config.
@@ -354,7 +372,7 @@ impl CoreHandle {
         })
     }
 
-    async fn control(&self, request: ControlRequest) -> Result<bytes::Bytes, CoreError> {
+    pub(super) async fn control(&self, request: ControlRequest) -> Result<bytes::Bytes, CoreError> {
         let mut call = self.submit(RequestKind::Control(Box::new(request))).await?;
         match call.recv().await {
             Some(ResponseItem::Control(bytes)) => Ok(bytes),
@@ -986,7 +1004,10 @@ mod tests {
     use crate::message::io_struct::GetInternalStateReq;
     use crate::message::multimodal::MmItem;
     use crate::message::request::MmData;
-    use crate::message::response::ChunkEvent;
+    use crate::message::response::{ChunkEvent, frame_health_ack};
+    use crate::runtime::Runnable;
+    use crate::tokenizer_manager::from_scheduler::Dispatcher;
+    use crate::tokenizer_manager::wiring::Senders;
 
     struct Harness {
         handle: CoreHandle,
@@ -1018,7 +1039,7 @@ mod tests {
             Default::default(),
             false,
             false,
-            BTreeMap::new(),
+            Vec::new(),
         )
     }
 
@@ -1029,7 +1050,7 @@ mod tests {
         response_activity: ActivityCounter,
         startup_ready: bool,
         is_disaggregation: bool,
-        mm_limits: BTreeMap<String, usize>,
+        mm_limits: Vec<(String, usize)>,
     ) -> CoreHandle {
         CoreHandle::new(
             intake_tx,
@@ -1072,7 +1093,7 @@ mod tests {
                 response_activity: Default::default(),
                 startup_ready: false,
                 is_disaggregation: false,
-                mm_limits: BTreeMap::new(),
+                mm_limits: Vec::new(),
                 metadata: CoreMetadata {
                     served_model_name: "served-model".into(),
                     max_context_length: 1_u64 << 32,
@@ -1324,7 +1345,7 @@ mod tests {
             Default::default(),
             false,
             false,
-            BTreeMap::from([("image".to_owned(), 1)]),
+            vec![("image".to_owned(), 1)],
         );
         let request = GenerateRequest {
             mm: Some(Box::new(MmData {
@@ -1346,20 +1367,81 @@ mod tests {
         assert!(abort_rx.try_recv().is_err());
     }
 
+    /// A processor's media failures reach adapters as Python's loader classes:
+    /// a client fault is a 400, a server fault a 500. Neither is admitted.
     #[tokio::test]
-    async fn healthy_probe_uses_shared_activity_and_cleans_up() {
+    async fn processor_media_failures_keep_their_status_class() {
+        struct FailingFetch;
+
+        impl MmProcessor for FailingFetch {
+            fn process(
+                &self,
+                _input_ids: TokenIds,
+                _mm: MmData,
+            ) -> Result<crate::multi_modality::worker::MmProcessOutput, String> {
+                unreachable!("rejected during admission")
+            }
+
+            fn fetch_media(
+                &self,
+                source: &str,
+                _modality: crate::multi_modality::encoded::MmModality,
+                _budget: &crate::MediaByteBudget,
+            ) -> Result<Option<Bytes>, MediaError> {
+                Err(match source {
+                    "custom://client" => MediaError::Client("bad media".into()),
+                    _ => MediaError::Server("backend down".into()),
+                })
+            }
+        }
+
+        let harness = Harness::unbounded(8);
+        assert!(harness.handle.set_mm_processor(Arc::new(FailingFetch)));
+        assert!(!harness.handle.set_mm_processor(Arc::new(FailingFetch)));
+        for (source, status, message) in [
+            ("custom://client", 400, "bad media"),
+            ("custom://server", 500, "backend down"),
+        ] {
+            let request = GenerateRequest {
+                mm: Some(Box::new(MmData {
+                    image_data: vec![MmItem::Source(source.into())],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let error = harness.handle.generate(request).await.err().unwrap();
+            assert_eq!(error.http_status().as_u16(), status, "{source}");
+            assert_eq!(error.to_string(), message);
+        }
+        assert!(harness.intake_rx.try_recv().is_err());
+        assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    /// A busy scheduler skips the probe and acknowledges it after its next step.
+    /// The dispatcher counts the acknowledgement as scheduler output, so the
+    /// probe passes without any batch frame.
+    #[tokio::test]
+    async fn skipped_probe_passes_on_health_ack_and_cleans_up() {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         let activity: ActivityCounter = Default::default();
-        let handle = configured_handle(
-            intake_tx,
-            abort_tx,
-            8,
+        let (from_scheduler_tx, from_scheduler_rx) =
+            crate::tokenizer_manager::channel::from_scheduler(8);
+        let (detok_tx, detok_rx) = flume::unbounded();
+        let (_shutdown_tx, shutdown_rx) = flume::bounded(1);
+        let dispatcher = Dispatcher::new(
+            from_scheduler_rx,
+            Senders {
+                tok_manager_tx: flume::unbounded().0,
+                abort_tx: flume::unbounded().0,
+                tokenizer_tx: flume::unbounded().0,
+                detokenizer_tx: vec![detok_tx],
+            },
             activity.clone(),
-            true,
-            false,
-            BTreeMap::new(),
+            shutdown_rx,
         );
+        let dispatcher = std::thread::spawn(move || dispatcher.run());
+        let handle = configured_handle(intake_tx, abort_tx, 8, activity, true, false, Vec::new());
         let probe_handle = handle.clone();
         let probe =
             tokio::spawn(async move { probe_handle.probe_health(Duration::from_secs(1)).await });
@@ -1371,7 +1453,7 @@ mod tests {
             !handle.abort(None),
             "internal probes must not enter the public abort-all registry"
         );
-        activity.fetch_add(1, Ordering::Relaxed);
+        assert!(from_scheduler_tx.push(frame_health_ack()));
 
         assert_eq!(probe.await.unwrap().unwrap(), HealthStatus::Healthy);
         assert!(matches!(
@@ -1379,6 +1461,12 @@ mod tests {
             AbortSource::Guard(aborted) if aborted == rid
         ));
         assert!(abort_rx.try_recv().is_err());
+        drop(from_scheduler_tx);
+        dispatcher.join().unwrap();
+        assert!(
+            detok_rx.try_recv().is_err(),
+            "an acknowledgement routes nothing"
+        );
     }
 
     #[tokio::test]
@@ -1392,7 +1480,7 @@ mod tests {
             Default::default(),
             true,
             true,
-            BTreeMap::new(),
+            Vec::new(),
         );
 
         let probe_task =
@@ -1454,7 +1542,7 @@ mod tests {
             Default::default(),
             false,
             true,
-            BTreeMap::new(),
+            Vec::new(),
         );
         let warm_up = tokio::spawn(async move { handle.warm_up(true).await });
 
