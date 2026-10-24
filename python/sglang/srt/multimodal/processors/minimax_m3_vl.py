@@ -562,8 +562,10 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         input_ids=None,
         video_metadata=None,
         images_resized=False,
+        processor=None,
         **kwargs,
     ):
+        processor, _ = self._resolve_processor(processor)
         image_config = (
             {**self.image_config, "do_resize": False}
             if images_resized
@@ -577,6 +579,7 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
                 images=images,
                 videos=videos,
                 audios=audios,
+                processor=processor,
                 video_metadata=video_metadata,
                 **kwargs,
             )
@@ -585,13 +588,13 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         result = {}
         if images:
             result.update(
-                self._processor.image_processor(
+                processor.image_processor(
                     images=images, return_tensors="pt", **image_config
                 )
             )
         if videos:
             result.update(
-                self._processor.video_processor(
+                processor.video_processor(
                     videos=videos,
                     return_tensors="pt",
                     **{"do_resize": False, **self.video_config},
@@ -614,7 +617,7 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
                 else video_frame_timestamps(
                     vars(metadata),
                     int(grid[0]),
-                    self._processor.video_processor.temporal_patch_size,
+                    processor.video_processor.temporal_patch_size,
                 )
             )
             for grid, metadata in zip(

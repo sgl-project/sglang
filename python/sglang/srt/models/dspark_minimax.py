@@ -82,14 +82,9 @@ class DSparkMiniMaxDecoder(MiniMaxM3DecoderLayer):
 class DSparkMiniMaxLayer(nn.Module):
     attention_conv = mlp_conv = None
 
-    def __init__(self, config, layer_id, quant_config, prefix):
+    def __init__(self, decoder_layer: DSparkMiniMaxDecoder):
         super().__init__()
-        self.decoder_layer = DSparkMiniMaxDecoder(
-            config=config,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=f"{prefix}.decoder_layer",
-        )
+        self.decoder_layer = decoder_layer
 
     @property
     def self_attn(self):
@@ -119,10 +114,12 @@ class MiniMaxDraftBackbone(DFlashDraftModel):
             self.layers = nn.ModuleList(
                 [
                     DSparkMiniMaxLayer(
-                        config,
-                        i,
-                        quant_config,
-                        f"language_model.model.dspark.layers.{i}",
+                        DSparkMiniMaxDecoder(
+                            config=config,
+                            layer_id=i,
+                            quant_config=quant_config,
+                            prefix=f"language_model.model.dspark.layers.{i}.decoder_layer",
+                        )
                     )
                     for i in range(config.num_hidden_layers)
                 ]

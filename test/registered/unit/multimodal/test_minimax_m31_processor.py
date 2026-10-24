@@ -121,6 +121,7 @@ class _ProcessorCase(CustomTestCase):
     def setUp(self):
         self.image_processor = MiniMaxM31ImageProcessor(max_size=(672, 672))
         processor = object.__new__(MiniMaxM3VLProcessor)
+        processor._tokenizer = None
         processor.IM_TOKEN_ID = 10
         processor.VIDEO_TOKEN_ID = 11
         processor.IM_START_TOKEN_ID = 12
@@ -326,6 +327,7 @@ class TestRequestPlumbing(CustomTestCase):
 class TestMiniMaxM31Processor(CustomTestCase):
     def setUp(self):
         self.processor = object.__new__(MiniMaxM3VLProcessor)
+        self.processor._tokenizer = None
         self.processor.IM_TOKEN_ID = 10
         self.processor.VIDEO_TOKEN_ID = 11
         self.processor.IM_START_TOKEN_ID = 12
@@ -427,6 +429,7 @@ class TestMiniMaxM31FeatureTransportDtype(CustomTestCase):
         """Features cast to the model dtype before transport must reach the vision
         encoder bit for bit as the fp32 features did, at half the bytes."""
         processor = object.__new__(MiniMaxM3VLProcessor)
+        processor._tokenizer = None
         processor.feature_dtype = torch.bfloat16
         pixel_values = torch.randn(
             256, 1176, generator=torch.Generator().manual_seed(0)
@@ -462,6 +465,7 @@ class TestMiniMaxM31EncoderPreprocessing(CustomTestCase):
         hf_processor = object.__new__(HFMiniMaxM3VLProcessor)
         hf_processor.image_processor = MiniMaxM31ImageProcessor(max_size=(112, 112))
         processor = object.__new__(MiniMaxM3VLProcessor)
+        processor._tokenizer = None
         processor._processor = hf_processor
         grid = torch.tensor([[1, 4, 6]])
         self.assertEqual(
@@ -476,6 +480,7 @@ class TestMiniMaxM31EncoderPreprocessing(CustomTestCase):
         hf_processor = object.__new__(HFMiniMaxM3VLProcessor)
         hf_processor.video_processor = MiniMaxM31VideoProcessor(max_size=(112, 112))
         processor = object.__new__(MiniMaxM3VLProcessor)
+        processor._tokenizer = None
         processor._processor = hf_processor
         grid = torch.tensor([[3, 4, 6]])
         for metadata in (
