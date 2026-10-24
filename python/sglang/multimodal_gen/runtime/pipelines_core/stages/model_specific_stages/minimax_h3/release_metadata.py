@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.minimax_h3_metadata import (
+    validate_minimax_h3_sigma_shift_scales,
+)
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import QUALITY_LEVELS
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -85,19 +88,7 @@ class MiniMaxH3ReleaseMetadata:
             raise ValueError(
                 "model_index.json._minimax_h3.task_aliases must map strings to strings"
             )
-        scales = raw.get("sigma_shift_scales")
-        if not isinstance(scales, Mapping):
-            raise ValueError(
-                "model_index.json._minimax_h3.sigma_shift_scales must be an object"
-            )
-        try:
-            video_sigma = float(scales["video"])
-            audio_sigma = float(scales["audio"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                "model_index.json._minimax_h3.sigma_shift_scales requires numeric "
-                "video and audio values"
-            ) from exc
+        scales = validate_minimax_h3_sigma_shift_scales(model_index)
         dmd_steps = raw.get("dmd_denoising_steps")
         if dmd_steps is not None:
             if (
@@ -129,8 +120,8 @@ class MiniMaxH3ReleaseMetadata:
             partition=partition,
             tasks=tasks,
             task_aliases=dict(aliases),
-            video_sigma_shift=video_sigma,
-            audio_sigma_shift=audio_sigma,
+            video_sigma_shift=scales["video"],
+            audio_sigma_shift=scales["audio"],
             dmd_denoising_steps=dmd_steps,
             pdd_fused_heads=pdd_fused_heads,
         )
