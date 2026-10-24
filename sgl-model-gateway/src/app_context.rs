@@ -336,6 +336,15 @@ impl AppContextBuilder {
             .tcp_nodelay(true)
             .tcp_keepalive(Some(Duration::from_secs(config.tcp_keepalive_secs)));
 
+        // reqwest 0.12 sets TCP_USER_TIMEOUT to 30 s by default on Linux. The kernel then
+        // aborts an upstream connection whose sent data stays unacknowledged for 30 s, which
+        // includes a worker that reads a large request body slowly (zero receive window).
+        // Leave the option unset: request_timeout_secs bounds the request instead.
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        {
+            client_builder = client_builder.tcp_user_timeout(None);
+        }
+
         // Force rustls backend when TLS is configured
         if has_tls_config {
             client_builder = client_builder.use_rustls_tls();
