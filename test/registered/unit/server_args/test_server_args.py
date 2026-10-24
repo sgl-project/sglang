@@ -4175,6 +4175,18 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "does not support --enable-hisparse"):
             handle_kv_cache_sharding(args)
 
+    def test_hicache_host_offload_is_accepted_but_not_storage(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.enable_hierarchical_cache = True
+        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+        args = self._args(
+            enable_hierarchical_cache=True, hicache_storage_backend="file"
+        )
+        with self.assertRaisesRegex(ValueError, "not --hicache-storage-backend"):
+            handle_kv_cache_sharding(args)
+
     def test_incompatible_cache_tree_modes_are_rejected(self):
         cases = (
             ({"radix_cache_backend": "custom"}, "built-in UnifiedRadixCache"),

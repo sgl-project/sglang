@@ -51,7 +51,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
-from sglang.srt.mem_cache.common import RetractionBackup
+from sglang.srt.mem_cache.common import RetractionBackup, _evict_until_allocatable
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -767,6 +767,15 @@ class UnifiedRadixCache(BasePrefixCache):
                             fallback_result.swa_num_tokens_evicted
                         )
                         result.mamba_num_evicted += fallback_result.mamba_num_evicted
+
+        full_target = available_size_targets.get(ComponentType.FULL)
+        if full_target is not None:
+            # Classed pools can free the requested count without raising their
+            # min-class capacity floor to the original allocation target.
+            retry_result = _evict_until_allocatable(self, allocator, full_target[1])
+            result.num_tokens_evicted += retry_result.num_tokens_evicted
+            result.swa_num_tokens_evicted += retry_result.swa_num_tokens_evicted
+            result.mamba_num_evicted += retry_result.mamba_num_evicted
 
         return result
 
@@ -1744,7 +1753,12 @@ class UnifiedRadixCache(BasePrefixCache):
         aux_xfers.extend(sidecar_xfers)
         # Defer submission so the next flush can merge pending node backups.
         return self.cache_controller.write(
-            device_value, node_id=node_id, extra_pools=aux_xfers or None, flush=False
+            device_value,
+            node_id=node_id,
+            extra_pools=aux_xfers or None,
+            flush=False,
+            # KV sharding: host slots follow the owners of the device pages.
+            start_class=self.tree_core.rotation_phase_of(node_id),
         )
 
     def _track_write_through_node(

@@ -30,12 +30,15 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
 5. ``begin_shard_extend`` plan capture (page positions, padded send rows,
    owner-congruence guard) with the gather stubbed out, following the
    SimpleNamespace binding pattern of ``test_dsa_layer_shard_utils.py``.
-6. MTP draft pool construction, shared allocator/layout validation, and scratch
-   sizing for separate target and draft pools.
+6. HiCache host offload: the host pool striped like the device pool,
+   owner-classed host slots, the per-rank narrowing of a transfer, an N-rank
+   backup -> evict -> load-back round trip, and the layer-load waits.
 7. The P/D send filter ``filter_kv_indices_for_shard_rank`` and the sender's
    skip of a non-final chunk this rank owns no page of.
 8. Real sharded MLA pools: N ranks of stock-size pools hold N times one pool's
    tokens, each token stored on exactly one rank.
+9. MTP draft pool construction, shared allocator/layout validation, and scratch
+   sizing for separate target and draft pools.
 
 The real NCCL MLA/MHA/MTP gathers over 2 GPUs live in
 ``test_page_interleave_gather_multi_gpu.py``. DSA indexer and attention
@@ -46,7 +49,7 @@ import shutil
 import unittest
 import unittest.mock
 from array import array
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -64,12 +67,16 @@ from sglang.srt.mem_cache.allocator.page_interleave import (
 )
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
     EvictResult,
     InsertParams,
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import _evict_until_allocatable
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -89,8 +96,13 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
 )
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.page_interleave import (
+    page_interleave_host_pool_cls,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
+from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context, get_memory, get_parallel, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -785,16 +797,18 @@ class TestEvictUntilAllocatable(CustomTestCase):
         # Each round frees ONE class-3 page (a whole 1-page chain): reaching
         # a min-class floor of 2 pages takes 2 rounds.
         tree = self._tree_stub(alloc, list(outs))
-        _evict_until_allocatable(tree, alloc, 2 * N * PS)
+        result = _evict_until_allocatable(tree, alloc, 2 * N * PS)
         self.assertGreaterEqual(alloc.available_size(), 2 * N * PS)
         self.assertEqual(tree.calls, 2)
+        self.assertEqual(result, EvictResult(num_tokens_evicted=2 * PS))
 
     def test_terminates_when_tree_dry(self):
         alloc, _ = self._allocator_with_tight_class()
         tree = self._tree_stub(alloc, [])  # nothing evictable
-        _evict_until_allocatable(tree, alloc, PS)
+        result = _evict_until_allocatable(tree, alloc, PS)
         self.assertEqual(alloc.available_size(), 0)  # need unmet, but no hang
         self.assertEqual(tree.calls, 1)
+        self.assertEqual(result, EvictResult())
 
 
 def _unified_tree(page_size=4, pool_size=256, disable=False):
@@ -863,6 +877,73 @@ class _TreeCoreBackendCase(CustomTestCase):
         )
         override.__enter__()
         self.addCleanup(override.__exit__, None, None, None)
+
+
+class TestShardedAllocationEviction(CustomTestCase):
+    def _cache_with_imbalanced_classes(self, *, cache_tight_page=True):
+        allocator = _make_allocator(pages_per_rank=4)
+        tree = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=ReqToTokenPool(
+                    size=8,
+                    max_context_len=128,
+                    device="cpu",
+                    enable_memory_saver=False,
+                ),
+                token_to_kv_pool_allocator=allocator,
+                page_size=PS,
+                tree_components=(ComponentType.FULL,),
+                tree_core_backend="python",
+            )
+        )
+        # These pages belong to active requests and cannot be evicted.
+        for owner in (0, 0, 1):
+            _alloc_extend(allocator, 0, PS, rotation_base=owner)
+
+        # LRU first frees an abundant class; only the second victim raises
+        # the minimum-class capacity that allocation admission uses.
+        abundant = _alloc_extend(allocator, 0, PS, rotation_base=1)
+        _insert(tree, [100] * PS, rotation_base=1, value=abundant)
+        tight = _alloc_extend(allocator, 0, PS, rotation_base=0)
+        if cache_tight_page:
+            _insert(tree, [200] * PS, rotation_base=0, value=tight)
+        self.assertEqual(allocator.class_free_page_counts(), [1, 2, 4, 4])
+        return tree, allocator
+
+    def test_direct_allocation_eviction_retries_and_counts_all_victims(self):
+        tree, allocator = self._cache_with_imbalanced_classes()
+        initial_available = allocator.available_size()
+        self.assertEqual(initial_available, GS)
+
+        # The shortfall is smaller than the initial free capacity: treating
+        # it as the absolute target would incorrectly skip the retry.
+        result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
+
+        self.assertGreaterEqual(allocator.available_size(), initial_available + PS)
+        self.assertEqual(allocator.class_free_page_counts(), [2, 3, 4, 4])
+        self.assertEqual(result, EvictResult(num_tokens_evicted=2 * PS))
+        self.assertEqual(tree.full_evictable_size(), 0)
+
+    def test_allocation_eviction_stops_when_tight_class_cannot_be_reclaimed(self):
+        tree, allocator = self._cache_with_imbalanced_classes(cache_tight_page=False)
+
+        result = tree.evict_for_alloc(EvictParams(num_tokens=PS))
+
+        self.assertEqual(allocator.available_size(), GS)
+        self.assertEqual(allocator.class_free_page_counts(), [1, 3, 4, 4])
+        self.assertEqual(result, EvictResult(num_tokens_evicted=PS))
+        self.assertEqual(tree.full_evictable_size(), 0)
+
+    def test_explicit_eviction_still_uses_token_count(self):
+        tree, allocator = self._cache_with_imbalanced_classes()
+
+        result = tree.evict(EvictParams(num_tokens=PS))
+
+        self.assertEqual(allocator.available_size(), GS)
+        self.assertEqual(allocator.class_free_page_counts(), [1, 3, 4, 4])
+        self.assertEqual(result, EvictResult(num_tokens_evicted=PS))
+        self.assertEqual(tree.full_evictable_size(), PS)
 
 
 @parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
@@ -1378,35 +1459,6 @@ class TestBeginShardExtendPlan(CustomTestCase):
         self.assertIn("cyclic", str(ctx.exception))
 
 
-class TestLayerTransferCounterRefused(CustomTestCase):
-    """Layer-wise KV load-back must fail loud at registration.
-
-    The gather reads pool rows directly (`_gather_pairs`), so it never passes
-    through the base getters' `layer_transfer_counter.wait_until` hook, and
-    `begin_shard_extend` kicks the first gather before any getter runs.
-    """
-
-    class _Base:
-        def register_layer_transfer_counter(self, counter):
-            self.counter = counter
-
-    class _Pool(PageInterleaveKVPoolMixin, _Base):
-        def __init__(self):
-            pass
-
-    def test_a_real_counter_is_refused(self):
-        pool = self._Pool()
-        with self.assertRaises(NotImplementedError) as cm:
-            pool.register_layer_transfer_counter(object())
-        self.assertIn("logical-page KV sharding", str(cm.exception))
-
-    def test_none_stays_a_no_op(self):
-        """The SWA/hybrid wrappers disable the counter by passing None."""
-        pool = self._Pool()
-        pool.register_layer_transfer_counter(None)
-        self.assertIsNone(pool.counter)
-
-
 class TestScratchTranslation(CustomTestCase):
     def _plan(self, base=2, n_prefix=7, n_chunk=9, rank=1):
         pages = _chain_pages(base=base, n_pages=n_prefix + n_chunk)
@@ -1539,6 +1591,258 @@ class TestWritePlan(CustomTestCase):
         owned_idx, local_rows = PageInterleaveKVPoolMixin._get_write_plan(stub, loc)
         self.assertEqual(owned_idx.numel(), 0)
         self.assertEqual(local_rows.numel(), 0)
+
+
+# ---- HiCache host offload ------------------------------------------------------
+
+
+def _host_pool(shard_rank, device_pages=32):
+    """A real MLA host pool (CPU, unpinned) striped for ``shard_rank``."""
+    device_pool = MLATokenToKVPool(
+        size=device_pages * PS,
+        page_size=PS,
+        dtype=torch.float16,
+        kv_lora_rank=8,
+        qk_rope_head_dim=4,
+        layer_num=2,
+        start_layer=0,
+        end_layer=2,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+    return page_interleave_host_pool_cls(MLATokenToKVPoolHost)(
+        device_pool.get_device_pool_infos()[0].buffer_info,
+        host_to_device_ratio=2.0,
+        host_size=0,
+        page_size=PS,
+        layout="layer_first",
+        pin_memory=False,
+        device="cpu",
+        device_capacity_tokens=device_pool.size,
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        target_layer_num=device_pool.layer_num,
+        placement=PageInterleavePlacement(_make_spec(shard_rank=shard_rank)),
+    )
+
+
+def _page_classes(indices):
+    return (indices[::PS] // PS % N).tolist()
+
+
+def _whole_pages(indices):
+    pages = indices[::PS] // PS
+    return (pages[:, None] * PS + torch.arange(PS)).reshape(-1)
+
+
+class TestShardedHostSlots(CustomTestCase):
+    """Host slots share the device's widened space and owner classes, so a
+    backup's host pages land on the ranks that hold its device pages."""
+
+    def test_rows_stay_per_rank_and_the_index_space_widens(self):
+        pool = _host_pool(shard_rank=1)
+        # ratio x the per-rank device pool, page-aligned (+1 page), as unsharded.
+        self.assertEqual(pool.size, (2 * 32 + 1) * PS)
+        self.assertEqual(pool.logical_size, N * pool.size)
+        # Every slot maps into this rank's host rows; local page 0 stays unused.
+        slots = pool.alloc(pool.available_size(), start_class=0)
+        self.assertEqual(slots.numel(), N * (pool.size - PS))
+        self.assertLess(int(pool.placement.local_index(slots).max()), pool.size)
+
+    def test_alloc_without_a_start_class_fails_loud(self):
+        with self.assertRaises(AssertionError):
+            _host_pool(shard_rank=0).alloc(PS)
+
+    def test_slots_are_mirrored_across_ranks(self):
+        """A pure function of the mirrored alloc/free stream: the tree's host
+        values agree on every shard rank."""
+
+        def run(pool):
+            first = pool.alloc(5 * PS, start_class=2)
+            pool.free(first[: 2 * PS])
+            return torch.cat([first, pool.alloc(3 * PS, start_class=0)])
+
+        outs = [run(_host_pool(r)) for r in range(N)]
+        for out in outs[1:]:
+            self.assertTrue(torch.equal(out, outs[0]))
+
+
+class TestOwnedRows(CustomTestCase):
+    def test_round_trip_through_host_restores_every_stripe(self):
+        """N simulated ranks: write a chain into owner rows, back it up with
+        each rank copying only its narrowed rows, evict, re-allocate with the
+        host pages' owners, load back the same way, and read every token."""
+        allocator = _make_allocator()
+        pools = [_host_pool(r) for r in range(N)]
+        dev = [torch.zeros(33 * PS) for _ in range(N)]
+        hst = [torch.zeros(pools[0].size) for _ in range(N)]
+        placement = PageInterleavePlacement(_make_spec())
+
+        chain = allocator.alloc_cyclic(start_class=3, need_size=9 * PS)
+        values = torch.arange(chain.numel(), dtype=torch.float32) + 1000
+        owners = placement.owner_of(chain)
+        for r in range(N):
+            dev[r][placement.local_index(chain[owners == r])] = values[owners == r]
+
+        start_class = int(chain[0]) // PS % N
+        host = [p.alloc(chain.numel(), start_class=start_class) for p in pools][0]
+        for r in range(N):
+            h_rows, d_rows = pools[r].owned_rows(
+                host_indices=host, device_indices=chain
+            )
+            hst[r][h_rows] = dev[r][d_rows]
+
+        allocator.free(chain)
+        allocator.alloc_cyclic(start_class=0, need_size=5 * PS)  # churn
+        for r in range(N):
+            dev[r].zero_()
+
+        reload = allocator.alloc_cyclic(
+            start_class=int(host[0]) // PS % N, need_size=host.numel()
+        )
+        self.assertFalse(torch.equal(reload, chain))
+        self.assertEqual(_page_classes(reload), _page_classes(chain))
+        for r in range(N):
+            h_rows, d_rows = pools[r].owned_rows(
+                host_indices=host, device_indices=reload
+            )
+            dev[r][d_rows] = hst[r][h_rows]
+
+        owners = placement.owner_of(reload)
+        for r in range(N):
+            got = dev[r][placement.local_index(reload[owners == r])]
+            self.assertTrue(torch.equal(got, values[owners == r]))
+
+    def test_controller_narrows_before_moving_indices(self):
+        pool = _host_pool(shard_rank=2)
+        device = _make_allocator().alloc_cyclic(start_class=0, need_size=6 * PS)
+        host = pool.alloc(6 * PS, start_class=0)
+        controller = SimpleNamespace(move_indices=lambda h, d: (h, d))
+        h_rows, d_rows = HybridCacheController._move_pool_indices(
+            controller, pool, host, device, write_back_jit=False
+        )
+        expected = pool.owned_rows(host_indices=host, device_indices=device)
+        self.assertTrue(torch.equal(h_rows, expected[0]))
+        self.assertTrue(torch.equal(d_rows, expected[1]))
+        self.assertEqual(h_rows.numel(), PS)  # classes 0,1,2,3,0,1: one 2
+
+
+class TestStorageAttachRefusedUnderSharding(CustomTestCase):
+    def test_runtime_attach_is_refused(self):
+        """The launch gate rejects --hicache-storage-backend under sharding;
+        the runtime attach endpoint must not slip L3 past it."""
+        cache = SimpleNamespace(
+            cache_controller=object(), token_to_kv_pool_allocator=_make_allocator()
+        )
+        ok, message = StorageAttachment(cache).attach(storage_backend="file")
+        self.assertFalse(ok)
+        self.assertIn("--enable-kv-cache-sharding", message)
+
+
+class TestOwnerMatchedLoadBack(CustomTestCase):
+    def test_alloc_cyclic_continues_the_given_class(self):
+        out = _make_allocator().alloc_cyclic(start_class=3, need_size=6 * PS)
+        self.assertEqual(_page_classes(out), [3, 0, 1, 2, 3, 0])
+        self.assertTrue(torch.equal(out, _whole_pages(out)))
+
+    def test_alloc_cyclic_defers_when_a_class_is_short(self):
+        allocator = _make_allocator(pages_per_rank=2)
+        allocator.alloc_cyclic(start_class=1, need_size=PS)
+        allocator.alloc_cyclic(start_class=1, need_size=PS)
+        before = allocator.class_free_page_counts()
+        self.assertIsNone(allocator.alloc_cyclic(start_class=1, need_size=PS))
+        self.assertEqual(allocator.class_free_page_counts(), before)
+        self.assertIsNotNone(allocator.alloc_cyclic(start_class=2, need_size=PS))
+
+    def test_controller_load_draws_the_host_pages_owners(self):
+        host = _host_pool(0).alloc(5 * PS, start_class=2)
+        controller = SimpleNamespace(
+            mem_pool_device_allocator=_make_allocator(),
+            device="cpu",
+            load_queue=[],
+            _resolve_device_transfers=lambda *args, **kwargs: None,
+        )
+        device = HybridCacheController.load(controller, host_indices=host)
+        self.assertEqual(_page_classes(device), _page_classes(host))
+        self.assertEqual(len(controller.load_queue), 1)
+
+
+class TestRotationPhase(_TreeCoreBackendCase):
+    """The backup's host start class: rotation base + the node's first
+    position-page, read host-side (the device value is on the GPU)."""
+
+    tree_core_backend = "python"
+
+    def _phase(self, tree, tokens):
+        node = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        return tree.tree_core.rotation_phase_of(node)
+
+    def test_phase_counts_the_pages_above_the_node(self):
+        tree = _unified_tree()
+        _insert(tree, list(range(12)), rotation_base=2)
+        # Split the 3-page node after 2 pages and hang a 1-page sibling there.
+        probe = list(range(8)) + [99, 98, 97, 96]
+        _insert(tree, probe, rotation_base=2)
+        self.assertEqual(self._phase(tree, list(range(8))), 2)
+        self.assertEqual(self._phase(tree, list(range(12))), 2 + 2)
+        self.assertEqual(self._phase(tree, probe), 2 + 2)
+
+    def test_unsharded_nodes_have_no_phase(self):
+        tree = _unified_tree()
+        _insert(tree, list(range(8)))
+        self.assertIsNone(self._phase(tree, list(range(8))))
+
+
+class TestGatherWaitsForLayerLoad(CustomTestCase):
+    """A HiCache load-back writes pool rows on its own stream; the gather
+    reads them directly, not through the waiting getters, so it waits first."""
+
+    def _pool(self, events, counter):
+        slot = SimpleNamespace(
+            tensors={"k": torch.zeros(N * PS, 1)},
+            ready=SimpleNamespace(record=lambda stream: None),
+            resident_key=None,
+        )
+
+        def gather_pairs(local_layer):
+            events.append(("gather", local_layer))
+            return [(torch.zeros(4 * PS, 1), "k")]
+
+        return SimpleNamespace(
+            start_layer=2,
+            layer_num=4,
+            _slots=[slot, slot],
+            _epoch=1,
+            _block_pages=1,
+            shard_spec=SimpleNamespace(page_size=PS),
+            shard_rank=0,
+            shard_size=N,
+            _send_rows=torch.arange(PS),
+            _gather_send_rows=lambda name: torch.arange(PS),
+            _gather_pairs=gather_pairs,
+            kv_gather_stream=SimpleNamespace(wait_stream=lambda stream: None),
+            device_module=SimpleNamespace(
+                stream=lambda stream: nullcontext(), current_stream=lambda: None
+            ),
+            kv_gather_comm=SimpleNamespace(
+                change_state=lambda enable: nullcontext(),
+                all_gather=lambda out, inp: events.append("all_gather"),
+            ),
+            layer_transfer_counter=counter,
+        )
+
+    def test_wait_precedes_the_gather(self):
+        events = []
+        counter = SimpleNamespace(wait_until=lambda i: events.append(("wait", i)))
+        PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, counter), 3)
+        self.assertEqual(events, [("wait", 1), ("gather", 1), "all_gather"])
+
+    def test_no_counter_no_wait(self):
+        events = []
+        PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, None), 3)
+        self.assertEqual(events, [("gather", 1), "all_gather"])
 
 
 class TestShardedPoolFootprint(CustomTestCase):

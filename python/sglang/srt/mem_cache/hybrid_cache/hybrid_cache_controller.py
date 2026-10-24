@@ -26,6 +26,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
@@ -39,6 +40,7 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPoolMixin
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 
@@ -512,6 +514,7 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
         *,
         reclaim: Optional[Callable[[int], Any]] = None,
+        start_class: Optional[int] = None,
     ) -> Optional[tuple[torch.Tensor, Optional[list[PoolTransfer]]]]:
         if self._uses_shared_host_domain(extra_pools):
             allocation = self.allocate_shared_host_transfers(
@@ -529,7 +532,9 @@ class HybridCacheController(BaseHiCacheController):
                 )
             return allocation
 
-        host_indices = self.mem_pool_host.alloc(len(device_indices), reclaim=reclaim)
+        host_indices = self.mem_pool_host.alloc(
+            len(device_indices), reclaim=reclaim, start_class=start_class
+        )
         if host_indices is None:
             return None
         pool_transfers = self.mem_pool_host.resolve_host_transfers(
@@ -549,8 +554,11 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
         flush: bool = True,
+        start_class: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
-        allocation = self.allocate_host_transfers(device_indices, extra_pools)
+        allocation = self.allocate_host_transfers(
+            device_indices, extra_pools, start_class=start_class
+        )
         if allocation is None:
             return None
         host_indices, pool_transfers = allocation
@@ -993,7 +1001,15 @@ class HybridCacheController(BaseHiCacheController):
         elif not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         else:
-            device_indices = full_allocator.alloc(len(host_indices))
+            if isinstance(full_allocator, PageInterleavePoolAllocator):
+                # Loaded pages keep their host copies' owners; host slots share
+                # the device placement, so the first page id gives the class.
+                device_indices = full_allocator.alloc_cyclic(
+                    start_class=int(host_indices[0]) // full_allocator.page_size,
+                    need_size=len(host_indices),
+                )
+            else:
+                device_indices = full_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
 
@@ -1473,6 +1489,11 @@ class HybridCacheController(BaseHiCacheController):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if uses_shared_host_layout(host_pool):
             return host_indices, device_indices
+        if isinstance(host_pool, PageInterleaveHostPoolMixin):
+            # Each shard rank copies only its own pages, as local rows.
+            host_indices, device_indices = host_pool.owned_rows(
+                host_indices=host_indices, device_indices=device_indices
+            )
         if write_back_jit and host_pool.can_use_write_back_jit:
             if host_indices.is_cuda:
                 host_indices = host_indices.cpu()
