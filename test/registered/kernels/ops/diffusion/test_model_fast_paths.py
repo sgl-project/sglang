@@ -155,7 +155,7 @@ from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=125, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=140, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -2514,6 +2514,34 @@ def test_wan_fused_qkv_keeps_bits_and_frees_with_its_layers():
         block.fuse_qkv_weights()
         assert block._fused_qkv(x.device) is not None
         assert torch.equal(run(), ref)
+
+
+@requires_inline_ptx
+@torch.no_grad()
+def test_wan_chained_blocks_match_blocks_one_by_one():
+    """Each block hands its FFN residual (MulAdd) to the next block's norm1, which
+    adds it in the same kernel; the chain keeps the bits of blocks run one by one."""
+    with _wan_block_env():
+        blocks = [_wan_block() for _ in range(3)]
+        assert all(block.chains_ffn_residual for block in blocks)
+        x, args, cache = _wan_block_inputs()
+        x = x * 4
+
+        ref = x
+        for block in blocks:
+            ref = block(ref, *args, rope_cos_sin_cache=cache)
+
+        hidden, residual = x, None
+        for block in blocks[:-1]:
+            hidden, residual = block(
+                hidden,
+                *args,
+                rope_cos_sin_cache=cache,
+                ffn_residual=residual,
+                defer_ffn_residual=True,
+            )
+        out = blocks[-1](hidden, *args, rope_cos_sin_cache=cache, ffn_residual=residual)
+    assert torch.equal(_bits(out), _bits(ref))
 
 
 if __name__ == "__main__":
