@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_group,
@@ -42,6 +43,11 @@ from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 logger = init_logger(__name__)
 
 IS_AMP_SUPPORTED = current_platform.is_amp_supported()
+_USE_AITER_TGEMM = current_platform.is_rocm() and envs.SGLANG_USE_ROCM_AITER_TGEMM
+if _USE_AITER_TGEMM:
+    from aiter.tuned_gemm import tgemm
+# aiter gemm_a16w16 kernels index operands with int32 offsets and fault beyond this.
+_AITER_TGEMM_MAX_NUMEL = 2**31
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
     "AWQMarlinLinearMethod",
@@ -61,6 +67,13 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "HQQMarlinMethod",
     "QuarkLinearMethod",
 ]
+
+
+def _uses_weight_loader_v2(quant_method: QuantizeMethodBase) -> bool:
+    # Subclasses inherit their base method's parameter types and loader contract.
+    return any(
+        cls.__name__ in WEIGHT_LOADER_V2_SUPPORTED for cls in type(quant_method).__mro__
+    )
 
 
 def adjust_scalar_to_fused_array(
@@ -88,8 +101,34 @@ def adjust_scalar_to_fused_array(
     return param[shard_id], loaded_weight
 
 
+def _load_tensor_parallel_weight(
+    param: Parameter,
+    loaded_weight: torch.Tensor,
+    tp_rank: int,
+    shard_dim: int | None,
+) -> None:
+    is_sharded_weight = getattr(param, "is_sharded_weight", False)
+    param_data = param.data
+    # Already-sharded checkpoints (e.g. bitsandbytes) must not be sliced twice.
+    if shard_dim is not None and not is_sharded_weight:
+        shard_size = param_data.shape[shard_dim]
+        loaded_weight = loaded_weight.narrow(
+            shard_dim, tp_rank * shard_size, shard_size
+        )
+    # AutoFP8 scales can be stored as scalars rather than length-one tensors.
+    if len(loaded_weight.shape) == 0:
+        loaded_weight = loaded_weight.reshape(1)
+    assert param_data.shape == loaded_weight.shape
+    param_data.copy_(loaded_weight)
+
+
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
+
+    def accepts_mxfp8_input(self, layer: torch.nn.Module) -> bool:
+        """Whether ``apply`` takes a prequantized ``(e4m3 input, swizzled E8M0
+        block scales)`` tuple for this layer."""
+        return False
 
     @abstractmethod
     def create_weights(
@@ -126,6 +165,36 @@ class LinearMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
 
+def apply_unquantized_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Apply a plain linear projection with the runtime's reference semantics."""
+    if x.device.type == "mps":
+        if x.dtype == weight.dtype and (bias is None or bias.dtype == x.dtype):
+            return F.linear(x, weight, bias)
+        return F.linear(
+            x.to(torch.float32),
+            weight.to(torch.float32),
+            None if bias is None else bias.to(torch.float32),
+        ).to(x.dtype)
+
+    if (
+        _USE_AITER_TGEMM
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and weight.dtype == x.dtype
+        and (bias is None or bias.dtype == x.dtype)
+        and x.numel() < _AITER_TGEMM_MAX_NUMEL
+        and x.numel() // x.shape[-1] * weight.shape[0] < _AITER_TGEMM_MAX_NUMEL
+    ):
+        return tgemm.mm(x, weight, bias)
+
+    return (
+        F.linear(x, weight, bias)
+        if IS_AMP_SUPPORTED or bias is None
+        else F.linear(x, weight, bias.to(x.dtype))
+    )
+
+
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
@@ -154,23 +223,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if x.device.type == "mps":
-            if x.dtype == layer.weight.dtype and (
-                bias is None or bias.dtype == x.dtype
-            ):
-                return F.linear(x, layer.weight, bias)
-            return F.linear(
-                x.to(torch.float32),
-                layer.weight.to(torch.float32),
-                None if bias is None else bias.to(torch.float32),
-            ).to(x.dtype)
-
-        output = (
-            F.linear(x, layer.weight, bias)
-            if IS_AMP_SUPPORTED or bias is None
-            else F.linear(x, layer.weight, bias.to(x.dtype))
-        )  # NOTE: explicit dtype cast for bias is needed on platforms where amp isn't supported
-        return output
+        return apply_unquantized_linear(x, layer.weight, bias)
 
 
 class LinearBase(torch.nn.Module):
@@ -310,6 +363,73 @@ class ReplicatedLinear(LinearBase):
         return s
 
 
+class MergedReplicatedLinear(ReplicatedLinear):
+    """Packed replicated linear layers with shard-aware weight loading.
+
+    This is the non-tensor-parallel counterpart of
+    :class:`MergedColumnParallelLinear`. It keeps independently stored logical
+    projections in one physical weight so eager inference launches one GEMM.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: list[int],
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        params_dtype: torch.dtype | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        self.output_sizes = output_sizes
+        super().__init__(
+            input_size=input_size,
+            output_size=sum(output_sizes),
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            output_sizes=output_sizes,
+            prefix=prefix,
+        )
+
+    def weight_loader(
+        self,
+        param: Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: int | str | None = None,
+    ) -> None:
+        if loaded_shard_id is None:
+            return super().weight_loader(param, loaded_weight)
+
+        if isinstance(loaded_shard_id, str):
+            try:
+                loaded_shard_id = {"q": 0, "k": 1, "v": 2}[loaded_shard_id]
+            except KeyError as exc:
+                raise ValueError(f"Invalid merged shard id: {loaded_shard_id}") from exc
+        if not 0 <= loaded_shard_id < len(self.output_sizes):
+            raise ValueError(f"Invalid merged shard id: {loaded_shard_id}")
+        param_data = param.data
+        output_dim = getattr(param, "output_dim", None)
+        if output_dim is not None:
+            shard_offset = sum(self.output_sizes[:loaded_shard_id])
+            shard_size = self.output_sizes[loaded_shard_id]
+            param_data = param_data.narrow(output_dim, shard_offset, shard_size)
+        elif getattr(param, "is_metadata", False):
+            shard_size = loaded_weight.shape[0]
+            param_data = param_data.narrow(0, loaded_shard_id * shard_size, shard_size)
+        elif getattr(param, "needs_scalar_to_array", False):
+            param_data, loaded_weight = adjust_scalar_to_fused_array(
+                param_data, loaded_weight, loaded_shard_id
+            )
+        if tuple(param_data.shape) != tuple(loaded_weight.shape):
+            raise ValueError(
+                f"Tried to load merged shard of size {loaded_weight.size()} "
+                f"to a parameter slice of size {param_data.size()}"
+            )
+        param_data.copy_(loaded_weight)
+
+
 class ColumnParallelLinear(LinearBase):
     """Linear layer with column parallelism.
 
@@ -379,7 +499,7 @@ class ColumnParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if _uses_weight_loader_v2(self.quant_method)
                 else self.weight_loader
             ),
         )
@@ -401,25 +521,9 @@ class ColumnParallelLinear(LinearBase):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor) -> None:
-        tp_rank = self.tp_rank
-        output_dim = getattr(param, "output_dim", None)
-
-        is_sharded_weight = getattr(param, "is_sharded_weight", False)
-        is_sharded_weight = is_sharded_weight
-
-        param_data = param.data
-        if output_dim is not None and not is_sharded_weight:
-            shard_size = param_data.shape[output_dim]
-            start_idx = tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
-
-        # Special case for loading scales off disk, which often do not
-        # have a shape (such as in the case of AutoFP8).
-        if len(loaded_weight.shape) == 0:
-            loaded_weight = loaded_weight.reshape(1)
-
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        _load_tensor_parallel_weight(
+            param, loaded_weight, self.tp_rank, getattr(param, "output_dim", None)
+        )
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor) -> None:
         # Special case for loading scales off disk, which often do not
@@ -553,7 +657,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             is_sharded_weight = getattr(param, "is_sharded_weight", False)
             # bitsandbytes loads the weights of the specific portion
             # no need to narrow
-            is_sharded_weight = is_sharded_weight
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = tp_rank * shard_size
@@ -951,7 +1054,6 @@ class QKVParallelLinear(ColumnParallelLinear):
             is_sharded_weight = getattr(param, "is_sharded_weight", False)
             # bitsandbytes loads the weights of the specific portion
             # no need to narrow
-            is_sharded_weight = is_sharded_weight
 
             shard_idx = 0
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
@@ -1052,7 +1154,7 @@ class RowParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if _uses_weight_loader_v2(self.quant_method)
                 else self.weight_loader
             ),
         )
@@ -1075,26 +1177,9 @@ class RowParallelLinear(LinearBase):
             self.register_parameter("bias", None)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        tp_rank = self.tp_rank
-        input_dim = getattr(param, "input_dim", None)
-        is_sharded_weight = getattr(param, "is_sharded_weight", False)
-        # bitsandbytes loads the weights of the specific portion
-        # no need to narrow
-        is_sharded_weight = is_sharded_weight
-
-        param_data = param.data
-        if input_dim is not None and not is_sharded_weight:
-            shard_size = param_data.shape[input_dim]
-            start_idx = tp_rank * shard_size
-            loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
-
-        # Special case for loading scales off disk, which often do not
-        # have a shape (such as in the case of AutoFP8).
-        if len(loaded_weight.shape) == 0:
-            loaded_weight = loaded_weight.reshape(1)
-
-        assert param_data.shape == loaded_weight.shape
-        param_data.copy_(loaded_weight)
+        _load_tensor_parallel_weight(
+            param, loaded_weight, self.tp_rank, getattr(param, "input_dim", None)
+        )
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
         # Special case for loading scales off disk, which often do not

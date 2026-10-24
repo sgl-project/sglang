@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
 )
 from sglang.srt.layers.dcp.layout import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_device, get_parallel
 
 
@@ -110,9 +111,10 @@ def prepare_decode_context_parallel_metadata(
         parallel.dcp_size,
     )
     # Prefix lengths are dcp_size-aligned (widened allocator page), so no nonzero().
-    dcp_local_prefix_kv_indices = (
+    # `get_mla_kv_buffer` is a read door with the caller-translates contract.
+    translator = get_attn_backend().kv_index_translator
+    dcp_local_prefix_kv_indices = translator.translate_dcp_read_ids(
         dcp_prefix_kv_indices[parallel.dcp_rank :: parallel.dcp_size]
-        // parallel.dcp_size
     )
     dcp_kv_buffer = torch.empty(
         (
@@ -139,7 +141,14 @@ def plan_dcp_decode_metadata(
     init_metadata_replay: bool,
     fast_decode_kwargs: dict,
     bs: int,
-):
+) -> int:
+    """Shard `kv_indices` to this DCP rank in place; return the shard's length.
+
+    `kv_lens` / `kv_indptr` are rewritten to the per-rank lengths, and this
+    rank's ids (`loc % dcp_size == dcp_rank`) are compacted into
+    `kv_indices[:total_local_len]`, still WIDENED. The returned length bounds the
+    prefix the caller hands to `KVIndexTranslator.translate_dcp_read_ids`.
+    """
     parallel = get_parallel()
     local_kv_lens = kv_lens.clone()
     update_local_kv_lens_for_dcp(local_kv_lens)
@@ -185,3 +194,4 @@ def plan_dcp_decode_metadata(
     kv_indices[:total_local_len] = local_kv_indices[:total_local_len]
     kv_lens.copy_(local_kv_lens)
     kv_indptr[: bs + 1] = local_kv_lens_cumsum[: bs + 1]
+    return total_local_len

@@ -47,6 +47,9 @@ class StageParallelismType(Enum):
     CFG_PARALLEL = auto()
     # executed on main rank only and send result to other ranks
     MAIN_RANK_ONLY_AND_SEND_TO_OTHERS = auto()
+    # a stage without CFG runs on every CFG rank, sequence-sharded over them
+    # as one Ulysses group; its inputs must already match across CFG ranks
+    SEQUENCE_PARALLEL_OVER_CFG_RANKS = auto()
 
 
 class StageVerificationError(Exception):
@@ -132,18 +135,9 @@ class PipelineStage(StageDedupMixin, ABC):
         # Default implementation - no verification
         return VerificationResult()
 
-    def maybe_free_model_hooks(self):
-        pass
-
     def load_model(self):
         """
         Load the model for the stage.
-        """
-        pass
-
-    def offload_model(self):
-        """
-        Offload the model for the stage.
         """
         pass
 
@@ -215,8 +209,7 @@ class PipelineStage(StageDedupMixin, ABC):
                 return replace(use, target_dtype=target_dtype)
             return use
         raise ValueError(
-            f"{self.__class__.__name__} did not declare component use: "
-            f"{component_name}"
+            f"{self.__class__.__name__} did not declare component use: {component_name}"
         )
 
     @contextmanager
@@ -255,6 +248,12 @@ class PipelineStage(StageDedupMixin, ABC):
         )
         self._component_residency_manager.begin_use(use, module=module)
 
+    def finish_unused_declared_component(self, *, component_name: str, module=None):
+        if self._component_residency_manager is None:
+            return
+        use = self._declared_component_use(component_name=component_name)
+        self._component_residency_manager.finish_unused_component(use, module=module)
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
@@ -292,6 +291,11 @@ class PipelineStage(StageDedupMixin, ABC):
         # if get_global_server_args().enable_cfg_parallel:
         #     return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
+
+    def parallelism_type_for(self, batch: Req | list[Req]) -> StageParallelismType:
+        """The parallelism the executor runs ``batch`` with; every rank must
+        resolve the same type."""
+        return self.parallelism_type
 
     def cfg_parallel_local_batch_fields(
         self, batch: Req, server_args: ServerArgs
@@ -346,15 +350,6 @@ class PipelineStage(StageDedupMixin, ABC):
             current_platform.device_type,
         )
 
-    def set_logging(self, enable: bool):
-        """
-        Enable or disable logging for this stage.
-
-        Args:
-            enable: Whether to enable logging.
-        """
-        self._enable_logging = enable
-
     def __call__(
         self,
         batch: Req,
@@ -384,6 +379,9 @@ class PipelineStage(StageDedupMixin, ABC):
 
         # Execute the actual stage logic with unified profiling.
         previous_batch_is_warmup = self._current_batch_is_warmup
+        metrics = batch.metrics
+        if metrics is not None and self.role_affinity == RoleType.DENOISER:
+            metrics.denoising_stages.add(stage_name)
         self._current_batch_is_warmup = batch.is_warmup
         try:
             with StageProfiler(

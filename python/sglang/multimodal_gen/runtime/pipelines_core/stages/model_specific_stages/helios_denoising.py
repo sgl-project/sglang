@@ -22,15 +22,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
     get_or_create_request_scheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-    PipelineStage,
-    StageParallelismType,
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    toggle_quality_fusions,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -106,14 +106,18 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.scheduler = scheduler
+        self._mounted_quality = "exact"
+
+    def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
+        quality = getattr(batch.sampling_params, "quality", "lossless")
+        if quality == self._mounted_quality:
+            return
+        toggle_quality_fusions([self.transformer], quality)
+        self._mounted_quality = quality
 
     @property
     def role_affinity(self) -> RoleType:
         return RoleType.DENOISER
-
-    @property
-    def parallelism_type(self):
-        return StageParallelismType.REPLICATED
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -481,6 +485,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the Helios chunked denoising loop."""
+        self._maybe_toggle_quality_fusions(batch)
         pipeline_config = server_args.pipeline_config
         scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         device = (

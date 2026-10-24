@@ -1,5 +1,6 @@
 """Start bootstrap/kv-store-related server"""
 
+import logging
 import os
 
 from sglang.srt.disaggregation.utils import (
@@ -14,14 +15,30 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def start_disagg_service():
     # Start kv bootstrap server on prefill
     disagg_mode = DisaggregationMode(get_disagg().disaggregation_mode)
     transfer_backend = TransferBackend(get_disagg().disaggregation_transfer_backend)
 
-    if disagg_mode == DisaggregationMode.PREFILL:
-        # only start bootstrap server on prefill tm
+    # With role switching, run bootstrap on every instance (not just prefill) so
+    # one flipped to prefill already has it; it isn't rebuilt on flip.
+    start_bootstrap = disagg_mode == DisaggregationMode.PREFILL or (
+        get_disagg().enable_pd_role_switch and disagg_mode != DisaggregationMode.NULL
+    )
+
+    if start_bootstrap and get_disagg().enable_pd_role_switch:
+        logger.warning(
+            "Role switch starts a bootstrap server on this instance at %s:%d. "
+            "If another PD instance runs on the same host, give each one a "
+            "distinct --disaggregation-bootstrap-port or the bind will conflict.",
+            get_serving().host,
+            get_disagg().disaggregation_bootstrap_port,
+        )
+
+    if start_bootstrap:
         kv_bootstrap_server_class = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER
         )
@@ -34,6 +51,21 @@ def start_disagg_service():
         return bootstrap_server
 
 
+def rust_server_serves_kv_bootstrap(transfer_backend: str) -> bool:
+    """Whether the embedded Rust server's KV bootstrap registry stands in for
+    the transfer backend's bootstrap server: it ports ``CommonKVBootstrapServer``,
+    the HTTP registry the built-in backends run, but not a backend that brings
+    a bootstrap server of its own."""
+    from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
+
+    server_class = get_kv_class(
+        TransferBackend(transfer_backend), KVClassType.BOOTSTRAP_SERVER
+    )
+    return server_class is not None and issubclass(
+        server_class, CommonKVBootstrapServer
+    )
+
+
 def maybe_create_ascend_config_store(transfer_backend: TransferBackend) -> None:
     """Also called directly by the rust-server scheduler: there the KV
     bootstrap registry is served by the embedded rust server's api listener
@@ -42,8 +74,7 @@ def maybe_create_ascend_config_store(transfer_backend: TransferBackend) -> None:
     which the rust registry ports verbatim), leaving this store as the only
     ``start_disagg_service`` duty left to perform."""
     if not (
-        get_parallel().config.node_rank == 0
-        and transfer_backend == TransferBackend.ASCEND
+        get_parallel().node_rank == 0 and transfer_backend == TransferBackend.ASCEND
     ):
         return
     try:

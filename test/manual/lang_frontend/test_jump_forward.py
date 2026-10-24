@@ -47,6 +47,7 @@ json_jump_forward = (
     + r"""\}\n"""
 )
 
+
 # fmt: off
 @sgl.function
 def json_gen(s):

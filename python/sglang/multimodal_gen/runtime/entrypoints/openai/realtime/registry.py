@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
-    BaseRealtimeModelAdapter,
-)
-
 if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.realtime_adapter import (
+        BaseRealtimeModelAdapter,
+    )
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -28,11 +27,17 @@ def _register_builtin_realtime_model_adapters() -> None:
     if _BUILTIN_ADAPTERS_REGISTERED:
         return
 
+    from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
+        CosmosDreamsRealtimeConfig,
+    )
     from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
         LingBotWorldCausalDMDConfig,
     )
     from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
         SanaWMRealtimeConfig,
+    )
+    from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.cosmos_dreams_realtime_adapter import (
+        CosmosDreamsRealtimeAdapter,
     )
     from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.adapters.lingbot_world_realtime_adapter import (
         LingBotWorldRealtimeAdapter,
@@ -41,6 +46,10 @@ def _register_builtin_realtime_model_adapters() -> None:
         SanaWMRealtimeAdapter,
     )
 
+    register_realtime_model_adapter(
+        CosmosDreamsRealtimeConfig,
+        CosmosDreamsRealtimeAdapter,
+    )
     register_realtime_model_adapter(
         LingBotWorldCausalDMDConfig,
         LingBotWorldRealtimeAdapter,
@@ -66,4 +75,13 @@ def get_realtime_model_adapter(
     raise ValueError(
         "Realtime video is not supported for pipeline config "
         f"{type(pipeline_config).__name__}; no realtime adapter is registered."
+    )
+
+
+def has_realtime_model_adapter(server_args: ServerArgs) -> bool:
+    """Whether the resolved pipeline config has a registered adapter."""
+    _register_builtin_realtime_model_adapters()
+    return any(
+        config_cls in _REALTIME_ADAPTER_REGISTRY
+        for config_cls in type(server_args.pipeline_config).__mro__
     )

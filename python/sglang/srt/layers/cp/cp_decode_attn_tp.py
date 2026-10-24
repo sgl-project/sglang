@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.runtime_context import get_parallel
 
@@ -51,7 +51,7 @@ class CpDecodeAttnTpContext:
     """Slices replicated attention weights across CP ranks during decode."""
 
     def __init__(self):
-        enable_attn_tp = get_parallel().config.enable_cp_decode_attn_tp
+        enable_attn_tp = get_parallel().enable_cp_decode_attn_tp
 
         if enable_attn_tp and get_parallel().attn_cp_size > 1:
             self.decode_tp_rank = get_parallel().attn_cp_rank
@@ -60,7 +60,6 @@ class CpDecodeAttnTpContext:
         else:
             self.decode_tp_rank = None
             self.decode_tp_size = None
-            logger.info("Disable CP decode attention TP")
 
         self.use_decode_attn_tp = False
         self._slice_cache: Dict = {}
@@ -75,7 +74,7 @@ class CpDecodeAttnTpContext:
             return
         # Skip during prefill context parallel (needs all heads); apply on every
         # other forward, which includes decode.
-        self.use_decode_attn_tp = not is_cp_v2_active(
+        self.use_decode_attn_tp = not is_cp_active(
             forward_batch
         ) and not dsa_use_prefill_cp(forward_batch)
 
@@ -84,6 +83,17 @@ class CpDecodeAttnTpContext:
         chunk = tensor.shape[dim] // self.decode_tp_size
         sliced = tensor.narrow(dim, self.decode_tp_rank * chunk, chunk)
         return sliced if dim == 0 else sliced.contiguous()
+
+    def _slice_aiter_bpreshuffled_weight(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Slice an AITER B-preshuffled weight along logical K."""
+        from aiter.ops.shuffle import shuffle_weight
+
+        from sglang.srt.layers.quantization.fp8_utils import (
+            unshuffle_aiter_fp8_weight,
+        )
+
+        logical = unshuffle_aiter_fp8_weight(tensor)
+        return shuffle_weight(self._slice(logical, 1), layout=(16, 16))
 
     # ==================== Unified activate/restore ====================
 
@@ -106,7 +116,16 @@ class CpDecodeAttnTpContext:
         cache_key = (id(obj), attr_name)
         cache = self._slice_cache.get(cache_key)
         if cache is None:
-            cache = (raw, self._slice(raw, dim), is_param)
+            if (
+                attr_name == "weight"
+                and dim == 1
+                and getattr(obj, "aiter_bpreshuffled", False)
+            ):
+                sliced = self._slice_aiter_bpreshuffled_weight(raw)
+            else:
+                sliced = self._slice(raw, dim)
+            # Cache shards to avoid recomputation and keep CUDA graph pointers stable.
+            cache = (raw, sliced, is_param)
             self._slice_cache[cache_key] = cache
 
         if cache[2]:
