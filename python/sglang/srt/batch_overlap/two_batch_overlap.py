@@ -832,6 +832,10 @@ class TboForwardBatchPreparer:
                 attn_tp_sequence_sharded=batch.attn_tp_sequence_sharded,
                 encoder_swa_replay=batch.encoder_swa_replay,
                 tbo_split_seq_index=None,
+                # TBO sub-batches keep the existing single-call mixed FIA path;
+                # their request/token boundaries differ from the parent batch.
+                mixed_num_prefill_reqs=None,
+                mixed_num_prefill_tokens=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
                 original_global_num_tokens_cpu=None,

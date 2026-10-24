@@ -586,6 +586,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     global_forward_mode: Optional[ForwardMode] = None
 
+    # Request/token boundary of the prefill-first segment in a mixed batch.
+    mixed_num_prefill_reqs: Optional[int] = None
+    mixed_num_prefill_tokens: Optional[int] = None
+
     # Current layer-stack invocation; each TBO child owns a separate stream.
     residual_stream: Optional[ResidualStream] = None
 
@@ -1080,6 +1084,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_prefill_cuda_graph=batch.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=batch.dp_prefill_cuda_graph_max_prefix_len,
             global_forward_mode=batch.global_forward_mode,
+            mixed_num_prefill_reqs=batch.mixed_num_prefill_reqs,
+            mixed_num_prefill_tokens=batch.mixed_num_prefill_tokens,
             is_prefill_only=batch.is_prefill_only,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
             spec_algorithm=batch.spec_algorithm,

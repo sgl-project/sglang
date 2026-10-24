@@ -351,7 +351,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         self._qwen_bcg_hc_sidechannel = qwen_bcg and not model_runner.is_draft_worker
         self._qwen_bcg_mtp_draft = qwen_bcg and model_runner.is_draft_worker
-        self.prefer_eager_mixed_prefill = (
+        # FIA mixed split needs MIXED dispatch. Use the common local policy
+        # so schedule-time DP votes and forward-time replay agree on eager.
+        self.prefer_eager_mixed_prefill = getattr(
+            model_runner.attn_backend, "enable_fia_mixed_split", False
+        ) or (
             self.prefill_backend_name == Backend.BREAKABLE
             and get_parallel().attn_dp_enabled
             and getattr(

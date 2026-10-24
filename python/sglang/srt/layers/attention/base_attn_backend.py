@@ -90,6 +90,11 @@ class AttentionBackend(ABC):
     # allow-list enforces.
     kv_index_translator = None
 
+    # Set by AscendAttnBackend when the NPU mixed-chunk FIA split is active, and
+    # mirrored by wrappers that hold it as a child. Dispatch sites read it to
+    # decide whether ForwardMode.MIXED must survive until forward_mixed().
+    enable_fia_mixed_split: bool = False
+
     def get_fused_kv_write_buffers(
         self, layer: RadixAttention, forward_batch: ForwardBatch
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:

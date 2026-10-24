@@ -13,6 +13,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers import schedule_batch  # noqa: E402
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
     Req,
     ScheduleBatch,
@@ -324,6 +325,7 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
             return_logprob=False,
             forward_mode=ForwardMode.EXTEND,
             enable_overlap=False,
+            device="cpu",
             is_prefill_only=True,
             out_cache_loc=torch.arange(6, dtype=torch.int64),
             prefix_lens=[0, 0],
@@ -356,6 +358,8 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
 
         self.assertEqual(extend_batch.forward_mode, ForwardMode.MIXED)
         self.assertIs(extend_batch.mix_running_indices, running_batch.req_pool_indices)
+        self.assertEqual(extend_batch.mixed_num_prefill_reqs, 2)
+        self.assertEqual(extend_batch.mixed_num_prefill_tokens, 6)
         self.assertEqual([r.rid for r in extend_batch.reqs], ["e1", "e2", "r1"])
         self.assertTrue(
             torch.equal(extend_batch.out_cache_loc, torch.arange(7, dtype=torch.int64))
@@ -370,6 +374,21 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
         self.assertIsNot(extend_batch.extend_lens, extend_lens_before)
         _assert_snapshot_not_mutated(self, extend_snapshot)
         _assert_snapshot_not_mutated(self, running_snapshot)
+
+        future_map = types.SimpleNamespace(
+            output_tokens_buf=torch.tensor([99], dtype=torch.int64),
+            spec_algo=types.SimpleNamespace(is_none=lambda: True),
+        )
+        resolve_forward_inputs(extend_batch, future_map)
+        self.assertIsNone(extend_batch.mix_running_indices)
+        self.assertEqual(extend_batch.mixed_num_prefill_reqs, 2)
+        self.assertEqual(extend_batch.mixed_num_prefill_tokens, 6)
+        self.assertTrue(
+            torch.equal(
+                extend_batch.input_ids,
+                torch.tensor([0, 1, 99], dtype=torch.int64),
+            )
+        )
 
 
 class TestPrepareEncoderInfoExtendOutOfPlace(unittest.TestCase):
