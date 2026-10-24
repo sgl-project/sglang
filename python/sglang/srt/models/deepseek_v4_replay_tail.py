@@ -149,7 +149,7 @@ class DecoderReplayTail:
             row_step=row_step, max_rows=max_rows, label="Decoder tail graph"
         )
         self._static_ids_global: dict[torch.dtype, torch.Tensor] = {}
-        # Older, smaller sets stay alive for the graphs that read them.
+        # Older, smaller sets stay alive for the graphs that write and read them.
         self._bridge_buffers: dict[tuple, List[List[Optional[torch.Tensor]]]] = {}
 
     @classmethod
@@ -477,10 +477,11 @@ class DecoderReplayTail:
         block_rows: int,
         source_kv_layer_id: Optional[int],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], List[torch.Tensor]]:
-        """Runs the tail in one break of the outer prefill graph, bridged into its
-        ``block_rows`` block."""
+        """Runs the tail in one break of the outer prefill graph; the break fills
+        the bridge this caller passes, over its ``block_rows`` block."""
         leaves, has_pre, rebuild = _flatten_state(state)
         bridge_key = (capture_dspark, has_pre)
+        bridge = self._bridge(bridge_key, block_rows)
         bcg_tail_layers_in_prefill_graph(
             self,
             rebuild,
@@ -489,20 +490,21 @@ class DecoderReplayTail:
             source_kv_layer_id,
             get_parallel().attn_dp_size > 1,
             bridge_key,
-            self._bridge(bridge_key, block_rows),
+            bridge,
             leaves,
             positions,
             input_ids,
             input_ids if input_ids_global is None else input_ids_global,
         )
+        if bridge is None:
+            bridge = self._bridge(bridge_key, block_rows)
         residual, pre, *aux = (
-            None if buf is None else buf[:block_rows]
-            for buf in self._bridge(bridge_key, block_rows)
+            None if buf is None else buf[:block_rows] for buf in bridge
         )
         return residual, pre, aux
 
     def _bridge(
-        self, key: tuple, block_rows: int
+        self, key: Tuple[bool, bool], block_rows: int
     ) -> Optional[List[Optional[torch.Tensor]]]:
         """The newest bridge buffers that hold ``block_rows`` rows, or None before
         the tail first runs or when the block outgrows them."""
@@ -513,7 +515,7 @@ class DecoderReplayTail:
 
     def _write_bridge(
         self,
-        key: tuple,
+        key: Tuple[bool, bool],
         block_rows: int,
         bridge: Optional[List[Optional[torch.Tensor]]],
         outputs: List[Optional[torch.Tensor]],
@@ -528,8 +530,14 @@ class DecoderReplayTail:
             ]
             self._bridge_buffers.setdefault(key, []).insert(0, bridge)
         for buf, t in zip(bridge, outputs, strict=True):
-            if t is not None:
-                buf[: t.shape[0]].copy_(t)
+            if t is None:
+                assert buf is None, "tail outputs differ within one bridge key"
+                continue
+            assert (buf.dtype, buf.shape[1:]) == (t.dtype, t.shape[1:]), (
+                (buf.dtype, buf.shape),
+                (t.dtype, t.shape),
+            )
+            buf[: t.shape[0]].copy_(t)
 
     def _ids_global_buffer(self, dtype: torch.dtype, dp_size: int) -> torch.Tensor:
         buf = self._static_ids_global.get(dtype)
@@ -676,7 +684,7 @@ def _tail_layers_in_prefill_graph(
     block_rows: int,
     source_kv_layer_id: Optional[int],
     dp: bool,
-    bridge_key: tuple,
+    bridge_key: Tuple[bool, bool],
     bridge: Optional[List[Optional[torch.Tensor]]],
     leaves: List[torch.Tensor],
     positions: torch.Tensor,
@@ -744,7 +752,9 @@ def _tail_layers_in_prefill_graph(
             residual, pre, aux = tail_layers.run(**kwargs)
         else:
             residual, pre, aux = tail_layers._run_layers_eagerly(**kwargs)
-        tail_layers._write_bridge(bridge_key, block_rows, bridge, [residual, pre, *aux])
+        tail_layers._write_bridge(
+            bridge_key, block_rows, bridge, outputs=[residual, pre, *aux]
+        )
     finally:
         bcg_module._current_capture_var.reset(capture_token)
         backend.exit_late_layer_tail(saved, forward_batch)

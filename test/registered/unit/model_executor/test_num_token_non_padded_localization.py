@@ -611,7 +611,7 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
                         batch.input_ids,
                         batch.input_ids,
                     )
-                outputs = tail_layers._write_bridge.call_args.args[3]
+                outputs = tail_layers._write_bridge.call_args.kwargs["outputs"]
                 self.assertIs(outputs[0], output)
                 self.assertEqual(tail_layers.run.call_count, expected)
                 self.assertEqual(
@@ -628,6 +628,23 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
             self.assertFalse(
                 replay_tail.DecoderReplayTail._can_capture_moe_bound(batch)
             )
+
+
+class TestDecoderReplayTailBridge(CustomTestCase):
+    def test_a_graph_keeps_writing_the_bridge_it_captured(self):
+        tail = object.__new__(replay_tail.DecoderReplayTail)
+        tail._bridge_buffers = {}
+        key = (False, False)
+        self.assertIsNone(tail._bridge(key, 4))
+        tail._write_bridge(key, 4, None, [torch.ones(3, 2), None])
+        small = tail._bridge(key, 4)
+        self.assertIs(tail._bridge(key, 2), small)
+        # A larger block gets a new set; the smaller graph still writes its own.
+        self.assertIsNone(tail._bridge(key, 8))
+        tail._write_bridge(key, 8, None, [torch.ones(8, 2), None])
+        tail._write_bridge(key, 4, small, [torch.full((2, 2), 5.0), None])
+        self.assertEqual(small[0][:2].tolist(), [[5.0, 5.0]] * 2)
+        self.assertEqual(tail._bridge(key, 8)[0][:2].tolist(), [[1.0, 1.0]] * 2)
 
 
 if __name__ == "__main__":
