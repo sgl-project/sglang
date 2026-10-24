@@ -113,6 +113,13 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
         scales = (self.k_sf_page_bytes + self.v_sf_page_bytes) // self.page_size
         return payload + scales * self.layer_num
 
+    def get_mapping_lengths(self) -> list[int]:
+        return [
+            self.size * super().get_size_per_token(),
+            self.page_num * self.layer_num * self.k_sf_page_bytes,
+            self.page_num * self.layer_num * self.v_sf_page_bytes,
+        ]
+
     def _init_scale_buffers(self, k_scales, v_scales):
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
         # Host: page-first like the payload, one contiguous scale block per

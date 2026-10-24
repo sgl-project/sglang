@@ -71,6 +71,7 @@ logger = logging.getLogger(__name__)
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
+    host_memory_allocation_bytes,
     host_memory_budget_bytes,
     synchronized,
 )
@@ -286,12 +287,24 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.device_buffers = device_buffers
         self.gpu_device = device_buffers[0].device if device_buffers else device
 
-        requested_bytes = self.layer_num * num_host_pages * self.item_bytes
-        available_bytes = host_memory_budget_bytes()
-        if requested_bytes > available_bytes:
+        if layout == "layer_first":
+            mapping_lengths = [num_host_pages * self.item_bytes] * self.layer_num
+        else:
+            mapping_lengths = [num_host_pages * self.layer_num * self.item_bytes]
+        allocation_bytes = host_memory_allocation_bytes(
+            mapping_lengths,
+            allocator=self.allocator,
+            device=self.gpu_device,
+        )
+        available_bytes = host_memory_budget_bytes(
+            allocation_bytes,
+            allocator=self.allocator,
+            device=self.gpu_device,
+        )
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for V4 paged pool {pool_name}. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
@@ -341,7 +354,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         logger.info(
             "Allocating %.2f GB host memory for V4 paged pool '%s' "
             "(layers=%d, pages=%d, item_bytes=%d, layout=%s).",
-            requested_bytes / 1e9,
+            allocation_bytes / 1e9,
             self.pool_name,
             self.layer_num,
             num_host_pages,
@@ -805,12 +818,24 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self._init_device_page_views()
         self.size_per_token = self.state_page_bytes
 
-        requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
-        available_bytes = host_memory_budget_bytes()
-        if requested_bytes > available_bytes:
+        if layout == "layer_first":
+            mapping_lengths = [num_host_pages * self.state_page_bytes] * self.layer_num
+        else:
+            mapping_lengths = [num_host_pages * self.layer_num * self.state_page_bytes]
+        allocation_bytes = host_memory_allocation_bytes(
+            mapping_lengths,
+            allocator=self.allocator,
+            device=self.gpu_device,
+        )
+        available_bytes = host_memory_budget_bytes(
+            allocation_bytes,
+            allocator=self.allocator,
+            device=self.gpu_device,
+        )
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for V4 state pool {pool_name}. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
@@ -858,7 +883,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         logger.info(
             "Allocating %.2f GB host memory for V4 state pool '%s' "
             "(layers=%d, pages=%d, state_page_bytes=%d, layout=%s).",
-            requested_bytes / 1e9,
+            allocation_bytes / 1e9,
             self.pool_name,
             self.layer_num,
             num_host_pages,

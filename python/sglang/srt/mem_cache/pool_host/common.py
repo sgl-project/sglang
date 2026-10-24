@@ -8,11 +8,17 @@ import os
 import weakref
 from collections import defaultdict
 from functools import lru_cache
+from typing import Union
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.storage.mmap import alloc_mmap
+from sglang.srt.mem_cache.storage.mmap import (
+    alloc_mmap,
+    hugetlb_pool_free_bytes,
+    tensor_uses_hugepage,
+)
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import hugepage_size_requested
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_hip
 
@@ -36,6 +42,21 @@ class HostTensorAllocator:
         self.dtype = dtype
         self.dims = dims
         return alloc_mmap(dims, dtype)
+
+    def free_hugetlb_bytes(self) -> int:
+        """Free hugetlb-pool bytes allocate() could map from, else 0.
+
+        Only the base allocate() maps MAP_HUGETLB (alloc_mmap honors
+        SGLANG_HUGEPAGE_SIZE). A subclass that overrides allocate() gets its
+        memory elsewhere and is credited nothing unless it overrides this too.
+        """
+        if not self.supports_hugetlb():
+            return 0
+        return hugetlb_pool_free_bytes()
+
+    def supports_hugetlb(self) -> bool:
+        """Whether allocate() can honor the SGLANG hugepage policy."""
+        return type(self).allocate is HostTensorAllocator.allocate
 
 
 class ShmHostTensorAllocator(HostTensorAllocator):
@@ -147,6 +168,11 @@ def _cuda_host_register(
     cudart = torch.cuda.cudart()
     base = buffer.data_ptr()
     total = buffer.numel() * buffer.element_size()
+    # cudaHostRegister requires hugetlb-backed ranges whose base or size are
+    # hugepage-aligned, so round the size up to the hugepage size.
+    hugepage_size = hugepage_size_requested() if tensor_uses_hugepage(buffer) else 0
+    if hugepage_size:
+        total = -(-total // hugepage_size) * hugepage_size
     chunk_limit_bytes = (
         max(envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB.get(), 1) * 1024**3
     )
@@ -160,15 +186,17 @@ def _cuda_host_register(
                 "registration_granularity_bytes must be positive, got "
                 f"{registration_granularity_bytes}"
             )
-        if registration_granularity_bytes > chunk_limit_bytes:
+        # Every internal boundary must align to both a complete copy unit and
+        # a hugepage. Rounding to either grid separately can break the other.
+        alignment_bytes = math.lcm(registration_granularity_bytes, hugepage_size or 1)
+        if alignment_bytes > chunk_limit_bytes:
             raise ValueError(
-                "Host registration granularity exceeds the configured chunk limit: "
+                "Host registration alignment exceeds the configured chunk limit: "
                 f"granularity={registration_granularity_bytes}, "
+                f"hugepage={hugepage_size}, alignment={alignment_bytes}, "
                 f"chunk_limit={chunk_limit_bytes}"
             )
-        chunk_bytes = (
-            chunk_limit_bytes // registration_granularity_bytes
-        ) * registration_granularity_bytes
+        chunk_bytes = (chunk_limit_bytes // alignment_bytes) * alignment_bytes
     registered_ranges: list[tuple[int, int]] = []
     try:
         offset = 0
@@ -458,3 +486,15 @@ ALLOC_MEMORY_FUNCS = defaultdict(
         "xpu": alloc_with_pin_memory_xpu,
     },
 )
+
+
+def device_uses_allocator(device: Union[str, torch.device]) -> bool:
+    """Whether allocations for ``device`` go through the HostTensorAllocator.
+
+    npu/musa allocate with torch.empty(pin_memory=True) and never see it.
+    """
+    # ALLOC_MEMORY_FUNCS is keyed by device *type* string ("npu"/"musa"/...),
+    # not torch.device objects; a torch.device key silently falls back to the
+    # default (host_register), misreporting pin-memory devices.
+    key = device.type if isinstance(device, torch.device) else str(device)
+    return ALLOC_MEMORY_FUNCS[key] is alloc_with_host_register
