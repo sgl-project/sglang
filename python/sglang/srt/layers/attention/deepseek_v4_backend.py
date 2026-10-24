@@ -63,6 +63,7 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
 )
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     _rope_fq4,
+    fused_low_ratio_compress_supported,
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
@@ -3232,11 +3233,12 @@ class DeepseekV4AttnBackend(
             }
             if ratio == 1:
                 bufs["kv"] = zeros(num_tokens, latent, dtype=torch.bfloat16)
-            else:
-                # | kv | score | rows feed the fused compressor; the torch path
-                # reads the two halves.
+            elif fused_low_ratio_compress_supported():
+                # The fused compressor reads | kv | score | rows.
                 bufs["kv_score"] = zeros(num_tokens, 2 * latent, dtype=torch.float32)
-                bufs["kv"], bufs["score"] = bufs["kv_score"].split(latent, dim=-1)
+            else:
+                bufs["kv"] = zeros(num_tokens, latent, dtype=torch.float32)
+                bufs["score"] = zeros(num_tokens, latent, dtype=torch.float32)
             # Keep the previous allocations alive: captured graphs still hold them.
             sets[ratio] = [bufs] + (have or [])
         bufs = sets[ratio][0]
