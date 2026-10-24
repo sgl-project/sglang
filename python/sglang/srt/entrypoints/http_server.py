@@ -1865,8 +1865,10 @@ async def openai_v1_chat_completions(
 )
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
-    return await raw_request.app.state.openai_serving_embedding.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_embedding.handle_request(
+            request, raw_request
+        )
     )
 
 
