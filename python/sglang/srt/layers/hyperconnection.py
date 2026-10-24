@@ -7,6 +7,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.layers.hc_mix_flydsl import (
+    flydsl_hc_mix_supported,
+    flydsl_hc_mix_weights_supported,
+    weight_cache_key,
+)
+
 
 
 @lru_cache(None)
@@ -164,6 +170,10 @@ class GatedResidual(HyperConnectionBase):
                 and lowrank % 8 == 0
             )
             self._mix_up_weight_padded = None
+            # Resolved on the first mix(), once the weights are final.
+            self._mix_flydsl_ok = None
+            self._mix_flydsl_weights = None
+            self._mix_flydsl_weight_key = None
 
         self._gate_stream = None
         if use_combine:
@@ -179,8 +189,10 @@ class GatedResidual(HyperConnectionBase):
                 and (self.hc_count * self.hidden_size) % 2048 == 0
             )
             vecs = self.hc_count * self.hidden_size // 8
+            # Off on ROCm/HIP: on gfx950 Qwen decode both halves of the split pair
+            # sit at the ~4.2us launch floor, slower than the single fused kernel.
             self._split_combine_ok = (
-                self._jit_combine_ok
+                and self._jit_combine_ok
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
@@ -233,6 +245,15 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
+    def _flydsl_mix_ok(self) -> bool:
+        if self._mix_flydsl_ok is None:
+            self._mix_flydsl_ok = flydsl_hc_mix_weights_supported(
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+            )
+        return self._mix_flydsl_ok
+
     def mix(
         self,
         hyper_input: torch.Tensor,
@@ -277,6 +298,18 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
+        elif flydsl_hc_mix_supported(hyper_input_normed, self._flydsl_mix_ok()):
+            from aiter.ops.flydsl.hc_mix import hc_mix, pack_hc_weights
+
+            down = self.input_mix_weight_down.weight
+            up = self.input_mix_weight_up.weight
+            key = weight_cache_key(down, up)
+            if self._mix_flydsl_weight_key != key:
+                self._mix_flydsl_weights = pack_hc_weights(down, up, self.hc_count)
+                self._mix_flydsl_weight_key = key
+            mixed_input = hc_mix(hyper_input_normed, *self._mix_flydsl_weights).to(
+                self.params_dtype
+            )
         elif fused_hc_mix_supported(
             hyper_input_normed,
             self.input_mix_weight_down.weight,
