@@ -3,7 +3,7 @@ import json
 import multiprocessing
 import time
 import warnings
-from typing import Dict, List, Optional, Union
+from typing import AsyncIterator, Dict, List, Optional, Union
 
 import aiohttp
 import msgspec
@@ -351,6 +351,36 @@ def compute_normalized_prompt_logprobs(input_logprobs):
     return sum(values) / len(values)
 
 
+async def _iter_sse_data(stream: aiohttp.StreamReader) -> AsyncIterator[bytes]:
+    """Read LF/CRLF-delimited SSE data events, discarding an unfinished event at EOF."""
+    pending = bytearray()
+    search_from = 0
+    data_lines = []
+    # HTTP reads can split a UTF-8 character or contain several SSE events.
+    # Avoid readline(), whose size limit also applies to cumulative text events.
+    async for chunk in stream.iter_any():
+        pending.extend(chunk)
+        start = 0
+        while True:
+            end = pending.find(b"\n", search_from)
+            if end < 0:
+                # Do not scan an unfinished (potentially long) line again.
+                search_from = len(pending)
+                break
+            line = bytes(pending[start:end]).removesuffix(b"\r")
+            start = end + 1
+            search_from = start
+            if not line:
+                if data_lines:
+                    yield b"\n".join(data_lines)
+                    data_lines.clear()
+            elif line.startswith(b"data:"):
+                data_lines.append(line[5:].removeprefix(b" "))
+        if start:
+            del pending[:start]
+            search_from -= start
+
+
 class Runtime:
     """
     A wrapper for the HTTP server.
@@ -497,19 +527,17 @@ class Runtime:
         timeout = aiohttp.ClientTimeout(total=3 * 3600)
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.post(self.generate_url, json=json_data) as response:
-                async for chunk, _ in response.content.iter_chunks():
-                    chunk = chunk.decode("utf-8")
-                    if chunk and chunk.startswith("data:"):
-                        if chunk == "data: [DONE]\n\n":
-                            break
-                        data = json.loads(chunk[5:].strip("\n"))
-                        if "text" in data:
-                            cur = data["text"][pos:]
-                            if cur:
-                                yield cur
-                            pos += len(cur)
-                        else:
-                            yield data
+                async for payload in _iter_sse_data(response.content):
+                    if payload == b"[DONE]":
+                        break
+                    data = json.loads(payload)
+                    if "text" in data:
+                        cur = data["text"][pos:]
+                        if cur:
+                            yield cur
+                        pos += len(cur)
+                    else:
+                        yield data
 
     add_request = async_generate
 
