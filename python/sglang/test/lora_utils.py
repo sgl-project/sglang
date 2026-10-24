@@ -775,6 +775,9 @@ def reference_sgmv_expand(
     return output
 
 
+_TPDIAG_CALL = 0  # [TPDIAG] diagnostic only: calls in this process
+
+
 def run_lora_test_one_by_one(
     prompts: List[str],
     model_case: LoRAModelCase,
@@ -808,6 +811,8 @@ def run_lora_test_one_by_one(
         mem_fraction_static (float, optional): The fraction of memory to use. Defaults to 0.88.
         test_tag (str, optional): The tag to use for the test. Defaults to "".
     """
+    global _TPDIAG_CALL
+    _TPDIAG_CALL += 1
     base_path = model_case.base
 
     # Create used adaptors for each prompt in batch
@@ -879,6 +884,21 @@ def run_lora_test_one_by_one(
         srt_decode = torch.tensor(srt_outputs.top_output_logprobs[i])
         max_decode_diff = torch.max(torch.abs(hf_decode - srt_decode))
         print("Max decode diff (HF vs SRT):", max_decode_diff)
+        # [TPDIAG] Diagnostic only: per-position top-5 decode logprob values.
+        print(
+            f"[TPDIAG] call={_TPDIAG_CALL} row={i} adaptor={adaptor.name} "
+            f"hf_decode={tuple(hf_decode.shape)} srt_decode={tuple(srt_decode.shape)} "
+            f"hf_prefill={tuple(hf_prefill.shape)} srt_prefill={tuple(srt_prefill.shape)}",
+            flush=True,
+        )
+        for pos in range(min(hf_decode.shape[0], srt_decode.shape[0])):
+            print(
+                f"[TPDIAG] call={_TPDIAG_CALL} row={i} pos={pos} "
+                f"maxdiff={(hf_decode[pos] - srt_decode[pos]).abs().max().item():.6f} "
+                f"hf={hf_decode[pos].tolist()} srt={srt_decode[pos].tolist()} "
+                f"srt_ids={srt_outputs.top_output_logprob_idx[i][pos]}",
+                flush=True,
+            )
 
         srt_output_str = srt_outputs.output_strs[i].strip()
         hf_output_str = hf_outputs.output_strs[i].strip()
