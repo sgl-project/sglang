@@ -15,6 +15,7 @@ import triton.language as tl
 from torch import nn
 
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig, Qwen4ExpTextConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -2002,6 +2003,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         super().__init__(config, quant_config, prefix, is_nextn)
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
+        self.dflash_layer_ids: Tuple[int, ...] = ()
         self.has_ple = any(
             self.layers[layer_id].ple is not None
             for layer_id in range(self.start_layer, self.end_layer)
@@ -2025,6 +2027,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if self.pp_group.is_last_rank
             else PPMissingLayer()
         )
+
+    def set_dflash_completed_layers_to_capture(self, layer_ids: list[int]) -> None:
+        outside = [i for i in layer_ids if not self.start_layer <= i < self.end_layer]
+        if outside:
+            raise ValueError(
+                f"DFLASH target layers {outside} are outside the layers "
+                f"[{self.start_layer}, {self.end_layer}) of the last pipeline stage, "
+                "where Qwen4-Exp captures aux hidden states."
+            )
+        self.dflash_layer_ids = tuple(layer_ids)
 
     def forward(
         self,
@@ -2105,14 +2117,15 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
                     ple_batch=ple_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
                 )
 
             normalized_input = norms.output
+            if i in self.dflash_layer_ids:
+                # DFlash drafters are trained on layer i's completed streams,
+                # averaged as in glm5_next; hc_contract returns a fresh tensor.
+                aux_hidden_states.capture(
+                    hc_contract(hidden_states, self.hc_count), owned=True
+                )
 
         if breakable_ple:
             _breakable_commit_ple_batch(batch=ple_batch)
@@ -2135,6 +2148,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         )
         if shards_rows:
             hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
+        if self.dflash_layer_ids:
+            if shards_rows:
+                aux_hidden_states = AuxHiddenStateList(
+                    cp_gather_after_forward(aux_hidden_state, forward_batch)
+                    for aux_hidden_state in aux_hidden_states
+                )
+            # Aux capture takes the slot the MTP streams use; the two never
+            # run together.
+            return hidden_states, aux_hidden_states
+        if shards_rows:
             # Only hidden-state capture reads the streams; gather them for it.
             capture = forward_batch.capture_hidden_mode
             hc_hidden_states = (
@@ -2144,10 +2167,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             )
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
-
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-        return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class Qwen4ExpVLModel(Qwen4ExpModel):
@@ -2184,7 +2204,8 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             inputs_embeds=input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        if isinstance(model_output, PPProxyTensors):
+        # Under aux capture, Qwen3VLForConditionalGeneration unpacks the tuple.
+        if isinstance(model_output, PPProxyTensors) or self.dflash_layer_ids:
             return model_output
         if isinstance(model_output, tuple):
             hidden_states, self.last_hc_hidden_states = model_output
@@ -2227,6 +2248,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
         head = self.lm_head.weight if self.pp_group.is_last_rank else None
         return embed, head
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        # No +1 shift as in the parent: capture runs after layer k completes.
+        self.model.set_dflash_completed_layers_to_capture(layer_ids)
 
     @torch.no_grad()
     def forward(
