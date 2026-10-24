@@ -112,6 +112,64 @@ class TestQueuedLimitAbort(CustomTestCase):
         )
         self.assertEqual(s.waiting_queue, [])
 
+    def test_zero_limit_empty_queue_rejects_incoming_without_crash(self):
+        # Regression test for --max-queued-requests 0: with an empty waiting
+        # queue there is no preemption candidate, so the priority branch must
+        # not call max() over the empty queue. The incoming request is rejected
+        # with 503 "The request queue is full.", matching the non-priority path.
+        for enable_priority_scheduling in (True, False):
+            with self.subTest(priority=enable_priority_scheduling):
+                incoming = _req("incoming", wait_entry=1.0)
+                incoming.priority = 0
+
+                s = _scheduler([])
+                s.max_queued_requests = 0
+                s.enable_priority_scheduling = enable_priority_scheduling
+                s.schedule_low_priority_values_first = False
+
+                self.assertTrue(s._abort_on_queued_limit(incoming))
+                self.assertEqual(s.waiting_queue, [])
+
+                abort_req, aborted = (
+                    s.ipc_channels.send_to_tokenizer.send_output.call_args[0]
+                )
+                self.assertEqual(abort_req.rid, "incoming")
+                self.assertIs(aborted, incoming)
+                self.assertEqual(abort_req.finished_reason["type"], "abort")
+                self.assertEqual(
+                    abort_req.finished_reason["message"],
+                    "The request queue is full.",
+                )
+
+    def test_zero_limit_nonempty_queue_still_preempts_lower_priority(self):
+        # A non-empty queue still goes through the priority branch: the higher
+        # priority incoming request displaces the lower priority waiter.
+        candidate = _req("candidate", wait_entry=1.0)
+        candidate.priority = 0
+        incoming = _req("incoming", wait_entry=2.0)
+        incoming.priority = 1
+
+        s = _scheduler([candidate])
+        s.max_queued_requests = 0
+        s.enable_priority_scheduling = True
+        s.schedule_low_priority_values_first = False
+        s.enable_hierarchical_cache = True
+        s.tree_cache = MagicMock(spec=["finish"])
+
+        self.assertFalse(s._abort_on_queued_limit(incoming))
+        self.assertEqual(s.waiting_queue, [])
+        s.tree_cache.finish.assert_called_once_with(
+            candidate.cache_request_handle, CacheRequestOutcome.ABORT
+        )
+
+        abort_req, aborted = s.ipc_channels.send_to_tokenizer.send_output.call_args[0]
+        self.assertEqual(abort_req.rid, "candidate")
+        self.assertEqual(
+            abort_req.finished_reason["message"],
+            "The request is aborted by a higher priority request.",
+        )
+        self.assertIs(aborted, candidate)
+
 
 class TestWaitingTimeout(CustomTestCase):
     def test_emits_only_reqs_past_the_deadline_and_keeps_queue_intact(self):

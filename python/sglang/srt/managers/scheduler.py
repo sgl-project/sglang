@@ -3524,8 +3524,13 @@ class Scheduler(
         # Reject the incoming request by default.
         req_to_abort = recv_req
         message = "The request queue is full."
-        if self.enable_priority_scheduling:
-            # With priority scheduling, consider aboritng an existing request based on the priority.
+        if self.enable_priority_scheduling and self.waiting_queue:
+            # With priority scheduling, consider aborting an existing request
+            # based on the priority.
+            # The queue must be non-empty here: max() over an empty queue would
+            # raise ValueError (e.g. --max-queued-requests 0 admits no waiting
+            # request, so there is nothing to preempt and the incoming request
+            # is rejected with 503, matching the non-priority path).
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
             # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
             # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
