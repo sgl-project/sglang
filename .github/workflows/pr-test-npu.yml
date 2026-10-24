@@ -402,6 +402,8 @@ jobs:
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
           ONLY_TESTS: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_multimodal_gen_test_1_npu_a3 }}
         run: |
+          set -o pipefail
+          mkdir -p "$SGLANG_DIFFUSION_ARTIFACT_DIR"
           # Coverage mode: enumerate this shard's targets with an NPU-only CI
           # helper (it reuses the shared diffusion runner read-only) and run
           # each target in its own `coverage run -m pytest` invocation. The
@@ -468,7 +470,7 @@ jobs:
             --suite 1-npu \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
-            "${FILTER_ARGS[@]}"
+            "${FILTER_ARGS[@]}" 2>&1 | tee "$SGLANG_DIFFUSION_ARTIFACT_DIR/run.log"
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -547,6 +549,8 @@ jobs:
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
           ONLY_TESTS: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_multimodal_gen_test_4_npu_a3 }}
         run: |
+          set -o pipefail
+          mkdir -p "$SGLANG_DIFFUSION_ARTIFACT_DIR"
           # Coverage mode: enumerate this shard's targets with an NPU-only CI
           # helper (it reuses the shared diffusion runner read-only) and run
           # each target in its own `coverage run -m pytest` invocation. The
@@ -613,7 +617,7 @@ jobs:
             --suite 2-npu \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
-            "${FILTER_ARGS[@]}"
+            "${FILTER_ARGS[@]}" 2>&1 | tee "$SGLANG_DIFFUSION_ARTIFACT_DIR/run.log"
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -713,6 +717,7 @@ jobs:
       inputs.coverage_mode != true &&
       needs.check-changes.outputs.changes_exist == 'true' }}
     outputs:
+      coverage_paths: ${{ steps.export-recs.outputs.coverage_paths }}
       should_run_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_1_npu_a3 }}
       only_tests_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_b_test_1_npu_a3 }}
       should_run_base_b_test_2_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_2_npu_a3 }}
@@ -847,6 +852,55 @@ jobs:
           path: recommended-tests-report.md
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Export recommended paths for failure analysis
+        id: export-recs
+        continue-on-error: true
+        if: always()
+        run: |
+          FILE="scripts/ci/npu/precise-test/recommended_pytest_paths.txt"
+          if [ -f "$FILE" ]; then
+            {
+              echo "coverage_paths<<EOF"
+              cat "$FILE"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "Exported $(wc -l < "$FILE") recommended paths"
+          else
+            echo "coverage_paths=" >> "$GITHUB_OUTPUT"
+            echo "::notice::recommended_pytest_paths.txt not found"
+          fi
+
+  # ==================== Analyze Failure Report ==================== #
+  # Cross-references test failures with coverage recommendations.
+  # !cancelled() only: skipped jobs in needs poison success().
+  analyze-failure-report:
+    name: Analyze failure report
+    needs:
+      [
+        base-a-test-npu,
+        base-b-test-1-npu-a3,
+        base-b-test-2-npu-a3,
+        base-b-test-4-npu-a3,
+        base-b-test-8-npu-a3,
+        base-b-test-16-npu-a3,
+
+        multimodal-gen-test-1-npu-a3,
+        multimodal-gen-test-4-npu-a3,
+
+        base-c-test-acc-2-npu-a3,
+        base-c-test-acc-16-npu-a3,
+        base-c-test-perf-2-npu-a3,
+        base-c-test-perf-16-npu-a3,
+
+        recommend-tests-from-coverage,
+      ]
+    if: ${{ !cancelled() && inputs.coverage_mode != true }}
+    uses: ./.github/workflows/_npu-analyze-failure.yml
+    with:
+      log_artifact_pattern: selected-test-logs-*
+      recommendations_content: ${{ needs.recommend-tests-from-coverage.outputs.coverage_paths || '' }}
+      upstream_job_results: ${{ toJSON(needs) }}
 
   # ==================== Coverage Assembly & Publish ==================== #
   # Assembles coverage data and publishes the baseline to the shared disk.

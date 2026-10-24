@@ -1,9 +1,62 @@
 import json
 import os
+import re
+from pathlib import Path
 
 import pytest
 
 _PERF_RESULTS = pytest.StashKey[list]()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = (yield).get_result()
+    artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
+    if not artifact_dir or (report.when != "call" and report.passed):
+        return
+
+    error = str(call.excinfo.value) if call.excinfo else ""
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    run_url = (
+        f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
+        f"{os.environ.get('GITHUB_REPOSITORY')}/actions/runs/{run_id}"
+        if run_id
+        else None
+    )
+    record = {
+        "testcase": item.nodeid,
+        "status": report.outcome,
+        "phase": report.when,
+        "error_type": call.excinfo.typename if call.excinfo else None,
+        "error": error,
+        "baseline": None,
+        "actual": None,
+        "threshold": None,
+        "job": os.environ.get("GITHUB_JOB"),
+        "job_url": os.environ.get("GITHUB_JOB_URL"),
+        "run_id": run_id,
+        "run_url": run_url,
+    }
+    for key, label in (
+        ("baseline", "Expected"),
+        ("actual", "Actual"),
+        ("threshold", "Limit"),
+    ):
+        match = re.search(rf"\b{label}:\s*([0-9]+(?:\.[0-9]+)?)", error)
+        if match:
+            record[key] = float(match.group(1))
+
+    # Persist each result so later setup failures or interrupted sessions retain evidence.
+    path = Path(artifact_dir) / "diffusion-test-summary.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        records = json.loads(path.read_text()) if path.exists() else []
+        records.append(record)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    except (OSError, ValueError) as exc:
+        print(f"::warning:: Cannot write diffusion test summary: {exc}")
 
 
 @pytest.fixture(scope="session")
