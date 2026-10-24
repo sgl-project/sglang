@@ -96,11 +96,24 @@ fits conditional count distributions from training trajectories only, keyed by
 explicit prefix/history bins and the full recipe digest. Distinct heldout
 trajectories provide visible mean/distribution errors. Native observation IDs
 and trajectories cannot overlap splits; unsupported recipes/layouts/conditions
-have no fallback. Deterministic sampling reads only before-work and preserves
-the native verify commit count, including commits crossing the remaining output
+have no fallback. Local batch sizes come from the joined original participant
+metadata. Each queried cell and local batch size must occur in both training
+and heldout evidence. This is an observed-support gate; the per-cell marginal
+distribution is not refitted or claimed to be batch-conditioned. Deterministic
+sampling reads only before-work and preserves the native verify commit count,
+including commits crossing the remaining output
 budget. SGLang's native scheduler owns visible output and finish clipping; KV
 advances by the full native commit. Neither loading nor heldout support is an accuracy
 admission; causal-history evidence still requires its separate source review.
+
+`conditional_commit_counts(before_step)` exposes immutable per-request native
+commit/frequency pairs from the training distribution without drawing an outcome.
+It applies the same runtime, recipe and heldout-support checks as prediction.
+A source-owned measured phase preparer can use these frequencies when its
+outcome-dependent cost composition is justified independently. They are marginal
+request distributions: multiplying them into a joint batch law is not supported.
+Reading them neither admits a phase cost nor supplies current native acceptance;
+missing measurements and complete-boundary checks still fail before sampling.
 
 Actual multi-DP scheduling/heterogeneous coordination, complete measured worker
 costs (including allocation), independently reviewed progress data and predictor

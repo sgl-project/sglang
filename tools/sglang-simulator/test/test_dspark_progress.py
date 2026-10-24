@@ -25,12 +25,17 @@ def artifact(tmp_path, monkeypatch):
 
     # Distribution/leakage tests isolate the native source reader. Production
     # always invokes the real shared SDK frame join, tested separately.
+    batch_sizes = {}
     monkeypatch.setattr(
         dspark_progress,
-        "verify_native_progress_rows",
-        lambda document, read: {
-            row["native_key"]: row["native_key"] for row in document["observations"]
-        },
+        "_verify_native_progress_context",
+        lambda document, read: (
+            {row["native_key"]: row["native_key"] for row in document["observations"]},
+            {
+                row["native_key"]: batch_sizes.get(row["native_key"], 1)
+                for row in document["observations"]
+            },
+        ),
     )
 
     recipe = dict.fromkeys(sdk.SAMPLING_FIELDS)
@@ -66,6 +71,7 @@ def artifact(tmp_path, monkeypatch):
         "training": [],
         "validation": [],
     }
+    participants = [{"tp_size": 2, "attn_dp_size": 1, "pp_size": 1, "attn_tp_size": 2}]
 
     def write(rows, split):
         proof = raw({"scope": "CPU protocol fixture only"})
@@ -81,9 +87,7 @@ def artifact(tmp_path, monkeypatch):
             "causal_history_evidence": [
                 {"path": proof_path.name, "sha256": proof_digest}
             ],
-            "participants": [
-                {"tp_size": 2, "attn_dp_size": 1, "pp_size": 1, "attn_tp_size": 2}
-            ],
+            "participants": participants,
             "phase_policy": "serialized",
         }
         data = raw(value)
@@ -104,6 +108,8 @@ def artifact(tmp_path, monkeypatch):
             runtime_profile_json=profile,
         )
 
+    load.batch_sizes = batch_sizes
+    load.participants = participants
     return recipe, profile, train, validation, document, load
 
 
@@ -161,6 +167,159 @@ def test_live_tail_preserves_native_commit_label_for_scheduler_finish_clipping(
     assert model.predict_progress(s).committed_tokens[0][1] in {2, 4}
 
 
+def test_phase_preparation_can_read_training_frequencies_without_sampling(
+    artifact, monkeypatch
+):
+    recipe, profile, _, _, _, load = artifact
+    model = load()
+
+    def no_sample(_step):
+        pytest.fail("conditional phase preparation sampled progress")
+
+    monkeypatch.setattr(model, "predict_progress", no_sample)
+    s = before(recipe, profile)
+    counts = model.conditional_commit_counts(s)
+    assert counts == (("a", ((2, 1), (4, 1))),)
+    with pytest.raises(TypeError):
+        counts[0][1][0] = (6, 100)
+    tail = replace(s.requests[0], output_tokens_before=19)
+    assert (
+        model.conditional_commit_counts(
+            replace(s, groups=(replace(s.groups[0], requests=(tail,)),))
+        )
+        == counts
+    )
+    changed = {**recipe, "temperature": 0.6}
+    with pytest.raises(PredictorError, match="independent training/heldout"):
+        model.conditional_commit_counts(before(changed, profile))
+
+
+def test_heldout_only_cells_never_appear_as_training_distributions(artifact):
+    _, _, _, heldout, _, load = artifact
+    heldout[0]["prefix_len"] = 5000
+    model = load()
+    assert len(model.distributions) == 1
+    assert sum(sum(counts.values()) for counts in model.distributions.values()) == 2
+    assert not model.validated_keys
+    assert len(model.validation) == 2
+
+
+def test_batch_support_requires_training_and_heldout_without_refitting_marginals(
+    artifact,
+):
+    recipe, profile, train, _, _, load = artifact
+    load.batch_sizes.update({row["native_key"]: 2 for row in train})
+    model = load()
+    assert model.validated_keys
+    assert not model.validated_batch_keys
+    assert model.validation[0]["training_batch_sizes"] == [2]
+    assert model.validation[0]["validation_batch_sizes"] == [1]
+    assert model.validation[0]["supported_batch_sizes"] == []
+    assert next(iter(model.distributions.values())) == {2: 1, 4: 1}
+    with pytest.raises(PredictorError, match="local batch"):
+        model.conditional_commit_counts(before(recipe, profile))
+
+
+def test_batch_support_uses_actual_local_group_not_total_participants(artifact):
+    from sglang_simulator.simulation.sglang.dspark import DSparkTopology
+
+    recipe, profile, _, _, _, load = artifact
+    load.participants[:] = [
+        {"tp_size": 2, "attn_dp_size": 2, "pp_size": 1, "attn_tp_size": 1}
+    ]
+    model = load()
+    s = before(recipe, profile)
+    other = replace(s.requests[0], rid="b")
+    s = replace(
+        s,
+        topology=DSparkTopology(2, 2),
+        groups=(
+            s.groups[0],
+            replace(s.groups[0], attention_dp_rank=1, requests=(other,)),
+        ),
+    )
+    assert model.conditional_commit_counts(s) == (
+        ("a", ((2, 1), (4, 1))),
+        ("b", ((2, 1), (4, 1))),
+    )
+    unsupported = replace(
+        s,
+        groups=(
+            replace(s.groups[0], requests=(s.requests[0], other)),
+            replace(s.groups[1], forward_mode="IDLE", requests=()),
+        ),
+    )
+    with pytest.raises(PredictorError, match="local batch"):
+        model.predict_progress(unsupported)
+
+
+def test_supported_batches_share_training_marginal_and_unobserved_batch_rejects(
+    artifact,
+):
+    import copy
+
+    recipe, profile, train, heldout, _, load = artifact
+    second_heldout = copy.deepcopy(heldout[0])
+    second_heldout.update(native_key="heldout:2", rid="heldout:2", commit_len=6)
+    heldout.append(second_heldout)
+    load.batch_sizes.update({train[1]["native_key"]: 2, "heldout:2": 2})
+    model = load()
+    s = before(recipe, profile)
+    one = model.conditional_commit_counts(s)
+    two = replace(
+        s,
+        groups=(
+            replace(
+                s.groups[0], requests=(s.requests[0], replace(s.requests[0], rid="b"))
+            ),
+        ),
+    )
+    assert model.conditional_commit_counts(two) == (
+        one[0],
+        ("b", one[0][1]),
+    )
+    assert one[0][1] == ((2, 1), (4, 1))
+    heldout[0]["commit_len"] = 5
+    assert load().conditional_commit_counts(s) == one
+    b16 = replace(
+        s,
+        groups=(
+            replace(
+                s.groups[0],
+                requests=tuple(replace(s.requests[0], rid=str(i)) for i in range(16)),
+            ),
+        ),
+    )
+    with pytest.raises(PredictorError, match="local batch"):
+        model.conditional_commit_counts(b16)
+
+
+def test_batch_seen_in_another_cell_is_not_support_for_query(artifact):
+    recipe, profile, train, heldout, _, load = artifact
+    train[1]["prefix_len"] = 5000
+    heldout.append(
+        {
+            **heldout[0],
+            "native_key": "heldout:2",
+            "rid": "heldout:2",
+            "prefix_len": 5000,
+        }
+    )
+    load.batch_sizes.update({train[1]["native_key"]: 2, "heldout:2": 2})
+    model = load()
+    s = before(recipe, profile)
+    two = replace(
+        s,
+        groups=(
+            replace(
+                s.groups[0], requests=(s.requests[0], replace(s.requests[0], rid="b"))
+            ),
+        ),
+    )
+    with pytest.raises(PredictorError, match="local batch"):
+        model.predict_progress(two)
+
+
 def test_missing_recipe_fields_and_current_outcome_inputs_are_rejected(artifact):
     _, _, train, _, _, load = artifact
     train[0]["current_accepted_length"] = 4
@@ -180,6 +339,7 @@ def test_native_label_verifier_uses_leader_only_and_checks_complete_peer_recipe(
     sampling = pytest.importorskip("infercast.sdk.native_sampling")
     from infercast.sdk import native_windows
     from sglang_simulator.time_predictor.dspark_progress import (
+        _verify_native_progress_context,
         verify_native_progress_rows,
     )
 
@@ -232,6 +392,10 @@ def test_native_label_verifier_uses_leader_only_and_checks_complete_peer_recipe(
     }
     read = lambda ref: {"records": [], "metadata": []}
     identity = verify_native_progress_rows(doc, read)["first"]
+    assert _verify_native_progress_context(doc, read) == (
+        {"first": identity},
+        {"first": 1},
+    )
     row["native_key"] = "renamed"
     assert verify_native_progress_rows(doc, read)["renamed"] == identity
     row["commit_len"] = 3
@@ -240,4 +404,17 @@ def test_native_label_verifier_uses_leader_only_and_checks_complete_peer_recipe(
     row["commit_len"] = 2
     peers[1]["metadata"]["recipes"][0]["temperature"] = 0.6
     with pytest.raises(PredictorError, match="peer original"):
+        verify_native_progress_rows(doc, read)
+    peers[1]["metadata"]["recipes"][0]["temperature"] = None
+    for peer in peers:
+        peer["metadata"]["request_ids"].append("not-selected")
+        peer["metadata"]["recipes"].append(copy.deepcopy(recipe))
+    peers[0]["native_step"]["reqs"].append(
+        {"rid": "not-selected", "prefix_len": 512, "verify_len": 6, "acc_len": 2}
+    )
+    assert len(doc["observations"]) == 1
+    assert _verify_native_progress_context(doc, read)[1] == {"renamed": 2}
+    peers[1]["metadata"]["request_ids"].pop()
+    peers[1]["metadata"]["recipes"].pop()
+    with pytest.raises(PredictorError, match="local batch size"):
         verify_native_progress_rows(doc, read)

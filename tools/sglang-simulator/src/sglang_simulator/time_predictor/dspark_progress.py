@@ -215,7 +215,9 @@ class EmpiricalDSparkProgress:
                     _error("progress history projection needs retained causal evidence")
                 for ref in document["causal_history_evidence"]:
                     read_evidence(ref)
-                identities = verify_native_progress_rows(document, read_evidence)
+                identities, batch_sizes = _verify_native_progress_context(
+                    document, read_evidence
+                )
                 topology = tuple(
                     document["participants"][0][k]
                     for k in ("tp_size", "attn_dp_size", "pp_size")
@@ -237,7 +239,7 @@ class EmpiricalDSparkProgress:
                         )
                     seen.add(key)
                     trajectories[split].add(row["trajectory_id"])
-                    result.append(row)
+                    result.append((row, batch_sizes[row["native_key"]]))
             if not result:
                 _error("progress split must contain observations")
             return result
@@ -246,15 +248,23 @@ class EmpiricalDSparkProgress:
             rows[split] = read_rows(split)
         if trajectories["training"] & trajectories["validation"]:
             _error("progress training and validation trajectories overlap")
-        for row in rows["training"]:
+        batch_support = {"training": set(), "validation": set()}
+        for split, observations in rows.items():
+            for row, batch_size in observations:
+                batch_support[split].add((self._row_key(row), batch_size))
+        self.validated_batch_keys = (
+            batch_support["training"] & batch_support["validation"]
+        )
+        for row, _ in rows["training"]:
             self.distributions[self._row_key(row)][row["commit_len"]] += 1
         heldout = defaultdict(Counter)
-        for row in rows["validation"]:
+        for row, _ in rows["validation"]:
             heldout[self._row_key(row)][row["commit_len"]] += 1
         self.validation = []
         self.validated_keys = set(heldout) & set(self.distributions)
         for key in sorted(set(heldout) | set(self.distributions)):
-            train, val = self.distributions[key], heldout[key]
+            train = self.distributions.get(key, Counter())
+            val = heldout.get(key, Counter())
             nt, nv = sum(train.values()), sum(val.values())
             train_mean = sum(k * n for k, n in train.items()) / nt if nt else None
             val_mean = sum(k * n for k, n in val.items()) / nv if nv else None
@@ -263,6 +273,17 @@ class EmpiricalDSparkProgress:
                     "cell": key,
                     "training_count": nt,
                     "validation_count": nv,
+                    "training_batch_sizes": sorted(
+                        size for cell, size in batch_support["training"] if cell == key
+                    ),
+                    "validation_batch_sizes": sorted(
+                        size
+                        for cell, size in batch_support["validation"]
+                        if cell == key
+                    ),
+                    "supported_batch_sizes": sorted(
+                        size for cell, size in self.validated_batch_keys if cell == key
+                    ),
                     "training_mean": train_mean,
                     "validation_mean": val_mean,
                     "mean_error": train_mean - val_mean if nt and nv else None,
@@ -333,7 +354,15 @@ class EmpiricalDSparkProgress:
             row["prefix_len"], row["draft_history_tokens"], row["sampling_params"]
         )
 
-    def predict_progress(self, step):
+    def conditional_commit_counts(self, step):
+        """Return immutable training frequencies for causal phase preparation.
+
+        This is a requestwise native-commit distribution, not a sampled outcome
+        or a joint batch law. A source-owned cost preparer may integrate a
+        measured outcome-dependent cost only with its separately justified
+        composition; independence across requests is not implied. The same
+        runtime/topology/recipe/heldout-support gates apply as to prediction.
+        """
         if (
             hashlib.sha256(step.runtime_profile_json.encode()).hexdigest()
             != self.profile_digest
@@ -341,7 +370,7 @@ class EmpiricalDSparkProgress:
             raise PredictorError(
                 "data_unavailable", "progress model has no matching runtime profile"
             )
-        predictions = []
+        conditioned = []
         if (
             step.topology.tp_size,
             step.topology.attention_dp_size,
@@ -350,23 +379,41 @@ class EmpiricalDSparkProgress:
             raise PredictorError(
                 "data_unavailable", "progress originals do not support this topology"
             )
-        for request in step.requests:
-            if request.extend_len != 6:
-                raise PredictorError(
-                    "data_unavailable", "progress model has no matching verify width"
+        for group in step.groups:
+            batch_size = len(group.requests)
+            for request in group.requests:
+                if request.extend_len != 6:
+                    raise PredictorError(
+                        "data_unavailable",
+                        "progress model has no matching verify width",
+                    )
+                key = self._key(
+                    request.target_prefix_len,
+                    request.bounded_draft_history_tokens(128),
+                    json.loads(request.sampling_params_json),
                 )
-            key = self._key(
-                request.target_prefix_len,
-                request.bounded_draft_history_tokens(128),
-                json.loads(request.sampling_params_json),
-            )
-            if key not in self.validated_keys:
-                raise PredictorError(
-                    "data_unavailable",
-                    "progress condition has no independent training/heldout support",
-                    cell=key,
+                if key not in self.validated_keys:
+                    raise PredictorError(
+                        "data_unavailable",
+                        "progress condition has no independent training/heldout support",
+                        cell=key,
+                    )
+                if (key, batch_size) not in self.validated_batch_keys:
+                    raise PredictorError(
+                        "data_unavailable",
+                        "progress local batch has no independent training/heldout support",
+                        cell=key,
+                        batch_size=batch_size,
+                    )
+                conditioned.append(
+                    (request.rid, tuple(sorted(self.distributions[key].items())))
                 )
-            counts = self.distributions[key]
+        return tuple(conditioned)
+
+    def predict_progress(self, step):
+        conditioned = self.conditional_commit_counts(step)
+        predictions = []
+        for request, (_, counts) in zip(step.requests, conditioned, strict=True):
             identity = _canonical(
                 {
                     "model": self.model_ref,
@@ -379,11 +426,11 @@ class EmpiricalDSparkProgress:
             # Integer selection is deterministic and has no mutable RNG/retry
             # state. The choice uses no outcome from the current forward.
             choice = int.from_bytes(hashlib.sha256(identity).digest(), "big") % sum(
-                counts.values()
+                frequency for _, frequency in counts
             )
             selected = None
-            for count in sorted(counts):
-                choice -= counts[count]
+            for count, frequency in counts:
+                choice -= frequency
                 if choice < 0:
                     selected = count
                     break
@@ -403,6 +450,12 @@ def verify_native_progress_rows(document, read_evidence):
     loading an immutable offline model; live prediction receives before-work.
     Causal-history derivation retains its own review/evidence contract.
     """
+    identities, _ = _verify_native_progress_context(document, read_evidence)
+    return identities
+
+
+def _verify_native_progress_context(document, read_evidence):
+    """Return original row identities and local batch sizes from one SDK join."""
     from infercast.sdk.native_sampling import native_sampling_params
     from infercast.sdk.native_windows import join_native_frames
 
@@ -448,7 +501,7 @@ def verify_native_progress_rows(document, read_evidence):
             "native progress source/participant join failed",
         ) from error
     byfid = {frame["forward_ct"]: frame for frame in frames}
-    identities, selected = {}, set()
+    identities, batch_sizes, selected = {}, {}, set()
     for row in rows:
         key = row["forward_ct"], row["rid"]
         if key in selected or key[0] not in byfid:
@@ -456,6 +509,7 @@ def verify_native_progress_rows(document, read_evidence):
         selected.add(key)
         matches = 0
         leaders = 0
+        local_batch_sizes = set()
         origin_parts = []
         for participant in byfid[key[0]]["participants"]:
             meta, record = participant["metadata"], participant["native_step"]
@@ -468,6 +522,7 @@ def verify_native_progress_rows(document, read_evidence):
             if _canonical(recipe) != _canonical(row["sampling_params"]):
                 _error("progress before-recipe differs from native peer original")
             matches += 1
+            local_batch_sizes.add(len(meta["request_ids"]))
             origin_parts.append(
                 {
                     "metadata_sha256": hashlib.sha256(_canonical(meta)).hexdigest(),
@@ -497,9 +552,12 @@ def verify_native_progress_rows(document, read_evidence):
                 )
         if matches != document["participants"][0]["attn_tp_size"] or leaders != 1:
             _error("native progress request omits an attention-TP peer")
+        if len(local_batch_sizes) != 1:
+            _error("native progress peers disagree on local batch size")
         if row["native_key"] in identities:
             _error("duplicate native progress observation label")
         identities[row["native_key"]] = hashlib.sha256(
             _canonical({"participants": origin_parts, "rid": row["rid"]})
         ).hexdigest()
-    return identities
+        batch_sizes[row["native_key"]] = local_batch_sizes.pop()
+    return identities, batch_sizes
