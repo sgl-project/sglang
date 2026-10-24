@@ -1,5 +1,6 @@
 """Primitive RoPE ops: rotate helpers and apply_rotary_emb utilities."""
 
+import functools
 from typing import Optional, Tuple
 
 import torch
@@ -31,6 +32,36 @@ if _flashinfer_apply_rope_inplace is not None:
     )
 else:
     flashinfer_apply_rope_inplace = None
+
+
+def _build_rope_positions(
+    offset: int, seq_len: int, batch_size: int, device: torch.device
+) -> torch.Tensor:
+    positions = torch.arange(offset, offset + seq_len, device=device, dtype=torch.long)
+    return positions if batch_size == 1 else positions.repeat(batch_size)
+
+
+@functools.lru_cache(maxsize=32)
+def _shared_rope_positions(
+    offset: int, seq_len: int, batch_size: int, device: torch.device
+) -> torch.Tensor:
+    return _build_rope_positions(offset, seq_len, batch_size, device)
+
+
+def rope_positions(
+    offset: int, seq_len: int, batch_size: int, device: torch.device
+) -> torch.Tensor:
+    """Read-only flat positions ``[offset, offset + seq_len)``, once per row.
+
+    Every block of a forward asks for the same positions, so eager calls share
+    one tensor per shape. Compile and graph capture build their own: a capture
+    records the arange without running it, so it must not fill the cache.
+    """
+    if torch.compiler.is_compiling() or (
+        device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+    ):
+        return _build_rope_positions(offset, seq_len, batch_size, device)
+    return _shared_rope_positions(offset, seq_len, batch_size, device)
 
 
 def _apply_rotary_emb(
@@ -185,8 +216,7 @@ def apply_flashinfer_rope_qk_inplace(
         return apply_rope_prefix(q, q_heads), apply_rope_prefix(k, k_heads)
 
     if positions is None:
-        pos_1d = torch.arange(seqlen, device=q.device, dtype=torch.long)
-        positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
+        positions = rope_positions(0, seqlen, bsz, q.device)
     else:
         if not (isinstance(positions, torch.Tensor) and positions.dim() == 1):
             raise ValueError("positions must be a 1D Tensor")

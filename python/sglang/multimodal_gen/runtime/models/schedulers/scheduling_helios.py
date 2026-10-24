@@ -407,22 +407,31 @@ class HeliosScheduler:
             rks.append(rk)
             D1s.append((mi - m0) / rk)
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        # stacked on the device: torch.tensor() reads every rk and b back to the host
+        rks = (
+            torch.stack([*rks, torch.ones_like(h)])
+            if rks
+            else torch.ones(1, dtype=torch.get_default_dtype(), device=device)
+        )
 
         R, b, h_phi_1, B_h = compute_unipc_bh_coefficients(
             h, rks, order, self.predict_x0, self.config.solver_type
         )
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.stack(b)
 
         if len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)
             if order == 2:
-                rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
+                rhos_p = torch.full((1,), 0.5, dtype=x.dtype, device=device)
             else:
-                rhos_p = torch.linalg.solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)
+                # solve_ex skips the singularity check that reads info on the host
+                rhos_p = (
+                    torch.linalg.solve_ex(R[:-1, :-1], b[:-1])
+                    .result.to(device)
+                    .to(x.dtype)
+                )
         else:
             D1s = None
 
@@ -481,15 +490,19 @@ class HeliosScheduler:
             rks.append(rk)
             D1s.append((mi - m0) / rk)
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        # stacked on the device: torch.tensor() reads every rk and b back to the host
+        rks = (
+            torch.stack([*rks, torch.ones_like(h)])
+            if rks
+            else torch.ones(1, dtype=torch.get_default_dtype(), device=device)
+        )
 
         R, b, h_phi_1, B_h = compute_unipc_bh_coefficients(
             h, rks, order, self.predict_x0, self.config.solver_type
         )
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.stack(b)
 
         if len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)
@@ -497,9 +510,9 @@ class HeliosScheduler:
             D1s = None
 
         if order == 1:
-            rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
+            rhos_c = torch.full((1,), 0.5, dtype=x.dtype, device=device)
         else:
-            rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
+            rhos_c = torch.linalg.solve_ex(R, b).result.to(device).to(x.dtype)
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
@@ -601,14 +614,12 @@ class HeliosScheduler:
         all_timesteps: torch.FloatTensor | None = None,
         **kwargs,
     ) -> HeliosSchedulerOutput | tuple:
+        # timesteps are device scalars; torch.full() would read them on the host
         pred_image_or_video = self.convert_flow_pred_to_x0(
             flow_pred=model_output,
             xt=sample,
-            timestep=torch.full(
-                (model_output.shape[0],),
-                timestep,
-                dtype=torch.long,
-                device=model_output.device,
+            timestep=timestep.to(model_output.device, torch.long).expand(
+                model_output.shape[0]
             ),
             sigmas=dmd_sigmas,
             timesteps=dmd_timesteps,
@@ -617,12 +628,9 @@ class HeliosScheduler:
             prev_sample = self.add_noise(
                 pred_image_or_video,
                 dmd_noisy_tensor,
-                torch.full(
-                    (model_output.shape[0],),
-                    all_timesteps[cur_sampling_step + 1],
-                    dtype=torch.long,
-                    device=model_output.device,
-                ),
+                all_timesteps[cur_sampling_step + 1]
+                .to(model_output.device, torch.long)
+                .expand(model_output.shape[0]),
                 sigmas=dmd_sigmas,
                 timesteps=dmd_timesteps,
             )

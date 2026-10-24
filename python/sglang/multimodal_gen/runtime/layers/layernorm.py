@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     RotaryEmbedding,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import rope_positions
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
@@ -1193,13 +1194,7 @@ def apply_qk_norm_rope(
         ) == seq_len * k.stride(1)
 
     if positions is None:
-        pos_1d = torch.arange(
-            position_offset,
-            position_offset + seq_len,
-            device=q.device,
-            dtype=torch.int64,
-        )
-        positions = pos_1d if batch_size == 1 else pos_1d.repeat(batch_size)
+        positions = rope_positions(position_offset, seq_len, batch_size, q.device)
     else:
         if positions.dim() != 1 or positions.numel() != batch_size * seq_len:
             raise ValueError(

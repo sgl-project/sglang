@@ -67,6 +67,52 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
 from sglang.srt.layers.linear import LinearBase as SrtLinearBase
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("starts_on_cpu", [False, True])
+def test_encoder_load_copies_host_checkpoint_into_final_parameters(
+    tmp_path, single_process_model_parallel, starts_on_cpu
+):
+    """GPU-resident encoders must not stage a second full GPU weight tensor."""
+    hf_config = transformers.T5Config(
+        vocab_size=64, d_model=32, d_kv=8, d_ff=64, num_layers=1, num_heads=4
+    )
+    reference = transformers.T5EncoderModel(hf_config)
+    weights = {name: p.detach().clone() for name, p in reference.named_parameters()}
+    save_file(weights, tmp_path / "model.safetensors")
+    config = T5Config()
+    config.update_model_arch(hf_config.to_dict())
+    config.arch_config.architectures = ["T5EncoderModel"]
+    read_weights = TextEncoderLoader._get_all_weights
+
+    def check_checkpoint_device(self, *args, **kwargs):
+        for name, tensor in read_weights(self, *args, **kwargs):
+            assert tensor.device.type == "cpu"
+            torch.testing.assert_close(tensor, weights[name], rtol=0, atol=0)
+            yield name, tensor
+
+    with mock.patch.object(
+        TextEncoderLoader, "_get_all_weights", check_checkpoint_device
+    ):
+        loaded = TextEncoderLoader().load_model(
+            str(tmp_path),
+            config,
+            SimpleNamespace(pipeline_config=None),
+            dtype="bf16",
+            component_starts_on_cpu=starts_on_cpu,
+        )
+    for name, parameter in loaded.named_parameters():
+        if ".qkv_proj." in name:
+            expected = torch.cat(
+                [weights[name.replace(".qkv_proj.", f".{part}.")] for part in "qkv"]
+            )
+        else:
+            expected = weights[name]
+        assert parameter.device.type == ("cpu" if starts_on_cpu else "cuda")
+        torch.testing.assert_close(
+            parameter.cpu(), expected.to(parameter.dtype), rtol=0, atol=0
+        )
+
+
 @pytest.mark.parametrize("backend", ["int8", "nvfp4"])
 @pytest.mark.parametrize("tensorwise", [False, True])
 @pytest.mark.parametrize("tp_size", [1, 2])

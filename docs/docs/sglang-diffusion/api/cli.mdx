@@ -119,6 +119,12 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--pe-server-url {HTTPADDRESS}`: url of SGLang server hosting the PE model (e.g., for ERNIE-Image). See [Models with Prompt Enhancement](/docs/sglang-diffusion/models_with_pe).
 - `--prompt-enhancer-config {JSON_FILE}`: configure an independent SRT LLM/VLM for opt-in HTTP prompt rewriting. Requests use `enhance_prompt=true`; no enhancer runs by default. See [Prompt enhancement](/docs/sglang-diffusion/models_with_pe).
 
+Keep internal scheduler ports on a trusted network: they use Python pickle,
+not an authenticated public API. On a monolithic scheduler, malformed payloads
+in valid request envelopes receive an error without discarding other requests
+received in the same poll.
+This isolation does not make untrusted pickle safe or recover from GPU failures.
+
 ### Disaggregated serving
 
 - `--disagg-role {monolithic|encoder|prompt_encoder|image_encoder|denoiser|decoder|server}`: select the stages run by this process. `monolithic` is the default; the split `prompt_encoder` and `image_encoder` roles currently support FLUX.3 Image.
