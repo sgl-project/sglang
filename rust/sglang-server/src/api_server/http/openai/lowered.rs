@@ -125,15 +125,7 @@ impl OpenAiChat {
             Some(rendered) => rendered.ok()?,
             None => {
                 let ChatBody { request: chat, raw } = ChatBody::deserialize(request).ok()?;
-                let kwargs = chat.chat_template_kwargs.as_ref();
-                render_chat(
-                    formatter,
-                    raw,
-                    &chat.request,
-                    kwargs,
-                    &self.template_defaults,
-                )
-                .ok()?
+                render_chat(formatter, raw, &chat.request, &self.template_defaults).ok()?
             }
         };
         let ids = rendered.encode(&*self.tokenizer).ok()?;

@@ -167,12 +167,7 @@ fn render_chat_prompt(
         .entry("model")
         .or_insert_with(|| Value::from("default"));
     let ChatBody {
-        request:
-            ChatRequest {
-                request,
-                chat_template_kwargs,
-                ..
-            },
+        request: ChatRequest { request, .. },
         raw: body,
     } = ChatBody::deserialize(Value::Object(fields))
         .map_err(|error| (INVALID_BODY, error.to_string()))?;
@@ -192,7 +187,6 @@ fn render_chat_prompt(
         formatter,
         body,
         &request,
-        chat_template_kwargs.as_ref(),
         &state.server_args.default_chat_template_kwargs,
     )
     .map_err(|error| (BAD_REQUEST, format!("chat template render failed: {error}")))

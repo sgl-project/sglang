@@ -18,6 +18,7 @@ mod loader;
 mod models;
 mod reasoning;
 mod selection;
+mod template;
 mod thinking;
 
 use self::legacy::LegacyFormatter;
@@ -30,6 +31,7 @@ use self::models::{
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
+pub use self::template::TemplateArgs;
 use self::thinking::ThinkingPolicy;
 pub use self::thinking::ThinkingTemplates;
 
