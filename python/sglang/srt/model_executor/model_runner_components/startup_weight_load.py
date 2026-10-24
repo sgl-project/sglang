@@ -74,6 +74,7 @@ class StartupWeightLoadState(str, enum.Enum):
 class StartupWeightLoadOptions:
     device: str
     is_cuda_platform: bool
+    is_npu: bool
     cuda_graph_enabled: bool
     prefill_cuda_graph_backend: Backend
     is_draft_worker: bool
@@ -115,6 +116,7 @@ class StartupWeightLoadOptions:
         return cls(
             device=get_device().device,
             is_cuda_platform=current_platform.is_cuda(),
+            is_npu=current_platform.is_npu(),
             cuda_graph_enabled=cuda_graph_enabled,
             prefill_cuda_graph_backend=cuda_graph_config.prefill.backend,
             is_draft_worker=is_draft_worker,
@@ -338,7 +340,11 @@ class StartupWeightLoadManager:
         # Keep these checks here because they depend on resolved loader and model
         # state; ServerArgs owns only the mode selection.
         basic_rules = (
-            (not options.is_cuda_platform or options.device != "cuda", "CUDA only"),
+            (
+                not (options.is_cuda_platform or options.is_npu)
+                or options.device not in ("cuda", "npu"),
+                "CUDA or NPU only",
+            ),
             (not options.cuda_graph_enabled, "CUDA graph capture is disabled"),
             (
                 options.prefill_cuda_graph_backend == Backend.TC_PIECEWISE,
@@ -515,7 +521,7 @@ class StartupWeightLoadManager:
             target_device=torch.device(self._device_config.device),
             startup_prefetch_active=startup_prefetch_active,
         )
-        torch.cuda.synchronize()
+        current_platform.synchronize()
         changed_names = manifest.changed_names(self._model)
         if changed_names:
             preview = ", ".join(changed_names[:8])
