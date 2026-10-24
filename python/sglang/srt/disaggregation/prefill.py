@@ -465,7 +465,9 @@ class PrefillBootstrapQueue:
         if len(req.origin_input_ids) > self.max_input_len:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_input_len}"
             logger.error(message)
-            req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+            req.time_stats.trace_ctx.abort(
+                abort_info={"reason": message, "status_code": HTTPStatus.BAD_REQUEST}
+            )
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
@@ -978,7 +980,10 @@ class SchedulerDisaggregationPrefillMixin:
                 if sampling_mask_finish_reason is not None:
                     req.to_finish = sampling_mask_finish_reason
                     req.time_stats.trace_ctx.abort(
-                        abort_info={"reason": sampling_mask_finish_reason.message}
+                        abort_info={
+                            "reason": sampling_mask_finish_reason.message,
+                            "status_code": sampling_mask_finish_reason.status_code,
+                        }
                     )
                     if self._retire_aborted_prefill_result(req):
                         req.time_stats.set_completion_time()
@@ -1273,7 +1278,12 @@ class SchedulerDisaggregationPrefillMixin:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": error_message,
+                "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+            }
+        )
         if req.finished_reason is None:
             req.finished_reason = FINISH_LENGTH(length=0)
         # unlock the tree
@@ -1341,7 +1351,12 @@ class SchedulerDisaggregationPrefillMixin:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        req.time_stats.trace_ctx.abort(
+            abort_info={
+                "reason": error_message,
+                "status_code": HTTPStatus.INTERNAL_SERVER_ERROR,
+            }
+        )
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=False)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)

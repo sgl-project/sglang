@@ -790,6 +790,11 @@ class TraceReqContext:
         if self.root_span:
             self.root_span.set_attributes(attrs)
 
+    def trace_set_root_error(self, finish_reason: Optional[Dict[str, Any]]):
+        if not self.tracing_enable or not self.root_span:
+            return
+        set_root_span_error(self.root_span, finish_reason)
+
     def trace_set_thread_attrs(self, attrs: Dict[str, Any]):
         if self.__check_fast_return():
             return
@@ -815,8 +820,11 @@ class TraceReqContext:
 
                 if isinstance(abort_info, BaseFinishReason):
                     abort_info = abort_info.to_json()
-                self.thread_context.thread_span.set_status(Status(StatusCode.ERROR))
-                self.thread_context.thread_span.set_attributes(abort_info)
+                if _is_server_fault(abort_info):
+                    self.thread_context.thread_span.set_status(Status(StatusCode.ERROR))
+                self.thread_context.thread_span.set_attributes(
+                    {k: v for k, v in abort_info.items() if v is not None}
+                )
 
             if self.events_cache:
                 for event in self.events_cache:
@@ -835,6 +843,28 @@ class TraceReqContext:
 
     def __del__(self):
         self.abort(abort_info={"reason": "have unclosed span, auto closed"})
+
+
+def _abort_status_code(abort_info: Mapping[str, Any]) -> int:
+    try:
+        return int(abort_info.get("status_code") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_server_fault(abort_info: Mapping[str, Any]) -> bool:
+    return _abort_status_code(abort_info) >= 500
+
+
+def set_root_span_error(span, finish_reason: Optional[Dict[str, Any]]):
+    # As for HTTP server spans in the OpenTelemetry semantic conventions,
+    # only a 5xx marks the span as an error.
+    if not finish_reason or finish_reason.get("type") != "abort":
+        return
+    status_code = _abort_status_code(finish_reason)
+    span.set_attribute("error.type", str(status_code) if status_code else "abort")
+    if _is_server_fault(finish_reason):
+        span.set_status(Status(StatusCode.ERROR, finish_reason.get("message")))
 
 
 @dataclass

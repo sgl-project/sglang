@@ -360,6 +360,19 @@ class ReqState:
     prompt_token_ids: Optional[List[int]] = None
 
 
+def _handler_failure_finish_reason(error: BaseException) -> Dict[str, Any]:
+    # Mirrors the status the HTTP entrypoints return for each exception.
+    if isinstance(error, fastapi.HTTPException):
+        status_code = error.status_code
+    elif isinstance(error, ValueError):
+        status_code = HTTPStatus.BAD_REQUEST
+    elif isinstance(error, Exception):
+        status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+    else:
+        status_code = None
+    return {"type": "abort", "message": str(error), "status_code": status_code}
+
+
 def _slice_streaming_output_meta_info(
     meta_info: Dict[Any, Any],
     last_output_offset: int,
@@ -970,7 +983,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         obj, request, request_states
                     ):
                         yield response
-        except BaseException:
+        except BaseException as e:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -978,7 +991,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # request -- would otherwise leak those entries forever. Drop
             # undelivered states, but abort dispatched requests for scheduler-side
             # cleanup.
-            self._release_req_states_on_failure(request_states)
+            self._release_req_states_on_failure(request_states, e)
             raise
 
     def _detect_input_format(
@@ -2760,6 +2773,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if state.time_stats.trace_ctx.tracing_enable
                     else None
                 )
+                state.time_stats.trace_ctx.trace_set_root_error(
+                    recv_obj.finished_reasons[i]
+                )
                 # Reuse the first batch's arrival time: a streaming request that
                 # finishes in its first output has no decode interval.
                 state.time_stats.set_finished_time(
@@ -3606,7 +3622,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
             return
         state.finished = True
-        state.time_stats.set_finished_time()
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
         finish_reason = {
@@ -3615,6 +3630,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
+        state.time_stats.trace_ctx.trace_set_root_error(finish_reason)
+        state.time_stats.set_finished_time()
         meta_info = {
             "id": recv_obj.rid,
             "finish_reason": finish_reason,
@@ -3862,12 +3879,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         self.rid_to_state.update(new_states)
 
-    def _release_req_states_on_failure(self, request_states: Dict[str, ReqState]):
+    def _release_req_states_on_failure(
+        self, request_states: Dict[str, ReqState], error: BaseException
+    ):
         """Release rid_to_state entries created for a failed handler.
 
-        Undelivered states are removed locally. Dispatched requests are aborted
-        and retained until the scheduler response removes them.
+        Undelivered states are removed locally, ending their traces with the
+        status *error* gets. Dispatched requests are aborted and retained until
+        the scheduler response removes them.
         """
+        finish_reason = _handler_failure_finish_reason(error)
         for rid, state in request_states.items():
             current_state = self.rid_to_state.get(rid)
             if current_state is not None:
@@ -3884,6 +3905,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else:
                     del self.rid_to_state[rid]
                     self._release_lora_once(state)
+                    state.time_stats.trace_ctx.trace_set_root_error(finish_reason)
+                    state.time_stats.set_finished_time()
             dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
             if dispatch_ready is not None:
                 dispatch_ready.set()

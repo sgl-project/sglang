@@ -92,6 +92,10 @@ SGLANG_TRACE_ASYNC=1 python -m sglang.launch_server --enable-trace --otlp-traces
 | `SGLANG_TRACE_ASYNC` | Enable async tracing | `false` |
 | `SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD` | Max buffered ops before auto-flush | `100` |
 
+## Failed Requests
+
+When a request is aborted, its root span records `error.type`: the HTTP status code the request ended with (e.g. `503`), or `abort` when there is none, as when the client aborts it. As for HTTP server spans in the OpenTelemetry semantic conventions, only a 5xx sets the span status to `ERROR`; a rejected request (4xx) or a client abort is recorded but not marked as an error. Aborted thread spans follow the same rule. A request rejected before it reaches the scheduler (e.g. invalid input, `400`) is recorded the same way.
+
 ## How to add Tracing for slices you're interested in?(API introduction)
 We have already inserted instrumentation points in the tokenizer and scheduler main threads. If you wish to trace additional request execution segments or perform finer-grained tracing, please use the APIs from the tracing package as described below.
 
