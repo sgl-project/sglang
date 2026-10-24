@@ -626,6 +626,9 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
 ):
     module = _load_megamoe_module(monkeypatch)
     monkeypatch.setattr(
+        module, "_num_valid_tokens_tensor", lambda: torch.zeros(1, dtype=torch.int32)
+    )
+    monkeypatch.setattr(
         module.envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16, "get", lambda: use_w4a16
     )
     monkeypatch.setattr(
@@ -634,6 +637,7 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
         lambda: in_kernel_reduce,
     )
     fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.FinalizeMode = _FakeFinalizeMode
 
     def make_config(
         *,
@@ -645,6 +649,8 @@ def test_nvfp4_keeps_weight_scale_storage_and_activation_contract(
         situ_beta=None,
         situ_linear_beta=None,
         apply_routing_weights_before_fc2=False,
+        finalize_mode=None,
+        num_valid_tokens_tensor=None,
         combine_dtype="bf16",
         input_norm_const=None,
     ):
