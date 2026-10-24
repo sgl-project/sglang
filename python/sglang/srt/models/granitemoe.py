@@ -1,12 +1,13 @@
 """Inference-only GraniteMoe model."""
 
-from typing import Iterable, Iterator, Optional
+from typing import Iterable, Iterator, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import GraniteConfig
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -406,6 +407,7 @@ class GraniteMoeModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture: List[int] = []
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -416,22 +418,29 @@ class GraniteMoeModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.get_input_embeddings(input_ids)
         hidden_states *= self.embedding_multiplier
 
+        aux_hidden_states = AuxHiddenStateList()
         for i in range(len(self.layers)):
+            if i in self.layers_to_capture:
+                aux_hidden_states.capture(hidden_states)
             layer = self.layers[i]
             hidden_states = layer(
                 positions,
                 hidden_states,
                 forward_batch,
             )
+        if len(self.layers) in self.layers_to_capture:
+            aux_hidden_states.capture(hidden_states)
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class GraniteMoeForCausalLM(nn.Module):
@@ -474,6 +483,7 @@ class GraniteMoeForCausalLM(nn.Module):
             logit_scale = None
         self.logits_processor = LogitsProcessor(config, logit_scale=logit_scale)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.capture_aux_hidden_states = False
 
     @torch.no_grad()
     def forward(
@@ -485,13 +495,35 @@ class GraniteMoeForCausalLM(nn.Module):
         get_embedding: bool = False,
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         if not get_embedding:
             logits_processor_output: LogitsProcessorOutput = self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
             return logits_processor_output
         else:
             return self.pooler(hidden_states, forward_batch)
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def _split_expert_params_mapping(self) -> list[tuple[str, str, int, str]]:
         # llmcompressor emits one tensor per expert per projection
