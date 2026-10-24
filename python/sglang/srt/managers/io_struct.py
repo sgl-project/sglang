@@ -189,6 +189,8 @@ class GenerateReqInput:
         Optional[Union[List[List[int]], List[int]]],
         PlainValidator(validate_optional_list_i64_1d_2d),
     ] = None
+    # Start multimodal token expansion here in supplied input_ids; preserve the prefix.
+    mm_token_expansion_start_len: Union[List[int], int] = 0
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -432,6 +434,12 @@ class GenerateReqInput:
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
+        # Checked before parallel sampling turns a single request into a batch.
+        if self.is_single and isinstance(self.mm_token_expansion_start_len, list):
+            raise ValueError(
+                "mm_token_expansion_start_len should be an integer for a single "
+                "request."
+            )
         self._handle_parallel_sampling()
 
         if self.is_single:
@@ -452,6 +460,10 @@ class GenerateReqInput:
         ):
             raise ValueError(
                 "Either text, input_ids or input_embeds should be provided."
+            )
+        if self.mm_token_expansion_start_len and not self.input_ids:
+            raise ValueError(
+                "input_ids must be non-empty when mm_token_expansion_start_len is set."
             )
         if (
             self.return_flat_raw_top_logprobs
@@ -606,6 +618,7 @@ class GenerateReqInput:
         self._normalize_sampling_params(num)
         self._normalize_watermark(num)
         self._normalize_logprob_params(num)
+        self._normalize_mm_token_expansion_start_len(num)
         self._normalize_return_hidden_states(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
@@ -820,6 +833,22 @@ class GenerateReqInput:
                 "Cannot use list token_ids_logprob with parallel_sample_num > 1"
             )
 
+    def _normalize_mm_token_expansion_start_len(self, num):
+        """Normalize mm_token_expansion_start_len for batch processing."""
+        if not isinstance(self.mm_token_expansion_start_len, list):
+            self.mm_token_expansion_start_len = [
+                self.mm_token_expansion_start_len
+            ] * num
+        elif len(self.mm_token_expansion_start_len) != self.batch_size:
+            raise ValueError(
+                "The length of mm_token_expansion_start_len should be equal to the "
+                "batch size."
+            )
+        else:
+            self.mm_token_expansion_start_len = (
+                self.mm_token_expansion_start_len * self.parallel_sample_num
+            )
+
     def _normalize_return_hidden_states(self, num):
         """Normalize and validate per-request hidden-state return modes."""
         if isinstance(self.return_hidden_states, list):
@@ -967,6 +996,7 @@ class GenerateReqInput:
             session_id=self.session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
+            mm_token_expansion_start_len=self.mm_token_expansion_start_len[i],
             input_embeds=(
                 self.input_embeds[i] if self.input_embeds is not None else None
             ),
