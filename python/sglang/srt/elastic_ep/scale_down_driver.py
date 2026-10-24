@@ -1,27 +1,10 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Adapter between ``ScaleDownStateMachine`` and the side effects it drives.
-
-Lives beside the state machine rather than in ``model_runner.py`` so the FSM can be
-driven by a stub in tests: every transition the machine can take is one method here.
-The two tails a runner owns arrive as callables, so nothing here needs a runner.
-"""
+"""Adapter from ``ScaleDownStateMachine`` transitions to their side effects; the two
+runner-owned tails arrive as callables, so tests can drive the machine with a stub."""
 
 from __future__ import annotations
 
 import time
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -45,10 +28,7 @@ class ScaleDownDriver:
     """FSM driver: bridges state transitions to the side effects they need."""
 
     def __init__(
-        self,
-        finalize_scale_down: Callable[..., None],
-        retire_and_exit: Callable[[], None],
-        is_idle: Optional[Callable[[], bool]] = None,
+        self, finalize_scale_down: Callable, retire_and_exit: Callable, is_idle=None
     ) -> None:
         self._finalize_scale_down = finalize_scale_down
         self._retire_and_exit = retire_and_exit
@@ -59,8 +39,7 @@ class ScaleDownDriver:
         ElasticEPStateManager.mark_phase("draining")
 
     def local_idle(self, sm) -> bool:
-        """No local work left. Unwired (non-scheduler caller) reads as idle rather
-        than holding the cohort on a predicate nobody can satisfy."""
+        """No local work left; unwired reads idle rather than hold the cohort."""
         return self._is_idle is None or self._is_idle()
 
     def post_drain_barrier(self, sm):
@@ -75,22 +54,20 @@ class ScaleDownDriver:
     def on_depart_drain(self, sm):
         ElasticEPStateManager.mark_phase("retiring")
 
-    def check_barrier(
-        self, handle, *, block_s: Optional[float] = None, keep_serving: bool = False
-    ):
+    def check_barrier(self, handle, *, block_s=None, keep_serving=False):
         return retire_barrier_check(handle, block_s=block_s, keep_serving=keep_serving)
 
     def consume_barrier(self, handle):
         retire_barrier_consume(handle)
 
     def on_retiree_quiesce(self, sm):
-        # FLIP_MASK narrows the device-side expert bound, which in-flight a2a asserts on.
-        # is_fully_idle() gates the scheduler; it does not promise the device is done.
+        # FLIP_MASK narrows the device-side expert bound in-flight a2a asserts on, and
+        # is_fully_idle() gates the scheduler, not the device.
         torch.cuda.synchronize()
 
     def on_nixl_retire_pre(self, sm):
-        # Quiesce while both peers are still connected: the barrier posts a tick early so
-        # a2a keeps queueing, and disconnecting over in-flight RDMA spins forever.
+        # Quiesce while both peers are connected: the barrier posts a tick early so a2a
+        # keeps queueing, and disconnecting over in-flight RDMA spins forever.
         torch.cuda.synchronize()
         _pre_nixl_retire(sm.ranks_to_retire)
 
@@ -125,24 +102,18 @@ def advance_scale_down(
     scale_timeout: float,
     fail_scale: Callable[[str, int], None],
 ) -> Optional[ScaleDownStateMachine]:
-    """Step the shrink one tick. Returns the machine to keep, or None once terminal.
-
-    Constructs the machine on the first pending-shrink tick, so the caller only has
-    to hold whatever comes back.
-    """
+    """Step the shrink one tick; returns the machine to keep, or None once terminal."""
     if time.monotonic() - pending_since > scale_timeout:
         fail_scale(
             f"Timed out waiting for cohort at retire barrier (target={pending_size})",
             effective_size,
         )
-        # Release before dropping: the machine may hold a barrier epoch this rank
-        # leads, and a leaked leader wedges every later scale.
         if sm is not None:
             sm.abandon(driver)
         return None
 
     if sm is None:
-        ranks_to_retire: List[int] = list(range(pending_size, effective_size))
+        ranks_to_retire = list(range(pending_size, effective_size))
         sm = ScaleDownStateMachine(
             is_retiree=my_global_rank in ranks_to_retire,
             target_size=pending_size,
@@ -154,7 +125,5 @@ def advance_scale_down(
     sm.tick(driver)
     if sm.is_failed():
         fail_scale(sm.last_error or "unknown scale-down FSM failure", effective_size)
-        # A failure can land with a barrier still posted; see abandon().
         sm.abandon(driver)
-    # FAILED is terminal, so this also tears down after the failure above.
     return None if sm.is_terminal() else sm
