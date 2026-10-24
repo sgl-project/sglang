@@ -41,7 +41,7 @@ pub(super) fn render_chat(
         // The SGLang path declines some valid requests only the engine renders;
         // with no engine here, the formatter's template renders them (one
         // with no other path declines them again).
-        Err(TemplateError::EngineOnly { .. }) => {
+        Err(TemplateError::NeedsRenderFallback { .. }) => {
             render_template(formatter, request, kwargs, defaults)
         }
         Err(error) => Err(error),
@@ -151,7 +151,7 @@ mod tests {
             let body = case["request"].clone();
             assert!(matches!(
                 formatter.render_request(body.clone(), &HashMap::new()),
-                Err(TemplateError::EngineOnly { .. })
+                Err(TemplateError::NeedsRenderFallback { .. })
             ));
             let request: CreateChatCompletionRequest =
                 serde_json::from_value(body.clone()).unwrap();
