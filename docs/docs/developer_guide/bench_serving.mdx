@@ -93,6 +93,7 @@ python3 -m sglang.bench_serving \
 Select with `--dataset-name`:
 
 - `sharegpt` (default): loads ShareGPT-style pairs; optionally restrict with `--sharegpt-context-len` and override outputs with `--sharegpt-output-len`
+- `embedding`: UTF-8 JSONL embedding inputs; use with `sglang-embedding` or `vllm-embedding` (see below)
 - `random`: random text lengths; sampled from ShareGPT token space
 - `random-ids`: random token ids (can lead to gibberish)
 - `image`: generates images and wraps them in chat messages; supports custom resolutions, multiple formats, and different content types
@@ -109,6 +110,39 @@ Common dataset flags:
 
 - `--apply-chat-template`: apply tokenizer chat template when constructing prompts
 - `--dataset-path PATH`: file path for ShareGPT json; if blank and missing, it will be downloaded and cached
+
+#### Embedding JSONL inputs
+
+Use `--dataset-name embedding --dataset-path embeddings.jsonl` to replay embedding
+requests against an OpenAI-compatible `/v1/embeddings` endpoint. Each JSONL object
+has an `input` string or a non-empty array of strings. An array is sent as one
+batched HTTP request; its prompt-token count is the sum of the individually
+tokenized strings. No chat template or output-token override is applied.
+
+```jsonl
+{"input": "A short document", "dimensions": 128, "encoding_format": "float"}
+{"input": ["First document", "Second document"], "dimensions": 128, "encoding_format": "float"}
+```
+
+With an embedding server already running, use its model and tokenizer identifiers:
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang-embedding \
+  --base-url http://127.0.0.1:30000 \
+  --model MODEL_ID --tokenizer TOKENIZER_PATH \
+  --dataset-name embedding --dataset-path embeddings.jsonl \
+  --num-prompts 2
+```
+
+The loader preserves per-record embedding parameters such as `dimensions`,
+`encoding_format`, and `user`; the server must support the supplied parameters.
+The model comes from the benchmark's `--model` option, not each JSONL record.
+`--num-prompts` limits valid request records, including batched records. Blank
+lines, malformed JSON, non-object records, missing inputs, empty or whitespace-only
+strings, empty arrays, and arrays containing non-string or blank elements are
+skipped. Token-ID arrays are not supported. Embedding requests have zero output
+tokens. Use the existing `openai` dataset for chat `messages` records instead.
 
 Generated Shared Prefix flags (for `generated-shared-prefix`):
 
