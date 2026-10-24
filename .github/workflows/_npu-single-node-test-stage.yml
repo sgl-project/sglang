@@ -230,6 +230,13 @@ jobs:
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
+      - name: Patch torch_npu dynamo trace rule (temporary workaround)
+        if: ${{ inputs.is_nightly_pipeline_job }}
+        shell: bash
+        run: |
+          python scripts/ci/npu/patch_torch_npu_trace_rule.py
+          python scripts/ci/npu/patch_torch_npu_trace_rule.py
+
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.test_timeout_minutes) }}
         env:

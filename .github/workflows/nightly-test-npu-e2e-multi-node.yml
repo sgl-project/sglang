@@ -64,6 +64,10 @@ on:
         type: string
         default: '{}'
         description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
+      is_nightly_pipeline_job:
+        description: 'Enable the temporary torch_npu trace-rule workaround inside the test pods'
+        type: boolean
+        default: false
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -99,6 +103,8 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Prepare code for testing
+        env:
+          IS_NIGHTLY_PIPELINE_JOB: ${{ inputs.is_nightly_pipeline_job }}
         run: |
           # copy source code to shared-disk
           # Append run_id to isolate concurrent runs sharing the same PVC.
@@ -107,6 +113,12 @@ jobs:
           rm -rf ${target_path}
           mkdir -p ${target_path}
           cp -r ${current_path}/* ${target_path}/
+          # Temporary workaround for the CANN 9.2 nightly images.
+          # The pods mount this directory at /root/sglang, so this marker is how
+          # run_npu_testcase.sh knows the torch_npu trace-rule patch is enabled.
+          if [ "${IS_NIGHTLY_PIPELINE_JOB}" = "true" ]; then
+            touch ${target_path}/.patch_torch_npu_trace_rule
+          fi
 
       - name: Clear resources
         run: |

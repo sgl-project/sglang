@@ -237,6 +237,13 @@ jobs:
           apt-get install -y libssl-dev
           pip install sglang_router
 
+      - name: Patch torch_npu dynamo trace rule (temporary workaround)
+        if: ${{ inputs.is_nightly_pipeline_job }}
+        shell: bash
+        run: |
+          python3 scripts/ci/npu/patch_torch_npu_trace_rule.py
+          python3 scripts/ci/npu/patch_torch_npu_trace_rule.py
+
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
