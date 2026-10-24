@@ -876,6 +876,13 @@ class LoRAManager:
                 # Otherwise, infer target_modules from adapter configs.
                 self.target_modules.update(adapter_target_modules)
 
+        # Normalization maps up_proj to gate_up_proj for fused MoE weights.
+        # Keep standalone dense/shared-expert up_proj modules eligible too.
+        if "gate_up_proj" in self.target_modules and any(
+            name.endswith(".up_proj") for name, _ in self.base_model.named_modules()
+        ):
+            self.target_modules.add("up_proj")
+
         # Fusion folds wk + weights_proj into wk_weights_proj, so the modules
         # LoRA wraps are absent and an indexer-targeted adapter is silently dropped.
         # Each Indexer decides fusion when it is built (CUDA, env, RoPE style).

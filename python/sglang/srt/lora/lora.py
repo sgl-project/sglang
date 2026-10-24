@@ -463,7 +463,16 @@ class LoRAAdapter(nn.Module):
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
         for weight_name in weight_names:
-            if "gate_proj" in weight_name:
+            if ".up_proj." in weight_name and self._is_non_gated_moe_weight(
+                weight_name
+            ):
+                gate_name = weight_name.replace(".up_proj.", ".gate_proj.")
+                if weight_name in weights and gate_name not in weights:
+                    # Non-gated experts can export their single input projection
+                    # as up_proj. The fused MoE buffer still calls it gate_up_proj.
+                    merged_name = weight_name.replace(".up_proj.", ".gate_up_proj.")
+                    weights[merged_name] = weights.pop(weight_name)
+            elif "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
                 # PEFT can ship up_proj in two forms when there's no real
@@ -496,7 +505,7 @@ class LoRAAdapter(nn.Module):
                     repeat_dims[ndim - 2] = 2
                     weights[gate_up_name] = weights[gate_up_name].repeat(*repeat_dims)
                 # else: no-op as LoRA B weight is already stacked.
-        # Orphan up_proj weights (no matching gate_proj) are kept as-is.
+        # Dense/shared-expert orphan up_proj weights are kept as-is.
         # Models with non-gated MLP/shared-experts declare up_proj in
         # supported_lora_modules so they get their own buffer and wrapping.
 
