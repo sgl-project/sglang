@@ -1,4 +1,4 @@
-"""MXFP4 W4A4 online quantization config (dual-level MXFP4 weights + activations).
+"""MXFP4 W4A4 online config: dual-level Linear and single-level MoE.
 
 Triggered by ``--quantization mxfp4`` on the Ascend NPU backend. On CUDA / AMD /
 CPU the ``mxfp4`` key resolves to the upstream :class:`Mxfp4Config` (OCP MXFP4
@@ -6,13 +6,11 @@ MoE) instead; the per-device split is done at registration time in
 ``sglang.srt.layers.quantization.__init__`` (this config is only registered
 inside the ``is_npu()`` block, mirroring ``GPTQAscendConfig``).
 
-Online mode: FP16/BF16 weights are quantised to **dual-level** MXFP4 in
-``process_weights_after_loading`` (a finer FP8 E4M3 L0 block scale plus a coarser
-L1 scale); activations are dynamically quantised the same way and the matmul runs
-via ``npu_dual_level_quant_matmul`` (see :class:`NPUDualLevelMXFP4LinearMethod`).
-Dual-level is the sole online path — it captures per-block dynamic range far more
-accurately than a single-level UE8M0 scale, avoiding the RTN degradation that made
-single-level online decoding loop under greedy sampling. Requires Ascend 950 (A5).
+Online Linear layers quantize FP16/BF16 weights and activations to dual-level
+MXFP4 and run ``npu_dual_level_quant_matmul``. MoE experts use single-level
+MXFP4 because the grouped kernels do not support dual-level scales. Ignored or
+group-unaligned Linear layers remain unquantized. This per-layer scale policy
+does not establish model-level RTN accuracy. Requires Ascend 950.
 
 Offline (msmodelslim ``W4A4_MXFP4``) checkpoints are single-level (the checkpoint
 stores UE8M0 scales) and are handled separately by the ``modelslim`` config
@@ -40,14 +38,14 @@ from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
+MXFP4_W4A4_GROUP_SIZE = 32
+
 
 class Mxfp4W4A4Config(QuantizationConfig):
-    """Single-level MXFP4 W4A4 online quantization config for Ascend NPU.
+    """Online MXFP4 on Ascend: dual-level Linear and single-level MoE experts.
 
-    True W4(weight) A4(activation): both weights and activations are quantised
-    to single-level MXFP4 (``float4_e2m1fn_x2``). The device-specific linear
-    method is selected in ``get_quant_method``; only Ascend NPU is wired up
-    today (on other devices ``mxfp4`` maps to the upstream ``Mxfp4Config``).
+    Ignored layers retain the unquantized method. On other devices, ``mxfp4``
+    resolves to the upstream ``Mxfp4Config`` instead of this NPU-only config.
     """
 
     def __init__(
@@ -74,6 +72,9 @@ class Mxfp4W4A4Config(QuantizationConfig):
     @classmethod
     def get_config_filenames(cls) -> List[str]:
         return []
+
+    def is_static_cfg(self) -> bool:
+        return False
 
     @classmethod
     def from_config(cls, config: Dict) -> Mxfp4W4A4Config:
@@ -108,27 +109,48 @@ class Mxfp4W4A4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
+            # Preserve the existing fallback for non-aligned visual Linear
+            # layers, such as Qwen3.5 vision FC2 with K=4304.
+            if layer.input_size % MXFP4_W4A4_GROUP_SIZE != 0:
+                logger.warning(
+                    "mxfp4 W4A4: skipping %s (input_size=%d not a multiple of "
+                    "%d); falling back to unquantized precision.",
+                    prefix,
+                    layer.input_size,
+                    MXFP4_W4A4_GROUP_SIZE,
+                )
+                return UnquantizedLinearMethod()
             if is_npu():
                 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
                     NPUDualLevelMXFP4LinearMethod,
                 )
 
-                # Online W4A4 always uses dual-level MXFP4 (finer FP8 L0 scales):
-                # single-level RTN was too lossy and degenerated under greedy
-                # decoding. Requires Ascend 950 (A5). The single-level kernel is
-                # retained only for the offline msmodelslim path.
+                # Online Linear uses dual-level scales; the single-level
+                # Linear kernel remains reserved for offline ModelSlim.
                 return NPUDualLevelMXFP4LinearMethod(self)
             raise NotImplementedError(
-                "mxfp4 W4A4 (single-level MXFP4 weights + activations) is currently "
+                "mxfp4 W4A4 Linear (dual-level MXFP4 weights + activations) is currently "
                 "only implemented for the Ascend NPU backend; no CUDA/other-device "
                 "kernel exists in this config. Add a device branch here when one lands."
             )
         elif isinstance(layer, FusedMoE):
-            # MoE single-level MXFP4 W4A4 not yet implemented; fall back to unquantised
+            if is_layer_skipped(
+                prefix,
+                self.ignored_layers,
+                fused_mapping=self.packed_modules_mapping,
+            ):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                )
+            if is_npu():
+                from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
+                    NPUW4A4MXFP4OnlineMoEMethod,
+                )
+
+                return NPUW4A4MXFP4OnlineMoEMethod(self)
             logger.warning(
-                "MXFP4 W4A4 quantization is not yet supported for FusedMoE layers "
-                "(prefix=%s). Falling back to unquantized MoE — MoE weights will "
-                "run in full precision (BF16/FP16).",
+                "MXFP4 W4A4 MoE is only implemented for the Ascend NPU backend "
+                "(prefix=%s); falling back to unquantized MoE (full precision).",
                 prefix,
             )
             return UnquantizedFusedMoEMethod(
