@@ -6,7 +6,7 @@ use dynamo_renderer::deepseek::v32::DeepSeekV32Formatter;
 use dynamo_renderer::{PromptFormatter, kimi_k3_formatter_for, native_formatter_for};
 
 use super::models::resolve_dsv4_profile;
-use super::{ChatFormatter, ThinkingTemplates, load_chat_formatter};
+use super::{ChatFormatter, TemplateError, ThinkingTemplates, load_chat_formatter};
 use crate::model_files::{resolve_chat_template_file, resolve_model_file};
 
 /// Model and template sources used to select a chat formatter.
@@ -67,15 +67,6 @@ pub fn select_chat_formatter(
             };
             return (Some(ChatFormatter::DeepSeekV4(profile)), None);
         }
-        if identity.is_deepseek_v32() {
-            return (
-                Some(ChatFormatter::HuggingFace {
-                    formatter: PromptFormatter::OAI(Arc::new(DeepSeekV32Formatter::new_chat())),
-                    thinking: ThinkingTemplates::native(false, false),
-                }),
-                None,
-            );
-        }
         if kimi_k3_formatter_for(&model_type_lower, &display_name_lower, true).is_some() {
             return (Some(ChatFormatter::KimiK3), None);
         }
@@ -90,17 +81,6 @@ pub fn select_chat_formatter(
                 None,
             );
         }
-        if let Some(formatter) = native_formatter_for(&model_type_lower, &display_name_lower) {
-            return (
-                Some(ChatFormatter::HuggingFace {
-                    formatter,
-                    // The remaining display-name fallback formatters are
-                    // constructed with their thinking mode enabled.
-                    thinking: ThinkingTemplates::native(true, false),
-                }),
-                None,
-            );
-        }
     }
     let discovered_template = config
         .chat_template
@@ -111,12 +91,23 @@ pub fn select_chat_formatter(
         .chat_template
         .as_deref()
         .or(discovered_template.as_deref());
-    match load_chat_formatter(
+    let loaded = load_chat_formatter(
         tokenizer_config_file.as_deref(),
         (!config.model_path.is_empty()).then_some(config.model_path.as_str()),
         identity.model_type.as_deref(),
         template_source,
-    ) {
+    );
+    // Python's `resolve_chat_encoding_spec`: a model's own encoder only when it
+    // ships no template.
+    if matches!(
+        loaded,
+        Err(TemplateError::Missing | TemplateError::MissingConfig)
+    ) && config.chat_template.is_none()
+        && let Some(formatter) = native_fallback(&identity, &model_type_lower, &display_name_lower)
+    {
+        return (Some(formatter), None);
+    }
+    match loaded {
         Ok(mut formatter) => {
             if identity.is_kimi_k25()
                 && let ChatFormatter::HuggingFace {
@@ -144,6 +135,25 @@ pub fn select_chat_formatter(
             )
         }
     }
+}
+
+fn native_fallback(
+    identity: &ModelIdentity,
+    model_type_lower: &Option<String>,
+    display_name_lower: &str,
+) -> Option<ChatFormatter> {
+    if identity.is_deepseek_v32() {
+        return Some(ChatFormatter::HuggingFace {
+            formatter: PromptFormatter::OAI(Arc::new(DeepSeekV32Formatter::new_chat())),
+            thinking: ThinkingTemplates::native(false, false),
+        });
+    }
+    Some(ChatFormatter::HuggingFace {
+        formatter: native_formatter_for(model_type_lower, display_name_lower)?,
+        // The remaining display-name fallback formatters are constructed with
+        // their thinking mode enabled.
+        thinking: ThinkingTemplates::native(true, false),
+    })
 }
 
 impl ModelIdentity {
