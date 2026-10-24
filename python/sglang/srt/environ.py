@@ -1412,6 +1412,12 @@ class Envs:
     SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(None)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
+    # MSCCL++ EP
+    # Use direct-send combine instead of the default rank-local reduction.
+    SGLANG_MSCCLPP_ENABLE_DIRECT_SEND = EnvBool(False)
+    # Retain SM capacity for shared-expert work by reducing the rank-major
+    # combine grid while keeping the full dispatch grid.
+    SGLANG_MSCCLPP_ENABLE_SHARED_EXPERTS_OVERLAP = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)
     # Force dynamic Waterfill with runtime EP all-reduce instead of the default
     # static local-batch path.

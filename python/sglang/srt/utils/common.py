@@ -4084,7 +4084,11 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             return True
         elif moe_a2a_backend.is_none():
             return True
-        elif moe_a2a_backend.is_flashinfer() or moe_a2a_backend.is_mori_epv2():
+        elif (
+            moe_a2a_backend.is_flashinfer()
+            or moe_a2a_backend.is_mori_epv2()
+            or moe_a2a_backend.is_mscclpp()
+        ):
             # FlashInfer/MORI EPv2 A2A need a rank-invariant, DP-synchronized per-rank
             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks
