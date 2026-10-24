@@ -444,7 +444,7 @@ def source_case(tmp_path):
     systems = tmp_path / "systems"
     systems.mkdir()
     (systems / "mi355x.json").write_text(
-        json.dumps({"data_dir": "data/mi355x"}), encoding="utf-8"
+        json.dumps({"data_dir": str(Path("data") / "mi355x")}), encoding="utf-8"
     )
     slice_dir = systems / "data/mi355x/framework/sglang/0.5.22"
     (slice_dir / "_meta").mkdir(parents=True)
@@ -1165,11 +1165,6 @@ def real_factory(source_case, tmp_path, monkeypatch):
             model=RUNTIME["model_path"], backend="sglang", geometry=geometry
         ),
     )
-    monkeypatch.setattr(
-        model_config,
-        "load_model_config",
-        lambda *args, **kwargs: copy.deepcopy(authoritative),
-    )
     progress_calls, progress_reads = [], []
 
     class NoProgress:
@@ -1210,9 +1205,18 @@ def real_factory(source_case, tmp_path, monkeypatch):
     config = SchedulerConfig(tp_size=2, backend_version="0.5.22")
 
     def build(**changes):
-        return InferCastDSparkTimePredictor(
-            model, NS(name="mi355x"), config, **{**kwargs, **changes}
-        )
+        # This toy checkpoint tests constructor identity only. Restore the
+        # loader before UMD's lazy template imports bind its from-import alias,
+        # so prospective phase preparation uses the real supported resource.
+        with monkeypatch.context() as constructor:
+            constructor.setattr(
+                model_config,
+                "load_model_config",
+                lambda *args, **kwargs: copy.deepcopy(authoritative),
+            )
+            return InferCastDSparkTimePredictor(
+                model, NS(name="mi355x"), config, **{**kwargs, **changes}
+            )
 
     return NS(
         build=build,
