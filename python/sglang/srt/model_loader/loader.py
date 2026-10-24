@@ -309,6 +309,11 @@ def _initialize_model(
         model = model_class(**kwargs)
         check_stage_producers(model)
     model.shared_experts_config = shared_experts
+    # ``MiniCPMV`` forwards attributes to the inner module via ``__getattr__``,
+    # so ``model.eval()`` in the loader returns the inner module.
+    inner = getattr(model, "minicpmv", None)
+    if inner is not None:
+        inner.shared_experts_config = shared_experts
     return model
 
 
