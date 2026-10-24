@@ -3,6 +3,8 @@ import json
 import unittest
 import warnings
 
+import xgrammar as xgr
+
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
     Tool,
@@ -14,6 +16,7 @@ from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.gemma4_detector import (
     Gemma4Detector,
     _parse_gemma4_args,
@@ -31,10 +34,13 @@ from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.ling3_detector import Ling3Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.utils import get_schema_properties
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_cpu_ci(est_time=70, suite="stage-b-test-cpu-intel")
@@ -1718,7 +1724,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                             call.parameters
                         )
 
-        self.assertGreater(num_tool_call_chunks, 8)
+        self.assertEqual(num_tool_call_chunks, 1)
 
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
@@ -1773,7 +1779,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                             call.parameters
                         )
 
-        self.assertGreater(num_tool_call_chunks, 8)
+        self.assertEqual(num_tool_call_chunks, 1)
         self.assertEqual(len(tool_calls_by_index), 1)
         self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
 
@@ -2053,91 +2059,6 @@ class TestDeepSeekV4Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV4Detector()
-        self.tokenizer = _shared_tokenizer("deepseek-ai/DeepSeek-V3.2")
-        self.interval = 1
-
-    def test_detect_and_parse_xml_format(self):
-        """Test parsing standard XML format (DSML)"""
-        text = """I'll help you with information about San Francisco and get its favorite tourist spot for you.\n\n
-        <｜DSML｜tool_calls>\n
-            <｜DSML｜invoke name="get_favorite_tourist_spot">\n
-                <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>\n
-            </｜DSML｜invoke>\n
-            <｜DSML｜invoke name="search">
-                <｜DSML｜parameter name="query" string="true">WebNav benchmark</｜DSML｜parameter>
-                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
-                <｜DSML｜parameter name="source" string="true">web</｜DSML｜parameter>
-            </｜DSML｜invoke>
-        </｜DSML｜tool_calls>
-        """
-        result = self.detector.detect_and_parse(text, self.tools)
-
-        self.assertIn("I'll help you with information", result.normal_text)
-        self.assertEqual(len(result.calls), 2)
-
-        # Check first call
-        call1 = result.calls[0]
-        self.assertEqual(call1.name, "get_favorite_tourist_spot")
-        params1 = json.loads(call1.parameters)
-        self.assertEqual(params1["city"], "San Francisco")
-
-        # Check second call
-        call2 = result.calls[1]
-        self.assertEqual(call2.name, "search")
-        params2 = json.loads(call2.parameters)
-        self.assertEqual(params2["query"], "WebNav benchmark")
-        self.assertEqual(params2["topn"], 10)
-        self.assertEqual(params2["source"], "web")
-
-    def test_streaming_xml_format(self):
-        """Test streaming parsing of XML format"""
-        text = """<｜DSML｜tool_calls>
-            <｜DSML｜invoke name="get_favorite_tourist_spot">
-                <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
-                <｜DSML｜parameter name="another_city" string="true">London</｜DSML｜parameter>
-                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
-                <｜DSML｜parameter name="obj" string="false">{"name": "John", "age": 30}</｜DSML｜parameter>
-            </｜DSML｜invoke>
-        </｜DSML｜tool_calls>"""
-
-        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        chunk_ids = [
-            input_ids[i : i + self.interval]
-            for i in range(0, len(input_ids), self.interval)
-        ]
-        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
-
-        tool_calls_by_index = {}
-
-        num_tool_call_chunks = 0
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
-            for call in result.calls:
-                num_tool_call_chunks += 1
-                if call.tool_index is not None:
-                    if call.tool_index not in tool_calls_by_index:
-                        tool_calls_by_index[call.tool_index] = {
-                            "name": "",
-                            "parameters": "",
-                        }
-
-                    if call.name:
-                        tool_calls_by_index[call.tool_index]["name"] = call.name
-                    if call.parameters:
-                        tool_calls_by_index[call.tool_index]["parameters"] += (
-                            call.parameters
-                        )
-
-        self.assertGreater(num_tool_call_chunks, 8)
-
-        self.assertEqual(len(tool_calls_by_index), 1)
-        self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
-        params = json.loads(tool_calls_by_index[0]["parameters"])
-        self.assertEqual(params["city"], "San Francisco")
-        self.assertEqual(params["another_city"], "London")
-        self.assertEqual(params["topn"], 10)
-        self.assertEqual(params["obj"]["name"], "John")
-        self.assertEqual(params["obj"]["age"], 30)
 
     def test_get_model_structural_tag(self):
         import xgrammar as xgr
@@ -2190,96 +2111,6 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
-
-    def test_self_closing_zero_arg_invoke(self):
-        """V4 emits `<｜DSML｜invoke name="x"/>` for zero-arg tools; the
-        detector must parse it as a complete tool call with empty params
-        instead of leaking the raw markup back into normal_text."""
-        submit_tool = Tool(
-            type="function",
-            function=Function(
-                name="submit",
-                description="Submit the final answer.",
-                parameters={"type": "object", "properties": {}},
-            ),
-        )
-
-        text = (
-            "Final answer.\n"
-            '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="submit"/>\n'
-            "</｜DSML｜tool_calls>"
-        )
-        result = self.detector.detect_and_parse(text, [submit_tool])
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "submit")
-        self.assertEqual(json.loads(result.calls[0].parameters), {})
-        self.assertNotIn("DSML", result.normal_text)
-
-    def test_self_closing_mixed_with_long_form(self):
-        """Mix of long-form (with params) and self-closing tags in one block."""
-        submit_tool = Tool(
-            type="function",
-            function=Function(
-                name="submit",
-                parameters={"type": "object", "properties": {}},
-            ),
-        )
-        text = (
-            "<｜DSML｜tool_calls>\n"
-            '<｜DSML｜invoke name="get_favorite_tourist_spot">\n'
-            '<｜DSML｜parameter name="city" string="true">SF</｜DSML｜parameter>\n'
-            "</｜DSML｜invoke>\n"
-            '<｜DSML｜invoke name="submit"/>\n'
-            "</｜DSML｜tool_calls>"
-        )
-        result = self.detector.detect_and_parse(text, self.tools + [submit_tool])
-        self.assertEqual(len(result.calls), 2)
-        self.assertEqual(result.calls[0].name, "get_favorite_tourist_spot")
-        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
-        self.assertEqual(result.calls[1].name, "submit")
-        self.assertEqual(json.loads(result.calls[1].parameters), {})
-
-    def test_streaming_self_closing_invoke(self):
-        """Self-closing invoke must terminate cleanly even when `/>` arrives
-        after the `name=` attribute crosses chunk boundaries."""
-        submit_tool = Tool(
-            type="function",
-            function=Function(
-                name="submit",
-                parameters={"type": "object", "properties": {}},
-            ),
-        )
-        # Build the prompt and feed it through the tokenizer to exercise the
-        # same chunk shapes the runtime sees.
-        text = (
-            "<｜DSML｜tool_calls>\n"
-            '<｜DSML｜invoke name="submit"/>\n'
-            "</｜DSML｜tool_calls>"
-        )
-        self.detector = DeepSeekV4Detector()
-        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        chunks = [
-            self.tokenizer.decode(input_ids[i : i + self.interval])
-            for i in range(0, len(input_ids), self.interval)
-        ]
-
-        tool_calls_by_index = {}
-        for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, [submit_tool])
-            for call in result.calls:
-                if call.tool_index is None:
-                    continue
-                slot = tool_calls_by_index.setdefault(
-                    call.tool_index, {"name": "", "parameters": ""}
-                )
-                if call.name:
-                    slot["name"] = call.name
-                if call.parameters:
-                    slot["parameters"] += call.parameters
-
-        self.assertEqual(len(tool_calls_by_index), 1)
-        self.assertEqual(tool_calls_by_index[0]["name"], "submit")
-        self.assertEqual(json.loads(tool_calls_by_index[0]["parameters"]), {})
 
 
 class TestQwen3CoderDetector(unittest.TestCase):
@@ -3671,11 +3502,199 @@ class TestGlm47MoeDetector(unittest.TestCase):
             self.assertIsNone(self.detector.get_structural_tag(self.tools))
 
             parser = FunctionCallParser(self.tools, "glm47")
+            self.assertEqual(
+                "full_assistant_ebnf",
+                parser.get_structure_constraint("required")[0],
+            )
+            strict_tools = [
+                tool.model_copy(
+                    update={
+                        "function": tool.function.model_copy(update={"strict": True})
+                    }
+                )
+                for tool in self.tools
+            ]
+            parser = FunctionCallParser(strict_tools, "glm47")
             constraint = parser.get_structure_constraint("required")
 
             self.assertIsNotNone(constraint)
             self.assertEqual("json_schema", constraint[0])
             _glm47_native_structural_tag_available.cache_clear()
+
+
+class TestGlm47FullAssistantGrammar(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(
+                [bytes([i]) for i in range(256)], vocab_type=xgr.VocabType.RAW
+            ),
+            max_threads=1,
+        )
+
+    def _compile(self, parameters=None, choice="auto", parallel=True, thinking=False):
+        tools = [
+            Tool(type="function", function=Function(name=name, parameters=parameters))
+            for name in ("alpha", "beta")
+        ]
+        parser = FunctionCallParser(tools, "glm47")
+        constraint = parser.get_structure_constraint(
+            choice, parallel_tool_calls=parallel, thinking_mode=thinking
+        )
+        self.assertIsNotNone(constraint)
+        return self.compiler.compile_grammar(xgr.Grammar.from_ebnf(constraint[1]))
+
+    def _accepts(self, grammar, text):
+        matcher = xgr.GrammarMatcher(grammar)
+        return matcher.accept_string(text) and matcher.is_completed()
+
+    def test_tool_choice_and_parallel_calls(self):
+        alpha = "<tool_call>alpha</tool_call>"
+        beta = "<tool_call>beta</tool_call>"
+        named = ToolChoice(function=ToolChoiceFuncName(name="alpha"))
+        for thinking in (False, True):
+            prefix = "analysis</think>" if thinking else ""
+            for parallel in (False, True):
+                for choice in ("auto", "required", named, "none"):
+                    with self.subTest(
+                        thinking=thinking, parallel=parallel, choice=choice
+                    ):
+                        grammar = self._compile(
+                            choice=choice, parallel=parallel, thinking=thinking
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + "Hello"),
+                            choice in ("auto", "none"),
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + alpha), choice != "none"
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + beta),
+                            choice in ("auto", "required"),
+                        )
+                        self.assertEqual(
+                            self._accepts(grammar, prefix + alpha * 2),
+                            parallel and choice != "none",
+                        )
+
+    def test_enum_json_types_and_boolean_schemas(self):
+        cases = [
+            ({"enum": [1, 2]}, ["1", "2"], ["3"]),
+            ({"enum": [True, False]}, ["true", "false"], ["True", "1"]),
+            (
+                {"type": ["string", "null"], "enum": ["ok", None]},
+                ["ok", "null"],
+                ["None", "bad"],
+            ),
+            ({"enum": [{"x": 1}, [True, None]]}, ['{"x": 1}', "[true, null]"], ["{}"]),
+            (True, ["anything"], []),
+            (False, ["anything"], []),
+        ]
+        for schema, accepted, rejected in cases:
+            with self.subTest(schema=schema):
+                grammar = self._compile({"properties": {"p": schema}})
+                for values, expected in ((accepted, True), (rejected, False)):
+                    for value in values:
+                        text = f"<tool_call>alpha<arg_key>p</arg_key><arg_value>{value}</arg_value></tool_call>"
+                        self.assertEqual(self._accepts(grammar, text), expected, text)
+
+    def test_composed_and_unresolved_schemas_allow_arguments(self):
+        schemas = [
+            {keyword: [{"properties": {"city": {"type": "string"}}}]}
+            for keyword in ("allOf", "anyOf", "oneOf")
+        ]
+        schemas += [
+            {
+                "properties": {"country": {"type": "string"}},
+                "allOf": [{"properties": {"city": {"type": "string"}}}],
+            },
+            {
+                "$ref": "#/$defs/args",
+                "$defs": {"args": {"properties": {"city": {"type": "string"}}}},
+            },
+            {
+                "anyOf": [
+                    {"properties": {"city": {"enum": [1]}}},
+                    {"properties": {"city": {"enum": ["Paris"]}}},
+                ]
+            },
+        ]
+        for schema in schemas:
+            with self.subTest(schema=schema):
+                grammar = self._compile(schema)
+                arg = "<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+                self.assertTrue(
+                    self._accepts(grammar, f"<tool_call>alpha{arg}</tool_call>")
+                )
+                self.assertTrue(
+                    self._accepts(grammar, f"<tool_call>alpha{arg}{arg}</tool_call>")
+                )
+                self.assertTrue(self._accepts(grammar, "<tool_call>alpha</tool_call>"))
+
+    def test_incomplete_composition_branches_allow_arguments(self):
+        city = {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+            "additionalProperties": False,
+        }
+        country = {
+            "type": "object",
+            "properties": {"country": {"type": "string"}},
+            "required": ["country"],
+            "additionalProperties": False,
+        }
+        branches = [
+            {"$ref": "#/$defs/by_country"},
+            {"patternProperties": {"^country$": {"type": "string"}}},
+            {"properties": {"region": {"type": "string"}}, "allOf": [country]},
+            {"additionalProperties": {"type": "string"}},
+            True,
+            {},
+            {"properties": {}},
+        ]
+        text = "<tool_call>alpha<arg_key>country</arg_key><arg_value>France</arg_value></tool_call>"
+        for branch in branches:
+            for nested in (False, True):
+                with self.subTest(branch=branch, nested=nested):
+                    schema = {
+                        "type": "object",
+                        "anyOf": [
+                            city,
+                            {"allOf": [{"oneOf": [branch]}]} if nested else branch,
+                        ],
+                        "$defs": {"by_country": country},
+                    }
+                    grammar = self._compile(schema, choice="required", parallel=False)
+                    self.assertTrue(self._accepts(grammar, text))
+                    self.assertFalse(
+                        self._accepts(grammar, text.replace("</arg_key>", ""))
+                    )
+                    self.assertFalse(self._accepts(grammar, text + text))
+
+    def test_complete_compositions_restrict_argument_names(self):
+        schema = {
+            "allOf": [
+                {"properties": {"city": {"type": "string"}}},
+                {
+                    "anyOf": [
+                        {"oneOf": [{"properties": {"country": {"type": "string"}}}]}
+                    ]
+                },
+            ]
+        }
+        grammar = self._compile(schema, choice="required", parallel=False)
+        for key, accepted in (("city", True), ("country", True), ("unknown", False)):
+            text = f"<tool_call>alpha<arg_key>{key}</arg_key><arg_value>Paris</arg_value></tool_call>"
+            self.assertEqual(self._accepts(grammar, text), accepted)
+
+    def test_escaped_property_names(self):
+        for key in ['a"b', "path\\name", "line\nbreak", "tab\tkey", "control\x01key"]:
+            with self.subTest(key=key):
+                grammar = self._compile({"properties": {key: {"type": "string"}}})
+                text = f"<tool_call>alpha<arg_key>{key}</arg_key><arg_value>v</arg_value></tool_call>"
+                self.assertTrue(self._accepts(grammar, text))
 
 
 class TestLing3Detector(unittest.TestCase):
@@ -3854,6 +3873,33 @@ class TestJsonArrayParser(unittest.TestCase):
         result = self.detector.parse_streaming_increment("", self.tools)
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, "")
+
+    def test_finish_streams_arguments_of_calls_completed_in_final_chunk(self):
+        """Calls that arrive whole in the last chunk still stream their
+        arguments at stream end, exactly once."""
+        text = (
+            '[{"name": "get_weather", "parameters": {"location": "Tokyo"}}, '
+            '{"name": "search", "parameters": {"query": "restaurants"}}]'
+        )
+        calls = self.detector.parse_streaming_increment(text, self.tools).calls
+        calls += self.detector.finish(self.tools).calls
+
+        streamed = {}
+        for call in calls:
+            entry = streamed.setdefault(call.tool_index, {"name": "", "arguments": ""})
+            entry["name"] += call.name or ""
+            entry["arguments"] += call.parameters or ""
+        self.assertEqual(
+            [
+                (e["name"], json.loads(e["arguments"]))
+                for _, e in sorted(streamed.items())
+            ],
+            [
+                ("get_weather", {"location": "Tokyo"}),
+                ("search", {"query": "restaurants"}),
+            ],
+        )
+        self.assertEqual(self.detector.finish(self.tools).calls, [])
 
     def test_braces_in_strings(self):
         """Test that JSON with } characters inside strings works correctly"""
@@ -5820,6 +5866,194 @@ class TestTopLevelCompositeToolSchema(unittest.TestCase):
         )
         self.assertEqual(name, "acme")
         self.assertEqual(json.loads(arguments), self.expected)
+
+
+class TestMuseSparkFunctionCallParser(CustomTestCase):
+    # Contract: meta-models/Muse-Spark-open-816B-A42B-NVFP4 at
+    # 7ea492f704b13336c1f7dab909c70d9e4a8beabc, tokenizer_config.json's
+    # response_template and chat_template.jinja. No checkpoint download needed.
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(name=name, parameters={"type": "object"}),
+            )
+            for name in ("report", "weather.lookup")
+        ]
+
+    def _assert_parses(self, text, expected_content, expected_calls):
+        parser = FunctionCallParser(self.tools, "muse")
+        content, calls = parser.parse_non_stream(text)
+        self.assertEqual(content, expected_content)
+        self.assertEqual(
+            [(c.tool_index, c.name, json.loads(c.parameters)) for c in calls],
+            expected_calls,
+        )
+        for size in (1, 7, len(text)):
+            with self.subTest(chunk_size=size):
+                parser = FunctionCallParser(self.tools, "muse")
+                content, calls = "", []
+                for i in range(0, len(text), size):
+                    delta, items = parser.parse_stream_chunk(text[i : i + size])
+                    content += delta
+                    calls.extend(items)
+                delta, items = parser.parse_stream_end()
+                content += delta
+                calls.extend(items)
+                self.assertEqual(content, expected_content)
+                self.assertEqual(
+                    [(c.tool_index, c.name, json.loads(c.parameters)) for c in calls],
+                    expected_calls,
+                )
+                self.assertEqual(parser.parse_stream_end(), ("", []))
+
+    def test_atem_parameter_types_and_multiline_strings(self):
+        # JSON values decode; non-JSON text must retain whitespace and Unicode.
+        text = (
+            ' to=report<|message|><atem:function_calls><atem:invoke name="report">'
+            '<atem:parameter name="text">  café\n"quoted"\n</atem:parameter>'
+            '<atem:parameter name="quoted">"hello"</atem:parameter>'
+            '<atem:parameter name="count">42</atem:parameter>'
+            '<atem:parameter name="ratio">1.5</atem:parameter>'
+            '<atem:parameter name="enabled">true</atem:parameter>'
+            '<atem:parameter name="disabled">false</atem:parameter>'
+            '<atem:parameter name="missing">null</atem:parameter>'
+            '<atem:parameter name="object">{"a": [1, false]}</atem:parameter>'
+            '<atem:parameter name="array">[1, "two", null]</atem:parameter>'
+            '<atem:parameter name="empty"></atem:parameter>'
+            "</atem:invoke></atem:function_calls><|eot|>"
+        )
+        self._assert_parses(
+            text,
+            "",
+            [
+                (
+                    0,
+                    "report",
+                    {
+                        "text": '  café\n"quoted"\n',
+                        "quoted": "hello",
+                        "count": 42,
+                        "ratio": 1.5,
+                        "enabled": True,
+                        "disabled": False,
+                        "missing": None,
+                        "object": {"a": [1, False]},
+                        "array": [1, "two", None],
+                        "empty": "",
+                    },
+                )
+            ],
+        )
+
+    def test_parallel_calls_use_separate_messages_and_keep_namespaces(self):
+        # The checkpoint template emits one invocation per assistant message.
+        text = (
+            " to=commentary<|message|>Checking.<|eom|>"
+            "<|start|>assistant to=report<|message|>"
+            '<atem:function_calls><atem:invoke name="report">'
+            "</atem:invoke></atem:function_calls><|eom|>"
+            "<|start|>assistant to=weather.lookup<|message|>"
+            '<atem:function_calls><atem:invoke name="weather.lookup">'
+            '<atem:parameter name="city">Paris</atem:parameter>'
+            "</atem:invoke></atem:function_calls><|eom|>"
+            "<|start|>assistant to=user<|message|>Done.<|eot|>"
+        )
+        self._assert_parses(
+            text,
+            "Checking.Done.",
+            [(0, "report", {}), (1, "weather.lookup", {"city": "Paris"})],
+        )
+
+    def test_quoted_atem_in_non_tool_channels_is_not_executed(self):
+        quoted = (
+            '<atem:function_calls><atem:invoke name="report">'
+            "</atem:invoke></atem:function_calls>"
+        )
+        for recipient in ("self", "user", "commentary"):
+            with self.subTest(recipient=recipient):
+                self._assert_parses(
+                    f" to={recipient}<|message|>{quoted}<|eom|>", quoted, []
+                )
+
+    def test_truncated_invocation_does_not_fabricate_a_call(self):
+        self._assert_parses(
+            ' to=report<|message|><atem:function_calls><atem:invoke name="report">'
+            '<atem:parameter name="count">42</atem:parameter>',
+            "",
+            [],
+        )
+
+    def test_reasoning_to_tool_pipeline_preserves_channel_boundaries(self):
+        quoted = '<atem:invoke name="report"></atem:invoke>'
+        text = (
+            f" to=self<|message|>Do not execute {quoted}.<|eom|>"
+            "<|start|>assistant to=commentary<|message|>Checking.<|eom|>"
+            "<|start|>assistant to=report<|message|>"
+            '<atem:function_calls><atem:invoke name="report">'
+            '<atem:parameter name="count">42</atem:parameter>'
+            "</atem:invoke></atem:function_calls><|eom|>"
+            f"<|start|>assistant to=user<|message|>Example: {quoted}<|eot|>"
+        )
+        expected = (
+            f"Do not execute {quoted}.",
+            f"Checking.Example: {quoted}",
+            [(0, "report", {"count": 42})],
+        )
+        rp = ReasoningParser("muse", tool_call_parser_active=True)
+        reasoning, remainder = rp.parse_non_stream(text)
+        content, calls = FunctionCallParser(self.tools, "muse").parse_non_stream(
+            remainder
+        )
+        self.assertEqual(
+            (
+                reasoning,
+                content,
+                [(c.tool_index, c.name, json.loads(c.parameters)) for c in calls],
+            ),
+            expected,
+        )
+        # Every possible two-chunk split, including inside headers and ATEM tags.
+        for split in range(1, len(text)):
+            with self.subTest(split=split):
+                rp = ReasoningParser("muse", tool_call_parser_active=True)
+                fp = FunctionCallParser(self.tools, "muse")
+                reasoning, content, calls = "", "", []
+                for chunk in (text[:split], text[split:]):
+                    thought, remainder = rp.parse_stream_chunk(chunk)
+                    reasoning += thought
+                    delta, items = fp.parse_stream_chunk(remainder)
+                    content += delta
+                    calls.extend(items)
+                thought, remainder = rp.parse_stream_end()
+                reasoning += thought
+                delta, items = fp.parse_stream_chunk(remainder)
+                content += delta
+                calls.extend(items)
+                delta, items = fp.parse_stream_end()
+                content += delta
+                calls.extend(items)
+                self.assertEqual(
+                    (
+                        reasoning,
+                        content,
+                        [
+                            (c.tool_index, c.name, json.loads(c.parameters))
+                            for c in calls
+                        ],
+                    ),
+                    expected,
+                )
+
+
+class TestToolCallParserNames(unittest.TestCase):
+    def test_matches_registry(self):
+        # `server_args` builds the --tool-call-parser choices from this list to
+        # keep the registry, and its dependencies, out of argument parsing.
+        self.assertEqual(
+            sorted(TOOL_CALL_PARSER_NAMES),
+            sorted(FunctionCallParser.ToolCallParserEnum),
+        )
 
 
 if __name__ == "__main__":

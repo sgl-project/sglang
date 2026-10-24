@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-"""Unit tests for warmup-calibrated auto residency adjustment."""
-
 from types import SimpleNamespace
 
 import pytest
@@ -68,6 +65,77 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _resolve_auto_residency_warmup_shape,
     _resolve_warmup_num_frames,
 )
+
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for warmup-calibrated auto residency adjustment."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn as nn
+
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
+from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
+    ACTIVATION_EXTRAPOLATION_MARGIN,
+    GIB_BYTES,
+    MAX_LAYERWISE_COMPONENT_TARGETS,
+    MAX_LAYERWISE_PIN_TARGETS,
+    MAX_LAYERWISE_POLICY_TARGETS,
+    MAX_LAYERWISE_RESIDENT_TARGETS,
+    MIN_VRAM_RESERVE_BYTES,
+    PAGEABLE_H2D_COST_MULTIPLIER,
+    AppliedResidencyChange,
+    AutoResidencyPlan,
+    AutoResidencyRollbackError,
+    DefaultWorkload,
+    RankResidencyReport,
+    ResidencyTarget,
+    WarmupMemoryRecord,
+    _layerwise_pin_targets,
+    _layerwise_policy_targets,
+    _layerwise_resident_targets,
+    apply_residency_changes,
+    collect_residency_targets,
+    commit_residency_changes,
+    component_resident_size_bytes,
+    component_runtime_weight_bytes,
+    current_placement_reserve_shortfall_bytes,
+    estimate_allocator_headroom_bytes,
+    estimate_candidate_latency_savings_ns,
+    estimate_default_workload_peak_bytes,
+    estimate_workload_phase_peaks,
+    format_applied_changes,
+    measured_failed_workload_phase_peaks,
+    plan_auto_residency,
+    rank_candidates_by_h2d_savings,
+    resolve_measured_default_workload,
+    rollback_residency_changes,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+    LAYERWISE_OFFLOAD,
+    RESIDENT,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    RESIDENCY_POLICY_LEADING,
+    RESIDENCY_POLICY_STRIDED,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.warmup_request_builder import (
+    SERVER_WARMUP_MAX_VIDEO_FRAMES,
+    _resolve_auto_residency_warmup_shape,
+    _resolve_warmup_num_frames,
+)
+
+PLANNER_UNAVAILABLE = "residency planner not available"
 
 
 def _record(
@@ -4838,8 +4906,9 @@ class TestAutoResidencySkipReason:
     ):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args(**overrides))
-        assert reason is None or reason == "requires CUDA"
+        assert reason == PLANNER_UNAVAILABLE
 
     def test_fixed_loading_components_are_excluded_individually(self):
         from sglang.multimodal_gen.runtime.server_args.auto_tune import (
@@ -4887,15 +4956,17 @@ class TestAutoResidencySkipReason:
             {"use_fsdp_inference": True},
         ],
     )
-    def test_parallel_paths_reach_platform_gate(self, monkeypatch, overrides):
+    def test_parallel_paths_reach_planner_gate(self, monkeypatch, overrides):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args(**overrides))
-        assert reason is None or reason == "requires CUDA"
+        assert reason == PLANNER_UNAVAILABLE
 
-    def test_eligible_path_reaches_platform_gate(self, monkeypatch):
+    def test_eligible_path_reaches_planner_gate(self, monkeypatch):
         monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY", raising=False)
         monkeypatch.delenv("SGLANG_CACHE_DIT_ENABLED", raising=False)
+        monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
         reason = self._skip_reason(self._base_args())
         # on a CUDA host everything passes; CPU CI stops at the platform gate
         assert reason is None or reason == "requires CUDA"
