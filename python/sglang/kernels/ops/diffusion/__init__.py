@@ -568,6 +568,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.copy_head_groups",
+        KernelBackend.TRITON,
+        "layout.head_group_copy_triton:copy_head_groups",
+        _CUDA,
+    ),
+    (
         "diffusion.varlen_pack_qkv",
         KernelBackend.TRITON,
         "layout.varlen_pack_pad_triton:fused_pack_qkv",
@@ -821,6 +827,7 @@ _EXPORTS: dict[str, str] = {
     "fused_causal_conv3d_cat_pad_cuda": "sglang.kernels.kda_kernels.causal_conv3d_cat_pad_jit",
     "fused_causal_conv3d_cat_pad": "layout.causal_conv3d_cat_pad_triton",
     "pack_qkv_destination_major": "layout.ulysses_qkv_triton",
+    "copy_head_groups": "layout.head_group_copy_triton",
     "fused_qknorm_rope_out_of_place": "rope.qknorm_rope_jit",
     "vdn_delta_factors": "attention.vdn_delta_factors_jit",
     "can_use_vdn_delta_factors": "attention.vdn_delta_factors_jit",
