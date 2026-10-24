@@ -252,6 +252,7 @@ class AnthropicToolChoice(BaseModel):
 
     type: Literal["auto", "any", "tool", "none"]
     name: Optional[str] = None
+    disable_parallel_tool_use: Optional[bool] = None
 
 
 class AnthropicThinkingParam(BaseModel):
