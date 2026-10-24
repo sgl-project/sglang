@@ -8,6 +8,7 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
+    MultimodalProcessorOutput,
 )
 
 
@@ -37,10 +38,12 @@ class TestMultimodalInputsFromDict(unittest.TestCase):
                 schedule_batch.envs.SGLANG_MM_BUFFER_SIZE_MB, "get", return_value=0
             ),
         ):
-            mm_inputs = MultimodalInputs.from_dict({"mm_items": [mm_item]})
+            mm_inputs = MultimodalInputs.from_processor_output(
+                MultimodalProcessorOutput(mm_items=[mm_item])
+            )
 
-        # Splitting happens at the processor layer, not in from_dict.
-        # from_dict just reconstructs and passes through.
+        # Splitting happens at the processor layer, not in
+        # from_processor_output, which just reconstructs and passes through.
         self.assertEqual(len(mm_inputs.mm_items), 1)
         self.assertTrue(torch.equal(mm_inputs.mm_items[0].feature, feature_tensor))
         proxy_feature.reconstruct_on_target_device.assert_called_once_with(0)
@@ -61,7 +64,9 @@ class TestMultimodalInputsFromDict(unittest.TestCase):
                 schedule_batch.envs.SGLANG_MM_BUFFER_SIZE_MB, "get", return_value=0
             ),
         ):
-            mm_inputs = MultimodalInputs.from_dict({"mm_items": [mm_item]})
+            mm_inputs = MultimodalInputs.from_processor_output(
+                MultimodalProcessorOutput(mm_items=[mm_item])
+            )
 
         self.assertTrue(
             torch.equal(
@@ -78,6 +83,8 @@ class TestMultimodalInputsFromDict(unittest.TestCase):
             modality=Modality.IMAGE,
             offsets=[(0, 1)],
             model_specific_data={"image_grid_thw": proxy_grid},
+            # No feature to hash; the tokenizer side normally precomputes it.
+            hash=1,
         )
 
         with (
@@ -87,7 +94,9 @@ class TestMultimodalInputsFromDict(unittest.TestCase):
                 schedule_batch.envs.SGLANG_MM_BUFFER_SIZE_MB, "get", return_value=0
             ),
         ):
-            mm_inputs = MultimodalInputs.from_dict({"mm_items": [mm_item]})
+            mm_inputs = MultimodalInputs.from_processor_output(
+                MultimodalProcessorOutput(mm_items=[mm_item])
+            )
 
         self.assertTrue(
             torch.equal(

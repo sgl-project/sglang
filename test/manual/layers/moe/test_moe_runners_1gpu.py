@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
     DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4,
@@ -20,7 +20,8 @@ class TestMoERunner(CustomTestCase):
     TIMEOUT = 6000
     DEFAULT_EVAL_KWARGS = {
         "eval_name": "mmlu",
-        "num_examples": 5,
+        # 5 examples moved the score in 0.2 steps and flaked across the threshold.
+        "num_examples": 64,
         "num_threads": 1,
     }
 
@@ -159,10 +160,13 @@ class TestMoERunner(CustomTestCase):
                 "triton",
                 "--speculative-num-steps",
                 "2",
+                "--speculative-eagle-topk",
+                "1",
                 "--speculative-num-draft-tokens",
-                "4",
+                "3",
+                # EAGLE draft decode does not support torch_native attention.
                 "--attention-backend",
-                "torch_native",
+                "triton",
                 "--sampling-backend",
                 "pytorch",
             ],
@@ -192,7 +196,7 @@ class TestMoERunner(CustomTestCase):
                 model=model,
                 **eval_kwargs,
             )
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             print(f"{metrics=}")
             self.assertGreaterEqual(metrics["score"], 0.48)
         finally:

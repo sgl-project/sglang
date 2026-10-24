@@ -119,7 +119,7 @@ def _hit_info(result, is_hicache):
 # ---------------------------------------------------------------------------
 
 
-def test_prefill_cache_hit(base_url, input_ids, max_new_tokens, is_hicache=False):
+def _check_prefill_cache_hit(base_url, input_ids, max_new_tokens, is_hicache=False):
     label = "device (L1) " if is_hicache else ""
     print(f"--- Prefill {label}cache hit KL test ---")
     _flush_cache(base_url)
@@ -146,7 +146,7 @@ def test_prefill_cache_hit(base_url, input_ids, max_new_tokens, is_hicache=False
     return _compute_kl(input_logprobs, output_logprobs)
 
 
-def test_decode_cache_hit(base_url, input_ids, max_new_tokens, is_hicache=False):
+def _check_decode_cache_hit(base_url, input_ids, max_new_tokens, is_hicache=False):
     label = "device (L1) " if is_hicache else ""
     print(f"--- Decode {label}cache hit KL test ---")
     suffix_token = [1]
@@ -300,7 +300,7 @@ class _DPAttentionPrefillCudaGraphKLMixin:
         offsets = [
             os.path.getsize(path) for path in (self.stdout_path, self.stderr_path)
         ]
-        prefill_kl = test_prefill_cache_hit(
+        prefill_kl = _check_prefill_cache_hit(
             self.base_url, self.input_ids, self.max_new_tokens
         )
         self._wait_for_prefill_graph_replay(
@@ -308,7 +308,7 @@ class _DPAttentionPrefillCudaGraphKLMixin:
             CACHED_PREFIX_GRAPH_REPLAY_PATTERN,
             "a cached-prefix request",
         )
-        decode_kl = test_decode_cache_hit(
+        decode_kl = _check_decode_cache_hit(
             self.base_url, self.input_ids, self.max_new_tokens
         )
 

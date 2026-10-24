@@ -10,21 +10,20 @@ Run a single test:
     python3 -m unittest test_crusoe_backend.TestCrusoeBackend.test_mt_bench
 """
 
+import os
 import unittest
 
 from sglang import Crusoe, set_default_backend
-from sglang.test.test_programs import (
-    test_mt_bench,
-    test_parallel_decoding,
-    test_parallel_encoding,
-    test_stream,
-)
+
+# Module import: names imported as test_* would be collected by pytest.
+from sglang.test import test_programs
 from sglang.test.test_utils import CustomTestCase
 
 # Default model available on Crusoe managed inference.
 DEFAULT_CRUSOE_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B"
 
 
+@unittest.skipUnless(os.environ.get("CRUSOE_API_KEY"), "CRUSOE_API_KEY is not set")
 class TestCrusoeBackend(CustomTestCase):
     backend = None
 
@@ -36,16 +35,16 @@ class TestCrusoeBackend(CustomTestCase):
         set_default_backend(self.backend)
 
     def test_mt_bench(self):
-        test_mt_bench()
+        test_programs.test_mt_bench()
 
     def test_stream(self):
-        test_stream()
+        test_programs.test_stream()
 
     def test_parallel_decoding(self):
-        test_parallel_decoding()
+        test_programs.test_parallel_decoding()
 
     def test_parallel_encoding(self):
-        test_parallel_encoding()
+        test_programs.test_parallel_encoding()
 
 
 class TestCrusoeBackendInit(CustomTestCase):

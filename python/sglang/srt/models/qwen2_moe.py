@@ -92,6 +92,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -1431,6 +1432,17 @@ class Qwen2MoeForCausalLM(nn.Module):
             )  # Specific layers for EAGLE3 support
         else:
             self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
+
+    def get_embed_and_head(self):
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head(self, embed, head):
+        del self.model.embed_tokens.weight
+        del self.lm_head.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head.weight = head
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
 
 EntryClass = Qwen2MoeForCausalLM
