@@ -93,6 +93,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe import aiter_mega_moe_tp
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
@@ -1435,6 +1436,10 @@ class ModelRunner:
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
+        # Not part of the helper above: it returns early for a model without a
+        # precompile hook, and the encoder server calls it too.
+        if not self.is_draft_worker:
+            aiter_mega_moe_tp.finalize(self.model)
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:

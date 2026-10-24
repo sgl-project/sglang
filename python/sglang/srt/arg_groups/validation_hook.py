@@ -170,6 +170,7 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
 
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
+    from sglang.srt.arg_groups.mega_moe_hook import check_aiter_mega_moe_tp_compat
 
     cfg = resolving_view(server_args)
 
@@ -219,6 +220,9 @@ def check_server_args(server_args: Any):
 
     # Check LoRA
     check_lora_server_args(server_args)
+
+    # After the LoRA check, which turns --lora-paths into enable_lora.
+    check_aiter_mega_moe_tp_compat(server_args)
 
     # Check speculative decoding
     if cfg.speculative_algorithm is not None:

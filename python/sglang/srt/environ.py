@@ -1055,6 +1055,13 @@ class Envs:
     SGLANG_AITER_MEGA_RANK_SYNC = EnvBool(False)
     SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY = EnvBool(False)
     SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD = EnvBool(False)
+    # --enable-aiter-mega-moe-tp: the largest eager extend forward (in tokens) that
+    # takes the kernel; larger forwards keep the stock MoE path. Sets the kernel's
+    # per-rank capacity, ceil(max tokens / TP size).
+    SGLANG_AITER_MEGA_MOE_TP_MAX_TOKENS = EnvInt(4096)
+    # Dtype of the data the kernel's ranks exchange. fp8 (default) is lossy: it adds
+    # quantization error beyond the stock bf16 all-reduce. bf16 is the accurate mode.
+    SGLANG_AITER_MEGA_MOE_TP_COMM_DTYPE = EnvStr("fp8")
     # Above 8192 tokens of context, aiter's non-static workspace is large enough
     # that mem_fraction_static is scaled by 0.85 to leave room for it. Set this to
     # honor an explicitly passed --mem-fraction-static instead. Off by default:
