@@ -1043,6 +1043,44 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.session_params, [{"id": "session1"}, {"id": "session2"}])
 
+    def test_session_input_embeds_rejection_and_token_retry(self):
+        embeds = [[0.1, 0.2], [0.3, 0.4]]
+        for stream in (False, True):
+            for batch in (False, True):
+                for params in (
+                    {"id": "session1"},
+                    {"id": "session1", "rid": "previous"},
+                    {"id": "session1", "replace": True},
+                    {"id": "session1", "offset": 1},
+                    {"id": "session1", "drop_previous_output": True},
+                ):
+                    with self.subTest(stream=stream, batch=batch, params=params):
+                        req = GenerateReqInput(
+                            input_embeds=[embeds, embeds] if batch else embeds,
+                            session_params=params,
+                            stream=stream,
+                        )
+                        with self.assertRaisesRegex(
+                            ValueError, "input_embeds does not support session_params"
+                        ):
+                            req.normalize_batch_and_arguments()
+                        self.assertEqual(req.session_params, params)
+
+                        req.input_embeds = None
+                        req.input_ids = [[1, 2], [3, 4]] if batch else [1, 2]
+                        req.normalize_batch_and_arguments()
+                        self.assertEqual(req.session_params, params)
+                        self.assertEqual(req.batch_size, 2 if batch else 1)
+
+        for params in (None, {}):
+            req = GenerateReqInput(input_embeds=embeds, session_params=params)
+            if params is None:
+                req.normalize_batch_and_arguments()
+                self.assertEqual(req.input_embeds, embeds)
+            else:
+                with self.assertRaisesRegex(ValueError, "session_params"):
+                    req.normalize_batch_and_arguments()
+
     def test_session_id_handling(self):
         req = GenerateReqInput(
             text=["Hello", "World"],
