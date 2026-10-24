@@ -136,26 +136,23 @@ class TorchOpLoader:
         return library_path
 
 
-_DSPARK_A5_SPARSE_ATTN_LOADER = TorchOpLoader(
-    OpLibSpec(
-        name="DSpark A5 KV-quant sparse-attention",
-        so_env="SGLANG_DSPARK_A5_EXTRA_OPS_SO",
-        namespace="_C_ascend",
-        required_ops=(
-            "npu_kv_quant_sparse_attn_sharedkv_v2_metadata",
-            "npu_kv_quant_sparse_attn_sharedkv_v2",
-        ),
-        pre_load_imports=("torch_npu",),
+def initialize_dspark_a5_sparse_attn_ops() -> None:
+    """Import the sgl-kernel-npu wheel and check the A5 DSpark operators."""
+    try:
+        import sgl_kernel_npu  # noqa: F401 - loads libsgl_kernel_npu.so
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "DSpark A5 requires an sgl-kernel-npu wheel containing the "
+            "quantized sparse-attention and host metadata operators."
+        ) from exc
+
+    required_ops = (
+        "kv_quant_sparse_attn_sharedkv_metadata_host",
+        "kv_quant_sparse_attn_sharedkv",
     )
-)
-
-
-def initialize_dspark_a5_sparse_attn_ops() -> Optional[Path]:
-    """Load the standalone A5 DSpark sparse-attention extension.
-
-    The external extension is expected to contain both the metadata operator
-    and the attention operator and to register them under ``torch.ops._C_ascend``.
-    Loading is idempotent, including when another package registered the same
-    operators before SGLang initialized its attention backends.
-    """
-    return _DSPARK_A5_SPARSE_ATTN_LOADER.initialize()
+    missing = [name for name in required_ops if not hasattr(torch.ops.npu, name)]
+    if missing:
+        raise RuntimeError(
+            f"The installed sgl-kernel-npu wheel is missing torch.ops.npu {missing}. "
+            "Rebuild and reinstall its Ascend 950 kernels wheel."
+        )
