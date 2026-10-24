@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from concurrent.futures import Future
 from typing import Any, Callable
 
 import zmq
@@ -51,14 +52,25 @@ class ScriptedTokenizerRecvProxy:
         *,
         timeout_s: float,
         description: str = "matching object",
+        post_future: Future | None = None,
+        allow_no_arrival: Callable[[], bool] | None = None,
     ) -> None:
         start_len = len(self._buffer)
         deadline = time.monotonic() + timeout_s
         while True:
             self._drain_underlying()
+            if post_future is not None and post_future.done():
+                post_future.result()
             for i, obj in enumerate(self._buffer):
                 if i >= start_len and predicate(obj):
                     return
+            if (
+                post_future is not None
+                and post_future.done()
+                and allow_no_arrival is not None
+                and allow_no_arrival()
+            ):
+                return
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"ScriptedTokenizerRecvProxy: no {description} arrived on the "
