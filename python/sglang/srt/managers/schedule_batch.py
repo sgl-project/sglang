@@ -132,6 +132,10 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     RETAINED_CUDA_IPC_FEATURE_PROXY_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.multimodal.transport.npu_ipc_bridge import (
+    IS_NPU,
+    current_device as current_device_from_bridge,
+)
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
     DPCooperationInfo,
@@ -800,7 +804,7 @@ class MultimodalInputs:
                     and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
                 ):
                     if reconstruct_device is None:
-                        reconstruct_device = torch.cuda.current_device()
+                        reconstruct_device = current_device_from_bridge()
                     mm_item.reconstruct(reconstruct_device)
         except BaseException:
             for mm_item in mm_items:
@@ -818,7 +822,11 @@ class MultimodalInputs:
                 try_add_to_buffer,
             )
 
-            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            device = (
+                current_device_from_bridge()
+                if (IS_NPU or torch.cuda.is_available())
+                else "cpu"
+            )
             if not is_feature_buffer_initialized():
                 init_feature_buffer(device)
             reset_buffer_offset()

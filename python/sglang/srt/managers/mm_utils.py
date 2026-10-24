@@ -46,6 +46,9 @@ from sglang.srt.multimodal.transport import (
     TensorTransportMode,
     determine_tensor_transport_mode,
 )
+from sglang.srt.multimodal.transport.npu_ipc_bridge import (
+    current_device as current_device_from_bridge,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_server_args,
@@ -944,7 +947,7 @@ def hash_feature(f):
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
     elif isinstance(f, CudaIpcTensorTransportProxy):
-        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
+        reconstruct_t = f.reconstruct_on_target_device(current_device_from_bridge())
         return tensor_hash([reconstruct_t])
     elif isinstance(f, ShmPointerMMData):
         if f.precomputed_hash is not None:

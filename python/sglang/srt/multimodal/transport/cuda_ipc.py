@@ -1,4 +1,5 @@
 import logging
+import pickle
 import threading
 from typing import Any, Optional
 
@@ -9,6 +10,12 @@ from sglang.srt.multimodal.transport.memory_pool import (
     DEFAULT_MAX_INFLIGHT_SLICES,
     StreamOrderedMmFeaturePool,
     StreamOrderedPoolConsumerMixin,
+)
+from sglang.srt.multimodal.transport.npu_ipc_bridge import (
+    IS_NPU,
+    make_device,
+    npu_ipc_pack_tensor,
+    npu_ipc_rebuild_tensor,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,6 +110,21 @@ class MmItemMemoryPool:
     ):
         self.device_id = base_gpu_id
         self.consumer_count = consumer_count
+
+        if IS_NPU:
+            # NPU follows torch_npu's memory_sharing_ipc.md method two: each
+            # feature is transported via reduce_tensor/rebuild, so no bounded
+            # pool or stream-ordered control words are needed.
+            self.memory_pool = None
+            self._pool = None
+            self._pool_ipc_handle = None
+            self._pool_full_warned = False
+            logger.info(
+                "NPU IPC transport uses torch_npu reduce_tensor/rebuild "
+                "memory sharing; no feature pool is reserved."
+            )
+            return
+
         self.memory_pool = torch.empty(
             memory_size, dtype=torch.uint8, device=f"cuda:{base_gpu_id}"
         ).contiguous()
@@ -126,15 +148,39 @@ class MmItemMemoryPool:
         )
 
     def shutdown(self):
-        self._pool.shutdown()
+        if self._pool is not None:
+            self._pool.shutdown()
 
     @property
     def active_lease_count(self) -> int:
+        if self._pool is None:
+            return 0
         return self._pool.active_lease_count
 
     def wrap_tensor(
         self, tensor: torch.Tensor, *, use_pool_handle_cache: bool
     ) -> Optional["CudaIpcTensorTransportProxy"]:
+        if IS_NPU:
+            try:
+                func, args = npu_ipc_pack_tensor(tensor)
+            except Exception as exc:
+                logger.warning(
+                    "NPU IPC reduce_tensor failed (%s); falling back to CPU transport.",
+                    exc,
+                )
+                return None
+            payload = pickle.dumps((func, args))
+            proxy = CudaIpcTensorTransportProxy.__new__(CudaIpcTensorTransportProxy)
+            proxy.proxy_state = {
+                "ipc_extra": {
+                    "transport_mode": "npu_ipc",
+                    "npu_ipc_payload": payload,
+                },
+                "tensor_data": None,
+            }
+            proxy._restore_npu_ipc_proxy_state()
+            return proxy
+
         lease, destination = self._pool.copy_tensor(tensor)
         if lease is None:
             nbytes = tensor.numel() * tensor.element_size()
@@ -155,6 +201,9 @@ class MmItemMemoryPool:
 
     def cancel_proxy(self, proxy: "CudaIpcTensorTransportProxy") -> None:
         """Return a published slice when its request was never dispatched."""
+        if IS_NPU:
+            # npu_ipc transport owns no lease, nothing to cancel.
+            return
         ipc_extra = proxy.proxy_state["ipc_extra"]
         if tuple(ipc_extra["pool_handle"]) != tuple(self._pool_ipc_handle):
             raise RuntimeError("CUDA IPC proxy does not belong to this pool")
@@ -235,6 +284,27 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         self.reconstruct_tensor = None
         # Keep uncached mappings alive until the work enqueued on the consumer
         # stream has completed.
+        self._pool_storage = None
+        self._borrowed_storage = None
+        self._borrowed_base_address = None
+        self._borrowed_device_id = None
+
+    def _restore_npu_ipc_proxy_state(self) -> None:
+        """Rebuild the NPU IPC proxy state after deserialization.
+
+        Only the ``npu_ipc`` transport uses this: the msgpack decoder guards the
+        call, and the producer side calls it right after building the shell with
+        ``__new__``, so ``__init__`` never fills these attributes.
+        """
+        ipc_extra = self.proxy_state["ipc_extra"]
+        self.npu_ipc_payload = ipc_extra["npu_ipc_payload"]
+        self.reconstruct_tensor = None
+        self._consumer_acknowledged = True
+        # npu_ipc owns no pool, so it has no control-word sync metadata; the
+        # attributes still have to exist because the msgpack proxy encoder
+        # serializes them.
+        self.sync_data_meta = None
+        self.sync_buffer = None
         self._pool_storage = None
         self._borrowed_storage = None
         self._borrowed_base_address = None
@@ -332,6 +402,9 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
     ) -> Optional[torch.Tensor]:
         """Return a zero-copy view whose lease remains owned by this proxy."""
         ipc_extra = self.proxy_state["ipc_extra"]
+        if ipc_extra.get("transport_mode") == "npu_ipc":
+            # npu_ipc transport has no pool lease; fall back to reconstruct.
+            return None
         if not ipc_extra["use_pool_handle_cache"] or self._consumer_acknowledged:
             return None
 
@@ -381,11 +454,26 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         consumer_count: int = 1,
         consumer_rank: Optional[int] = None,
     ):
-        rebuild_device = torch.device(f"cuda:{rebuild_device_idx}")
+        rebuild_device = make_device(rebuild_device_idx)
         if (
             isinstance(self.reconstruct_tensor, torch.Tensor)
             and self.reconstruct_tensor.device == rebuild_device
         ):
+            return self.reconstruct_tensor
+
+        if self.proxy_state["ipc_extra"].get("transport_mode") == "npu_ipc":
+            func, args = pickle.loads(self.npu_ipc_payload)
+            self.reconstruct_tensor = npu_ipc_rebuild_tensor(
+                func, args, rebuild_device_idx
+            )
+            logger.info(
+                "NPU IPC rebuild success on device %s: shape=%s, dtype=%s, nbytes=%d.",
+                rebuild_device,
+                tuple(self.reconstruct_tensor.shape),
+                self.reconstruct_tensor.dtype,
+                self.reconstruct_tensor.numel()
+                * self.reconstruct_tensor.element_size(),
+            )
             return self.reconstruct_tensor
 
         ipc_extra = self.proxy_state["ipc_extra"]
