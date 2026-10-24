@@ -27,8 +27,8 @@ class DummyDetector(BaseFormatDetector):
         pass
 
 
-def test_unknown_tool_name_dropped_default(caplog):
-    """Test that unknown tools are dropped by default (legacy behavior)."""
+def test_unknown_tool_name_dropped_when_disabled(caplog):
+    """Test that unknown tools are dropped when SGLANG_FORWARD_UNKNOWN_TOOLS=false."""
     with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(False):
         tools = [
             Tool(
@@ -76,6 +76,32 @@ def test_unknown_tool_name_forwarded(caplog):
         assert result.calls[0].name == "unknown_tool"
         assert result.calls[0].tool_index == -1
         assert json.loads(result.calls[0].parameters)["city"] == "Paris"
+
+
+def test_unknown_tool_name_forwarded_by_default(caplog):
+    """Test that unknown tools are forwarded by default (new default behavior)."""
+    # No env override - should use the default (True)
+    tools = [
+        Tool(
+            function=Function(
+                name="get_weather", parameters={"type": "object", "properties": {}}
+            )
+        )
+    ]
+    detector = DummyDetector()
+    with caplog.at_level(
+        logging.WARNING, logger="sglang.srt.function_call.base_format_detector"
+    ):
+        result = detector.detect_and_parse(
+            '{"name":"unknown_tool","parameters":{"city":"Paris"}}', tools
+        )
+    assert any(
+        "Model attempted to call undefined function: unknown_tool" in m
+        for m in caplog.messages
+    )
+    assert len(result.calls) == 1
+    assert result.calls[0].name == "unknown_tool"
+    assert result.calls[0].tool_index == -1
 
 
 if __name__ == "__main__":
