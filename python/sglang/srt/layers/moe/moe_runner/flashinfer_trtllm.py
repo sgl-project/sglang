@@ -1128,6 +1128,102 @@ class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
     routing_bias: Optional[torch.Tensor] = None
 
 
+def _flashinfer_autotune_active() -> bool:
+    from flashinfer.autotuner import AutoTuner
+
+    return AutoTuner.get().is_tuning_mode
+
+
+def _rank_local_num_experts(
+    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
+    top_k: int,
+    *,
+    taken: Optional[tuple[int, int]],
+) -> Optional[int]:
+    """num_experts for packed ids the fused route made rank-local (``taken``,
+    from route_quant_handoff.take_local_experts), None for global ids."""
+    from sglang.srt.layers.moe import route_quant_handoff
+
+    if taken is None:
+        return None
+    assert taken == (quant_info.local_expert_offset, quant_info.local_num_experts), (
+        taken,
+        quant_info.local_expert_offset,
+        quant_info.local_num_experts,
+    )
+    num_experts = route_quant_handoff.rank_local_num_experts(
+        *taken, quant_info.global_num_experts, top_k
+    )
+    assert num_experts is not None, (taken, quant_info.global_num_experts, top_k)
+    return num_experts
+
+
+def _tune_rank_local_routing(
+    routing: FlashInferRouting,
+    x_quant: torch.Tensor,
+    x_scale: Optional[torch.Tensor],
+    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
+) -> None:
+    """Decode batches within the fused route's token cap reach FlashInfer with
+    rank-local ids, a separate tuner key (num_experts) that the decode-shaped
+    autotune forward misses when it runs above the cap. Tune it from this
+    forward's routes, relabelled as the fused route would."""
+    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+    from flashinfer.tllm_enums import ActivationType, RoutingMethodType
+
+    from sglang.kernels.ops.moe.moe_route_quant_fused import MAX_TOKENS
+    from sglang.srt.layers.moe import route_quant_handoff
+
+    if not isinstance(routing, tuple) or x_scale is None or x_scale.dim() != 2:
+        return
+    topk_ids, topk_weights = routing
+    top_k = topk_ids.shape[1]
+    offset, count = quant_info.local_expert_offset, quant_info.local_num_experts
+    num_experts = route_quant_handoff.rank_local_num_experts(
+        offset, count, quant_info.global_num_experts, top_k
+    )
+    if num_experts is None:
+        return
+    rows = min(topk_ids.shape[0], MAX_TOKENS)
+    local = topk_ids[:rows].to(torch.int32) - offset
+    slot = torch.arange(top_k, device=local.device, dtype=torch.int32)
+    ids = torch.where((local >= 0) & (local < count), local, count + slot)
+    bits = topk_weights[:rows].to(torch.bfloat16).view(torch.int16).to(torch.int32)
+    trtllm_fp4_block_scale_routed_moe(
+        topk_ids=(ids << 16) | (bits & 0xFFFF),
+        routing_bias=None,
+        hidden_states=x_quant[:rows],
+        hidden_states_scale=x_scale[:rows],
+        gemm1_weights=quant_info.w13_weight,
+        gemm1_weights_scale=quant_info.w13_weight_scale,
+        gemm1_bias=None,
+        gemm1_alpha=quant_info.gemm1_alpha,
+        gemm1_beta=quant_info.gemm1_clamp_limit,
+        gemm1_clamp_limit=None,
+        gemm2_weights=quant_info.w2_weight,
+        gemm2_weights_scale=quant_info.w2_weight_scale,
+        gemm2_bias=None,
+        output1_scale_scalar=None,
+        output1_scale_gate_scalar=None,
+        output2_scale_scalar=None,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=quant_info.intermediate_size_per_partition,
+        local_expert_offset=0,
+        local_num_experts=count,
+        routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.TopK.value,
+        activation_type=ActivationType.Situ.value,
+        tune_max_num_tokens=next_power_of_2(rows),
+        # same output and finalize mode as the decode call, so the same tuner key
+        output=x_quant.new_empty((rows, x_quant.shape[1]), dtype=torch.bfloat16),
+        do_finalize=not _deferred_finalize_enabled.get(),
+        enable_pdl=trtllm_moe_enable_pdl(rows),
+    )
+
+
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
@@ -1215,6 +1311,20 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 else _get_routing_for_flashinfer_routed(topk_output)
             )
             routed_top_k = _routing_top_k(routing)
+            num_experts = quant_info.global_num_experts
+            local_expert_offset = quant_info.local_expert_offset
+            if prepared_packed_topk is not None:
+                from sglang.srt.layers.moe import route_quant_handoff
+
+                rank_local = _rank_local_num_experts(
+                    quant_info,
+                    routed_top_k,
+                    taken=route_quant_handoff.take_local_experts(routing),
+                )
+                if rank_local is not None:
+                    num_experts, local_expert_offset = rank_local, 0
+            elif _flashinfer_autotune_active():
+                _tune_rank_local_routing(routing, x_quant, x_scale, quant_info)
 
             defer_finalize = _deferred_finalize_enabled.get()
             result = trtllm_fp4_block_scale_routed_moe(
@@ -1234,12 +1344,12 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 output1_scale_scalar=None,
                 output1_scale_gate_scalar=None,
                 output2_scale_scalar=None,
-                num_experts=quant_info.global_num_experts,
+                num_experts=num_experts,
                 top_k=routed_top_k,
                 n_group=None,
                 topk_group=None,
                 intermediate_size=quant_info.intermediate_size_per_partition,
-                local_expert_offset=quant_info.local_expert_offset,
+                local_expert_offset=local_expert_offset,
                 local_num_experts=quant_info.local_num_experts,
                 routed_scaling_factor=None,
                 routing_method_type=RoutingMethodType.TopK.value,

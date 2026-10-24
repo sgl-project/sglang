@@ -1301,9 +1301,21 @@ class KimiK3MoE(nn.Module):
             and self.experts.moe_runner_config.activation == "situ"
         )
 
+    def _route_quant_local_experts(self) -> Optional[tuple[int, int]]:
+        """This rank's (first expert, count) when the routed experts are split
+        over EP ranks, for rank-local packed ids (route_quant_handoff). The
+        range is the one Mxfp4MoEMethod hands the trtllm-gen runner."""
+        experts = self.experts
+        if experts.num_local_experts >= experts.num_experts:
+            return None
+        return (
+            experts.moe_ep_rank * experts.num_local_experts,
+            experts.num_local_experts,
+        )
+
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
         if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+            route_quant_handoff.stage(routed_input, self._route_quant_local_experts())
         try:
             topk_output = self.topk(hidden_states, router_logits)
             with zero_copy_context.set_moe_output(latent):
@@ -1319,7 +1331,7 @@ class KimiK3MoE(nn.Module):
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
         if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+            route_quant_handoff.stage(routed_input, self._route_quant_local_experts())
         try:
             topk_output = self.topk(hidden_states, router_logits)
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
