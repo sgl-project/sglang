@@ -57,6 +57,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         # Initialize attributes that were missing in the original PR
         self.current_func_name: Optional[str] = None
+        self._stream_ended: bool = False
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
@@ -315,10 +316,18 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     # 1. [Normal] Encounter </parameter>
                     # 2. [Abnormal] Encounter next <parameter=
                     # 3. [Abnormal] Encounter </function>
+                    # 4. [Abnormal] Encounter </tool_call>, once the stream has ended
                     # So we need to find the smallest one as the parameter end position.
                     cand_end_param = rest_of_slice.find(self.parameter_end_token)
                     cand_next_param = rest_of_slice.find(self.parameter_prefix)
                     cand_end_func = rest_of_slice.find(self.function_end_token)
+                    # Mid-stream, </tool_call> may be literal text in a value that a
+                    # later </parameter> closes.
+                    cand_end_tool = (
+                        rest_of_slice.find(self.tool_call_end_token)
+                        if self._stream_ended
+                        else -1
+                    )
 
                     candidates = []
                     if cand_end_param != -1:
@@ -329,6 +338,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
                         candidates.append((cand_next_param, 0))
                     if cand_end_func != -1:
                         candidates.append((cand_end_func, 0))
+                    if cand_end_tool != -1:
+                        candidates.append((cand_end_tool, 0))
 
                     if candidates:
                         best_cand = min(candidates, key=lambda x: x[0])
@@ -407,6 +418,20 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # 5. Tool Call End: </tool_call>
             # -------------------------------------------------------
             if current_slice.startswith(self.tool_call_end_token):
+                if self.current_func_name is not None:
+                    # The model omitted </function>; close the arguments object
+                    # anyway, as detect_and_parse does.
+                    if not self.json_started:
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id, parameters="{"
+                            )
+                        )
+                        self.json_started = True
+                    calls.append(
+                        ToolCallItem(tool_index=self.current_tool_id, parameters="}")
+                    )
+                    self.current_func_name = None
                 self.parsed_pos += len(self.tool_call_end_token)
                 self.is_inside_tool_call = False  # [FIX] Exit tool call region
                 continue
@@ -472,6 +497,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         normal_text = "".join(normal_text_chunks) if normal_text_chunks else ""
         return StreamingParseResult(calls=calls, normal_text=normal_text)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        # No </parameter> can arrive any more, so a parameter still open ends at
+        # </tool_call>, as detect_and_parse reads it.
+        self._stream_ended = True
+        return self.parse_streaming_increment("", tools)
 
     def supports_structural_tag(self) -> bool:
         return True
