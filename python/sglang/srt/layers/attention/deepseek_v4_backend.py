@@ -121,7 +121,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
-    is_capturing,
 )
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
@@ -326,7 +325,16 @@ def _prefill_graph_full_topk(layer, x, q_lora, pos):
     )
 
 
-_bcg_prefill_graph_full_topk = eager_on_graph(True)(_prefill_graph_full_topk)
+def _prefill_graph_full_topk_capture_stub(layer, x, q_lora, pos):
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    return get_attn_backend()._prefill_graph_full_topk_capture(
+        layer, x, q_lora, pos, forward_batch
+    )
+
+
+_bcg_prefill_graph_full_topk = eager_on_graph(
+    True, capture_stub=_prefill_graph_full_topk_capture_stub
+)(_prefill_graph_full_topk)
 _bcg_low_ratio_source_projections = eager_on_graph(True)(_low_ratio_source_projections)
 
 
@@ -4048,7 +4056,30 @@ class DeepseekV4AttnBackend(
         """One full top-k layer at an eager break of the prefill graph, over the live
         batch at any context length: writes the sparse indices the attention break
         reads, and the candidate source returns its table for the captured consumers."""
-        indexer = layer.indexer
+        inputs = self._prefill_graph_full_topk_inputs(
+            layer, x, q_lora, pos, forward_batch
+        )
+        if not layer.indexer.is_candidate_source:
+            self.full_topk_indexer.topk_prefill(inputs)
+            return ()
+        return self.prefill_candidates.publish_prefill_graph(inputs, x.shape[0])
+
+    def _prefill_graph_full_topk_capture(self, layer, x, q_lora, pos, forward_batch):
+        """The break in the capture pass, where x and q_lora come from segments that
+        were captured but never run: nothing is selected from them, so the sparse
+        indices hold the empty selection and the candidate source the empty table
+        until the first replay."""
+        inputs = self._prefill_graph_full_topk_inputs(
+            layer, x, q_lora, pos, forward_batch
+        )
+        inputs.reset_outputs()
+        if not layer.indexer.is_candidate_source:
+            return ()
+        return self.prefill_candidates.capture_prefill_graph_table(inputs, x.shape[0])
+
+    def _prefill_graph_full_topk_inputs(
+        self, layer, x, q_lora, pos, forward_batch
+    ) -> PrefillInputs:
         real = forward_batch.global_num_token_non_padded_cpu
         if real is None:
             real = x.shape[0]
@@ -4059,7 +4090,7 @@ class DeepseekV4AttnBackend(
         # The metadata in use holds the rows x has: the late-layer tail's when the
         # source is the tail's first layer, which are not the extend's leading rows.
         req = self.forward_metadata.low_ratio_req_indices[:real]
-        inputs = self._make_low_ratio_prefill_indexer_inputs(
+        return self._make_low_ratio_prefill_indexer_inputs(
             layer,
             x[:real],
             q_lora[:real],
@@ -4067,12 +4098,6 @@ class DeepseekV4AttnBackend(
             pos[:real],
             forward_batch,
             None,
-        )
-        if not indexer.is_candidate_source:
-            self.full_topk_indexer.topk_prefill(inputs)
-            return ()
-        return self.prefill_candidates.publish_prefill_graph(
-            inputs, x.shape[0], shared=is_capturing()
         )
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:

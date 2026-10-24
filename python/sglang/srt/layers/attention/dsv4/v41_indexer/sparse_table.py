@@ -218,12 +218,9 @@ class SparseTableBackend:
             transform(published.phys_blocks, inputs.out_page_indices)
         transform(published.blocks, inputs.out_raw_indices)
 
-    def publish_prefill_graph(
-        self, inputs: PrefillInputs, num_rows: int, *, shared: bool
-    ) -> tuple:
-        """The candidate source's table over the graph's ``num_rows`` rows. Buckets may
-        share one buffer: graphs replay one at a time, and the shapes, DeepGEMM's
-        schedule included, depend only on the row and block counts."""
+    def publish_prefill_graph(self, inputs: PrefillInputs, num_rows: int) -> tuple:
+        """The candidate source's table over the graph's ``num_rows`` rows, at replay;
+        it is copied into the buffers capture_prefill_graph_table recorded."""
         published = self.publish_prefill(inputs)
         assert published is not None, "candidate source published no sparse table"
         live = published.blocks.shape[0]
@@ -231,8 +228,34 @@ class SparseTableBackend:
             live - 1
         )
         table = published.gather_rows(rows)
+        return (table.blocks, table.schedule, table.phys_blocks, table.valid_lens)
+
+    def capture_prefill_graph_table(
+        self, inputs: PrefillInputs, num_rows: int
+    ) -> tuple:
+        """Capture time: an empty table (no row has a block) over ``num_rows`` rows,
+        in buffers that buckets may share: graphs replay one at a time, and the
+        shapes, DeepGEMM's schedule included, depend only on the row and block
+        counts."""
+        device = inputs.kv_page_table.device
+        no_blocks = torch.zeros(num_rows, dtype=torch.int32, device=device)
+        table = _build_prefill_table(
+            blocks=torch.zeros(
+                num_rows, self.topk_blocks, dtype=torch.int32, device=device
+            ),
+            compress_lens=no_blocks,
+            page_table=torch.zeros(num_rows, 1, dtype=torch.int32, device=device),
+            page_size=self.token_to_kv_pool.get_index_k_page_size(
+                inputs.compress_ratio
+            ),
+            request_ids=torch.arange(num_rows, dtype=torch.int32, device=device),
+            rows_per_request=None,
+            # quantize_index_q packs the fp4 queries as int8
+            q_dtype=torch.int8,
+            valid_lens=no_blocks,
+        )
         out = (table.blocks, table.schedule, table.phys_blocks, table.valid_lens)
-        return self._shared_graph_table(inputs.layer_id, out) if shared else out
+        return self._shared_graph_table(inputs.layer_id, out)
 
     def bind_prefill_graph_table(self, tensors: tuple) -> _SparseTable:
         """Capture time: the table the captured consumers read, over the tensors the
