@@ -104,6 +104,12 @@ pub(crate) fn render(
         Value::Array(messages) => messages.clone(),
         _ => return Err("messages must be an array".into()),
     };
+    // Pydantic lowercases message roles.
+    for message in &mut messages {
+        if let Some(role) = message["role"].as_str() {
+            message["role"] = role.to_lowercase().into();
+        }
+    }
     // SGLang's trailing-assistant rule, as `_handle_last_assistant_message`.
     let mut task_prefix = None;
     if let Some(content) = messages

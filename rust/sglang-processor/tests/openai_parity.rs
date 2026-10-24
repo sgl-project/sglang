@@ -61,16 +61,22 @@ impl Checkpoint {
         }
     }
 
-    /// The prompt ids SGLang encodes: the rendered prompt, then the
-    /// `continue_final_message` prefix without its BOS.
+    /// The prompt ids SGLang encodes: the formatter's own ids when it encodes
+    /// requests, else the rendered prompt, then the `continue_final_message`
+    /// prefix without its BOS.
     fn render(&self, request: &Value, settings: &OpenAiSettings) -> Option<Vec<u32>> {
-        let defaults = settings
+        let defaults: HashMap<String, Value> = settings
             .default_chat_template_kwargs
             .clone()
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        if let Some(ids) = self.formatter.encode_request(request.clone(), &defaults) {
+            return ids.ok();
+        }
         let (prompt, prefix) = self
             .formatter
-            .render_request(request.clone(), &defaults.into_iter().collect())
+            .render_request(request.clone(), &defaults)
             .ok()?;
         let ids = |text: &str| self.tokenizer.encode(text).unwrap().token_ids().to_vec();
         let bos = ids("").first().copied();
