@@ -1630,6 +1630,12 @@
                     ]
                   },
                   {
+                    "group": "Stability AI",
+                    "pages": [
+                      "cookbook/diffusion/StabilityAI/Stable-Diffusion-XL"
+                    ]
+                  },
+                  {
                     "group": "Krea",
                     "pages": [
                       "cookbook/diffusion/Krea/Krea-2"

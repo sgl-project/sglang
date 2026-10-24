@@ -1544,6 +1544,21 @@ ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
 ONE_GPU_5090_CASES.append(_make_5090_h3_consumer_budget_case())
 
 
+# XPU-only cases: no CUDA perf baseline or consistency GT exists for them, so
+# they join ONE_GPU_CASES only on XPU. UNet parity is covered by
+# test_hunyuan3d_native_texture_models.py instead of component accuracy.
+_XPU_ONLY_CASES = [
+    DiffusionTestCase(
+        "sdxl_base_image_t2i",
+        DiffusionServerArgs(model_path="stabilityai/stable-diffusion-xl-base-1.0"),
+        T2I_sampling_params,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
+]
+if current_platform.is_xpu():
+    ONE_GPU_CASES += _XPU_ONLY_CASES
+
 # Intel Arc Pro B60 has 24 GiB of XPU memory, so only sub-~5B-parameter
 # checkpoints fit fully resident. Larger cases in ONE_GPU_CASES (FLUX.1-dev,
 # FLUX.2-dev, Qwen-Image, Hunyuan3D, SANA-Video, image-edit families) OOM on
@@ -1553,11 +1568,12 @@ ONE_GPU_XPU_CASE_IDS = (
     "flux_2_klein_image_t2i",
     "flux_2_klein_base_image_t2i",
     "wan2_1_t2v_1.3b",
+    "sdxl_base_image_t2i",
 )
 
 
 def _select_xpu_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCase]:
-    cases_by_id = {case.id: case for case in ONE_GPU_CASES}
+    cases_by_id = {case.id: case for case in ONE_GPU_CASES + _XPU_ONLY_CASES}
     missing = [case_id for case_id in case_ids if case_id not in cases_by_id]
     if missing:
         raise RuntimeError(f"Unknown XPU diffusion case(s): {missing}")
