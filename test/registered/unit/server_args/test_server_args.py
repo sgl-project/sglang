@@ -399,6 +399,34 @@ class TestPrepareServerArgs(CustomTestCase):
             ):
                 validate_mega_moe_token_budget(args, "Qwen3MoeForCausalLM")
 
+    def test_megamoe_token_budget_counts_dp_attention_chunk_once(self):
+        """The check runs after handle_data_parallelism split the chunk; splitting
+        it again let 32768-token rank chunks pass a 16384 cap and crash at runtime."""
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+        from sglang.srt.environ import envs
+
+        args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="megamoe",
+            tp_size=4,
+            attn_dp_size=4,
+            chunked_prefill_size=131072,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.DISABLED)
+            ),
+        )
+        parallel_hook.handle_data_parallelism(args)
+        with override_platform(is_hip=False):
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                16384
+            ):
+                with self.assertRaisesRegex(ValueError, "required_per_rank=32768"):
+                    validate_mega_moe_token_budget(args, "DeepseekV4ForCausalLM")
+            with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(
+                32768
+            ):
+                validate_mega_moe_token_budget(args, "DeepseekV4ForCausalLM")
+
     def test_megamoe_token_budget_gate_by_arch_and_nvfp4(self):
         from sglang.srt.arg_groups.mega_moe_hook import mega_moe_needs_token_budget
 
