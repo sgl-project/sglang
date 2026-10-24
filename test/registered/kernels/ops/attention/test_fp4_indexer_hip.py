@@ -63,7 +63,11 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import (
+    _pad_page_table_kernel,
+    _prefill_schedule_prep_kernel,
     build_decode_schedule,
+    build_prefill_schedule,
+    warmup_prefill_schedule,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
     rope_tail_fake_quant_fp4,
@@ -685,6 +689,103 @@ def test_decode_schedule_matches_aiter_varctx_schedule(
     )
     assert torch.equal(scratch[:1], ref_safe)
     assert torch.equal(cta_info, ref)
+
+
+def _prefill_schedule_case(
+    rows: int, max_seq_len: int, seed: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    torch.manual_seed(seed)
+    pages = -(-max_seq_len // PAGE_SIZE)
+    page_table = torch.randint(
+        0, 1 << 20, (rows, pages), device=get_device(), dtype=torch.int32
+    )
+    c4_seq_lens = torch.randint(
+        0, max_seq_len + 1, (rows,), device=get_device(), dtype=torch.int32
+    )
+    c4_seq_lens[::7] = 0
+    return page_table, c4_seq_lens
+
+
+@pytest.mark.parametrize(
+    "rows,max_seq_len,min_ctas",
+    [
+        (1, 256, 1024),
+        (37, 8192, 1024),
+        (300, 65536, 0),
+        (4096, 2048, 1024),
+        (4097, 4096, 1024),
+        (6000, 65536, 0),
+    ],
+)
+def test_prefill_schedule_matches_aiter_schedule(
+    rows: int, max_seq_len: int, min_ctas: int
+) -> None:
+    """The in-tree prefill schedule writes AITER compute_prefill_schedule's cta_info rows,
+    on both sides of MAX_FUSED_ROWS. Past it, AITER is handed a padded max_seq_len, which
+    must not change the split; min_ctas=0 gives a grid tight enough that rows split."""
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        CTA_INFO_WIDTH,
+        compute_prefill_schedule,
+    )
+
+    page_table, c4_seq_lens = _prefill_schedule_case(rows, max_seq_len, rows)
+    ref_page_table, seq_len = _guard_page_table(page_table)
+    cta_count = max(min_ctas, rows)
+    ref = torch.full(
+        (cta_count, CTA_INFO_WIDTH), -1, device=get_device(), dtype=torch.int32
+    )
+    compute_prefill_schedule(
+        torch.arange(rows, device=get_device(), dtype=torch.int32),
+        torch.zeros(rows, device=get_device(), dtype=torch.int32),
+        c4_seq_lens,
+        block_k=256,
+        parallel_unit_num=cta_count,
+        max_seq_len=seq_len,
+        cta_info_out=ref,
+    )
+    cta_info = torch.full_like(ref, -1)
+    guarded, _ = build_prefill_schedule(
+        page_table=page_table,
+        local_ends=c4_seq_lens,
+        cta_info_out=cta_info,
+        parallel_unit_num=cta_count,
+        max_seq_len=seq_len,
+    )
+    assert torch.equal(guarded, ref_page_table)
+    assert torch.equal(cta_info, ref)
+
+
+def test_prefill_schedule_compiles_only_at_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prefill schedule is rebuilt per forward outside the graph, so a variant first
+    met mid-serving stalls the engine while it compiles. Row counts and widths of any
+    kind must reuse what warmup_prefill_schedule compiled."""
+    from collections import defaultdict
+
+    from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
+        _prefill_cta_info_kernel,
+        _prefill_row_plan_kernel,
+    )
+
+    caches = []
+    for kernel in (
+        _prefill_schedule_prep_kernel,
+        _pad_page_table_kernel,
+        _prefill_row_plan_kernel,
+        _prefill_cta_info_kernel,
+    ):
+        monkeypatch.setattr(kernel, "device_caches", defaultdict(kernel.create_binder))
+        caches.append(kernel.device_caches[torch.cuda.current_device()][0])
+
+    warmup_prefill_schedule(torch.device(get_device()))
+    warm = [len(cache) for cache in caches]
+    sizes = [1, 2, 15, 16, 17, 63, 255, 256, 257, 1000, 1023, 4095, 4096, 4097, 5003]
+    for i, rows in enumerate(sizes):
+        page_table, c4_seq_lens = _prefill_schedule_case(rows, 256 * (3 * i + 1), i)
+        prepare_fp4_prefill_workspace(page_table, c4_seq_lens)
+
+    assert [len(cache) for cache in caches] == warm
 
 
 def _decode_plan(seq_lens: torch.Tensor, compress_ratio: int) -> CompressorDecodePlan:
