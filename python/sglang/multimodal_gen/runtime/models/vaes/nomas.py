@@ -21,6 +21,11 @@ from torch import nn
 from torch.nn import functional as F
 
 from sglang.multimodal_gen.configs.models.vaes.nomas import NomasVAEConfig
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_decode_parallel_group_coordinator,
+    get_decode_parallel_world_size,
+    model_parallel_is_initialized,
+)
 
 TUBELET = (4, 16, 16)
 TUBE_DIM = TUBELET[0] * TUBELET[1] * TUBELET[2] * 3
@@ -648,6 +653,28 @@ class NomasPixelUMMDecoder(nn.Module):
             dim=2,
         )
 
+    @staticmethod
+    def _decode_windows(decode_window, starts):
+        """Decode independent windows, spread over the decode-parallel group.
+
+        Every window depends only on its own latents and frame-indexed noise, so
+        rank ``r`` decodes windows ``r, r + W, ...`` and an all-gather hands every
+        rank all windows; values and merge order are those of a serial decode.
+        """
+        group = None
+        if model_parallel_is_initialized() and get_decode_parallel_world_size() > 1:
+            group = get_decode_parallel_group_coordinator()
+        if group is None or len(starts) < group.world_size:
+            return [decode_window(start) for start in starts]
+        world, rank = group.world_size, group.rank_in_group
+        mine = [decode_window(start) for start in starts[rank::world]]
+        per_rank = -(-len(starts) // world)
+        mine += [torch.zeros_like(mine[0])] * (per_rank - len(mine))
+        gathered = group.all_gather(torch.stack(mine), dim=0)
+        return [
+            gathered[(i % world) * per_rank + i // world] for i in range(len(starts))
+        ]
+
     @torch.inference_mode()
     def decode(self, latent, return_dict=True, generator=None):
         if latent.ndim != 5 or latent.shape[1] != 32:
@@ -664,15 +691,17 @@ class NomasPixelUMMDecoder(nn.Module):
         # A single step generates only one window of noise at a time.
         state = self._noise(latent, offset, offset + length) if len(steps) > 1 else None
         for t_cur, t_next in zip(steps, (*steps[1:], 0.0)):
-            parts = []
-            for start in starts:
+
+            def decode_window(start):
                 end = min(start + arch.temporal_window_latents, length)
                 noise = (
                     self._noise(latent, offset + start, offset + end)
                     if state is None
                     else state[:, :, start * 4 : end * 4]
                 )
-                parts.append(self.decoder(latent[:, :, start:end], noise))
+                return self.decoder(latent[:, :, start:end], noise)
+
+            parts = self._decode_windows(decode_window, starts)
             video = merge_windows(parts, [s * 4 for s in starts])
             if t_next:
                 state = video.float() + (t_next / t_cur) * (state - video.float())

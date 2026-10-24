@@ -141,3 +141,67 @@ def test_tensor_and_sequence_parallel_match_single_rank(tmp_path, backend):
     _launch(1, 1, backend, str(tmp_path))
     _launch(2, 2, backend, str(tmp_path))  # TP=2
     _launch(2, 1, backend, str(tmp_path))  # Ulysses SP=2
+
+
+def _run_window_parallel_decode(rank, port):
+    from sglang.multimodal_gen.configs.models.vaes.nomas import (
+        NomasVAEArchConfig,
+        NomasVAEConfig,
+    )
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        get_decode_parallel_world_size,
+    )
+    from sglang.multimodal_gen.runtime.models.vaes.nomas import (
+        NomasPixelUMMDecoder,
+        merge_windows,
+        window_starts,
+    )
+
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+        RANK=str(rank),
+        LOCAL_RANK=str(rank),
+        WORLD_SIZE="2",
+    )
+    torch.cuda.set_device(rank)
+    maybe_init_distributed_environment_and_model_parallel(
+        tp_size=1, sp_size=2, ulysses_degree=2, ring_degree=1
+    )
+    assert get_decode_parallel_world_size() == 2
+    torch.manual_seed(5)
+    arch = NomasVAEArchConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_layers=1,
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=32,
+    )
+    decoder = NomasPixelUMMDecoder(NomasVAEConfig(arch_config=arch)).cuda().eval()
+    latent = torch.randn(
+        1, 32, 21, 2, 2, generator=torch.Generator().manual_seed(11)
+    ).cuda()
+    with torch.inference_mode():
+        starts = window_starts(21, 10, 5)
+        serial = merge_windows(
+            [
+                decoder.decoder(
+                    latent[:, :, s : s + 10], decoder._noise(latent, s, s + 10)
+                )
+                for s in starts
+            ],
+            [s * 4 for s in starts],
+        )
+        # Four windows over two ranks: each rank decodes two, then all gather.
+        assert torch.equal(decoder.decode(latent).sample, serial)
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA GPUs")
+def test_window_parallel_decode_matches_serial_decode():
+    mp.spawn(
+        _run_window_parallel_decode,
+        args=(get_free_port_below_ephemeral(),),
+        nprocs=2,
+    )
