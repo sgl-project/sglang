@@ -452,7 +452,7 @@ def flash_decode_with_gqa_share_sparse(
     )
     # launch attention kernel
     grid = (batch_size * NUM_TOPK_CHUNKS, num_kv_heads)
-    # The pinned launch and fp16 widening were tuned on Hopper.
+    # The pinned launch and its fp16 widening were tuned together on Hopper.
     hopper = get_platform().is_sm90
     paged = hopper and paged_contig and hisparse_slots is None
     kernel = (
@@ -509,7 +509,7 @@ def flash_decode_with_gqa_share_sparse(
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
         PAGED=paged,
-        WIDEN_F16=is_fp8 and q.dtype != torch.float8_e4m3fn and hopper,
+        WIDEN_F16=paged and is_fp8 and q.dtype != torch.float8_e4m3fn,
         **pinned_cfg,
     )
     # merge partials into chunk 0
