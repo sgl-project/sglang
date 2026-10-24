@@ -169,6 +169,79 @@ def test_prepared_snapshot_survives_post_forward_batch_mutation(hooked_scheduler
     assert test.predictor.last_batch.request_info() == [[8, 0]]
 
 
+@pytest.mark.parametrize("local_idle", [False, True])
+def test_dspark_uses_complete_staged_timing_without_ordinary_forward_query(
+    hooked_scheduler, local_idle
+):
+    from sglang_simulator.simulation.sglang.dspark import (
+        STEP_ATTRIBUTE,
+        DSparkGroup,
+        DSparkPhaseCost,
+        DSparkProgress,
+        DSparkRequest,
+        DSparkStep,
+        DSparkStepResult,
+        DSparkStepTiming,
+        DSparkTopology,
+    )
+
+    test = hooked_scheduler
+    test.predictor.supports_dspark = True
+    request = DSparkRequest("request", 512, 6, 0, 512, 1, 20, '{"max_new_tokens":20}')
+    groups = (DSparkGroup(0, "TARGET_VERIFY", (request,), '{"path":"CPU fixture"}'),)
+    if local_idle:
+        groups += (DSparkGroup(1, "IDLE", (), '{"path":"coordinated idle"}'),)
+    before = DSparkStep(
+        0, DSparkTopology(2, 2 if local_idle else 1), groups, '{"source":"CPU fixture"}'
+    )
+    result = DSparkStepResult(
+        before,
+        DSparkStepTiming(
+            0,
+            tuple(
+                DSparkPhaseCost(p, 0.01, "CPU fixture") for p in before.required_phases
+            ),
+        ),
+        DSparkProgress(0, (("request", 2),), "CPU fixture"),
+        local_attention_dp_rank=1 if local_idle else 0,
+        prediction_wall_seconds=0.3,
+    )
+
+    def attach(batch, native_result):
+        test.clock.now += 0.3
+        setattr(native_result, STEP_ATTRIBUTE, result)
+
+    test.target.after_forward = attach
+    batch = make_batch()
+    batch.forward_mode.name = "IDLE" if local_idle else "DECODE"
+    if local_idle:
+        batch.reqs = []
+    test.target.run_batch(batch)
+    assert not hasattr(test.predictor, "last_batch")
+    assert StateManager.get_current_inference_dur() == pytest.approx(0.05)
+    assert StateManager.get_iteration() == 1
+    assert test.hook.CURRENT_PREDICTOR_TIME_COST == pytest.approx(0.3)
+    assert test.hook.SIMULATION_BATCH.forward_mode == (
+        "IDLE" if local_idle else "TARGET_VERIFY"
+    )
+
+
+def test_dspark_result_cannot_relabel_an_extend_batch(hooked_scheduler):
+    from sglang_simulator.simulation.sglang.dspark import STEP_ATTRIBUTE
+    from test_dspark_step import session, step
+
+    test = hooked_scheduler
+    test.predictor.supports_dspark = True
+    before = step(requests=None)
+    result = session(before).execute(before)
+    test.target.after_forward = lambda batch, ret: setattr(ret, STEP_ATTRIBUTE, result)
+    batch = make_batch("a")
+    batch.forward_mode.name = "EXTEND"
+    with pytest.raises(PredictorError, match="worker mode differs"):
+        test.target.run_batch(batch)
+    assert StateManager.get_iteration() == 0
+
+
 @pytest.mark.parametrize("snapshot", [None, object()])
 def test_prepared_predictor_rejects_missing_or_invalid_result_snapshot(
     hooked_scheduler, snapshot

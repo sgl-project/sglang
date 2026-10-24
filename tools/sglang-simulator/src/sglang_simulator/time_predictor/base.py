@@ -59,7 +59,7 @@ class ScheduleBatch:
 
     def is_decode(self) -> bool:
         if self.forward_mode is not None:
-            return self.forward_mode == "DECODE"
+            return self.forward_mode in {"DECODE", "TARGET_VERIFY"}
         for req in self.reqs:
             if req.extend_length > 1:
                 return False

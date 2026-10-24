@@ -15,6 +15,7 @@ from sglang_simulator.hook import (
 )
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
+from sglang_simulator.simulation.sglang.dspark import dspark_result_from_native
 from sglang_simulator.simulation.sglang.prepared_batch import (
     predictor_batch_from_result,
 )
@@ -34,12 +35,10 @@ from sglang_simulator.simulation.utils import (
 from sglang_simulator.time_predictor.base import (
     InferTimePredictor,
     PredictorError,
+    ScheduleRequest,
 )
 from sglang_simulator.time_predictor.base import (
     ScheduleBatch as SimulationScheduleBatch,
-)
-from sglang_simulator.time_predictor.base import (
-    ScheduleRequest,
 )
 from sglang_simulator.utils import get_logger
 from sglang_simulator.utils.json import CustomJsonEncoder
@@ -475,12 +474,50 @@ class C_SchedulerHook(BaseHook):
             )
 
             if ret.__class__.__name__ == "GenerationBatchResult":
+                speculative_step = dspark_result_from_native(ret)
                 prepared_batch = getattr(
                     C_SchedulerHook.INFERENCE_PREDICTOR,
                     "requires_prepared_batch",
                     False,
                 )
-                if prepared_batch:
+                if speculative_step is not None:
+                    if not getattr(
+                        C_SchedulerHook.INFERENCE_PREDICTOR, "supports_dspark", False
+                    ):
+                        raise PredictorError(
+                            "unsupported_execution_profile",
+                            "predictor does not support DSPark steps",
+                        )
+                    group = speculative_step.local_group
+                    source_mode = getattr(batch.forward_mode, "name", None)
+                    allowed_modes = {
+                        "DECODE": {"TARGET_VERIFY"},
+                        "TARGET_VERIFY": {"TARGET_VERIFY"},
+                        "EXTEND": {"EXTEND", "MIXED"},
+                        "MIXED": {"MIXED"},
+                        "IDLE": {"IDLE"},
+                    }
+                    if group.forward_mode not in allowed_modes.get(source_mode, set()):
+                        raise PredictorError(
+                            "invalid_dspark_step",
+                            "DSPark worker mode differs from the native batch",
+                        )
+                    if tuple(req.rid for req in batch.reqs) != tuple(
+                        request.rid for request in group.requests
+                    ):
+                        raise PredictorError(
+                            "invalid_dspark_step",
+                            "DSPark result does not match the native local batch",
+                        )
+                    simulation_batch = SimulationScheduleBatch(
+                        reqs=[
+                            ScheduleRequest(r.extend_len, r.target_prefix_len)
+                            for r in group.requests
+                        ],
+                        forward_mode=group.forward_mode,
+                    )
+                    prepared_batch = True
+                elif prepared_batch:
                     simulation_batch = predictor_batch_from_result(
                         ret, expected_batch_size=len(batch.reqs)
                     )
@@ -506,16 +543,22 @@ class C_SchedulerHook(BaseHook):
                                 )
                             )
 
-                if not simulation_batch.is_empty():
+                if not simulation_batch.is_empty() or speculative_step is not None:
                     if not prepared_batch:
                         StateManager.inc_iteration()
                     pred_start = time.perf_counter()
                     predicted_latency = (
-                        C_SchedulerHook.INFERENCE_PREDICTOR.predict_infer_time(
+                        speculative_step.timing.seconds
+                        if speculative_step is not None
+                        else C_SchedulerHook.INFERENCE_PREDICTOR.predict_infer_time(
                             simulation_batch
                         )
                     )
-                    predictor_time_cost = time.perf_counter() - pred_start
+                    predictor_time_cost = (
+                        speculative_step.prediction_wall_seconds
+                        if speculative_step is not None
+                        else time.perf_counter() - pred_start
+                    )
                     C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += predictor_time_cost
                     if prepared_batch:
                         C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST = (

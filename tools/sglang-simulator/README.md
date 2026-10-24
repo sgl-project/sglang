@@ -21,6 +21,53 @@ capacity for metadata checks. This path does not qualify older packed factories
 without that seam, virtualize payload storage or establish large-capacity model
 support.
 
+### DSPark integration boundary
+
+The DSPark adapter currently provides CPU protocols and worker/scheduler hooks;
+it does not yet qualify a V4.1 serving run. Existing ordinary-forward predictors
+and launch validation keep their current support bounds.
+
+`simulation.sglang.dspark` separates immutable before-work (`DSparkStep`),
+complete sequential worker timing (`DSparkStepTiming`) and independently modeled
+output progress (`DSparkProgress`). `DSparkSession` checks prior injected or
+committed KV ranges, queries cost before progress, and commits history only after
+both results validate. Target prefix length cannot initialize draft history.
+Each phase cost is already coordinated across the modeled participants; the
+simulator adds no TP or layer multiplier. Missing preamble, proposal, target,
+accept/commit/publication or tail costs fail before progress advances.
+
+The before-work contract represents TP2/ADP1, TP4/ADP1 and TP2/ADP2. All actual
+attention-DP partitions, including idle groups, must be supplied explicitly.
+This representation does not implement a DP load balancer or establish measured
+support for these layouts. Heterogeneous prefill/verify phases require a separate
+source-specific coordination adapter.
+
+The integration seam is an explicitly configured predictor with
+`supports_dspark = True` and a `dspark_runtime` object:
+
+- `forward_batch_generation(worker=..., batch=..., on_publish=...)` returns the
+  native SGLang result with a `DSparkStepResult` attached under
+  `_sglang_simulator_dspark_step`.
+- `note_request_finished(rid=..., natural_stop=...)` releases request state.
+- `clear_cache_pool()` clears the adapter's causal state when native caches reset.
+- The runtime owns source-correct prefill/KV injection, native result and next
+  draft-input construction, logical allocation, publication and cleanup. It must
+  preserve full sampling recipes and exact source/runtime profiles when calling
+  the existing InferCast UMD/PerfDB paths.
+
+The decode session accepts separate
+`cost_model.predict_step(before_step)` and
+`progress_model.predict_progress(before_step)` objects. There is no built-in
+latency, acceptance fallback, fixed speedup or use of the current measured
+acceptance. The scheduler consumes the attached staged timing once, accounts for
+predictor wall time, and preserves coordinated idle time. It does not issue an
+ordinary one-token DECODE query for that speculative step.
+
+Full prefill/injection, verified progress artifacts, runtime construction,
+multi-DP scheduling and full worker cost coverage remain required before launch
+validation can admit a complete V4.1 AgentX run. CPU fixture results are protocol
+checks and must not be reported as actual Simulator accuracy or hardware data.
+
 ## Requirements
 
 - A compatible SGLang checkout. The simulator uses the SGLang source from the

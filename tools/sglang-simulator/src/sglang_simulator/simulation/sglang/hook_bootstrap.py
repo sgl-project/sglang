@@ -16,6 +16,7 @@ sgl_kernel_hook.install_load_utils_stub()
 import sglang_simulator.hook as sglang_simulator_hook
 from sglang_simulator.simulation.sglang import (
     cache_controller,
+    dspark_worker,
     hicache_storage,
     mem_cache_allocator,
     mem_pool_host,
@@ -45,6 +46,7 @@ def install_simulator_hooks() -> None:
             scheduler.C_SchedulerHook,
             scheduler.C_SglangPrefillAdderHook,
             scheduler.C_SchedulerRequestReceiver,
+            dspark_worker.C_DSparkWorkerHook,
             model_runner.C_ModelRunnerHook,
             model_runner.C_KVCacheConfiguratorHook,
             hicache_storage.C_StorageBackendFactory,
