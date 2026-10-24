@@ -227,33 +227,18 @@ class SchedulerPPMixin:
         Stage P
         recv ith req from previous stage
         pop bootstrapped reqs (PPConsensusStore + pp_sync polls)
-        recv ith transferred req from previous stage
         recv ith proxy from previous stage
         run ith batch
-        recv prev (i+1) % mb_size th release req from previous stage
-        local consensus on release req
         recv prev (i+1) % mb_size th outputs
         process batch result of prev (i+1)% mb_size th batch (can be run in parallel with the curr batch GPU computation)
         send ith req to next stage
-        send ith transferred req to next stage
         send ith proxy to next stage
         send current stage's outputs to next stage (can be stashed and delayed to send later)
 
         the above order can be optimized and reordered to minimize communication-related CPU stall and overhead bubbles.
         ====================================================================
-
-        Release Requests still use the two-pass PP consensus. Bootstrap uses
-        PPConsensusStore instead of the legacy two-round RID sync.
-
         """
         self.init_pp_loop_state()
-
-        # PD additional state initialization
-        tmbs = [None] * self.pp_loop_size
-        transferred_rids: List[str] = []
-        release_rids: Optional[List[str]] = None
-        send_transfer_work = []
-        send_release_work = []
 
         while True:
             server_is_idle = True
@@ -266,7 +251,6 @@ class SchedulerPPMixin:
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
-                next_release_rids = None
                 d2h_event = None
                 next_batch_result = None
 
@@ -276,10 +260,6 @@ class SchedulerPPMixin:
                     self._pp_commit_comm_work(self.send_req_work)
 
                 self.process_bootstrapped_queue()
-
-                transferred_rids = self._pp_pd_get_prefill_transferred_ids()
-                self._pp_commit_comm_work(send_transfer_work)
-                tmbs[mb_id] = transferred_rids
 
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
@@ -323,15 +303,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
-                    )
-                )
 
-                if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
-                self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
@@ -341,20 +313,15 @@ class SchedulerPPMixin:
                     )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if tmbs[next_mb_id] is not None:
-                    self.process_disagg_prefill_inflight_queue(next_release_rids)
+                self.process_disagg_prefill_inflight_queue()
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
                     )
                     if cur_batch:
                         self._pp_send_proxy_to_next_stage(result)
 
                 self.pp_outputs = next_pp_outputs
-                release_rids = next_release_rids
 
                 self.running_batch.batch_is_full = False
 
@@ -606,35 +573,12 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[
             str, deque[Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]]
         ] = defaultdict(deque)
+        self.pp_poll_sync_work_list_bootstrap: List[torch.distributed.Work] = []
+        self.pp_poll_sync_work_list_inflight: List[torch.distributed.Work] = []
 
     def process_bootstrapped_queue(self: Scheduler):
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
         self.waiting_queue.extend(reqs)
-
-    def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
-        # get the current stage transfer success
-        if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-        # if other ranks, do intersection with the previous rank's transferred rids
-        else:
-            # 2 (Release): Receive the transferred rids from the previous rank
-            # 1. recv previous stage's transferred reqs info
-            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-            # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
-            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-            transferred_rids = list(
-                set(prev_transferred_rids) & set(curr_transferred_rids)
-            )
-        return transferred_rids
 
     def _pp_pd_send_consensus_bootstrapped_ids(
         self: Scheduler,

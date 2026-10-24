@@ -58,6 +58,7 @@ def pp_sync_polls(
     pp_rank: int,
     pp_size: int,
     sync_work_list: List,
+    p2p_tag: P2PTag,
 ) -> List[int]:
     """Synchronize poll states from PP0 through the PP pipeline.
 
@@ -76,7 +77,7 @@ def pp_sync_polls(
     if pp_rank > 0:
         data = pp_group.recv_object(
             src=pp_rank - 1,
-            tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+            tag=p2p_tag,
         )
     if pp_rank + 1 < pp_size:
         sync_work_list.extend(
@@ -84,7 +85,7 @@ def pp_sync_polls(
                 data,
                 dst=pp_rank + 1,
                 async_send=True,
-                tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+                tag=p2p_tag,
             )
         )
     return data
@@ -116,6 +117,7 @@ def poll_and_all_reduce_prefill_pp(
     pp_rank: int,
     pp_size: int,
     pp_poll_sync_work_list: List[torch.distributed.Work],
+    p2p_tag: P2PTag,
 ) -> List[int]:
     polls: List[int] = []
     if pp_rank == 0:
@@ -123,7 +125,9 @@ def poll_and_all_reduce_prefill_pp(
         polls = _all_reduce_polls(polls, attn_tp_cpu_group)
         polls = _all_reduce_polls(polls, attn_cp_cpu_group)
     # Propagate PP0's data to other ranks
-    polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list)
+    polls = pp_sync_polls(
+        polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list, p2p_tag
+    )
     return polls
 
 
