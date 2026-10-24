@@ -185,6 +185,51 @@ class TestShortestPrefillFirst(CustomTestCase):
         # Now long is the one held: it sorts behind other until short is admitted.
         self.assertEqual([req.rid for req in queue], ["short", "other", "long"])
 
+    def test_shared_prefix_group_holds_all_but_its_shortest_request(self):
+        # The shared prefix is still computed once: only the shortest member of the
+        # group runs, and every longer member is held.
+        shared = list(range(32))
+        queue = [
+            _make_req("long", "", shared + list(range(1000, 5000))),
+            _make_req("mid", "", shared + list(range(6000, 8000))),
+            _make_req("short", "", shared + list(range(9000, 9393))),
+        ]
+        held = self.policy._compute_prefix_matches(
+            queue, CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        )
+        self.assertEqual(held, {"long", "mid"})
+
+    def test_identical_prompts_hold_the_later_one_in_queue(self):
+        # Equal work keeps queue order, so parallel samples of one prompt dedupe as
+        # they did before; the rids sort the other way to catch a rid tie-break.
+        prompt = list(range(432))
+        queue = [_make_req("z", "", prompt), _make_req("a", "", prompt)]
+        held = self.policy._compute_prefix_matches(
+            queue, CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+        )
+        self.assertEqual(held, {"a"})
+
+    def test_other_policies_dedupe_shared_prefixes_in_queue_order(self):
+        # Only SPF reorders the dedupe; LPM and HRRN still hold the later request
+        # of a shared-prefix group, even when it is the shorter one.
+        shared = list(range(32))
+        for policy in (CacheAwarePolicy.LPM, CacheAwarePolicy.HRRN):
+            with self.subTest(policy=policy):
+                schedule_policy = SchedulePolicy(
+                    policy=policy.value,
+                    tree_cache=RadixCache.create_simulated(),
+                    enable_hierarchical_cache=True,
+                    enable_priority_scheduling=False,
+                    schedule_low_priority_values_first=False,
+                )
+                queue = [
+                    _make_req("long", "", shared + list(range(1000, 5000))),
+                    _make_req("other", "", list(range(20000, 26000))),
+                    _make_req("short", "", shared + list(range(9000, 9393))),
+                ]
+                held = schedule_policy._compute_prefix_matches(queue, policy)
+                self.assertEqual(held, {"short"})
+
     def test_retracted_output_is_part_of_uncached_work(self):
         replay = self.make_req("replay", 16, cached=1024)
         replay.output_ids.extend([0] * 64)
