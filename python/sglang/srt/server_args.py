@@ -313,6 +313,11 @@ class ServerArgs:
         )
         return f"ServerArgs({values})"
 
+    @property
+    def num_dp_ranks(self) -> int:
+        """Configured number of scheduler ranks across replica and attention DP groups."""
+        return num_dp_ranks_of(resolving_view(self))
+
     def resolved_dict(self) -> dict[str, Any]:
         """Serialize resolved field values, expanding nested records and excluding bookkeeping.
 
@@ -419,6 +424,10 @@ class ServerArgs:
             "--enable-dp-attention",
             action=DeprecatedStoreTrueAction,
             new_flag="--attn-dp-size <dp-size>",
+            additional_guidance=(
+                "In in-process integrations, use `server_args.num_dp_ranks` "
+                "for the scheduler rank count."
+            ),
             help="Deprecated. Use --attn-dp-size <dp-size> instead of "
             "--dp-size <dp-size> --enable-dp-attention.",
         )
