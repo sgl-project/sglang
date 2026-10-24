@@ -87,6 +87,18 @@ def joint_select(
         cum_logprobs, top_logprobs, top_tokens, num_candidates
     )
 
+    if stop_token_ids.numel() == 0 and num_candidates >= k:
+        return SelectResult(
+            next_tokens=tokens[:k],
+            parent_idx=parent[:k],
+            new_cum_logprobs=cand_scores[:k],
+            num_survivors=torch.full((), k, dtype=torch.int64, device=tokens.device),
+            fin_tokens=torch.zeros_like(tokens),
+            fin_parent_idx=torch.zeros_like(parent),
+            fin_cum_logprobs=torch.zeros_like(cand_scores),
+            num_finished=torch.zeros((), dtype=torch.int64, device=tokens.device),
+        )
+
     if stop_token_ids.numel() > 0:  # static-shape branch, constant under capture
         is_stop = torch.isin(tokens, stop_token_ids)
     else:
