@@ -37,12 +37,14 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCall,
     UsageInfo,
 )
+from sglang.srt.sampling.sampling_params import MAX_N, SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
-class TestCompletionRequest(unittest.TestCase):
+class TestCompletionRequest(CustomTestCase):
     """Test CompletionRequest protocol model"""
 
     def test_basic_completion_request(self):
@@ -64,8 +66,18 @@ class TestCompletionRequest(unittest.TestCase):
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model")  # missing prompt
 
+    def test_completion_n_bounds(self):
+        """n outside [1, MAX_N] must be rejected before reaching the response path."""
+        for n in (-1, 0, MAX_N + 1):
+            with self.subTest(n=n), self.assertRaises(ValidationError):
+                CompletionRequest(model="test-model", prompt="Hello", n=n)
+        for n in (1, MAX_N):
+            self.assertEqual(
+                CompletionRequest(model="test-model", prompt="Hello", n=n).n, n
+            )
 
-class TestChatCompletionRequest(unittest.TestCase):
+
+class TestChatCompletionRequest(CustomTestCase):
     """Test ChatCompletionRequest protocol model"""
 
     def test_full_assistant_ebnf_preserves_explicit_output_constraints(self):
@@ -498,8 +510,40 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         self.assertNotIn("json_schema", sampling_params)
 
+    def test_zero_output_limits_preserve_precedence(self):
+        """An explicit zero completion limit must survive request conversion."""
+        for params, expected in (
+            ({}, None),
+            ({"max_tokens": None, "max_completion_tokens": None}, None),
+            ({"max_tokens": 0}, 0),
+            ({"max_completion_tokens": 0}, 0),
+            ({"max_tokens": 5, "max_completion_tokens": 0}, 0),
+            ({"max_tokens": 0, "max_completion_tokens": 5}, 5),
+            ({"max_tokens": 5, "max_completion_tokens": None}, 5),
+        ):
+            with self.subTest(params=params):
+                request = ChatCompletionRequest(
+                    messages=[{"role": "user", "content": "Hello"}], **params
+                )
+                sampling_params = SamplingParams(**request.to_sampling_params([], {}))
+                sampling_params.verify(vocab_size=32)
+                self.assertEqual(sampling_params.max_new_tokens, expected)
 
-class TestAudioContentParts(unittest.TestCase):
+    def test_chat_stop_token_id_bounds_are_validated(self):
+        """Chat stop_token_ids must reach SamplingParams validation."""
+        for token_id in (-1, 32, 33):
+            with self.subTest(token_id=token_id):
+                request = ChatCompletionRequest(
+                    messages=[{"role": "user", "content": "Hello"}],
+                    stop_token_ids=[token_id],
+                    min_tokens=1,
+                )
+                sampling_params = SamplingParams(**request.to_sampling_params([], {}))
+                with self.assertRaisesRegex(ValueError, "stop_token_ids"):
+                    sampling_params.verify(vocab_size=32)
+
+
+class TestAudioContentParts(CustomTestCase):
     """Test audio content parts and the input_audio conversion"""
 
     def _audio_part(self, part):
@@ -568,7 +612,7 @@ class TestAudioContentParts(unittest.TestCase):
         )
 
 
-class TestModelSerialization(unittest.TestCase):
+class TestModelSerialization(CustomTestCase):
     """Test model serialization with hidden states"""
 
     def _chat_payloads(self, tool_calls):
@@ -685,7 +729,7 @@ class TestModelSerialization(unittest.TestCase):
         self.assertEqual(data["meta_info"], {"prompt_tokens": 3})
 
 
-class TestFunctionDeferLoading(unittest.TestCase):
+class TestFunctionDeferLoading(CustomTestCase):
     """Test defer_loading field behavior on Function/Tool."""
 
     def test_function_defaults_preserve_strict(self):
@@ -751,7 +795,7 @@ class TestFunctionDeferLoading(unittest.TestCase):
         self.assertEqual(parts[1].type, "text")
 
 
-class TestValidationEdgeCases(unittest.TestCase):
+class TestValidationEdgeCases(CustomTestCase):
     """Test edge cases and validation scenarios"""
 
     def test_negative_token_limits(self):

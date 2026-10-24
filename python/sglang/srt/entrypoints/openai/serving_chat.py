@@ -1037,7 +1037,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     "or contains a cycle."
                 )
 
-        max_output_tokens = request.max_completion_tokens or request.max_tokens
+        max_output_tokens = request.effective_max_tokens
         server_context_length = get_model().context_length
         if (
             max_output_tokens
