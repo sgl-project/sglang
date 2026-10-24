@@ -57,7 +57,17 @@ class DllmAlgorithm:
 
     @classmethod
     def validate_request(cls, req: Req) -> Optional[str]:
-        """Return an error for unsupported request features, if any."""
+        """Return an error for unsupported request features, if any.
+
+        ``process_batch_result_dllm`` has no logprob stage, so the streamer
+        would answer a logprob request with empty arrays. Algorithms that
+        compute logprobs override this.
+        """
+        if req.return_logprob:
+            return (
+                f"return_logprob is not supported by the {cls.__name__} diffusion "
+                "LLM algorithm: it does not produce per-token logprobs."
+            )
         return None
 
     def prepare_inputs(
