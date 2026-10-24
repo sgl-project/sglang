@@ -1,19 +1,20 @@
 export const config = (() => {
-  // Real-weight H200 runs: offline API, HTTP /v1/videos and the realtime WebSocket
-  // on one GPU; WebSocket with Ulysses SP=2 on two GPUs (pixel-identical to one GPU).
+  // Real-weight H200 runs of sglang serve: HTTP /v1/videos and the realtime WebSocket
+  // on one GPU, Ulysses SP=2 and DiT layerwise offload, all pixel-identical to one GPU.
   const recipes = [
-    [1, 1],
-    [2, 2],
-  ].map(([gpus, ulysses]) => ({
-    id: ["h200", gpus, "resident", "sp" + ulysses].join("-"),
+    [1, 1, "resident"],
+    [2, 2, "resident"],
+    [1, 1, "offload"],
+  ].map(([gpus, ulysses, placement]) => ({
+    id: ["h200", gpus, placement, "sp" + ulysses].join("-"),
     hw: "h200",
     nodes: 1,
     gpus_per_node: gpus,
-    placement: "resident",
+    placement,
     tp_size: 1,
     ulysses_degree: ulysses,
     ring_degree: 1,
-    default: gpus === 1,
+    default: gpus === 1 && placement === "resident",
     unverified: false,
   }));
 
