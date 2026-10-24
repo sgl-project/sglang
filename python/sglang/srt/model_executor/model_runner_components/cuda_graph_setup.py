@@ -386,6 +386,8 @@ def drop_elastic_cuda_graph_state(
     set_global_graph_memory_pool(None)
     gc.collect()
     current_platform.empty_cache()
+    if hasattr(torch._C, "_host_emptyCache"):
+        torch._C._host_emptyCache()
 
 
 def capture_cuda_graphs(

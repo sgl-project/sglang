@@ -354,6 +354,20 @@ class BreakableCUDAGraph:
             graph.instantiate()
         self._segments.append(graph)
 
+    def reset(self) -> None:
+        for seg in self._segments:
+            if hasattr(seg, "reset"):
+                seg.reset()
+            elif (
+                hasattr(seg, "original_graph")
+                and getattr(seg, "original_graph", None) is not None
+            ):
+                orig = seg.original_graph
+                if hasattr(orig, "reset"):
+                    orig.reset()
+        self._segments.clear()
+        self._break_fns.clear()
+
 
 class BreakableCUDAGraphCapture:
     """Context manager that captures the enclosed code as one or more
@@ -390,13 +404,18 @@ class BreakableCUDAGraphCapture:
         self._current_graph_needs_instantiate = False
 
     def __enter__(self):
+        device_module = get_device_module()
+        if hasattr(device_module, "empty_cache"):
+            device_module.empty_cache()
+        if hasattr(torch._C, "_host_emptyCache"):
+            torch._C._host_emptyCache()
         _install_wait_stream_hook()
         if self._stream is not None:
-            self._stream_ctx = get_device_module().stream(self._stream)
+            self._stream_ctx = device_module.stream(self._stream)
             self._stream_ctx.__enter__()
         self._capture_token = _current_capture_var.set(self)
         self._stream_token = _current_stream_var.set(
-            self._stream or get_device_module().current_stream()
+            self._stream or device_module.current_stream()
         )
         self._forked_token = _forked_streams_var.set(set())
         self._begin_new_segment()
