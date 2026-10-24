@@ -510,7 +510,7 @@ __global__ __launch_bounds__(kFusedKV41WarpsPerCTA* device::kWarpThreads) void f
   for (uint32_t mask = 2; mask >= 1; mask >>= 1) {
 #pragma unroll
     for (uint32_t p = 0; p < kPairs; ++p)
-      sums[p] += __shfl_xor_sync(0xffffffffu, sums[p], mask);
+      sums[p] += __shfl_xor_sync(warp::kFullMask, sums[p], mask);
   }
 #pragma unroll
   for (uint32_t half = kPairs / 2; half >= 1; half >>= 1) {
@@ -521,7 +521,7 @@ __global__ __launch_bounds__(kFusedKV41WarpsPerCTA* device::kWarpThreads) void f
   float sum_of_squares = sums[0];
 #pragma unroll
   for (uint32_t mask = 16; mask >= 4; mask >>= 1)
-    sum_of_squares += __shfl_xor_sync(0xffffffffu, sum_of_squares, mask);
+    sum_of_squares += __shfl_xor_sync(warp::kFullMask, sum_of_squares, mask);
   const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
 
   // As in the reference: round the normed values, rotate the RoPE tail, round again.
@@ -814,7 +814,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
 #pragma unroll
       for (int i = 0; i < kVecSize; ++i) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
+        const float other = __shfl_xor_sync(warp::kFullMask, data[i], mask, kWarpThreads);
         data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
       }
     }
@@ -1031,7 +1031,7 @@ fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRop
     for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
 #pragma unroll
       for (int i = 0; i < kVecSize; ++i) {
-        const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
+        const float other = __shfl_xor_sync(warp::kFullMask, data[i], mask, kWarpThreads);
         data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
       }
     }
