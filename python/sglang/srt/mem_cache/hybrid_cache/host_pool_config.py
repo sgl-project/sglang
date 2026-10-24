@@ -26,7 +26,7 @@ class HostPoolGroupConfig(msgspec.Struct, frozen=True, kw_only=True):
 
     # Original-token slots moved together. Individual buffers may use fewer rows.
     transfer_page_size: int
-    # Dependency order with the unique primary KV root first.
+    # Dependency order with the unique layout root first.
     pools: tuple[HostPoolConfig, ...]
 
 
@@ -104,16 +104,20 @@ def _find_pool_decl(*, decls: tuple[HostPoolDecl, ...], name: PoolName) -> HostP
 
 
 def _validate_and_order_decls(
-    decls: tuple[HostPoolDecl, ...],
+    decls: tuple[HostPoolDecl, ...], *, index_primary: Optional[PoolName]
 ) -> tuple[HostPoolDecl, ...]:
     names = [decl.pool_name for decl in decls]
     if len(set(names)) != len(names):
         raise ValueError(f"duplicate host pool names: {names}")
     root = layout_root(decls)
-    if not root.is_primary or root.pool_name != PoolName.KV:
-        raise ValueError(
-            f"expected the layout root to be the primary KV pool, got {root.pool_name}"
-        )
+    if index_primary is None:
+        if not root.is_primary or root.pool_name != PoolName.KV:
+            raise ValueError(
+                f"expected the layout root to be the primary KV pool, got {root.pool_name}"
+            )
+        index_primary = root.pool_name
+    elif any(decl.is_primary for decl in decls):
+        raise ValueError("a sidecar group must take every index from the target")
     for decl in decls:
         if not decl.is_layout_root and (
             decl.host_pool_builder is None or decl.storage_info is None
@@ -129,9 +133,9 @@ def _validate_and_order_decls(
             raise ValueError(f"{decl.pool_name}: invalid owned_device_layers {owned}")
         if decl.is_primary:
             continue
-        if decl.indices_from_pool != root.pool_name:
+        if decl.indices_from_pool != index_primary:
             raise ValueError(
-                f"{decl.pool_name}.indices_from_pool must be {root.pool_name}, "
+                f"{decl.pool_name}.indices_from_pool must be {index_primary}, "
                 f"got {decl.indices_from_pool}"
             )
         if decl.is_layout_root:
@@ -170,13 +174,16 @@ def prepare_host_pool_config(
     transfer_layer_id_max: int,
     transfer_page_size: int,
     packed_draft_device_pools: tuple[Any, ...] = (),
+    index_primary: Optional[PoolName] = None,
 ) -> HostPoolGroupConfig:
     """Validate declarations and buffers, then append packed draft transfer layers.
 
     The input mapping and limit describe target layers only. No host memory is
-    allocated here. config.pools are in host construction order.
+    allocated here. config.pools are in host construction order. A target group
+    owns its primary KV pool. A separate draft sidecar group passes the target's
+    ``index_primary`` and takes every transfer index from it.
     """
-    decls = _validate_and_order_decls(decls)
+    decls = _validate_and_order_decls(decls, index_primary=index_primary)
     root = decls[0]
     target_layers = root.device_pool.layer_num
     for transfer_id, device_id in full_layer_mapping.items():
