@@ -101,7 +101,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
         if not has_tool_call:
             self._buffer = ""
-            for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
+            for e_token in [self.eot_token, "<｜tool▁call▁end｜>"]:
                 if e_token in new_text:
                     new_text = new_text.replace(e_token, "")
             return StreamingParseResult(normal_text=new_text)
