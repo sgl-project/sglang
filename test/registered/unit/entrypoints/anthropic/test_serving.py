@@ -1579,12 +1579,12 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(converted.messages[0].content, "Stable instructions")
 
     def test_dsv41_uses_the_native_inline_system_encoder(self):
-        """DeepSeek-V4.1-Flash ships no ``chat_template``, so the Jinja probe cannot
-        see that its native encoder renders mid-conversation system messages in
-        place: ``encoding_dsv41.render_message`` emits ``SYSTEM_SP_TOKEN`` for any
-        system message past index 0. The allowlist has to answer for it, otherwise
-        Messages hoists the turn into the leading system block and the prompt prefix
-        changes on every turn, which is what defeats the radix cache."""
+        """DeepSeek-V4.1-Flash ships no ``chat_template`` and renders the conversation
+        with its own encoder, so the Jinja probe cannot answer for it: the encoder
+        converts the message list itself, so a system turn past index 0 stays where
+        it is. The allowlist has to answer for it, otherwise Messages hoists the turn
+        into the leading system block and the prompt prefix changes on every turn,
+        which is what defeats the radix cache."""
         self.assertTrue(spec_supports_inline_system("dsv41"))
         self.assertTrue(spec_supports_inline_system("kimi_k3"))
         # Inkling renders prompt ids natively, but its inline-system handling is
