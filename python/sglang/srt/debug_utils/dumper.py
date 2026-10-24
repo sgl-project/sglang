@@ -1,6 +1,8 @@
+import ast
 import enum
 import functools
 import json
+import operator
 import os
 import random
 import re
@@ -1306,7 +1308,159 @@ class _DefaultNoneDict(dict):
         return None
 
 
-_FILTER_BUILTINS: dict[str, Any] = {"search": re.search, "match": re.match}
+_SAFE_COMPARE_OPS = {
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+    ast.Is: operator.is_,
+    ast.IsNot: operator.is_not,
+    ast.In: lambda a, b: a in b,
+    ast.NotIn: lambda a, b: a not in b,
+}
+
+_SAFE_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+}
+
+_SAFE_UNARY_OPS = {
+    ast.Not: operator.not_,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+class _SafeRegexWrapper:
+    """Wraps re.search/re.match so filter expressions cannot reach __globals__."""
+
+    __slots__ = ("_func",)
+
+    def __init__(self, func):
+        object.__setattr__(self, "_func", func)
+
+    def __call__(self, *args, **kwargs):
+        func = object.__getattribute__(self, "_func")
+        return func(*args, **kwargs)
+
+    def __getattribute__(self, name):
+        # Allow Python protocol dunders needed for calling/repr; block everything else.
+        if name.startswith("__") and name.endswith("__"):
+            return object.__getattribute__(self, name)
+        raise AttributeError(f"Access to '{name}' is not allowed in filter expressions")
+
+
+_FILTER_BUILTINS: dict[str, Any] = {
+    "search": _SafeRegexWrapper(re.search),
+    "match": _SafeRegexWrapper(re.match),
+    "len": len,
+    "abs": abs,
+    "min": min,
+    "max": max,
+    "sum": sum,
+    "any": any,
+    "all": all,
+}
+
+_ALLOWED_CALLABLES = frozenset(_FILTER_BUILTINS.values())
+
+
+def _safe_eval_node(node: ast.AST, namespace: dict[str, Any]) -> Any:
+    """Evaluate an AST node with a whitelist of safe operations (no eval/exec)."""
+    if isinstance(node, ast.Constant):
+        return node.value
+
+    if isinstance(node, ast.Name):
+        return namespace[node.id]
+
+    if isinstance(node, ast.Attribute):
+        # Block all attribute access so function objects cannot leak __globals__.
+        raise ValueError(
+            f"Attribute access ('.{node.attr}') is not allowed in filter expressions"
+        )
+
+    if isinstance(node, ast.Subscript):
+        obj = _safe_eval_node(node.value, namespace)
+        key = _safe_eval_node(node.slice, namespace)
+        if obj is None:
+            return None
+        return obj[key]
+
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in _FILTER_BUILTINS:
+            raise ValueError(
+                "Only search(), match(), and the listed helpers may be called "
+                "in filter expressions"
+            )
+        func = _FILTER_BUILTINS[node.func.id]
+        if func not in _ALLOWED_CALLABLES:
+            raise ValueError("Disallowed callable in filter expression")
+        args = [_safe_eval_node(a, namespace) for a in node.args]
+        kwargs = {
+            kw.arg: _safe_eval_node(kw.value, namespace)
+            for kw in node.keywords
+            if kw.arg is not None
+        }
+        return func(*args, **kwargs)
+
+    if isinstance(node, ast.Compare):
+        left = _safe_eval_node(node.left, namespace)
+        for op, comparator in zip(node.ops, node.comparators):
+            right = _safe_eval_node(comparator, namespace)
+            op_func = _SAFE_COMPARE_OPS.get(type(op))
+            if op_func is None:
+                raise ValueError(
+                    f"Comparison operator {type(op).__name__} is not allowed"
+                )
+            if not op_func(left, right):
+                return False
+            left = right
+        return True
+
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            result: Any = True
+            for value in node.values:
+                result = _safe_eval_node(value, namespace)
+                if not result:
+                    return result
+            return result
+        if isinstance(node.op, ast.Or):
+            result = False
+            for value in node.values:
+                result = _safe_eval_node(value, namespace)
+                if result:
+                    return result
+            return result
+        raise ValueError(f"Boolean operator {type(node.op).__name__} is not allowed")
+
+    if isinstance(node, ast.BinOp):
+        op_func = _SAFE_BIN_OPS.get(type(node.op))
+        if op_func is None:
+            raise ValueError(f"Binary operator {type(node.op).__name__} is not allowed")
+        return op_func(
+            _safe_eval_node(node.left, namespace),
+            _safe_eval_node(node.right, namespace),
+        )
+
+    if isinstance(node, ast.UnaryOp):
+        op_func = _SAFE_UNARY_OPS.get(type(node.op))
+        if op_func is None:
+            raise ValueError(f"Unary operator {type(node.op).__name__} is not allowed")
+        return op_func(_safe_eval_node(node.operand, namespace))
+
+    if isinstance(node, ast.Tuple):
+        return tuple(_safe_eval_node(e, namespace) for e in node.elts)
+    if isinstance(node, ast.List):
+        return [_safe_eval_node(e, namespace) for e in node.elts]
+
+    raise ValueError(f"Unsupported expression type: {type(node).__name__}")
 
 
 def _evaluate_filter(filter_expr: str, tags: dict[str, Any]) -> bool:
@@ -1314,10 +1468,15 @@ def _evaluate_filter(filter_expr: str, tags: dict[str, Any]) -> bool:
 
     Unknown tag keys resolve to None, so `layer_id is None` works when layer_id is absent.
     `re.search` and `re.match` are available as `search()` and `match()`.
+
+    Expressions are evaluated via a restricted AST walker rather than ``eval``,
+    so callers cannot reach ``__globals__`` / ``__builtins__`` through the
+    exposed helpers.
     """
+    tree = ast.parse(filter_expr, mode="eval")
     namespace = _DefaultNoneDict(tags)
     namespace.update(_FILTER_BUILTINS)
-    return bool(eval(filter_expr, {"__builtins__": {}}, namespace))
+    return bool(_safe_eval_node(tree.body, namespace))
 
 
 def _deepcopy_or_clone(x):
