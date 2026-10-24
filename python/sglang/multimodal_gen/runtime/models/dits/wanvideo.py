@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import weakref
 from functools import lru_cache
 from typing import Any
 
@@ -266,12 +267,13 @@ class WanT2VCrossAttention(WanSelfAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, is_cross_attention=True)
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens, context_kv=None):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
+            context_kv: ``project_context_kv(context)``, when already projected
         """
         q, _ = self.to_q(x)
         if self.tp_rmsnorm:
@@ -280,15 +282,7 @@ class WanT2VCrossAttention(WanSelfAttention):
             q = self.norm_q(q)
         q = q.unflatten(2, (self.local_num_heads, self.head_dim))
 
-        k, _ = self.to_k(context)
-        if self.tp_rmsnorm:
-            k = tensor_parallel_rms_norm(k, self.norm_k)
-        else:
-            k = self.norm_k(k)
-        k = k.unflatten(2, (self.local_num_heads, self.head_dim))
-
-        v, _ = self.to_v(context)
-        v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+        k, v = self.project_context_kv(context) if context_kv is None else context_kv
 
         # compute attention
         x = self.attn(q, k, v)
@@ -297,6 +291,20 @@ class WanT2VCrossAttention(WanSelfAttention):
         x = x.flatten(2)
         x, _ = self.to_out(x)
         return x
+
+    def project_context_kv(
+        self, context: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The normed K and the V of ``context``, as [B, L2, heads, head_dim]"""
+        k, _ = self.to_k(context)
+        if self.tp_rmsnorm:
+            k = tensor_parallel_rms_norm(k, self.norm_k)
+        else:
+            k = self.norm_k(k)
+        k = k.unflatten(2, (self.local_num_heads, self.head_dim))
+        v, _ = self.to_v(context)
+        v = v.unflatten(2, (self.local_num_heads, self.head_dim))
+        return k, v
 
 
 class WanI2VCrossAttention(WanSelfAttention):
@@ -736,6 +744,7 @@ class WanTransformerBlock(nn.Module):
         c_gate_msa: torch.Tensor,
         orig_dtype: torch.dtype,
         defer_ffn_residual: bool = False,
+        text_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -747,9 +756,17 @@ class WanTransformerBlock(nn.Module):
         )
         norm_hidden_states = norm_hidden_states.to(orig_dtype)
         hidden_states = hidden_states.to(orig_dtype)
-        attn_output = self.attn2(
-            norm_hidden_states, context=encoder_hidden_states, context_lens=None
-        )
+        if text_kv is None:
+            attn_output = self.attn2(
+                norm_hidden_states, context=encoder_hidden_states, context_lens=None
+            )
+        else:
+            attn_output = self.attn2(
+                norm_hidden_states,
+                context=encoder_hidden_states,
+                context_lens=None,
+                context_kv=text_kv,
+            )
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
@@ -778,9 +795,11 @@ class WanTransformerBlock(nn.Module):
         rope_cos_sin_cache: torch.Tensor | None = None,
         ffn_residual: tuple[torch.Tensor, torch.Tensor] | None = None,
         defer_ffn_residual: bool = False,
+        text_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """``ffn_residual`` is the previous block's (ff_output, gate), still to be added
-        to ``hidden_states``; ``defer_ffn_residual`` hands this block's back the same way."""
+        to ``hidden_states``; ``defer_ffn_residual`` hands this block's back the same way.
+        ``text_kv`` is the cross-attention's projected (K, V) of ``encoder_hidden_states``."""
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
         bs, seq_length, _ = hidden_states.shape
@@ -889,6 +908,7 @@ class WanTransformerBlock(nn.Module):
             c_gate_msa,
             orig_dtype,
             defer_ffn_residual,
+            text_kv,
         )
 
 
@@ -1235,19 +1255,59 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         self.layer_names = ["blocks"]
+        # id(prompt embeds) -> (weakref to the request, that tensor, every block's
+        # cross-attention K/V)
+        self._text_kv_cache: dict[int, tuple] = {}
 
-    def _chains_ffn_residuals(self) -> bool:
-        # plain Wan blocks in a plain list (a cache adapter or another block type keeps the
-        # one-block-at-a-time contract)
-        return (
-            type(self.blocks) is nn.ModuleList
-            and len(self.blocks) > 1
-            and all(
-                type(block) is WanTransformerBlock
-                and "forward" not in vars(block)
-                and block.chains_ffn_residual
+    def _text_kvs(
+        self, source: torch.Tensor, context: torch.Tensor
+    ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
+        """Every block's cross-attention (K, V) of ``context``, the embedding of ``source``.
+
+        The denoising stage hands the same prompt tensor to every step of a request's
+        loop, so the K/V are projected once per (request, prompt tensor); holding the
+        tensor keeps its id from being reused while cached, and a new request (whose
+        LoRA or weights may differ) projects again. Off when the projections could
+        differ step to step (LoRA wrappers, offloaded weights) or would be captured.
+        """
+        req = get_forward_context().forward_batch
+        if (
+            req is None
+            or not isinstance(source, torch.Tensor)
+            or self.layerwise_offload_managers
+            or torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+            or not self._plain_blocks()
+            or not all(
+                type(block.attn2) is WanT2VCrossAttention
+                and type(block.attn2.to_k) is ColumnParallelLinear
+                and type(block.attn2.to_v) is ColumnParallelLinear
                 for block in self.blocks
             )
+        ):
+            return None
+        entry = self._text_kv_cache.get(id(source))
+        if entry is not None and entry[0]() is req and entry[1] is source:
+            return entry[2]
+        kvs = [block.attn2.project_context_kv(context) for block in self.blocks]
+        # one entry per CFG branch is enough
+        if len(self._text_kv_cache) >= 2:
+            self._text_kv_cache.pop(next(iter(self._text_kv_cache)))
+        self._text_kv_cache[id(source)] = (weakref.ref(req), source, kvs)
+        return kvs
+
+    def _plain_blocks(self) -> bool:
+        # plain Wan blocks in a plain list: no cache adapter or block hook replaced them
+        return type(self.blocks) is nn.ModuleList and all(
+            type(block) is WanTransformerBlock and "forward" not in vars(block)
+            for block in self.blocks
+        )
+
+    def _chains_ffn_residuals(self) -> bool:
+        return (
+            len(self.blocks) > 1
+            and self._plain_blocks()
+            and all(block.chains_ffn_residual for block in self.blocks)
         )
 
     def post_load_weights(self) -> None:
@@ -1315,6 +1375,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         guidance=None,
         **kwargs,
     ) -> torch.Tensor:
+        text_source = encoder_hidden_states
         forward_batch = get_forward_context().forward_batch
         if forward_batch is not None:
             sequence_shard_enabled = (
@@ -1483,10 +1544,15 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     ],
                     dim=-1,
                 )
+            text_kvs = self._text_kvs(text_source, encoder_hidden_states)
+            text_kv_kwargs = [
+                {} if text_kvs is None else {"text_kv": kv}
+                for kv in (text_kvs or [None] * len(self.blocks))
+            ]
             if self._chains_ffn_residuals():
                 # each block's FFN residual is added by the next block's norm1
                 ffn_residual = None
-                for block in self.blocks[:-1]:
+                for block, kv_kwargs in zip(self.blocks[:-1], text_kv_kwargs):
                     hidden_states, ffn_residual = block(
                         hidden_states,
                         encoder_hidden_states,
@@ -1495,6 +1561,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         rope_cos_sin_cache=rope_cos_sin_cache,
                         ffn_residual=ffn_residual,
                         defer_ffn_residual=True,
+                        **kv_kwargs,
                     )
                 hidden_states = self.blocks[-1](
                     hidden_states,
@@ -1503,15 +1570,17 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     freqs_cis,
                     rope_cos_sin_cache=rope_cos_sin_cache,
                     ffn_residual=ffn_residual,
+                    **text_kv_kwargs[-1],
                 )
             else:
-                for block in self.blocks:
+                for block, kv_kwargs in zip(self.blocks, text_kv_kwargs):
                     hidden_states = block(
                         hidden_states,
                         encoder_hidden_states,
                         timestep_proj,
                         freqs_cis,
                         rope_cos_sin_cache=rope_cos_sin_cache,
+                        **kv_kwargs,
                     )
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:

@@ -81,6 +81,21 @@ def test_chained_blocks_match_blocks_one_by_one():
         out = blocks[-1](hidden, *args, rope_cos_sin_cache=cache, ffn_residual=residual)
     assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
 
+    # the cross-attention K/V projected ahead of the step give the same bits
+    with ExitStack() as stack:
+        for name, value in (
+            ("get_attn_backend", SDPABackend),
+            ("get_compute_dtype", torch.bfloat16),
+            ("_resolve_sp_attention_mode", ("ulysses", False)),
+            ("_maybe_install_backend_autotune", None),
+        ):
+            stack.enter_context(patch.object(layer, name, return_value=value))
+        stack.enter_context(set_forward_context(0, None))
+        kv = blocks[0].attn2.project_context_kv(context)
+        out = blocks[0](x, *args, rope_cos_sin_cache=cache, text_kv=kv)
+        ref = blocks[0](x, *args, rope_cos_sin_cache=cache)
+    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
