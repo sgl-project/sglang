@@ -119,6 +119,8 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_spec,
+    linear_attn_parallel_group,
+    linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
@@ -397,11 +399,6 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        from sglang.srt.runtime_context import (
-            linear_attn_parallel_group,
-            linear_attn_tp_size,
-        )
-
         head_shard_size = linear_attn_tp_size()
         head_parallel_group = linear_attn_parallel_group()
 
@@ -842,7 +839,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 update=residual.attn_update,
                 tp_group=SumGroup.TP
                 if config.is_kda_layer(layer_id)
-                and get_parallel().enable_cp_tp_group_sharing
+                and linear_attn_parallel_group() == "tp"
                 else SumGroup.ATTN_TP,
             ),
             declare_ffn(

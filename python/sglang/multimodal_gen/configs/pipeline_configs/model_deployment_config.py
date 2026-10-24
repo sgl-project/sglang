@@ -27,6 +27,9 @@ class ModelDeploymentConfig:
     # torch.compile is model opt-in because it can be slower than eager for
     # diffusion workloads dominated by already-optimized kernels
     speed_mode_enable_torch_compile_by_default: bool = False
+    # pipeline classes measured faster with breakable CUDA graphs; auto and speed
+    # modes enable BCG for them unless a gate in ServerArgs rules it out
+    bcg_default_pipeline_class_names: tuple[str, ...] = ()
     supports_cfg_parallel: bool = True
 
     def get_auto_cfg_parallel_degree(self, num_gpus: int) -> int:

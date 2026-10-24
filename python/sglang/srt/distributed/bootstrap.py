@@ -114,6 +114,12 @@ def init_parallel_runtime(
     tic = time.perf_counter()
     logger.info("Init parallel begin.")
 
+    # NPU: install transfer_to_npu to route torch.cuda.* to torch.npu.*
+    if is_npu():
+        from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+        init_npu_backend()
+
     backend = _resolve_backend(device=device)
     if not get_parallel().enable_p2p_check:
         monkey_patch_p2p_access_check()

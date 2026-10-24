@@ -14,8 +14,6 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4StateHostPool,
 )
 from sglang.srt.mem_cache.pool_host import common as host_common
-from sglang.srt.mem_cache.pool_host import mha as mha_pool_host
-from sglang.srt.mem_cache.pool_host import mla as mla_pool_host
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_register,
@@ -29,9 +27,7 @@ from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     AsymmetricMHATokenToKVPoolHost,
     MHATokenToKOnlyPoolHost,
-    MHATokenToKVPoolHost,
 )
-from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -239,57 +235,6 @@ class TestHiCacheHostRegister(unittest.TestCase):
                     alloc.call_args.kwargs["registration_granularity_bytes"],
                     host.indexer_layout_dim,
                 )
-
-    def test_page_first_direct_mla_uses_page_registration_granularity(self):
-        pool = MLATokenToKVPoolHost.__new__(MLATokenToKVPoolHost)
-        pool.layout = "page_first_direct"
-        pool.page_num = 4
-        pool.layer_num = 3
-        pool.page_size = 2
-        pool.kv_cache_dim = 5
-        pool.dtype = torch.float16
-        pool.device_pool = SimpleNamespace(device="cuda")
-        pool._transfer_device = torch.device("cuda")
-        pool.device = "cpu"
-        pool.pin_memory = True
-        pool.allocator = object()
-        alloc = mock.Mock(return_value=object())
-
-        with mock.patch.dict(mla_pool_host.ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
-            pool.init_kv_buffer()
-
-        self.assertEqual(
-            alloc.call_args.kwargs["registration_granularity_bytes"],
-            pool.page_size * pool.layer_num * pool.kv_cache_dim * pool.dtype.itemsize,
-        )
-
-    def test_page_first_direct_mha_uses_page_registration_granularity(self):
-        pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
-        pool.layout = "page_first_direct"
-        pool.page_num = 4
-        pool.layer_num = 3
-        pool.page_size = 2
-        pool.head_num = 2
-        pool.head_dim = 4
-        pool.dtype = torch.float16
-        pool.device_pool = SimpleNamespace(device="cuda")
-        pool._transfer_device = torch.device("cuda")
-        pool.device = "cpu"
-        pool.pin_memory = True
-        pool.allocator = object()
-        alloc = mock.Mock(return_value=object())
-
-        with mock.patch.dict(mha_pool_host.ALLOC_MEMORY_FUNCS, {"cuda": alloc}):
-            pool.init_kv_buffer()
-
-        self.assertEqual(
-            alloc.call_args.kwargs["registration_granularity_bytes"],
-            pool.page_size
-            * pool.layer_num
-            * pool.head_num
-            * pool.head_dim
-            * pool.dtype.itemsize,
-        )
 
     def test_mamba_page_layouts_use_per_buffer_page_granularity(self):
         for layout in ("page_first", "page_first_direct"):

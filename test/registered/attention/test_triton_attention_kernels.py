@@ -1,3 +1,4 @@
+import itertools
 import random
 import unittest
 
@@ -1175,6 +1176,56 @@ class TestTritonAttention(CustomTestCase):
                 self._test_extend_attention_unified_vs_regular_once(
                     B, N_CTX, H_Q, H_KV, D
                 )
+
+    def test_extend_attention_unified_gfx950_tile_bitwise(self):
+        """Deterministic mode relies on the gfx950 unified-kernel tile keeping the reduction
+        order: its output must equal the default tile's output bit for bit."""
+        from sglang.kernels.ops.attention import extend_attention as ea
+
+        if not ea._is_gfx95:
+            self.skipTest("gfx950-only tile")
+        device = get_device()
+        torch.manual_seed(0)
+        prefix_lens, extend_lens = [0, 1500, 4096], [700, 2048, 333]
+        for H_Q, H_KV, D in ((32, 8, 128), (64, 8, 64)):
+            seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+            q = torch.randn(
+                sum(extend_lens), H_Q, D, dtype=torch.bfloat16, device=device
+            )
+            k = torch.randn(sum(seq_lens), H_KV, D, dtype=torch.bfloat16, device=device)
+            v = torch.randn_like(k)
+            qo_indptr = torch.tensor(
+                [0, *itertools.accumulate(extend_lens)],
+                dtype=torch.int32,
+                device=device,
+            )
+            kv_indptr = torch.tensor(
+                [0, *itertools.accumulate(seq_lens)], dtype=torch.int32, device=device
+            )
+            kv_indices = torch.arange(sum(seq_lens), dtype=torch.int64, device=device)
+            prefix = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
+
+            def run():
+                o = torch.empty_like(q)
+                extend_attention_fwd_unified(
+                    q,
+                    o,
+                    k,
+                    v,
+                    1.0,
+                    1.0,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    prefix,
+                    max_len_extend=max(extend_lens),
+                )
+                return o
+
+            o_tuned = run()
+            with unittest.mock.patch.object(ea, "_is_gfx95", False):
+                o_default = run()
+            self.assertTrue(torch.equal(o_tuned, o_default), f"head_dim {D}")
 
     def test_build_unified_kv_indices(self):
         """Test build_unified_kv_indices correctness."""

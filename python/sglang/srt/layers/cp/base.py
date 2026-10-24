@@ -25,6 +25,7 @@ The strategy implementation is split across:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
@@ -245,6 +246,22 @@ def _is_dsa_active() -> bool:
 
 
 _STRATEGY: Optional[ContextParallelStrategy] = None
+
+
+@contextmanager
+def disable_cp_strategy():
+    """Suspend the cached target strategy while a TP-only draft runs.
+
+    Pair with a runtime topology scope that disables prefill CP so lazy lookup
+    cannot reconstruct the target strategy. Restore it even if draft work fails.
+    """
+    global _STRATEGY
+    strategy = _STRATEGY
+    _STRATEGY = None
+    try:
+        yield
+    finally:
+        _STRATEGY = strategy
 
 
 def init_cp_strategy(

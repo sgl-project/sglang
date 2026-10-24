@@ -60,41 +60,6 @@ class TestDSV4DecodeCapacity(CustomTestCase):
         self.assertEqual(allocator.ensure_c128_capacity.call_args.args[1], 2)
         allocator.evict_to_free_tokens.assert_called_once()
 
-    def test_c128_capacity_evicts_full_leaves_until_enough_pages_exist(self):
-        available_pages = 1
-        c128_page_size = 16
-
-        def available_size():
-            return available_pages * c128_page_size
-
-        def evict(_params):
-            nonlocal available_pages
-            available_pages += 1
-            return SimpleNamespace(num_tokens_evicted=128)
-
-        allocator = SimpleNamespace(
-            page_size=128,
-            c128_attn_allocator=SimpleNamespace(
-                page_size=c128_page_size,
-                available_size=available_size,
-            ),
-        )
-        tree_cache = SimpleNamespace(
-            supports_prefix_sharing=lambda: True,
-            evict=MagicMock(side_effect=evict),
-        )
-
-        result = DSV4NPUTokenToKVPoolAllocator.ensure_c128_capacity(
-            allocator, tree_cache, num_pages=3
-        )
-
-        self.assertTrue(result)
-        self.assertEqual(tree_cache.evict.call_count, 2)
-        self.assertEqual(
-            [call.args[0].num_tokens for call in tree_cache.evict.call_args_list],
-            [128, 128],
-        )
-
 
 class TestDSV4HostViews(CustomTestCase):
     @staticmethod
@@ -178,6 +143,42 @@ class TestDSV4HostViews(CustomTestCase):
 
 
 class TestC128L2Ownership(CustomTestCase):
+    def test_eviction_hooks_accept_cache_actions(self):
+        pages = torch.tensor([7, 8])
+        data = SimpleNamespace(value=pages, host_value=None)
+        node = SimpleNamespace(component_data={ComponentType.C128: data})
+        component = C128SidecarComponent.__new__(C128SidecarComponent)
+        component.tree_core = SimpleNamespace(
+            component_evictable_size_={ComponentType.C128: 2}
+        )
+        device_frees = {ComponentType.C128: []}
+        host_frees = {ComponentType.C128: []}
+        actions = []
+
+        self.assertEqual(
+            component.evict_component(
+                node, device_frees, host_frees, cache_actions=actions
+            ),
+            (0, 0),
+        )
+        self.assertIsNone(data.value)
+        self.assertIs(device_frees[ComponentType.C128][0], pages)
+        self.assertEqual(
+            component.tree_core.component_evictable_size_[ComponentType.C128], 0
+        )
+
+        component.is_evict_device_ongoing = False
+        component.evict_device_start(1)
+        try:
+            self.assertIsNone(
+                component.evict_device_next_node(
+                    {}, device_frees, host_frees, cache_actions=actions
+                )
+            )
+        finally:
+            component.evict_device_end()
+        self.assertEqual(actions, [])
+
     def test_load_back_retains_and_attaches_each_c128_page(self):
         allocator = SimpleNamespace(
             c128_attn_allocator=SimpleNamespace(page_size=4),

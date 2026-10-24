@@ -27,6 +27,7 @@ from sglang.srt.utils.hf_transformers import (
     get_rope_config,
     get_tokenizer,
 )
+from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.utils.patch_tokenizer import unpatch_tokenizer
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -235,6 +236,50 @@ class TestHFTransformersLoading(unittest.TestCase):
                 self.assertTrue(torch.isfinite(batch["pixel_values"]).all())
                 self.assertEqual(batch["input_ids"].tolist(), [[3, 3, 3, 3, 5]])
                 self.assertEqual(batch["attention_mask"].tolist(), [[1, 1, 1, 1, 1]])
+
+    def test_kev_adapter_reads_the_text_config_of_its_pinned_base(self):
+        """A Kev LoRA checkpoint has no config.json. Its config is the text config
+        of the base its head.pt pins, served by the text-only class, and the base
+        is recorded so its weights load. A base without the Qwen3.5 backbone, as
+        Kev-0.5B's Qwen2.5, is refused, and so is an adapter trained on a BF16
+        backbone, as Kev-27B v1, which Kev applies unmerged."""
+        Path(self.model_path, "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_5",
+                    "architectures": ["Qwen3_5ForConditionalGeneration"],
+                    "text_config": {"model_type": "qwen3_5_text", "hidden_size": 32},
+                }
+            )
+        )
+
+        def adapter(base, weights_dtype="fp32"):
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+            Path(directory.name, "adapter_config.json").write_text(
+                json.dumps({"r": 16, "lora_alpha": 32})
+            )
+            torch.save(
+                {"base": base, "base_revision": None, "weights_dtype": weights_dtype},
+                Path(directory.name, "head.pt"),
+            )
+            return directory.name
+
+        path = adapter(self.model_path)
+        config = get_config(path, trust_remote_code=False, local_files_only=True)
+        self.assertEqual(
+            (config.model_type, config.architectures, config.hidden_size),
+            ("qwen3_5_text", ["Qwen3_5ForCausalLM"], 32),
+        )
+        self.assertEqual(POINTER_ADAPTER_BASES[(path, None)], (self.model_path, None))
+
+        llama = tempfile.TemporaryDirectory()
+        self.addCleanup(llama.cleanup)
+        Path(llama.name, "config.json").write_text(json.dumps(self.text_config()))
+        with self.assertRaisesRegex(ValueError, "on a llama base"):
+            get_config(adapter(llama.name), trust_remote_code=False)
+        with self.assertRaisesRegex(ValueError, "trained on a bf16 backbone"):
+            get_config(adapter(self.model_path, "bf16"), trust_remote_code=False)
 
 
 if __name__ == "__main__":

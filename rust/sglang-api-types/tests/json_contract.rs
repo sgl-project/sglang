@@ -84,10 +84,9 @@ fn sampling_denies_unknown_keys() {
 /// pinned in message/request.rs).
 #[test]
 fn generate_request_ignores_unknown_keys() {
-    let req: GenerateRequest = serde_json::from_str(
-        r#"{"text": "hi", "priority": 3, "session_id": "s", "custom_logit_processor": "x"}"#,
-    )
-    .unwrap();
+    let req: GenerateRequest =
+        serde_json::from_str(r#"{"text": "hi", "priority": 3, "conversation_id": "ignored"}"#)
+            .unwrap();
     assert!(matches!(
         req.text,
         Some(StringOrList {
@@ -251,6 +250,7 @@ fn generate_response_matches_frame_value_shape() {
             ..Default::default()
         }),
         index: None,
+        prompt_token_ids: None,
     };
     assert_eq!(
         serde_json::to_string(&frame).unwrap(),

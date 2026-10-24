@@ -66,6 +66,7 @@ def _simulated_bonus_row_partial_kernel(
     logits_stride,
     temperatures_ptr,
     correct_len_ptr,
+    correct_len_stride,
     seed_ptr,
     part_val_ptr,
     part_idx_ptr,
@@ -76,7 +77,7 @@ def _simulated_bonus_row_partial_kernel(
 ):
     req = tl.program_id(0)
     split = tl.program_id(1)
-    row = req * ROWS + tl.load(correct_len_ptr + req)
+    row = req * ROWS + tl.load(correct_len_ptr + req * correct_len_stride)
     t = tl.load(temperatures_ptr + req).to(tl.float32)
     offs = split * BLOCK + tl.arange(0, BLOCK)
     mask = offs < vocab
@@ -125,7 +126,34 @@ def simulated_bonus_sample_graph(
     """Graph-safe variant of simulated_bonus_sample: seed ([1] int) and per-request
     temperatures ([bs] float; <= 0 means argmax) are read from device buffers, and
     only the row at ``correct_len`` is sampled. [bs] int64."""
+    part_val, part_idx = simulated_bonus_partials_graph(
+        target_logits=target_logits,
+        correct_len=correct_len,
+        temperatures=temperatures,
+        seed=seed,
+        bs=bs,
+        rows_per_request=rows_per_request,
+    )
+    out = torch.empty((bs,), dtype=torch.int64, device=target_logits.device)
+    _simulated_bonus_row_select_kernel[(bs,)](
+        part_val, part_idx, out, target_logits.shape[1], NSPLIT=part_val.shape[1]
+    )
+    return out
+
+
+def simulated_bonus_partials_graph(
+    *,
+    target_logits: torch.Tensor,
+    correct_len: torch.Tensor,
+    temperatures: torch.Tensor,
+    seed: torch.Tensor,
+    bs: int,
+    rows_per_request: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """simulated_bonus_sample_graph's per-split (value, index) maxima, [bs, NSPLIT],
+    reduced by ``simulated_bonus_select_partials``. ``correct_len`` may be stride-0."""
     assert target_logits.stride(1) == 1
+    assert correct_len.dim() == 1 and correct_len.shape[0] == bs
     device = target_logits.device
     vocab = target_logits.shape[1]
     block = 4096
@@ -136,7 +164,8 @@ def simulated_bonus_sample_graph(
         target_logits,
         target_logits.stride(0),
         temperatures,
-        correct_len.contiguous(),
+        correct_len,
+        correct_len.stride(0),
         seed,
         part_val,
         part_idx,
@@ -146,11 +175,17 @@ def simulated_bonus_sample_graph(
         BLOCK=block,
         num_warps=8,
     )
-    out = torch.empty((bs,), dtype=torch.int64, device=device)
-    _simulated_bonus_row_select_kernel[(bs,)](
-        part_val, part_idx, out, vocab, NSPLIT=nsplit
-    )
-    return out
+    return part_val, part_idx
+
+
+def simulated_bonus_select_partials(
+    *, part_val: torch.Tensor, part_idx: torch.Tensor, vocab: int
+) -> torch.Tensor:
+    """Torch reference of _simulated_bonus_row_select_kernel: the largest value,
+    ties to the lowest index. [bs] int64."""
+    top = part_val.max(dim=1, keepdim=True).values
+    sentinel = torch.full_like(part_idx, vocab)
+    return torch.where(part_val == top, part_idx, sentinel).min(dim=1).values.long()
 
 
 def simulated_bonus_sample(

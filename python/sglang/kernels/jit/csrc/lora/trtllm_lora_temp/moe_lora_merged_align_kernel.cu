@@ -48,11 +48,21 @@ using Vec = int4;
 
 namespace moe_lora_merged {
 
+template <bool HasAdapterEnabled>
+__device__ __forceinline__ bool
+adapter_is_enabled(int lora_id, const int32_t* adapter_enabled, int num_slots, int64_t enabled_stride) {
+  if (lora_id < 0 || lora_id >= num_slots) return false;
+  if constexpr (HasAdapterEnabled) {
+    return adapter_enabled[lora_id * enabled_stride] != 0;
+  }
+  return true;
+}
+
 // Inline mirror of _fused_virtual_topk_ids_kernel (virtual_experts.py). Returns
 // the merged virtual expert id for flat slot `i` (range [-1, virtual_num_experts);
 // -1 is the dropped/masked sentinel). The caller adds +1 to get the histogram
 // bucket (sentinel -> bucket 0), matching the native +1 offset convention.
-template <typename scalar_t>
+template <typename scalar_t, bool HasAdapterEnabled>
 __device__ __forceinline__ int compute_virtual_id(
     const scalar_t* __restrict__ topk_ids,
     const int32_t* __restrict__ token_lora_mapping,
@@ -63,27 +73,32 @@ __device__ __forceinline__ int compute_virtual_id(
     int local_num_experts,
     bool ep_local,
     bool shared_outer,
-    bool compact) {
+    bool compact,
+    const int32_t* __restrict__ adapter_enabled,
+    int num_slots,
+    int64_t enabled_stride) {
   int m = static_cast<int>(i) / top_k;
   int lora_id = token_lora_mapping[m];
-  bool mask_val = lora_id >= 0;
-  int safe_lora = lora_id > 0 ? lora_id : 0;
+  bool mask_val = adapter_is_enabled<HasAdapterEnabled>(lora_id, adapter_enabled, num_slots, enabled_stride);
 
-  int base = shared_outer ? 0 : static_cast<int>(topk_ids[i]);
+  scalar_t original_id = topk_ids[i];
+  if (!mask_val || original_id < 0) return -1;
+  if (!shared_outer && original_id >= num_experts_for_weight) return -1;
+  int base = shared_outer ? 0 : static_cast<int>(original_id);
   if (ep_local) {
     bool owned = base >= local_expert_offset && base < local_expert_offset + local_num_experts;
     base = owned ? base : -1;
   }
-  if (!mask_val || base < 0) return -1;
+  if (base < 0) return -1;
   // compact: dense LOCAL expert id in [0, local_num_experts) so the histogram
   // spans only local_num_experts buckets instead of the full global virtual
-  // space (337/385 empty under EP). Assumes max_loras==1 (safe_lora shift is 0;
+  // space (337/385 empty under EP). Assumes max_loras==1 (adapter shift is 0;
   // the wrapper guards). expert_ids is converted back to global at write time.
   if (compact) return base - local_expert_offset;
-  return base + safe_lora * num_experts_for_weight;
+  return base + lora_id * num_experts_for_weight;
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool HasAdapterEnabled>
 __global__ void count_and_sort_expert_tokens_kernel(
     const scalar_t* __restrict__ topk_ids,
     const int32_t* __restrict__ token_lora_mapping,
@@ -97,12 +112,15 @@ __global__ void count_and_sort_expert_tokens_kernel(
     bool ep_local,
     bool shared_outer,
     bool do_skip,
-    bool compact) {
+    bool compact,
+    const int32_t* __restrict__ adapter_enabled,
+    int num_slots,
+    int64_t enabled_stride) {
   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.x;
 
   for (size_t i = tid; i < numel; i += stride) {
-    int vid = compute_virtual_id<scalar_t>(
+    int vid = compute_virtual_id<scalar_t, HasAdapterEnabled>(
         topk_ids,
         token_lora_mapping,
         i,
@@ -112,7 +130,10 @@ __global__ void count_and_sort_expert_tokens_kernel(
         local_num_experts,
         ep_local,
         shared_outer,
-        compact);
+        compact,
+        adapter_enabled,
+        num_slots,
+        enabled_stride);
     // EP skip: dropped/masked slots (vid < 0) produce no delta on this rank, so
     // they never need a slot in sorted_token_ids -> skip the global atomicAdd
     // (kills the sentinel-bucket-0 contention). When do_skip is off they fall
@@ -124,7 +145,7 @@ __global__ void count_and_sort_expert_tokens_kernel(
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, bool HasAdapterEnabled, bool WriteInactivePrefixCount>
 __global__ void moe_align_block_size_kernel(
     const scalar_t* __restrict__ topk_ids,
     const int32_t* __restrict__ token_lora_mapping,
@@ -146,7 +167,10 @@ __global__ void moe_align_block_size_kernel(
     bool ep_local,
     bool shared_outer,
     bool do_skip,
-    bool compact) {
+    bool compact,
+    const int32_t* __restrict__ adapter_enabled,
+    int num_slots,
+    int64_t enabled_stride) {
   // Use a separate thread block to populate sorted_token_ids
   if (blockIdx.x == 1) {
     if (pad_sorted_token_ids) {
@@ -181,7 +205,7 @@ __global__ void moe_align_block_size_kernel(
   __syncthreads();
 
   for (size_t i = tid; i < numel; i += stride) {
-    int vid = compute_virtual_id<scalar_t>(
+    int vid = compute_virtual_id<scalar_t, HasAdapterEnabled>(
         topk_ids,
         token_lora_mapping,
         i,
@@ -191,16 +215,20 @@ __global__ void moe_align_block_size_kernel(
         local_num_experts,
         ep_local,
         shared_outer,
-        compact);
+        compact,
+        adapter_enabled,
+        num_slots,
+        enabled_stride);
     // EP skip: dropped/masked slots don't increment any bucket (sentinel bucket
     // 0 stays empty), so they never get a block and never reach count_and_sort.
     if (!do_skip || vid >= 0) {
       atomicAdd(&shared_counts[vid + 1], 1);
     }
-    // token_lora_mask[m] = token_lora_mapping[m] >= 0, written once per row.
+    // Publish the same bounded adapter predicate used by both routing passes.
     if (static_cast<int>(i) % top_k == 0) {
       int m = static_cast<int>(i) / top_k;
-      token_lora_mask[m] = token_lora_mapping[m] >= 0;
+      token_lora_mask[m] =
+          adapter_is_enabled<HasAdapterEnabled>(token_lora_mapping[m], adapter_enabled, num_slots, enabled_stride);
     }
   }
 
@@ -235,6 +263,9 @@ __global__ void moe_align_block_size_kernel(
     prefix[num_experts] = warp_sums[num_warps_for_scan - 1];
     s_total_tokens_post_pad = prefix[num_experts];
     *total_tokens_post_pad = s_total_tokens_post_pad;
+    if constexpr (WriteInactivePrefixCount) {
+      total_tokens_post_pad[1] = CEILDIV(shared_counts[0], block_size);
+    }
   }
   __syncthreads();
 
@@ -277,9 +308,9 @@ __global__ void moe_align_block_size_kernel(
         right = mid;
       }
     }
-    // compact buckets hold LOCAL expert ids; restore the global id (+offset) so
-    // the downstream GEMM still indexes the global contiguous LoRA weight.
-    expert_ids[i] = left - 2 + (compact ? local_expert_offset : 0);
+    // Restore global IDs only for real compact buckets. The negative bucket
+    // stays -1 so overwrite consumers can zero it before touching weights.
+    expert_ids[i] = left == 1 ? -1 : left - 2 + (compact ? local_expert_offset : 0);
   }
 }
 
@@ -287,9 +318,9 @@ __global__ void moe_align_block_size_kernel(
 // in ONE threadblock (one launch), eliminating the separate count_and_sort kernel
 // AND its redundant re-computation of the virtual id (cached in shared `svids`).
 // Only valid for small numel (the scatter is single-block); the wrapper routes
-// large numel (prefill) to the 2-kernel path. do_skip is implied (this is the
-// decode hot path); dropped slots are simply never scattered.
-template <typename scalar_t>
+// large numel (prefill) to the 2-kernel path. do_skip omits dropped slots;
+// overwrite consumers can retain them for the existing negative-expert store.
+template <typename scalar_t, bool HasAdapterEnabled, bool WriteInactivePrefixCount>
 __global__ void fused_align_scatter_kernel(
     const scalar_t* __restrict__ topk_ids,
     const int32_t* __restrict__ token_lora_mapping,
@@ -310,7 +341,10 @@ __global__ void fused_align_scatter_kernel(
     bool ep_local,
     bool shared_outer,
     bool do_skip,
-    bool compact) {
+    bool compact,
+    const int32_t* __restrict__ adapter_enabled,
+    int num_slots,
+    int64_t enabled_stride) {
   extern __shared__ int32_t smem[];
   int32_t* shared_counts = smem;                  // [num_experts]
   int32_t* prefix = shared_counts + num_experts;  // [num_experts + 1]
@@ -345,7 +379,7 @@ __global__ void fused_align_scatter_kernel(
 
   // Phase 2: histogram + cache the virtual id per slot + token_lora_mask.
   for (size_t i = tid; i < numel; i += stride) {
-    int vid = compute_virtual_id<scalar_t>(
+    int vid = compute_virtual_id<scalar_t, HasAdapterEnabled>(
         topk_ids,
         token_lora_mapping,
         i,
@@ -355,14 +389,18 @@ __global__ void fused_align_scatter_kernel(
         local_num_experts,
         ep_local,
         shared_outer,
-        compact);
+        compact,
+        adapter_enabled,
+        num_slots,
+        enabled_stride);
     svids[i] = vid;
     if (!do_skip || vid >= 0) {
       atomicAdd(&shared_counts[vid + 1], 1);
     }
     if (static_cast<int>(i) % top_k == 0) {
       int m = static_cast<int>(i) / top_k;
-      token_lora_mask[m] = token_lora_mapping[m] >= 0;
+      token_lora_mask[m] =
+          adapter_is_enabled<HasAdapterEnabled>(token_lora_mapping[m], adapter_enabled, num_slots, enabled_stride);
     }
   }
   __syncthreads();
@@ -387,6 +425,9 @@ __global__ void fused_align_scatter_kernel(
     prefix[num_experts] = warp_sums[num_warps_for_scan - 1];
     s_total_tokens_post_pad = prefix[num_experts];
     *total_tokens_post_pad = s_total_tokens_post_pad;
+    if constexpr (WriteInactivePrefixCount) {
+      total_tokens_post_pad[1] = CEILDIV(shared_counts[0], block_size);
+    }
   }
   __syncthreads();
   if (tid >= num_experts && tid < scan_size) scan_buf[tid] = 0;
@@ -420,7 +461,7 @@ __global__ void fused_align_scatter_kernel(
         right = mid;
       }
     }
-    expert_ids[i] = left - 2 + (compact ? local_expert_offset : 0);
+    expert_ids[i] = left == 1 ? -1 : left - 2 + (compact ? local_expert_offset : 0);
   }
   if (tid < num_experts) cursor[tid] = prefix[tid];
   __syncthreads();
@@ -437,7 +478,7 @@ __global__ void fused_align_scatter_kernel(
 
 }  // namespace moe_lora_merged
 
-template <typename scalar_t>
+template <typename scalar_t, bool HasAdapterEnabled, bool WriteInactivePrefixCount>
 struct MoeLoraMergedAlignKernel {
   static void
   run(tvm::ffi::TensorView topk_ids,
@@ -458,7 +499,10 @@ struct MoeLoraMergedAlignKernel {
       bool shared_outer,
       bool do_skip,
       bool compact,
-      bool fuse_scatter) {
+      bool fuse_scatter,
+      tvm::ffi::Optional<tvm::ffi::TensorView> adapter_enabled,
+      int64_t num_slots,
+      int64_t enabled_stride) {
     using namespace host;
 
     auto device = topk_ids.device();
@@ -475,12 +519,6 @@ struct MoeLoraMergedAlignKernel {
     // shared memory); the v2 (>1024) regime keeps the old path via the wrapper.
     RuntimeCheck(
         num_experts <= 1024, "moe_lora_merged_align: num_experts (bucket count) must be <= 1024, got ", num_experts);
-    // compact buckets hold LOCAL ids and restore global expert ids as
-    // (left-2+offset). For the sentinel bucket 0 that yields (offset-1), NOT the
-    // -1 the GEMM expects to skip -- only safe when do_skip empties bucket 0.
-    RuntimeCheck(
-        !compact || do_skip, "moe_lora_merged_align: compact requires do_skip (sentinel bucket must be empty)");
-
     const scalar_t* topk_ids_ptr = static_cast<const scalar_t*>(topk_ids.data_ptr());
     const int32_t* tlm_ptr = static_cast<const int32_t*>(token_lora_mapping.data_ptr());
     bool* token_lora_mask_ptr = static_cast<bool*>(token_lora_mask.data_ptr());
@@ -489,6 +527,21 @@ struct MoeLoraMergedAlignKernel {
     int32_t* num_tokens_post_pad_ptr = static_cast<int32_t*>(num_tokens_post_pad.data_ptr());
     int32_t* cumsum_buffer_ptr = static_cast<int32_t*>(cumsum_buffer.data_ptr());
     size_t numel = topk_ids.numel();
+    const int32_t* enabled_ptr = nullptr;
+    if constexpr (HasAdapterEnabled) {
+      CHECK_HOST(adapter_enabled.has_value());
+      TensorMatcher({num_slots})
+          .with_dtype<int32_t>()
+          .with_device(device)
+          .with_strides({enabled_stride})
+          .verify(adapter_enabled.value());
+      enabled_ptr = static_cast<const int32_t*>(adapter_enabled.value().data_ptr());
+    }
+    TensorMatcher({WriteInactivePrefixCount ? 2 : 1})
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .ensure_alignment(WriteInactivePrefixCount ? 8 : 4)
+        .verify(num_tokens_post_pad);
 
     const size_t scan_size = host::round_up_pow2(static_cast<uint32_t>(num_experts));
 
@@ -497,7 +550,7 @@ struct MoeLoraMergedAlignKernel {
       // shared for the scatter cursor [num_experts] and cached virtual ids [numel].
       const size_t shmem =
           (num_experts + (num_experts + 1) + scan_size + WARP_SIZE + num_experts + numel) * sizeof(int32_t);
-      auto fused = moe_lora_merged::fused_align_scatter_kernel<scalar_t>;
+      auto fused = moe_lora_merged::fused_align_scatter_kernel<scalar_t, HasAdapterEnabled, WriteInactivePrefixCount>;
       LaunchKernel(dim3(1), dim3(threads), stream, shmem)(
           fused,
           topk_ids_ptr,
@@ -519,13 +572,17 @@ struct MoeLoraMergedAlignKernel {
           ep_local,
           shared_outer,
           do_skip,
-          compact);
+          compact,
+          enabled_ptr,
+          static_cast<int>(num_slots),
+          enabled_stride);
       return;
     }
 
     const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + WARP_SIZE) * sizeof(int32_t);
 
-    auto align_kernel = moe_lora_merged::moe_align_block_size_kernel<scalar_t>;
+    auto align_kernel =
+        moe_lora_merged::moe_align_block_size_kernel<scalar_t, HasAdapterEnabled, WriteInactivePrefixCount>;
     LaunchKernel(dim3(2), dim3(threads), stream, shared_mem_size)(
         align_kernel,
         topk_ids_ptr,
@@ -548,14 +605,19 @@ struct MoeLoraMergedAlignKernel {
         ep_local,
         shared_outer,
         do_skip,
-        compact);
+        compact,
+        enabled_ptr,
+        static_cast<int>(num_slots),
+        enabled_stride);
+
+    if (numel == 0) return;
 
     const int block_threads = std::min(256, threads);
     const int num_blocks = (numel + block_threads - 1) / block_threads;
     const int max_blocks = 65535;
     const int actual_blocks = std::min(num_blocks, max_blocks);
 
-    auto sort_kernel = moe_lora_merged::count_and_sort_expert_tokens_kernel<scalar_t>;
+    auto sort_kernel = moe_lora_merged::count_and_sort_expert_tokens_kernel<scalar_t, HasAdapterEnabled>;
     LaunchKernel(dim3(actual_blocks), dim3(block_threads), stream)(
         sort_kernel,
         topk_ids_ptr,
@@ -570,7 +632,10 @@ struct MoeLoraMergedAlignKernel {
         ep_local,
         shared_outer,
         do_skip,
-        compact);
+        compact,
+        enabled_ptr,
+        static_cast<int>(num_slots),
+        enabled_stride);
   }
 };
 

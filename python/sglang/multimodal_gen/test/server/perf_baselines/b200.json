@@ -272,10 +272,10 @@
             "expected_avg_denoise_ms": 478.63,
             "expected_median_denoise_ms": 443.42,
             "estimated_full_test_time_s": 181.8,
-            "load_peak_vram_mb": 4920.72,
-            "runtime_peak_vram_mb": 9895.98,
-            "load_peak_allocated_mb": 4858.5,
-            "runtime_peak_allocated_mb": 6460.38
+            "load_peak_vram_mb": 25490.0,
+            "runtime_peak_vram_mb": 35568.0,
+            "load_peak_allocated_mb": 24622.71,
+            "runtime_peak_allocated_mb": 28881.55
         },
         "ideogram4_nvfp4_t2i": {
             "expected_load_ms": 33439.28,

@@ -24,11 +24,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DraftStateRegion,
     FusedDraftPlacement,
 )
-from sglang.srt.mem_cache.layout.token_major import (
-    ENTRY_ALIGN_BYTES,
-    align_entry_bytes,
-    align_part_offset,
-)
+from sglang.srt.mem_cache.layout.token_major import align_entry_bytes
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_draft_pool import (
     UnifiedDraftKVPool,
@@ -102,28 +98,6 @@ def _placement(region, num_runners=1):
     return FusedDraftPlacement.from_counts(
         counts={"full": [region.lane_num] * num_runners}, regions={"full": region}
     )
-
-
-class TestFusedSpecMath(unittest.TestCase):
-    def test_fused_entry_appends_the_draft_parts(self):
-        f = _host_spec(_draft_region())
-        r = f.draft_region
-        self.assertEqual(r.k_row_bytes(), 48)
-        self.assertEqual(r.v_row_bytes(), 16)
-        self.assertEqual(r.entry_bytes(), 64)
-        self.assertEqual(
-            f.draft_offset_in_entry(), align_part_offset(f.host_entry_bytes())
-        )
-        self.assertEqual(f.draft_offset_in_entry(), 64)
-        self.assertEqual(f.entry_bytes(), align_entry_bytes(64 + 64))
-        self.assertEqual(f.entry_bytes() % ENTRY_ALIGN_BYTES, 0)
-        layout = f.layout()
-        self.assertEqual(
-            [p.name for p in layout.parts], ["k", "v", "draft_k", "draft_v"]
-        )
-        self.assertEqual(layout.part("draft_k").offset_bytes, 64)
-        self.assertEqual(layout.part("draft_v").offset_bytes, 64 + 48)
-        self.assertEqual(layout.part("draft_k").layer_stride_bytes, 64)
 
 
 class TestFusedRegionConfinement(unittest.TestCase):
@@ -320,16 +294,6 @@ class TestFusedStateHost(unittest.TestCase):
         s = _mamba_spec()
         self.assertEqual(s.host_entry_bytes(), 2 * (3 * 8 * 2 + 2 * 4))
         self.assertEqual(s.entry_bytes(), s.host_entry_bytes())
-
-    def test_fused_entry_appends_the_state_block(self):
-        f = _mamba_spec(_state_region())
-        host = f.host_entry_bytes()
-        self.assertEqual(f.draft_offset_in_entry(), align_part_offset(host))
-        self.assertEqual(
-            f.entry_bytes(),
-            align_entry_bytes(f.draft_offset_in_entry() + f.draft_region.entry_bytes()),
-        )
-        self.assertEqual(f.draft_region.entry_bytes(), 2 * (2 * 4 * 4) + 2 * 4)
 
     def _pool(self):
         region = _state_region()

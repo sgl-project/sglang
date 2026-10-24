@@ -44,6 +44,11 @@ DRAFT_SUFFIX = re.compile(r"(NextN|MTP|DSpark|DFlash|Standalone)$")
 
 def _target_of(arch: str, archs: dict):
     """The arch a draft entry class drafts for, if it is named after it."""
+    # Bailing shares its NextN entry class across generations. Its loader
+    # fusion hooks belong to V3; legacy checkpoints return a fused count of 0
+    # (covered by TestBailingMoeV3Gate in test_shared_experts_fusion_gates.py).
+    if arch == "BailingMoeForCausalLMNextN":
+        return "BailingMoeV3ForCausalLM"
     match = DRAFT_SUFFIX.search(arch)
     if not match:
         return None

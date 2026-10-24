@@ -30,6 +30,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         self,
         sigma_shift_scales=None,
         dmd_denoising_steps: tuple[int, ...] | None = None,
+        pdd_heads: str | None = None,
     ) -> None:
         super().__init__()
         # Per-model sigma shift override (model_index.json "_minimax_h3" release
@@ -38,7 +39,9 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         self.sigma_shift_scales = sigma_shift_scales
         self.dmd_denoising_steps = dmd_denoising_steps
         self._pdd_config = None
-        pdd_heads = envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
+        # The pipeline resolves the release's fused heads; the env var serves
+        # stages built without a pipeline.
+        pdd_heads = pdd_heads or envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
         if pdd_heads:
             from safetensors import safe_open
 
@@ -49,6 +52,9 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 steps = f.get_slice("video_out.weight").get_shape()[0]
             if self._pdd_config["num_inference_steps"] != steps:
                 raise ValueError("MiniMax-H3 PDD config does not match the fused heads")
+            sigma_max = float(self._pdd_config.get("sigma_max", 1.0))
+            if not 0.0 < sigma_max <= 1.0:
+                raise ValueError("MiniMax-H3 PDD sigma_max must be in (0, 1]")
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
@@ -95,6 +101,10 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         )
 
         config = self._pdd_config
+        # Students trained on a grid ending at sigma_max < 1 (FastGen's
+        # max_t) sample the [1, 0] grid scaled by it. The scale is shared by
+        # every interval, so the fused heads' in-block weights are unchanged.
+        sigma_max = float(config.get("sigma_max", 1.0))
         sigmas = batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY]
         for modality in ("video", "audio"):
             expected = minimax_h3_time_shift_sigmas(
@@ -104,18 +114,20 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             if batch.is_warmup:
                 # Warmup may run fewer steps, but must use the same intervals
                 # as serving rather than rescaling a shorter grid to [1, 0].
-                sigmas[modality] = expected[: batch.num_inference_steps + 1]
-                continue
-            actual = sigmas[modality]
-            if len(actual) != len(expected) or any(
-                not math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-7)
-                for a, b in zip(actual, expected)
-            ):
-                raise ValueError(
-                    f"MiniMax-H3 PDD requires num_inference_steps="
-                    f"{config['num_inference_steps']} and {modality} shift="
-                    f"{config[f'{modality}_shift']} to match the fused heads"
-                )
+                expected = expected[: batch.num_inference_steps + 1]
+            else:
+                actual = sigmas[modality]
+                if len(actual) != len(expected) or any(
+                    not math.isclose(a, b, rel_tol=1e-6, abs_tol=1e-7)
+                    for a, b in zip(actual, expected)
+                ):
+                    raise ValueError(
+                        f"MiniMax-H3 PDD requires num_inference_steps="
+                        f"{config['num_inference_steps']} and {modality} shift="
+                        f"{config[f'{modality}_shift']} to match the fused heads"
+                    )
+            if batch.is_warmup or sigma_max != 1.0:
+                sigmas[modality] = [sigma * sigma_max for sigma in expected]
 
     @staticmethod
     def _publish_native_timestep_state(batch: Req) -> None:

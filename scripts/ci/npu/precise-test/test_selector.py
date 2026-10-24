@@ -79,13 +79,18 @@ def _get_test_files_from_pr_diff(diff_file: str) -> list[str]:
         print(f"  Warning: Failed to read diff file for test file detection: {e}")
         return test_files_found
 
-    # Pattern to match test file paths: test/registered/ directory
+    # Pattern to match test file paths: test/registered/ directory and the
+    # multimodal_gen diffusion tests.
     # In diff output:
     #   - +++ b/test/registered/unit/xxx/test_xxx.py (new/modified test file)
     #   - rename to test/registered/unit/xxx/test_xxx.py (renamed test file)
     # Test files must be in test/ directory and start with test_
     test_file_pattern = re.compile(
-        r"^(?:\+\+\+ [ab]/|rename to )((?:test/registered(?:/.+)?/test_\w+\.py|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py))",
+        r"^(?:\+\+\+ [ab]/|rename to )("
+        r"test/registered(?:/.+)?/test_\w+\.py"
+        r"|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py"
+        r"|python/sglang/multimodal_gen/test/(?:.*/)?test_\w+\.py"
+        r")",
         re.MULTILINE,
     )
 
@@ -130,10 +135,15 @@ def _get_deleted_test_files_from_pr(diff_file: str, test_case_map: dict) -> list
         print(f"  Warning: Failed to read diff file for deleted test detection: {e}")
         return deleted_test_files
 
-    # Pattern to match deleted test files (test/registered/ directory)
+    # Pattern to match deleted test files (test/registered/ directory and
+    # multimodal_gen diffusion tests)
     # Match --- a/test/... followed by +++ /dev/null (deleted file marker)
     deleted_pattern = re.compile(
-        r"^--- a/(test/registered(?:/.+)?/test_\w+\.py|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py)\s*\n\s*\+\+\+ [ab]?/dev/null",
+        r"^--- a/("
+        r"test/registered(?:/.+)?/test_\w+\.py"
+        r"|test/(?:unit|e2e|integration)(?:/.+)?/test_\w+\.py"
+        r"|python/sglang/multimodal_gen/test/(?:.*/)?test_\w+\.py"
+        r")\s*\n\s*\+\+\+ [ab]?/dev/null",
         re.MULTILINE,
     )
 
@@ -147,6 +157,26 @@ def _get_deleted_test_files_from_pr(diff_file: str, test_case_map: dict) -> list
         )
 
     return deleted_test_files
+
+
+def _get_all_changed_paths_from_diff(diff_file: str) -> list[str]:
+    """
+    Extract every changed path (added/modified/deleted/renamed, product code or
+    not) from a PR diff. Consumed by bucket_recommended_tests.py to check that
+    an empty recommendation is trustworthy (all changes under python/sglang/).
+    """
+    paths: list[str] = []
+    try:
+        with open(diff_file, encoding="utf-8-sig") as f:
+            content = f.read()
+    except Exception as e:
+        print(f"  Warning: Failed to read diff file for changed-path listing: {e}")
+        return paths
+    for match in re.finditer(r"^diff --git a/(.+) b/(.+)$", content, re.MULTILINE):
+        for p in (match.group(1), match.group(2)):
+            if p and p != "/dev/null" and p not in paths:
+                paths.append(p)
+    return paths
 
 
 class CoverageSelector:
@@ -1942,6 +1972,16 @@ def main():
         for test_name in test_names:
             f.write(test_name + "\n")
     print(f"\nResults saved to: {output_file}")
+
+    # Changed-path list for bucket_recommended_tests.py's empty-recommendation
+    # confinement check (PR mode only; empty/missing when the diff is absent).
+    if args.github_pr and diff_file:
+        changed_paths_file = BASE_DIR / "pr_changed_files.txt"
+        all_changed_paths = _get_all_changed_paths_from_diff(diff_file)
+        with open(changed_paths_file, "w", encoding="utf-8") as f:
+            for path in all_changed_paths:
+                f.write(path + "\n")
+        print(f"Changed paths saved to: {changed_paths_file}")
 
 
 if __name__ == "__main__":

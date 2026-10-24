@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 
 from sglang.kernels.ops.speculative.cache_locs import (
-    assign_draft_cache_locs_contiguous,
+    assign_draft_cache_locs_contiguous_func,
 )
 from sglang.kernels.ops.speculative.eagle import (
     build_chain_tree,
@@ -48,9 +48,6 @@ from sglang.srt.utils.common import is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
-
-if _is_cpu:
-    from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -281,40 +278,25 @@ def prepare_for_draft(
                 dtype=torch.int64,
                 device=batch.device,
             )
-            if _is_cpu:
-                assign_draft_cache_locs_contiguous_cpu(
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
-                    topk,
-                    num_steps,
-                )
-            else:
-                if batch.seq_lens.is_cuda and topk == 1:
-                    prepared_positions = torch.empty_like(batch.seq_lens)
-                    if draft_model_runner.model_config.model_is_mrope and all(
-                        x is None for x in batch.multimodal_inputs
-                    ):
-                        prepared_mrope_positions = torch.empty(
-                            (3, bs), dtype=torch.int64, device=batch.device
-                        )
-                # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous[(bs,)](
-                    batch.req_pool_indices,
-                    req_to_token_pool.req_to_token,
-                    batch.seq_lens,
-                    batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
-                    topk,
-                    window_cols,
-                    positions=prepared_positions,
-                    mrope=prepared_mrope_positions,
-                    BS=bs,
-                    WRITE_POSITIONS=prepared_positions is not None,
-                    WRITE_MROPE=prepared_mrope_positions is not None,
-                )
+            if batch.seq_lens.is_cuda and topk == 1:
+                prepared_positions = torch.empty_like(batch.seq_lens)
+                if draft_model_runner.model_config.model_is_mrope and all(
+                    x is None for x in batch.multimodal_inputs
+                ):
+                    prepared_mrope_positions = torch.empty(
+                        (3, bs), dtype=torch.int64, device=batch.device
+                    )
+            # TODO(lsyin): align with the default code path
+            assign_draft_cache_locs_contiguous_func(
+                batch.req_pool_indices,
+                req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                batch.out_cache_loc,
+                topk,
+                window_cols,
+                positions=prepared_positions,
+                mrope=prepared_mrope_positions,
+            )
             if plans_window:
                 kv_loc_plan = target_translator.plan(
                     req_pool_indices=batch.req_pool_indices,

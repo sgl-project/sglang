@@ -59,14 +59,54 @@ pub struct MmProcessOutput {
     pub result: MmEncodedEntry,
 }
 
+/// Client/server class of a media preparation failure, mirroring Python's
+/// loader contract: `ValueError` is a 400, any other exception a 500.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum MediaError {
+    /// Bad input from the client (400).
+    #[error("{0}")]
+    Client(String),
+    /// A fault on the server side, e.g. a media backend that is down (500).
+    #[error("{0}")]
+    Server(String),
+}
+
 /// Multimodal processor shared by built-in and external implementations.
 /// Implementations run on the fixed Rust worker pool and must not retain
 /// request-scoped Python objects. `input_ids` arrive tokenized (the FSM runs
 /// `Tokenizing` before `Encoding` for a text prompt), so a processor never
 /// tokenizes: it expands placeholders in ids. `mm` is the request's media,
 /// owned.
+///
+/// The media hooks run earlier, during admission on the API runtime, before
+/// any media is fetched or the request reaches the worker pool.
 pub trait MmProcessor: Send + Sync {
     fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String>;
+
+    /// Reject a request's media before any of it is fetched, e.g. a modality
+    /// the served model cannot encode. `Err` is a client error (400). Runs on
+    /// an async worker, so it must not block.
+    fn check_media(&self, _mm: &MmData) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Fetch one I/O-backed source, charging its bytes to `budget`; runs on
+    /// the API runtime's blocking pool. `Ok(None)` leaves the source to the
+    /// built-in fetcher (`http(s)://`, `file://` and absolute paths), which
+    /// rejects every other URI scheme.
+    fn fetch_media(
+        &self,
+        _source: &str,
+        _modality: MmModality,
+        _budget: &crate::MediaByteBudget,
+    ) -> Result<Option<bytes::Bytes>, MediaError> {
+        Ok(None)
+    }
+
+    /// Finish item layout after caller hash overrides, before feature publication.
+    fn finalize(&self, _entry: &mut MmEncodedEntry) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 struct QwenMmProcessor {
@@ -265,6 +305,8 @@ fn process(
         output.result.items.iter_mut().map(|item| &mut item.hash),
         &caller_hashes,
     );
+    ctx.processor.finalize(&mut output.result)?;
+    output.result.validate(output.input_ids.len())?;
     let buffers = make_buffers(output.result, ctx.feature_shm)?;
     Ok((output.input_ids, buffers))
 }
@@ -709,6 +751,63 @@ mod tests {
         let text = format!("{meta}");
         assert!(text.contains("42"), "caller hash 0x2a applied: {text}");
         assert!(text.contains("clip_index"), "{text}");
+    }
+
+    #[test]
+    fn finalization_runs_after_caller_hashes_and_is_validated() {
+        struct FinalizingProcessor {
+            final_end: u32,
+        }
+
+        impl MmProcessor for FinalizingProcessor {
+            fn process(&self, ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
+                ExternalProcessor {
+                    shape: vec![1],
+                    offsets: vec![(0, 0)],
+                }
+                .process(ids, mm)
+            }
+
+            fn finalize(&self, entry: &mut MmEncodedEntry) -> Result<(), String> {
+                let parent_hash = entry.items[0].hash;
+                assert_eq!(parent_hash, 42);
+                entry.items[0].hash = parent_hash + 1;
+                entry.items.push(MmEncodedItem {
+                    modality: MmModality::Image,
+                    feature: Tensor {
+                        shape: vec![1],
+                        data: TensorData::F32(vec![2.0]),
+                    },
+                    hash: parent_hash + 2,
+                    offsets: vec![(1, self.final_end)],
+                    model_specific_data: BTreeMap::new(),
+                });
+                Ok(())
+            }
+        }
+
+        for final_end in [1, 2] {
+            let ctx = MmContext::with_processor(Arc::new(FinalizingProcessor { final_end }), false);
+            let result = process(
+                &ctx,
+                vec![1, 2],
+                MmData {
+                    mm_hashes: vec!["2a".to_owned()],
+                    ..Default::default()
+                },
+            );
+            if final_end == 2 {
+                assert!(result.is_err(), "finalized spans must be validated");
+                continue;
+            }
+            let (ids, buffers) = result.expect("valid finalized items");
+            assert_eq!(ids, [1, 2]);
+            assert!(find(&buffers, "mm.feature.1").is_some());
+            let meta: serde_json::Value = rmpv::ext::from_value(decoded_meta(&buffers)).unwrap();
+            assert_eq!(meta["items"].as_array().unwrap().len(), 2);
+            assert_eq!(meta["items"][0]["hash"].as_u64(), Some(43));
+            assert_eq!(meta["items"][1]["hash"].as_u64(), Some(44));
+        }
     }
 
     /// Malformed results are rejected before any buffer exists, so nothing

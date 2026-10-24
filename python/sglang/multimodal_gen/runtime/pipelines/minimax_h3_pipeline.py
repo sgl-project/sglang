@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import replace
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
@@ -140,6 +142,25 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 f"disaggregation role {role.value!r} is not supported"
             )
 
+    def initialize_pipeline(self, server_args: ServerArgs) -> None:
+        self.pdd_heads = self._resolve_pdd_heads()
+        transformer = self.get_module("transformer")
+        if (
+            self.pdd_heads
+            and transformer is not None
+            and transformer.final_layer._pdd_heads is None
+        ):
+            transformer.final_layer.load_pdd_fused_heads(self.pdd_heads)
+
+    def _resolve_pdd_heads(self) -> str | None:
+        """The env override, else a PDD release's own fused heads."""
+        if envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS:
+            return envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
+        release_metadata = getattr(self, "release_metadata", None)
+        if release_metadata is None or release_metadata.pdd_fused_heads is None:
+            return None
+        return os.path.join(self.model_path, release_metadata.pdd_fused_heads)
+
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         # Per-model sigma override from model_index.json; contract tests
         # construct the pipeline without model_path, hence the guard.
@@ -180,6 +201,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     if release_metadata is not None
                     else None
                 ),
+                pdd_heads=getattr(self, "pdd_heads", None),
             )
         )
         self.add_stage(
@@ -206,7 +228,8 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
 
 
 class FastH3Pipeline(MiniMaxH3Pipeline):
-    """FastH3: 8-step DMD2-distilled MiniMax-H3 (V2, t2va only).
+    """FastH3: 8-step DMD2-distilled MiniMax-H3 (V2, t2va only), and the
+    FastH3 Omni Ref2VA PDD student.
 
     The flat single-partition repo is materialized into the base-H3 layout by
     its registered model overlay (see runtime/utils/model_overlay.py), so every stage, loader,

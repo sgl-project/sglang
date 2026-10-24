@@ -576,6 +576,11 @@ field defaults to the conservative answer.
       <td><code>False</code></td>
       <td>The sgl_kernel HiCache transfer / write-back kernels are available; otherwise host pools skip their staging buffers.</td>
     </tr>
+    <tr>
+      <td><code>supports_pynccl</code></td>
+      <td><code>False</code></td>
+      <td>Model-parallel groups create a PyNccl communicator when the caller does not choose. Set it to True only if the device runs NCCL (or an NCCL-compatible library PyNccl loads).</td>
+    </tr>
   </tbody>
 </table>
 
@@ -603,7 +608,17 @@ field defaults to the conservative answer.
     <tr>
       <td><code>get_graph_runner_cls()</code></td>
       <td><code>return None</code></td>
-      <td>Graph Runner class</td>
+      <td>Graph Runner class. Adaptive speculative decoding also builds one target verify runner per step count from it, passing <code>attn_backend</code>, <code>speculative_num_steps</code> and <code>speculative_num_draft_tokens</code> as keyword arguments.</td>
+    </tr>
+    <tr>
+      <td><code>get_speculative_graph_runner_cls(algorithm, phase)</code></td>
+      <td><code>return None</code></td>
+      <td>EAGLE draft graph runner for <code>"draft_decode"</code> or <code>"draft_extend"</code> on the built-in worker, constructed like the built-in runner for that phase. <code>None</code> runs the phase eagerly; not consulted when <code>capabilities.graph_capture</code> is False.</td>
+    </tr>
+    <tr>
+      <td><code>get_speculative_worker_cls(algorithm)</code></td>
+      <td><code>return None</code></td>
+      <td>Worker class that replaces the built-in speculative worker, for any algorithm. It is constructed with the built-in worker&#39;s keyword arguments, must expose the same scheduler-facing interface, and must reject flags it cannot serve (such as multi-layer EAGLE). <code>--speculative-adaptive</code> falls back to static parameters with a platform worker, since only the built-in worker implements it. EAGLE, EAGLE3, NEXTN (asked as <code>"EAGLE"</code>) and STANDALONE also require <code>supports_speculative_algorithm(algorithm)</code> to return True.</td>
     </tr>
     <tr>
       <td><code>get_kv_pool_cls(kind=...)</code></td>
@@ -630,8 +645,15 @@ field defaults to the conservative answer.
       <td><code>"native"</code></td>
       <td>BaseFusedOp (fused-op) dispatch key name</td>
     </tr>
+    <tr>
+      <td><code>get_group_coordinator_device(local_rank)</code></td>
+      <td><code>torch.device("cpu")</code></td>
+      <td>Device each <code>GroupCoordinator</code> binds to on this rank (e.g. <code>torch.device(f"mydev:{local_rank}")</code>). Without it, device collectives on an out-of-tree platform run against a CPU device.</td>
+    </tr>
   </tbody>
 </table>
+
+SGLang custom ops (e.g. the <code>inplace_all_reduce</code> collective) register their implementation under the <code>PrivateUse1</code> dispatch key on an out-of-tree platform, the key torch reserves for out-of-tree backends.
 
 #### Lifecycle Hooks (from SRTPlatform)
 

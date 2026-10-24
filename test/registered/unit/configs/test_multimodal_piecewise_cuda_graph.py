@@ -121,6 +121,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         args._model_config = SimpleNamespace(
             is_embedding_gemma=True,
             joint_head_config=None,
+            pointer_head=None,
             is_multimodal=False,
             context_len=2048,
             hf_config=SimpleNamespace(architectures=["Gemma3TextModel"]),
@@ -158,6 +159,7 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
                 is_embedding_gemma=False,
             ),
             joint_head_config=None,
+            pointer_head=None,
             is_multimodal=False,
             hf_config=SimpleNamespace(architectures=["BertModel"]),
         )

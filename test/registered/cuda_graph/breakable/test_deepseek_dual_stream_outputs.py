@@ -6,6 +6,8 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.moe.topk import TopKOutputFormat
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.models import deepseek_v2
 from sglang.srt.runtime_context import get_forward
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -28,7 +30,11 @@ class DualStreamOperand:
         self.shared_experts = object()
         self.is_hash = False
         self.gate = SimpleNamespace(e_score_correction_bias_vl=None)
+        self.topk = SimpleNamespace(
+            topk_config=SimpleNamespace(output_format=TopKOutputFormat.BYPASSED)
+        )
         self.experts = SimpleNamespace(
+            runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
             use_flashinfer_trtllm_moe=True,
             quant_method=None,
             should_fuse_routed_scaling_factor_in_topk=False,
@@ -71,13 +77,15 @@ class TestDualStreamOutputs(CustomTestCase):
                     patch.object(
                         deepseek_v2,
                         "get_moe_runner_backend",
-                        return_value=SimpleNamespace(is_flashinfer_trtllm=lambda: True),
+                        return_value=MoeRunnerBackend.FLASHINFER_TRTLLM,
                     ),
                     patch.object(
                         deepseek_v2,
                         "get_exec",
                         return_value=SimpleNamespace(
-                            moe=SimpleNamespace(enable_eplb=False)
+                            moe=SimpleNamespace(
+                                enable_eplb=False, ep_dispatch_algorithm="static"
+                            )
                         ),
                     ),
                     patch.object(

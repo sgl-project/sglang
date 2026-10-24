@@ -24,7 +24,7 @@ from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=319, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=224, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=224, suite="extra-a-test-1-gpu-small-amd")
 
 PROMPTS = [
     "AI is a field of computer science focused on",

@@ -25,7 +25,24 @@ from __future__ import annotations
 
 from typing import Callable, TypeVar
 
+import torch
+
 F = TypeVar("F", bound=Callable)
+
+
+def is_cuda_sm_at_least(
+    min_sm: tuple[int, int], device: torch.device | int | None = None
+) -> bool:
+    """True on a CUDA build whose ``device`` has compute capability >= ``min_sm``.
+
+    ``torch.version.cuda`` rules out ROCm, whose capability is derived from the
+    gfx number (gfx1250 reports (12, 5)) and would clear a bare comparison.
+    """
+    return (
+        torch.version.cuda is not None
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(device) >= min_sm
+    )
 
 
 def platform_key() -> str:

@@ -2,7 +2,8 @@ import dataclasses
 import types
 import unittest
 from array import array
-from unittest.mock import MagicMock
+from itertools import product
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -11,11 +12,22 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers import schedule_batch  # noqa: E402
 from sglang.srt.managers.schedule_batch import (  # noqa: E402
+    Req,
     ScheduleBatch,
     split_cached_prefix_by_tier,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.managers.scheduler_components.batch_result_processor import (  # noqa: E402
+    SchedulerBatchResultProcessor,
+)
+from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.runtime_context import get_context  # noqa: E402
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -139,6 +151,130 @@ class _FakeReq:
         return len(self.origin_input_ids) + len(self.output_ids)
 
 
+class TestForwardBatchPrefillCompletion(unittest.TestCase):
+    def test_first_commit_or_zero_token_completion_keeps_gate_open(self):
+        runner = types.SimpleNamespace(
+            device="cpu",
+            is_draft_worker=False,
+            model_config=types.SimpleNamespace(
+                requires_mm_token_modalities=False, model_is_mrope=False
+            ),
+            kv_index_translator=MagicMock(),
+            prefill_attention_backend_str="torch_native",
+            ngram_embedding_manager=types.SimpleNamespace(enabled=False),
+            lora_manager=None,
+            attn_backend=MagicMock(),
+            attn_tp_sequence_sharded=lambda _: False,
+        )
+        for algorithm, (output_len, end, mixed, zero_tokens, completing) in product(
+            (
+                SpeculativeAlgorithm.NONE,
+                SpeculativeAlgorithm.EAGLE,
+                SpeculativeAlgorithm.EAGLE3,
+            ),
+            (
+                (0, 4, False, False, False),
+                (0, 8, False, False, True),
+                (0, 4, True, False, False),
+                (0, 8, True, False, True),
+                (2, 8, False, False, False),
+                (2, 10, False, False, True),
+                (0, 4, False, True, False),
+                (0, 8, False, True, True),
+                (0, 4, True, True, False),
+                (0, 8, True, True, True),
+            ),
+        ):
+            with self.subTest(
+                algorithm=algorithm,
+                output_len=output_len,
+                end=end,
+                mixed=mixed,
+                zero_tokens=zero_tokens,
+            ):
+                incoming = Req(
+                    "incoming",
+                    "",
+                    array("q", range(8)),
+                    SamplingParams(max_new_tokens=0 if zero_tokens else 16),
+                )
+                incoming.sampling_params.normalize(None)
+                incoming.output_ids.extend(range(output_len))
+                incoming.refresh_fill_ids()
+                incoming.extend_end = end
+                running = Req("running", "", array("q", range(8)), SamplingParams())
+                running.output_ids.extend([0, 1])
+                running.refresh_fill_ids()
+                running.extend_end = 10
+                reqs = [incoming, running] if mixed else [incoming]
+                prefix = [2, 9][: len(reqs)]
+                lengths = [req.extend_end - start for req, start in zip(reqs, prefix)]
+                seq_lens = torch.tensor([req.extend_end for req in reqs])
+                batch = ScheduleBatch(
+                    reqs=reqs,
+                    decoding_reqs=[running] if mixed else None,
+                    device="cpu",
+                    model_config=types.SimpleNamespace(
+                        is_encoder_decoder=False, is_matryoshka=False
+                    ),
+                    spec_algorithm=algorithm,
+                    forward_mode=ForwardMode.MIXED if mixed else ForwardMode.EXTEND,
+                    input_ids=torch.zeros(sum(lengths), dtype=torch.int64),
+                    req_pool_indices=torch.arange(len(reqs)),
+                    req_pool_indices_cpu=torch.arange(len(reqs)),
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens,
+                    seq_lens_sum=int(seq_lens.sum()),
+                    orig_seq_lens=torch.tensor(
+                        [len(req.full_untruncated_fill_ids) for req in reqs]
+                    ),
+                    out_cache_loc=torch.arange(sum(lengths)),
+                    prefix_lens=prefix,
+                    extend_lens=lengths,
+                    extend_num_tokens=sum(lengths),
+                    extend_logprob_start_lens=[0] * len(reqs),
+                )
+                with get_context().override_server_args(device="cpu"):
+                    forward = ForwardBatch.init_new(
+                        batch,
+                        runner,
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                        return_hidden_states_before_norm=False,
+                    )
+                output_starts = [len(req.output_ids) for req in reqs]
+                if completing:
+                    incoming.output_ids.append(100)
+                    incoming.update_finish_state()
+                if mixed:
+                    running.output_ids.append(101)
+                commits = SchedulerBatchResultProcessor._build_auxiliary_commits(
+                    batch, output_starts
+                )
+                if completing and zero_tokens:
+                    self.assertTrue(incoming.finished())
+                    self.assertEqual(incoming.finished_len, 0)
+                    self.assertIsNone(commits[0])
+                required_rows = [
+                    i
+                    for i, (req, commit) in enumerate(zip(reqs, commits, strict=True))
+                    if (commit is not None and commit.output_index == 0)
+                    or (req.finished() and req.finished_len == 0)
+                ]
+                self.assertEqual(bool(required_rows), completing and output_len == 0)
+                for i in required_rows:
+                    self.assertTrue(forward.contains_last_prefill_chunk)
+                    self.assertEqual(
+                        int(forward.extend_prefix_lens[i] + forward.extend_seq_lens[i]),
+                        int(forward.orig_seq_lens[i]),
+                    )
+                self.assertEqual(forward.contains_last_prefill_chunk, completing)
+                incoming.extend_end = 4 if completing else 8 + output_len
+                self.assertEqual(forward.contains_last_prefill_chunk, completing)
+                self.assertEqual(
+                    dataclasses.replace(forward).contains_last_prefill_chunk, completing
+                )
+
+
 class TestMergeBatchOutOfPlace(unittest.TestCase):
     def test_merge_batch_rebinds_lists_without_mutating_either_side(self):
         """merge_batch must build new list objects; no field of either side may be mutated in place."""
@@ -212,7 +348,11 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
         extend_snapshot = _snapshot_mutable_fields(extend_batch)
         running_snapshot = _snapshot_mutable_fields(running_batch)
 
-        extend_batch.mix_with_running(running_batch)
+        settings = types.SimpleNamespace(
+            mamba=types.SimpleNamespace(enable_mamba_extra_buffer_lazy=False)
+        )
+        with patch.object(schedule_batch, "get_exec", return_value=settings):
+            extend_batch.mix_with_running(running_batch)
 
         self.assertEqual(extend_batch.forward_mode, ForwardMode.MIXED)
         self.assertIs(extend_batch.mix_running_indices, running_batch.req_pool_indices)

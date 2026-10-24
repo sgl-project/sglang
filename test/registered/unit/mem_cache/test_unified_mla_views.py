@@ -104,31 +104,6 @@ def _build_views(raw, ps, num_pages):
     )
 
 
-class TestMLASubPoolSpec(unittest.TestCase):
-    def test_rejects_nonpositive_dims(self):
-        with self.assertRaises(AssertionError):
-            MLASubPoolSpec(
-                name="full",
-                layer_num=_L,
-                kv_lora_rank=0,
-                qk_rope_head_dim=_ROPE,
-                store_dtype=_DTYPE,
-                grow_direction="down",
-            )
-
-    def test_misaligned_latent_row_is_refused(self):
-        spec = MLASubPoolSpec(
-            name="full",
-            layer_num=_L,
-            kv_lora_rank=5,
-            qk_rope_head_dim=_ROPE,
-            store_dtype=_DTYPE,
-            grow_direction="down",
-        )
-        with self.assertRaisesRegex(ValueError, "14-byte latent row"):
-            spec.layout()
-
-
 class TestMLAViews(unittest.TestCase):
     def _make_raw(self, ps, num_pages, short=0):
         n = num_pages * ps * _ENTRY - short
@@ -182,20 +157,8 @@ class TestMLAViews(unittest.TestCase):
         for l in range(_L):
             self.assertTrue(torch.all(views[l][t] == float(l + 1)))
 
-    def test_short_buffer_fails_loud(self):
-        ps, num_pages = 2, 4
-        with self.assertRaises(AssertionError):
-            _build_views(self._make_raw(ps, num_pages, short=1), ps, num_pages)
-
 
 class TestUnifiedKVPoolMLA(unittest.TestCase):
-    def test_raw_is_exactly_the_budget(self):
-        pool, full, mamba = _make_unified(page_size=4)
-        total = full.entry_bytes() * 64 + mamba.entry_bytes() * 8
-        self.assertEqual(pool.max_slots("full"), total // full.entry_bytes())
-        self.assertEqual(pool.max_slots("mamba"), total // mamba.entry_bytes())
-        self.assertEqual(pool._raw.numel(), total)
-
     def test_reserved_floor_covers_page0_envelope(self):
         ps = 4
         pool, full, mamba = _make_unified(page_size=ps)

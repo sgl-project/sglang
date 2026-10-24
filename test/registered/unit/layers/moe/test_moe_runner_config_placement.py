@@ -187,12 +187,13 @@ def test_sm120_nvfp4_dispatch_uses_live_layer_placement(monkeypatch) -> None:
     )
     for tp, ep in [(1, 1), (2, 1), (1, 2)]:
         layer.moe_tp_size, layer.moe_ep_size = tp, ep
-        flashinfer_cutlass._run_flashinfer_cutlass(
-            dispatch_output=dispatch,
-            quant_info=quant,
-            runner_config=config,
-            output=torch.empty_like(x),
-        )
+        with get_context().override_server_args(model_path="dummy"):
+            flashinfer_cutlass._run_flashinfer_cutlass(
+                dispatch_output=dispatch,
+                quant_info=quant,
+                runner_config=config,
+                output=torch.empty_like(x),
+            )
     assert calls == ["native", (2, 1), (1, 2)]
 
 

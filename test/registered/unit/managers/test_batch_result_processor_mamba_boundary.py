@@ -27,20 +27,6 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 TRACK_INTERVAL = 4
 
 
-def _set_mamba_track_indices_on_cpu(batch, track_positions=None):
-    real_tensor = torch.tensor
-
-    def tensor_without_pinning(*args, **kwargs):
-        kwargs["pin_memory"] = False
-        return real_tensor(*args, **kwargs)
-
-    with patch(
-        "sglang.srt.managers.schedule_batch.torch.tensor",
-        side_effect=tensor_without_pinning,
-    ):
-        set_mamba_track_indices_from_reqs(batch, track_positions)
-
-
 def _make_batch() -> tuple[Req, ScheduleBatch]:
     sampling_params = SamplingParams(max_new_tokens=32)
     sampling_params.normalize(None)
@@ -202,6 +188,7 @@ class TestMambaPrevTrackSeqlen(unittest.TestCase):
         req, batch = _make_batch()
         processor = _make_processor()
         req.kv.mamba_ping_pong_track_buffer = torch.tensor([10, 11])
+        req.kv.mamba_ping_pong_empty = [False, False]
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_idx = 1
         batch.mamba_track_buffer_indices = None
@@ -242,7 +229,7 @@ class TestMambaFreedTrackIndicesCPU(unittest.TestCase):
                         req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
                     ),
                 )
-                _set_mamba_track_indices_on_cpu(batch, positions)
+                set_mamba_track_indices_from_reqs(batch, positions)
                 self.assertEqual(batch.mamba_track_indices.tolist(), expected)
 
 

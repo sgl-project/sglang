@@ -98,9 +98,9 @@ class TestWarmupMemory(CustomTestCase):
                 for kernel_type in DeepGemmKernelType:
                     if (
                         kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32
-                        and architecture != "hopper"
+                        and architecture == "musa"
                     ):
-                        continue  # Native block32 is only dispatched on Hopper.
+                        continue  # Native block32 is only dispatched on SM90/SM100.
                     with self.subTest(
                         architecture=architecture, kernel_type=kernel_type, max_m=max_m
                     ):

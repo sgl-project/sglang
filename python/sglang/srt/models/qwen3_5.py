@@ -347,6 +347,9 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 
 
 if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_mrope import (
+        triton_split_qkv_rmsnorm_mrope,
+    )
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
     )
@@ -1541,6 +1544,31 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
+    def forward_prepare_npu_prefill(self, positions, hidden_states):
+        rotary_emb = self.rotary_emb
+        if not getattr(rotary_emb, "mrope_section", None):
+            return self.forward_prepare_native(positions, hidden_states)
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        if positions.ndim == 1:
+            positions = positions.expand(3, -1)
+        cos_sin = rotary_emb.cos_sin_cache[positions].to(qkv)
+        q, k, v, gate = triton_split_qkv_rmsnorm_mrope(
+            qkv=qkv,
+            q_weight=self.q_norm.gemma_weight,
+            k_weight=self.k_norm.gemma_weight,
+            cos_sin=cos_sin,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            mrope_section=rotary_emb.mrope_section,
+            is_interleaved=rotary_emb.mrope_interleaved,
+            rope_dim=rotary_emb.rotary_dim,
+            has_gate=self.attn_output_gate,
+        )
+        return q, k, v, gate if self.attn_output_gate else None
+
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
         if self.refreshes_rope_cos_sin:
@@ -1576,11 +1604,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        if (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or not self.attn_output_gate
-        ):
+        if _is_npu and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            return self.forward_prepare_npu_prefill(positions, hidden_states)
+        if not _is_npu or not self.attn_output_gate:
             return self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,

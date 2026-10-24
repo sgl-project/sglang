@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -1187,6 +1187,13 @@ class FluxTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
+def _add_control_residual(hidden_states, residuals, index):
+    # Residuals are the image-token shard on the compute dtype; None skips a block.
+    if index < len(residuals) and residuals[index] is not None:
+        return hidden_states + residuals[index]
+    return hidden_states
+
+
 class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Flux.
@@ -1319,6 +1326,8 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         guidance: torch.Tensor = None,
         freqs_cis: torch.Tensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        controlnet_block_samples: Optional[List[Optional[torch.Tensor]]] = None,
+        controlnet_single_block_samples: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """
         The [`FluxTransformer2DModel`] forward method.
@@ -1425,8 +1434,17 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         run_transformer_blocks = (
             self.begin_spectrum_step() if spectrum_enabled else True
         )
+        if (
+            controlnet_block_samples is not None
+            or controlnet_single_block_samples is not None
+        ) and (
+            len(self.transformer_blocks) != self.config.num_layers
+            or len(self.single_transformer_blocks) != self.config.num_single_layers
+        ):
+            # Block wrappers (e.g. cache-dit) break the index mapping.
+            raise ValueError("ControlNet residuals need the unwrapped block lists")
         if run_transformer_blocks:
-            for block in self.transformer_blocks:
+            for index, block in enumerate(self.transformer_blocks):
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
@@ -1436,7 +1454,11 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     joint_attention_kwargs=joint_attention_kwargs,
                     num_replicated_prefix=num_replicated_prefix,
                 )
-            for block in self.single_transformer_blocks:
+                if controlnet_block_samples is not None:
+                    hidden_states = _add_control_residual(
+                        hidden_states, controlnet_block_samples, index
+                    )
+            for index, block in enumerate(self.single_transformer_blocks):
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
@@ -1446,6 +1468,10 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     joint_attention_kwargs=joint_attention_kwargs,
                     num_replicated_prefix=num_replicated_prefix,
                 )
+                if controlnet_single_block_samples is not None:
+                    hidden_states = _add_control_residual(
+                        hidden_states, controlnet_single_block_samples, index
+                    )
             if spectrum_enabled:
                 self.spectrum_record_features(hidden_states)
         else:

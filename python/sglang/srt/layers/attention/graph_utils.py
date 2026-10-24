@@ -32,8 +32,23 @@ def _zero_padded_tokens(output, actual_tokens):
         output[actual_tokens:].zero_()
 
 
+def attention_query_tokens(forward_batch, tokens):
+    # Import at call time: the CP package also imports RadixAttention.
+    from sglang.srt.layers.cp.padding import attention_query_tokens as cp_query_tokens
+
+    return cp_query_tokens(forward_batch, tokens)
+
+
+def attention_output_tokens(forward_batch, tokens):
+    from sglang.srt.layers.cp.padding import attention_output_tokens as cp_output_tokens
+
+    return cp_output_tokens(forward_batch, tokens)
+
+
 @contextmanager
-def attention_input_scope(forward_batch, output, query_tokens, kv_tokens, kwargs):
+def attention_input_scope(
+    forward_batch, output, query_tokens, kv_tokens, kwargs, *, cache_tokens=None
+):
     """Narrow per-token operands and restore the caller's batch even on failure."""
     kwargs = dict(kwargs)
     for name in (
@@ -56,9 +71,11 @@ def attention_input_scope(forward_batch, output, query_tokens, kv_tokens, kwargs
         ]
     cache_loc, positions = forward_batch.out_cache_loc, forward_batch.positions
     previous_output = forward_batch._attn_output
-    forward_batch.out_cache_loc = cache_loc[:query_tokens]
+    if cache_tokens is None:
+        cache_tokens = query_tokens
+    forward_batch.out_cache_loc = cache_loc[:cache_tokens]
     if positions is not None:
-        forward_batch.positions = positions[:query_tokens]
+        forward_batch.positions = positions[:cache_tokens]
     forward_batch._attn_output = output[:query_tokens]
     try:
         yield kwargs

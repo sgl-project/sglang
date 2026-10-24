@@ -1,6 +1,7 @@
 .github @merrymercy @Fridge003 @ispobock @Kangyan-Zhou @HaiShaw @bingxche
 /docker @Fridge003 @ispobock @HaiShaw @ishandhanani @yctseng0211 @sogalin
 /docker/npu.Dockerfile @ping1jing2 @iforgetmyname @whybeyoung
+/docker/sgl-router.Dockerfile @sherlockwu @Kangyan-Zhou @ShangmingCai
 /docs @wisclmy0611 @zijiexia @sogalin
 /docs @wisclmy0611 @zijiexia @Richardczl98 @JustinTong0323 @sogalin
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
@@ -82,6 +83,11 @@
 /rust/sglang-processor @sagearc @sherlockwu
 /rust/sglang-radix-tree @Jialin @alphabetc1
 /rust/sglang-server @rainj-me @merrymercy
+/sgl-router @sherlockwu @Kangyan-Zhou @ShangmingCai @hzh0425
+/sgl-router/sgl-kv-indexer @sherlockwu @lixiufei-leo @ShangmingCai @wuyl1 @hzh0425
+/sgl-router/src/policies @sherlockwu @ShangmingCai @Bo-Vincent
+/sgl-router/src/workers @sherlockwu @AMD-yanfeiwang
+/sgl-router/src/protocol @sherlockwu @whybeyoung
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237
 /sgl-model-gateway/bindings/python @CatherineSue @key4ng @slin1237

@@ -229,6 +229,23 @@ def choose_output_image_ext(
     return "jpg"
 
 
+_MODEL_PATH_FIELDS = ("upscaling_model_path", "frame_interpolation_model_path")
+
+
+def _reject_remote_model_paths(kwargs: dict[str, Any]) -> None:
+    """Reject URL model paths so a client cannot make the server fetch them (SSRF).
+
+    Only network entry points call this; the CLI and Python API still accept URLs.
+    """
+    for name in _MODEL_PATH_FIELDS:
+        value = kwargs.get(name)
+        if isinstance(value, str) and "://" in value:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be a local path or a HuggingFace repo id, not a URL",
+            )
+
+
 def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     """Build SamplingParams from request parameters.
 
@@ -253,6 +270,7 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    _reject_remote_model_paths(kwargs)
     has_explicit_compression = kwargs.get("output_compression") is not None
 
     # parse "WxH" size string if provided
@@ -292,9 +310,12 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     # SamplingParams.__post_init__ may have resolved with the wrong data_type
     # (default VIDEO) before _adjust() set the correct one.
     if not has_explicit_compression and output_quality is not None:
-        sampling_params.output_compression = adjust_output_quality(
-            output_quality, sampling_params.data_type
-        )
+        try:
+            sampling_params.output_compression = adjust_output_quality(
+                output_quality, sampling_params.data_type
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return sampling_params
 
@@ -418,6 +439,30 @@ async def _maybe_url_image(
         raise ValueError("Unsupported image url format")
 
 
+# Arbitrary cap; keeps a hostile or mistaken URL from filling server memory.
+_MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+
+async def _download_capped_to_temp_file(response: httpx.Response) -> str:
+    too_large = f"Image exceeds the {_MAX_IMAGE_DOWNLOAD_BYTES} byte download limit"
+    declared = response.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > _MAX_IMAGE_DOWNLOAD_BYTES:
+        raise ValueError(too_large)
+    fd, part_path = tempfile.mkstemp()
+    try:
+        with os.fdopen(fd, "wb") as f:
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > _MAX_IMAGE_DOWNLOAD_BYTES:
+                    raise ValueError(too_large)
+                await asyncio.to_thread(f.write, chunk)
+    except BaseException:
+        os.remove(part_path)
+        raise
+    return part_path
+
+
 async def _save_url_image_to_path(
     image_url: str, target_path: str, *, uploads_root: str | None = None
 ) -> str:
@@ -447,9 +492,13 @@ async def _save_url_image_to_path(
     try:
         async with httpx.AsyncClient(follow_redirects=True) as client:
             for attempt in range(1, max_attempts + 1):
+                part_path = None
                 try:
-                    response = await client.get(image_url, timeout=10.0)
-                    response.raise_for_status()
+                    async with client.stream(
+                        "GET", image_url, timeout=10.0
+                    ) as response:
+                        response.raise_for_status()
+                        part_path = await _download_capped_to_temp_file(response)
 
                     # Determine file extension from content type or URL after downloading
                     if not os.path.splitext(target_path)[1]:
@@ -488,11 +537,12 @@ async def _save_url_image_to_path(
 
                     if uploads_root is not None:
                         target_path = ensure_path_within_root(target_path, uploads_root)
-                    with open(target_path, "wb") as f:
-                        f.write(response.content)
+                    await asyncio.to_thread(shutil.move, part_path, target_path)
 
                     return target_path
                 except Exception as e:
+                    if part_path is not None and os.path.exists(part_path):
+                        os.remove(part_path)
                     last_error = e
                     if attempt == max_attempts or not _is_retryable_download_error(e):
                         raise
@@ -525,21 +575,25 @@ async def process_generation_batch(
             scheduler_batches if scheduler_batches is not None else [batch]
         )
 
+        # failed finalization can leave tensors or encoded files attached
+        if result.error:
+            raise RuntimeError(
+                f"Model generation failed. Error from scheduler: {result.error}"
+            )
+
         if (
             result.output is None
             and result.output_file_paths is None
             and result.raw_frame_batches is None
         ):
-            error_msg = result.error or "Unknown error"
-            raise RuntimeError(
-                f"Model generation returned no output. Error from scheduler: {error_msg}"
-            )
+            raise RuntimeError("Model generation returned no output.")
 
         save_file_path_list = []
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
         elif result.output is not None:
             num_outputs = len(result.output)
+            image_bytes = [] if batch.return_image_bytes else None
             save_file_path_list = save_outputs(
                 result.output,
                 batch.data_type,
@@ -548,6 +602,7 @@ async def process_generation_batch(
                 lambda idx: str(batch.output_file_path(num_outputs, idx)),
                 audio=result.audio,
                 audio_sample_rate=result.audio_sample_rate,
+                image_bytes_out=image_bytes,
                 output_compression=batch.output_compression,
                 x264_preset=batch.x264_preset,
                 enable_frame_interpolation=batch.enable_frame_interpolation,
@@ -558,6 +613,7 @@ async def process_generation_batch(
                 upscaling_model_path=batch.upscaling_model_path,
                 upscaling_scale=batch.upscaling_scale,
             )
+            result.output_image_bytes = image_bytes
 
     total_time = time.perf_counter() - total_start_time
     if get_global_server_args().batching_max_size > 1:

@@ -63,7 +63,6 @@
 --mm-preprocess-cache-size-mb
 --mm-processor-worker-num
 --otlp-service-name
---prefill-decode-interval
 --prefill-kv-cache-dequant-dtype
 --qsa-indexer-dtype
 --radix-eviction-policy-config

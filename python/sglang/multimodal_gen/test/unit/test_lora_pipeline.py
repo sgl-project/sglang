@@ -34,6 +34,7 @@ def _make_layer() -> BaseLayerWithLoRA:
 
 def _make_pipeline(layer: BaseLayerWithLoRA) -> _TestLoRAPipeline:
     pipeline = object.__new__(_TestLoRAPipeline)
+    pipeline._stages = []
     pipeline.modules = {"transformer": torch.nn.Module()}
     pipeline.server_args = SimpleNamespace(
         lora_alpha=None,

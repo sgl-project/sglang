@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import functools
 import logging
 from typing import TYPE_CHECKING, NamedTuple, Optional
@@ -77,6 +78,9 @@ class DraftProposal(msgspec.Struct, frozen=True):
     confidence: Optional[torch.Tensor] = None
     confidence_raw: Optional[torch.Tensor] = None
     folded: bool = False
+    # [bs, gamma + 1] ``[anchor | draft tokens]`` from the draft graph tail; None
+    # when the caller builds them.
+    verify_ids: Optional[torch.Tensor] = None
 
 
 def select_draft_hidden_without_anchor(
@@ -163,6 +167,9 @@ def resolve_draft_params(
         torch.where(greedy_mask, _zero(device), temperatures, out=step_temperatures)
     return DraftParams(temperatures, greedy_mask, step_temperatures)
 
+
+# Arbitrary; how often the proposer logs its restage-skip count, in graph steps.
+STAGED_PARAMS_LOG_EVERY = 500
 
 # XORed into the server seed so the draft noise differs from other samplers'.
 _DRAFT_NOISE_DOMAIN = 0x2D2A9C317E44B1F3
@@ -317,6 +324,11 @@ def sample_draft_block(
 
 
 class DraftBlockProposer:
+    _staged_params_key = None
+    num_staged_params_skips = 0
+    num_staged_params_calls = 0
+    deferred_commit = None
+
     def __init__(
         self,
         *,
@@ -347,9 +359,16 @@ class DraftBlockProposer:
         )
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        # SGLANG_DSPARK_DEFER_CONTEXT_KV's staged commit, set by the worker.
+        self.deferred_commit = None
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
+        # (sampler, bs, temperatures, top_ks) last staged: SamplingBatchInfo rebinds
+        # these tensors when the batch changes, never edits them in place
+        self._staged_params_key: Optional[tuple] = None
+        self.num_staged_params_skips = 0
+        self.num_staged_params_calls = 0
         self._num_token_non_padded = (
             torch.empty((1,), dtype=torch.int32, device=self.draft_model_runner.device)
             if enable_num_token_non_padded()
@@ -362,6 +381,34 @@ class DraftBlockProposer:
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
+
+    def _stage_sampling_params(self, draft_sampler, *, bs: int, sampling_info) -> None:
+        """The draft graph's sampling params, restaged only when the sampler, bs or
+        the batch's temperature / top-k tensors changed since the last stage."""
+        key = (
+            draft_sampler,
+            bs,
+            None if sampling_info is None else sampling_info.temperatures,
+            None if sampling_info is None else sampling_info.top_ks,
+        )
+        staged = self._staged_params_key
+        self.num_staged_params_calls += 1
+        skip = (
+            staged is not None
+            and staged[1] == bs
+            and all(staged[i] is key[i] for i in (0, 2, 3))
+        )
+        self.num_staged_params_skips += skip
+        if self.num_staged_params_calls % STAGED_PARAMS_LOG_EVERY == 0:
+            logger.debug(
+                "DSpark draft: sampling params restage skipped on %d of %d steps",
+                self.num_staged_params_skips,
+                self.num_staged_params_calls,
+            )
+        if skip:
+            return
+        draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+        self._staged_params_key = key
 
     def _base_logits_context(self):
         return draft_tp_context(self._dp_moe_sync)
@@ -376,6 +423,7 @@ class DraftBlockProposer:
         device: str,
         target_model,
         sampling_info,
+        anchor_prepared: bool = False,
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
@@ -392,10 +440,11 @@ class DraftBlockProposer:
             embed_module=embed_module,
             draft_sampler=draft_sampler,
             sampling_info=sampling_info,
+            anchor_prepared=anchor_prepared,
         )
         draft_block_ids = fwd.draft_block_ids
 
-        confidence = confidence_raw = None
+        confidence = confidence_raw = verify_ids = None
         folded = False
         if (
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
@@ -415,6 +464,8 @@ class DraftBlockProposer:
             if draft_sampler.confidence_out is not None:
                 confidence = draft_sampler.confidence_out[:bs]
                 confidence_raw = draft_sampler.confidence_raw_out[:bs]
+            if draft_sampler.verify_ids is not None:
+                verify_ids = draft_sampler.verify_ids[:bs]
         else:
             with self._base_logits_context():
                 base_logits, confidence_features = self.draft_model.compute_base_logits(
@@ -449,6 +500,7 @@ class DraftBlockProposer:
             confidence=confidence,
             confidence_raw=confidence_raw,
             folded=folded,
+            verify_ids=verify_ids,
         )
 
     def run_idle_participation(self, batch: ScheduleBatch) -> None:
@@ -477,6 +529,19 @@ class DraftBlockProposer:
         with torch.inference_mode():
             self.draft_model_runner.forward(idle_batch)
 
+    def draft_block_ids_view(self, *, bs: int, device) -> torch.Tensor:
+        """The ``[bs, query_token_num]`` draft input ids: mask tokens past column 0."""
+        buf = self._draft_block_ids_buf
+        if buf is None or buf.shape[0] < bs or buf.device != torch.device(device):
+            buf = torch.full(
+                (bs, self.query_token_num),
+                int(self._mask_token_id),
+                dtype=torch.long,
+                device=device,
+            )
+            self._draft_block_ids_buf = buf
+        return buf[:bs]
+
     def _run_forward(
         self,
         *,
@@ -488,6 +553,7 @@ class DraftBlockProposer:
         embed_module,
         draft_sampler=None,
         sampling_info=None,
+        anchor_prepared: bool = False,
     ) -> DraftForwardResult:
         gamma = self.gamma
         query_token_num = self.query_token_num
@@ -495,18 +561,9 @@ class DraftBlockProposer:
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
 
-        buf = self._draft_block_ids_buf
-        if buf is None or buf.shape[0] < bs or buf.device != prefix_lens.device:
-            buf = torch.full(
-                (bs, query_token_num),
-                int(self._mask_token_id),
-                dtype=torch.long,
-                device=device,
-            )
-            self._draft_block_ids_buf = buf
-        draft_block_ids = buf[:bs]
-
-        draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
+        draft_block_ids = self.draft_block_ids_view(bs=bs, device=prefix_lens.device)
+        if not anchor_prepared:
+            draft_block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
         draft_positions = positions_2d[:, :query_token_num].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
 
@@ -554,14 +611,29 @@ class DraftBlockProposer:
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
-        if (
-            draft_sampler is not None
-            and graph_runner is not None
-            and graph_runner.can_run_graph(draft_forward_batch)
-        ):
-            draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+        runs_graph = graph_runner is not None and graph_runner.can_run_graph(
+            draft_forward_batch
+        )
+        if draft_sampler is not None and runs_graph:
+            self._stage_sampling_params(
+                draft_sampler, bs=bs, sampling_info=sampling_info
+            )
+        commit = self.deferred_commit
+        if commit is not None:
+            commit.before_draft_forward(
+                graph_bs=(
+                    graph_runner.capture_bs[
+                        bisect.bisect_left(graph_runner.capture_bs, bs)
+                    ]
+                    if runs_graph
+                    else None
+                )
+            )
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
+        if commit is not None:
+            assert draft_out.can_run_graph == runs_graph
+            commit.after_draft_forward(graph_ran=draft_out.can_run_graph)
         logits_output = draft_out.logits_output
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:

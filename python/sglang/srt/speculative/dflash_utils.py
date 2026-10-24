@@ -8,9 +8,11 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
+from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
+from sglang.kernels.ops.speculative.verify_sampling import (
+    tree_speculative_sampling_target_only,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -20,14 +22,12 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
-from sglang.utils import LazyImport
+from sglang.srt.utils import is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 logger = logging.getLogger(__name__)
 
-_DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
@@ -42,43 +42,10 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-if is_cuda():
-    from sglang.kernels.ops.speculative.sampling import (
-        tree_speculative_sampling_target_only,
-    )
-
-    # Resolved on first call: CUDA builds without FlashInfer must still import
-    # this module.
-    top_k_renorm_prob = LazyImport("flashinfer.sampling", "top_k_renorm_probs")
-    top_p_renorm_prob = LazyImport("flashinfer.sampling", "top_p_renorm_probs")
-
-    _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
-elif is_musa():
-    try:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
-
-        _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
-    except Exception:
-        top_k_renorm_prob = None
-        top_p_renorm_prob = None
-        tree_speculative_sampling_target_only = None
-elif is_hip():
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_k_renorm_probs_triton as top_k_renorm_prob,
-    )
-    from sglang.kernels.ops.sampling.renorm_triton import (
-        top_p_renorm_probs_triton as top_p_renorm_prob,
-    )
-
-    tree_speculative_sampling_target_only = None
-else:
-    top_k_renorm_prob = None
-    top_p_renorm_prob = None
-    tree_speculative_sampling_target_only = None
+# DFlash does not run sampling verify on NPU, even where the op exists.
+_DFLASH_SAMPLING_VERIFY_AVAILABLE = (
+    tree_speculative_sampling_target_only is not None and not is_npu()
+)
 
 
 def is_dflash_sampling_verify_available() -> bool:
@@ -881,85 +848,6 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
-@triton.jit
-def _fused_correct_drafts_and_bonus_kernel(
-    candidates_ptr,
-    target_predict_ptr,
-    num_correct_drafts_ptr,
-    bonus_tokens_ptr,
-    block_size,
-    BLOCK: tl.constexpr,
-):
-    b = tl.program_id(0).to(tl.int64)
-    offs = tl.arange(0, BLOCK)
-    in_row = offs < block_size - 1
-    drafts = tl.load(candidates_ptr + b * block_size + 1 + offs, mask=in_row, other=-1)
-    targets = tl.load(target_predict_ptr + b * block_size + offs, mask=in_row, other=-2)
-    eq = (drafts == targets) & in_row
-    # Leading-match count = index of the first mismatch lane; lanes past the
-    # row and all-match rows both resolve to block_size - 1 via the min.
-    num_correct = tl.min(tl.where(eq, BLOCK, offs), 0)
-    bonus_token = tl.load(target_predict_ptr + b * block_size + num_correct)
-    tl.store(num_correct_drafts_ptr + b, num_correct.to(tl.int32))
-    tl.store(bonus_tokens_ptr + b, bonus_token.to(tl.int64))
-
-
-def compute_dflash_correct_drafts_and_bonus(
-    *,
-    candidates: torch.Tensor,
-    target_predict: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute DFlash accept lengths and bonus tokens (greedy verify rule).
-
-    Args:
-        candidates: Token ids proposed by the DFlash draft, including the current token.
-            Shape: [bs, block_size]. candidates[:, 0] is the current token.
-        target_predict: Token ids predicted by the target model for each position in the block.
-            Shape: [bs, block_size]. target_predict[:, t] corresponds to argmax at position t.
-
-    Returns:
-        correct_len: int32 tensor [bs], number of accepted *draft* tokens (excluding current token and bonus token).
-        bonus: int64 tensor [bs], the target-predicted token at index correct_len (the "bonus" token to append).
-
-    Notes:
-        Matches the reference implementation rule:
-          accept while candidates[:, 1:] == target_predict[:, :-1] consecutively.
-    """
-    if candidates.ndim != 2:
-        raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
-    if target_predict.shape != candidates.shape:
-        raise ValueError(
-            "target_predict must have the same shape as candidates. "
-            f"candidates.shape={tuple(candidates.shape)}, target_predict.shape={tuple(target_predict.shape)}"
-        )
-
-    bs, block_size = candidates.shape
-    if bs <= 0:
-        raise ValueError(f"batch size must be positive, got {bs}.")
-    if block_size <= 0:
-        raise ValueError(f"block_size must be positive, got {block_size}.")
-
-    if candidates.is_cuda:
-        num_correct_drafts = torch.empty(
-            bs, dtype=torch.int32, device=candidates.device
-        )
-        bonus_tokens = torch.empty(bs, dtype=torch.int64, device=candidates.device)
-        _fused_correct_drafts_and_bonus_kernel[(bs,)](
-            candidates.contiguous(),
-            target_predict.contiguous(),
-            num_correct_drafts,
-            bonus_tokens,
-            block_size,
-            BLOCK=triton.next_power_of_2(max(block_size - 1, 1)),
-        )
-        return num_correct_drafts, bonus_tokens
-
-    matches = candidates[:, 1:] == target_predict[:, :-1]
-    correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
-    bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
-    return correct_len.to(torch.int32), bonus.to(torch.int64)
-
-
 def apply_dflash_simulated_acceptance(
     *,
     candidates: torch.Tensor,
@@ -1222,83 +1110,3 @@ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
     return None
-
-
-@triton.jit
-def _table_qk_norm_rope_kernel(
-    qkv_ptr,
-    q_weight_ptr,
-    k_weight_ptr,
-    cos_sin_ptr,
-    pos_ptr,
-    row_stride,
-    q_size,
-    NHQ: tl.constexpr,
-    D: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    t = tl.program_id(0).to(tl.int64)
-    h = tl.program_id(1)
-    pos = tl.load(pos_ptr + t).to(tl.int64)
-
-    HALF: tl.constexpr = D // 2
-    half_ar = tl.arange(0, HALF)
-    d_ar = tl.arange(0, D)
-    cos = tl.load(cos_sin_ptr + pos * D + half_ar).to(tl.float32)
-    sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar).to(tl.float32)
-
-    is_q = h < NHQ
-    col0 = tl.where(is_q, h * D, q_size + (h - NHQ) * D).to(tl.int64)
-    w_ptr = tl.where(is_q, q_weight_ptr.to(tl.int64), k_weight_ptr.to(tl.int64)).to(
-        tl.pointer_type(tl.bfloat16)
-    )
-
-    row = qkv_ptr + t * row_stride + col0
-    x = tl.load(row + d_ar).to(tl.float32)
-    ms = tl.sum(x * x, 0) / D
-    inv = 1.0 / tl.sqrt(ms + EPS)
-    w1 = tl.load(w_ptr + half_ar).to(tl.float32)
-    w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
-    x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
-    x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
-    x1 = x1.to(tl.bfloat16).to(tl.float32)
-    x2 = x2.to(tl.bfloat16).to(tl.float32)
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-    tl.store(row + half_ar, o1.to(tl.bfloat16))
-    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
-
-
-def table_qk_norm_rope_(
-    qkv: torch.Tensor,
-    positions: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    num_q_heads: int,
-    num_k_heads: int,
-    head_dim: int,
-    eps: float,
-) -> None:
-    """In-place QK RMSNorm + table-lookup neox RoPE on the fused QKV tensor.
-
-    Reads cos/sin from the SAME rotary table as the unfused path, so there is
-    no large-position angle drift (unlike theta-recompute kernels). V columns
-    are untouched.
-    """
-    T = qkv.shape[0]
-    if T == 0:
-        return
-    grid = (T, num_q_heads + num_k_heads)
-    _table_qk_norm_rope_kernel[grid](
-        qkv,
-        q_weight,
-        k_weight,
-        cos_sin_cache,
-        positions,
-        qkv.stride(0),
-        num_q_heads * head_dim,
-        NHQ=num_q_heads,
-        D=head_dim,
-        EPS=eps,
-    )

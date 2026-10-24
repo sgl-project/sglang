@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 import torch
-from fastapi import APIRouter, FastAPI, Request, Response
+from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.srt.observability.http_request_metrics import (
     add_http_request_metrics_middleware,
     init_http_request_metrics,
@@ -320,9 +321,11 @@ async def stats_endpoint(request: Request):
 
 
 def make_serializable(obj):
-    """Recursively converts Tensors to None for JSON serialization."""
+    """Serialize output metadata without copying tensors back to the CPU."""
     if isinstance(obj, torch.Tensor):
         return None
+    if isinstance(obj, RequestMetrics):
+        return obj.to_dict()
     if isinstance(obj, dict):
         return {k: make_serializable(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -331,10 +334,11 @@ def make_serializable(obj):
 
 
 def encode_video_to_base64(file_path: str):
-    if not os.path.exists(file_path):
-        return None
     with open(file_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+        content = f.read()
+    if not content:
+        raise ValueError(f"Empty model output file: {file_path}")
+    return base64.b64encode(content).decode("utf-8")
 
 
 async def forward_to_scheduler(
@@ -344,6 +348,8 @@ async def forward_to_scheduler(
     """Forwards request to scheduler and processes the result."""
     try:
         response = await async_scheduler_client.forward(req_obj)
+        if response.error:
+            raise RuntimeError(response.error)
         if response.output is None and response.output_file_paths is None:
             raise RuntimeError("Model generation returned no output.")
 
@@ -370,19 +376,10 @@ async def forward_to_scheduler(
                 upscaling_scale=sp.upscaling_scale,
             )
 
-        if hasattr(response, "model_dump"):
-            data = response.model_dump()
-        else:
-            data = response if isinstance(response, dict) else vars(response)
-
-        if output_file_path:
-            logger.info("Processing output file: %s", output_file_path)
-            b64_video = encode_video_to_base64(output_file_path)
-
-            if b64_video:
-                data["output"] = b64_video
-                data.pop("video_data", None)
-                data.pop("video_tensor", None)
+        data = vars(response).copy()
+        data["output"] = await asyncio.to_thread(
+            encode_video_to_base64, output_file_path
+        )
 
         return make_serializable(data)
 
@@ -402,27 +399,31 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
     server_args = get_global_server_args()
     params = vertex_req.parameters or {}
 
-    futures = []
+    requests = []
 
     for inst in vertex_req.instances:
         rid = f"vertex_{uuid.uuid4()}"
 
-        sp = build_sampling_params(
-            rid,
-            prompt=inst.get("prompt") or inst.get("text"),
-            image_path=inst.get("image") or inst.get("image_url"),
-            num_frames=params.get("num_frames"),
-            fps=params.get("fps"),
-            width=params.get("width"),
-            height=params.get("height"),
-            guidance_scale=params.get("guidance_scale"),
-            save_output=params.get("save_output"),
-        )
+        try:
+            sp = build_sampling_params(
+                rid,
+                prompt=inst.get("prompt") or inst.get("text"),
+                image_path=inst.get("image") or inst.get("image_url"),
+                num_frames=params.get("num_frames"),
+                fps=params.get("fps"),
+                width=params.get("width"),
+                height=params.get("height"),
+                guidance_scale=params.get("guidance_scale"),
+                save_output=params.get("save_output"),
+            )
+            requests.append(prepare_request(server_args, sampling_params=sp))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        backend_req = prepare_request(server_args, sampling_params=sp)
-        futures.append(forward_to_scheduler(backend_req, sp))
-
-    results = await asyncio.gather(*futures)
+    # validate every instance before creating coroutines or dispatching work
+    results = await asyncio.gather(
+        *(forward_to_scheduler(req, req.sampling_params) for req in requests)
+    )
 
     return orjson_response({"predictions": results})
 

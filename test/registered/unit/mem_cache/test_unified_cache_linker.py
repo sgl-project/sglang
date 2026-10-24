@@ -1,3 +1,4 @@
+import queue
 import sys
 import threading
 import unittest
@@ -5,7 +6,7 @@ from array import array
 from collections import defaultdict
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -24,8 +25,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    MooncakeDirectLinker,
+)
 from sglang.srt.mem_cache.unified_cache.cache_action import (
-    ReplaceWriteThroughOnNodeSplit,
+    UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -40,6 +44,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_disagg
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
 from sglang.test.kits.unified_radix_cache.config import (
@@ -488,6 +493,34 @@ class TestUnifiedCacheLinkerPythonBackend(
         _, transfers = consumer_linker.lookup_calls[0]
         (kv_lookup,) = transfers
         self.assertEqual(kv_lookup.keys, kv_offload.keys[2:])
+
+    def test_decode_match_skips_linker_lookup(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        producer, producer_allocator, producer_req_pool = build_fixture(cfg)
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        tokens = list(range(1, 9))
+        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+
+        consumer, _, consumer_req_pool = build_fixture(cfg)
+        consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        consumer.init_cache_linker(consumer_linker)
+        key = RadixKey(array("q", tokens))
+        with get_disagg().override(disaggregation_mode="decode"):
+            req = self._make_req(consumer_req_pool)
+            match = consumer.match_prefix(MatchPrefixParams(key=key, req=req))
+        self.assertEqual(match.host_hit_length, 0)
+        self.assertEqual(consumer_linker.lookup_calls, [])
+        self.assertFalse(consumer.linker.has_hit(req.rid))
+
+        req = self._make_req(consumer_req_pool)
+        match = consumer.match_prefix(MatchPrefixParams(key=key, req=req))
+        self.assertEqual(match.host_hit_length, len(tokens))
+        consumer.linker.release_request(req.rid)
 
     def test_failed_split_offload_retries_and_reset_releases_locks(self):
         cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)
@@ -1198,7 +1231,12 @@ def test_split_action_retargets_pending_external_offload():
     cache._replace_pending_write_through_node = lambda *args: calls.append(
         ("hicache", *args)
     )
-    action = ReplaceWriteThroughOnNodeSplit(
+    cache.components = {
+        ComponentType.FULL: SimpleNamespace(
+            apply_component_action=lambda action: calls.append(("full", action))
+        )
+    }
+    action = UpdatePendingBackupOnNodeSplit(
         ack_id=7,
         old_node_id=7,
         new_node_id=8,
@@ -1210,6 +1248,7 @@ def test_split_action_retargets_pending_external_offload():
     assert calls == [
         ("hicache", 7, 7, [8, 7]),
         ("linker", 7, 7, [8, 7]),
+        ("full", action),
     ]
 
 
@@ -1563,6 +1602,54 @@ def test_linker_load_preserves_swa_boundaries(
     if not participates:
         swa.build_external_linker_transfer.assert_not_called()
         swa.update_external_linker_load.assert_not_called()
+
+
+class TestOffloadReadyEvents(CustomTestCase):
+    def _record(self, forward_stream):
+        device = MagicMock(name="device_module")
+        device.Event.side_effect = lambda: MagicMock(name="event")
+        linker = _FakeLinker()
+        linker.forward_stream = forward_stream
+        with patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.device_module",
+            device,
+        ):
+            return linker.record_offload_ready()
+
+    def test_offload_waits_on_the_forward_writing_the_pages(self):
+        forward_stream = MagicMock(name="forward_stream")
+        indices_ready, kv_written = self._record(forward_stream)
+        indices_ready.record.assert_called_once_with()
+        kv_written.record.assert_called_once_with(forward_stream)
+        # The offload thread waits; the forward stream's own order is untouched.
+        self.assertEqual(forward_stream.mock_calls, [])
+
+    def test_offload_without_a_forward_stream_waits_on_the_current_one(self):
+        (indices_ready,) = self._record(None)
+        indices_ready.record.assert_called_once_with()
+
+    def test_mooncake_offload_thread_waits_on_every_event(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        order = MagicMock()
+        linker.storage = order.storage
+        order.storage.batch_set_v2.return_value = {}
+        linker.stats = {"offload": 1}
+        linker.offload_results = queue.Queue()
+        linker.offload_queue = queue.Queue()
+        linker.offload_queue.put(
+            (["transfer"], 1, [order.indices_ready, order.kv_written])
+        )
+        linker.offload_queue.put(None)
+        linker.offload_thread_func()
+        self.assertEqual(
+            order.mock_calls,
+            [
+                call.indices_ready.synchronize(),
+                call.kv_written.synchronize(),
+                call.storage.batch_set_v2(["transfer"]),
+            ],
+        )
+        self.assertTrue(linker.offload_results.get_nowait())
 
 
 if __name__ == "__main__":

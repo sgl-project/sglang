@@ -23,6 +23,7 @@ dependencies = [
   "build",
   "compressed-tensors",
   "datasets",
+  "deepseek-recipe==0.2.0 ; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin'",
   "easydict",
   "einops",
   "fastapi",

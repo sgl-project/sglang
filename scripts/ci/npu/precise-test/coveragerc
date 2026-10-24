@@ -16,5 +16,3 @@ include =
 omit =
     */.local/*
     /usr/*
-    */sglang/test/*
-    */sglang/benchmark/*

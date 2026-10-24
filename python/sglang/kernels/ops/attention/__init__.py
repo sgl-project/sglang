@@ -47,6 +47,7 @@ _TRITON_KERNELS = [
     ("pad", "unpad_draft_extend_output"),
     ("pad", "seqlens_expand_triton"),
     ("position", "compute_position_triton"),
+    ("table_qk_norm_rope", "table_qk_norm_rope_"),
     ("dsv4.attn_metadata_kernels", "expand_prefill_causally"),
     ("dsv4.attn_metadata_kernels", "build_page_table_positions"),
     ("dsv4.attn_metadata_kernels", "build_causal_swa_page_indices"),

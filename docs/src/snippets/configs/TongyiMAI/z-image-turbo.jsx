@@ -4,11 +4,12 @@ export const config = (() => {
     const flags = ["--model-path " + modelOf(s)];
     if (s.hw === "a2") flags.push("--num-gpus 1");
     else if (s.hw === "a3") flags.push("--tp-size 2", "--sp-degree 1", "--num-gpus 2");
-    else if (s.hw !== "arc_b") flags.push("--ulysses-degree=1", "--ring-degree=1");
+    else if (s.hw !== "arc_b" && s.hw !== "xeon") flags.push("--ulysses-degree=1", "--ring-degree=1");
     return {
       flags,
       gpus: s.hw === "a3" ? 2 : 1,
       topology: { tp_size: s.hw === "a3" ? 2 : 1, ulysses_degree: 1, ring_degree: 1 },
+      env: s.hw === "xeon" ? ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"] : [],
     };
   };
   const defaults = {
@@ -22,11 +23,12 @@ export const config = (() => {
   };
   const config = {
     modelName: "Z-Image-Turbo",
-    supportedHardware: ["mi300x", "mi325x", "mi355x", "b200", "h200", "h100", "a2", "a3", "arc_b"],
+    supportedHardware: ["mi300x", "mi325x", "mi355x", "b200", "h200", "h100", "a2", "a3", "arc_b", "xeon"],
     hardware: [
       { id: "a2", label: "Ascend A2", vram: "", vendor: "npu" },
       { id: "a3", label: "Ascend A3", vram: "2 NPUs / card", vendor: "npu" },
       { id: "arc_b", label: "Intel BMG", vram: "", vendor: "intel" },
+      { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
     ],
     groupHardware: false,
     matchDims: [],
@@ -34,8 +36,11 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 2 } },
-        verifiedRecipes: ["mi300x", "mi325x", "mi355x", "b200", "h200", "h100", "a2", "a3", "arc_b"].map((hw) => {
+        limits: {
+          nodes: { min: 1, max: 1 },
+          gpus_per_node: { min: 1, max: 2, disabledWhen: (s) => s.hw === "xeon", disabledValue: 1 },
+        },
+        verifiedRecipes: ["mi300x", "mi325x", "mi355x", "b200", "h200", "h100", "a2", "a3", "arc_b", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
           return {

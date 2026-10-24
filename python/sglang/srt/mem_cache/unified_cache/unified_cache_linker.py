@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 logger = logging.getLogger(__name__)
+device_module = get_device_module()
 
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
@@ -133,6 +135,25 @@ class UnifiedCacheLinker(ABC):
 
     layer_done_counter: object
     pools: dict[PoolName, object]
+    # The stream the forward writes the device pools on; None when the current
+    # stream is the pages' only writer.
+    forward_stream: Optional[torch.cuda.Stream] = None
+
+    def record_offload_ready(self) -> list[torch.cuda.Event]:
+        """Record the events an offload waits on before it reads device pages.
+
+        The current stream has computed which pages to offload, and the forward
+        stream may still be writing them: prefill read-done lets the scheduler's
+        stream run ahead of the forward that fills a stashed chunk.
+        """
+        indices_ready = device_module.Event()
+        indices_ready.record()
+        events = [indices_ready]
+        if self.forward_stream is not None:
+            kv_written = device_module.Event()
+            kv_written.record(self.forward_stream)
+            events.append(kv_written)
+        return events
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:

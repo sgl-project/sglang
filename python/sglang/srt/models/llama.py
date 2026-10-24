@@ -49,6 +49,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_activation import DenseSiluAndMulQuant
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -118,6 +119,7 @@ class LlamaMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
         self.dual_gemm = DualGemm(self.gate_up_proj, self.down_proj, hidden_size)
+        self.activation_quant = DenseSiluAndMulQuant(self.down_proj)
 
     def forward(
         self,
@@ -128,7 +130,12 @@ class LlamaMLP(nn.Module):
             x = self.dual_gemm(x, self.gate_up_proj)
         else:
             gate_up, _ = self.gate_up_proj(x)
-            x = self.act_fn(gate_up)
+            if forward_batch is not None and forward_batch.forward_mode.is_decode():
+                x = self.activation_quant.forward_decode(
+                    gate_up, self.act_fn, self.down_proj
+                )
+            else:
+                x = self.act_fn(gate_up)
 
         x, _ = self.down_proj(x)
         return x
@@ -404,7 +411,7 @@ class LlamaDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 

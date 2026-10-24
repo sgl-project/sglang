@@ -42,7 +42,7 @@ docker run --gpus all \
 **AMD GPUs (ROCm)** — AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 10 version.
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261016
+docker pull lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261021
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -52,7 +52,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261016 \
+    lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261021 \
     sglang serve <use args below>
 ```
 
@@ -224,14 +224,14 @@ Only the L2 tier is exposed here. For the storage (L3) tier and the canonical fl
 
 Agentic replay is a different workload: long-context prompts, multi-turn sessions that reuse their own prefix across turns, and subagent branches that fan out within one session. Concurrency below counts live sessions, not requests. Every command keeps the engram tables on the host, and none adds a HiCache tier. The sessions fit the device pool.
 
-Two commands follow, one per concurrency range. TP2 covers concurrency 1 to 32 and TP4 covers 1 to 16; at 32 and 64 the same two GPUs also run DP attention with TP MoE.
+TP2 covers concurrency 1 to 32 and TP4 covers 1 to 16; at 32 and 64 the same two GPUs also run DP attention with TP MoE.
 
-**TP2 or TP4, concurrency 1–32:**
+**TP2 or TP4, concurrency 1–16:**
 
-- TP2 raises `--mem-fraction-static` from concurrency 16 and continues through 32; TP4 stops at 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare.
+- TP2 raises `--mem-fraction-static` at concurrency 16; TP4 stops at 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare.
 - A longer `--prefill-decode-interval` runs more decode rounds between prefill batches, trading TTFT for P90 inter-token latency.
 - Up to concurrency 8 it pairs with `--schedule-policy lpm`, which admits the requests with the longest cached prefix first.
-- Concurrency ≤ 16 uses the same low-latency path as §3's Low-Latency card (`--monokernel-backend amd` and `--disable-shared-experts-fusion`, as in the command below); at concurrency 32 swap those two flags for `--enforce-shared-experts-fusion`.
+- These points set `--monokernel-backend amd`. Do not set `SGLANG_HIP_DSV41_INDEX_K_PAGE8`: the monokernel refuses that layout.
 
 The braced values in the command follow concurrency:
 
@@ -252,13 +252,11 @@ SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
 SGLANG_USE_AITER=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
-AITER_BF16_FP8_MOE_BOUND=0 \
 TRITON_HIP_USE_ASYNC_COPY=0 \
 ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \
 SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true \
 SGLANG_OPT_HIP_FLYDSL_MXFP8=1 \
 SGLANG_HIP_FP4_INDEXER_ROWGROUP=1 \
-SGLANG_HIP_DSV41_INDEX_K_PAGE8=1 \
 HSA_NO_SCRATCH_RECLAIM=0 \
 GPU_MAX_HW_QUEUES=2 \
 sglang serve \
@@ -269,8 +267,9 @@ sglang serve \
   --speculative-algorithm DSPARK \
   --speculative-dspark-block-size 5 \
   --monokernel-backend amd \
-  --disable-shared-experts-fusion \
+  --enforce-shared-experts-fusion \
   --fp8-gemm-backend aiter \
+  --enable-decoder-swa-bounded-replay \
   --cuda-graph-backend-prefill disabled \
   --mem-fraction-static {mem-fraction-static} \
   --chunked-prefill-size 16384 \
@@ -283,6 +282,8 @@ sglang serve \
   --tool-call-parser auto \
   --watchdog-timeout 3600
 ```
+
+**TP2, concurrency 32:** the command above with the concurrency-32 column, without `--monokernel-backend amd`, and with `SGLANG_HIP_DSV41_INDEX_K_PAGE8=1`.
 
 **DP2, concurrency 32–64:** two DP attention ranks, one per GPU, with the MoE still tensor parallel across both. The braced values follow concurrency:
 
@@ -300,7 +301,6 @@ SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT=per_rank \
 SGLANG_USE_AITER=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
-AITER_BF16_FP8_MOE_BOUND=0 \
 TRITON_HIP_USE_ASYNC_COPY=0 \
 ROCM_QUICK_REDUCE_QUANTIZATION=INT8 \
 SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=true \
@@ -329,6 +329,7 @@ sglang serve \
   --speculative-dspark-block-size 5 \
   --enforce-shared-experts-fusion \
   --fp8-gemm-backend aiter \
+  --enable-decoder-swa-bounded-replay \
   --cuda-graph-backend-prefill disabled \
   --mem-fraction-static {mem-fraction-static} \
   --chunked-prefill-size 32768 \

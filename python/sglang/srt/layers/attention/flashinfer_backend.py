@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.kernels.ops.attention.kv_indices import spec_kv_index_token_blocks
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
 )
@@ -66,7 +67,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
@@ -887,7 +887,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if (
             in_capture
-            and envs.SGLANG_FLASHINFER_VERIFY_HOST_PLAN.get()
+            and envs.SGLANG_OPT_FLASHINFER_VERIFY_HOST_PLAN.get()
             and forward_mode.is_target_verify()
             and spec_info is not None
             and spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
@@ -2420,8 +2420,9 @@ def _build_draft_indptr_host(
     """Mirror the draft kernel's prefix sums from resolved host lengths.
 
     At draft entry, positions repeat each committed sequence length ``topk``
-    times. Step i adds i+1 tokens per branch. This also covers the graph
-    runner's padded rows, whose CPU lengths have already been filled.
+    times. Step i adds i+1 tokens per branch. Only live entries match the
+    device prefix sums: graph padding fills CPU lengths with 1 while device
+    positions stay 0, so padded entries differ.
     """
     assert seq_lens_cpu.device.type == "cpu" and seq_lens_cpu.ndim == 1
     offsets = [0]
@@ -2511,6 +2512,21 @@ class FlashInferMultiStepDraftBackend:
             seq_lens_sum=seq_lens_sum,
         )
 
+        # Blocks from the length sum (upper bound on the longest live row),
+        # capped by the draft window, not from the table width. pool_len is
+        # the req_to_token row width, the same table width the other call
+        # sites size from.
+        num_token_blocks = spec_kv_index_token_blocks(
+            table_width=self.pool_len,
+            kv_lens_sum=seq_lens_sum,
+            batch_size=num_seqs,
+            base_programs=self.speculative_num_steps * num_seqs * self.topk,
+            length_cap=(
+                self.draft_window_size + self.draft_sink_size
+                if self.draft_window_size > 0
+                else None
+            ),
+        )
         src = self.kv_index_translator.read_source(
             forward_batch.kv_loc_plan,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -2518,7 +2534,7 @@ class FlashInferMultiStepDraftBackend:
         )
         host_lengths = forward_batch.seq_lens_cpu
         use_host_indptr = (
-            envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.get()
+            envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.get()
             and self.draft_window_size == 0
             and host_lengths is not None
             and host_lengths.device.type == "cpu"
@@ -2531,8 +2547,11 @@ class FlashInferMultiStepDraftBackend:
             if use_host_indptr
             else 1
         )
+        # One launch, the larger of the two tilings: the host-plan path never
+        # drops below its 512-token blocks.
+        num_token_blocks = max(num_token_blocks, num_blocks)
         self.generate_draft_decode_kv_indices[
-            (self.speculative_num_steps * num_blocks, num_seqs, self.topk)
+            (self.speculative_num_steps * num_token_blocks, num_seqs, self.topk)
         ](
             src.row_ids,
             src.ids,
@@ -2552,7 +2571,14 @@ class FlashInferMultiStepDraftBackend:
             ENTRY_PAGE_SIZE=src.entry_page_size,
             v2p=src.v2p,
             TRANSLATE=src.v2p is not None,
-            NUM_STEPS=self.speculative_num_steps if use_host_indptr else 0,
+            # A single token block without the host plan is the historical
+            # launch; NUM_STEPS=0 keeps its 128-wide program instead of the
+            # token-block specialization.
+            NUM_STEPS=(
+                self.speculative_num_steps
+                if num_token_blocks > 1 or use_host_indptr
+                else 0
+            ),
         )
 
         assert forward_batch.spec_info is not None

@@ -84,7 +84,7 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
                 def plan(i, batch):
                     observed.append(backend.global_override_indptr_cpu.clone())
 
-                with envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.override(True):
+                with envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.override(True):
                     obj.common_template(fb, indices, plan)
                 graph = torch.cuda.CUDAGraph()
                 consumer = torch.empty_like(indices)
@@ -105,13 +105,13 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
                     fb.positions.copy_(fb.seq_lens.repeat_interleave(topk))
                     fb.req_pool_indices.add_(1).remainder_(len(initial) + 1)
                     indices.fill_(-17)
-                    with envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.override(False):
+                    with envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.override(False):
                         obj.common_template(fb, indices, lambda i, batch: None)
                     original = indices.clone()
                     original_indptr = obj.kv_indptr.clone()
                     indices.fill_(-17)
                     observed.clear()
-                    with envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.override(True):
+                    with envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.override(True):
                         obj.common_template(fb, indices, plan)
                     torch.testing.assert_close(indices, original, rtol=0, atol=0)
                     torch.testing.assert_close(
@@ -131,13 +131,13 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
         obj, indices, fb = self._build(1, 3, 1, [8192, 1024])
         obj.draft_window_size = 256
         obj.draft_sink_size = 16
-        with envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.override(False):
+        with envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.override(False):
             obj.common_template(fb, indices, lambda i, batch: None)
         expected = indices.clone()
         expected_indptr = obj.kv_indptr.clone()
         observed = []
         indices.fill_(-17)
-        with envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.override(True):
+        with envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.override(True):
             obj.common_template(
                 fb,
                 indices,
@@ -152,7 +152,7 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
 
     def test_missing_host_mirror_and_failed_plan_restore_override(self):
         obj, indices, fb = self._build(1, 3, 1, [8192])
-        with envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.override(False):
+        with envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.override(False):
             obj.common_template(fb, indices, lambda i, batch: None)
         expected = indices.clone()
         fb.seq_lens_cpu = None
@@ -161,7 +161,7 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
         previous = backend.global_override_indptr_cpu
         backend.global_override_indptr_cpu = sentinel
         try:
-            with envs.SGLANG_FLASHINFER_DRAFT_HOST_INDPTR.override(True):
+            with envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.override(True):
                 obj.common_template(fb, indices, lambda i, batch: None)
                 self.assertIs(backend.global_override_indptr_cpu, sentinel)
                 torch.testing.assert_close(indices, expected, rtol=0, atol=0)

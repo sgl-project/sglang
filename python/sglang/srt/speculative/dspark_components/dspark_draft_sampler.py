@@ -5,6 +5,7 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.megakernels.runtime import megakernel_agree, megakernel_draft_sampler
 from sglang.srt.speculative.dspark_components.dspark_draft import (
@@ -25,6 +26,8 @@ _is_xpu = is_xpu()
 
 class DsparkDraftSampler:
     """The eager path's markov block, run as the draft cuda graph's tail."""
+
+    verify_ids = None
 
     def __init__(
         self,
@@ -52,6 +55,13 @@ class DsparkDraftSampler:
         else:
             self.out = torch.empty(
                 (self.max_bs * self.gamma,), dtype=torch.int64, device=device
+            )
+        # [max_bs, gamma + 1] verify ids ([anchor | draft tokens]) written by the
+        # graph tail, so the step skips its eager concat (SGLANG_OPT_DSV41_DSPARK_MID_FOLD).
+        self.verify_ids: Optional[torch.Tensor] = None
+        if envs.SGLANG_OPT_DSV41_DSPARK_MID_FOLD.get():
+            self.verify_ids = torch.empty(
+                (self.max_bs, self.gamma + 1), dtype=torch.int64, device=device
             )
         confidence_head = model.confidence_head
         if confidence_head is None:
@@ -157,6 +167,12 @@ class DsparkDraftSampler:
             )
             self.confidence_out[:bs].copy_(confidence)
             self.confidence_raw_out[:bs].copy_(confidence_raw)
+        if self.verify_ids is not None:
+            torch.cat(
+                [anchor.view(bs, 1), self.out[: bs * self.gamma].view(bs, self.gamma)],
+                dim=1,
+                out=self.verify_ids[:bs],
+            )
 
     def _markov_block(self, model_hidden, sample_hidden, anchor, bs: int):
         base_logits, confidence_features = self.model.compute_base_logits(model_hidden)

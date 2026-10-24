@@ -68,6 +68,9 @@ _REPLICA: GroupCoordinator | None = None
 _ENCODER_DP: GroupCoordinator | None = None
 _SRT_MOE_EP = None
 _VAE_DECODE: GroupCoordinator | None = None
+# the CFG ranks as one Ulysses group for stages that run without CFG; a view
+# over _CFG's communicators, built only when cfg > 1 and sp == 1
+_CFG_SP: SequenceParallelGroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
 _VAE_DECODE_PARALLEL_AXES = "tp-sp-pp-cfg"
@@ -532,6 +535,11 @@ def initialize_model_parallel(
         ring_group=PROCESS_GROUP.RING_PG,
     )
 
+    global _CFG_SP
+    assert _CFG_SP is None, "CFG sequence parallel group is already initialized"
+    if classifier_free_guidance_degree > 1 and sequence_parallel_degree == 1:
+        _CFG_SP = SequenceParallelGroupCoordinator.over_group(_CFG, _SP.ring_group)
+
     global _TP
     assert _TP is None, "Tensor parallel group is already initialized"
     _TP = init_parallel_group_coordinator(
@@ -612,6 +620,26 @@ def initialize_model_parallel(
     if vae_parallel_size > 0:
         init_vae_group(dit_parallel_size, vae_parallel_size, backend)
     init_dit_group(dit_parallel_size, backend)
+
+
+def get_cfg_sequence_parallel_group() -> SequenceParallelGroupCoordinator | None:
+    return _CFG_SP
+
+
+@contextmanager
+def use_sequence_parallel_group(sp_group: SequenceParallelGroupCoordinator):
+    """Route every SP accessor in the scope to ``sp_group``.
+
+    Latent shards, RoPE offsets and the Ulysses all-to-alls all read the group
+    through these accessors, so a stage runs entirely on one topology.
+    """
+    global _SP
+    old_sp_group = _SP
+    _SP = sp_group
+    try:
+        yield
+    finally:
+        _SP = old_sp_group
 
 
 def get_sp_world_size() -> int:
@@ -905,6 +933,7 @@ def init_vae_group(
 def destroy_model_parallel() -> None:
     """Set the groups to none and destroy them."""
     global _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE, _REPLICA, _ENCODER_DP
+    global _CFG_SP
 
     _clear_srt_tp_group()
     # The IPC transport keeps CUDA mappings associated with the current
@@ -959,3 +988,5 @@ def destroy_model_parallel() -> None:
     _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE, _REPLICA, _ENCODER_DP = (
         None,
     ) * 10
+    # a view over _CFG's communicators, released with it
+    _CFG_SP = None

@@ -433,6 +433,12 @@ def _bf16_gemm_dispatch_impl(
         _use_hopper_bf16_gemv is not None
         and bias is None
         and _use_hopper_bf16_gemv(m, weight.shape[0], weight.shape[1])
+        # The GEMV reads x and weight with 16-byte vector loads;
+        # other layouts take the cuBLAS routes below.
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
     ):
         output = _hopper_bf16_gemv(x.view(-1, x.shape[-1]), weight).view(
             *x.shape[:-1], -1
@@ -749,6 +755,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
         self._cache_permute_indices = dict({})
+        self.runner: Optional[MoeRunner] = None
+        self._aiter_runner: Optional[MoeRunner] = None
         # Set by process_weights_after_loading when w13 rows are permuted to
         # interleave gate/up for the fused swiglu up-GEMM epilogue.
         self.w13_swiglu_interleaved = False
@@ -982,10 +990,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             return
 
         moe_runner_config = layer.moe_runner_config
+        runner_backend = self.get_moe_runner_backend(layer)
         if not (
             _is_cuda
-            and self._aiter_runner is None
-            and self.runner.runner_backend.is_triton()
+            and runner_backend is not None
+            and runner_backend.is_triton()
             and get_moe_a2a_backend().is_none()
             and not self.with_bias
             and layer.w13_weight.dtype == torch.bfloat16
@@ -1029,7 +1038,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         block layout. During weight update, checkpoint tensors are in
         canonical layout and need a temporary shape restore for copy.
         """
-        if not get_moe_runner_backend().is_flashinfer_trtllm_routed():
+        runner_backend = self.get_moe_runner_backend(layer)
+        if runner_backend is None or not runner_backend.is_flashinfer_trtllm_routed():
             return
 
         expected_shape = None
@@ -1138,6 +1148,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     f"aiter CK fused-MoE does not support this layer: {reason}; "
                     "using triton MoE runner."
                 )
+
+    def get_moe_runner_backend(self, layer):
+        runner = self._aiter_runner if self._aiter_runner is not None else self.runner
+        return runner.runner_backend if runner is not None else None
 
     @property
     def load_up_proj_weight_first(self) -> bool:

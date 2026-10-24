@@ -47,6 +47,9 @@ class StageParallelismType(Enum):
     CFG_PARALLEL = auto()
     # executed on main rank only and send result to other ranks
     MAIN_RANK_ONLY_AND_SEND_TO_OTHERS = auto()
+    # a stage without CFG runs on every CFG rank, sequence-sharded over them
+    # as one Ulysses group; its inputs must already match across CFG ranks
+    SEQUENCE_PARALLEL_OVER_CFG_RANKS = auto()
 
 
 class StageVerificationError(Exception):
@@ -288,6 +291,11 @@ class PipelineStage(StageDedupMixin, ABC):
         # if get_global_server_args().enable_cfg_parallel:
         #     return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED
+
+    def parallelism_type_for(self, batch: Req | list[Req]) -> StageParallelismType:
+        """The parallelism the executor runs ``batch`` with; every rank must
+        resolve the same type."""
+        return self.parallelism_type
 
     def cfg_parallel_local_batch_fields(
         self, batch: Req, server_args: ServerArgs

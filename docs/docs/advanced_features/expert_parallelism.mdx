@@ -148,14 +148,14 @@ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --moe-a2a-ba
 
 ## Extensible EP Framework
 
-SGLang's EP framework provides modular abstractions for easy integration of custom kernels, backends, and optimizations. It decouples the MoE forward pass into stages (dispatch → pre-permute → core runner → post-permute → combine), enabling seamless extensions without refactoring core logic.
+SGLang's EP framework provides modular abstractions for easy integration of custom kernels, backends, and optimizations. It decouples the MoE forward pass into stages (dispatch → pre-permute → core runner → post-permute → combine), enabling seamless extensions without refactoring core logic. A fused function registered for a layer's all-to-all and runner backends replaces the three middle stages.
 
 ### Framework Overview
 
 The framework centers on `FusedMoE` as the unified entry point for a single, extensible structure. Key components include:
 - **Dispatcher**: Manages dispatch/combine for backends like DeepEP (implements `BaseDispatcher` subclasses).
 - **MoeRunner**: Orchestrates grouped-GEMM execution via `MoeRunnerCore` implementations (e.g., `TritonRunnerCore`).
-- **PermuteMethodPool**: Auto-registers layout conversions (e.g., pre/post-permute via `register_pre_permute` and `register_post_permute` for dynamic modes, or `register_fused_func` for static, torch.compile-compatible fused operations).
+- **FusedOpPool** and **PermuteMethodPool**: Auto-register fused functions per all-to-all and runner backend pair (`register_fused_func`) and layout conversions (`register_pre_permute` and `register_post_permute`). `MoeRunner.run` calls the fused function when one is registered for the layer's pair and LoRA is disabled; otherwise it runs pre-permute, the runner core, and post-permute, or hands the dispatch output to a `DispatchMoeRunnerCore`.
 - **TopK Router**: Backend-agnostic expert selection.
 
 This design supports multiple backends via `--moe-a2a-backend` and `--moe-runner-backend`, with quantization integrated through a standardized `apply()` method. The computation flow ensures modularity:
@@ -176,10 +176,12 @@ This design supports multiple backends via `--moe-a2a-backend` and `--moe-runner
           |              [DispatchOutput]
           |                     |
           |                     v
-          |             quant_method.apply -> MoeRunner.forward
+          |             quant_method.apply -> MoeRunner.run
           |                     |              |
           |                     |              v
-          |                     | pre-permute + grouped_gemm + post-permute
+          |                     | fused func
+          |                     | or DispatchMoeRunnerCore.run_from_dispatch
+          |                     | or pre-permute + grouped_gemm + post-permute
           |                     |              |
           |                     |--------------
           |                     v
@@ -205,11 +207,13 @@ To add a new backend:
    - **Fused Mode** (static, torch.compile-compatible): Use `register_fused_func` for end-to-end operations.
    - **Permute Mode** (dynamic): Register `register_pre_permute` and `register_post_permute` for flexible layouts.
 
+   When both are registered for a backend pair, the fused function takes precedence; the non-fused path still serves LoRA, which skips fused functions.
+
 See the [MoE Refactor Implementation PR](https://github.com/sgl-project/sglang/pull/9269) for full changes, including type hints and config expansions.
 
 ### Examples
 
-For an example implementation, see [moe_runner/triton.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/moe/moe_runner/triton.py), which demonstrates Triton-based grouped GEMMs with registered fused and permutation functions.
+For an example implementation, see [moe_runner/triton.py](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/moe/moe_runner/triton.py), which demonstrates Triton-based grouped GEMMs with a fused function registered for the `none` all-to-all backend and permutation functions as the fallback path, used for example with LoRA.
 
 ## Computation and Communication Overlap
 

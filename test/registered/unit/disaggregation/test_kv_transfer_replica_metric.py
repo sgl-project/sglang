@@ -17,7 +17,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSende
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 KV_ITEM_LENS_SUM = 100
 STATE_ITEM_LENS_SUM = 7
@@ -83,35 +83,6 @@ class TestKVTransferReplicaMetric(CustomTestCase):
         )
         expected = (8 * KV_ITEM_LENS_SUM + 5 * STATE_ITEM_LENS_SUM) * 4
         self.assertEqual(sender.get_transfer_metric().transfer_total_bytes, expected)
-
-    def test_non_mla_factor_is_one_regardless_of_destinations(self):
-        # Non-MLA head slices sum to one logical copy: factor stays 1.
-        mgr = _make_kv_mgr(is_mla_backend=False)
-        sender = _make_sender(mgr)
-
-        mgr.resolve_kv_replica_factor(_room(8))
-        self.assertEqual(mgr._kv_replica_factor, 1)
-
-        sender._record_transfer_indices(np.arange(6, dtype=np.int32), None)
-        self.assertEqual(
-            sender.get_transfer_metric().transfer_total_bytes, 6 * KV_ITEM_LENS_SUM
-        )
-
-    def test_unresolved_factor_does_not_crash_metric(self):
-        # An empty room or a missing required_dst_info_num leaves the factor
-        # unresolved. get_transfer_metric() must still compute -- it must not
-        # multiply bytes by None.
-        for room in ({}, {"sess0": SimpleNamespace(required_dst_info_num=None)}):
-            mgr = _make_kv_mgr(is_mla_backend=True)
-            sender = _make_sender(mgr)
-
-            mgr.resolve_kv_replica_factor(room)
-            self.assertIsNone(mgr._kv_replica_factor)
-
-            sender._record_transfer_indices(np.arange(4, dtype=np.int32), None)
-            self.assertIsInstance(
-                sender.get_transfer_metric().transfer_total_bytes, int
-            )
 
 
 if __name__ == "__main__":

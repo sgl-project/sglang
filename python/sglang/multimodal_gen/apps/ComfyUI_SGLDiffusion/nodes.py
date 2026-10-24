@@ -3,9 +3,15 @@ ComfyUI nodes for SGLang Diffusion integration.
 Provides nodes for connecting to SGLang Diffusion server and generating images/videos.
 """
 
+import base64
+import ipaddress
 import os
+import socket
+import urllib.parse
 import uuid
 
+import comfy.model_management
+import comfy.utils
 import folder_paths
 import torch
 
@@ -13,14 +19,19 @@ from .core import SGLDiffusionGenerator, SGLDiffusionServerAPI
 from .options import SGLDOptions
 
 
-def _enable_gguf_in_diffusion_models() -> None:
-    """Let SGLDUNETLoader list ``.gguf`` DiTs. Quantization lives in the file."""
-    entry = folder_paths.folder_names_and_paths.get("diffusion_models")
-    if entry is not None and len(entry) >= 2 and isinstance(entry[1], set):
-        entry[1].add(".gguf")
+def _list_unet_names_including_gguf() -> list[str]:
+    """SGLDUNETLoader's file list plus ``.gguf`` DiTs.
+
+    Kept local: registering ``.gguf`` in ``folder_paths`` would make ComfyUI's
+    stock loader offer files it cannot load.
+    """
+    names = set(folder_paths.get_filename_list("diffusion_models"))
+    for folder in folder_paths.get_folder_paths("diffusion_models"):
+        files, _ = folder_paths.recursive_search(folder)
+        names.update(folder_paths.filter_files_extensions(files, {".gguf"}))
+    return sorted(names)
 
 
-_enable_gguf_in_diffusion_models()
 from .utils import (
     convert_b64_to_tensor_image,
     convert_video_to_comfy_video,
@@ -67,6 +78,15 @@ class SGLDH3DistilledSigmas:
         from .executors.minimax_h3 import distilled_h3_sigmas
 
         return (torch.tensor(distilled_h3_sigmas(model_type)),)
+
+
+def _comfy_job_hooks() -> dict:
+    """Wire a server-mode job into ComfyUI's progress bar and Cancel button."""
+    pbar = comfy.utils.ProgressBar(100)
+    return {
+        "progress_callback": pbar.update_absolute,
+        "check_interrupt": comfy.model_management.throw_exception_if_processing_interrupted,
+    }
 
 
 class SGLDLoraLoader:
@@ -138,7 +158,7 @@ class SGLDUNETLoader:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
+                "unet_name": (_list_unet_names_including_gguf(),),
                 "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e5m2"],),
             },
             "optional": {
@@ -211,7 +231,21 @@ class SGLDiffusionServerModel:
                         "multiline": False,
                     },
                 ),
-            }
+            },
+            "optional": {
+                "image_timeout": (
+                    "INT",
+                    {
+                        "default": 300,
+                        "min": 1,
+                        "max": 3600,
+                        "tooltip": "Seconds to wait for an image "
+                        "generate/edit request (e.g. a large job, or "
+                        "torch.compile warmup on the first request, can "
+                        "need more than 300s)",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("SGLD_CLIENT", "STRING")
@@ -219,9 +253,11 @@ class SGLDiffusionServerModel:
     FUNCTION = "load_server"
     CATEGORY = "SGLDiffusion"
 
-    def load_server(self, base_url: str, api_key: str):
+    def load_server(self, base_url: str, api_key: str, image_timeout: int = 300):
         """Initialize OpenAI client for SGLang Diffusion server."""
-        client = SGLDiffusionServerAPI(base_url=base_url, api_key=api_key)
+        client = SGLDiffusionServerAPI(
+            base_url=base_url, api_key=api_key, image_timeout=image_timeout
+        )
         try:
             model_info = client.get_model_info()
             # Format model_info as a readable string
@@ -325,11 +361,19 @@ class SGLDiffusionGenerateImage:
                         "one IMAGE batch. Image i uses seed + i.",
                     },
                 ),
+                "enhance_prompt": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Rewrite the prompt on the server (needs "
+                        "--prompt-enhancer-config); returned as revised_prompt",
+                    },
+                ),
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("image", "revised_prompt")
     FUNCTION = "generate_image"
     CATEGORY = "SGLDiffusion"
     OUTPUT_NODE = False
@@ -347,6 +391,7 @@ class SGLDiffusionGenerateImage:
         height: int = 1024,
         enable_teacache: bool = False,
         num_images: int = 1,
+        enhance_prompt: bool = False,
     ):
         """Generate image using SGLang Diffusion API."""
         if not positive_prompt:
@@ -377,6 +422,8 @@ class SGLDiffusionGenerateImage:
             request_params["seed"] = seed
         if enable_teacache:
             request_params["enable_teacache"] = True
+        if enhance_prompt:
+            request_params["enhance_prompt"] = True
         if image is not None:
             # If the image is empty, use the size of the image to generate the image
             if is_empty_image(image):
@@ -392,7 +439,9 @@ class SGLDiffusionGenerateImage:
         except Exception as e:
             raise RuntimeError(f"Failed to generate image: {str(e)}")
 
-        return (_decode_image_batch(response, num_images),)
+        images = _decode_image_batch(response, num_images)
+        revised_prompt = response["data"][0].get("revised_prompt") or positive_prompt
+        return (images, revised_prompt)
 
 
 class SGLDiffusionGenerateVideo:
@@ -425,6 +474,10 @@ class SGLDiffusionGenerateVideo:
                         "default": None,
                         "tooltip": "input image to use for image-to-video",
                     },
+                ),
+                "video": (
+                    "VIDEO",
+                    {"tooltip": "source clip for video-to-video"},
                 ),
                 "seed": (
                     "INT",
@@ -503,11 +556,19 @@ class SGLDiffusionGenerateVideo:
                         "default": False,
                     },
                 ),
+                "enhance_prompt": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Rewrite the prompt on the server (needs "
+                        "--prompt-enhancer-config); returned as revised_prompt",
+                    },
+                ),
             },
         }
 
-    RETURN_TYPES = ("VIDEO", "STRING")
-    RETURN_NAMES = ("video", "video_path")
+    RETURN_TYPES = ("VIDEO", "STRING", "STRING")
+    RETURN_NAMES = ("video", "video_path", "revised_prompt")
     FUNCTION = "generate_video"
     CATEGORY = "SGLDiffusion"
     OUTPUT_NODE = False
@@ -527,6 +588,8 @@ class SGLDiffusionGenerateVideo:
         fps: int = 24,
         seconds: int = 5,
         enable_teacache: bool = False,
+        video=None,
+        enhance_prompt: bool = False,
     ):
         """Generate video using SGLang Diffusion API."""
         if not positive_prompt:
@@ -565,18 +628,35 @@ class SGLDiffusionGenerateVideo:
                 request_params["size"] = size
             else:
                 request_params["input_reference"] = get_image_path(image)
+        if video is not None:
+            request_params["video_path"] = os.path.join(
+                output_dir, f"sgl_input_{uuid.uuid4().hex[:8]}.mp4"
+            )
+            video.save_to(request_params["video_path"])
+        if enhance_prompt:
+            request_params["extra_fields"] = {"enhance_prompt": True}
 
         # Call API
         try:
-            response = sgld_client.generate_video(**request_params)
+            response = sgld_client.generate_video(
+                **request_params, **_comfy_job_hooks()
+            )
             video_path = resolve_video_path(
                 response.get("file_path"), response.get("url")
             )
+            # The server may have resolved a different size than requested
+            # (e.g. to match an image-to-video input's aspect ratio).
+            resolved_size = response.get("size", "")
+            if resolved_size:
+                width, height = (int(v) for v in resolved_size.split("x"))
             video = convert_video_to_comfy_video(video_path, height, width)
+        except comfy.model_management.InterruptProcessingException:
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed to generate video: {str(e)}")
 
-        return (video, video_path)
+        revised_prompt = response.get("revised_prompt") or positive_prompt
+        return (video, video_path, revised_prompt)
 
 
 class SGLDiffusionGenerateH3:
@@ -663,11 +743,61 @@ class SGLDiffusionGenerateH3:
     OUTPUT_NODE = False
 
     @staticmethod
-    def _material_uri(value: str) -> str:
-        """Local paths become file:// URIs; remote URLs are passed through."""
+    def _image_material_uri(image: torch.Tensor) -> str:
+        """Embed the image inline as a base64 data URI.
+
+        A `file://` path only works when the SGLD server runs on this same
+        machine; the server's H3 material loader accepts `data:` URIs
+        directly (no upload endpoint needed), so this works locally and
+        remotely alike.
+        """
+        path = get_image_path(image)
+        try:
+            with open(path, "rb") as fh:
+                encoded = base64.b64encode(fh.read()).decode("ascii")
+        finally:
+            os.remove(path)
+        return f"data:image/png;base64,{encoded}"
+
+    @staticmethod
+    def _is_local_server(base_url: str) -> bool:
+        host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+        if not host:
+            return False
+        if host in ("localhost", "0.0.0.0", "::"):
+            return True
+        own = {socket.gethostname().lower(), socket.getfqdn().lower()}
+        if host in own:
+            return True
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except (OSError, UnicodeError):
+            return False
+        addrs = {info[4][0].split("%", 1)[0] for info in infos}
+        return bool(addrs) and all(
+            ipaddress.ip_address(addr).is_loopback for addr in addrs
+        )
+
+    @classmethod
+    def _remote_material_uri(cls, value: str, kind: str, base_url: str) -> str:
+        """Remote URLs pass through. A local path only works when the SGLD
+        server is also on this machine: H3's server-side `/v1/videos`
+        endpoint has no multipart slot for the video/audio conditions this
+        node sends through `extra_fields.conditions`, unlike the image
+        conditions above (which sidestep that by embedding bytes inline).
+        Raise clearly instead of building a `file://` URI that will
+        silently fail against any server that isn't local.
+        """
+        # file:// already names a server-side path
         if value.startswith(("http://", "https://", "file://")):
             return value
-        return f"file://{os.path.abspath(value)}"
+        if cls._is_local_server(base_url):
+            return f"file://{os.path.abspath(value)}"
+        raise ValueError(
+            f"{kind} must be an http(s) URL when the SGLD server "
+            f"({base_url}) isn't on this machine; got a local path "
+            f"({value!r}), which that server has no way to read or upload."
+        )
 
     def generate(
         self,
@@ -700,7 +830,7 @@ class SGLDiffusionGenerateH3:
             conditions.append(
                 {
                     "type": "image",
-                    "uri": self._material_uri(get_image_path(first_frame)),
+                    "uri": self._image_material_uri(first_frame),
                     "role": "keyframe",
                     "frame_index": 0,
                 }
@@ -709,7 +839,7 @@ class SGLDiffusionGenerateH3:
             conditions.append(
                 {
                     "type": "image",
-                    "uri": self._material_uri(get_image_path(last_frame)),
+                    "uri": self._image_material_uri(last_frame),
                     "role": "keyframe",
                     "frame_index": -1,
                 }
@@ -718,7 +848,7 @@ class SGLDiffusionGenerateH3:
             conditions.append(
                 {
                     "type": "image",
-                    "uri": self._material_uri(get_image_path(reference_image)),
+                    "uri": self._image_material_uri(reference_image),
                     "role": "reference",
                 }
             )
@@ -726,7 +856,9 @@ class SGLDiffusionGenerateH3:
             conditions.append(
                 {
                     "type": "video",
-                    "uri": self._material_uri(reference_video),
+                    "uri": self._remote_material_uri(
+                        reference_video, "reference_video", sgld_client.base_url
+                    ),
                     "role": "reference",
                 }
             )
@@ -734,7 +866,9 @@ class SGLDiffusionGenerateH3:
             conditions.append(
                 {
                     "type": "audio",
-                    "uri": self._material_uri(reference_audio),
+                    "uri": self._remote_material_uri(
+                        reference_audio, "reference_audio", sgld_client.base_url
+                    ),
                     "role": "reference",
                 }
             )
@@ -778,10 +912,14 @@ class SGLDiffusionGenerateH3:
             request_params["seed"] = seed
 
         try:
-            response = sgld_client.generate_video(**request_params)
+            response = sgld_client.generate_video(
+                **request_params, **_comfy_job_hooks()
+            )
             video_path = resolve_video_path(
                 response.get("file_path"), response.get("url")
             )
+        except comfy.model_management.InterruptProcessingException:
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed to generate MiniMax-H3 video: {str(e)}")
 
@@ -833,6 +971,17 @@ class SGLDiffusionServerSetLora:
                         "tooltip": "Which transformer(s) to apply the LoRA to",
                     },
                 ),
+                "strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "tooltip": "LoRA merge strength; the server's own "
+                        "default is 1.0",
+                    },
+                ),
             },
         }
 
@@ -848,6 +997,7 @@ class SGLDiffusionServerSetLora:
         lora_name: str = "",
         lora_nickname: str = "",
         target: str = "all",
+        strength: float = 1.0,
     ):
         """Set LoRA adapter using SGLang Diffusion API."""
         if lora_nickname == "":
@@ -858,6 +1008,7 @@ class SGLDiffusionServerSetLora:
             "lora_nickname": lora_nickname,
             "lora_path": lora_name,
             "target": target,
+            "strength": strength,
         }
 
         # Call API

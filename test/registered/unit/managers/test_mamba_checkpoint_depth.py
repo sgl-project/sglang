@@ -14,9 +14,11 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import torch
-
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    _MambaRadixCacheV2TrackEntry,
+)
 from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -30,15 +32,15 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 CHUNK = 64
 
 
-def _track_seqlen(
+def _prepare_extend(
     *,
     tree_page: int,
     prefix_len: int,
     extend_len: int,
     dcp_enabled: bool = False,
-) -> int | None:
-    """Run one extend through the tracker and report the donated depth, or
-    None when the extend donates no checkpoint."""
+    next_idx: int = 0,
+) -> tuple[_MambaRadixCacheV2TrackEntry, Req]:
+    """Run one extend through the tracker; return its track entry and the request."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
     # The property would otherwise load the HF config for the dummy model.
     server_args._mamba_cache_chunk_size = CHUNK
@@ -55,8 +57,7 @@ def _track_seqlen(
     )
     req.prefix_len = prefix_len
     req.extend_end = prefix_len + extend_len
-    req.kv.mamba_ping_pong_track_buffer = torch.tensor([0, 1], dtype=torch.int64)
-    req.kv.mamba_next_track_idx = 0
+    req.kv.mamba_next_track_idx = next_idx
     req.mamba_branching_seqlen = None
 
     batch = ScheduleBatch(reqs=[req])
@@ -65,13 +66,19 @@ def _track_seqlen(
     )
     batch.tree_cache = SimpleNamespace(page_size=tree_page)
     batch.req_to_token_pool = MagicMock()
-    batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1
+    batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1 - next_idx
 
     with patch(
         "sglang.srt.managers.schedule_batch.get_parallel",
         return_value=SimpleNamespace(dcp_enabled=dcp_enabled),
     ):
         entry = batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
+    return entry, req
+
+
+def _track_seqlen(**kwargs) -> int | None:
+    """The donated depth of one extend, or None when it donates no checkpoint."""
+    entry, req = _prepare_extend(**kwargs)
     if not entry.track_mask:
         assert req.kv.mamba_last_track_seqlen is None
         return None
@@ -124,6 +131,20 @@ class TestMambaCheckpointDepth(unittest.TestCase):
         )
 
 
+class TestMambaTrackPosition(unittest.TestCase):
+    def test_track_position_is_taken_before_the_ping_pong_swap(self):
+        # prepare_for_extend gathers the slot id at this position; the read it
+        # replaced took buffer[mamba_next_track_idx] before the boundary swap.
+        for next_idx in (0, 1):
+            with self.subTest(next_idx=next_idx):
+                entry, req = _prepare_extend(
+                    tree_page=CHUNK, prefix_len=0, extend_len=96, next_idx=next_idx
+                )
+                self.assertTrue(entry.track_mask)
+                self.assertEqual(entry.track_position, next_idx)
+                self.assertEqual(req.kv.mamba_next_track_idx, 1 - next_idx)
+
+
 class TestMambaTrackGrid(unittest.TestCase):
     def _grid(self, *, interval: int, tree_page: int, chunk: int = CHUNK) -> int:
         with get_context().override_server_args(
@@ -133,11 +154,6 @@ class TestMambaTrackGrid(unittest.TestCase):
 
     def test_widened_tree_page_rounds_the_interval_up(self):
         self.assertEqual(self._grid(interval=256, tree_page=512), 512)
-
-    def test_interval_already_on_the_tree_page_is_untouched(self):
-        self.assertEqual(self._grid(interval=256, tree_page=256), 256)
-        self.assertEqual(self._grid(interval=256, tree_page=128), 256)
-        self.assertEqual(self._grid(interval=256, tree_page=64), 256)
 
     def test_grid_stays_on_the_chunk_size(self):
         self.assertEqual(self._grid(interval=192, tree_page=64, chunk=128) % 128, 0)

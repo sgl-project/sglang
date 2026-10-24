@@ -64,8 +64,6 @@ def _topk_gate_small_m(
     scores,
     bias,
     topk=22,
-    scoring_func="sigmoid",
-    num_fused_shared_experts=0,
     renormalize=True,
     routed_scaling_factor=1.0,
     apply_routed_scaling_factor_on_output=False,
@@ -75,7 +73,7 @@ def _topk_gate_small_m(
     assert scores.dtype == torch.float32
     assert 1 <= scores.shape[0] <= 16
     assert bias.shape == (512,) and bias.dtype == torch.float32 and bias.is_contiguous()
-    assert topk == 22 and scoring_func == "sigmoid" and num_fused_shared_experts == 0
+    assert topk == 22
     m = scores.shape[0]
     weights = torch.empty((m, 22), device=scores.device, dtype=torch.float32)
     ids = torch.empty((m, 22), device=scores.device, dtype=torch.int32)
@@ -415,7 +413,7 @@ def moe_fused_gate(
     from sglang.srt.environ import envs
 
     if (
-        envs.SGLANG_SM120_MTP_ROUTER_TOP22.get()
+        envs.SGLANG_OPT_SM120_MTP_ROUTER_TOP22.get()
         and scores.is_cuda
         and torch.cuda.get_device_capability(scores.device) == (12, 0)
         and 2 <= scores.shape[0] <= 16

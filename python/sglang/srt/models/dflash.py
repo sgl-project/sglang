@@ -369,7 +369,9 @@ class DFlashAttention(nn.Module):
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
         elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
-            from sglang.srt.speculative.dflash_utils import table_qk_norm_rope_
+            from sglang.kernels.ops.attention.table_qk_norm_rope import (
+                table_qk_norm_rope_,
+            )
 
             table_qk_norm_rope_(
                 qkv,

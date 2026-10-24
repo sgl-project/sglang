@@ -52,7 +52,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_spec, get_stream
 from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
 
 logger = logging.getLogger(__name__)
@@ -123,6 +123,22 @@ def _resolve_flash_attn_varlen_func():
             "QSA decode requires flash_attn (FA2), flash-attn-4 (FA4 cute), "
             "or aiter (ROCm) for its packed varlen fallback."
         ) from exc
+
+
+def _gather_cp_kv(
+    layer, k: torch.Tensor, v: torch.Tensor, forward_batch
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """All-gather this rank's new K/V rows into global token order."""
+    k = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim)
+    v = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
+    k_width = k.shape[1] * k.shape[2]
+    v_width = v.shape[1] * v.shape[2]
+    kv_local = torch.cat([k.flatten(1), v.flatten(1)], dim=-1)
+    kv_full = cp_materialize_global_token_order(kv_local, forward_batch)
+    k_full, v_full = kv_full.split([k_width, v_width], dim=-1)
+    k_full = k_full.reshape(-1, k.shape[1], k.shape[2]).contiguous()
+    v_full = v_full.reshape(-1, v.shape[1], v.shape[2]).contiguous()
+    return k_full, v_full
 
 
 class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
@@ -254,6 +270,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
         self._verify_mask = None
+        # (layer_id, k_full, v_full) of the prefill-CP K/V gather prefetch_cp_kv
+        # started; that layer's _forward_extend_cp joins it.
+        self._cp_kv_pending: Optional[Tuple[int, torch.Tensor, torch.Tensor]] = None
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -596,6 +615,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "mis-mapped to requests"
             )
         speculative_paged = self._is_speculative_paged_mode(forward_batch.forward_mode)
+        prefill_sequence_lengths_cpu = None
         if speculative_paged:
             logical_positions = forward_batch.positions
             if logical_positions.ndim == 2:
@@ -664,6 +684,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                         "QSA extend request mapping exceeds token rows: "
                         f"mapping={token_to_batch_idx.numel()}, "
                         f"positions={num_position_tokens}"
+                    )
+                if forward_batch.seq_lens_cpu is not None:
+                    prefill_sequence_lengths_cpu = tuple(
+                        forward_batch.seq_lens_cpu[:batch_size].tolist()
                     )
         decode_page_table = None
         decode_lengths = None
@@ -751,6 +775,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 self._can_defer_block_expansion(forward_batch.forward_mode)
                 and decode_logical_positions is not None
             ),
+            prefill_sequence_lengths_cpu=prefill_sequence_lengths_cpu,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -761,6 +786,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch):
+        if self._cp_kv_pending is not None:
+            # Left by a forward that failed before its attention: join it
+            # before this stream issues further collectives on the CP group.
+            torch.cuda.current_stream().wait_stream(get_stream("qsa_cp_kv"))
+            self._cp_kv_pending = None
         if forward_batch.forward_mode.is_idle():
             self.forward_metadata = None
             return
@@ -1532,6 +1562,22 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         return self._pad_extend_output(output, num_output_rows)
 
+    def prefetch_cp_kv(self, layer, k: torch.Tensor, v: torch.Tensor, forward_batch):
+        """Run ``layer``'s prefill-CP K/V gather on a side stream; the layer's
+        forward_extend then joins it instead of gathering inline.
+
+        Call it before the CP indexer on every rank, so the K/V gather precedes
+        the index-key gather on the CP group. ``k``/``v``
+        must be the tensors later passed to the layer's attention, unmodified:
+        the side stream reads them until that join. Stream waits in both
+        directions around the gathered K/V's reads replace record_stream."""
+        assert self._cp_kv_pending is None, "unjoined QSA CP K/V prefetch"
+        stream = get_stream("qsa_cp_kv")
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            k_full, v_full = _gather_cp_kv(layer, k, v, forward_batch)
+        self._cp_kv_pending = (layer.layer_id, k_full, v_full)
+
     def _forward_extend_cp(
         self,
         q: torch.Tensor,
@@ -1561,15 +1607,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         meta = forward_batch.attn_cp_metadata
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
-        k = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim)
-        v = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
-        k_width = k.shape[1] * k.shape[2]
-        v_width = v.shape[1] * v.shape[2]
-        kv_local = torch.cat([k.flatten(1), v.flatten(1)], dim=-1)
-        kv_full = cp_materialize_global_token_order(kv_local, forward_batch)
-        k_full, v_full = kv_full.split([k_width, v_width], dim=-1)
-        k_full = k_full.reshape(-1, k.shape[1], k.shape[2]).contiguous()
-        v_full = v_full.reshape(-1, v.shape[1], v.shape[2]).contiguous()
+        pending, self._cp_kv_pending = self._cp_kv_pending, None
+        if pending is not None:
+            torch.cuda.current_stream().wait_stream(get_stream("qsa_cp_kv"))
+            layer_id, k_full, v_full = pending
+            assert layer_id == layer.layer_id, "unjoined QSA CP K/V prefetch"
+        else:
+            k_full, v_full = _gather_cp_kv(layer, k, v, forward_batch)
+        metadata = self._resolve_metadata(forward_batch)
         if save_kv_cache:
             # out_cache_loc was trimmed to the full extend token count by
             # prepare_cp_forward; write all new tokens on every rank.
@@ -1589,15 +1634,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             pool = self.token_to_kv_pool
             k_buffer = pool.get_key_buffer(layer.layer_id)
             v_buffer = pool.get_value_buffer(layer.layer_id)
-            req_to_token = self.req_to_token_pool.req_to_token
-            req_indices = forward_batch.req_pool_indices[: meta.bs].tolist()
+            # Row i holds request i's req_to_token slots; indexing it by row
+            # avoids a device sync on req_pool_indices in every layer.
+            slot_table = metadata.token_slot_table
             k_parts, v_parts = [], []
             extend_start = 0
-            for req_idx, prefix_len, extend_len in zip(
-                req_indices, prefix_lens, extend_lens
+            for row, (prefix_len, extend_len) in enumerate(
+                zip(prefix_lens, extend_lens)
             ):
                 if prefix_len:
-                    slots = req_to_token[req_idx, :prefix_len].long()
+                    slots = slot_table[row, :prefix_len].long()
                     # QSA stores K/V without scales; casting also supports an
                     # FP8 prefix alongside the unquantized new tokens.
                     k_parts.append(k_buffer.index_select(0, slots).to(k_full.dtype))
@@ -1609,12 +1655,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             # Use gathered new K/V even when save_kv_cache=False; those rows
             # need not have been written to the cache by the caller.
             k_full, v_full = torch.cat(k_parts), torch.cat(v_parts)
-        base = [0]
-        for length in seq_lens[:-1]:
-            base.append(base[-1] + length)
         # one entry per (request, prev block) then per (request, next block);
         # the kernel reads cu_k[e] as the request's K base row only.
-        cu_k = torch.tensor(base + base, dtype=torch.int32, device=q.device)
+        # Built on device: a host list -> device copy would sync every layer.
+        device_seq_lens = metadata.sequence_lengths[: meta.bs]
+        k_base = torch.cumsum(device_seq_lens, 0, dtype=torch.int32) - device_seq_lens
+        cu_k = torch.cat([k_base, k_base])
         output = sparse_gqa_fwd_interface_triton_ck(
             q,
             k_full,
@@ -1624,7 +1670,12 @@ class QwenSparseAttnBackend(AttentionBackend):
             cu_k,
             meta.kv_len_combined_tensor,
             layer.scaling,
+            max_q=meta.max_seqlen_q_combined,
         )
+        if pending is not None:
+            # The gathered K/V live in the side stream's pool; order their
+            # release there (unmap, cudaFreeAsync) after this stream's reads.
+            get_stream("qsa_cp_kv").wait_stream(torch.cuda.current_stream())
         return self._pad_extend_output(output, num_output_rows)
 
     @staticmethod

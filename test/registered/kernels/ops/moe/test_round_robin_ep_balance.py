@@ -132,6 +132,27 @@ def test_kernel_matches_reference_on_every_shard(
         assert torch.equal(weights, torch.full_like(weights, 1.0 / topk))
 
 
+def test_kernel_masks_padded_rows_and_scales_weights():
+    tokens, real, scale = 300, 250, 1.5
+    ids = torch.zeros((tokens, TOPK), dtype=torch.int64, device="cuda")
+    weights = torch.ones((tokens, TOPK), dtype=torch.float32, device="cuda")
+    _simulate_balanced_routing(
+        ids,
+        weights,
+        NUM_EXPERTS,
+        random=False,
+        num_ranks=EP_SIZE,
+        layer_id=3,
+        num_token_non_padded=torch.tensor([real], device="cuda"),
+        weight_scale=scale,
+    )
+    expected_ids, expected_weights = _route(tokens, layer_id=3)
+    assert torch.equal(ids[:real], expected_ids[:real].long())
+    torch.testing.assert_close(weights[:real], expected_weights[:real] * scale)
+    assert torch.equal(ids[real:], torch.full_like(ids[real:], -1))
+    assert torch.equal(weights[real:], torch.zeros_like(weights[real:]))
+
+
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 300])
 @pytest.mark.parametrize("num_ranks", [4, 8, 16])
 def test_single_shard_balances_within_one_slot(num_tokens, num_ranks):

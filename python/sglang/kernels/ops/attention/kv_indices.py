@@ -1,3 +1,5 @@
+from typing import Optional
+
 import triton
 import triton.language as tl
 
@@ -16,6 +18,41 @@ def kv_indices_num_token_blocks(table_width: int, base_programs: int) -> int:
     cap = (table_width + _MIN_TOKENS_PER_BLOCK - 1) // _MIN_TOKENS_PER_BLOCK
     want = _TARGET_PROGRAMS // max(1, base_programs)
     return max(1, min(cap, want))
+
+
+# Token-block parallelism pays only on long-context servers; below this the
+# spec-decode index launches keep their historical grids.
+SPEC_KV_INDEX_BLOCKS_MIN_CONTEXT = 32768
+
+
+def spec_kv_index_token_blocks(
+    table_width: int,
+    kv_lens_sum: Optional[int],
+    batch_size: int,
+    base_programs: Optional[int] = None,
+    length_cap: Optional[int] = None,
+    context_len: Optional[int] = None,
+) -> int:
+    """Token blocks per base program for a spec-decode KV-index launch.
+
+    1 below the long-context gate (``context_len``, default ``table_width``).
+    Otherwise sized from an upper bound on the longest live row — the launch
+    time is set by the longest row, and ``kv_lens_sum`` bounds it from above
+    while still a host int (tightened by ``length_cap`` and ``table_width``,
+    which also bound any single row). Any block count is correct; it only
+    changes the parallelism.
+    """
+    gate = table_width if context_len is None else context_len
+    if gate < SPEC_KV_INDEX_BLOCKS_MIN_CONTEXT or batch_size <= 0:
+        return 1
+    if kv_lens_sum is None:
+        width = table_width
+    else:
+        width = min(kv_lens_sum, table_width)
+        if length_cap is not None:
+            width = min(width, length_cap)
+    programs = batch_size if base_programs is None else base_programs
+    return kv_indices_num_token_blocks(width, programs)
 
 
 @triton.jit

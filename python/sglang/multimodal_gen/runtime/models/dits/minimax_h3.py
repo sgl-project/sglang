@@ -134,6 +134,9 @@ def _reject_non_lora_delta_tensors(adapter: dict[str, torch.Tensor]) -> None:
         )
 
 
+# DO NOT CHANGE, MILES-D IS USING: miles_diffusion keeps a clone in
+# miles/backends/fsdp_utils/models/diffusers/h3/weight_bridge.py; change both together.
+# TODO(rockdu): load weights and update weights in one format so the clone can go.
 def _diffusers_h3_checkpoint(
     iterator: Iterable[tuple[str, torch.Tensor]],
 ) -> Iterator[tuple[str, torch.Tensor]]:

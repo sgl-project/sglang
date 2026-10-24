@@ -79,6 +79,13 @@ class RadixLinearAttention(nn.Module):
         self.dt_bias = dt_bias
         self.lower_bound = lower_bound
 
+    def refresh_conv_weights(self, weight: torch.Tensor) -> None:
+        """Rebuild the cached convolution view after replacing its parameter."""
+        if weight.dim() == 3 and weight.size(1) == 1:
+            self.conv_weights = weight.view(weight.size(0), weight.size(2))
+        else:
+            self.conv_weights = weight.squeeze() if weight.dim() > 2 else weight
+
     def forward(
         self,
         forward_batch: ForwardBatch,

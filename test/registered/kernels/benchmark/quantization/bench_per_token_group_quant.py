@@ -1,5 +1,6 @@
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_empty, create_random
+from sglang.kernels.ops.activation.activation import silu_and_mul
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
@@ -18,7 +19,7 @@ from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=25, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=35, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
 HIDDEN = 2048
@@ -73,5 +74,23 @@ def benchmark(group_size: int, layout: str, num_tokens: int, impl: str):
     )
 
 
+def _dense_activation_quant(x, fused):
+    return per_token_group_quant(
+        x if fused else silu_and_mul(x),
+        fuse_silu_and_mul=fused,
+        silu_and_mul_mode="dense" if fused else "legacy",
+        scale_ue8m0=True,
+        column_major_scales=True,
+    )
+
+
+@marker.parametrize("num_tokens", [1, 32, 128], ci_vals=[1, 32])
+@marker.benchmark("fused", [False, True])
+def benchmark_dense(num_tokens: int, fused: bool):
+    x = create_random(num_tokens, 8192)
+    return marker.do_bench(_dense_activation_quant, input_args=(x, fused))
+
+
 if __name__ == "__main__":
     benchmark.run()
+    benchmark_dense.run()

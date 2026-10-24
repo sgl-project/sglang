@@ -49,15 +49,10 @@ template <>
 struct WeightTrait<fp8_e4m3_t> {
   using packed2_t = fp8x2_e4m3_t;
   static constexpr float kMaxValue = DTypeTrait<fp8_e4m3_t>::kFloatMax;
-  // SATFINITE saturates +-inf / out-of-range values, but converts NaN to an
-  // fp8 NaN code. A single upper clamp is enough to sanitize: IEEE fminf
-  // returns the non-NaN operand, so NaN / +inf quantize to +448, and -inf
-  // passes through for SATFINITE to saturate to -448 -- non-finite inputs
-  // never reach an fp8 NaN code, matching the v1/v2/Triton kernels.
-  // CUDA-graph capture warmup runs the model on whatever the (reused,
-  // uninitialized) buffers contain, and relies on this: an fp8 NaN code would
-  // poison the downstream GEMM and trip the sampler NaN check. For finite
-  // inputs the clamp is bit-identical to bare SATFINITE.
+  // Keep the existing sanitization for FP16 and FP32 inputs. BF16 uses the
+  // saturating FP8 conversion directly so NaNs remain observable downstream.
+  // SATFINITE already saturates infinities and out-of-range finite values;
+  // the upper clamp additionally maps NaN to +448.
   SGL_DEVICE static packed2_t quant(const float2 v) {
     return packed2_t{float2{fminf(v.x, kMaxValue), fminf(v.y, kMaxValue)}};
   }
@@ -243,7 +238,8 @@ template <
     bool kUe8m0_,
     bool kRowMajor_,
     bool kAligned_,
-    bool kFuseSiluAndMul_>
+    bool kFuseSiluAndMul_,
+    bool kDenseSiluAndMul = false>
 struct QuantTrait {
   // rename
   using InputType = InputType_;
@@ -258,6 +254,7 @@ struct QuantTrait {
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
   static_assert(sizeof(InputType) == 2 || sizeof(InputType) == 4, "inputs must be 16-bit (bf16/fp16) or fp32");
   static_assert(sizeof(InputType) == 2 || !kFuseSiluAndMul, "fp32 inputs do not implement the fused silu");
+  static_assert(!kDenseSiluAndMul || (kFuseSiluAndMul && kGroupSize == 128 && std::is_same_v<QuantType, fp8_e4m3_t>));
   static_assert(16 <= kGroupSize && kGroupSize <= 256, "supported group sizes are 16..256");
   static_assert(kGroupSize % kVecSize == 0 && 1 <= kNumLanes && kNumLanes <= device::kWarpThreads);
   static_assert(!kUe8m0 || std::is_same_v<QuantType, fp8_e4m3_t>, "ue8m0 scales imply fp8 output");
@@ -307,8 +304,15 @@ struct QuantTrait {
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
         const auto gate = cast<float2>(in[i]);
-        const auto act = cast<T2>(float2{detail::silu(gate.x), detail::silu(gate.y)});
-        in[i] = __hmul2(act, up[i]);
+        if constexpr (kDenseSiluAndMul) {
+          // Match dense activation.cuh: round the product, not SiLU, to T.
+          const auto up_f32 = cast<float2>(up[i]);
+          in[i] = cast<T2>(
+              float2{(gate.x / (1.0f + expf(-gate.x))) * up_f32.x, (gate.y / (1.0f + expf(-gate.y))) * up_f32.y});
+        } else {
+          const auto act = cast<T2>(float2{detail::silu(gate.x), detail::silu(gate.y)});
+          in[i] = __hmul2(act, up[i]);
+        }
       }
     }
 
@@ -331,24 +335,34 @@ struct QuantTrait {
       scale_inv = static_cast<uint8_t>(exp);
       const float quant_scale = inv_scale_ue8m0(exp);
       const auto scale2 = cast<T2>(float2{quant_scale, quant_scale});
-      // Finite scaled values already lie in +-448 (2^exp >= amax/448), so the
-      // single __hmin2 only sanitizes NaN / +inf (it returns the non-NaN
-      // operand); -inf saturates to -448 via the SATFINITE fp8 cast (see
-      // WeightTrait<fp8_e4m3_t>).
+      // BF16 can represent the multiplier, so preserve NaNs instead of hiding
+      // them as +448. FP16 retains sanitization because its multiplier can
+      // overflow even for finite inputs (including zero * inf).
       const auto max_clip = cast<T>(kMaxValue);
       const auto max_clip2 = T2{max_clip, max_clip};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), max_clip2));
+        if constexpr (std::is_same_v<T, bf16_t>) {
+          out[i] = static_cast<Q2>(__hmin2_nan(__hmul2(in[i], scale2), max_clip2));
+        } else {
+          out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), max_clip2));
+        }
       }
     } else {
       // fp32 scale: multiply in fp32 (hmul2 brings too much precision loss)
       scale_inv = raw_scale;
-      const float quant_scale = kMaxValue / amax;
+      // Dense mode uses activation's compiler flags, but quantization must
+      // retain the fast division used by the standalone quantizer.
+      const float quant_scale = kDenseSiluAndMul ? __fdividef(kMaxValue, amax) : kMaxValue / amax;
       const float2 quant_scale2 = {quant_scale, quant_scale};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        out[i] = WTrait::quant(detail::mul2(cast<float2>(in[i]), quant_scale2));
+        const auto scaled = detail::mul2(cast<float2>(in[i]), quant_scale2);
+        if constexpr (std::is_same_v<T, bf16_t> && std::is_same_v<Q, fp8_e4m3_t>) {
+          out[i] = Q2{scaled};
+        } else {
+          out[i] = WTrait::quant(scaled);
+        }
       }
     }
 
@@ -618,9 +632,11 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
-    bool kUsePDL>
+    bool kUsePDL,
+    bool kDenseSiluAndMul = false>
 struct PerTokenGroupQuantFlatKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait =
+      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kDenseSiluAndMul>;
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     const auto ctx = build_quant_context<Trait, /*kMasked=*/false>(input, output_q, output_s);

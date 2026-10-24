@@ -172,7 +172,7 @@ def _count_active_replicated_modes(
     )
 
 
-def _prepare_sdpa_mask(
+def prepare_sdpa_mask(
     mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
     mask = mask.to(device=device)
@@ -757,20 +757,7 @@ class LocalAttention(nn.Module):
             q_ = q.transpose(1, 2)
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
-
-            if torch.is_floating_point(attn_mask):
-                mask = attn_mask.to(dtype=q_.dtype, device=q_.device)
-                if mask.dim() == 2:
-                    mask = mask[:, None, None, :]
-                elif mask.dim() == 3:
-                    mask = mask[:, None, :, :]
-            else:
-                mask = attn_mask.to(dtype=q_.dtype, device=q_.device)
-                if mask.dim() == 2:
-                    mask = mask[:, None, None, :]
-                elif mask.dim() == 3:
-                    mask = mask[:, None, :, :]
-                mask = (mask - 1.0) * torch.finfo(q_.dtype).max
+            mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
 
             if q_.shape[1] != k_.shape[1]:
                 repeat_factor = q_.shape[1] // k_.shape[1]
@@ -1269,7 +1256,7 @@ class USPAttention(nn.Module):
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
-                mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
+                mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
                 sdpa_context = (
                     sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                     if self.allow_cudnn_sdp and q_.device.type == "cuda"
@@ -1448,7 +1435,7 @@ class USPAttention(nn.Module):
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
-                mask = _prepare_sdpa_mask(
+                mask = prepare_sdpa_mask(
                     gathered_mask, dtype=q_.dtype, device=q_.device
                 )
                 sdpa_context = (
@@ -2114,7 +2101,7 @@ class USPAttention(nn.Module):
         q_ = q.transpose(1, 2)
         k_ = k.transpose(1, 2)
         v_ = v.transpose(1, 2)
-        mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
+        mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
         sdpa_context = (
             sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
             if self.allow_cudnn_sdp and q_.device.type == "cuda"

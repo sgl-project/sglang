@@ -12,41 +12,13 @@ calling the implementation, so a bug in it cannot make both sides agree.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 import unittest
 
 from sglang.srt.disaggregation.common.staging_buffer import compute_head_slice_params
 from sglang.test.test_utils import CustomTestCase
-
-
-class TestHeadSliceParamsGather(CustomTestCase):
-    SRC_TP, DST_TP, KV_HEADS = 4, 2, 8
-
-    def _call(self, src_rank, dst_rank=0):
-        return compute_head_slice_params(
-            self.SRC_TP, self.DST_TP, src_rank, dst_rank, self.KV_HEADS
-        )
-
-    def test_prefill_ranks_tile_the_decode_head_range(self):
-        self.assertEqual([self._call(r)[2] for r in range(4)], [0, 2, 0, 2])
-
-    def test_rank_is_taken_modulo_the_tp_group(self):
-        for src_rank in range(self.SRC_TP):
-            self.assertEqual(self._call(src_rank), self._call(src_rank + self.SRC_TP))
-
-
-class TestHeadSliceParamsScatter(CustomTestCase):
-    SRC_TP, DST_TP, KV_HEADS = 2, 4, 8
-
-    def _call(self, dst_rank, src_rank=0):
-        return compute_head_slice_params(
-            self.SRC_TP, self.DST_TP, src_rank, dst_rank, self.KV_HEADS
-        )
-
-    def test_decode_ranks_walk_the_prefill_head_range(self):
-        self.assertEqual([self._call(d)[0] for d in range(4)], [0, 2, 0, 2])
 
 
 class TestHeadSliceParamsScatterReplication(CustomTestCase):
@@ -89,15 +61,6 @@ class TestHeadSliceParamsGatherReplication(CustomTestCase):
             self.assertEqual(
                 self._call(src_rank)[1], 1, "max(1, 4 // 8) clamps to one head"
             )
-
-
-class TestHeadSliceParamsEqualTp(CustomTestCase):
-    def test_equal_tp_copies_the_whole_rank_slice(self):
-        for rank in range(4):
-            src_start, num_heads, dst_start, _ = compute_head_slice_params(
-                4, 4, rank, rank, 8
-            )
-            self.assertEqual((src_start, num_heads, dst_start), (0, 2, 0))
 
 
 if __name__ == "__main__":

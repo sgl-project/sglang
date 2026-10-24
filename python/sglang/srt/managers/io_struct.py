@@ -2270,6 +2270,8 @@ class PdRoleSwitchReqInput(BaseReq, kw_only=True):
     decode_cuda_graph_bs: Optional[List[int]] = None
     # Measured graph footprint from a matching decode peer.
     decode_cuda_graph_memory_gb: Optional[float] = None
+    # Internal preflight across DP workers; does not change roles.
+    prepare_only: bool = False
 
 
 class PdRoleSwitchReqOutput(BaseReq, kw_only=True):

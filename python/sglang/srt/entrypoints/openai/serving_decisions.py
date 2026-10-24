@@ -84,6 +84,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
         self.prompt_text_is_lossy = chat_serving._prompt_text_round_trip_is_lossy
         self.decision_config = self.tokenizer_manager.model_config.decision_config
         self.joint_head_config = self.tokenizer_manager.model_config.joint_head_config
+        self.pointer_head = self.tokenizer_manager.model_config.pointer_head
         tokenizer = self.tokenizer_manager.tokenizer
         # Other tokenizers skip the shortcut in _encode_labels and check the full prompt.
         self.added_tokens = (

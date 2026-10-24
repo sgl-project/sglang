@@ -18,6 +18,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
+    SparsePrefillKVBuffer,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4SingleKVPool,
@@ -43,21 +44,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDSV4CompressedPools(CustomTestCase):
-    def test_swa_key_page_size_uses_physical_paged_size(self):
-        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-        pool.request_window = None
-        pool.swa_page_size = 256
-        for physical_page_size in (256, 64):
-            with self.subTest(physical_page_size=physical_page_size):
-                pool.swa_kv_pool = SimpleNamespace(page_size=physical_page_size)
-                self.assertEqual(pool.get_swa_key_page_size(), physical_page_size)
-
-    def test_swa_key_page_size_without_paged_pool(self):
-        pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
-        pool.swa_kv_pool = None
-        pool.request_window = SimpleNamespace(page_size=256)
-        self.assertEqual(pool.get_swa_key_page_size(), 256)
-
     def test_physical_kv_pages_cover_reserved_logical_page(self):
         size = 8192
         self.assertEqual(_num_dsv4_physical_kv_pages(size, 256, 256), 33)
@@ -342,38 +328,61 @@ class TestV41KVPoolLayouts(CustomTestCase):
             self.assertEqual(view.stride(0), pool.bytes_per_page_padded)
 
     def test_v41_pool_buffers(self):
-        for option, expect in ((None, KVLayout.V41_FP4), ("fp8", KVLayout.V41)):
-            with self.subTest(compressed=option):
-                pool = self.make_pool([0, 0, 2, 1, 1], [2, 3], KVLayout.V41, option)
-                self.assert_kernel_requirements(pool.swa_kv_pool, KVLayout.V41)
-                self.assertEqual(pool.get_swa_key_bytes_per_token(), 528)
-                for ratio in (1, 2):
-                    layer_id = pool.sources_by_ratio[ratio][0]
-                    self.assertIs(pool.get_extra_key_layout(layer_id), expect)
-                    self.assertEqual(
-                        pool.get_extra_key_bytes_per_token(layer_id),
-                        expect.bytes_per_token,
-                    )
-                    self.assertTrue(is_valid_kv_layout_pair(pool.kv_layout, expect))
-                    self.assert_kernel_requirements(pool.kv_pools[ratio], expect)
-        # A pool of the fp4 layout cannot be the main cache.
-        with self.assertRaises(AssertionError):
-            self.make_pool([0], [], KVLayout.V41_FP4)
+        for main in (KVLayout.V41, KVLayout.V41_NEW):
+            for option, encoding in (
+                (None, KVLayout.V41_FP4),
+                ("fp8", KVLayout.V41),
+            ):
+                expect = encoding.with_interleaved(main.is_interleaved)
+                with self.subTest(main=main, compressed=option):
+                    pool = self.make_pool([0, 0, 2, 1, 1], [2, 3], main, option)
+                    self.assert_kernel_requirements(pool.swa_kv_pool, main)
+                    self.assertIs(pool.get_swa_key_layout(), main)
+                    self.assertEqual(pool.get_swa_key_bytes_per_token(), 528)
+                    for ratio in (1, 2):
+                        layer_id = pool.sources_by_ratio[ratio][0]
+                        self.assertIs(pool.get_extra_key_layout(layer_id), expect)
+                        self.assertEqual(
+                            pool.get_extra_key_bytes_per_token(layer_id),
+                            expect.bytes_per_token,
+                        )
+                        self.assertTrue(is_valid_kv_layout_pair(pool.kv_layout, expect))
+                        self.assert_kernel_requirements(pool.kv_pools[ratio], expect)
+        # A pool of an fp4 layout cannot be the main cache.
+        for fp4 in (KVLayout.V41_FP4, KVLayout.V41_FP4_NEW):
+            with self.assertRaises(AssertionError):
+                self.make_pool([0], [], fp4)
 
     def test_v41_pool_with_c4_c128(self):
-        pool = self.make_pool(
-            [0, 4, 128],
-            [],
-            KVLayout.V41,
-            c4_size=PAGE_SIZE,
-            c128_size=PAGE_SIZE,
-            c4_state_pool_size=16,
-            c128_state_pool_size=16,
-        )
-        for ratio in (4, 128):
-            self.assertEqual(pool.kv_pools[ratio].page_size, PAGE_SIZE // ratio)
-        # The 2-token c128 page is the only production page that pads.
-        self.assertEqual(pool.kv_pools[128].bytes_per_page_padded, 1536)
+        # The 2-token c128 page is the only production page the block-split
+        # layout pads; the interleaved one never pads.
+        for main, c128_page_bytes in ((KVLayout.V41, 1536), (KVLayout.V41_NEW, 1056)):
+            with self.subTest(main=main):
+                pool = self.make_pool(
+                    [0, 4, 128],
+                    [],
+                    main,
+                    c4_size=PAGE_SIZE,
+                    c128_size=PAGE_SIZE,
+                    c4_state_pool_size=16,
+                    c128_state_pool_size=16,
+                )
+                for ratio in (4, 128):
+                    self.assertEqual(pool.kv_pools[ratio].page_size, PAGE_SIZE // ratio)
+                    self.assertIs(pool.kv_pools[ratio].kv_layout, main)
+                self.assertEqual(
+                    pool.kv_pools[128].bytes_per_page_padded, c128_page_bytes
+                )
+
+    def test_pd_layout_names_the_arrangement(self):
+        """Prefill and decode servers must refuse to pair the two arrangements:
+        their pages have the same size, so a mismatch would read garbage."""
+        names = {
+            main: self.make_pool([0, 0, 2, 1, 1], [2, 3], main).pd_kv_layout()
+            for main in (KVLayout.V41, KVLayout.V41_NEW)
+        }
+        self.assertNotEqual(names[KVLayout.V41], names[KVLayout.V41_NEW])
+        self.assertIn("v41_fp4_new", names[KVLayout.V41_NEW])
 
     def test_pd_entries_cover_the_c4_kv_page_count(self):
         """The PD transfer walks every registered entry with the c4 KV pool's
@@ -663,6 +672,7 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         layout = window_layout(
             torch.ones(rows, dtype=torch.int64),
             torch.arange(rows),
+            zero_row=pool.request_window.zero_row,
             capacity=pool.request_window.capacity,
             num_groups=1,
         )
@@ -670,6 +680,7 @@ class TestEncoderReplayWithoutSpeculation(CustomTestCase):
         backend.token_to_kv_pool = pool
         backend.req_to_token = torch.zeros((3, 2048), dtype=torch.int32)
         backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
+        backend.sparse_prefill_kv_buffer = SparsePrefillKVBuffer(torch.device("cpu"))
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             seq_lens=torch.tensor([rows]),

@@ -9,6 +9,13 @@ from diffusers.utils import logging
 from einops import rearrange
 from torchvision.transforms import Normalize
 
+from sglang.kernels.ops.diffusion import (
+    can_use_minimax_h3_vae_denorm_clamp,
+    minimax_h3_vae_denorm_clamp,
+    minimax_h3_vae_output_device_supported,
+)
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
+
 NORM_CONFIGS = {
     "imagenet": {
         "mean": (0.485, 0.456, 0.406),
@@ -53,6 +60,20 @@ def get_denormalize_transform(
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+# Bit-exact against Normalize + clamp, so it runs at every quality level and
+# verifies itself once against the eager chain (see klvae for the blend write).
+_DENORM_FUSION = BitExactFusionGate("MiniMax-H3 VAE output denorm")
+
+
+def _denorm_kernel_candidate(tensor: torch.Tensor, gate: BitExactFusionGate) -> bool:
+    return (
+        tensor.is_cuda
+        and tensor.dtype == torch.float32
+        and not torch.is_grad_enabled()
+        and gate.can_attempt_once()
+        and minimax_h3_vae_output_device_supported(tensor.device)
+    )
 
 
 class VAEProcessor:
@@ -265,8 +286,38 @@ class VAEProcessor:
         """Undo pixel normalization, reusing storage only when ownership is explicit.
 
         Custom reverse transforms remain out-of-place unless their caller also
-        provides an in-place counterpart.
+        provides an in-place counterpart. On SM100+ one kernel replaces a
+        Normalize + clamp chain bit for bit, under the same ownership rule: in
+        place when the caller owns the frames and an in-place transform exists,
+        into a fresh buffer otherwise.
         """
+        if (
+            self.use_3d_conv
+            and isinstance(self.transform_rev, Normalize)
+            and _denorm_kernel_candidate(tensor, _DENORM_FUSION)
+        ):
+            value = tensor.unsqueeze(2) if tensor.ndim == 4 else tensor
+            mean, std = self.transform_rev.mean, self.transform_rev.std
+            in_place = runtime_owned and self.transform_rev_inplace is not None
+            out = value if in_place else None
+            if can_use_minimax_h3_vae_denorm_clamp(value, mean=mean, std=std, out=out):
+                if not _DENORM_FUSION.verified:
+                    # First sight on one frame: the kernel is elementwise and the
+                    # probe keeps the width and stride alignment of the full run,
+                    # so verifying it costs no full-size copy of the video.
+                    probe = value[:1, :, :1]
+                    _DENORM_FUSION.accept_or_fallback(
+                        minimax_h3_vae_denorm_clamp(probe, mean=mean, std=std),
+                        self._revert_tensor_eager(probe, runtime_owned=False),
+                        logger=logger,
+                    )
+                if _DENORM_FUSION.verified:
+                    return minimax_h3_vae_denorm_clamp(
+                        value, mean=mean, std=std, out=out
+                    )
+        return self._revert_tensor_eager(tensor, runtime_owned=runtime_owned)
+
+    def _revert_tensor_eager(self, tensor, *, runtime_owned):
         B, T = None, None
         if self.use_3d_conv:
             tensor = tensor.unsqueeze(2) if tensor.ndim == 4 else tensor

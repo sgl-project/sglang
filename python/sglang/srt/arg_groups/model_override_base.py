@@ -351,14 +351,10 @@ def get_default_attn_backend(server_args: Any, use_mla_backend: bool, model_conf
             return "triton"
 
 
-def _dspark_verify_on_decode_backend(
-    backend: Optional[str], q_len: int, kv_cache_dtype: Optional[str]
-) -> bool:
+def _dspark_verify_on_decode_backend(backend: Optional[str], q_len: int) -> bool:
     """Whether the MLA decode backend can serve a q_len-wide target verify."""
     if backend == "trtllm_mla":
         return True
-    if backend == "tokenspeed_mla":
-        return kv_cache_dtype == "fp8_e4m3" and q_len <= 8
     if backend == "cutedsl_mla":
         # cute-dsl monolithic MLA decode folds the verify tokens into the head
         # dim (fold_sq), so it serves any DSPARK verify width. Needs flashinfer

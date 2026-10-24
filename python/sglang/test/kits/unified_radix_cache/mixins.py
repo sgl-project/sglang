@@ -11,11 +11,14 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
+    InitLoadBackParams,
     InsertParams,
+    MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ComponentType,
+    EvictLayer,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -73,9 +76,8 @@ class UnifiedRadixCacheFixtures:
         if not (self.cfg.has_swa and self.cfg.page_size > 1):
             return allocator.alloc(need_size)
 
-        # SWATokenToKVPoolAllocator.alloc() asserts page_size == 1, and
-        # alloc_extend() requires batch tensors unsuitable for unit tests.
-        # Replicate alloc_extend's core logic here.
+        # The SWA allocator's alloc asserts page_size == 1 and alloc_extend needs
+        # batch tensors, so replicate alloc_extend's core logic.
         ps = self.cfg.page_size
         aligned = ((need_size + ps - 1) // ps) * ps
         if aligned > allocator.full_attn_allocator.available_size():
@@ -195,9 +197,8 @@ class UnifiedRadixCacheFixtures:
         if storage_backend == "file":
             from sglang.srt.runtime_context import get_parallel
 
-            # The file-backend storage config records TP/PP rank/size. These unit
-            # fixtures run without initializing distributed parallel state, so
-            # force the local single-rank topology the fixture represents.
+            # Distributed state is not initialized in unit fixtures; force the
+            # local single-rank topology.
             parallel_override = get_parallel().override(
                 tp_rank=0, tp_size=1, pp_rank=0, pp_size=1
             )
@@ -216,7 +217,6 @@ class UnifiedRadixCacheFixtures:
                 extra.update(storage_extra)
             storage_extra_config = json.dumps(extra) if extra else None
 
-        # See _init_hicache: production kernel IO backend, pinned pools.
         server_args = ServerArgs(
             model_path="dummy",
             page_size=self.cfg.page_size,
@@ -228,7 +228,6 @@ class UnifiedRadixCacheFixtures:
             hicache_host_memory_mode=host_memory_mode,
             context_length=context_length,
         )
-        # See build_fixture for why _mamba_cache_chunk_size is preset.
         server_args._mamba_cache_chunk_size = max(FLA_CHUNK_SIZE, self.cfg.page_size)
         set_global_server_args_for_scheduler(server_args)
         cache.init_hicache(server_args, cache.cache_init_params)
@@ -237,15 +236,12 @@ class UnifiedRadixCacheFixtures:
         cache.write_through_threshold = 1 << 30
         cache.load_back_threshold = 0
         if storage_backend is not None:
-            # Unit fixtures size host/device pools equally, which makes the
-            # production prefetch capacity limit (host - device) zero.  Keep the
-            # L3 tests focused on storage round trips by allowing one fixture
-            # worth of prefetch tokens.
+            # Fixtures size host and device pools equally, which zeroes the
+            # prefetch capacity limit; allow one fixture of prefetch tokens.
             cache.cache_controller.prefetch_capacity_limit = max(
                 cache.cache_controller.prefetch_capacity_limit,
                 cache.cache_controller.mem_pool_host.size,
             )
-            # Background prefetch/backup threads are daemon; stop them per-test.
             self.addCleanup(cache.cache_controller._stop_storage_threads)
 
     def _build_hicache_fixture(self, tree_core_backend: Optional[str] = None):
@@ -307,10 +303,9 @@ class UnifiedRadixCacheFixtures:
         )
 
     def _build_chain_pages(self, cache, allocator, req_to_token_pool, num_pages):
-        """Insert an incremental chain of single-page extensions.
+        """Insert a chain of single-page extensions; return it root-to-leaf.
 
-        Returns the chain root-to-leaf. Length may differ from num_pages
-        when the radix tree merges or splits nodes.
+        The length may differ from num_pages when the tree merges or splits nodes.
         """
         seq: list[int] = []
         for i in range(num_pages):
@@ -340,6 +335,31 @@ class UnifiedRadixCacheFixtures:
             ack.finish_event.synchronize()
         cache.loading_check()
 
+    def _evict_device_component(self, cache, node, component_type):
+        """Evict one node's device value of one component, as the eviction
+        walk does for the victim it picks."""
+        result = cache.tree_core.evict_component(
+            node, component_type, EvictLayer.DEVICE
+        )
+        cache._free_values(result.device_frees, result.host_frees)
+
+    def _load_back_through_admission(self, cache, req_to_token_pool, tokens):
+        """Match ``tokens`` and start the scheduler's load-back of the host
+        hit. The load-back holds its path lock until it is released."""
+        req = self._make_req(req_to_token_pool)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self._apply_match_to_req(req, match)
+        cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=req.host_hit_length,
+                req=req,
+            )
+        )
+        return req
+
     def _match_tokens_for_chain(self, cache, chain):
         tokens: list[int] = []
         for node in chain:
@@ -363,9 +383,7 @@ class UnifiedRadixCacheFixtures:
         )
 
     def _swa_finalize_setup(self):
-        """Build a SWA chain long enough to fill at least the window
-        plus one extra page, and host-back every node so we can flip
-        SWA tombstones at will."""
+        """Build a SWA chain longer than the window, host-backed at every node."""
         ps = self.cfg.page_size
         sw = self.cfg.sliding_window_size
         window_pages = (sw + ps - 1) // ps

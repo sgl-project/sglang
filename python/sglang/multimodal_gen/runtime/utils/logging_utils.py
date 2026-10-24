@@ -217,8 +217,6 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
 
     logger = logging.getLogger(name)
 
-    server_log_level = logger.getEffectiveLevel()
-
     # Patch instance methods
     setattr(logger, "info_once", MethodType(_print_info_once, logger))
     setattr(logger, "warning_once", MethodType(_print_warning_once, logger))
@@ -237,7 +235,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
             **kwargs: Any,
         ) -> None:
             _log_process_aware(
-                server_log_level,
+                self.getEffectiveLevel(),
                 level,
                 self,
                 msg,
@@ -302,6 +300,8 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
         if key_hint in ("prompt", "negative_prompt"):
             if isinstance(obj, str):
                 return f"<redacted, len={len(obj)}>"
+        if isinstance(obj, str) and obj.startswith("data:"):
+            return f"<inline media, len={len(obj)}>"
         return obj
 
     if isinstance(obj, Enum):
