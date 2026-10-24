@@ -584,6 +584,9 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         req.set_finish_with_abort.assert_called_once()
         self.assertIn("compile error", req.set_finish_with_abort.call_args[0][0])
+        mgr.grammar_backend.set_cache.assert_called_once_with(
+            ("json", "bad"), invalid_copy
+        )
 
     def test_aborted_req_removed_from_queue(self):
         mgr = self._make_mgr()
@@ -614,11 +617,26 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         req.set_finish_with_abort.assert_called_once()
         self.assertIn("timed out", req.set_finish_with_abort.call_args[0][0])
-        # Cache should store InvalidGrammarObject for timeout
-        mgr.grammar_backend.set_cache.assert_called_once()
-        cached_key, cached_val = mgr.grammar_backend.set_cache.call_args[0]
-        self.assertEqual(cached_key, ("json", "slow"))
-        self.assertIsInstance(cached_val, InvalidGrammarObject)
+
+    def test_timeout_does_not_poison_cache(self):
+        """A grammar that times out once must not abort later requests with the same schema."""
+        mgr = self._make_mgr()
+        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 1
+        backend = BaseGrammarBackend()
+        # Compiles never finish, so every request for the key times out.
+        backend.executor = MagicMock()
+        backend.executor.submit.side_effect = lambda *args: Future()
+        mgr.grammar_backend = backend
+
+        req1 = _make_req(json_schema="slow", rid="r1")
+        self.assertTrue(mgr.process_req_with_grammar(req1))
+        mgr.get_ready_grammar_requests()
+        req1.set_finish_with_abort.assert_called_once()
+        self.assertIn("timed out", req1.set_finish_with_abort.call_args[0][0])
+
+        req2 = _make_req(json_schema="slow", rid="r2")
+        self.assertTrue(mgr.process_req_with_grammar(req2))
+        req2.set_finish_with_abort.assert_not_called()
 
     def test_pending_future_stays_in_queue(self):
         """Futures that aren't done stay in the queue."""
