@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,50 @@ from sglang_simulator.time_predictor.infercast_dspark import (
 
 def raw(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def mock_config_link(monkeypatch, source, target):
+    """Model link resolution deterministically on hosts without symlink privilege."""
+    original_resolve, original_lstat, original_readlink = (
+        Path.resolve,
+        Path.lstat,
+        Path.readlink,
+    )
+    state = {"target": target}
+
+    def resolve(path, *args, **kwargs):
+        if path == source:
+            return original_resolve(state["target"], *args, **kwargs)
+        return original_resolve(path, *args, **kwargs)
+
+    def lstat(path, *args, **kwargs):
+        result = original_lstat(path, *args, **kwargs)
+        if path != source:
+            return result
+        fields = {
+            name: getattr(result, name)
+            for name in (
+                "st_dev",
+                "st_ino",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        }
+        return NS(**fields, st_mode=stat.S_IFLNK | 0o777)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setattr(
+        Path,
+        "readlink",
+        lambda path: (
+            Path(os.path.relpath(state["target"], source.parent))
+            if path == source
+            else original_readlink(path)
+        ),
+    )
+    return state
 
 
 @pytest.fixture
@@ -597,18 +642,193 @@ def test_local_checkpoint_config_is_required_and_bounded(factory, fault):
     assert not factory.calls["open"] and not factory.calls["progress"]
 
 
-def test_local_checkpoint_symlink_guard_is_checked_without_device_imports(
-    factory, monkeypatch
+def test_default_model_root_preserves_regular_file_binding_metadata(factory):
+    reference = factory.build().get_metrics()["infercast_dspark"]["native_model_config"]
+    source = factory.native_config_path
+    assert reference["path"] == str(source)
+    assert reference["resolved_path"] == str(source.resolve())
+    assert reference["root"] == str(source.parent.resolve())
+    assert reference["size_bytes"] == source.stat().st_size
+    assert reference["target_stat"]["st_ino"] == source.stat().st_ino
+    assert reference["source_stat"] == reference["target_stat"]
+    assert reference["stable_binding"] is True and reference["link_target"] is None
+
+
+@pytest.mark.parametrize("value", ["", " ", False, 1, [], {}])
+def test_invalid_model_config_root_fails_before_reader_seams(factory, value):
+    with pytest.raises(PredictorError, match="model_config_root"):
+        factory.build(model_config_root=value)
+    assert not factory.calls["config"] and not factory.calls["open"]
+
+
+@pytest.mark.parametrize("fault", ["missing", "file", "outside"])
+def test_model_config_root_must_contain_existing_model_directory(
+    factory, tmp_path, fault
 ):
-    original = Path.is_symlink
-    monkeypatch.setattr(
-        Path,
-        "is_symlink",
-        lambda path: path == factory.native_config_path or original(path),
-    )
-    with pytest.raises(PredictorError, match="without a symlink"):
+    root = tmp_path / fault
+    if fault == "file":
+        root.write_bytes(b"not a directory")
+    elif fault == "outside":
+        root.mkdir()
+    with pytest.raises(PredictorError):
+        factory.build(model_config_root=str(root))
+    assert not factory.calls["open"] and not factory.calls["progress"]
+
+
+@pytest.mark.parametrize("explicit_root", [False, True])
+def test_internal_config_link_is_supported_without_guessing_cache_layout(
+    factory, monkeypatch, explicit_root
+):
+    source = factory.native_config_path
+    target = source.with_name("source-config.json")
+    target.write_bytes(source.read_bytes())
+    mock_config_link(monkeypatch, source, target)
+    kwargs = {"model_config_root": str(source.parent)} if explicit_root else {}
+    reference = factory.build(**kwargs).get_metrics()["infercast_dspark"][
+        "native_model_config"
+    ]
+    assert reference["path"] == str(source)
+    assert reference["resolved_path"] == str(target)
+    assert reference["link_target"] == "source-config.json"
+    assert reference["stable_binding"] is True
+
+
+@pytest.fixture
+def hf_cache_link(factory, tmp_path, monkeypatch):
+    cache = tmp_path / "hf-cache"
+    snapshot = cache / "snapshots" / "revision"
+    snapshot.mkdir(parents=True)
+    blobs = cache / "blobs"
+    blobs.mkdir()
+    content = factory.native_config_path.read_bytes()
+    target = blobs / "verified-hash"
+    target.write_bytes(content)
+    source = snapshot / "config.json"
+    source.write_bytes(content)
+    factory.model.model_path = str(snapshot)
+    factory.native_config_path = source
+    state = mock_config_link(monkeypatch, source, target)
+    return NS(root=cache, source=source, target=target, state=state)
+
+
+def test_hf_cache_link_needs_explicit_containing_root(factory, hf_cache_link):
+    with pytest.raises(PredictorError, match="escapes model_config_root"):
         factory.build()
     assert not factory.calls["open"] and not factory.calls["progress"]
+    reference = factory.build(model_config_root=str(hf_cache_link.root)).get_metrics()[
+        "infercast_dspark"
+    ]["native_model_config"]
+    assert reference["path"] == str(hf_cache_link.source)
+    assert reference["resolved_path"] == str(hf_cache_link.target)
+    assert reference["root"] == str(hf_cache_link.root)
+    assert Path(reference["link_target"]).as_posix() == "../../blobs/verified-hash"
+    assert (
+        reference["sha256"]
+        == hashlib.sha256(hf_cache_link.target.read_bytes()).hexdigest()
+    )
+
+
+@pytest.mark.parametrize("fault", ["escape", "dangling", "directory", "oversized"])
+def test_hf_config_link_target_must_be_contained_bounded_and_regular(
+    factory, hf_cache_link, tmp_path, fault
+):
+    if fault == "escape":
+        target = tmp_path / "outside.json"
+        target.write_bytes(hf_cache_link.target.read_bytes())
+        hf_cache_link.state["target"] = target
+    elif fault == "dangling":
+        hf_cache_link.target.unlink()
+    elif fault == "directory":
+        hf_cache_link.target.unlink()
+        hf_cache_link.target.mkdir()
+    else:
+        with hf_cache_link.target.open("wb") as stream:
+            stream.truncate(64 * 1024**2 + 1)
+    with pytest.raises(PredictorError):
+        factory.build(model_config_root=str(hf_cache_link.root))
+    assert not factory.calls["open"] and not factory.calls["progress"]
+
+
+@pytest.mark.parametrize("fault", ["retarget", "replace", "modify"])
+def test_config_link_and_target_must_remain_stable_through_native_binding(
+    factory, hf_cache_link, fault
+):
+    target = hf_cache_link.target
+    replacement = target.with_name("replacement")
+    replacement.write_bytes(target.read_bytes())
+    native = copy.deepcopy(factory.model.hf_config)
+
+    def native_config():
+        if fault == "retarget":
+            hf_cache_link.state["target"] = replacement
+        elif fault == "replace":
+            replacement.replace(target)
+        else:
+            target.write_bytes(target.read_bytes() + b"\n")
+        return native
+
+    factory.model.hf_config = NS(to_dict=native_config)
+    with pytest.raises(PredictorError, match="changed during native binding"):
+        factory.build(model_config_root=str(hf_cache_link.root))
+    assert not factory.calls["open"] and not factory.calls["progress"]
+
+
+@pytest.mark.parametrize("fault", ["opened_another_file", "changed_during_read"])
+def test_open_descriptor_identity_and_read_stability_are_checked(
+    factory, monkeypatch, fault
+):
+    original_fstat = os.fstat
+    calls = []
+
+    def fstat(descriptor):
+        value = original_fstat(descriptor)
+        calls.append(descriptor)
+        fields = {
+            name: getattr(value, name)
+            for name in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        }
+        if fault == "opened_another_file" and len(calls) == 1:
+            fields["st_ino"] += 1
+        elif fault == "changed_during_read" and len(calls) == 2:
+            fields["st_size"] += 1
+        return NS(**fields)
+
+    monkeypatch.setattr(os, "fstat", fstat)
+    with pytest.raises(
+        PredictorError, match="changed before read|changed during bounded"
+    ):
+        factory.build()
+    assert not factory.calls["open"] and not factory.calls["progress"]
+
+
+@pytest.mark.parametrize("layout", ["internal", "hf_cache"])
+def test_real_model_config_symlink_layout(factory, tmp_path, layout):
+    source = factory.native_config_path
+    target = (
+        source.with_name("config-source.json")
+        if layout == "internal"
+        else tmp_path / "blobs" / "config-source"
+    )
+    target.parent.mkdir(exist_ok=True)
+    target.write_bytes(source.read_bytes())
+    source.unlink()
+    try:
+        source.symlink_to(os.path.relpath(target, source.parent))
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    root = None if layout == "internal" else str(tmp_path)
+    reference = factory.build(model_config_root=root).get_metrics()["infercast_dspark"][
+        "native_model_config"
+    ]
+    assert reference["resolved_path"] == str(target.resolve())
+    assert reference["path"] == str(source) and reference["stable_binding"]
 
 
 @pytest.mark.parametrize(

@@ -3,7 +3,9 @@
 import copy
 import hashlib
 import json
+import os
 import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -86,7 +88,116 @@ def _canonical_config(value):
     ).encode("utf-8")
 
 
-def _bind_local_model_config(model, authoritative):
+def _file_metadata(value):
+    return {
+        name: getattr(value, name)
+        for name in (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+    }
+
+
+def _local_config_bytes(model_path, model_config_root):
+    """Read a bounded config within an explicit root and verify read stability."""
+    model_dir = Path(model_path).absolute()
+    root = Path(model_config_root).absolute()
+    source = model_dir / "config.json"
+
+    def snapshot():
+        anchor = root.resolve(strict=True)
+        model = model_dir.resolve(strict=True)
+        anchor_stat, model_stat = anchor.stat(), model.stat()
+        _require(
+            stat.S_ISDIR(anchor_stat.st_mode) and stat.S_ISDIR(model_stat.st_mode),
+            "model_config_root and local model path must be existing directories",
+            code="incompatible_runtime",
+        )
+        _require(
+            model.is_relative_to(anchor),
+            "local model directory escapes model_config_root",
+            code="incompatible_runtime",
+        )
+        target = source.resolve(strict=True)
+        _require(
+            target.is_relative_to(anchor),
+            "resolved local model config escapes model_config_root",
+            code="incompatible_runtime",
+        )
+        source_stat, target_stat = source.lstat(), target.lstat()
+        _require(
+            stat.S_ISREG(target_stat.st_mode) and target_stat.st_size <= 64 * 1024**2,
+            "resolved local model config must be a bounded regular file",
+            code="incompatible_runtime",
+        )
+
+        # Directory contents may change independently in a shared HF cache.
+        # Bind directory identity and link resolution, not directory mtimes.
+        def directory_identity(path, resolved_stat):
+            value = path.lstat()
+            return {
+                "requested_identity": [value.st_dev, value.st_ino, value.st_mode],
+                "resolved_identity": [
+                    resolved_stat.st_dev,
+                    resolved_stat.st_ino,
+                    resolved_stat.st_mode,
+                ],
+                "link_target": str(path.readlink())
+                if stat.S_ISLNK(value.st_mode)
+                else None,
+            }
+
+        return {
+            "path": str(source),
+            "resolved_path": str(target),
+            "requested_root": str(root),
+            "root": str(anchor),
+            "resolved_model_dir": str(model),
+            "root_identity": directory_identity(root, anchor_stat),
+            "model_dir_identity": directory_identity(model_dir, model_stat),
+            "source_stat": _file_metadata(source_stat),
+            "target_stat": _file_metadata(target_stat),
+            "link_target": str(source.readlink())
+            if stat.S_ISLNK(source_stat.st_mode)
+            else None,
+        }
+
+    before = snapshot()
+    with Path(before["resolved_path"]).open("rb") as stream:
+        opened = _file_metadata(os.fstat(stream.fileno()))
+        _require(
+            # Windows path stat and descriptor fstat can expose different
+            # ctime meanings. Compare ctime within each API below; cross-check
+            # file identity, mode, size and mtime across the opened descriptor.
+            all(
+                opened[name] == before["target_stat"][name]
+                for name in opened
+                if name != "st_ctime_ns"
+            ),
+            "local model config target changed before read",
+            code="incompatible_runtime",
+        )
+        raw = stream.read(64 * 1024**2 + 1)
+        _require(
+            len(raw) <= 64 * 1024**2
+            and len(raw) == opened["st_size"]
+            and _file_metadata(os.fstat(stream.fileno())) == opened,
+            "local model config changed during bounded read",
+            code="incompatible_runtime",
+        )
+    _require(
+        snapshot() == before,
+        "local model config path or target changed during read",
+        code="incompatible_runtime",
+    )
+    return raw, {**before, "read_stat": opened}
+
+
+def _bind_local_model_config(model, authoritative, model_config_root=None):
     """Bind local checkpoint bytes and native HF text fields to SDK source JSON."""
     path = getattr(model, "model_path", None)
     _require(
@@ -94,25 +205,16 @@ def _bind_local_model_config(model, authoritative):
         "DSPark requires an explicit local model.model_path",
         code="incompatible_runtime",
     )
-    root = Path(path)
-    source = root / "config.json"
+    _require(
+        model_config_root is None
+        or type(model_config_root) is str
+        and bool(model_config_root.strip()),
+        "model_config_root must be None or an explicit nonempty path",
+        code="incompatible_runtime",
+    )
+    root = path if model_config_root is None else model_config_root
     try:
-        _require(
-            root.is_dir()
-            and not root.is_symlink()
-            and source.is_file()
-            and not source.is_symlink()
-            and source.stat().st_size <= 64 * 1024**2,
-            "local model config must be a bounded regular file without a symlink",
-            code="incompatible_runtime",
-        )
-        with source.open("rb") as stream:
-            raw = stream.read(64 * 1024**2 + 1)
-        _require(
-            len(raw) <= 64 * 1024**2,
-            "local model config exceeds its byte bound",
-            code="incompatible_runtime",
-        )
+        raw, binding = _local_config_bytes(path, root)
 
         def unique(pairs):
             result = {}
@@ -237,16 +339,31 @@ def _bind_local_model_config(model, authoritative):
                 "native HF expert dtype differs from SDK source",
                 code="incompatible_runtime",
             )
+        final_raw, final_binding = _local_config_bytes(path, root)
+        _require(
+            final_binding == binding and final_raw == raw,
+            "local model config path or target changed during native binding",
+            code="incompatible_runtime",
+        )
         return {
-            "path": str(source.resolve(strict=True)),
+            **binding,
             "sha256": hashlib.sha256(raw).hexdigest(),
+            "size_bytes": len(raw),
+            "stable_binding": True,
             "sdk_canonical_sha256": hashlib.sha256(
                 _canonical_config(authoritative)
             ).hexdigest(),
         }
     except PredictorError:
         raise
-    except (ImportError, OSError, UnicodeError, ValueError, TypeError) as error:
+    except (
+        ImportError,
+        OSError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        RuntimeError,
+    ) as error:
         raise PredictorError(
             "incompatible_runtime", f"local/native model config is unsupported: {error}"
         ) from error
@@ -322,6 +439,7 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
         progress_artifact=None,
         proposal_profile_id=None,
         output_token_id=1,
+        model_config_root=None,
         **kwargs,
     ):
         _require(
@@ -375,6 +493,12 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             "systems_root must be explicit",
         )
         _require(
+            model_config_root is None
+            or type(model_config_root) is str
+            and bool(model_config_root.strip()),
+            "model_config_root must be None or an explicit nonempty path",
+        )
+        _require(
             proposal_profile_id is None
             or type(proposal_profile_id) is str
             and re.fullmatch("[0-9a-f]{64}", proposal_profile_id) is not None,
@@ -418,7 +542,9 @@ class InferCastDSparkTimePredictor(InferTimePredictor):
             authoritative = load_model_config(
                 model_id, allow_download=False, revision=model_revision
             )
-            model_config_ref = _bind_local_model_config(model, authoritative)
+            model_config_ref = _bind_local_model_config(
+                model, authoritative, model_config_root=model_config_root
+            )
             description = build_model_description(
                 model_id,
                 backend="sglang",

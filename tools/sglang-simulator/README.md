@@ -134,12 +134,22 @@ factory currently prepares only the existing proposal module; complete prefill
 and decode phases remain explicit data gaps. Constructing it does not establish
 a complete runnable cost model, source resolver or accuracy admission.
 
+For a HuggingFace snapshot whose `config.json` links into the cache's blob
+directory, set `model_config_root` to the explicit containing checkpoint/cache
+root. Both the requested checkpoint and resolved config must remain inside it.
+Without this option, the checkpoint directory is the bound. Binding preserves
+the requested and resolved paths, checks bounded regular-file bytes against the
+SDK source, and rejects link or target changes during native config binding.
+It does not rewrite or materialize the cache. This root path also resolves from
+the simulation configuration directory.
+
 ```json
 {
   "name": "infercast_dspark",
   "model_id": "deepseek-ai/DeepSeek-V4.1-Flash",
   "model_revision": "5254448103b6254fc646dacbca1cbbf20e9216c1",
   "provider_revision": "<installed InferCast full commit>",
+  "model_config_root": "../checkpoint-cache",
   "systems_root": "../systems",
   "runtime_profile": {"path": "runtime.json", "sha256": "<file SHA-256>"},
   "progress_artifact": {"path": "progress.json", "sha256": "<file SHA-256>"},

@@ -17,6 +17,7 @@ def config():
             "model_id": "deepseek-ai/DeepSeek-V4.1-Flash",
             "model_revision": "a" * 40,
             "provider_revision": "b" * 40,
+            "model_config_root": "model-cache",
             "systems_root": "systems",
             "runtime_profile": {"path": "runtime.json", "sha256": "c" * 64},
             "progress_artifact": {"path": "progress.json", "sha256": "d" * 64},
@@ -59,6 +60,7 @@ def test_json_factory_uses_config_directory_and_preserves_original(
     assert result.model is model and result.hw is hw and result.config is scheduler
     assert result.system == "MI355X"
     assert result.systems_root == str((folder / "systems").resolve())
+    assert result.model_config_root == str((folder / "model-cache").resolve())
     assert result.runtime_profile == {
         "path": str((folder / "runtime.json").resolve()),
         "sha256": "c" * 64,
@@ -85,3 +87,14 @@ def test_malformed_asset_is_passed_to_predictor_validator_not_repaired(factory):
     result = ConfigManager.get_inference_time_predictor(None, None, None)
     assert result.runtime_profile == {"sha256": "c" * 64}
     assert calls == [result]
+
+
+def test_model_config_root_is_optional_and_malformed_values_are_not_repaired(factory):
+    calls, raw, _ = factory
+    raw["predictor"].pop("model_config_root")
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert not hasattr(result, "model_config_root")
+    raw["predictor"]["model_config_root"] = 123
+    result = ConfigManager.get_inference_time_predictor(None, None, None)
+    assert result.model_config_root == 123
+    assert calls[-1] is result

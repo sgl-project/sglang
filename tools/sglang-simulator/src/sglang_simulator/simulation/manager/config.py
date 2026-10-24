@@ -292,6 +292,7 @@ class ConfigManager:
                 "model_id",
                 "model_revision",
                 "provider_revision",
+                "model_config_root",
                 "systems_root",
                 "runtime_profile",
                 "progress_artifact",
@@ -310,6 +311,10 @@ class ConfigManager:
             options["systems_root"] = cls.resolve_infercast_path(
                 options.get("systems_root")
             )
+            if type(options.get("model_config_root")) is str:
+                options["model_config_root"] = cls.resolve_infercast_path(
+                    options["model_config_root"]
+                )
             for key in ("runtime_profile", "progress_artifact"):
                 ref = options.get(key)
                 if isinstance(ref, dict) and type(ref.get("path")) is str:
