@@ -57,10 +57,7 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.speculative.ragged_verify import (
-    build_ragged_target_verify_geometry,
-    resolve_ragged_verify_layout,
-)
+from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.utils import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
@@ -773,7 +770,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info,
         device: torch.device,
-        ragged_verify_layout=None,
+        *,
+        ragged_verify_layout: Optional[RaggedVerifyLayout],
     ) -> TRTLLMMHAMetadata:
         """Create TRTLLMMHAMetadata with pre-allocated buffer slice refs, stored in the dict."""
         metadata = TRTLLMMHAMetadata()
@@ -902,7 +900,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
-        ragged_verify_layout=None,
+        *,
+        ragged_verify_layout: Optional[RaggedVerifyLayout],
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -1066,7 +1065,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if (
             forward_mode.is_target_verify()
-            and resolve_ragged_verify_layout(forward_batch) is not None
+            and forward_batch.ragged_verify_layout is not None
         ):
             self._assert_ragged_verify_supported()
 
@@ -1078,14 +1077,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_mode,
                 spec_info,
                 forward_batch.seq_lens.device,
-                ragged_verify_layout=resolve_ragged_verify_layout(forward_batch),
+                ragged_verify_layout=forward_batch.ragged_verify_layout,
             )
 
         if forward_mode.is_decode_or_idle():
             self.forward_metadata = self.decode_cuda_graph_metadata[bs]
         elif forward_mode.is_target_verify():
             self.forward_metadata = self.target_verify_metadata[bs]
-            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            ragged_layout = forward_batch.ragged_verify_layout
             if ragged_layout is not None:
                 self._write_ragged_verify_graph_metadata(
                     self.forward_metadata,
@@ -1195,7 +1194,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
-            ragged_verify_layout=resolve_ragged_verify_layout(forward_batch),
+            ragged_verify_layout=forward_batch.ragged_verify_layout,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -1232,7 +1231,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
         elif forward_batch.forward_mode.is_target_verify():
-            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            ragged_layout = forward_batch.ragged_verify_layout
             if ragged_layout is not None:
                 self._assert_ragged_verify_supported()
                 geometry = build_ragged_target_verify_geometry(

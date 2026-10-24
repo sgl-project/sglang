@@ -185,6 +185,7 @@ class TestFa3VerifyReadsTheDraftTail(CustomTestCase):
                 ForwardMode.TARGET_VERIFY,
                 SimpleNamespace(),
                 live,
+                ragged_verify_layout=None,
             )
             self.assertTrue(
                 torch.equal(

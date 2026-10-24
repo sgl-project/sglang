@@ -626,7 +626,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
-    # Per-request target-verify geometry; read via resolve_ragged_verify_layout().
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
     # === Derived from ScheduleBatch.reqs ===

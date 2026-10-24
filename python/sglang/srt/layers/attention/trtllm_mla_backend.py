@@ -75,7 +75,6 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
@@ -1547,7 +1546,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq_len = metadata.max_seq_len_k + (
                     0 if dcp_enabled else draft_token_num
                 )
-                ragged_layout = resolve_ragged_verify_layout(forward_batch)
+                ragged_layout = forward_batch.ragged_verify_layout
                 if ragged_layout is None or dcp_enabled:
                     q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
                     needs_unpad = False

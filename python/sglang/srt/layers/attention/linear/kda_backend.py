@@ -51,7 +51,6 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_cache_chunk_size,
 )
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 
 
 def _validate_flashinfer_kda_prefill(
@@ -1281,7 +1280,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
-        ragged_layout = resolve_ragged_verify_layout(forward_batch)
+        ragged_layout = forward_batch.ragged_verify_layout
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,

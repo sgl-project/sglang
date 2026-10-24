@@ -216,11 +216,6 @@ def build_capture_verify_lens(
     return [base + 1] * rem + [base] * (num_slots - rem)
 
 
-def resolve_ragged_verify_layout(forward_batch) -> Optional[RaggedVerifyLayout]:
-    """Canonical read of the batch's verify layout (ForwardBatch field)."""
-    return forward_batch.ragged_verify_layout
-
-
 class RaggedTargetVerifyGeometry(msgspec.Struct):
     cache_seqlens_int32: torch.Tensor
     cu_seqlens_q: torch.Tensor

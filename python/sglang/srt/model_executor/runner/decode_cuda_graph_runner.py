@@ -118,7 +118,6 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -848,7 +847,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
 
         ragged_layout = (
-            resolve_ragged_verify_layout(forward_batch)
+            forward_batch.ragged_verify_layout
             if self.ragged_verify_mode
             else None
         )
@@ -1534,7 +1533,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "Diffusion graph replay requires prepared input embeddings"
             )
         ragged_layout = (
-            resolve_ragged_verify_layout(forward_batch)
+            forward_batch.ragged_verify_layout
             if self.ragged_verify_mode
             else None
         )
