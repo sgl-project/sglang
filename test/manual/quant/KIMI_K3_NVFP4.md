@@ -47,4 +47,14 @@ The handoff test checks consume-once behavior, scale/layout identity and fallbac
 
 Historical measurements came from earlier experimental branches: routing/quant improved 8k/B1 no-spec decode from101.89 to104.81 tok/s; Cake+CuTe improved fixed-acceptance decode by2.68–4.57% and one128k cached-prefill case from2221.9 to762.5ms. A later BF16-KV/DCP8 comparison improved128k cached-prefill from705.1 to557.6ms with MHA+BCG and then496.1ms with KV CUTLASS. These are separate experiments, not additive gains or results for this exact branch/FP8-KV/DCP1 configuration.
 
-FP8-KV/DCP1 BCG MHA validation is in progress. Startup and padded graph replay succeeded after matching KV write locations to the real token count; the five row/metadata regression checks passed. Cached retrieval passed 6/6 cases at 8k and 6/6 at 32k with natural DFlash acceptance. Full quality and matched performance comparisons are pending; this option remains disabled by default.
+FP8-KV/DCP1 BCG MHA validation: startup and padded graph replay succeeded after matching KV write locations to the real token count; the five row/metadata regression checks passed. On B300x8 TP8, with Modal DFlash block8 and natural acceptance, cached retrieval passed 18/18 for both eager MHA and BCG MHA. BCG MHA scored 196/200 on GSM8K; eager-MHA GSM8K is still pending. This option remains disabled by default.
+
+The following isolated B1 prefill measurements use the PR attention changes through `fb7830c269`, with route/quant and KV CUTLASS enabled in both arms. The only arm differences are the prefill graph backend (disabled versus breakable) and `SGLANG_K3_BCG_MHA` (0 versus 1). Each median uses three formal repetitions after two discarded repetitions. Prompt hashes and actual cached counts match. The timer is `bench_one_batch_server` with OSL1; these are not decode or PD measurements.
+
+| Input tokens | Cached tokens | Hit rate | Extend tokens | Eager MHA (ms) | BCG MHA (ms) | BCG extend tokens/s |
+|---|---|---|---|---|---|---|
+| 8192 | 7680 | 93.75% | 512 | 303.8 | 98.3 | 5208.5 |
+| 32768 | 31232 | 95.31% | 1536 | 316.9 | 175.7 | 8742.2 |
+| 131072 | 124416 | 94.92% | 6656 | 554.5 | 554.2 | 12010.1 |
+
+These show a graph benefit versus eager MHA at 8k and 32k; 128k has no demonstrated improvement. They do not isolate MHA versus MLA. Cold-prefill and full decode coverage remain pending. The single-node adaptation used prefill Mamba ratio0.9 and HiCache180; it does not substitute for the decode configuration with Mamba ratio0.015.
