@@ -2343,6 +2343,18 @@ class MHATokenToKVPool(KVCache):
             else KVBufferLayout(self.kv_cache_layout),
         )
 
+    def get_kv_scale_buf_infos(self):
+        """(ptrs, lens, item_lens) for per-token KV scale buffers, k then v.
+
+        Same convention as the MXFP8 flat layout: one row per token slot, so a
+        page's scales are ``page_size`` consecutive rows.
+        """
+        tensors = self.k_scale_buffer + self.v_scale_buffer
+        ptrs = [t.data_ptr() for t in tensors]
+        lens = [t.nbytes for t in tensors]
+        item_lens = [t[0].nbytes * self.page_size for t in tensors]
+        return ptrs, lens, item_lens
+
     def _mha_scale_buffers(self):
         from sglang.srt.mem_cache.device_pool_info import KVScaleBuffers, KVScaleLayout
 
@@ -2788,7 +2800,19 @@ class MHATokenToKVPool(KVCache):
                 v_cpu = self.v_buffer[layer_id][chunk_indices].to(
                     "cpu", non_blocking=True
                 )
-                kv_cache_cpu[-1].append([k_cpu, v_cpu])
+                entry = [k_cpu, v_cpu]
+                if self.k_scale_buffer is not None:
+                    # Quantized (FP4) payloads dequantize against their
+                    # per-token scales; a restored slot needs them too.
+                    entry += [
+                        self.k_scale_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                        self.v_scale_buffer[layer_id][chunk_indices].to(
+                            "cpu", non_blocking=True
+                        ),
+                    ]
+                kv_cache_cpu[-1].append(entry)
         current_platform.synchronize()
         return kv_cache_cpu
 
@@ -2813,6 +2837,15 @@ class MHATokenToKVPool(KVCache):
                 v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
                 self.k_buffer[layer_id][chunk_indices] = k_chunk
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
+                entry = kv_cache_cpu[layer_id][i // chunk_size]
+                if self.k_scale_buffer is not None and len(entry) == 4:
+                    device = self.k_scale_buffer[0].device
+                    self.k_scale_buffer[layer_id][chunk_indices] = entry[2].to(
+                        device, non_blocking=True
+                    )
+                    self.v_scale_buffer[layer_id][chunk_indices] = entry[3].to(
+                        device, non_blocking=True
+                    )
         current_platform.synchronize()
 
     def _get_key_buffer(self, layer_id: int):

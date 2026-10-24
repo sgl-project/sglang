@@ -183,6 +183,15 @@ def uses_ssm_state(model_config) -> bool:
     )
 
 
+def _has_per_token_kv_scales(kv_cache) -> bool:
+    if not isinstance(kv_cache, MHATokenToKVPool):
+        return False
+    from sglang.srt.mem_cache.device_pool_info import KVScaleLayout
+
+    scales = kv_cache._mha_scale_buffers()
+    return scales is not None and scales.layout != KVScaleLayout.MXFP8_INTERLEAVED
+
+
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     """Resolve the retraction backend onto the config bags and return it.
 
@@ -219,6 +228,9 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
                 isinstance(kv_cache, MHATokenToKVPool)
                 or (isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0)
             )
+            # The MHA host pool only takes MXFP8-interleaved scales (it raises
+            # on others); per-token scales (FP4) use the cpu_tensor backup.
+            and not _has_per_token_kv_scales(kv_cache)
         )
         schedule = get_schedule()
         priority_preemption = (
