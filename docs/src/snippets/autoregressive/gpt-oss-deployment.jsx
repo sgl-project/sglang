@@ -57,18 +57,6 @@ export const GPTOSSDeployment = () => {
     }
   };
 
-  const getDisplayOptions = (values) => ({
-    ...options,
-    quantization: options.quantization,
-    speculative: {
-      ...options.speculative,
-      items: options.speculative.items.map(item => ({
-        ...item,
-        disabled: values.hardware === 'xeon' && item.id === 'enabled'
-      }))
-    }
-  });
-
   // Initialize state
   const getInitialState = () => {
     const initialState = {};
@@ -102,13 +90,7 @@ export const GPTOSSDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => {
-      const next = { ...prev, [optionName]: value };
-      if (optionName === 'hardware' && value === 'xeon') {
-        next.speculative = 'disabled';
-      }
-      return next;
-    });
+    setValues(prev => ({ ...prev, [optionName]: value }));
   };
 
   // Generate command
@@ -173,7 +155,7 @@ export const GPTOSSDeployment = () => {
       cmd += 'SGLANG_USE_AITER=0 ';
     }
 
-    if (speculative === 'enabled') {
+    if (speculative === 'enabled' && hardware !== 'xeon') {
       cmd += 'SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 ';
     }
 
@@ -209,12 +191,16 @@ export const GPTOSSDeployment = () => {
 
     // Add speculative decoding if enabled (MI30x handled above)
     if (speculative === 'enabled') {
-      cmd += ` \\\n  --speculative-algorithm EAGLE3 \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4`;
+      if (hardware === 'xeon') {
+        cmd += ` \\\n  --speculative-algorithm NGRAM`;
+      } else {
+        cmd += ` \\\n  --speculative-algorithm EAGLE3 \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4`;
 
-      if (modelsize === '120b') {
-        cmd += ` \\\n  --speculative-draft-model-path nvidia/gpt-oss-120b-Eagle3`;
-      } else if (modelsize === '20b') {
-        cmd += ` \\\n  --speculative-draft-model-path zhuyksir/EAGLE3-gpt-oss-20b-bf16`;
+        if (modelsize === '120b') {
+          cmd += ` \\\n  --speculative-draft-model-path nvidia/gpt-oss-120b-Eagle3`;
+        } else if (modelsize === '20b') {
+          cmd += ` \\\n  --speculative-draft-model-path zhuyksir/EAGLE3-gpt-oss-20b-bf16`;
+        }
       }
     }
 
@@ -234,7 +220,7 @@ export const GPTOSSDeployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(getDisplayOptions(values)).map(([key, option]) => (
+      {Object.entries(options).map(([key, option]) => (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>
           <div style={itemsStyle}>

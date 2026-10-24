@@ -76,6 +76,9 @@ class InterleaveContextParallelMetadata(BaseContextParallelMetadata):
     gather_index: Optional[torch.Tensor] = None
     local_index: Optional[torch.Tensor] = None
     moe_local_token_count: Optional[torch.Tensor] = None
+    # Only sequence-dependent graph segments use this capacity. Eager cache
+    # operations and gathers must continue using total_seq_lens (live tokens).
+    graph_num_tokens: Optional[int] = None
 
 
 def is_interleave_extend(forward_batch):
@@ -92,7 +95,9 @@ def cp_interleave_to_sequence_order(hidden_states, forward_batch):
     ``[t0, t1, t2, t3, t4, t5, t6]`` for sequence-dependent compute.
 
     The residual and mHC coefficients do not move: only the already-read mixer
-    input is reordered. Remove physical CP padding before the recurrent kernel.
+    input is reordered. Eager execution removes physical CP padding. Graph
+    execution keeps the capture shape; KDA's refreshed sequence table masks
+    padded rows out of its recurrent state updates.
     """
     if not is_interleave_extend(forward_batch):
         return hidden_states
@@ -101,10 +106,15 @@ def cp_interleave_to_sequence_order(hidden_states, forward_batch):
         return hidden_states.index_select(0, metadata.gather_index)
     size = get_parallel().attn_cp_size
     rows = hidden_states.shape[0] // size
+    num_tokens = (
+        metadata.graph_num_tokens
+        if metadata.graph_num_tokens is not None
+        else metadata.total_seq_lens
+    )
     return (
         hidden_states.reshape(size, rows, *hidden_states.shape[1:])
         .transpose(0, 1)
-        .flatten(0, 1)[: metadata.total_seq_lens]
+        .flatten(0, 1)[:num_tokens]
         .contiguous()
     )
 
@@ -231,9 +241,7 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         extend_seqs: Any,
     ):
         """Build device outputs in the shared kernel to keep the split graph-safe."""
-        from sglang.kernels.ops.attention.dsa.cp_split import (
-            dsa_cp_interleave_q_seqs_kernel,
-        )
+        from sglang.kernels.ops.attention.dsa.cp_split import dsa_cp_interleave_q_seqs
 
         cp_size = self.cp_size
         cp_rank = self.cp_rank
@@ -248,14 +256,8 @@ class InterleaveCPStrategy(ContextParallelStrategy):
         bs_idx_cpu = [i for i, q_len in enumerate(q_lens_cpu) if q_len > 0]
         q_lens_cpu = [q_len for q_len in q_lens_cpu if q_len > 0]
 
-        q_lens = torch.empty(
-            (len(bs_idx_cpu),), device=extend_seqs.device, dtype=extend_seqs.dtype
-        )
-        bs_idx = torch.empty(
-            (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
-        )
-        dsa_cp_interleave_q_seqs_kernel[(1,)](
-            extend_seqs, q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
+        q_lens, bs_idx = dsa_cp_interleave_q_seqs(
+            extend_seqs, len(bs_idx_cpu), cp_size, cp_rank
         )
         return q_lens_cpu, q_lens, bs_idx_cpu, bs_idx
 

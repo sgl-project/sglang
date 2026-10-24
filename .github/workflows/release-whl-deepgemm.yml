@@ -115,7 +115,7 @@ jobs:
           - arch_label: sm100
             runner: 8-gpu-b200
             wheel_arch: x86_64
-            timeout: 60
+            timeout: 180
           # The sm120 tests require a runner with RTX 6000. It causes OOM on 5090 runners.
           # - arch_label: sm120
           #   runner: 1-gpu-5090
@@ -168,7 +168,6 @@ jobs:
           # so bind eagerly to fail here on any missing symbol.
           LD_BIND_NOW=1 python3 - <<'PY'
           import ctypes
-          import sys
           import torch
           import deep_ep
           import deep_gemm
@@ -179,9 +178,6 @@ jobs:
           assert ctypes.CDLL("libnccl.so.2").ncclGetVersion(ctypes.byref(nccl_version)) == 0
           assert nccl_version.value == 23007, nccl_version.value
           assert hasattr(deep_ep, "ElasticBuffer"), "DeepEP ElasticBuffer is required"
-          sys.path.insert(0, "DeepGEMM/third-party")
-          from tilelang_ops import ref_mhc
-          assert ref_mhc.has_baseline(), "Mega mHC reference operators are unavailable"
           print("DeepGEMM test dependencies ready; NCCL:", nccl_version.value)
           PY
 

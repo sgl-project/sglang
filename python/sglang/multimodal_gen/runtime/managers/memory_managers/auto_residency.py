@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Warmup memory, timing and layer-use estimates for the default workload.
+"""Warmup memory estimates for the default workload.
 
 Peak-memory extrapolation separates persistent weights from workload-scaled
-activations. Phase and layer-use estimates account for stage-specific iteration
-counts rather than scaling every stage by the request's denoising steps.
+activations.
 """
 
 from __future__ import annotations
