@@ -1058,6 +1058,8 @@ class ChatCompletionRequest(PDRoutingFields):
         "top_k": -1,
         "min_p": 0.0,
         "repetition_penalty": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
     }
 
     @model_validator(mode="before")
@@ -1181,15 +1183,33 @@ class ChatCompletionRequest(PDRoutingFields):
         model_generation_config: Dict[str, Any],
         tool_call_constraint: Optional[ToolCallConstraint] = None,
         renderer_handles_response_format: bool = False,
+        preferred_sampling_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
-        Priority: user value > model generation_config > OpenAI defaults
+        Priority: user value > preferred sampling params (--preferred-sampling-params)
+        > model generation_config > OpenAI defaults
         """
+
+        preferred = preferred_sampling_params or {}
+
+        # presence_penalty/frequency_penalty declare a non-None field default
+        # (0.0), so "user set" cannot be read off the value alone; only an
+        # explicitly provided value counts, detected via model_fields_set.
+        _NON_NONE_DEFAULT_PARAMS = ("presence_penalty", "frequency_penalty")
 
         def get_param(param_name: str):
             value = getattr(self, param_name)
-            if value is None:
+            if param_name in _NON_NONE_DEFAULT_PARAMS:
+                is_user_value = param_name in self.model_fields_set
+            else:
+                is_user_value = value is not None
+            if not is_user_value:
+                # Fall through to --preferred-sampling-params so the server-side
+                # row is not shadowed by an eagerly-resolved generation-config
+                # or OpenAI default (see issue #39096).
+                if param_name in preferred:
+                    return preferred[param_name]
                 return model_generation_config.get(
                     param_name, self._DEFAULT_SAMPLING_PARAMS[param_name]
                 )
@@ -1212,8 +1232,8 @@ class ChatCompletionRequest(PDRoutingFields):
             "top_p": get_param("top_p"),
             "top_k": get_param("top_k"),
             "min_p": get_param("min_p"),
-            "presence_penalty": self.presence_penalty,
-            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": get_param("presence_penalty"),
+            "frequency_penalty": get_param("frequency_penalty"),
             "repetition_penalty": get_param("repetition_penalty"),
             "regex": self.regex,
             "ebnf": self.ebnf,
