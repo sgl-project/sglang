@@ -4,6 +4,7 @@ request semantics."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -21,9 +22,12 @@ from sglang.srt.parser.deepseek_recipe_output import (
     DeepSeekRecipeOutputParser,
     RecipeToolCall,
     RecipeToolCallDelta,
+    parse_output_text,
     whole_tool_calls,
 )
 from sglang.srt.parser.deepseek_recipe_renderer import (
+    THINK_END_TOKEN,
+    THINK_START_TOKEN,
     DeepSeekRecipe,
     parse_effort_budget,
 )
@@ -35,7 +39,10 @@ if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.protocol import (
         ChatCompletionRequest,
         ResponsesRequest,
+        Tool,
     )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_EFFORT_ENVS = {
     "dsv4": envs.SGLANG_DSV4_REASONING_EFFORT,
@@ -45,6 +52,7 @@ PARSERS = {
     "dsv4": ("deepseek-v4", "deepseekv4"),
     "dsv41": ("deepseek-v41", "deepseekv41"),
 }
+RECIPE_PARSER_NAMES = frozenset(name for names in PARSERS.values() for name in names)
 JSON_RESPONSE_FORMATS = ("json_object", "json_schema")
 
 
@@ -293,6 +301,45 @@ class DeepSeekRecipeChatEncodingAdapter:
             )
         )
 
+    def separate_reasoning_text(self, text: str) -> tuple[str, str]:
+        """Native /separate_reasoning: text that closes a thinking block is reasoning
+        up to `</think>`, with or without a leading `<think>`."""
+        text = text.removeprefix(THINK_START_TOKEN)
+        delta = parse_output_text(
+            self.deepseek_recipe,
+            text,
+            thinking=THINK_END_TOKEN in text,
+            parse_tool_calls=False,
+        )
+        return delta.reasoning, delta.content
+
+    def parse_function_call_text(
+        self, text: str, tools: list[Tool]
+    ) -> tuple[str, list[ToolCallItem]]:
+        """Native /parse_function_call, with the text parsers' tool rules:
+        `tool_index` is the tool's position in `tools`, and a call to another tool
+        is dropped unless SGLANG_FORWARD_UNKNOWN_TOOLS is set."""
+        delta = parse_output_text(
+            self.deepseek_recipe, text, thinking=False, parse_tool_calls=True
+        )
+        tool_indices = {tool.function.name: i for i, tool in enumerate(tools)}
+        calls = []
+        for call in whole_tool_calls(delta):
+            if call.name not in tool_indices:
+                logger.warning(
+                    f"Model attempted to call undefined function: {call.name}"
+                )
+                if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                    continue
+            calls.append(
+                ToolCallItem(
+                    tool_index=tool_indices.get(call.name, -1),
+                    name=call.name,
+                    parameters=call.arguments,
+                )
+            )
+        return delta.content, calls
+
     def _new_output_parser(
         self, request: ChatCompletionRequest
     ) -> DeepSeekRecipeOutputParser:
@@ -389,3 +436,22 @@ def _tool_call_items(
         ToolCallItem(tool_index=call.index, name=call.name, parameters=call.arguments)
         for call in calls
     ]
+
+
+def recipe_text_parser(
+    encoding_adapter: Any, parser_name: Optional[str]
+) -> Optional[DeepSeekRecipeChatEncodingAdapter]:
+    """The adapter that parses `parser_name` output for the native endpoints; None
+    for parsers recipe does not own. A DeepSeek parser on a server not serving its
+    model raises ValueError: recipe parses with that checkpoint's tokenizer."""
+    if parser_name not in RECIPE_PARSER_NAMES:
+        return None
+    if (
+        not isinstance(encoding_adapter, DeepSeekRecipeChatEncodingAdapter)
+        or parser_name not in PARSERS[encoding_adapter._spec]
+    ):
+        raise ValueError(
+            f"{parser_name!r} output is parsed by deepseek-recipe, which needs a "
+            "server serving that DeepSeek model"
+        )
+    return encoding_adapter

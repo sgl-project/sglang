@@ -220,3 +220,21 @@ class DeepSeekRecipeOutputParser:
                 )
             )
         return delta
+
+
+def parse_output_text(
+    deepseek_recipe: DeepSeekRecipe,
+    text: str,
+    *,
+    thinking: bool,
+    parse_tool_calls: bool,
+) -> RecipeOutputDelta:
+    """`text` parsed as a whole output; the markers it spells count as the tokens
+    the model would have sampled."""
+    output_ids = deepseek_recipe.hf_tokenizer.encode(text, add_special_tokens=False).ids
+    parser = DeepSeekRecipeOutputParser(
+        deepseek_recipe,
+        thinking_stage=deepseek_recipe.parse_start(thinking=thinking),
+        parse_tool_calls=parse_tool_calls,
+    )
+    return parser.finish(output_ids, {"type": "stop"})

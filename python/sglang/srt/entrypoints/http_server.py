@@ -109,6 +109,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_decisions import OpenAIServingDecisions
+from sglang.srt.entrypoints.openai.serving_deepseek_recipe import recipe_text_parser
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
@@ -1716,15 +1717,25 @@ async def parse_function_call_request(
     """
     A native API endpoint to parse function calls from a text.
     """
-    # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(
-        tools=obj.tools,
-        tool_call_parser=obj.tool_call_parser,
-        tokenizer=get_global_state().tokenizer_manager.tokenizer,
-    )
+    try:
+        recipe_parser = recipe_text_parser(
+            request.app.state.openai_serving_chat.encoding_adapter,
+            obj.tool_call_parser,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
+    if recipe_parser is not None:
+        normal_text, calls = recipe_parser.parse_function_call_text(obj.text, obj.tools)
+    else:
+        # 1) Initialize the parser based on the request body
+        parser = FunctionCallParser(
+            tools=obj.tools,
+            tool_call_parser=obj.tool_call_parser,
+            tokenizer=get_global_state().tokenizer_manager.tokenizer,
+        )
 
-    # 2) Call the non-stream parsing method (non-stream)
-    normal_text, calls = parser.parse_non_stream(obj.text)
+        # 2) Call the non-stream parsing method (non-stream)
+        normal_text, calls = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
@@ -1744,22 +1755,37 @@ async def separate_reasoning_request(
     """
     A native API endpoint to separate reasoning from a text.
     """
-    # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(
-        model_type=obj.reasoning_parser,
-        request=request,
-        tokenizer=get_global_state().tokenizer_manager.tokenizer,
-    )
-
-    # 2) Call the non-stream parsing method (non-stream)
-    if obj.return_blocks:
-        blocks = parser.parse_non_stream_blocks(obj.text)
-        reasoning_blocks = [b["text"] for b in blocks if b["type"] == "reasoning"]
-        text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
-        reasoning_text = "".join(reasoning_blocks)
-        normal_text = "".join(text_blocks)
+    try:
+        recipe_parser = recipe_text_parser(
+            request.app.state.openai_serving_chat.encoding_adapter,
+            obj.reasoning_parser,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
+    if recipe_parser is not None:
+        reasoning_text, normal_text = recipe_parser.separate_reasoning_text(obj.text)
+        blocks = [
+            {"type": kind, "text": text}
+            for kind, text in (("reasoning", reasoning_text), ("text", normal_text))
+            if text
+        ]
     else:
-        reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+        # 1) Initialize the parser based on the request body
+        parser = ReasoningParser(
+            model_type=obj.reasoning_parser,
+            request=request,
+            tokenizer=get_global_state().tokenizer_manager.tokenizer,
+        )
+
+        # 2) Call the non-stream parsing method (non-stream)
+        if obj.return_blocks:
+            blocks = parser.parse_non_stream_blocks(obj.text)
+            reasoning_text = "".join(
+                b["text"] for b in blocks if b["type"] == "reasoning"
+            )
+            normal_text = "".join(b["text"] for b in blocks if b["type"] == "text")
+        else:
+            reasoning_text, normal_text = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
@@ -1767,8 +1793,12 @@ async def separate_reasoning_request(
         "text": normal_text,
     }
     if obj.return_blocks:
-        response_data["reasoning_blocks"] = reasoning_blocks
-        response_data["text_blocks"] = text_blocks
+        response_data["reasoning_blocks"] = [
+            b["text"] for b in blocks if b["type"] == "reasoning"
+        ]
+        response_data["text_blocks"] = [
+            b["text"] for b in blocks if b["type"] == "text"
+        ]
         response_data["blocks"] = blocks
 
     return ORJSONResponse(content=response_data, status_code=200)
