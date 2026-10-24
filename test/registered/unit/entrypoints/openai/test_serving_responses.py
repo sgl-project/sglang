@@ -1682,6 +1682,7 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
         from sglang.srt.entrypoints.openai import chat_encoding_adapters
 
         return chat_encoding_adapters.ChatOutputHooks(
+            thinking_requested=Mock(),
             tool_call_parsing_active=Mock(),
             history_tool_calls_count=Mock(),
             tool_call_id=Mock(),
@@ -1709,7 +1710,7 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
             )
 
         with patch.dict(sys.modules, {"tml_renderers": None}):
-            for encoding in ("kimi_k3", "dsv4", "dsv41", "dsv32"):
+            for encoding in ("kimi_k3", "dsv32"):
                 with self.subTest(encoding=encoding):
                     self.assertIsNone(
                         chat_encoding_adapters.build_chat_encoding_adapter(

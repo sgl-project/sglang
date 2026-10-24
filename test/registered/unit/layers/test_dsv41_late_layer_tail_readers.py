@@ -10,6 +10,7 @@ import torch
 from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     late_layer_tail_layout,
 )
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Mxfp8Activation
 from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     SWA_WINDOW,
@@ -289,6 +290,7 @@ def _prefill_graph_replay(*, ratios, seq_len):
     backend.has_c4 = 4 in ratios
     backend.has_c128 = 128 in ratios
     backend._build_forward_metadata = build_full
+    backend._prefill_graph_translates_swa_loc = lambda metadata: False
     backend._prefill_graph_tail_metadata = build_tail
     backend._activate_request_window = lambda: None
     capture = object.__new__(DSV4Metadata)
@@ -323,7 +325,7 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
     """An eager low-ratio break inside the prefill graph's late-layer tail must read
     the hoisted rows of the tail, not rows rebuilt from the whole extend."""
 
-    def _run(self, hoisted_req, hoisted_pos, positions):
+    def _run(self, hoisted_req, hoisted_pos, positions, q_lora=None):
         backend = object.__new__(deepseek_v4_backend.DeepseekV4AttnBackend)
         backend.tail_source_kv_layer_id = None
         backend.forward_metadata = SimpleNamespace(
@@ -350,12 +352,13 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
             backend.forward_low_ratio_sources(
                 layer=layer,
                 x=torch.zeros(positions.shape[0], 4),
-                q_lora=torch.zeros(positions.shape[0], 4),
+                q_lora=torch.zeros(positions.shape[0], 4) if q_lora is None else q_lora,
                 positions=positions,
                 forward_batch=forward_batch,
             )
         compress_args = backend._low_ratio_compress.call_args.args
         index_args = backend._low_ratio_index_topk.call_args.args
+        self.index_q_lora = index_args[2]
         return compress_args[2], compress_args[3], index_args[3], index_args[4]
 
     def test_tail_break_uses_live_prefix_of_hoisted_rows(self):
@@ -368,6 +371,17 @@ class TestDSV4LateLayerTailLowRatioRows(CustomTestCase):
         self.assertEqual(pos.tolist(), [2, 3, 3, 4, 5])
         self.assertEqual(index_req.tolist(), [7, 7, 9, 9, 9])
         self.assertEqual(index_pos.tolist(), [2, 3, 3, 4, 5])
+
+    def test_dp_padding_cuts_a_quantized_q_lora_by_rows(self):
+        """HIP's quantized q_lora raises a TypeError on a plain slice; DP padding past the
+        hoisted rows must cut it field by field."""
+        q_lora = Mxfp8Activation(
+            q=torch.arange(320).view(5, 64), scale=torch.arange(10).view(5, 2)
+        )
+        positions = torch.tensor([2, 3, 3, 0, 0])
+        self._run(torch.tensor([7, 7, 9]), torch.tensor([2, 3, 3]), positions, q_lora)
+        self.assertTrue(torch.equal(self.index_q_lora.q, q_lora.q[:3]))
+        self.assertTrue(torch.equal(self.index_q_lora.scale, q_lora.scale[:3]))
 
 
 if __name__ == "__main__":
