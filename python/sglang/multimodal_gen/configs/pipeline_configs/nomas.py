@@ -182,6 +182,7 @@ def register():
     register_configs(
         NomasSamplingParams,
         NomasPipelineConfig,
+        hf_model_paths=["tencent/Hy-Nomas"],
         model_detectors=[lambda name: name.lower() == "nomaspipeline"],
         pipeline_config_registry_entries={
             "NomasPipeline": (NomasPipelineConfig, NomasSamplingParams)

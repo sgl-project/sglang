@@ -260,6 +260,13 @@ def test_invalid_attention_layout_rejected(mask, offsets, windows):
         )
 
 
+def test_official_model_id_routes_cli_to_diffusion():
+    # The official repo has no model_index.json; detection relies on the registry.
+    from sglang.cli.utils import get_is_diffusion_model
+
+    assert get_is_diffusion_model("tencent/Hy-Nomas")
+
+
 def test_model_registry_and_full_parameter_count():
     from sglang.multimodal_gen.runtime.models.registry import (
         _discover_and_register_models,
