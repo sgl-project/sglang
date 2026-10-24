@@ -165,8 +165,11 @@ def test_vertex_slow_output_read_does_not_block_liveness(monkeypatch, tmp_path):
     "invalid", [{}, {"prompt": 123}], ids=["missing-prompt", "numeric-prompt"]
 )
 def test_vertex_validates_batch_before_dispatch(monkeypatch, tmp_path, invalid):
+    model_path = tmp_path / "Wan2.1-T2V-1.3B-Diffusers"
+    model_path.mkdir()
+    (model_path / "model_index.json").write_text('{"_class_name": "WanPipeline"}')
     server_args = SimpleNamespace(
-        model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+        model_path=str(model_path),
         pipeline_class_name="WanPipeline",
         pipeline_config=WanT2V480PConfig(),
         output_path=str(tmp_path),
