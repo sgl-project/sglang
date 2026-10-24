@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.layers.moe.trtllm_moe_workspace import get_trtllm_moe_workspace
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils.common import (
@@ -1217,38 +1218,44 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             routed_top_k = _routing_top_k(routing)
 
             defer_finalize = _deferred_finalize_enabled.get()
-            result = trtllm_fp4_block_scale_routed_moe(
-                topk_ids=routing,
-                routing_bias=None,
-                hidden_states=x_quant,
-                hidden_states_scale=x_scale,
-                gemm1_weights=quant_info.w13_weight,
-                gemm1_weights_scale=quant_info.w13_weight_scale,
-                gemm1_bias=None,
-                gemm1_alpha=quant_info.gemm1_alpha,
-                gemm1_beta=quant_info.gemm1_clamp_limit,
-                gemm1_clamp_limit=None,
-                gemm2_weights=quant_info.w2_weight,
-                gemm2_weights_scale=quant_info.w2_weight_scale,
-                gemm2_bias=None,
-                output1_scale_scalar=None,
-                output1_scale_gate_scalar=None,
-                output2_scale_scalar=None,
-                num_experts=quant_info.global_num_experts,
-                top_k=routed_top_k,
-                n_group=None,
-                topk_group=None,
-                intermediate_size=quant_info.intermediate_size_per_partition,
-                local_expert_offset=quant_info.local_expert_offset,
-                local_num_experts=quant_info.local_num_experts,
-                routed_scaling_factor=None,
-                routing_method_type=RoutingMethodType.TopK.value,
-                activation_type=ActivationType.Situ.value,
-                tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
-                output=symm_output,
-                do_finalize=not defer_finalize,
-                enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+            moe_kwargs = {
+                "topk_ids": routing,
+                "routing_bias": None,
+                "hidden_states": x_quant,
+                "hidden_states_scale": x_scale,
+                "gemm1_weights": quant_info.w13_weight,
+                "gemm1_weights_scale": quant_info.w13_weight_scale,
+                "gemm1_bias": None,
+                "gemm1_alpha": quant_info.gemm1_alpha,
+                "gemm1_beta": quant_info.gemm1_clamp_limit,
+                "gemm1_clamp_limit": None,
+                "gemm2_weights": quant_info.w2_weight,
+                "gemm2_weights_scale": quant_info.w2_weight_scale,
+                "gemm2_bias": None,
+                "output1_scale_scalar": None,
+                "output1_scale_gate_scalar": None,
+                "output2_scale_scalar": None,
+                "num_experts": quant_info.global_num_experts,
+                "top_k": routed_top_k,
+                "n_group": None,
+                "topk_group": None,
+                "intermediate_size": quant_info.intermediate_size_per_partition,
+                "local_expert_offset": quant_info.local_expert_offset,
+                "local_num_experts": quant_info.local_num_experts,
+                "routed_scaling_factor": None,
+                "routing_method_type": RoutingMethodType.TopK.value,
+                "activation_type": ActivationType.Situ.value,
+                "tune_max_num_tokens": next_power_of_2(x_quant.shape[0]),
+                "output": symm_output,
+                "do_finalize": not defer_finalize,
+                "enable_pdl": trtllm_moe_enable_pdl(x_quant.shape[0]),
+            }
+            workspace = get_trtllm_moe_workspace(
+                "mxfp4_bf16" if x_scale is None else "mxfp4_mxfp8", **moe_kwargs
             )
+            if workspace is not None:
+                moe_kwargs["workspace_buffer"] = workspace
+            result = trtllm_fp4_block_scale_routed_moe(**moe_kwargs)
             if defer_finalize:
                 gemm2_out, topk_weights, expanded_idx = result
                 result = FlashInferTrtllmDeferredFinalizeOutput(
@@ -1265,75 +1272,86 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             # the pointer contract explicit for K3's zero-copy latent buffer.
             return StandardCombineInput(hidden_states=symm_output)
 
-        trtllm_fp4_block_scale_moe(
-            routing_logits=router_logits.to(torch.bfloat16).contiguous(),
-            routing_bias=quant_info.routing_bias,
-            hidden_states=x_quant,
-            hidden_states_scale=x_scale,
-            gemm1_weights=quant_info.w13_weight,
-            gemm1_weights_scale=quant_info.w13_weight_scale,
-            gemm1_bias=None,
-            gemm1_alpha=quant_info.gemm1_alpha,
-            gemm1_beta=quant_info.gemm1_clamp_limit,
-            gemm1_clamp_limit=None,
-            gemm2_weights=quant_info.w2_weight,
-            gemm2_weights_scale=quant_info.w2_weight_scale,
-            gemm2_bias=None,
-            output1_scale_scalar=None,
-            output1_scale_gate_scalar=None,
-            output2_scale_scalar=None,
-            num_experts=quant_info.global_num_experts,
-            top_k=top_k,
-            n_group=topk_output.topk_config.num_expert_group,
-            topk_group=topk_output.topk_config.topk_group,
-            intermediate_size=quant_info.intermediate_size_per_partition,
-            routed_scaling_factor=(
-                topk_output.topk_config.routed_scaling_factor or 1.0
-            ),
-            routing_method_type=RoutingMethodType.DeepSeekV3.value,
-            activation_type=ActivationType.Situ.value,
-            norm_topk_prob=topk_output.topk_config.renormalize,
-            local_expert_offset=quant_info.local_expert_offset,
-            local_num_experts=quant_info.local_num_experts,
-            tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
-            output=symm_output,
-            enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+        moe_kwargs = {
+            "routing_logits": router_logits.to(torch.bfloat16).contiguous(),
+            "routing_bias": quant_info.routing_bias,
+            "hidden_states": x_quant,
+            "hidden_states_scale": x_scale,
+            "gemm1_weights": quant_info.w13_weight,
+            "gemm1_weights_scale": quant_info.w13_weight_scale,
+            "gemm1_bias": None,
+            "gemm1_alpha": quant_info.gemm1_alpha,
+            "gemm1_beta": quant_info.gemm1_clamp_limit,
+            "gemm1_clamp_limit": None,
+            "gemm2_weights": quant_info.w2_weight,
+            "gemm2_weights_scale": quant_info.w2_weight_scale,
+            "gemm2_bias": None,
+            "output1_scale_scalar": None,
+            "output1_scale_gate_scalar": None,
+            "output2_scale_scalar": None,
+            "num_experts": quant_info.global_num_experts,
+            "top_k": top_k,
+            "n_group": topk_output.topk_config.num_expert_group,
+            "topk_group": topk_output.topk_config.topk_group,
+            "intermediate_size": quant_info.intermediate_size_per_partition,
+            "routed_scaling_factor": topk_output.topk_config.routed_scaling_factor
+            or 1.0,
+            "routing_method_type": RoutingMethodType.DeepSeekV3.value,
+            "activation_type": ActivationType.Situ.value,
+            "norm_topk_prob": topk_output.topk_config.renormalize,
+            "local_expert_offset": quant_info.local_expert_offset,
+            "local_num_experts": quant_info.local_num_experts,
+            "tune_max_num_tokens": next_power_of_2(x_quant.shape[0]),
+            "output": symm_output,
+            "enable_pdl": trtllm_moe_enable_pdl(x_quant.shape[0]),
+        }
+        workspace = get_trtllm_moe_workspace(
+            "mxfp4_bf16" if x_scale is None else "mxfp4_mxfp8", **moe_kwargs
         )
+        if workspace is not None:
+            moe_kwargs["workspace_buffer"] = workspace
+        trtllm_fp4_block_scale_moe(**moe_kwargs)
         return StandardCombineInput(hidden_states=symm_output)
 
     from flashinfer import trtllm_fp4_block_scale_moe
 
-    trtllm_gen_output = trtllm_fp4_block_scale_moe(
-        router_logits.to(torch.bfloat16),
-        None,  # routing_bias
-        x_quant,
-        x_scale,
-        quant_info.w13_weight,  # uint8 (e2m1 x 2)
-        quant_info.w13_weight_scale,  # uint8 (e4m3 x 2)
-        quant_info.w13_weight_bias,  # fp32 per expert per channel
-        quant_info.gemm1_alpha,  # fp32 per expert
-        quant_info.gemm1_beta,  # fp32 per expert
-        quant_info.gemm1_clamp_limit,  # fp32 per expert
-        quant_info.w2_weight,  # uint8 (e2m1 x 2)
-        quant_info.w2_weight_scale,  # ue8m0
-        quant_info.w2_weight_bias,  # fp32 per expert per channel
-        None,  # output1_scale_scalar
-        None,  # output1_scale_gate_scalar
-        None,  # output2_scale_scalar
-        quant_info.global_num_experts,
-        top_k,
-        None,  # n_group      # TODO: support n_group
-        None,  # topk_group   # TODO: support topk_group
-        quant_info.intermediate_size_per_partition,  # padded to multiple of 128
-        quant_info.local_expert_offset,
-        quant_info.local_num_experts,
-        None,  # routed_scaling_factor
-        1,  # routing_method_type, renormalize
-        True,  # do finalize
-        tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
-        output=symm_output,
-        enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
-    )[0]
+    moe_kwargs = {
+        "routing_logits": router_logits.to(torch.bfloat16),
+        "routing_bias": None,
+        "hidden_states": x_quant,
+        "hidden_states_scale": x_scale,
+        "gemm1_weights": quant_info.w13_weight,
+        "gemm1_weights_scale": quant_info.w13_weight_scale,
+        "gemm1_bias": quant_info.w13_weight_bias,
+        "gemm1_alpha": quant_info.gemm1_alpha,
+        "gemm1_beta": quant_info.gemm1_beta,
+        "gemm1_clamp_limit": quant_info.gemm1_clamp_limit,
+        "gemm2_weights": quant_info.w2_weight,
+        "gemm2_weights_scale": quant_info.w2_weight_scale,
+        "gemm2_bias": quant_info.w2_weight_bias,
+        "output1_scale_scalar": None,
+        "output1_scale_gate_scalar": None,
+        "output2_scale_scalar": None,
+        "num_experts": quant_info.global_num_experts,
+        "top_k": top_k,
+        "n_group": None,
+        "topk_group": None,
+        "intermediate_size": quant_info.intermediate_size_per_partition,
+        "local_expert_offset": quant_info.local_expert_offset,
+        "local_num_experts": quant_info.local_num_experts,
+        "routed_scaling_factor": None,
+        "routing_method_type": 1,
+        "do_finalize": True,
+        "tune_max_num_tokens": next_power_of_2(x_quant.shape[0]),
+        "output": symm_output,
+        "enable_pdl": trtllm_moe_enable_pdl(x_quant.shape[0]),
+    }
+    workspace = get_trtllm_moe_workspace(
+        "mxfp4_bf16" if x_scale is None else "mxfp4_mxfp8", **moe_kwargs
+    )
+    if workspace is not None:
+        moe_kwargs["workspace_buffer"] = workspace
+    trtllm_gen_output = trtllm_fp4_block_scale_moe(**moe_kwargs)[0]
     return StandardCombineInput(hidden_states=trtllm_gen_output)
 
 
@@ -1586,6 +1604,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
+        workspace = get_trtllm_moe_workspace("nvfp4", **moe_kwargs)
+        if workspace is not None:
+            moe_kwargs["workspace_buffer"] = workspace
         result = trtllm_fp4_block_scale_routed_moe(**moe_kwargs)
         if defer_finalize:
             result = _make_deferred_finalize_output(
@@ -1641,6 +1662,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
 
+        workspace = get_trtllm_moe_workspace("nvfp4", **moe_kwargs)
+        if workspace is not None:
+            moe_kwargs["workspace_buffer"] = workspace
         result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
             result = _make_deferred_finalize_output(result, top_k=topk_config.top_k)
@@ -1753,29 +1777,31 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
                 routing_method_type = RoutingMethodType.TopK
 
             routing = _get_routing_for_flashinfer_routed(topk_output)
-            final_hidden_states = trtllm_bf16_routed_moe(
-                topk_ids=routing,
-                hidden_states=hidden_states,
-                gemm1_weights=quant_info.gemm1_weights,
-                gemm2_weights=quant_info.gemm2_weights,
-                num_experts=quant_info.global_num_experts,
-                top_k=runner_config.top_k,
-                n_group=None,
-                topk_group=None,
-                intermediate_size=runner_config.intermediate_size_per_partition,
-                local_expert_offset=quant_info.local_expert_offset,
-                local_num_experts=runner_config.num_local_experts,
-                routing_method_type=routing_method_type,
-                routed_scaling_factor=(
-                    runner_config.routed_scaling_factor
-                    if runner_config.routed_scaling_factor is not None
-                    else 1.0
-                ),
-                do_finalize=not defer_finalize,
-                enable_pdl=trtllm_moe_enable_pdl(hidden_states.shape[0]),
-                tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
-                activation_type=activation_type,
-            )
+            moe_kwargs = {
+                "topk_ids": routing,
+                "hidden_states": hidden_states,
+                "gemm1_weights": quant_info.gemm1_weights,
+                "gemm2_weights": quant_info.gemm2_weights,
+                "num_experts": quant_info.global_num_experts,
+                "top_k": runner_config.top_k,
+                "n_group": None,
+                "topk_group": None,
+                "intermediate_size": runner_config.intermediate_size_per_partition,
+                "local_expert_offset": quant_info.local_expert_offset,
+                "local_num_experts": runner_config.num_local_experts,
+                "routing_method_type": routing_method_type,
+                "routed_scaling_factor": runner_config.routed_scaling_factor
+                if runner_config.routed_scaling_factor is not None
+                else 1.0,
+                "do_finalize": not defer_finalize,
+                "enable_pdl": trtllm_moe_enable_pdl(hidden_states.shape[0]),
+                "tune_max_num_tokens": next_power_of_2(hidden_states.shape[0]),
+                "activation_type": activation_type,
+            }
+            workspace = get_trtllm_moe_workspace("bf16", **moe_kwargs)
+            if workspace is not None:
+                moe_kwargs["workspace_buffer"] = workspace
+            final_hidden_states = trtllm_bf16_routed_moe(**moe_kwargs)
             if defer_finalize:
                 final_hidden_states = _make_deferred_finalize_output(
                     final_hidden_states,
@@ -1786,25 +1812,29 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
             topk_config = topk_output.topk_config
 
             # Call the fused kernel
-            final_hidden_states = trtllm_bf16_moe(
-                routing_logits=topk_output.router_logits,
-                routing_bias=topk_config.correction_bias,
-                hidden_states=hidden_states,
-                gemm1_weights=quant_info.gemm1_weights,
-                gemm2_weights=quant_info.gemm2_weights,
-                num_experts=quant_info.global_num_experts,
-                top_k=topk_config.top_k,
-                n_group=topk_config.num_expert_group,
-                topk_group=topk_config.topk_group,
-                intermediate_size=runner_config.intermediate_size_per_partition,
-                local_expert_offset=quant_info.local_expert_offset,
-                local_num_experts=runner_config.num_local_experts,
-                routing_method_type=runner_config.routing_method_type,
-                routed_scaling_factor=runner_config.routed_scaling_factor,
-                tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
-                activation_type=activation_type,
-                do_finalize=not defer_finalize,
-            )
+            moe_kwargs = {
+                "routing_logits": topk_output.router_logits,
+                "routing_bias": topk_config.correction_bias,
+                "hidden_states": hidden_states,
+                "gemm1_weights": quant_info.gemm1_weights,
+                "gemm2_weights": quant_info.gemm2_weights,
+                "num_experts": quant_info.global_num_experts,
+                "top_k": topk_config.top_k,
+                "n_group": topk_config.num_expert_group,
+                "topk_group": topk_config.topk_group,
+                "intermediate_size": runner_config.intermediate_size_per_partition,
+                "local_expert_offset": quant_info.local_expert_offset,
+                "local_num_experts": runner_config.num_local_experts,
+                "routing_method_type": runner_config.routing_method_type,
+                "routed_scaling_factor": runner_config.routed_scaling_factor,
+                "tune_max_num_tokens": next_power_of_2(hidden_states.shape[0]),
+                "activation_type": activation_type,
+                "do_finalize": not defer_finalize,
+            }
+            workspace = get_trtllm_moe_workspace("bf16", **moe_kwargs)
+            if workspace is not None:
+                moe_kwargs["workspace_buffer"] = workspace
+            final_hidden_states = trtllm_bf16_moe(**moe_kwargs)
             if defer_finalize:
                 final_hidden_states = _make_deferred_finalize_output(
                     final_hidden_states, top_k=topk_config.top_k

@@ -496,32 +496,40 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             # The op launches the routing kernel, so the join must precede it.
             torch.cuda.current_stream().wait_event(input_ready)
 
-        result = moe_call(
+        from sglang.srt.layers.moe.trtllm_moe_workspace import get_trtllm_moe_workspace
+
+        moe_kwargs = {
             **routing,
-            hidden_states=x_quant,
-            hidden_states_scale=x_scale,
-            gemm1_weights=w13,
-            gemm1_weights_scale=w13_scale,
-            gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
-            gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
-            gemm2_weights=w2,
-            gemm2_weights_scale=w2_scale,
-            gemm2_bias=None,
-            output1_scale_scalar=layer.output1_scale_scalar,
-            output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
-            output2_scale_scalar=layer.output2_scale_scalar,
-            num_experts=layer.num_experts,
-            top_k=top_k,
-            intermediate_size=intermediate_size,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-            local_num_experts=num_local_experts,
-            do_finalize=not defer_finalize,
-            tune_max_num_tokens=next_power_of_2(num_tokens),
-            output=symm_output,
-            enable_pdl=trtllm_moe_enable_pdl(num_tokens),
+            "hidden_states": x_quant,
+            "hidden_states_scale": x_scale,
+            "gemm1_weights": w13,
+            "gemm1_weights_scale": w13_scale,
+            "gemm1_bias": None,
+            "gemm1_alpha": None,
+            "gemm1_beta": None,
+            "gemm1_clamp_limit": self._gemm1_clamp_limit_tensor,
+            "gemm2_weights": w2,
+            "gemm2_weights_scale": w2_scale,
+            "gemm2_bias": None,
+            "output1_scale_scalar": layer.output1_scale_scalar,
+            "output1_scale_gate_scalar": layer.output1_scale_gate_scalar,
+            "output2_scale_scalar": layer.output2_scale_scalar,
+            "num_experts": layer.num_experts,
+            "top_k": top_k,
+            "intermediate_size": intermediate_size,
+            "local_expert_offset": layer.moe_ep_rank * layer.num_local_experts,
+            "local_num_experts": num_local_experts,
+            "do_finalize": not defer_finalize,
+            "tune_max_num_tokens": next_power_of_2(num_tokens),
+            "output": symm_output,
+            "enable_pdl": trtllm_moe_enable_pdl(num_tokens),
+        }
+        workspace = get_trtllm_moe_workspace(
+            "mxfp4_bf16" if x_scale is None else "mxfp4_mxfp8", **moe_kwargs
         )
+        if workspace is not None:
+            moe_kwargs["workspace_buffer"] = workspace
+        result = moe_call(**moe_kwargs)
         if defer_finalize:
             output = _make_deferred_finalize_output(result, top_k=top_k)
         else:
