@@ -59,6 +59,7 @@ import hashlib
 import logging
 import re
 import sys
+import weakref
 from array import array
 from concurrent.futures import Future
 from enum import Enum, auto
@@ -1169,13 +1170,15 @@ class Req(ReqDllmMixin):
         self._think_end_match_len = 0
         self._think_start_match_len = 0
 
-        # Only custom logit processors need the "__req__" reference cycle.
+        # Only custom logit processors read "__req__". The reference is weak:
+        # a strong one would make the request cyclic garbage, kept with
+        # everything it holds until the cyclic collector runs.
         if custom_logit_processor is not None and isinstance(
             sampling_params.custom_params, dict
         ):
             sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
-                "__req__": self
+                "__req__": weakref.proxy(self)
             }
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
