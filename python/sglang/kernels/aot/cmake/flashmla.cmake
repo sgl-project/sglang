@@ -7,11 +7,11 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flashmla)
 
-# flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
+# NVIDIA/cutlass v4.8.1, ahead of the flashmla submodule pin
 FetchContent_Declare(
     repo-flashmla-cutlass
-    URL      https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/147f5673d0c1c3dcf66f78d677fd647e4a020219.tar.gz
-    URL_HASH SHA256=9f6c53320a85b4a570975e557918cde65168cd311f081920446c238437347dc6
+    URL      https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/2c85f497547eb441f0fe80bfb0fb2e6f9add1719.tar.gz
+    URL_HASH SHA256=bc246a2e5eb99be6e9f8cf30ee17f83af7ede97caa39cb7e8a6c7f8ca54a1583
     SOURCE_DIR ${repo-flashmla_SOURCE_DIR}/csrc/cutlass
 )
 FetchContent_Populate(repo-flashmla-cutlass)
@@ -44,45 +44,17 @@ endif()
 if(${CUDA_VERSION} VERSION_GREATER_EQUAL "13.0")
     # B300 is sm_103; sm_100f is family-compatible so it runs there, but ptxas emits
     # better SASS for the native arch. FlashMLA's setup.py picks sm_100a + sm_103a
-    # over sm_100f for the same reason. The cutlass patch below is what lets a TU
-    # compile at __CUDA_ARCH__ == 1030 against the pinned cutlass.
+    # over sm_100f for the same reason.
     list(APPEND FLASHMLA_CUDA_FLAGS
         "-gencode=arch=compute_103a,code=sm_103a"
     )
+endif()
 
-    # Patch cutlass/arch/config.h: add SM103 architecture defines.
-    # This patch is only needed (and only valid) with CUDA 13+.
-    # The new block is inserted right before the existing "// SM101 and SM101a"
-    # anchor in the upstream header.
-    set(CUTLASS_CONFIG_FILE "${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include/cutlass/arch/config.h")
-    file(READ "${CUTLASS_CONFIG_FILE}" CUTLASS_CONFIG_CONTENT)
-    string(FIND "${CUTLASS_CONFIG_CONTENT}" "SM103" SM103_FOUND)
-    if(SM103_FOUND EQUAL -1)
-        string(REPLACE
-"// SM101 and SM101a"
-"// SM103 and SM103a
-#if !CUTLASS_CLANG_CUDA && (__CUDACC_VER_MAJOR__ >= 13)
-  #define CUTLASS_ARCH_MMA_SM103_SUPPORTED 1
-  #if (!defined(CUTLASS_ARCH_MMA_SM103_ENABLED) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030)
-    #define CUTLASS_ARCH_MMA_SM103_ENABLED 1
-    #if !defined(CUTLASS_ARCH_MMA_SM100A_ENABLED)
-      #define CUTLASS_ARCH_MMA_SM100A_ENABLED 1
-    #endif
-    #if !defined(CUTLASS_ARCH_MMA_SM100F_ENABLED)
-      #define CUTLASS_ARCH_MMA_SM100F_ENABLED 1
-    #endif
-  #endif
-#endif
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
-
-// SM101 and SM101a"
-            CUTLASS_CONFIG_CONTENT "${CUTLASS_CONFIG_CONTENT}")
-        file(WRITE "${CUTLASS_CONFIG_FILE}" "${CUTLASS_CONFIG_CONTENT}")
-        message(STATUS "Patched cutlass/arch/config.h for SM103a support")
-    else()
-        message(STATUS "cutlass/arch/config.h already patched for SM103a")
-    endif()
+execute_process(COMMAND ${CMAKE_CUDA_COMPILER} --list-gpu-arch OUTPUT_VARIABLE FLASHMLA_NVCC_ARCHS ERROR_QUIET)
+if(FLASHMLA_NVCC_ARCHS MATCHES "compute_107")
+    list(APPEND FLASHMLA_CUDA_FLAGS
+        "-gencode=arch=compute_107a,code=sm_107a"
+    )
 endif()
 
 
