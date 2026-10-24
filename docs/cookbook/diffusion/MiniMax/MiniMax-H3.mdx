@@ -907,10 +907,10 @@ rejected. The trained sparsity 0.8 is the default; `--attention-backend-config
 '{"VSA_sparsity": ...}'` overrides it. FastH3 requests default to
 `quality: "lossless"`, which fuses the VAE decoder's per-head QK RMSNorm and
 RoPE and runs its attention on cuDNN SDPA; `quality: "exact"` keeps the
-reference decoder kernels. At every quality level FastH3 decodes each GPU's
-spatial VAE tiles as one batch rather than one at a time, which changes GEMM
-shapes and so the output at rounding level; base MiniMax-H3 decodes tile by
-tile.
+reference decoder kernels. Under `"lossless"` FastH3 decodes each GPU's
+spatial VAE tiles in one call rather than one at a time (base MiniMax-H3
+batches up to 64 per call), which changes GEMM shapes and so the output at
+rounding level; `"exact"` decodes tile by tile on both.
 
 `video_sparse_attn_h3` (VSA-H3) is the trained sparse policy: in-tree
 block-sparse kernels (FastVideo's native tcgen05 forward on SM100 / SM103, a
@@ -1101,13 +1101,16 @@ done
 levels:
 
 - `"exact"`: the exact reference path. Output is bit-exact
-  against the reference implementation and the CI ground truth.
+  against the reference implementation and the CI ground truth. On SM100+
+  the video VAE's temporal blend and output denormalization run as single
+  kernels that reproduce the reference arithmetic bit for bit and verify that
+  against the eager chain on first use.
 - `"lossless"` (default): includes the global fusion-only tier but does not enable
   Cache-DiT or another approximate optimization. Each DiT block runs its
   RMSNorm and AdaLN modulation as one kernel that rounds once instead of after
   every op, and VAE decode fuses the ViT decoder's per-head QK RMSNorm and
-  RoPE into one launch and runs its attention on cuDNN SDPA (rounding-level
-  differences only).
+  RoPE into one launch, runs its attention on cuDNN SDPA and, on CUDA, decodes
+  several spatial tiles per decoder forward (rounding-level differences only).
 - `"high"`: the audited accelerated path. Quality is guaranteed (the audited
   Cache-DiT configuration measures SSIM 0.931 / PSNR 28.16 dB against
   `exact`), but output is no longer bit-identical to the reference.
@@ -1558,6 +1561,7 @@ fold decision is not node-boundary aware:
 - The distilled pipeline uses a single denoising branch, so CFG parallelism does not apply. Keep it disabled: a CFG degree greater than 1 is accepted for request compatibility, but the extra ranks only recompute the same branch and do not accelerate the request. Explicitly disabling CFG, or setting its size to 1, remains a valid no-op.
 - The released visual VAE quality recipe uses overlapping tiled decode. SGLang keeps that recipe by default and distributes complete tiles across the decode group; this changes scheduling, not the computation inside each tile.
 - H3 rejects `--vae-config.parallel-decode-mode spatial` and `spatial_shard`: validation found output mismatches. Use the default released tiled recipe.
+- On CUDA, `quality: "lossless"` (the default) decodes up to `vae_config.decoder_tile_batch` (64) spatial tiles and `vae_config.window_batch` (1) temporal windows per video VAE decoder forward, next to the fused Q/K norm+RoPE and cuDNN SDPA; `exact` decodes one tile and one window at a time, `--performance-mode memory` does so at every level, and other platforms keep one tile per forward. On SM100+ the temporal blend and output denormalization run as bit-exact kernels at every quality level.
 - Keep the default `--encoder-parallel auto`. With the server’s default `batching_max_size` of 1, single-node H100/H200/B200/B300 recipes with peer-to-peer access fold the Qwen text encoder over otherwise idle Ulysses ranks. This is separate from DiT tensor parallelism. A pure-TP recipe already shards the encoder over its TP group and does not add a world fold.
 - Single-node Ulysses recipes pipeline each block's all-to-all against dense attention (FlashAttention on Hopper, cuDNN SDPA on Blackwell) over the copy engine: one head group's q/k/v moves while the previous group attends, every copy (the merge into the output included) runs on the copy engine, and the output is bit-identical to the sequential exchange. It needs peer-to-peer access and stream memory operations on every rank and about 6 × (rows per rank) × heads × head_dim extra activations per rank (2.1 GB for Ref2VA at Ulysses 2), one set shared by every resolution; when that does not fit on some rank, every rank keeps the sequential exchange. `SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=0` restores the sequential exchange.
 - For throughput-oriented serving, select **DP (batched throughput)**. The picker pairs `--encoder-parallel dp` with an editable `--batching-max-size` greater than 1. Encoder DP stays inside each DiT replica and composes with encoder TP: the H100 TP2 + Ulysses2 recipe has two TP-sharded encoder copies that can split a batch, while the RTX 5090 pure-TP2 recipe has one encoder copy and therefore no additional batch-DP degree. It provides no benefit for a batch of one and is not bitwise-identical to the unsplit deployment.
