@@ -8,8 +8,6 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
 
 namespace sglang {
 
@@ -70,6 +68,9 @@ struct StoreTrait {
     vec_t chunk;
     chunk.load(src, lane);
     if constexpr (kCastFp8) {
+#ifdef USE_ROCM
+      static_assert(!kCastFp8, "the bf16 -> fp8 cast store is CUDA-only");
+#else
       uint2 packed;
       auto* out = reinterpret_cast<__nv_fp8x2_storage_t*>(&packed);
 #pragma unroll
@@ -78,6 +79,7 @@ struct StoreTrait {
             *reinterpret_cast<const __nv_bfloat162_raw*>(&chunk[i]), __NV_SATFINITE, __NV_E4M3);
       }
       reinterpret_cast<uint2*>(dst)[lane] = packed;
+#endif
     } else {
       chunk.store(dst, lane);
     }
