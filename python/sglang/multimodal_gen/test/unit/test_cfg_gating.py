@@ -5,10 +5,14 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class _PipelineConfig:
@@ -22,7 +26,7 @@ class _PipelineConfig:
         return noise_pred
 
 
-class TestCFGGating(unittest.TestCase):
+class TestCFGGating(CustomTestCase):
     def _make_server_args(self, enable_cfg_parallel=False):
         return SimpleNamespace(
             enable_cfg_parallel=enable_cfg_parallel,
@@ -107,6 +111,80 @@ class TestCFGGating(unittest.TestCase):
         self.assertEqual(state["fresh_uncond"], 1)
         self.assertEqual(state["reused"], 1)
         self.assertEqual(state["invalidations"], 0)
+
+    def test_spectrum_forecasts_cannot_be_saved_as_gating_residuals(self):
+        """A scheduled Spectrum skip at the freeze step must run both branches."""
+
+        class TinyModel(SpectrumMixin):
+            def __init__(self):
+                self.prefix = "flux"
+                self._init_spectrum_state()
+
+        stage = DenoisingStage.__new__(DenoisingStage)
+        model = TinyModel()
+        batch = self._make_batch()
+        batch.enable_spectrum = True
+        batch.num_inference_steps = 4
+        batch.debug = False
+        batch.spectrum_params = SpectrumParams(
+            warmup_steps=1, window_size=2, flex_window=0, m=1
+        )
+        server_args = self._make_server_args()
+        policy = CFGPolicy().build(batch, {}, {}, {})
+        state = self._make_gate_state(gate_step=2)
+        calls = []
+
+        def predict(**kwargs):
+            ctx = get_forward_context()
+            real = model.begin_spectrum_step()
+            calls.append((ctx.current_timestep, batch.is_cfg_negative, real))
+            value = (
+                1 - ctx.current_timestep
+                if batch.is_cfg_negative
+                else 5 + ctx.current_timestep
+            )
+            features = torch.tensor([float(value)])
+            if real:
+                model.spectrum_record_features(features)
+                return features
+            return model.spectrum_predict_features(features)
+
+        stage._predict_noise = predict
+        with patch(
+            "sglang.multimodal_gen.runtime.server_args.get_global_server_args",
+            return_value=server_args,
+        ):
+            for step in range(3):
+                stage._predict_noise_with_cfg(
+                    current_model=model,
+                    latent_model_input=torch.zeros(1),
+                    timestep=torch.tensor(step),
+                    batch=batch,
+                    timestep_index=step,
+                    attn_metadata=None,
+                    target_dtype=torch.float32,
+                    current_guidance_scale=4.0,
+                    cfg_policy=policy,
+                    cfg_gate_state=state,
+                    server_args=server_args,
+                    guidance=None,
+                    latents=torch.zeros(1),
+                )
+        self.assertEqual(
+            calls[:4],
+            [(0, False, True), (0, True, True), (1, False, True), (1, True, True)],
+        )
+        torch.testing.assert_close(state["delta"][0], torch.tensor([6.0]))
+        self.assertEqual(state["reused"], 1)
+        self.assertEqual(len(calls), 5)
+        for predictor in (
+            model.spectrum_forecaster,
+            model.spectrum_forecaster_negative,
+        ):
+            self.assertEqual(predictor.cheb._count, 2)
+            torch.testing.assert_close(
+                predictor.cheb.t_buf[:2], torch.tensor([0.0, 1.0])
+            )
 
     def test_model_switch_invalidates_cached_delta(self):
         stage = DenoisingStage.__new__(DenoisingStage)

@@ -2206,12 +2206,13 @@ class DenoisingStage(PipelineStage):
             batch, current_guidance_scale
         )
 
-        def predict_fn(branch):
+        def predict_fn(branch, *, force_spectrum_real=False):
             branch.configure_batch(batch)
             with set_forward_context(
                 current_timestep=timestep_index,
                 attn_metadata=attn_metadata,
                 forward_batch=batch,
+                force_spectrum_real=force_spectrum_real,
             ):
                 raw = self._predict_noise(
                     current_model=current_model,
@@ -2242,7 +2243,16 @@ class DenoisingStage(PipelineStage):
                 cfg_gate_state["delta"] = None
                 cfg_gate_state["invalidations"] += 1
 
-            pos_pred = predict_fn(cfg_policy.branches[0])
+            # Never freeze a Spectrum forecast into the long-lived CFG delta.
+            # Force real forwards through the usual Spectrum hooks so both
+            # branch histories and counters still advance exactly once.
+            refresh_delta = (
+                timestep_index < cfg_gate_state["gate_step"]
+                or cfg_gate_state["delta"] is None
+            )
+            pos_pred = predict_fn(
+                cfg_policy.branches[0], force_spectrum_real=refresh_delta
+            )
             pos_t = _wrap(pos_pred)
             delta_t = cfg_gate_state["delta"]
             can_reuse = (
@@ -2255,11 +2265,16 @@ class DenoisingStage(PipelineStage):
                 neg_pred = _unwrap(tuple(p - d for p, d in zip(pos_t, delta_t)))
                 cfg_gate_state["reused"] += 1
             else:
-                neg_pred = predict_fn(cfg_policy.branches[1])
+                neg_pred = predict_fn(cfg_policy.branches[1], force_spectrum_real=True)
                 neg_t = _wrap(neg_pred)
-                cfg_gate_state["delta"] = tuple(
-                    p.detach() - n.detach() for p, n in zip(pos_t, neg_t)
+                cfg_gate_state["delta"] = (
+                    tuple(p.detach() - n.detach() for p, n in zip(pos_t, neg_t))
+                    if refresh_delta
+                    else None
                 )
+                # A changed output arity discovered after the positive forward
+                # invalidates the delta. Rebuild it from two real branches on
+                # the next step instead of storing a possibly forecasted value.
                 cfg_gate_state["model_id"] = model_id
                 cfg_gate_state["fresh_uncond"] += 1
 
