@@ -362,9 +362,12 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
 
     fn create_match_validator(
         &self,
-        _tree_core: &UnifiedTreeCore<K>,
+        tree_core: &UnifiedTreeCore<K>,
         match_device_only: bool,
     ) -> Box<dyn FnMut(&UnifiedTreeCore<K>, NodeIdx_) -> bool> {
+        if tree_core.pd_decode_aux_from_prefill {
+            return Box::new(|_, _| true);
+        }
         let sliding_window_size = self.sliding_window_size;
         // A per-request SWA ring is not stored in tree nodes. Its layout, not
         // the presence of a host tier, determines whether tombstones gate reuse.
@@ -393,6 +396,11 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
         value_chunks: &[Tensor],
         best_value_len: usize,
     ) -> MatchResult {
+        if tree_core.pd_decode_aux_from_prefill {
+            result.swa_host_hit_length = 0;
+            result.swa_branching_seqlen = None;
+            return result;
+        }
         let swa_boundary_len = result.device_prefix_len + result.host_hit_length;
 
         // Branch at the last page-aligned Full-KV position past the SWA boundary.

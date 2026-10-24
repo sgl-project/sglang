@@ -2345,7 +2345,7 @@ class _PlainKvStrategy(StackStrategy):
         )
 
 
-class _DsaStrategy(StackStrategy):
+class _DeclaredKvStrategy(StackStrategy):
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
@@ -2376,12 +2376,23 @@ class _DsaStrategy(StackStrategy):
         model_name=None,
         enable_storage_metrics=False,
     ):
+        drafts = params.mtp_draft_device_pools
+        if params.pd_decode_aux_from_prefill:
+            full_mapping, aux_mapping = _swa_layer_mappings(kvcache)
+            # Keep original layer IDs, including uncached auxiliary layers.
+            transfer_layer_id_max = max(full_mapping.keys() | aux_mapping.keys()) + 1
+            kvcache = kvcache.full_kv_pool
+            drafts = tuple(getattr(pool, "full_kv_pool", pool) for pool in drafts)
+            drafts = tuple(pool for pool in drafts if pool.layer_num)
+        else:
+            full_mapping = {i: i for i in range(kvcache.layer_num)}
+            transfer_layer_id_max = kvcache.layer_num
         config = prepare_host_pool_config(
             decls=kvcache.host_pool_decls(),
-            full_layer_mapping={i: i for i in range(kvcache.layer_num)},
-            transfer_layer_id_max=kvcache.layer_num,
+            full_layer_mapping=full_mapping,
+            transfer_layer_id_max=transfer_layer_id_max,
             transfer_page_size=params.page_size,
-            packed_draft_device_pools=params.mtp_draft_device_pools,
+            packed_draft_device_pools=drafts,
         )
         host_pool_group = build_host_pool_group(config=config)
         cache_controller = HybridCacheController(
@@ -2400,7 +2411,7 @@ class _DsaStrategy(StackStrategy):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             # The controller adds packed draft transfers after target layers.
-            transfer_layer_id_max=kvcache.layer_num,
+            transfer_layer_id_max=transfer_layer_id_max,
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=get_memory().hicache_host_memory_mode,
         )
@@ -2424,7 +2435,7 @@ _STRATEGIES: list[StackStrategy] = [
     _MambaStrategy(),
     _SwaStrategy(),
     _MambaSwaStrategy(),
-    _DsaStrategy(),
+    _DeclaredKvStrategy(),
     _MiniMaxSparseStrategy(),
     _PlainKvStrategy(),
 ]
@@ -2448,7 +2459,10 @@ def _select_strategy(kvcache: Any, components: set[ComponentType]) -> StackStrat
 
 # Strategies that assemble from host_pool_decls(), so every declared pool has an
 # entry by construction. A miss here is a bug, not an unsupported combination.
-_DECLARATION_VERIFIED_STRATEGIES: tuple[type, ...] = (_DsaStrategy, _MambaStrategy)
+_DECLARATION_VERIFIED_STRATEGIES: tuple[type, ...] = (
+    _DeclaredKvStrategy,
+    _MambaStrategy,
+)
 
 
 def _check_declared_pools_present(
@@ -2517,7 +2531,11 @@ def attach_hybrid_pool_to_unified_cache(
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         components = set(cache.components.keys())
-        strategy = _select_strategy(kvcache, components)
+        strategy = (
+            _DeclaredKvStrategy()
+            if params.pd_decode_aux_from_prefill
+            else _select_strategy(kvcache, components)
+        )
         result = strategy.build(
             cache=cache,
             kvcache=kvcache,

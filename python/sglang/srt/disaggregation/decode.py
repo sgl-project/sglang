@@ -484,6 +484,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
+    def _requires_fresh_swa_window(self) -> bool:
+        return getattr(self.tree_cache, "pd_decode_aux_from_prefill", False) and (
+            isinstance(self.token_to_kv_pool, SWAKVPool)
+        )
+
     def _uses_swa_reservation(self) -> bool:
         return (
             self._uses_swa_tail_prealloc()
@@ -546,7 +551,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return self.token_to_kv_pool_allocator.available_size()
 
     def _swa_tail_len(self, seq_len: int) -> int:
-        if not self._uses_swa_tail_prealloc() or seq_len <= 0:
+        if (
+            not self._uses_swa_tail_prealloc() and not self._requires_fresh_swa_window()
+        ) or seq_len <= 0:
             return max(seq_len, 0)
 
         window_size = self.scheduler.sliding_window_size
@@ -844,7 +851,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         max_prefix_len = None
-        if self._uses_swa_tail_prealloc():
+        if self._uses_swa_tail_prealloc() or self._requires_fresh_swa_window():
             fill_len = self._pre_alloc_fill_len(req)
             max_prefix_len = fill_len - self._swa_tail_len(fill_len)
         # Match and lock only reusable FULL KV. The entire SWA tail must be

@@ -204,6 +204,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
+        self.pd_decode_aux_from_prefill = params.pd_decode_aux_from_prefill
 
         if params.enable_metrics:
             self.init_metrics_collector()
