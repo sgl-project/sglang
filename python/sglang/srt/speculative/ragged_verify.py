@@ -89,6 +89,16 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     def bs(self) -> int:
         return int(self.verify_lens.shape[0])
 
+    def is_full_block(self, verify_num_draft_tokens: int) -> bool:
+        """Every request verifies its whole block and the graph has no
+        padding rows: the packed rows are the [bs, verify_num_draft_tokens]
+        verify window itself."""
+        return (
+            self.total_verify_tokens
+            == self.graph_num_tokens
+            == self.bs * verify_num_draft_tokens
+        )
+
     @classmethod
     def _assemble_device(
         cls,

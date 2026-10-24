@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.dflash import (
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
+    AcceptGreedy,
     accept_sampling,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -80,12 +81,32 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_sampler_capture_hook,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.dspark_components.dspark_observability import (
+    DecodeStepObservation,
+    DsparkInfoDumper,
+    resolve_enabled_components,
+)
+from sglang.srt.speculative.dspark_components.dspark_planner import (
+    DSparkVerifyPlanner,
+    VerifyWindow,
+)
+from sglang.srt.speculative.dspark_components.dspark_verify import (
+    TargetVerifyExecutor,
+)
 from sglang.srt.speculative.lilicorr_utils import (
     build_lilicorr_draft_sampler,
     propose_lilicorr_block,
     publish_anchor,
     resolve_sampling_enabled,
     target_input_embeddings,
+)
+from sglang.srt.speculative.online_acceptance_estimator import (
+    OnlineAcceptanceEstimator,
+)
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    RaggedVerifyMode,
+    read_ragged_verify_mode,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_sampling_mask import (
@@ -244,6 +265,24 @@ def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     )
 
 
+def _walked_confidence(
+    estimator, *, candidate_ids, scores, tokens, temperatures, greedy_mask
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(feature, conditional acceptance probability) of each draft token, both
+    [bs, block_size - 1]. The feature scores the selector row the walk drew the
+    token from, at the request's temperature (1 for a greedy row), never the
+    token itself. The walk is recovered by matching each token against its
+    slot's candidates, which are distinct vocabulary ids (a top-k)."""
+    path = (candidate_ids == tokens.unsqueeze(-1)).int().argmax(dim=-1)
+    rows = scores[:, 1:].gather(
+        2, path[:, :-1, None, None].expand(-1, -1, 1, scores.shape[-1])
+    )[:, :, 0]
+    return estimator.feature_and_predict(
+        torch.cat((scores[:, :1, 0], rows), dim=1),
+        temperatures.masked_fill(greedy_mask, 1.0),
+    )
+
+
 class _SelectorDraftSampler:
     """Selector decode folded into the draft cuda graph.
 
@@ -252,7 +291,14 @@ class _SelectorDraftSampler:
     """
 
     def __init__(
-        self, *, draft_model, block_size, max_bs, device, sampling_enabled: bool
+        self,
+        *,
+        draft_model,
+        block_size,
+        max_bs,
+        device,
+        sampling_enabled: bool,
+        acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
     ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
@@ -271,6 +317,14 @@ class _SelectorDraftSampler:
         self.q_out = torch.empty(
             (max_bs, gamma, top_k), dtype=torch.float32, device=device
         )
+        # The verify planner's acceptance feature and confidence, when it
+        # schedules a budget.
+        self.acceptance_estimator = acceptance_estimator
+        if acceptance_estimator is not None:
+            self.feature_out = torch.empty(
+                (max_bs, gamma), dtype=torch.float32, device=device
+            )
+            self.confidence_out = torch.empty_like(self.feature_out)
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before the draft
@@ -306,6 +360,17 @@ class _SelectorDraftSampler:
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
         self.candidate_out[:bs].copy_(candidate_ids)
         self.q_out[:bs].copy_(q_rows)
+        if self.acceptance_estimator is not None:
+            feature, confidence = _walked_confidence(
+                self.acceptance_estimator,
+                candidate_ids=candidate_ids,
+                scores=scores,
+                tokens=tokens,
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
+            )
+            self.feature_out[:bs].copy_(feature)
+            self.confidence_out[:bs].copy_(confidence)
 
 
 class _DominoDraftSampler:
@@ -599,6 +664,95 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
         self._target_logits_processor = self._defer_target_verify_gather()
+        self._init_verify_planner()
+
+    def _init_verify_planner(self) -> None:
+        """Confidence-scheduled verify (SGLANG_RAGGED_VERIFY_MODE cap-accept or
+        compact) on DSpark's verify planner and target-verify executor. DFLASH
+        drafts have no confidence head: an online acceptance estimator scores
+        each draft token from the selector row it was drawn from."""
+        gamma = int(self.block_size) - 1
+        mode = read_ragged_verify_mode()
+        self._verify_planner: Optional[DSparkVerifyPlanner] = None
+        self._verify_executor: Optional[TargetVerifyExecutor] = None
+        self._acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None
+        # This step's acceptance feature and confidence of the drafts.
+        self._draft_feature: Optional[torch.Tensor] = None
+        self._draft_confidence: Optional[torch.Tensor] = None
+        # Per-step records for sglang.benchmark.dspark_sps_profiler; off unless
+        # SGLANG_DSPARK_ENABLE_SPS_RECORD or SGLANG_DSPARK_DEBUG_DUMP is set.
+        self._info_dumper = DsparkInfoDumper(
+            components=resolve_enabled_components(),
+            gamma=gamma,
+            verify_num_draft_tokens=int(self.block_size),
+            attn_tp_rank=get_parallel().attn_tp_rank,
+            device=self.device,
+            mode_value=mode.value,
+            sps_report_interval=envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL.get(),
+        )
+        if mode is RaggedVerifyMode.STATIC:
+            return
+        if self.selector is None or not self._selector_sampling_enabled:
+            raise ValueError(
+                f"SGLANG_RAGGED_VERIFY_MODE={mode.value!r} with DFLASH needs a "
+                "selector draft (DFlash2) on a backend with selector sampling: "
+                "its verify budget is planned from the selector's candidate scores."
+            )
+        if get_parallel().attn_dp_enabled:
+            raise ValueError(
+                f"SGLANG_RAGGED_VERIFY_MODE={mode.value!r} with DFLASH does not "
+                "support attention DP yet; use SGLANG_RAGGED_VERIFY_MODE=static."
+            )
+        if SIMULATE_ACC_LEN > 0 and SIMULATE_ACC_LEN != 1.0:
+            raise ValueError(
+                "SGLANG_SIMULATE_ACC_LEN other than 1.0 can force an acceptance "
+                f"past a planned verify length; got {SIMULATE_ACC_LEN} with "
+                f"SGLANG_RAGGED_VERIFY_MODE={mode.value!r}."
+            )
+        self._verify_planner = DSparkVerifyPlanner(
+            draft_model=self.draft_model,
+            gamma=gamma,
+            model_runner=self.model_runner,
+            device=self.device,
+            tp_rank=get_parallel().tp_rank,
+            verify_num_draft_tokens=int(self.block_size),
+            tp_sync=self._tp_sync,
+            external_confidence=True,
+        )
+        self._verify_executor = TargetVerifyExecutor(
+            target_worker=self._target_worker,
+            gamma=gamma,
+            verify_num_draft_tokens=int(self.block_size),
+            model_runner=self.model_runner,
+            tp_sync=self._tp_sync,
+        )
+        # max_num_reqs only sizes the observe kernel's tile; any batch works.
+        self._acceptance_estimator = OnlineAcceptanceEstimator(
+            num_positions=gamma,
+            max_num_reqs=get_schedule().max_running_requests
+            or max(get_exec().graph.cuda_graph_config.decode.bs or [1]),
+            device=self.device,
+        )
+
+    def get_confidence_budget_prepare(self):
+        if self._verify_planner is None:
+            return None
+        return self._verify_planner.confidence_budget_prepare()
+
+    def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
+        if self._verify_planner is not None:
+            self._verify_planner.set_forced_budget_frac(frac)
+
+    def dump_info_records(self) -> Optional[dict]:
+        dumped = self._info_dumper.dump()
+        if dumped is not None:
+            dumped["simulate_acc_len"] = (
+                SIMULATE_ACC_LEN if SIMULATE_ACC_LEN > 0 else None
+            )
+        return dumped
+
+    def clear_info_records(self) -> None:
+        self._info_dumper.clear()
 
     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
         processors = [
@@ -679,6 +833,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
         )
+        target_attn_backend = self.model_runner.attn_backend
+        if (
+            read_ragged_verify_mode() is RaggedVerifyMode.COMPACT
+            and not target_attn_backend.supports_ragged_verify_graph
+        ):
+            raise ValueError(
+                "SGLANG_RAGGED_VERIFY_MODE=compact verifies packed per-request "
+                "token runs, which the target attention backend "
+                f"{type(target_attn_backend).__name__} does not support; use "
+                "SGLANG_RAGGED_VERIFY_MODE=cap-accept or static."
+            )
 
     def init_cuda_graphs(self):
         with (
@@ -887,6 +1052,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
                 sampling_enabled=self._selector_sampling_enabled,
+                acceptance_estimator=self._acceptance_estimator,
             )
         if self.lilicorr is not None:
             if not head_supported:
@@ -1503,6 +1669,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)
+        if self._acceptance_estimator is not None:
+            self._draft_feature, self._draft_confidence = _walked_confidence(
+                self._acceptance_estimator,
+                candidate_ids=candidate_ids,
+                scores=scores,
+                tokens=tokens,
+                temperatures=temperatures,
+                greedy_mask=greedy_mask,
+            )
         return tokens.view(bs, num_pred)
 
     def _selector_sampling_accept(
@@ -1514,7 +1689,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         q_rows: torch.Tensor,
         sampling_info,
         draft_input,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cutoff_verify_lens: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
         bs, block = candidates.shape
         gamma = block - 1
@@ -1530,7 +1706,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_probs = buffer[:bs]
         try:
             draft_probs.scatter_(-1, candidate_ids, q_rows.float())
-            accept_len, bonus, _ = accept_sampling(
+            accept_len, bonus, cap_trim_lens = accept_sampling(
                 candidates=candidates,
                 target_logits=next_token_logits,
                 draft_probs=draft_probs,
@@ -1538,7 +1714,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_input=draft_input,
                 gamma=gamma,
                 verify_num_draft_tokens=block,
-                cutoff_verify_lens=None,
+                cutoff_verify_lens=cutoff_verify_lens,
                 block_verification=self._block_verification,
             )
         finally:
@@ -1546,7 +1722,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # buffer the next draft step overwrites. In finally because the next
             # call scatters different ids and reads q across the whole vocabulary.
             draft_probs.scatter_(-1, candidate_ids, 0.0)
-        return accept_len.to(torch.int32), bonus.to(torch.int64)
+        return accept_len.to(torch.int32), bonus.to(torch.int64), cap_trim_lens
 
     def _greedy_sample_from_quantized_head(
         self,
@@ -2182,17 +2358,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         prefix_lens: torch.Tensor,
         bs: int,
         target_predict: Optional[torch.Tensor] = None,
+        cutoff_verify_lens: Optional[torch.Tensor] = None,
     ):
+        """With cutoff_verify_lens, request i accepts at most
+        cutoff_verify_lens[i] - 1 drafts and takes its bonus from the last row
+        it verified; cap_trim_lens counts the accepted drafts the cutoff cut."""
         new_seq_lens = None
+        cap_trim_lens = None
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
-            accept_len, bonus = self._selector_sampling_accept(
+            accept_len, bonus, cap_trim_lens = self._selector_sampling_accept(
                 candidates=candidates,
                 next_token_logits=next_token_logits,
                 candidate_ids=selector_candidate_ids,
                 q_rows=selector_q_rows,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
+                cutoff_verify_lens=cutoff_verify_lens,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
@@ -2200,6 +2382,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         elif target_predict is None and (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
+            # Ragged modes require a selector draft (_init_verify_planner); this
+            # kernel cannot stop at a planned verify length.
+            assert cutoff_verify_lens is None
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=next_token_logits,
@@ -2215,7 +2400,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.view(bs, int(self.block_size))
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
-            if self._use_triton_accept_bonus:
+            if cutoff_verify_lens is not None:
+                accept_len, bonus, cap_trim_lens = AcceptGreedy.execute(
+                    candidates=candidates,
+                    target_logits=None,
+                    target_predict=target_predict,
+                    verify_num_draft_tokens=int(self.block_size),
+                    cutoff_verify_lens=cutoff_verify_lens,
+                )
+                out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+            elif self._use_triton_accept_bonus:
                 try:
                     (
                         accept_len,
@@ -2270,7 +2464,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # accept_len; recompute it from the forced commit_lens.
             new_seq_lens = None
 
-        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
+        return accept_len, commit_lens, bonus, out_tokens, new_seq_lens, cap_trim_lens
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
@@ -2331,6 +2525,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            self._note_non_decode_step()
             self._wait_for_fused_hicache_load(batch)
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
@@ -2420,6 +2615,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         if batch.forward_mode.is_idle():
+            self._note_non_decode_step()
             # Under dp attention an idle DP rank must still run the target
             # verify forward (IDLE mode) so its cross-DP collectives stay in
             # lockstep with the active DP group; the draft block's
@@ -2472,6 +2668,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+        self._info_dumper.begin_step()
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -2662,6 +2859,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
+            self._draft_feature = self._draft_confidence = None
             if self._draft_sampler is not None:
                 # Consumed by the in-graph sample; must be staged before the replay.
                 self._draft_sampler.stage_sampling_params(
@@ -2720,6 +2918,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
+            if self._acceptance_estimator is not None:
+                self._draft_feature = self._draft_sampler.feature_out[:bs]
+                self._draft_confidence = self._draft_sampler.confidence_out[:bs]
             if (
                 self.selector is not None
                 and not _is_all_greedy(batch.sampling_info)
@@ -2823,46 +3024,68 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if self._need_mamba_verify_commit else None
         )
-        seq_lens_cpu_backup = batch.seq_lens_cpu
-        seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
-            batch.seq_lens_cpu = verify_host_seq_lens
-            batch.seq_lens_sum = int(verify_host_seq_lens.sum())
-        elif draft_input.nxt_kv_lens_cpu is not None:
-            batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
-            batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
-
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
+        confidence, verify_token_budget, layout = self._plan_verify(
+            batch=batch, draft_input=draft_input, prefix_lens=prefix_lens
         )
-        batch.seq_lens_cpu = seq_lens_cpu_backup
-        batch.seq_lens_sum = seq_lens_sum_backup
-
-        # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
-        # counts while a graph-replaying rank assumes the padded bucket, so
-        # their DP-gather segment offsets disagree. Fall back to eager verify
-        # whenever any DP rank is idle this round.
-        if (
-            get_parallel().attn_dp_enabled
-            and verify_forward_batch.original_global_num_tokens_cpu is not None
-            and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
-        ):
-            verify_forward_batch.can_run_decode_cuda_graph = False
-
-        # Mixed-round guard: an extend rank's raw token counts disagree with
-        # the verify batch's spec-scaled counts on the DP-gather layout; run
-        # eager, symmetric with the idle guard above.
-        if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
-            verify_forward_batch.can_run_decode_cuda_graph = False
-
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True if not _is_npu else None,
+        run_compact = self._verify_planner is not None and (
+            self._verify_planner.should_run_compact(layout=layout)
         )
+        if run_compact:
+            target_out = self._run_compact_verify(
+                batch=batch,
+                layout=layout,
+                draft_tokens=draft_tokens,
+                verify_window=VerifyWindow(
+                    positions_2d=positions_2d,
+                    verify_cache_loc=verify_out_cache_loc,
+                    verify_cache_loc_2d=verify_out_cache_loc_2d,
+                    kv_loc_plan=kv_loc_plan,
+                ),
+            )
+            routed_experts_output = indexer_topk_output = None
+        else:
+            seq_lens_cpu_backup = batch.seq_lens_cpu
+            seq_lens_sum_backup = batch.seq_lens_sum
+            if seq_lens_cpu_backup is not None:
+                # Verify host bound = committed prefix + one verify block (matches draft).
+                verify_host_seq_lens = seq_lens_cpu_backup + block_size
+                batch.seq_lens_cpu = verify_host_seq_lens
+                batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+            elif draft_input.nxt_kv_lens_cpu is not None:
+                batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+                batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+
+            verify_forward_batch, _ = verify_input.prepare_for_verify(
+                batch, self.target_worker
+            )
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
+
+            # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
+            # counts while a graph-replaying rank assumes the padded bucket, so
+            # their DP-gather segment offsets disagree. Fall back to eager verify
+            # whenever any DP rank is idle this round.
+            if (
+                get_parallel().attn_dp_enabled
+                and verify_forward_batch.original_global_num_tokens_cpu is not None
+                and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
+            ):
+                verify_forward_batch.can_run_decode_cuda_graph = False
+
+            # Mixed-round guard: an extend rank's raw token counts disagree with
+            # the verify batch's spec-scaled counts on the DP-gather layout; run
+            # eager, symmetric with the idle guard above.
+            if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
+                verify_forward_batch.can_run_decode_cuda_graph = False
+
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True if not _is_npu else None,
+            )
+            routed_experts_output = target_out.routed_experts_output
+            indexer_topk_output = target_out.indexer_topk_output
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
@@ -2908,6 +3131,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus,
             out_tokens,
             new_seq_lens,
+            cap_trim_lens,
         ) = self._accept_block(
             candidates=candidates,
             next_token_logits=logits_output.next_token_logits,
@@ -2916,7 +3140,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             bs=bs,
             target_predict=target_predict,
+            cutoff_verify_lens=None if layout is None else layout.verify_lens,
         )
+        if self._acceptance_estimator is not None:
+            self._observe_acceptance(accept_len=accept_len, layout=layout)
 
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,
@@ -2953,7 +3180,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
-            on_publish(new_seq_lens)
+            if confidence is not None:
+                on_publish(new_seq_lens, confidence=confidence)
+            else:
+                on_publish(new_seq_lens)
+        if self._info_dumper.enabled:
+            self._observe_decode_step(
+                batch=batch,
+                layout=layout,
+                confidence=confidence,
+                verify_token_budget=verify_token_budget,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
+                accept_len=accept_len,
+                cap_trim_lens=cap_trim_lens,
+                bonus=bonus,
+                commit_lens=commit_lens,
+            )
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
         hidden = logits_output.hidden_states
@@ -2992,6 +3235,139 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
-            routed_experts_output=target_out.routed_experts_output,
-            indexer_topk_output=target_out.indexer_topk_output,
+            block_accept_lens=(
+                None if cap_trim_lens is None else commit_lens + cap_trim_lens
+            ),
+            cap_lens=None if layout is None else layout.verify_lens.to(torch.int32),
+            routed_experts_output=routed_experts_output,
+            indexer_topk_output=indexer_topk_output,
+        )
+
+    def _note_non_decode_step(self) -> None:
+        self._info_dumper.note_non_decode_step()
+        if self._verify_planner is not None:
+            self._verify_planner.note_non_decode_step()
+
+    def _observe_acceptance(
+        self, *, accept_len: torch.Tensor, layout: Optional[RaggedVerifyLayout]
+    ) -> None:
+        """Teach the acceptance estimator this step's outcome: the drafts the
+        target verified (every draft without a layout) and how many of them
+        it accepted."""
+        self._acceptance_estimator.observe(
+            self._draft_feature,
+            num_verified=(
+                torch.full_like(accept_len, int(self.block_size) - 1)
+                if layout is None
+                else layout.verify_lens - 1
+            ),
+            num_accepted=accept_len,
+        )
+
+    def _plan_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        prefix_lens: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], Optional[int], Optional[RaggedVerifyLayout]]:
+        """(confidence, verify token budget, layout) of this step; a None layout
+        verifies every draft. As for DSPARK, every TP rank computes the same
+        confidence from the same draft, and the planner broadcasts the lengths."""
+        if self._verify_planner is None:
+            return None, None, None
+        confidence = self._draft_confidence
+        verify_token_budget = self._verify_planner.resolve_verify_token_budget(
+            draft_input=draft_input,
+            confidence=confidence,
+            prefix_lens=prefix_lens,
+            req_pool_indices=batch.req_pool_indices,
+        )
+        layout = self._verify_planner.schedule_layout(
+            req_pool_indices=batch.req_pool_indices,
+            prefix_lens=prefix_lens,
+            device=self.device,
+            confidence=confidence,
+            budget=verify_token_budget,
+        )
+        return confidence, verify_token_budget, layout
+
+    def _run_compact_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        layout: RaggedVerifyLayout,
+        draft_tokens: torch.Tensor,
+        verify_window: VerifyWindow,
+    ):
+        """Verify only verify_lens[i] rows of request i. The logits (still on
+        the vocabulary shard when the gather is deferred) and hidden states
+        come back in the [bs * block_size] layout."""
+        target_out, _ = self._verify_executor.run_compact(
+            batch=batch,
+            layout=layout,
+            draft_block_ids=draft_tokens,
+            draft_tokens=draft_tokens[:, 1:],
+            bs=int(draft_tokens.shape[0]),
+            device=self.device,
+            # Applied by the caller once the logits are gathered.
+            sampling_info=None,
+            verify_window=verify_window,
+        )
+        return target_out
+
+    def _observe_decode_step(
+        self,
+        *,
+        batch: ScheduleBatch,
+        layout: Optional[RaggedVerifyLayout],
+        confidence: Optional[torch.Tensor],
+        verify_token_budget: Optional[int],
+        prefix_lens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        accept_len: torch.Tensor,
+        cap_trim_lens: Optional[torch.Tensor],
+        bonus: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        planner = self._verify_planner
+        decision = None if planner is None else planner.take_budget_decision()
+        predicted_step_seconds = (
+            None if decision is None else decision.predicted_step_seconds
+        )
+        num_verify_tokens = (
+            draft_tokens.numel() if layout is None else layout.graph_num_tokens
+        )
+        self._info_dumper.observe_decode_step(
+            DecodeStepObservation(
+                forward_ct=int(batch.forward_iter),
+                bs=int(draft_tokens.shape[0]),
+                mode=self._info_dumper.mode_value,
+                budget=verify_token_budget,
+                lag_steps=None if planner is None else planner.lag_steps,
+                num_verify_tokens=num_verify_tokens,
+                verify_tokens_local=int(batch.spec_verify_tier_num_tokens),
+                verify_tokens_dp_synced=-1,
+                verify_tokens_graph_key=num_verify_tokens,
+                predicted_step_ms=(
+                    None
+                    if predicted_step_seconds is None
+                    else predicted_step_seconds * 1e3
+                ),
+                predicted_theta=None if decision is None else decision.predicted_theta,
+                verify_lens=None if layout is None else layout.verify_lens,
+                confidence=confidence,
+                req_pool_indices=batch.req_pool_indices,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
+                bonus_tokens=bonus,
+                correct_len=accept_len,
+                cap_trim_lens=(
+                    torch.zeros_like(commit_lens)
+                    if cap_trim_lens is None
+                    else cap_trim_lens
+                ),
+                commit_lens=commit_lens,
+                rids=[req.rid for req in batch.reqs],
+            )
         )

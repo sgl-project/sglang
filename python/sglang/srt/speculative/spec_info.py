@@ -161,7 +161,7 @@ class SpeculativeAlgorithm(Enum):
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
         graphs in the decode cuda graph runner."""
-        return self.is_dspark()
+        return self.is_dflash_family()
 
     def supports_grammar_overlap(self) -> bool:
         # Whether the worker advances the grammar FSM inside verify() (via the

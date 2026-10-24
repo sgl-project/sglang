@@ -123,7 +123,10 @@ class SchedulerInternalStateController:
         accept_length = self._average_accept_length()
         if accept_length is not None:
             state["avg_spec_accept_length"] = accept_length
-        if scheduler.spec_algorithm.is_dspark() and scheduler.draft_worker is not None:
+        if (
+            scheduler.spec_algorithm.is_dflash_family()
+            and scheduler.draft_worker is not None
+        ):
             info_record = scheduler.draft_worker.dump_info_records()
             if info_record is not None:
                 state["dspark_info_record"] = info_record
@@ -218,6 +221,14 @@ class SchedulerInternalStateController:
         self._require_dspark_worker(key, "set_dspark_forced_budget_frac")
         if value is not None and not (0.0 < float(value) <= 1.0):
             raise UpdateRejected(f"{key} must be in (0, 1] or null, got {value}.")
+        simulate_acc_len = envs.SGLANG_SIMULATE_ACC_LEN.get()
+        if value is not None and simulate_acc_len > 0 and simulate_acc_len != 1.0:
+            # A pinned budget trims verify lengths, and a simulated correct_len
+            # above 0 can run past them.
+            raise UpdateRejected(
+                f"{key} cannot pin a verify budget with "
+                f"SGLANG_SIMULATE_ACC_LEN={simulate_acc_len}; use 1.0 or unset it."
+            )
 
     def _apply_dspark_budget_frac(self, key: str, value: Any) -> None:
         # A worker command, not a server arg: keep it out of the override.
@@ -233,10 +244,10 @@ class SchedulerInternalStateController:
             self.scheduler.draft_worker.clear_info_records()
 
     def _require_dspark_worker(self, key: str, command: str) -> None:
-        if not self.scheduler.spec_algorithm.is_dspark() or not hasattr(
+        if not self.scheduler.spec_algorithm.is_dflash_family() or not hasattr(
             self.scheduler.draft_worker, command
         ):
-            raise UpdateRejected(f"{key} requires a DSpark draft worker.")
+            raise UpdateRejected(f"{key} requires a DSpark or DFLASH draft worker.")
 
     # ------------------------------------------------------------------ shared
 

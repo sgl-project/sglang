@@ -62,13 +62,23 @@ def _case_accept_greedy(tc):
     candidates = _ri(0, 200, (bs, t))
     target_logits = torch.randn(bs * t, 200, device=DEVICE)
     for cutoff in (None, _ri(1, t + 1, (bs,), torch.int32)):
-        tc._parity(
+        got, _ = tc._parity(
             dspark_accept.AcceptGreedy,
             candidates=candidates,
             target_logits=target_logits,
             verify_num_draft_tokens=t,
             cutoff_verify_lens=cutoff,
         )
+        # A caller holding the argmax ids passes them instead of the logits.
+        from_ids, _ = tc._parity(
+            dspark_accept.AcceptGreedy,
+            candidates=candidates,
+            target_logits=None,
+            target_predict=target_logits.argmax(dim=-1),
+            verify_num_draft_tokens=t,
+            cutoff_verify_lens=cutoff,
+        )
+        tc._eq(from_ids, got)
     # gather_row_bonus: bonus token at a per-row column index.
     table, idx = _ri(0, VOCAB, (64, t)), _ri(0, t, (64,), torch.int32)
     ref = table[torch.arange(64, device=DEVICE), idx.long()]
@@ -130,18 +140,21 @@ def _case_build_ragged_verify_window(tc):
             req_to_token=_ri(0, 1_000_000, (bs + 3, 64), torch.int32)
         )
     )
-    for graph_num_tokens in (bs * t, (bs + 3) * t):  # tight and bucket padding
-        tc._parity(
-            dspark_verify_window.BuildRaggedVerifyWindow,
-            batch=batch,
-            layout=_layout(verify_lens, graph_num_tokens),
-            draft_block_ids=_ri(0, VOCAB, (bs, gamma)),
-            draft_tokens=_ri(0, VOCAB, (bs, gamma)),
-            bs=bs,
-            device=DEVICE,
-            verify_num_draft_tokens=t,
-            model_runner=model_runner,
-        )
+    # tight and bucket padding; DSpark's gamma-wide anchor block and DFLASH's
+    # gamma + 1 wide one (anchor and drafts)
+    for graph_num_tokens in (bs * t, (bs + 3) * t):
+        for block_width in (gamma, t):
+            tc._parity(
+                dspark_verify_window.BuildRaggedVerifyWindow,
+                batch=batch,
+                layout=_layout(verify_lens, graph_num_tokens),
+                draft_block_ids=_ri(0, VOCAB, (bs, block_width)),
+                draft_tokens=_ri(0, VOCAB, (bs, gamma)),
+                bs=bs,
+                device=DEVICE,
+                verify_num_draft_tokens=t,
+                model_runner=model_runner,
+            )
 
 
 def _case_cap_correct_len(tc):
