@@ -626,7 +626,6 @@ class LogitsProcessor(nn.Module):
                     pruned_states,
                     lm_head,
                     logits_metadata,
-                    use_logits_buffer=self.beam_trie_output_head is None,
                 )
                 beam_normalizer = None
             else:
@@ -943,7 +942,9 @@ class LogitsProcessor(nn.Module):
         )
         logits_buffer = (
             logits_metadata.next_token_logits_buffer
-            if use_logits_buffer and not self.do_tensor_parallel_all_gather
+            if use_logits_buffer
+            and not self.do_tensor_parallel_all_gather
+            and self.beam_trie_output_head is None
             else None
         )
         with get_forward().scoped(lora_batch_layout=lora_batch_layout):
