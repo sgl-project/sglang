@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.model_override_base import (
@@ -249,6 +250,17 @@ def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None
         )
 
 
+def _keep_dp_graph_collectives_unregistered() -> None:
+    # DP ranks pick their own V4.1 decode graph variant, so collectives captured on
+    # per-graph registered buffers read stale data; must run before the schedulers start.
+    if os.environ.setdefault("SGLANG_AITER_CAPTURE_COPY_IN", "1") != "1":
+        logger.warning(
+            "SGLANG_AITER_CAPTURE_COPY_IN=%s was set explicitly; DeepSeek-V4.1 "
+            "with DP attention can then decode wrong tokens.",
+            os.environ["SGLANG_AITER_CAPTURE_COPY_IN"],
+        )
+
+
 def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
         is_unified_kv_triton,
@@ -261,6 +273,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    if get_platform().is_hip and attn_dp_enabled_of(cfg):
+        _keep_dp_graph_collectives_unregistered()
     if (
         cfg.dsv4_attn_backend == "trtllm"
         and cfg.cuda_graph_config.prefill.backend
