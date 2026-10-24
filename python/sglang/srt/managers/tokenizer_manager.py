@@ -114,7 +114,7 @@ from sglang.srt.managers.io_struct import (
     unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import wrap_shm_features
+from sglang.srt.managers.mm_utils import discard_shm_features, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.positional_embeds_transport import PositionalEmbedsTransport
 from sglang.srt.managers.schedule_batch import (
@@ -1798,7 +1798,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (tokenized_obj,)
             )
             tokenized_obj.time_stats.set_api_server_dispatch_time()
-            tokenized_obj = wrap_shm_features(tokenized_obj)
+            tokenized_obj = await self._wrap_shm_features_async(tokenized_obj)
             time_stats = tokenized_obj.time_stats
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
@@ -1813,6 +1813,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
                 self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
+
+    async def _wrap_shm_features_async(
+        self,
+        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
+    ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
+        """Copy features into shared memory without blocking the event loop.
+
+        Decoded images reach hundreds of MB per request; copying them on the
+        loop stalls every other request and the health endpoint.
+        """
+        if tokenized_obj.mm_inputs is None:
+            return tokenized_obj
+        future = asyncio.get_running_loop().run_in_executor(
+            None, wrap_shm_features, tokenized_obj
+        )
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            discard_shm_features(await future)
+            raise
 
     def _mark_state_dispatched(self, rid: str):
         """Record that *rid* reached the scheduler.
