@@ -37,6 +37,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, retry
 from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.utils.hf_transformers_utils import (
+    CONTEXT_LENGTH_KEYS,
     get_config,
     get_context_length,
     get_generation_config,
@@ -1299,6 +1300,34 @@ class ModelConfig:
                 self.context_len = min(derived_context_len, 8192)
             else:
                 self.context_len = derived_context_len
+
+            # On this path the user did not ask for a specific context length,
+            # so the value is entirely inferred from the model config: fine-tuned
+            # models often ship a max_position_embeddings that understates what
+            # they actually support, and get_context_length() silently falls back
+            # to a hard-coded 2048 when no context-length field exists at all.
+            # Surface what was picked so a wrong value is caught at startup
+            # instead of showing up later as unexplained truncation.
+            if any(
+                getattr(self.hf_text_config, key, None) is not None
+                for key in CONTEXT_LENGTH_KEYS
+            ):
+                logger.info(
+                    "context_length is not specified; derived %d from the model "
+                    "config. If that config is inaccurate (common for fine-tuned "
+                    "models), long inputs may be truncated. Pass --context-length "
+                    "to override.",
+                    self.context_len,
+                )
+            else:
+                logger.warning(
+                    "None of the context-length fields (%s) is present in the "
+                    "model config, so context_length falls back to the built-in "
+                    "default of %d. Long inputs may be truncated. Pass "
+                    "--context-length to set it explicitly.",
+                    ", ".join(CONTEXT_LENGTH_KEYS),
+                    self.context_len,
+                )
 
         # Transfer context_len to HuggingFace config so models can access it
         self.hf_config.context_len = self.context_len
