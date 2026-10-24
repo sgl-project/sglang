@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
 from sglang.kernels.ops.layernorm.mhc import hc_pre as _hc_pre_fn
+from sglang.kernels.ops.layernorm.mhc import prewarm_mhc_pre
 from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_stages,
 )
@@ -118,6 +119,7 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_mm,
     get_parallel,
+    get_schedule,
     get_spec,
     linear_attn_parallel_group,
     linear_attn_tp_size,
@@ -1933,6 +1935,55 @@ class Glm5NextForConditionalGeneration(nn.Module):
             return
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
+        )
+
+    def precompile_kernels_after_loading(self) -> None:
+        """Compile the mhc_pre kernels for all split counts before serving.
+
+        mhc_pre gets its prenorm GEMM split count from the number of tokens
+        and compiles one kernel for each split count on first use. Without
+        this, eager prefills compile while the server serves. The checks
+        below give the same result on all ranks.
+        """
+        if (
+            not _is_cuda
+            or self.model is None
+            or not self.config.mhc
+            or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
+        ):
+            return
+        # prewarm_mhc_pre gets its token counts from chunked_prefill_size.
+        chunked_prefill_size = get_schedule().chunked_prefill_size
+        if chunked_prefill_size is None or chunked_prefill_size <= 0:
+            return
+        layer = next(
+            (m for m in self.model.layers if isinstance(m, Glm5NextDecoderLayer)),
+            None,
+        )
+        if layer is None:
+            return
+        # OffloaderV1 onloads only through layer.forward; the load hook bypasses it.
+        device = torch.device("cuda", torch.cuda.current_device())
+        prewarm_mhc_pre(
+            # Gives dtype and device; each bucket allocates its own tokens.
+            residual=torch.zeros(
+                (1, self.config.hc_mult, self.config.hidden_size),
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            fn=layer.hc_attn_fn.detach().to(device),
+            hc_scale=layer.hc_attn_scale.detach().to(device),
+            hc_base=layer.hc_attn_base.detach().to(device),
+            rms_eps=self.config.rms_norm_eps,
+            hc_pre_eps=self.config.hc_eps,
+            hc_sinkhorn_eps=self.config.hc_eps,
+            hc_post_mult_value=_MHC_POST_MULT_VALUE,
+            sinkhorn_repeat=self.config.hc_sinkhorn_iters,
+            # The mhc_pre defaults, which hc_pre uses.
+            n_splits=1,
+            n_splits_pre=32,
+            norm_weight=layer.input_layernorm.weight.detach().to(device),
+            norm_eps=layer.input_layernorm.variance_epsilon,
         )
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
