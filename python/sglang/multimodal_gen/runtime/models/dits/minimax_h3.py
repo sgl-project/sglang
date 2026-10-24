@@ -66,9 +66,6 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
-    vsa_h3_fold_gate,
-)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     claim_deferred_component_attn_backend,
     get_attn_backend,
@@ -421,11 +418,11 @@ def _modulate_rmsnorm_scale_shift(
 
 
 def _accepts_mxfp8_input(linear: nn.Module) -> bool:
-    return (
-        isinstance(linear, LinearBase)
-        and linear.quant_method is not None
-        and linear.quant_method.accepts_mxfp8_input(linear)
-    )
+    if not isinstance(linear, LinearBase):
+        return False
+    # SRT-backed NPU methods need not implement this optional fused-input hook.
+    accepts = getattr(linear.quant_method, "accepts_mxfp8_input", None)
+    return callable(accepts) and accepts(linear)
 
 
 def _modulate_scale_shift(
@@ -881,6 +878,11 @@ def _minimax_h3_attention_core_impl(
         if ulysses_active:
             out = _usp_output_all_to_all(out[None], head_dim=2)[0]
         if fold_after_exchange:
+            # CUDA-only VSA kernels must not be imported by other backends.
+            from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
+                vsa_h3_fold_gate,
+            )
+
             _, ulysses_rank = get_ulysses_ctx()
             vsa_h3_fold_gate(
                 out,
@@ -980,6 +982,7 @@ class MiniMaxH3Attention(nn.Module):
         self.local_inner_dim = self.num_heads * self.head_dim
         self.softmax_scale = self.head_dim**-0.5
         self.prefix = prefix
+        self._quant_config = quant_config
         self._attention_impl = None
         self._attention_backend_enum: AttentionBackendEnum | None = None
         # attention initializes on the first real QKV tensors, after the
@@ -1079,6 +1082,7 @@ class MiniMaxH3Attention(nn.Module):
             num_kv_heads=self.num_heads,
             prefix=self.prefix,
             packed_trailing_padding=True,
+            quant_config=self._quant_config,
         )
         # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
         # the resolved enum alongside the impl instance instead of a second
