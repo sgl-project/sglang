@@ -3142,8 +3142,7 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=True,
         )
         if self._prefill_graph_translates_swa_loc(self.forward_metadata):
-            # One translation for every layer store, refreshed in place at replay,
-            # instead of one captured per layer.
+            # Every layer's store reads this buffer; replay refreshes it in place.
             self.forward_metadata.core_attn_metadata.swa_out_cache_loc = (
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
