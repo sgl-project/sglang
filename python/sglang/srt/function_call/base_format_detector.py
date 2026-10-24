@@ -74,6 +74,16 @@ class BaseFormatDetector(ABC):
             tool.function.name: i for i, tool in enumerate(tools) if tool.function.name
         }
 
+    def _handle_unknown_tool(self, name: Optional[str]) -> bool:
+        """Log the unknown-tool warning; return True to skip, False to forward.
+
+        Streaming callers must gate on their own "tool name already sent" flag
+        before invoking this; otherwise each chunk that re-parses the buffered
+        tool call will re-warn for the same name.
+        """
+        logger.warning(f"Model attempted to call undefined function: {name}")
+        return not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+
     def parse_base_json(self, action: Any, tools: List[Tool]) -> List[ToolCallItem]:
         tool_indices = self._get_tool_indices(tools)
         if not isinstance(action, list):
@@ -83,9 +93,8 @@ class BaseFormatDetector(ABC):
         for act in action:
             name = act.get("name")
             if not (name and name in tool_indices):
-                logger.warning(f"Model attempted to call undefined function: {name}")
-                if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
-                    continue  # Skip unknown tools (default legacy behavior)
+                if self._handle_unknown_tool(name):
+                    continue
 
             results.append(
                 ToolCallItem(
@@ -215,15 +224,23 @@ class BaseFormatDetector(ABC):
                     current_text[start_idx : start_idx + end_idx]
                 )
 
-                # Validate tool name if present
-                if "name" in obj and obj["name"] not in self._tool_indices:
-                    # Invalid tool name - reset state
-                    self._buffer = ""
-                    self.current_tool_id = -1
-                    self.current_tool_name_sent = False
-                    if self.streamed_args_for_tool:
-                        self.streamed_args_for_tool.pop()
-                    return StreamingParseResult()
+                # obj["name"] persists across chunks while args stream, so
+                # only validate once per tool call.
+                if (
+                    not self.current_tool_name_sent
+                    and "name" in obj
+                    and obj["name"] not in self._tool_indices
+                ):
+                    if self._handle_unknown_tool(obj["name"]):
+                        # Keep current_tool_id and streamed_args_for_tool
+                        # intact — already-completed slots must survive so
+                        # the next valid tool advances via Case 1.
+                        self._buffer = (
+                            current_text[start_idx + end_idx :]
+                            if is_current_complete
+                            else ""
+                        )
+                        return StreamingParseResult()
 
                 # Handle parameters/arguments consistency
                 # NOTE: we assume here that the obj is always partial of a single tool call
@@ -246,7 +263,8 @@ class BaseFormatDetector(ABC):
             if not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")
 
-                if function_name and function_name in self._tool_indices:
+                # Unknown names are already filtered by the validation branch above.
+                if function_name:
                     # If this is a new tool (current_tool_id was -1), initialize it
                     if self.current_tool_id == -1:
                         self.current_tool_id = 0
