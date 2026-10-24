@@ -5,6 +5,7 @@ import math
 import multiprocessing
 import os
 import random
+import re
 import shutil
 import subprocess
 import time
@@ -16,10 +17,11 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_cpu_ids_by_node, is_cuda, is_xpu
+from sglang.srt.utils import get_cpu_ids_by_node, is_cuda, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -379,7 +381,7 @@ def _is_numa_available() -> bool:
     Check if NUMA is available and not already configured externally.
     A host where only CPU affinity can be set (a container without SYS_NICE) counts.
     """
-    if not (_is_cuda or _is_xpu):
+    if not (_is_cuda or _is_xpu or _is_npu):
         return False
 
     # Check if this is a numa system.
@@ -395,6 +397,100 @@ def _is_numa_available() -> bool:
     return True
 
 
+def _npu_visible_physical_device_id(device_id: int) -> int | None:
+    """Map a logical NPU device id to its physical NPU id.
+
+    ASCEND_RT_VISIBLE_DEVICES holds an ordered subset of physical NPU ids
+    (verified on Atlas 910B3 / CANN 8.x: "1,3" maps logical 0 -> physical 1;
+    reordering such as "5,0" is rejected by the driver), so the logical id
+    indexes the list in order. Unset or unparsable values fall back to the
+    identity mapping.
+    """
+    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").strip()
+    if not visible:
+        return device_id
+    try:
+        ids = [int(x) for x in re.split(r"[ ,]", visible) if x]
+    except ValueError:
+        logger.warning(
+            f"Unparsable ASCEND_RT_VISIBLE_DEVICES={visible!r}; "
+            f"treating device_id={device_id} as the physical NPU id."
+        )
+        return device_id
+    if not 0 <= device_id < len(ids):
+        logger.warning(
+            f"ASCEND_RT_VISIBLE_DEVICES={visible!r} has no entry for "
+            f"logical device {device_id}; skipping NPU NUMA binding."
+        )
+        return None
+    return ids[device_id]
+
+
+def _npu_pci_bdf(physical_id: int) -> str | None:
+    """Return the PCI BDF of a physical NPU from ``npu-smi info`` output.
+
+    The npu-smi table lists each NPU over two rows; the Bus-Id appears on
+    the second row as e.g. ``0000:C1:00.0``.
+    """
+    if shutil.which("npu-smi") is None:
+        logger.debug("npu-smi not found, skipping NUMA node configuration for NPU")
+        return None
+    try:
+        out = subprocess.run(
+            ["npu-smi", "info"], capture_output=True, text=True, timeout=10
+        ).stdout
+    except Exception as e:
+        logger.warning(f"npu-smi info failed ({e}); skipping NPU NUMA binding")
+        return None
+    lines = out.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"\|\s+(\d+)\s+\S+\s+\|", line)
+        if m and int(m.group(1)) == physical_id:
+            for j in range(i + 1, min(i + 3, len(lines))):
+                m2 = re.search(
+                    r"\|\s+([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])\s*\|",
+                    lines[j],
+                )
+                if m2:
+                    return m2.group(1).lower()
+    logger.warning(
+        f"NPU {physical_id} not found in npu-smi output; skipping NPU NUMA binding"
+    )
+    return None
+
+
+def _query_numa_node_for_npu(device_id: int) -> list:
+    """Get the NUMA node affinity for a logical Ascend NPU device id.
+
+    Resolution chain: logical -> physical NPU via ASCEND_RT_VISIBLE_DEVICES,
+    physical NPU -> PCI BDF via ``npu-smi info``, BDF -> NUMA node via
+    sysfs (``/sys/bus/pci/devices/<bdf>/numa_node``). Degrades safely to no
+    binding (returns []) at every step.
+    """
+    physical = _npu_visible_physical_device_id(device_id)
+    if physical is None:
+        return []
+    bdf = _npu_pci_bdf(physical)
+    if bdf is None:
+        return []
+    try:
+        with open(f"/sys/bus/pci/devices/{bdf}/numa_node") as f:
+            node = int(f.read().strip())
+    except OSError:
+        logger.warning(
+            f"numa_node unavailable for PCI {bdf} (NPU {physical}); "
+            f"skipping NPU NUMA binding"
+        )
+        return []
+    if node < 0:
+        logger.warning(
+            f"NUMA node {node} for PCI {bdf} (NPU {physical}) is invalid; "
+            f"skipping NPU NUMA binding"
+        )
+        return []
+    return [node]
+
+
 def _query_numa_node_for_gpu(device_id: int):
     """
     Get the NUMA node affinity list for a GPU device.
@@ -406,6 +502,9 @@ def _query_numa_node_for_gpu(device_id: int):
     """
     if _is_xpu:
         return _query_numa_node_for_xpu(device_id)
+
+    if _is_npu:
+        return _query_numa_node_for_npu(device_id)
 
     try:
         import pynvml
