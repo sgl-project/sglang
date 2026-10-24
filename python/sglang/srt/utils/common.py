@@ -1233,7 +1233,7 @@ def is_gfx95_supported():
 
     False on every non-HIP build, so callers do not need their own is_hip().
     """
-    if torch.version.hip:
+    if torch.version.hip and torch.cuda.is_available():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx95"])
     else:
@@ -1245,7 +1245,7 @@ def is_gfx942_supported():
     """
     Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
     """
-    if torch.version.hip:
+    if torch.version.hip and torch.cuda.is_available():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx942"])
     else:
@@ -1257,7 +1257,7 @@ def is_gfx1250_supported():
     """
     Returns whether the current platform is AMD RDNA4 (gfx1250).
     """
-    if torch.version.hip:
+    if torch.version.hip and torch.cuda.is_available():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx1250"])
     else:
