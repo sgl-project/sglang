@@ -32,10 +32,18 @@ service SglangService {
   rpc Rerank(OpenAIRequest) returns (OpenAIResponse);
 
   // Admin/Ops RPCs
+  // Schedules the engine's configured SIGTERM shutdown procedure.
+  // A response acknowledges scheduling, not completion; it may be lost on exit.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc StartProfile(StartProfileRequest) returns (StartProfileResponse);
   rpc StopProfile(StopProfileRequest) returns (StopProfileResponse);
   rpc UpdateWeightsFromDisk(UpdateWeightsRequest) returns (UpdateWeightsResponse);
 }
+
+message ShutdownRequest {}
+// Acknowledges acceptance, not completion. The server may close the
+// connection before the client observes the response.
+message ShutdownResponse {}
 
 // Disaggregated prefill/decode rendezvous parameters.
 //

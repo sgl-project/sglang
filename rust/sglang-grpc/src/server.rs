@@ -764,6 +764,15 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
         Ok(Response::new(proto::GetLoadResponse { json_info }))
     }
 
+    async fn shutdown(
+        &self,
+        _request: Request<proto::ShutdownRequest>,
+    ) -> Result<Response<proto::ShutdownResponse>, Status> {
+        self.blocking_bridge_call("Failed to initiate shutdown", PyBridge::shutdown)
+            .await?;
+        Ok(Response::new(proto::ShutdownResponse {}))
+    }
+
     async fn abort(
         &self,
         request: Request<proto::AbortRequest>,
