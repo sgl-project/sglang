@@ -434,7 +434,9 @@ def capture_cuda_graphs(
     )
     if capture_decode_cuda_graph:
         if current_platform.capabilities.graph_capture:
-            decode = capture_decode_graph(model_runner=model_runner)
+            decode = capture_decode_graph(
+                model_runner=model_runner, prefill_runner=prefill.runner
+            )
     else:
         decode = GraphCapture(
             runner=eager_runner,
@@ -491,6 +493,17 @@ def capture_prefill_graph(
             memory_usage_gb=memory_usage_gb,
             capture_time=capture_time,
         )
+
+    # CPU prefill graph capture is owned by CPUGraphRunner; keep the shared
+    # setup path eager for unsupported CPU configurations.
+    if model_runner.device == "cpu":
+        if not get_flags().capture.enable_torch_compile:
+            return result(None)
+        if model_runner.is_draft_worker and not force_for_draft_worker:
+            return result(None)
+        if not model_runner._uses_cpu_graph_attention_backend():
+            return result(None)
+        return result(CPUGraphRunner(model_runner))
 
     if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
         logger.info(
@@ -700,7 +713,9 @@ def capture_prefill_graph(
     return result(prefill_runner, mem_usage, capture_time)
 
 
-def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
+def capture_decode_graph(
+    *, model_runner: ModelRunner, prefill_runner: Optional[BaseRunner] = None
+) -> GraphCapture:
     """Capture device graphs."""
     if model_runner.is_draft_worker:
         memory_phase = "draft_decode"
@@ -732,8 +747,18 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         Phase.DECODE, Backend.DISABLED
     ):
         return no_capture
-    if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
-        return no_capture
+    if model_runner.device == "cpu":
+        if prefill_runner is None:
+            prefill_runner = getattr(model_runner, "prefill_cuda_graph_runner", None)
+        if isinstance(prefill_runner, CPUGraphRunner):
+            return GraphCapture(
+                runner=prefill_runner,
+                memory_phase=memory_phase,
+                memory_usage_gb=0,
+                capture_time=0,
+            )
+        if not get_flags().capture.enable_torch_compile:
+            return no_capture
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)

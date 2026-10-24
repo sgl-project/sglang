@@ -88,6 +88,21 @@ import pybase64
 import requests
 import torch
 import torch.distributed as dist
+
+# Cache CPU capability checks at import time to prevent Dynamo from tracing lru_cache wrappers.
+_IS_HOST_CPU_X86 = (
+    platform.machine().lower() in ("x86_64", "amd64", "i386", "i686")
+    and hasattr(torch, "cpu")
+    and torch.cpu.is_available()
+)
+_IS_HOST_CPU_ARM64 = (
+    platform.machine().lower() in ("aarch64", "arm64")
+    and hasattr(torch, "cpu")
+    and torch.cpu.is_available()
+)
+_IS_CPU_ENGINE = os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and (
+    _IS_HOST_CPU_X86 or _IS_HOST_CPU_ARM64
+)
 import triton
 from packaging import version as pkg_version
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -200,27 +215,15 @@ def is_npu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
-    machine = platform.machine().lower()
-    return (
-        machine in ("x86_64", "amd64", "i386", "i686")
-        and hasattr(torch, "cpu")
-        and torch.cpu.is_available()
-    )
+    return _IS_HOST_CPU_X86
 
 
 def is_host_cpu_arm64() -> bool:
-    machine = platform.machine().lower()
-    return (
-        machine in ("aarch64", "arm64")
-        and hasattr(torch, "cpu")
-        and torch.cpu.is_available()
-    )
+    return _IS_HOST_CPU_ARM64
 
 
-@lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
+    return _IS_CPU_ENGINE
 
 
 @lru_cache(maxsize=1)

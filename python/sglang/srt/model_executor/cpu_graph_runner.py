@@ -18,15 +18,26 @@
 from __future__ import annotations
 
 import bisect
+import copy
+import itertools
 import logging
+import os
+import types
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
+import torch.nn.functional as F
 import tqdm
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -38,12 +49,14 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
+from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_lora,
     get_model,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.utils import (
@@ -68,6 +81,315 @@ logger = logging.getLogger(__name__)
 # for skip_cross_attention instead of a data-dependent branch to avoid recompiles.
 
 _capture_skip_cross_attention: Optional[bool] = None
+_compile_wrapper_counter = itertools.count()
+# Dynamo requires an explicit upper bound for marked dynamic dimensions. Use a
+# practical sentinel rather than a capture-bucket size so one graph can serve
+# arbitrary request sizes within the model/runtime limits.
+_DYNAMIC_DIM_MAX = 2**31 - 1
+
+# ---------------------------------------------------------------------------
+# Dynamo-compatible layer boundary containers
+# ---------------------------------------------------------------------------
+# TorchDynamo's tracer cannot instantiate C-extension msgspec.Struct instances
+# directly via object.__new__, raising InternalTorchDynamoError. These lightweight
+# __slots__ classes provide compatible interfaces during graph capture and replay.
+
+
+class _DynamoCompatibleContribution:
+    __slots__ = ("value", "update", "owed")
+
+    def __init__(self, value, update, owed=None):
+        self.value = value
+        self.update = update
+        self.owed = owed
+
+    def for_boundary(self):
+        from sglang.srt.layers.layer_boundary.output import (
+            DeferredFinalize,
+            UnreducedOutput,
+        )
+
+        if isinstance(self.owed, (UnreducedOutput, DeferredFinalize)):
+            return self.owed
+        return self.value
+
+    def complete(self):
+        from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
+
+        if isinstance(self.owed, DeclaredSum):
+            value = self.owed.complete(self.value)
+        elif self.owed is not None:
+            value = self.owed.complete()
+        else:
+            return self.value
+        self.value, self.owed = value, None
+        return value
+
+    def release(self):
+        self.value = None
+        self.owed = None
+
+
+class _DynamoCompatibleDeclaredSum:
+    __slots__ = ("group", "complete_sum")
+
+    def __init__(self, group, complete_sum=None):
+        self.group = group
+        self.complete_sum = complete_sum
+
+    def complete(self, value):
+        if self.complete_sum is not None:
+            return self.complete_sum(value)
+        from sglang.srt.layers.layer_boundary.layout import _sum_group
+
+        return _sum_group(self.group).all_reduce(value)
+
+
+class _DynamoCompatibleOwedOutput:
+    __slots__ = ("contribution",)
+
+    def __init__(self, contribution):
+        self.contribution = contribution
+
+
+class _DynamoCompatibleExitDecision:
+    __slots__ = ("defer_moe_finalize", "sum_in_reduce_scatter", "complete")
+
+    def __init__(self, defer_moe_finalize, sum_in_reduce_scatter, complete):
+        self.defer_moe_finalize = defer_moe_finalize
+        self.sum_in_reduce_scatter = sum_in_reduce_scatter
+        self.complete = complete
+
+
+class _DynamoCompatibleUnreducedOutput:
+    __slots__ = ("partial", "group", "reduce_to_dp_local", "complete_sum")
+
+    def __init__(self, partial, group=None, reduce_to_dp_local=None, complete_sum=None):
+        self.partial = partial
+        self.group = group
+        self.reduce_to_dp_local = reduce_to_dp_local
+        self.complete_sum = complete_sum
+
+    def complete(self):
+        if self.complete_sum is not None:
+            return self.complete_sum(self.partial)
+        if self.reduce_to_dp_local is not None:
+            return self.reduce_to_dp_local(self.partial)
+        return self.group.all_reduce(self.partial)
+
+
+_cpu_graph_patch_depth = 0
+_saved_patch_state = None
+
+
+# Re-entrant context manager patching layer boundary classes during capture and replay.
+# Holding this context during capture and replay prevents Dynamo global guard failures
+# (___check_obj_id) and graph breaks, while restoring original classes outside CPU graph.
+@contextmanager
+def cpu_graph_patch_boundary_classes():
+    global _cpu_graph_patch_depth, _saved_patch_state
+    if _cpu_graph_patch_depth == 0:
+        import msgspec.structs
+
+        import sglang.srt.layers.layer_boundary.residual.stream as stream_mod
+        from sglang.srt.layers.layer_boundary import exit as exit_mod
+        from sglang.srt.layers.layer_boundary import output as output_mod
+        from sglang.srt.layers.layer_boundary import prepare as prepare_mod
+        from sglang.srt.layers.layer_boundary import stage as stage_mod
+        from sglang.srt.layers.layer_boundary.fusions import allreduce as allreduce_mod
+        from sglang.srt.layers.layer_boundary.fusions import cutedsl as cutedsl_mod
+        from sglang.srt.layers.layer_boundary.residual import access as access_mod
+
+        declared_sum_modules = (stream_mod, prepare_mod, stage_mod)
+        owed_output_modules = (stream_mod, access_mod)
+        unreduced_output_modules = (
+            stream_mod,
+            prepare_mod,
+            access_mod,
+            exit_mod,
+            output_mod,
+            allreduce_mod,
+            cutedsl_mod,
+        )
+
+        import sglang.srt.distributed.communication_op as comm_mod
+        import sglang.srt.distributed.parallel_state as ps_mod
+
+        # Temporarily unwrap deprecated getters in parallel_state and communication_op
+        # to avoid graph breaks caused by sys._getframe() inside _warn_if_called_from_outside.
+        unwrapped_getters = []
+        for name in getattr(ps_mod, "_CONTEXT_NAME_OF", ()):
+            fn = getattr(ps_mod, name, None)
+            if fn and hasattr(fn, "__wrapped__"):
+                unwrapped_getters.append((ps_mod, name, fn))
+                setattr(ps_mod, name, fn.__wrapped__)
+            comm_fn = getattr(comm_mod, name, None)
+            if comm_fn and hasattr(comm_fn, "__wrapped__"):
+                unwrapped_getters.append((comm_mod, name, comm_fn))
+                setattr(comm_mod, name, comm_fn.__wrapped__)
+
+        orig_replace = msgspec.structs.replace
+
+        def compat_replace(obj, **changes):
+            if isinstance(obj, msgspec.Struct):
+                return orig_replace(obj, **changes)
+            cls = type(obj)
+            slots = getattr(cls, "__slots__", None)
+            if slots is not None:
+                kwargs = {s: getattr(obj, s) for s in slots}
+                kwargs.update(changes)
+                return cls(**kwargs)
+            return orig_replace(obj, **changes)
+
+        _saved_patch_state = {
+            "contribution": stream_mod.Contribution,
+            "declared_sum": [(m, m.DeclaredSum) for m in declared_sum_modules],
+            "owed_output": [(m, m.OwedOutput) for m in owed_output_modules],
+            "exit_decision": exit_mod.ExitDecision,
+            "unreduced_output": [
+                (m, m.UnreducedOutput) for m in unreduced_output_modules
+            ],
+            "unwrapped_getters": unwrapped_getters,
+            "replace": orig_replace,
+        }
+
+        stream_mod.Contribution = _DynamoCompatibleContribution
+        for m in declared_sum_modules:
+            m.DeclaredSum = _DynamoCompatibleDeclaredSum
+        for m in owed_output_modules:
+            m.OwedOutput = _DynamoCompatibleOwedOutput
+        exit_mod.ExitDecision = _DynamoCompatibleExitDecision
+        for m in unreduced_output_modules:
+            m.UnreducedOutput = _DynamoCompatibleUnreducedOutput
+        msgspec.structs.replace = compat_replace
+
+    _cpu_graph_patch_depth += 1
+    try:
+        yield
+    finally:
+        _cpu_graph_patch_depth -= 1
+        if _cpu_graph_patch_depth == 0:
+            import msgspec.structs
+
+            import sglang.srt.layers.layer_boundary.residual.stream as stream_mod
+            from sglang.srt.layers.layer_boundary import exit as exit_mod
+
+            stream_mod.Contribution = _saved_patch_state["contribution"]
+            for m, orig in _saved_patch_state["declared_sum"]:
+                m.DeclaredSum = orig
+            for m, orig in _saved_patch_state["owed_output"]:
+                m.OwedOutput = orig
+            exit_mod.ExitDecision = _saved_patch_state["exit_decision"]
+            for m, orig in _saved_patch_state["unreduced_output"]:
+                m.UnreducedOutput = orig
+            for mod, name, orig in _saved_patch_state["unwrapped_getters"]:
+                setattr(mod, name, orig)
+            msgspec.structs.replace = _saved_patch_state["replace"]
+            _saved_patch_state = None
+
+
+def _compile_wrapper_forward(self, *args, **kwargs):
+    with torch.no_grad():
+        if self.model_forward is None:
+            return self.model(*args, **kwargs)
+        return self.model_forward(*args, **kwargs)
+
+
+def _make_compile_wrapper(
+    model: torch.nn.Module, model_forward: Optional[Callable] = None
+) -> torch.nn.Module:
+    wrapper_id = next(_compile_wrapper_counter)
+    forward_code = _compile_wrapper_forward.__code__.replace(
+        co_firstlineno=wrapper_id + 1
+    )
+    forward = types.FunctionType(
+        forward_code,
+        globals(),
+        f"cpu_graph_forward_{wrapper_id}",
+    )
+    wrapper_type = type(
+        f"CPUGraphCompileWrapper{wrapper_id}",
+        (torch.nn.Module,),
+        {"forward": forward},
+    )
+    wrapper = wrapper_type()
+    wrapper.model = model
+    wrapper.model_forward = model_forward
+    return wrapper
+
+
+class _PrefillForwardDispatcher:
+    """Keep the model's ``forward`` attribute stable across graph replays.
+
+    Different prefill buckets need different compiled callables, so the
+    callable changes through ``active_forward`` instead of replacing
+    ``module.forward`` for every request. This avoids Dynamo guards on the
+    module instance dictionary changing during serving.
+    """
+
+    def __init__(self, original_forward: Callable):
+        self.original_forward = original_forward
+        self.active_forward: Optional[Callable] = None
+
+    def __call__(self, *args, **kwargs):
+        if self.active_forward is None:
+            return self.original_forward(*args, **kwargs)
+        return self.active_forward(*args, **kwargs)
+
+
+def _install_prefill_forward_dispatcher(
+    model: torch.nn.Module,
+) -> _PrefillForwardDispatcher:
+    dispatcher = getattr(model, "_sglang_prefill_forward_dispatcher", None)
+    if not isinstance(dispatcher, _PrefillForwardDispatcher):
+        dispatcher = _PrefillForwardDispatcher(model.forward)
+        model._sglang_prefill_forward_dispatcher = dispatcher
+    model.forward = dispatcher
+    return dispatcher
+
+
+@contextmanager
+def _use_prefill_forward(
+    dispatcher: _PrefillForwardDispatcher, compiled_forward: Callable
+):
+    previous = dispatcher.active_forward
+    dispatcher.active_forward = compiled_forward
+    try:
+        yield
+    finally:
+        dispatcher.active_forward = previous
+
+
+@contextmanager
+def _disable_duck_shape():
+    try:
+        import torch.fx.experimental._config as fx_config
+    except ImportError:
+        yield
+        return
+
+    previous = fx_config.use_duck_shape
+    fx_config.use_duck_shape = False
+    try:
+        yield
+    finally:
+        fx_config.use_duck_shape = previous
+
+
+@contextmanager
+def _disable_cpu_graph_custom_op_aliasing_check():
+    try:
+        import torch._functorch.config as functorch_config
+    except ImportError:
+        yield
+        return
+
+    if not hasattr(functorch_config, "check_custom_op_aliasing"):
+        yield
+        return
+
+    with functorch_config.patch(check_custom_op_aliasing=False):
+        yield
 
 
 def get_capture_skip_cross_attention() -> Optional[bool]:
@@ -87,6 +409,34 @@ def capture_with_skip_cross_attention(skip: bool):
         _capture_skip_cross_attention = previous
 
 
+def _mark_dynamic(
+    *tensors: Optional[torch.Tensor], max_value: Optional[int] = None
+) -> None:
+    """Mark dim 0 dynamic with a broad runtime-compatible range."""
+    dynamic_max = max_value or _DYNAMIC_DIM_MAX
+    for t in tensors:
+        if t is not None:
+            if t.ndim > 0 and t.shape[0] == 1:
+                torch._dynamo.maybe_mark_dynamic(t, 0)
+            else:
+                torch._dynamo.mark_dynamic(
+                    t, 0, min=1, max=max(dynamic_max, int(t.shape[0]))
+                )
+
+
+def _mark_dynamic_axis(
+    tensor: Optional[torch.Tensor], dim: int, max_value: Optional[int] = None
+) -> None:
+    if tensor is not None:
+        if tensor.ndim > 0 and tensor.shape[dim] == 1:
+            torch._dynamo.maybe_mark_dynamic(tensor, dim)
+        else:
+            dynamic_max = max_value or _DYNAMIC_DIM_MAX
+            torch._dynamo.mark_dynamic(
+                tensor, dim, min=1, max=max(dynamic_max, int(tensor.shape[dim]))
+            )
+
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -95,8 +445,9 @@ if TYPE_CHECKING:
 def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
-    num_tokens: int,
     tp_group: GroupCoordinator,
+    dynamic: bool = False,
+    model_forward: Optional[Callable] = None,
 ):
     """Patch the model to make it compatible with torch.compile"""
     backup_ca_comm = None
@@ -108,15 +459,44 @@ def patch_model(
             # We found the custom allreduce is much faster than the built-in allreduce in torch,
             # even with ENABLE_INTRA_NODE_COMM=1.
             # tp_group.ca_comm = None
-            yield torch.compile(
-                torch.no_grad()(model.forward),
-                dynamic=False,
-            )
+            with (
+                cpu_graph_patch_boundary_classes(),
+                _disable_duck_shape(),
+                _disable_cpu_graph_custom_op_aliasing_check(),
+                torch._dynamo.config.patch(allow_unspec_int_on_nn_module=True),
+            ):
+                compile_backend = os.environ.get(
+                    "SGLANG_CPU_GRAPH_COMPILE_BACKEND", "inductor"
+                )
+                yield torch.compile(
+                    _make_compile_wrapper(model, model_forward),
+                    backend=compile_backend,
+                    dynamic=dynamic,
+                )
         else:
             yield model.forward
     finally:
         if enable_compile:
             tp_group.ca_comm = backup_ca_comm
+
+
+def _install_cpu_compile_layer_caches(model_runner: ModelRunner):
+    if model_runner is None:
+        return
+    mamba_pool = getattr(model_runner.req_to_token_pool, "mamba_pool", None)
+    mamba_cache = getattr(mamba_pool, "mamba_cache", None)
+    if mamba_pool is None or mamba_cache is None:
+        return
+
+    layer_caches = [
+        mamba_cache.at_layer_idx(layer_idx)
+        for layer_idx in range(mamba_pool.num_mamba_layers)
+    ]
+
+    def get_layer_cache(layer_id: int):
+        return layer_caches[layer_id]
+
+    mamba_pool.mamba2_layer_cache = get_layer_cache
 
 
 def set_torch_compile_config():
@@ -128,19 +508,17 @@ def set_torch_compile_config():
     torch._dynamo.config.accumulated_cache_size_limit = 1024
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
+    torch._dynamo.config.assume_static_by_default = False
     register_inductor_fallback_ops()
     monkey_patch_torch_compile()
 
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
-    # torch compile speeds up decoding by reducing python overhead on CPU
-    # Reuse cuda_graph_config[decode].bs here.
-    # Users can customize the batch sizes supported by cpu_graph, such as:
-    # --cuda-graph-bs-decode 1 2 4 8 16
+    # CPU decode graph buckets are normalized into decode.bs by ServerArgs.
+    # Users can customize them with --cuda-graph-bs-decode or its legacy alias
+    # --cuda-graph-bs.
     capture_bs = get_exec().graph.cuda_graph_config.decode.bs
-    assert max(capture_bs) <= get_exec().graph.torch_compile_max_bs, (
-        f"{capture_bs=}, {get_exec().graph.torch_compile_max_bs=}"
-    )
+    assert capture_bs and min(capture_bs) > 0, f"{capture_bs=}"
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
@@ -148,6 +526,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
 
 
 _CPU_COMPILE_FAKE_OPS: set[str] = set()
+_CPU_COMPILE_FAKE_OPS_REGISTERED = False
 
 
 def register_cpu_compile_fake(op_name: str):
@@ -173,19 +552,29 @@ def register_fake_ops(tp_size: int):
     Registers fake/meta implementations for all custom sgl_kernel CPU operators
     using torch.library.register_fake to support torch.compile
     """
+    global _CPU_COMPILE_FAKE_OPS_REGISTERED
+    if _CPU_COMPILE_FAKE_OPS_REGISTERED:
+        return
+
+    def add_position_dependency(output, positions):
+        position_zero = positions.to(output.dtype).sum() * 0
+        return output + position_zero
 
     none_return_ops = [
         "shm_allreduce",
+        "shm_allgather_into_tensor",
+        "shm_reduce_scatter_tensor",
         "bmm_cpu",
         "fused_add_rmsnorm_cpu",
         "decode_attention_cpu",
         "extend_attention_cpu",
         "gemma_fused_add_rmsnorm_cpu",
-        "layernorm_cpu",
-        "fused_add_layernorm_cpu",
+        "fused_sigmoid_mul_cpu",
+        "rotary_embedding_cpu",
+        "apply_rotary_pos_emb_cpu",
         "multimodal_rotary_embedding_cpu",
         "apply_multidimensional_rope_cpu",
-        "fused_sigmoid_mul_cpu",
+        "store_cache_cpu",
     ]
     for op in none_return_ops:
 
@@ -195,8 +584,9 @@ def register_fake_ops(tp_size: int):
 
     for op in [
         "rmsnorm_cpu",
+        "layernorm_cpu",
+        "fused_add_layernorm_cpu",
         "l2norm_cpu",
-        "fused_experts_cpu",
         "fused_rmsnorm_gated_cpu",
         "shared_expert_cpu",
         "causal_conv1d_update_cpu",
@@ -209,6 +599,18 @@ def register_fake_ops(tp_size: int):
         @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_cpu")
+    def _(q, k, *args, **kwargs):
+        return torch.empty_like(q), torch.empty_like(k)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_sumsq_cpu")
+    def _(q, k):
+        return torch.empty((q.shape[0], 2), dtype=torch.float32, device=q.device)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_apply_from_stats_cpu")
+    def _(q, k, *args, **kwargs):
+        return torch.empty_like(q), torch.empty_like(k)
 
     @register_cpu_compile_fake("fused_qk_gemma_rmsnorm_cpu")
     def _(q, k, q_weight, k_weight, eps, head_dim):
@@ -223,21 +625,35 @@ def register_fake_ops(tp_size: int):
         gate_out = q_gate.new_empty((seq_len * num_head, head_dim))
         return q_out, k_out, gate_out
 
-    @register_cpu_compile_fake("fused_qk_rmsnorm_cpu")
-    def _(q, k, *args, **kwargs):
-        return torch.empty_like(q), torch.empty_like(k)
-
-    @register_cpu_compile_fake("fused_qk_rmsnorm_sumsq_cpu")
-    def _(q, k):
-        return torch.empty((q.shape[0], 2), dtype=torch.float32, device=q.device)
-
-    @register_cpu_compile_fake("fused_qk_rmsnorm_apply_from_stats_cpu")
-    def _(q, k, *args, **kwargs):
-        return torch.empty_like(q), torch.empty_like(k)
-
     @register_cpu_compile_fake("shm_allgather")
     def _(data, dim):
         return torch.cat([data] * tp_size, dim=dim)
+
+    @register_cpu_compile_fake("fused_experts_cpu")
+    def _(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        inplace,
+        moe_comp_method,
+        w1_scale,
+        w2_scale,
+        w1_zero,
+        w2_zero,
+        a1_scale,
+        block_size,
+        w1_bias,
+        w2_bias,
+        alpha,
+        limit,
+        is_vnni,
+        activation=None,
+    ):
+        if inplace:
+            return hidden_states
+        return torch.empty_like(hidden_states, dtype=torch.bfloat16)
 
     @register_cpu_compile_fake("qkv_proj_with_rope")
     def _(
@@ -256,6 +672,7 @@ def register_fake_ops(tp_size: int):
         q_a_proj_scale,
         q_b_proj_scale,
         kv_a_proj_scale,
+        w_scale,
         is_vnni,
         block_size,
     ):
@@ -277,18 +694,10 @@ def register_fake_ops(tp_size: int):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        q_input = add_position_dependency(q_input, positions)
+        k_input = add_position_dependency(k_input, positions)
         v_input = k_input.narrow(-1, 0, kv_lora_rank)
         return q_input, k_input, v_input
-
-    @register_cpu_compile_fake("rotary_embedding_cpu")
-    def _(positions, query, key, head_size, cos_sin_cache, is_neox):
-        if query.ndim == 3:
-            return torch.empty_like(query), torch.empty_like(key)
-        return query, key
-
-    @register_cpu_compile_fake("apply_rotary_pos_emb_cpu")
-    def _(query, key, cos, sin):
-        return query, key
 
     @register_cpu_compile_fake("qkv_proj_with_rope_fused_weight")
     def _(
@@ -333,6 +742,8 @@ def register_fake_ops(tp_size: int):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        q_input = add_position_dependency(q_input, positions)
+        k_input = add_position_dependency(k_input, positions)
         v_input = k_input.narrow(-1, 0, kv_lora_rank)
         return q_input, k_input, v_input
 
@@ -346,15 +757,20 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("weight_packed_linear")
     def _(mat1, mat2, bias, is_vnni):
-        M = mat1.shape[0]
         N = get_n_size(mat2, is_vnni)
-        return mat1.new_empty(M, N)
+        # The non-FMA kernel flattens leading dimensions for GEMM and restores
+        # them before returning. The FP32/FMA path only accepts a 2D mat1.
+        output_shape = (
+            list(mat1.shape) if mat2.dtype != torch.float32 else [mat1.shape[0], N]
+        )
+        output_shape[-1] = N
+        return mat1.new_empty(output_shape)
 
     @register_cpu_compile_fake("per_token_quant_int8_cpu")
     def _(input):
         M = input.shape[0]
-        K = input.shape[1]
-        Aq = input.new_empty(M, K, dtype=torch.int8)
+        # The C++ kernel stores quantized values as uint8, not signed int8.
+        Aq = input.new_empty(input.shape, dtype=torch.uint8)
         As = input.new_empty(M, dtype=torch.float32)
         return Aq, As
 
@@ -469,19 +885,6 @@ def register_fake_ops(tp_size: int):
         N = mat2.shape[0]
         return mat1.new_empty(M, N, dtype=out_dtype)
 
-    @register_cpu_compile_fake("fp8_per_tensor_scaled_mm_cpu")
-    def _(
-        mat1,
-        mat2,
-        scale2,
-        bias,
-        out_dtype,
-        is_vnni,
-    ):
-        M = mat1.shape[0]
-        N = mat2.shape[0]
-        return mat1.new_empty(M, N, dtype=out_dtype)
-
     @register_cpu_compile_fake("mxfp4_scaled_mm_cpu")
     def _(mat1, mat2, scales2, bias, is_vnni):
         sizes = list(mat1.shape)
@@ -584,32 +987,52 @@ def register_fake_ops(tp_size: int):
     ):
         output = torch.empty_like(value)
         assert initial_state is not None
-        final_state = initial_state.to(torch.float32)
+        return output
 
-        return output, final_state
+    @register_cpu_compile_fake("conv3d_embed_cpu")
+    def _(x, weight, bias=None, is_vnni=False):
+        c_out = bias.shape[0] if bias is not None else weight.shape[0]
+        # CPU conv3d is a patch-embedding GEMM whose D/H/W output is one.
+        return x.new_empty((x.shape[0], c_out))
+
+    _CPU_COMPILE_FAKE_OPS_REGISTERED = True
 
 
-# TODO Remove unnecessary settings for CPUGraphRunner.
-# Re-abstract the graph runner and restructure CPUGraphRunner to reuse the same logic.
 class CPUGraphRunner:
-    """A CPUGraphRunner runs the forward pass of a model with cpu torch.compile."""
+    """CPU torch.compile runner for decode and prefill buckets.
+
+    Decode uses batch-size buckets. Prefill uses total-token buckets. Static
+    padding follows the server setting; ``SGLANG_TORCH_DYNAMIC_SHAPE=1`` adds
+    one dynamic fallback per phase, while the default is eager fallback.
+    """
 
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
+        # Decode steps (and hence decode graphs) only exist for generation
+        # models -- embedding/reward/classification models only ever run
+        # EXTEND. Gate the decode-only setup below on this instead of
+        # skipping construction entirely (that would also deny non-generation
+        # models the prefill graph, which *is* meaningful for them).
+        self.is_generation = model_runner.is_generation
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
             else get_server_return_hidden_states_mode()
         )
-        self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         # bs -> compiled fn (text-only / skip_cross_attention=True)
         self.graphs = {}
         # bs -> compiled fn (cross-attention / skip_cross_attention=False, enc-dec only)
         self.graphs_cross = {}
+        # Dynamic decode fallback keyed by skip_cross_attention.
+        self.decode_dynamic_graphs = {}
+        self.decode_dynamic_batch_templates = {}
         self.output_buffers = {}
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
+        if self.enable_torch_compile:
+            _install_cpu_compile_layer_caches(self.model_runner)
+        self.enable_dynamic_graph = envs.SGLANG_TORCH_DYNAMIC_SHAPE.get()
         self.disable_padding = get_exec().graph.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer()
@@ -617,14 +1040,38 @@ class CPUGraphRunner:
         self.require_mlp_sync = require_mlp_sync()
         self.require_attn_tp_gather = require_attn_tp_gather()
         self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
-        self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
         self.tp_size = get_parallel().tp_size
-        self.num_dp_ranks = get_parallel().num_dp_ranks
+        self.dp_size = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode
+        self._prefill_graph_model = self._get_prefill_graph_model()
+        self._prefill_uses_eager_logits_tail = (
+            self._prefill_graph_model is not self.model_runner.model
+        )
+        self._prefill_forward_dispatcher = None
+        existing_dispatcher = getattr(
+            self._prefill_graph_model, "_sglang_prefill_forward_dispatcher", None
+        )
+        # Compile the real bound method, not the dispatcher. The dispatcher is
+        # only the stable bridge used when outer model.forward calls this module.
+        self._prefill_original_forward = (
+            (
+                existing_dispatcher.original_forward
+                if isinstance(existing_dispatcher, _PrefillForwardDispatcher)
+                else self._prefill_graph_model.forward
+            )
+            if self._prefill_uses_eager_logits_tail
+            else None
+        )
+        if self._prefill_uses_eager_logits_tail:
+            # Install before decode capture so every decode graph sees the same
+            # instance-level forward shape; prefill only changes active_forward.
+            self._prefill_forward_dispatcher = _install_prefill_forward_dispatcher(
+                self._prefill_graph_model
+            )
         # Static capture width: CPU graphs are decode-only.
         self.captured_req_width = 1
 
@@ -645,57 +1092,146 @@ class CPUGraphRunner:
             "CPUGraphRunner does not support speculative inference yet."
         )
 
-        assert self.num_dp_ranks == 1, "CPUGraphRunner does not support DP yet."
+        assert self.dp_size == 1, "CPUGraphRunner does not support DP yet."
         assert self.pp_size == 1, "CPUGraphRunner does not support PP yet."
 
-        # Batch sizes to capture
-        self.capture_bs = get_batch_sizes_to_capture(model_runner)
-        log_info_on_rank0(logger, f"Capture cpu graph bs {self.capture_bs}")
-        # bs -> ForwardBatch (text-only / skip_cross_attention=True)
-        self.captured_forward_batches = {}
-        # bs -> ForwardBatch (cross-attention / skip=False, enc-dec only)
-        self.captured_forward_batches_cross = {}
-        # Attention backend
-        self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.captured_req_width
-        self.model_runner.attn_backend.init_cpu_graph_state(
-            self.max_bs, self.max_num_token
-        )
+        if self.is_generation:
+            # Batch sizes to capture
+            self.capture_bs = get_batch_sizes_to_capture(model_runner)
+            log_info_on_rank0(logger, f"Capture cpu graph bs {self.capture_bs}")
+            self.dynamic_decode_max_bs = model_runner.req_to_token_pool.size
+            # bs -> ForwardBatch (text-only / skip_cross_attention=True)
+            self.captured_forward_batches = {}
+            # bs -> ForwardBatch (cross-attention / skip=False, enc-dec only)
+            self.captured_forward_batches_cross = {}
+            # Attention backend
+            self.max_bs = max(self.capture_bs)
+            if self.enable_dynamic_graph:
+                self.dynamic_capture_bs = min(
+                    self.max_bs + 1, model_runner.req_to_token_pool.size
+                )
+            else:
+                self.dynamic_capture_bs = self.max_bs
+            self.capture_buffer_bs = max(self.max_bs, self.dynamic_capture_bs)
+            self.capture_buffer_num_token = (
+                self.capture_buffer_bs * self.captured_req_width
+            )
+            self.model_runner.attn_backend.init_cpu_graph_state(
+                self.capture_buffer_bs, self.capture_buffer_num_token
+            )
 
-        self.encoder_len_fill_value = 0
-        self.seq_len_fill_value = (
-            self.model_runner.attn_backend.get_cpu_graph_seq_len_fill_value()
-        )
+            self.encoder_len_fill_value = 0
+            self.seq_len_fill_value = (
+                self.model_runner.attn_backend.get_cpu_graph_seq_len_fill_value()
+            )
+        else:
+            # No decode steps for non-generation (embedding/reward/classification)
+            # models -- leave decode state empty; can_run_graph rejects DECODE
+            # mode below and everything falls through to the prefill path.
+            self.capture_bs = []
+            self.captured_forward_batches = {}
+            self.captured_forward_batches_cross = {}
+            self.max_bs = 0
+            self.encoder_len_fill_value = 0
+            self.seq_len_fill_value = 0
 
         if self.enable_torch_compile:
             register_fake_ops(self.tp_size)
             set_torch_compile_config()
 
-        # Graph inputs
-        with torch.device(self.device):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
-            self.seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int64
-            )
-            self.out_cache_loc = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
-            self.num_token_non_padded = torch.zeros((1,), dtype=torch.int64)
-            self.custom_mask = torch.ones(
-                (
-                    (self.seq_lens.sum().item() + self.max_num_token)
-                    * self.captured_req_width
-                ),
-                dtype=torch.bool,
-                device=self.device,
-            )
-            if self.is_encoder_decoder:
-                self.encoder_lens = torch.full(
-                    (self.max_bs,), self.encoder_len_fill_value, dtype=torch.int64
+        if self.is_generation:
+            # Graph inputs
+            with torch.device(self.device):
+                self.input_ids = torch.zeros(
+                    (self.capture_buffer_num_token,), dtype=torch.int64
                 )
-            else:
-                self.encoder_lens = None
+                self.req_pool_indices = torch.zeros(
+                    (self.capture_buffer_bs,), dtype=torch.int64
+                )
+                self.seq_lens = torch.full(
+                    (self.capture_buffer_bs,),
+                    self.seq_len_fill_value,
+                    dtype=torch.int64,
+                )
+                self.out_cache_loc = torch.zeros(
+                    (self.capture_buffer_num_token,), dtype=torch.int64
+                )
+                self.positions = torch.zeros(
+                    (self.capture_buffer_num_token,), dtype=torch.int64
+                )
+                self.mrope_positions = torch.zeros(
+                    (3, self.capture_buffer_num_token), dtype=torch.int64
+                )
+                self.num_token_non_padded = torch.zeros((1,), dtype=torch.int64)
+                self.custom_mask = torch.ones(
+                    (
+                        (
+                            self.seq_lens[: self.capture_buffer_bs].sum().item()
+                            + self.capture_buffer_num_token
+                        )
+                        * self.captured_req_width
+                    ),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                if self.is_encoder_decoder:
+                    self.encoder_lens = torch.full(
+                        (self.capture_buffer_bs,),
+                        self.encoder_len_fill_value,
+                        dtype=torch.int64,
+                    )
+                else:
+                    self.encoder_lens = None
+        else:
+            self.encoder_lens = None
+
+        # --- Prefill (EXTEND) graph state -------------------------------
+        # bs is NOT the bucket axis here (num_tokens is) -- see class
+        # docstring section on prefill design. Disabled (empty bucket list)
+        # for encoder-decoder models (skip_cross_attention dual-graph capture
+        # is not implemented for prefill), when cuda_graph_config.prefill.bs
+        # isn't configured, or when prefill.backend is explicitly 'disabled' --
+        # can_run_graph then simply rejects EXTEND batches and callers fall
+        # back to eager, exactly like today.
+        prefill_disabled = check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+        self.capture_num_tokens = (
+            sorted(get_exec().graph.cuda_graph_config.prefill.bs or [])
+            if not self.is_encoder_decoder and not prefill_disabled
+            else []
+        )
+        if get_exec().graph.cuda_graph_config.prefill.bs and self.is_encoder_decoder:
+            log_info_on_rank0(
+                logger,
+                "Skipping CPU prefill graph for encoder-decoder model "
+                "(unsupported in v1).",
+            )
+        # num_tokens bucket -> compiled callable (bs dynamic inside).
+        self.prefill_graphs: dict = {}
+        self.prefill_graphs_bs1: dict = {}
+        # Single fallback callable (num_tokens *and* bs both dynamic), used for
+        # any num_tokens that doesn't exactly match a configured bucket.
+        self.prefill_dynamic_graph: Optional[Callable] = None
+        self.prefill_dynamic_graph_bs1: Optional[Callable] = None
+        self.prefill_dynamic_batch_template: Optional[ForwardBatch] = None
+        schedule = get_schedule()
+        configured_prefill_max_tokens = getattr(schedule, "max_prefill_tokens", None)
+        self.dynamic_prefill_max_tokens = max(
+            int(configured_prefill_max_tokens or 0),
+            self.capture_num_tokens[-1] if self.capture_num_tokens else 0,
+            1,
+        )
+        if self.capture_num_tokens:
+            self.prefill_max_num_tokens = self.capture_num_tokens[-1]
+            self.prefill_max_bs = model_runner.req_to_token_pool.size
+            # bs values used to warm up every bucket / the dynamic fallback so
+            # the request axis is established as a symbolic range before
+            # serving starts (design notes doc, section 9.4). Two
+            # well-separated values (>=2) force torch.compile to generate a
+            # symbolic shape graph immediately without specializing on size 1.
+            start_bs = 2 if self.prefill_max_bs >= 2 else 1
+            self.prefill_warmup_bs_values = list(
+                dict.fromkeys([start_bs, min(4, self.prefill_max_bs), 1])
+            )
 
         # Capture
         try:
@@ -706,8 +1242,11 @@ class CPUGraphRunner:
             capture_context = (
                 model_capture_mode if self.is_encoder_decoder else empty_context
             )
-            with capture_context():
-                self.capture()
+            with cpu_graph_patch_boundary_classes():
+                with capture_context():
+                    self.capture()
+                if self.capture_num_tokens:
+                    self.capture_prefill()
         except RuntimeError as e:
             raise Exception(
                 f"Capture CPU graph failed: {e}\n{CPU_GRAPH_CAPTURE_FAILED_MSG}"
@@ -726,13 +1265,23 @@ class CPUGraphRunner:
         return bool(forward_batch.encoder_lens.max() == 0)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
-        is_bs_supported = (
-            forward_batch.batch_size in self.graphs
-            if self.disable_padding
-            else forward_batch.batch_size <= self.max_bs
-        )
+        if forward_batch.forward_mode.is_extend():
+            return self._can_run_prefill_graph(forward_batch)
 
-        return is_bs_supported
+        skip_cross_attention = self._get_skip_cross_attention(forward_batch)
+        graphs = self.graphs if skip_cross_attention else self.graphs_cross
+        if forward_batch.batch_size in graphs:
+            return True
+        if not self.disable_padding and forward_batch.batch_size <= self.max_bs:
+            return True
+        # PyTorch's dynamic symbols use a default lower bound of 2.  Keep a
+        # size-one request on the static/padding path instead of tracing a
+        # dynamic decode graph with an invalid lower bound.
+        if forward_batch.batch_size == 1:
+            return False
+        return self.enable_dynamic_graph and (
+            self.decode_dynamic_graphs.get(skip_cross_attention) is not None
+        )
 
     def capture(self) -> None:
         with get_model().override(
@@ -756,7 +1305,6 @@ class CPUGraphRunner:
             with patch_model(
                 self.model_runner.model,
                 bs in self.capture_bs,
-                num_tokens=bs * self.captured_req_width,
                 tp_group=get_parallel().tp_group,
             ) as forward:
                 graph, output_buffers = self.capture_one_batch_size(
@@ -775,6 +1323,8 @@ class CPUGraphRunner:
         # Re-init states for qwen3-next as
         # torch.compile may change the states
         self._reset_mamba_cache_if_needed()
+        if not self.capture_num_tokens:
+            self._compile_decode_dynamic_graphs()
 
     def _reset_mamba_cache_if_needed(self) -> None:
 
@@ -795,8 +1345,24 @@ class CPUGraphRunner:
         for v in vars(mamba_cache).values():
             _zero_nested(v)
 
+        for name in (
+            "replayssm_write_pos",
+            "replayssm_cache_base",
+            "replayssm_is_flush",
+            "req_index_to_mamba_index_mapping",
+            "req_index_to_mamba_ping_pong_track_buffer_mapping",
+        ):
+            value = getattr(mamba_pool, name, None)
+            if isinstance(value, torch.Tensor):
+                value.zero_()
+
     def capture_one_batch_size(
-        self, bs: int, forward: Callable, skip_cross_attention: bool = False
+        self,
+        bs: int,
+        forward: Callable,
+        skip_cross_attention: bool = False,
+        mark_dynamic: bool = False,
+        save_captured_batch: bool = True,
     ):
         num_tokens = bs * self.captured_req_width
 
@@ -806,10 +1372,30 @@ class CPUGraphRunner:
         seq_lens = self.seq_lens[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
-        mrope_positions = self.mrope_positions[:, :num_tokens]
+        if mark_dynamic:
+            # A dynamic slice must not retain the larger capture buffer as its
+            # view base. Dynamo otherwise guards on base.size() == view.size()
+            # and specializes the dynamic callable for every warmup bucket.
+            input_ids = input_ids.clone()
+            req_pool_indices = req_pool_indices.clone()
+            seq_lens = seq_lens.clone()
+            out_cache_loc = out_cache_loc.clone()
+            positions = positions.clone()
+        # Runtime mRoPE positions are [3, token_count] contiguous tensors.
+        # Do not trace a view with the parent buffer's max-batch stride, and do
+        # not introduce a Tensor input for models that never use mRoPE.
+        # Use model config here because this is capture-time model metadata,
+        # not a runtime model-specific forward branch.
+        mrope_positions = (
+            self.mrope_positions[:, :num_tokens].contiguous()
+            if getattr(self.model_runner.model_config, "model_is_mrope", False)
+            else None
+        )
         self.num_token_non_padded[...] = num_tokens
         if self.is_encoder_decoder:
             encoder_lens = self.encoder_lens[:bs]
+            if mark_dynamic:
+                encoder_lens = encoder_lens.clone()
         else:
             encoder_lens = None
 
@@ -840,7 +1426,6 @@ class CPUGraphRunner:
             ),
             global_forward_mode=self.capture_forward_mode,
         )
-        self.model_runner.kv_index_translator.bind_runner_slots(forward_batch)
         # Wrap all forward calls with capture_with_skip_cross_attention so that
         # mllama (and any other encoder-decoder model) sees the correct compile-
         # time constant for skip_cross_attention during tracing.
@@ -864,6 +1449,8 @@ class CPUGraphRunner:
                     forward_batch.forward_mode,
                     forward_batch.spec_info,
                 )
+                if mark_dynamic:
+                    self._mark_dynamic_decode_inputs(forward_batch)
                 with torch.no_grad():
                     get_parallel().tp_group.barrier()
                     self.model_runner.model.forward(
@@ -890,11 +1477,101 @@ class CPUGraphRunner:
                         get_parallel().tp_group.barrier()
                         out = run_once()
                     # Save the captured forward_batch in the appropriate dict
-                    if skip_cross_attention:
-                        self.captured_forward_batches[bs] = forward_batch
-                    else:
-                        self.captured_forward_batches_cross[bs] = forward_batch
+                    if save_captured_batch:
+                        if skip_cross_attention:
+                            self.captured_forward_batches[bs] = forward_batch
+                        else:
+                            self.captured_forward_batches_cross[bs] = forward_batch
+                    if mark_dynamic:
+                        self.decode_dynamic_batch_templates[skip_cross_attention] = (
+                            forward_batch
+                        )
                     return forward, out
+
+    def _mark_dynamic_decode_inputs(self, forward_batch: ForwardBatch) -> None:
+        for name, value in vars(forward_batch).items():
+            if not isinstance(value, torch.Tensor) or value.ndim == 0:
+                continue
+            dim = value.ndim - 1 if name == "mrope_positions" else 0
+            _mark_dynamic_axis(value, dim, max_value=self.dynamic_decode_max_bs)
+
+    def _refresh_dynamic_forward_batch_metadata(
+        self,
+        dynamic_forward_batch: ForwardBatch,
+        forward_batch: ForwardBatch,
+        include_extend_metadata: bool,
+    ) -> None:
+        metadata_fields = [
+            "encoder_lens_cpu",
+            "encoder_cached",
+        ]
+        if include_extend_metadata:
+            metadata_fields.extend(
+                [
+                    "extend_num_tokens",
+                    "extend_seq_lens_cpu",
+                    "extend_prefix_lens_cpu",
+                    "extend_logprob_start_lens_cpu",
+                    "top_logprobs_nums",
+                    "token_ids_logprobs",
+                    "multi_item_delimiter_indices",
+                ]
+            )
+        for name in metadata_fields:
+            value = getattr(forward_batch, name)
+            setattr(dynamic_forward_batch, name, copy.copy(value))
+
+    def _compile_decode_dynamic_graph(self, skip_cross_attention: bool) -> Callable:
+        with patch_model(
+            self.model_runner.model,
+            self.enable_torch_compile,
+            tp_group=get_parallel().tp_group,
+            dynamic=True,
+        ) as forward:
+            dynamic_warmup_bs = [
+                bs
+                for bs in sorted(set(self.capture_bs + [self.dynamic_capture_bs]))
+                if bs >= 2
+            ]
+            for bs in dynamic_warmup_bs:
+                self.capture_one_batch_size(
+                    bs,
+                    forward,
+                    skip_cross_attention=skip_cross_attention,
+                    mark_dynamic=True,
+                    save_captured_batch=False,
+                )
+        return forward
+
+    def _prepare_dynamic_decode_batch(
+        self, forward_batch: ForwardBatch, skip_cross_attention: bool
+    ) -> ForwardBatch:
+        template = self.decode_dynamic_batch_templates.get(skip_cross_attention)
+        if template is None:
+            return forward_batch
+
+        dynamic_forward_batch = template
+        for name, value in vars(forward_batch).items():
+            if isinstance(value, torch.Tensor):
+                setattr(dynamic_forward_batch, name, value)
+        dynamic_forward_batch.forward_mode = self.capture_forward_mode
+        dynamic_forward_batch.global_forward_mode = self.capture_forward_mode
+        dynamic_forward_batch.batch_size = forward_batch.batch_size
+        dynamic_forward_batch.seq_lens_sum = forward_batch.seq_lens_sum
+        if (
+            forward_batch.mm_inputs is not None
+            and not forward_batch.contains_mm_inputs()
+        ):
+            dynamic_forward_batch.mm_inputs = None
+        else:
+            dynamic_forward_batch.mm_inputs = forward_batch.mm_inputs
+        dynamic_forward_batch.encoder_out_cache_loc = None
+        self._refresh_dynamic_forward_batch_metadata(
+            dynamic_forward_batch,
+            forward_batch,
+            include_extend_metadata=False,
+        )
+        return dynamic_forward_batch
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
@@ -919,14 +1596,53 @@ class CPUGraphRunner:
 
         raw_bs = forward_batch.batch_size
         if raw_bs in graphs:
+            # Use the same ForwardBatch object and storage that were traced.
+            # Passing the live scheduler tensors for an exact bucket makes
+            # Dynamo observe a different dynamic-marker/storage state than it
+            # saw during capture, even when all visible shapes match.
+            captured_forward_batch = cfbs[raw_bs]
+            assert captured_forward_batch is not None
+            captured_forward_batch.input_ids.copy_(forward_batch.input_ids)
+            captured_forward_batch.req_pool_indices.copy_(
+                forward_batch.req_pool_indices
+            )
+            captured_forward_batch.seq_lens.copy_(forward_batch.seq_lens)
+            captured_forward_batch.out_cache_loc.copy_(forward_batch.out_cache_loc)
+            captured_forward_batch.positions.copy_(forward_batch.positions)
+            if captured_forward_batch.mrope_positions is not None:
+                assert forward_batch.mrope_positions is not None
+                captured_forward_batch.mrope_positions.copy_(
+                    forward_batch.mrope_positions
+                )
             # Keep encoder_out_cache_loc consistent with the captured graph (None).
             if self.is_encoder_decoder:
                 # encoder_out_cache_loc is never accessed during decode (k/v are
                 # None so the KV-write path is skipped in the kernel).  Use None
                 # consistently at both capture time and runtime.
+                captured_forward_batch.encoder_lens.copy_(forward_batch.encoder_lens)
                 forward_batch.encoder_out_cache_loc = None
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-            return forward_batch
+                captured_forward_batch.encoder_out_cache_loc = None
+            if enable_num_token_non_padded():
+                captured_forward_batch.num_token_non_padded.copy_(
+                    forward_batch.num_token_non_padded
+                )
+            self._refresh_dynamic_forward_batch_metadata(
+                captured_forward_batch,
+                forward_batch,
+                include_extend_metadata=False,
+            )
+            replay_init = getattr(
+                self.model_runner.attn_backend,
+                "init_forward_metadata_cpu_graph_replay",
+                None,
+            )
+            if replay_init is None:
+                self.model_runner.attn_backend.init_forward_metadata(
+                    captured_forward_batch
+                )
+            else:
+                replay_init(captured_forward_batch)
+            return captured_forward_batch
 
         raw_num_token = raw_bs * self.captured_req_width
         index = bisect.bisect_left(self.capture_bs, raw_bs)
@@ -952,8 +1668,12 @@ class CPUGraphRunner:
             forward_batch.out_cache_loc
         )
         captured_forward_batch.positions[:raw_num_token].copy_(forward_batch.positions)
-        if forward_batch.mrope_positions is not None:
-            self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
+        if captured_forward_batch.mrope_positions is not None:
+            assert forward_batch.mrope_positions is not None
+            captured_forward_batch.mrope_positions[:, raw_num_token:].zero_()
+            captured_forward_batch.mrope_positions[:, :raw_num_token].copy_(
+                forward_batch.mrope_positions
+            )
 
         if self.is_encoder_decoder:
             captured_forward_batch.encoder_lens[:raw_bs].copy_(
@@ -961,13 +1681,24 @@ class CPUGraphRunner:
             )
             captured_forward_batch.encoder_out_cache_loc = None
         if enable_num_token_non_padded():
-            # CPUGraphRunner asserts not require_gathered_buffer, so this path is
-            # never attn-TP sharded: LOCAL == GLOBAL.
             captured_forward_batch.num_token_non_padded.copy_(
-                forward_batch.global_num_token_non_padded
+                forward_batch.num_token_non_padded
             )
+        self._refresh_dynamic_forward_batch_metadata(
+            captured_forward_batch,
+            forward_batch,
+            include_extend_metadata=False,
+        )
 
-        self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
+        replay_init = getattr(
+            self.model_runner.attn_backend,
+            "init_forward_metadata_cpu_graph_replay",
+            None,
+        )
+        if replay_init is None:
+            self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
+        else:
+            replay_init(captured_forward_batch)
         return captured_forward_batch
 
     def execute(
@@ -975,52 +1706,87 @@ class CPUGraphRunner:
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        assert pp_proxy_tensors is None, (
-            "PPProxyTensors is not supported in CPUGraphRunner yet."
-        )
+        with cpu_graph_patch_boundary_classes():
+            if forward_batch.forward_mode.is_extend():
+                return self._execute_prefill_graph(forward_batch, pp_proxy_tensors)
 
-        replay_context = (
-            model_capture_mode if self.is_encoder_decoder else empty_context
-        )
-        # Determine which compiled graph to use and pin skip_cross_attention so
-        # that any torch.compile re-tracing sees the same compile-time constant.
-        skip = self._get_skip_cross_attention(forward_batch)
-        graphs = self.graphs_cross if not skip else self.graphs
-        skip_ctx = (
-            capture_with_skip_cross_attention(skip)
-            if self.is_encoder_decoder
-            else empty_context()
-        )
-        with replay_context():
-            with skip_ctx:
-                prepared_forward_batch = self.prepare_replay(forward_batch, skip=skip)
-                with forward_context(
-                    ForwardContext(attn_backend=self.model_runner.attn_backend),
-                    forward_batch=prepared_forward_batch,
-                ):
-                    output = graphs[prepared_forward_batch.batch_size](
-                        prepared_forward_batch.input_ids,
-                        prepared_forward_batch.positions,
-                        prepared_forward_batch,
+            assert pp_proxy_tensors is None, (
+                "PPProxyTensors is not supported in CPUGraphRunner yet."
+            )
+
+            replay_context = (
+                model_capture_mode if self.is_encoder_decoder else empty_context
+            )
+            # Determine which compiled graph to use and pin skip_cross_attention so
+            # that any torch.compile re-tracing sees the same compile-time constant.
+            skip = self._get_skip_cross_attention(forward_batch)
+            graphs = self.graphs_cross if not skip else self.graphs
+            skip_ctx = (
+                capture_with_skip_cross_attention(skip)
+                if self.is_encoder_decoder
+                else empty_context()
+            )
+            with _disable_cpu_graph_custom_op_aliasing_check(), replay_context():
+                with skip_ctx:
+                    dynamic_graph = self.decode_dynamic_graphs.get(skip)
+                    can_pad = (
+                        not self.disable_padding
+                        and forward_batch.batch_size <= self.max_bs
                     )
-        if forward_batch.batch_size in graphs:
-            return output
+                    if (
+                        forward_batch.batch_size not in graphs
+                        and not can_pad
+                        and dynamic_graph is not None
+                    ):
+                        dynamic_forward_batch = self._prepare_dynamic_decode_batch(
+                            forward_batch, skip
+                        )
+                        self._mark_dynamic_decode_inputs(dynamic_forward_batch)
+                        self.model_runner.attn_backend.init_forward_metadata(
+                            dynamic_forward_batch
+                        )
+                        with forward_context(
+                            ForwardContext(attn_backend=self.model_runner.attn_backend),
+                            forward_batch=dynamic_forward_batch,
+                        ):
+                            return dynamic_graph(
+                                dynamic_forward_batch.input_ids,
+                                dynamic_forward_batch.positions,
+                                dynamic_forward_batch,
+                            )
+                    prepared_forward_batch = self.prepare_replay(
+                        forward_batch, skip=skip
+                    )
+                    with forward_context(
+                        ForwardContext(attn_backend=self.model_runner.attn_backend),
+                        forward_batch=prepared_forward_batch,
+                    ):
+                        output = graphs[prepared_forward_batch.batch_size](
+                            prepared_forward_batch.input_ids,
+                            prepared_forward_batch.positions,
+                            prepared_forward_batch,
+                        )
+            if forward_batch.batch_size in graphs:
+                return output
 
-        assert isinstance(output, LogitsProcessorOutput)
-        return LogitsProcessorOutput(
-            next_token_logits=output.next_token_logits[: self.raw_num_token],
-            hidden_states=(
-                output.hidden_states[: self.raw_num_token]
-                if output.hidden_states is not None
-                else None
-            ),
-        )
+            assert isinstance(output, LogitsProcessorOutput)
+            return LogitsProcessorOutput(
+                next_token_logits=output.next_token_logits[: self.raw_num_token],
+                hidden_states=(
+                    output.hidden_states[: self.raw_num_token]
+                    if output.hidden_states is not None
+                    else None
+                ),
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
-        if (
-            self.model_runner.spec_algorithm.is_eagle()
-            or self.model_runner.spec_algorithm.is_standalone()
+        spec_config = get_spec()
+        speculative_algorithm = (
+            spec_config.speculative_algorithm if spec_config is not None else None
+        )
+        if speculative_algorithm is not None and (
+            speculative_algorithm.is_eagle() or speculative_algorithm.is_standalone()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -1035,15 +1801,512 @@ class CPUGraphRunner:
                     retrieve_next_token=None,
                     retrieve_next_sibling=None,
                     retrieve_cum_len=None,
-                    spec_steps=get_spec().speculative_num_steps,
-                    topk=get_spec().speculative_eagle_topk,
-                    draft_token_num=get_spec().speculative_num_draft_tokens,
+                    spec_steps=spec_config.speculative_num_steps,
+                    topk=spec_config.speculative_eagle_topk,
+                    draft_token_num=spec_config.speculative_num_draft_tokens,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
 
         return spec_info
+
+    # ------------------------------------------------------------------
+    # Prefill (EXTEND) graph: dummy batch construction
+    # ------------------------------------------------------------------
+
+    def _build_prefill_dummy_forward_batch(
+        self, num_tokens: int, bs: int
+    ) -> ForwardBatch:
+        """Build a dummy EXTEND ForwardBatch with `bs` requests sharing
+        `num_tokens` total tokens (split as evenly as possible), no cached
+        prefix. Simplified vs. PrefillCudaGraphRunner.capture_prepare: no mamba
+        track / multimodal / pp_proxy support (v1 scope, see class docstring).
+        """
+        assert bs <= num_tokens, f"{bs=} must be <= {num_tokens=}"
+        base = num_tokens // bs
+        lens_cpu = [base] * bs
+        lens_cpu[-1] += num_tokens - base * bs  # remainder goes to the last request
+        start_loc_cpu = [0]
+        for l in lens_cpu[:-1]:
+            start_loc_cpu.append(start_loc_cpu[-1] + l)
+
+        with torch.device(self.device):
+            req_pool_indices = torch.arange(bs, dtype=torch.int64)
+            extend_seq_lens = torch.tensor(lens_cpu, dtype=torch.int32)
+            extend_prefix_lens = torch.zeros((bs,), dtype=torch.int32)
+            extend_start_loc = torch.tensor(start_loc_cpu, dtype=torch.int32)
+            seq_lens = torch.tensor(
+                lens_cpu, dtype=torch.int64
+            )  # no cached prefix in the dummy batch
+            input_ids = torch.zeros((num_tokens,), dtype=torch.int64)
+            out_cache_loc = torch.zeros((num_tokens,), dtype=torch.int64)
+            positions = torch.cat(
+                [torch.arange(l, dtype=torch.int64) for l in lens_cpu]
+            )
+            mrope_positions = (
+                positions.unsqueeze(0).repeat(3, 1)
+                if getattr(self.model_runner.model_config, "model_is_mrope", False)
+                else None
+            )
+            num_token_non_padded = torch.tensor([num_tokens], dtype=torch.int64)
+
+        return ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=torch.tensor(lens_cpu, dtype=torch.int64),
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc=extend_start_loc,
+            extend_seq_lens_cpu=lens_cpu,
+            extend_prefix_lens_cpu=[0] * bs,
+            extend_logprob_start_lens_cpu=lens_cpu,
+            return_logprob=False,
+            positions=positions,
+            mrope_positions=mrope_positions,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            spec_info=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_token_non_padded=num_token_non_padded,
+            global_forward_mode=ForwardMode.EXTEND,
+        )
+
+    def _mark_dynamic_request_axis(self, forward_batch: ForwardBatch) -> None:
+        _mark_dynamic(
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.extend_seq_lens,
+            forward_batch.extend_prefix_lens,
+            forward_batch.extend_start_loc,
+            max_value=self.prefill_max_bs,
+        )
+
+    def _mark_dynamic_token_axis(self, forward_batch: ForwardBatch) -> None:
+        _mark_dynamic(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch.out_cache_loc,
+            max_value=self.dynamic_prefill_max_tokens,
+        )
+        _mark_dynamic_axis(
+            forward_batch.mrope_positions,
+            1,
+            max_value=self.dynamic_prefill_max_tokens,
+        )
+
+    def _mark_dynamic_prefill_metadata(self) -> None:
+        backend = self.model_runner.attn_backend
+        for candidate in (backend, getattr(backend, "linear_attn_backend", None)):
+            metadata = getattr(candidate, "forward_metadata", None)
+            if metadata is not None:
+                _mark_dynamic(
+                    getattr(metadata, "query_start_loc", None),
+                    getattr(metadata, "mamba_cache_indices", None),
+                    max_value=self.prefill_max_bs + 1,
+                )
+
+    # ------------------------------------------------------------------
+    # Prefill (EXTEND) graph: capture / warmup
+    # ------------------------------------------------------------------
+
+    def _get_prefill_graph_model(self) -> torch.nn.Module:
+        # Keep the model's outer forward eager so it owns embeddings, optional
+        # multimodal preprocessing, and output handling. Compile the resolved
+        # language-model body that the outer forward invokes.
+        model = self.model_runner.model
+        if (
+            self.is_generation
+            and getattr(model, "pp_group", None) is not None
+            and model.pp_group.is_last_rank
+        ):
+            try:
+                layer_model = resolve_language_model(model)
+            except AttributeError:
+                layer_model = getattr(model, "language_model", model)
+
+            seen = set()
+            while not hasattr(layer_model, "layers") and hasattr(layer_model, "model"):
+                model_id = id(layer_model)
+                if model_id in seen:
+                    return model
+                seen.add(model_id)
+                layer_model = layer_model.model
+
+            if hasattr(layer_model, "layers"):
+                return layer_model
+        return model
+
+    def _run_prefill_once(self, compiled_fn: Callable, forward_batch: ForwardBatch):
+        # Metadata prep happens *outside* the compiled callable, exactly like
+        # decode already does above -- CPU never needs a separate "capture-time"
+        # metadata initializer the way CUDA graphs do (see class docstring).
+        original_num_token_non_padded_cpu = (
+            forward_batch.global_num_token_non_padded_cpu
+        )
+        # CPU Intel AMX graphs do not use the DP-only host token count.  Leaving
+        # it populated makes linear attention guard on a varying Python int.
+        forward_batch.global_num_token_non_padded_cpu = None
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend),
+            forward_batch=forward_batch,
+        ):
+            try:
+                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                if self.enable_torch_compile:
+                    self._mark_dynamic_prefill_metadata()
+                with _disable_cpu_graph_custom_op_aliasing_check(), torch.no_grad():
+                    get_parallel().tp_group.barrier()
+                    if self._prefill_uses_eager_logits_tail:
+                        # The outer model retains its normal forward contract; the
+                        # dispatcher redirects only its inner LM call for this graph.
+                        with _use_prefill_forward(
+                            self._prefill_forward_dispatcher, compiled_fn
+                        ):
+                            return self.model_runner.model.forward(
+                                forward_batch.input_ids,
+                                forward_batch.positions,
+                                forward_batch,
+                            )
+                    return compiled_fn(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                    )
+            finally:
+                forward_batch.global_num_token_non_padded_cpu = (
+                    original_num_token_non_padded_cpu
+                )
+
+    def _warmup_prefill_callable(
+        self,
+        compiled_fn: Callable,
+        num_tokens: int,
+        mark_token_axis_dynamic: bool,
+        warmup_bs_values: Optional[list[int]] = None,
+        mark_request_axis_dynamic: bool = True,
+        save_dynamic_template: bool = True,
+    ) -> None:
+        for bs in warmup_bs_values or self.prefill_warmup_bs_values:
+            if bs > num_tokens:
+                continue
+            fb = self._build_prefill_dummy_forward_batch(num_tokens, bs)
+            if self.enable_torch_compile and mark_request_axis_dynamic:
+                self._mark_dynamic_request_axis(fb)
+            if self.enable_torch_compile and mark_token_axis_dynamic:
+                self._mark_dynamic_token_axis(fb)
+            if mark_token_axis_dynamic and save_dynamic_template:
+                self.prefill_dynamic_batch_template = fb
+            # Run twice: the first call triggers tracing/compilation, the second
+            # exercises the already-compiled artifact (mirrors
+            # capture_one_batch_size above).
+            for _ in range(2):
+                self._run_prefill_once(compiled_fn, fb)
+
+    def _compile_prefill_bucket(self, num_tokens: int) -> Callable:
+        with patch_model(
+            self._prefill_graph_model,
+            self.enable_torch_compile,
+            tp_group=get_parallel().tp_group,
+            dynamic=True,
+            model_forward=(
+                self._prefill_original_forward
+                if self._prefill_uses_eager_logits_tail
+                else None
+            ),
+        ) as forward:
+            dynamic_warmup_bs = [
+                bs for bs in self.prefill_warmup_bs_values if bs >= 2
+            ] or [1]
+            self._warmup_prefill_callable(
+                forward,
+                num_tokens,
+                mark_token_axis_dynamic=False,
+                warmup_bs_values=dynamic_warmup_bs,
+            )
+        return forward
+
+    def _compile_prefill_bucket_bs1(self, num_tokens: int) -> Callable:
+        with patch_model(
+            self._prefill_graph_model,
+            self.enable_torch_compile,
+            tp_group=get_parallel().tp_group,
+            dynamic=False,
+            model_forward=(
+                self._prefill_original_forward
+                if self._prefill_uses_eager_logits_tail
+                else None
+            ),
+        ) as forward:
+            self._warmup_prefill_callable(
+                forward,
+                num_tokens,
+                mark_token_axis_dynamic=False,
+                warmup_bs_values=[1],
+                mark_request_axis_dynamic=False,
+            )
+        return forward
+
+    def _prepare_dynamic_prefill_batch(
+        self, forward_batch: ForwardBatch
+    ) -> ForwardBatch:
+        template = self.prefill_dynamic_batch_template
+        if template is None:
+            return forward_batch
+
+        dynamic_forward_batch = template
+        # Reuse the capture-time ForwardBatch structure for Dynamo stability;
+        # only tensor fields and request metadata are refreshed per request.
+        for name, value in vars(forward_batch).items():
+            if isinstance(value, torch.Tensor):
+                setattr(dynamic_forward_batch, name, value)
+        dynamic_forward_batch.forward_mode = ForwardMode.EXTEND
+        dynamic_forward_batch.global_forward_mode = ForwardMode.EXTEND
+        dynamic_forward_batch.batch_size = forward_batch.batch_size
+        dynamic_forward_batch.seq_lens_sum = forward_batch.seq_lens_sum
+        dynamic_forward_batch.mm_inputs = None
+        self._refresh_dynamic_forward_batch_metadata(
+            dynamic_forward_batch,
+            forward_batch,
+            include_extend_metadata=True,
+        )
+        dynamic_forward_batch.global_num_token_non_padded_cpu = None
+        return dynamic_forward_batch
+
+    def _compile_prefill_dynamic_fallback(self) -> Callable:
+        with patch_model(
+            self._prefill_graph_model,
+            self.enable_torch_compile,
+            tp_group=get_parallel().tp_group,
+            dynamic=True,
+            model_forward=(
+                self._prefill_original_forward
+                if self._prefill_uses_eager_logits_tail
+                else None
+            ),
+        ) as forward:
+            # Warm up at two distinct num_tokens (as well as two distinct bs) so
+            # both axes are established as symbolic, not just bs.
+            for num_tokens in sorted(
+                {self.prefill_max_num_tokens, max(self.prefill_max_num_tokens // 2, 1)}
+            ):
+                dynamic_warmup_bs = [
+                    bs for bs in self.prefill_warmup_bs_values if bs >= 2
+                ] or [1]
+                self._warmup_prefill_callable(
+                    forward,
+                    num_tokens,
+                    mark_token_axis_dynamic=True,
+                    warmup_bs_values=dynamic_warmup_bs,
+                )
+        return forward
+
+    def _compile_prefill_dynamic_batch_one(self) -> Callable:
+        with patch_model(
+            self._prefill_graph_model,
+            self.enable_torch_compile,
+            tp_group=get_parallel().tp_group,
+            dynamic=True,
+            model_forward=(
+                self._prefill_original_forward
+                if self._prefill_uses_eager_logits_tail
+                else None
+            ),
+        ) as forward:
+            for num_tokens in sorted(
+                {self.prefill_max_num_tokens, max(self.prefill_max_num_tokens // 2, 1)}
+            ):
+                self._warmup_prefill_callable(
+                    forward,
+                    num_tokens,
+                    mark_token_axis_dynamic=True,
+                    warmup_bs_values=[1],
+                    mark_request_axis_dynamic=False,
+                    save_dynamic_template=False,
+                )
+        return forward
+
+    def _rewarm_decode_dynamic_graphs(self) -> None:
+        """Re-establish decode variants after prefill warmup.
+
+        Decode and prefill use separate compiled callables, but Dynamo guards
+        the shared model forward code by ``ForwardMode``. Prefill capture runs
+        after the initial decode capture, so warm one representative decode
+        shape once more at the end of startup before requests can switch back
+        to DECODE. The initial decode capture already covers every bucket.
+        """
+        representative_bs = self.dynamic_capture_bs
+        if representative_bs < 2:
+            return
+        for skip_cross_attention, compiled_fn in self.decode_dynamic_graphs.items():
+            self.capture_one_batch_size(
+                representative_bs,
+                compiled_fn,
+                skip_cross_attention=skip_cross_attention,
+                mark_dynamic=True,
+                save_captured_batch=False,
+            )
+
+    def _compile_decode_dynamic_graphs(self) -> None:
+        if not (
+            self.is_generation
+            and self.enable_dynamic_graph
+            and self.enable_torch_compile
+        ):
+            return
+
+        log_info_on_rank0(logger, "Compiling CPU decode dynamic fallback graph last")
+        self.decode_dynamic_graphs[True] = self._compile_decode_dynamic_graph(
+            skip_cross_attention=True
+        )
+        if self.is_encoder_decoder:
+            self.decode_dynamic_graphs[False] = self._compile_decode_dynamic_graph(
+                skip_cross_attention=False
+            )
+        if self.capture_num_tokens:
+            self._rewarm_decode_dynamic_graphs()
+        self._reset_mamba_cache_if_needed()
+
+    def capture_prefill(self) -> None:
+        capture_range = (
+            tqdm.tqdm(list(reversed(self.capture_num_tokens)))
+            if get_parallel().tp_rank == 0
+            else reversed(self.capture_num_tokens)
+        )
+        for num_tokens in capture_range:
+            if get_parallel().tp_rank == 0:
+                capture_range.set_description(
+                    f"Capturing prefill num_tokens ({num_tokens=})"
+                )
+            self.prefill_graphs[num_tokens] = self._compile_prefill_bucket(num_tokens)
+            self.prefill_graphs_bs1[num_tokens] = self._compile_prefill_bucket_bs1(
+                num_tokens
+            )
+
+        if self.enable_dynamic_graph:
+            log_info_on_rank0(logger, "Compiling CPU prefill dynamic fallback graph")
+            self.prefill_dynamic_graph = self._compile_prefill_dynamic_fallback()
+            self.prefill_dynamic_graph_bs1 = self._compile_prefill_dynamic_batch_one()
+
+        self._compile_decode_dynamic_graphs()
+        # Prefill warmups run after the decode capture reset and mutate the
+        # recurrent cache again. Clear all capture-time state before serving.
+        self._reset_mamba_cache_if_needed()
+
+    # ------------------------------------------------------------------
+    # Prefill (EXTEND) graph: runtime
+    # ------------------------------------------------------------------
+
+    def _can_run_prefill_graph(self, forward_batch: ForwardBatch) -> bool:
+        if not self.capture_num_tokens:
+            return False
+        if forward_batch.return_logprob:
+            return False
+        if forward_batch.input_embeds is not None:
+            return False
+        if getattr(forward_batch, "replace_embeds", None) is not None:
+            return False
+        if forward_batch.batch_size > self.prefill_max_bs:
+            return False
+
+        raw_num_tokens = forward_batch.input_ids.shape[0]
+        if forward_batch.contains_mm_inputs():
+            # Vision preprocessing depends on Python-side multimodal objects;
+            # keep that path eager until it has a tensor-only graph contract.
+            return False
+        if raw_num_tokens > self.prefill_max_num_tokens:
+            return self.prefill_dynamic_graph is not None
+        if raw_num_tokens in self.prefill_graphs:
+            return True
+        return (
+            self._get_prefill_padding_bucket(raw_num_tokens) is not None
+            or self.prefill_dynamic_graph is not None
+        )
+
+    def _get_prefill_padding_bucket(self, raw_num_tokens: int) -> Optional[int]:
+        if self.disable_padding or raw_num_tokens > self.prefill_max_num_tokens:
+            return None
+
+        idx = bisect.bisect_left(self.capture_num_tokens, raw_num_tokens)
+        if idx >= len(self.capture_num_tokens):
+            return None
+
+        candidate = self.capture_num_tokens[idx]
+        diff = candidate - raw_num_tokens
+        if diff / float(raw_num_tokens) <= 0.20 or diff <= 64:
+            return candidate
+        return None
+
+    def _execute_prefill_graph(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        assert pp_proxy_tensors is None, (
+            "PPProxyTensors is not supported in CPUGraphRunner's prefill path yet."
+        )
+
+        if (
+            forward_batch.mm_inputs is not None
+            and not forward_batch.contains_mm_inputs()
+        ):
+            forward_batch = copy.copy(forward_batch)
+            forward_batch.mm_inputs = None
+
+        raw_num_tokens = forward_batch.input_ids.shape[0]
+        use_batch_one_graph = forward_batch.batch_size == 1
+        graph_map = (
+            self.prefill_graphs_bs1 if use_batch_one_graph else self.prefill_graphs
+        )
+        compiled_fn = graph_map.get(raw_num_tokens)
+        using_dynamic_fallback = False
+
+        if compiled_fn is None:
+            padded_num_tokens = self._get_prefill_padding_bucket(raw_num_tokens)
+
+            if padded_num_tokens is not None and padded_num_tokens in graph_map:
+                compiled_fn = graph_map[padded_num_tokens]
+                pad_len = padded_num_tokens - raw_num_tokens
+                padded_fb = copy.copy(forward_batch)
+                padded_fb.input_ids = F.pad(
+                    forward_batch.input_ids, (0, pad_len), value=0
+                )
+                padded_fb.positions = F.pad(
+                    forward_batch.positions, (0, pad_len), value=0
+                )
+                if forward_batch.mrope_positions is not None:
+                    padded_fb.mrope_positions = F.pad(
+                        forward_batch.mrope_positions, (0, pad_len), value=0
+                    )
+                if forward_batch.out_cache_loc is not None:
+                    padded_fb.out_cache_loc = F.pad(
+                        forward_batch.out_cache_loc, (0, pad_len), value=0
+                    )
+                forward_batch = padded_fb
+            elif self.prefill_dynamic_graph is not None:
+                using_dynamic_fallback = True
+                if use_batch_one_graph and self.prefill_dynamic_graph_bs1 is not None:
+                    compiled_fn = self.prefill_dynamic_graph_bs1
+                else:
+                    compiled_fn = self.prefill_dynamic_graph
+                    forward_batch = self._prepare_dynamic_prefill_batch(forward_batch)
+
+        if self.enable_torch_compile and not use_batch_one_graph:
+            self._mark_dynamic_request_axis(forward_batch)
+        if self.enable_torch_compile and using_dynamic_fallback:
+            self._mark_dynamic_token_axis(forward_batch)
+
+        output = self._run_prefill_once(compiled_fn, forward_batch)
+        if (
+            isinstance(output, LogitsProcessorOutput)
+            and output.hidden_states is not None
+        ):
+            output.hidden_states = output.hidden_states[:raw_num_tokens]
+        return output
 
 
 CPU_GRAPH_CAPTURE_FAILED_MSG = (
