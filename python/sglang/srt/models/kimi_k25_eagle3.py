@@ -342,27 +342,37 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
-        # llama_eagle3 sets a load-from-target flag when draft_vocab_size is
-        # missing. This checkpoint declares its own draft head, so keep ours.
+        # Same head/processor resolution as llama_eagle3: a declared
+        # draft_vocab_size wins over the tied embedding, because the checkpoint
+        # ships its own reduced lm_head.weight in that case.
         self.load_lm_head_from_target = False
         draft_vocab_size = getattr(config, "draft_vocab_size", None)
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            if draft_vocab_size is None:
-                self.load_lm_head_from_target = True
-                draft_vocab_size = config.vocab_size
-                config.draft_vocab_size = draft_vocab_size
+        if draft_vocab_size is not None:
             self.lm_head = ParallelLMHead(
                 draft_vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
+            draft_logits_vocab_size = draft_vocab_size
+        elif config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+            draft_logits_vocab_size = config.vocab_size
+        else:
+            self.load_lm_head_from_target = True
+            draft_vocab_size = config.vocab_size
+            config.draft_vocab_size = draft_vocab_size
+            self.lm_head = ParallelLMHead(
+                draft_vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+            )
+            draft_logits_vocab_size = draft_vocab_size
 
         # Logits processor sees the draft vocab.
         config_for_logits = copy.deepcopy(config)
-        config_for_logits.vocab_size = draft_vocab_size or config.vocab_size
+        config_for_logits.vocab_size = draft_logits_vocab_size
         self.logits_processor = LogitsProcessor(config_for_logits)
 
         self.capture_aux_hidden_states = True
