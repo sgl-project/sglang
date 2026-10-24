@@ -21,6 +21,7 @@ without it a test still passes when the fast path never engaged at all.
 
 import sys
 import unittest
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from unittest.mock import patch
 
@@ -62,6 +63,11 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
 from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    maybe_init_distributed_environment_and_model_parallel,
+    model_parallel_is_initialized,
+)
+from sglang.multimodal_gen.runtime.layers.attention import layer as attn_layer
 from sglang.multimodal_gen.runtime.layers.attention.backends import sdpa as sdpa_backend
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
@@ -72,6 +78,7 @@ from sglang.multimodal_gen.runtime.layers.linear import MergedColumnParallelLine
 from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
     _apply_rotary_emb,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.ernie_image import (
     _ernie_gated_norm_scale_shift,
     _ernie_norm_scale_shift,
@@ -115,6 +122,7 @@ from sglang.multimodal_gen.runtime.models.dits.sana import (
 from sglang.multimodal_gen.runtime.models.dits.sana import (
     sana_ln_modulate,
 )
+from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTransformerBlock
 from sglang.multimodal_gen.runtime.models.vaes import (
     autoencoder_kl_qwenimage as qwen_vae,
 )
@@ -142,12 +150,15 @@ from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanRMS_norm
 from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
+    ensure_distributed_env_defaults,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=100, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=125, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # backend-specific: preserve ROCm eager fallback coverage for CUDA-only fusions.
-register_amd_ci(est_time=6, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=8, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -2403,6 +2414,108 @@ def test_moss_image_selected_kernel_rejects_mismatched_operands(monkeypatch, ope
         with pytest.raises(ValueError):
             norm(x)
         assert not moss_image._RMSNORM_FUSION.disabled
+
+
+# -------------------------------------------------------------------------
+# Wan -- fused q/k/v GEMM, FFN residual chain, text K/V once per loop
+# -------------------------------------------------------------------------
+
+
+@contextmanager
+def _wan_block_env():
+    """Single-rank model parallel state and the attention patches a Wan block
+    needs to be built and run outside a pipeline."""
+    if not model_parallel_is_initialized():
+        ensure_distributed_env_defaults()
+        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+    with ExitStack() as stack:
+        for name, value in (
+            ("get_attn_backend", sdpa_backend.SDPABackend),
+            ("get_compute_dtype", torch.bfloat16),
+            ("_resolve_sp_attention_mode", ("ulysses", False)),
+            ("_maybe_install_backend_autotune", None),
+        ):
+            stack.enter_context(patch.object(attn_layer, name, return_value=value))
+        stack.enter_context(set_forward_context(0, None))
+        yield
+
+
+def _wan_block(dim=5120, heads=40):
+    block = WanTransformerBlock(
+        dim,
+        1024,
+        heads,
+        qk_norm="rms_norm_across_heads",
+        cross_attn_norm=True,
+        eps=1e-6,
+        supported_attention_backends=set(),
+    ).cuda()
+    with torch.no_grad():
+        for p in block.parameters():
+            p.normal_(0, 0.02)
+    return block.to(torch.bfloat16)
+
+
+def _wan_block_inputs(seq=512, dim=5120):
+    """x, (context, temb, freqs) as the block's positional args, and the
+    rope cos/sin cache"""
+    x = torch.randn(1, seq, dim, device="cuda", dtype=torch.bfloat16)
+    context = torch.randn(1, 64, dim, device="cuda", dtype=torch.bfloat16)
+    temb = torch.randn(1, 6, dim, device="cuda")
+    theta = torch.rand(seq, 64, device="cuda") * 50
+    freqs = (theta.cos(), theta.sin())
+    return x, (context, temb, freqs), torch.cat(freqs, dim=-1).contiguous()
+
+
+def _bits(x):
+    return x.view(torch.int16)
+
+
+@requires_inline_ptx
+@torch.no_grad()
+def test_wan_fused_qkv_keeps_bits_and_frees_with_its_layers():
+    """q/k/v share one weight after loading and run as one GEMM with the same
+    bits; a layer that stops reading the shared weight sends the block back to
+    its three projections, and moving the block takes the shared weight along."""
+    with _wan_block_env():
+        block = _wan_block()
+        x, args, cache = _wan_block_inputs()
+        run = lambda: _bits(block(x, *args, rope_cos_sin_cache=cache))
+        projs = (block.to_q, block.to_k, block.to_v)
+        weights = [proj.weight.clone() for proj in projs]
+        ref = run()
+        assert block._fused_qkv(x.device) is None
+        block.fuse_qkv_weights()
+        assert block._fused_qkv(x.device) is not None
+        for proj, w in zip(projs, weights):
+            assert torch.equal(proj.weight, w)
+        assert torch.equal(run(), ref)
+
+        # a layer whose weight moved (offload, a weight swap) stops the fused GEMM
+        block.to_k.weight.data = block.to_k.weight.data.clone()
+        assert block._fused_qkv(x.device) is None
+        assert torch.equal(run(), ref)
+
+        # moving the block takes the shared weight with it: nothing else holds it
+        block.fuse_qkv_weights()
+        on_gpu = [*block.parameters(), *block.buffers()]
+        gpu_bytes = sum(t.numel() * t.element_size() for t in on_gpu)
+        del on_gpu
+        allocated = torch.cuda.memory_allocated()
+        block.to("cpu")
+        assert allocated - torch.cuda.memory_allocated() >= gpu_bytes
+        assert block._fused_qkv(torch.device("cpu")) is None
+        block.fuse_qkv_weights()
+        fused_weight, fused_bias = block._fused_qkv(torch.device("cpu"))
+        assert torch.equal(fused_weight, torch.cat(weights).cpu())
+        assert torch.equal(fused_bias, torch.cat([p.bias for p in projs]))
+
+        block.to("cuda")
+        assert block._fused_qkv(x.device) is None
+        assert torch.equal(run(), ref)
+        block.fuse_qkv_weights()
+        assert block._fused_qkv(x.device) is not None
+        assert torch.equal(run(), ref)
 
 
 if __name__ == "__main__":
