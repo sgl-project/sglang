@@ -908,6 +908,7 @@ class TokenizerManagerScoreMixin:
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
         image_data: Optional[List[List[ImageData]]] = None,
+        received_time: Optional[float] = None,
     ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
@@ -1205,6 +1206,7 @@ class TokenizerManagerScoreMixin:
                 positional_embed_overrides=positional_embed_overrides,
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
+                received_time=received_time,
             )
         else:
             batch_request = EmbeddingReqInput(
@@ -1214,6 +1216,7 @@ class TokenizerManagerScoreMixin:
                 return_pooled_hidden_states=return_pooled_hidden_states,
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
+                received_time=received_time,
             )
 
         results = await self.generate_request(batch_request, request).__anext__()

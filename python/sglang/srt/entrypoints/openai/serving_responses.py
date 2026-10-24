@@ -96,6 +96,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import get_disagg, get_serving
 from sglang.srt.sampling.sampling_params import (
@@ -299,6 +300,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         raw_request: Optional[Request] = None,
     ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
+        # Timestamp at the HTTP entry; propagated to the internal request
+        # so trace/e2e latency covers responses-specific preprocessing.
+        received_time = monotonic_time()
         # Validate model
         if not self.tokenizer_manager:
             return self.create_error_response("Model not loaded")
@@ -566,6 +570,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         # background+stream streams on this connection, so don't detach.
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
+                        received_time=received_time,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -3004,6 +3009,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
                 require_reasoning=adapted_request.require_reasoning,
+                received_time=adapted_request.received_time,
             )
 
             # Update sampling params with reduced max_tokens
