@@ -4798,6 +4798,28 @@ class ServingChatTestCase(CustomTestCase):
                 ):
                     self.chat._apply_jinja_template(request, None, False)
 
+    def test_reasoning_history_accepts_vllm_field_name(self):
+        self._use_preserved_reasoning_template()
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                *self.basic_req.messages,
+                {"role": "assistant", "content": "Hello", "reasoning": "alias"},
+                {
+                    "role": "assistant",
+                    "content": "Hello",
+                    "reasoning": "alias",
+                    "reasoning_content": "native",
+                },
+                *self.basic_req.messages,
+            ],
+        )
+        self.chat._apply_jinja_template(request, None, False)
+        self.assertEqual(
+            self.tm.tokenizer.encode.call_args.args[0],
+            "<think>alias</think><think>native</think>",
+        )
+
     def test_non_stream_reasoning_response_preserves_payload_whitespace(self):
         self.chat.reasoning_parser = "qwen3"
         self.template_manager.force_reasoning = False

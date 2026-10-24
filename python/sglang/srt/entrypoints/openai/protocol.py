@@ -748,6 +748,18 @@ class ChatCompletionMessageGenericParam(BaseModel):
     # DeepSeek API prefix completion: continue this final assistant message.
     prefix: Optional[bool] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_reasoning_alias(cls, data):
+        # vLLM accepts prior thinking as `reasoning`; keep it for the chat template.
+        if (
+            isinstance(data, dict)
+            and data.get("reasoning_content") is None
+            and isinstance(data.get("reasoning"), str)
+        ):
+            data = {**data, "reasoning_content": data["reasoning"]}
+        return data
+
     @field_validator("role", mode="before")
     @classmethod
     def _normalize_role(cls, v):
