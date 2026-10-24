@@ -5088,6 +5088,156 @@ class ServingChatTestCase(CustomTestCase):
                 ):
                     self.chat._apply_jinja_template(request, None, False)
 
+    def test_gpt_oss_thinking_history_replay_in_jinja_template(self):
+        from pathlib import Path
+
+        gpt_oss_template_str = (
+            Path(__file__)
+            .with_name("gpt_oss_20b_chat_template.jinja")
+            .read_text(encoding="utf-8")
+        )
+        compiled = _compile_jinja_template(gpt_oss_template_str)
+        compiled.globals["strftime_now"] = lambda fmt: "2026-01-01"
+        self.tm.tokenizer.chat_template = gpt_oss_template_str
+        self.tm.tokenizer.apply_chat_template.side_effect = (
+            lambda messages, add_generation_prompt=True, **kwargs: compiled.render(
+                messages=messages,
+                add_generation_prompt=add_generation_prompt,
+            )
+        )
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = None
+        self.chat.is_gpt_oss = True
+
+        tool_call_payload = [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city":"SF"}'},
+            }
+        ]
+        expected_base_prompt = (
+            "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\n"
+            "Knowledge cutoff: 2024-06\n"
+            "Current date: 2026-01-01\n\n"
+            "Reasoning: medium\n\n"
+            "# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>"
+            "<|start|>user<|message|>Weather in SF?<|end|>"
+            "<|start|>assistant<|channel|>analysis<|message|>{thinking}<|end|>"
+            '<|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{{"city": "SF"}}<|call|>'
+            '<|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>"Sunny"<|end|>'
+            "<|start|>assistant"
+        )
+        for msg_input, expected_thinking in (
+            (
+                {
+                    "role": "assistant",
+                    "reasoning_content": "Need weather tool",
+                    "tool_calls": tool_call_payload,
+                },
+                "Need weather tool",
+            ),
+            (
+                {
+                    "role": "assistant",
+                    "thinking": "Need weather tool",
+                    "tool_calls": tool_call_payload,
+                },
+                "Need weather tool",
+            ),
+            (
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Need weather"},
+                        {"type": "thinking", "thinking": "tool"},
+                    ],
+                    "tool_calls": tool_call_payload,
+                },
+                "Need weather\ntool",
+            ),
+            (
+                {
+                    "role": "assistant",
+                    "reasoning_content": "Need weather tool",
+                    "content": "Calling get_weather",
+                    "tool_calls": tool_call_payload,
+                },
+                "Need weather tool\nCalling get_weather",
+            ),
+        ):
+            with self.subTest(msg_input=msg_input):
+                req = ChatCompletionRequest(
+                    model="openai/gpt-oss-20b",
+                    messages=[
+                        {"role": "user", "content": "Weather in SF?"},
+                        msg_input,
+                        {
+                            "role": "tool",
+                            "name": "get_weather",
+                            "tool_call_id": "call_1",
+                            "content": "Sunny",
+                        },
+                    ],
+                )
+                self.chat._apply_jinja_template(req, None, False)
+                rendered = self.tm.tokenizer.encode.call_args.args[0]
+                self.assertEqual(
+                    rendered,
+                    expected_base_prompt.format(thinking=expected_thinking),
+                )
+                self.assertTrue(self.chat.supports_native_reasoning_history())
+
+    def test_non_gpt_oss_thinking_template_preserves_content_with_tool_calls(self):
+        non_gpt_oss_template = (
+            "{%- for message in messages -%}"
+            "{%- if message.role == 'assistant' -%}"
+            "{{ message.thinking or '' }}|{{ message.content or '' }}"
+            "{%- endif -%}"
+            "{%- endfor -%}"
+        )
+        compiled = _compile_jinja_template(non_gpt_oss_template)
+        self.tm.tokenizer.chat_template = non_gpt_oss_template
+        self.tm.tokenizer.apply_chat_template.side_effect = (
+            lambda messages, add_generation_prompt=True, **kwargs: compiled.render(
+                messages=messages,
+                add_generation_prompt=add_generation_prompt,
+            )
+        )
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = None
+        self.chat.is_gpt_oss = False
+
+        req = ChatCompletionRequest(
+            model="custom-thinking-model",
+            messages=[
+                {"role": "user", "content": "Weather in SF?"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "Need weather tool",
+                    "content": "Calling get_weather",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city":"SF"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "Sunny",
+                },
+            ],
+        )
+        self.chat._apply_jinja_template(req, None, False)
+        rendered = self.tm.tokenizer.encode.call_args.args[0]
+        self.assertEqual(rendered, "Need weather tool|Calling get_weather")
+
     def test_non_stream_reasoning_response_preserves_payload_whitespace(self):
         self.chat.reasoning_parser = "qwen3"
         self.template_manager.force_reasoning = False
