@@ -25,7 +25,7 @@ Lifecycle:
 
 from __future__ import annotations
 
-from typing import Iterator, Mapping, Optional, Sequence, TypeVar
+from typing import Callable, Iterator, Mapping, Optional, Sequence, TypeVar
 
 import numpy as np
 
@@ -106,22 +106,27 @@ class OutputStore:
     ) -> list[S]:
         """Read the named fields of each ref into arrays the caller owns.
 
-        Reads in chunks whose stored bytes fit ``buffer_bytes``, the backend's read buffer
-        (for Mooncake, the client's local buffer), and copies each chunk out before reading
-        the next, so the backend holds at most one chunk. Fails before reading anything when
-        a field is missing or larger than the buffer.
+        Reads in chunks that fit ``buffer_bytes``, the backend's read buffer (for Mooncake,
+        the client's local buffer), counting each field as the backend allocates it, and
+        copies each chunk out before reading the next, so the backend holds at most one
+        chunk. Fails before reading anything when a field is missing or cannot fit the buffer.
         """
         self._check_backend([ref for ref, _ in requests])
         wanted = [_named_specs(ref, names) for ref, names in requests]
         for (ref, _), specs in zip(requests, wanted):
             for spec in specs:
-                if spec.nbytes > buffer_bytes:
+                held = self._backend.read_buffer_bytes(spec.nbytes)
+                if held > buffer_bytes:
                     raise ValueError(
-                        f"field {spec.name} of {ref.key} has {spec.nbytes} bytes, "
-                        f"more than the {buffer_bytes}-byte read buffer"
+                        f"field {spec.name} of {ref.key} has {spec.nbytes} bytes and takes "
+                        f"{held} to read, more than the {buffer_bytes}-byte read buffer"
                     )
         fields: list[dict[str, RawField]] = [{} for _ in requests]
-        for chunk in _chunk_by_bytes(wanted, buffer_bytes=buffer_bytes):
+        for chunk in _chunk_by_bytes(
+            wanted,
+            buffer_bytes=buffer_bytes,
+            read_buffer_bytes=self._backend.read_buffer_bytes,
+        ):
             self._read_chunk(requests, chunk, out=fields)
         return [stash_type.from_fields(named) for named in fields]
 
@@ -206,17 +211,22 @@ def _named_specs(ref: StoreRef, names: Sequence[str]) -> list[FieldSpec]:
 
 
 def _chunk_by_bytes(
-    wanted: Sequence[Sequence[FieldSpec]], *, buffer_bytes: int
+    wanted: Sequence[Sequence[FieldSpec]],
+    *,
+    buffer_bytes: int,
+    read_buffer_bytes: Callable[[int], int],
 ) -> Iterator[dict[int, list[FieldSpec]]]:
-    """Group (request index, field) pairs, in order, into chunks of at most ``buffer_bytes``."""
+    """Group (request index, field) pairs, in order, into chunks whose reads hold at most
+    ``buffer_bytes``."""
     chunk: dict[int, list[FieldSpec]] = {}
     used = 0
     for i, specs in enumerate(wanted):
         for spec in specs:
-            if chunk and used + spec.nbytes > buffer_bytes:
+            held = read_buffer_bytes(spec.nbytes)
+            if chunk and used + held > buffer_bytes:
                 yield chunk
                 chunk, used = {}, 0
             chunk.setdefault(i, []).append(spec)
-            used += spec.nbytes
+            used += held
     if chunk:
         yield chunk

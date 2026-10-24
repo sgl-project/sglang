@@ -9,6 +9,9 @@ Mooncake 0.3.13 this relies on (probed against a live master):
 - A put copies through the client's local buffer and fails at once (-600) when the
   buffer has no room; it never waits. Reads come out of the same buffer and hold
   their part of it for as long as their views live.
+- A read allocates each part from that buffer on its own, rounded up to the
+  allocator's size class (at most 1/8 more), and returns ``None`` for a part that
+  finds no room, as it does for a missing part or a failed transfer.
 - A read leaves a lease on the key, and a remove without ``force`` fails (-706) while
   the lease lasts.
 """
@@ -18,7 +21,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from typing import Callable, Mapping, Sequence, Union
+from typing import Callable, Mapping, NoReturn, Sequence, Union
 
 import msgspec
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig
@@ -29,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 _LOCAL_BUFFER_FULL = -600
 _OBJECT_NOT_FOUND = -704
+# Mooncake's OffsetAllocator (mooncake-store/src/offset_allocator.cpp) counts the buffer in
+# power-of-two units, at most this many, and rounds each allocation up to a size class.
+_ALLOCATOR_MAX_UNITS = 4026531840
+_ALLOCATOR_MANTISSA_BITS = 3
 
 _SIZE_UNITS = {
     "kb": 1024,
@@ -60,13 +67,15 @@ class MooncakeBackend(StorageBackend):
 
     def __init__(self, config: MooncakeConfig) -> None:
         self._key_prefix = config.key_prefix
+        local_buffer_bytes = parse_size(config.local_buffer_size)
+        self._allocator_unit_shift = _allocator_unit_shift(local_buffer_bytes)
         store = MooncakeDistributedStore()
         setup_error = store.setup(
             {
                 "local_hostname": config.local_hostname,
                 "metadata_server": config.metadata_server,
                 "global_segment_size": 0,
-                "local_buffer_size": parse_size(config.local_buffer_size),
+                "local_buffer_size": local_buffer_bytes,
                 "protocol": config.protocol,
                 "rdma_devices": config.device_name,
                 "master_server_addr": config.master_server_address,
@@ -111,18 +120,17 @@ class MooncakeBackend(StorageBackend):
         part_keys = [
             _part_key(key, name) for key, named in zip(keys, parts) for name, _ in named
         ]
-        handles = iter(self._store.batch_get_buffer(part_keys) if part_keys else [])
+        handles = self._store.batch_get_buffer(part_keys) if part_keys else []
+        unread = [key for key, handle in zip(part_keys, handles) if handle is None]
+        if unread:
+            self._raise_unread(unread)
+        remaining = iter(handles)
         objects = []
         for key, named in zip(keys, parts):
             got = {}
             for name, nbytes in named:
-                handle = next(handles)
-                if handle is None:
-                    raise KeyError(
-                        f"output store part not found: {_part_key(key, name)}"
-                    )
                 # Mooncake exports signed bytes; the view keeps the handle alive.
-                data = memoryview(handle).cast("B")
+                data = memoryview(next(remaining)).cast("B")
                 if data.nbytes != nbytes:
                     raise ValueError(
                         f"output store part {_part_key(key, name)} has {data.nbytes} bytes, "
@@ -131,6 +139,9 @@ class MooncakeBackend(StorageBackend):
                 got[name] = data
             objects.append(got)
         return objects
+
+    def read_buffer_bytes(self, nbytes: int) -> int:
+        return _allocated_bytes(nbytes, unit_shift=self._allocator_unit_shift)
 
     def delete_many(
         self, keys: Sequence[str], *, parts: Sequence[Sequence[str]]
@@ -145,6 +156,17 @@ class MooncakeBackend(StorageBackend):
 
     def close(self) -> None:
         self._store.close()
+
+    def _raise_unread(self, part_keys: Sequence[str]) -> NoReturn:
+        exists = self._store.batch_is_exist(list(part_keys))
+        missing = [key for key, found in zip(part_keys, exists) if found == 0]
+        if missing:
+            raise KeyError(f"output store part not found: {missing[0]}")
+        raise RuntimeError(
+            f"Mooncake could not read {len(part_keys)} of the stored parts, "
+            f"such as {part_keys[0]}: no room in the local buffer or a failed "
+            "transfer (see the Mooncake log)"
+        )
 
     def _remove(self, keys: Sequence[str]) -> list[tuple[str, int]]:
         """Remove keys that may or may not exist; returns the ones that failed."""
@@ -195,6 +217,22 @@ class _LocalBufferGate:
                 if exclusive:
                     self._exclusive = False
                 self._cond.notify_all()
+
+
+def _allocator_unit_shift(buffer_bytes: int) -> int:
+    shift = 0
+    while buffer_bytes >> shift > _ALLOCATOR_MAX_UNITS:
+        shift += 1
+    return shift
+
+
+def _allocated_bytes(nbytes: int, *, unit_shift: int) -> int:
+    units = -(-nbytes >> unit_shift)
+    if units >= 1 << _ALLOCATOR_MANTISSA_BITS:
+        # A size class keeps the leading one and the next 3 bits of the unit count.
+        step = 1 << (units.bit_length() - 1 - _ALLOCATOR_MANTISSA_BITS)
+        units = -(-units // step) * step
+    return units << unit_shift
 
 
 def parse_size(value: Union[int, str]) -> int:

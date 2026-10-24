@@ -38,6 +38,10 @@ class StorageBackend(ABC):
     ) -> list[dict[str, memoryview]]:
         """Read the named parts of each object; ``parts`` gives each part's size."""
 
+    def read_buffer_bytes(self, nbytes: int) -> int:
+        """Read-buffer bytes that an ``nbytes`` part holds while its views live."""
+        return nbytes
+
     @abstractmethod
     def delete_many(
         self, keys: Sequence[str], *, parts: Sequence[Sequence[str]]

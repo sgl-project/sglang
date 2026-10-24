@@ -85,6 +85,29 @@ def test_a_missing_or_resized_part_fails_the_read():
         backend.get_many([key], parts=[[("f0", 4)]])
 
 
+def test_a_stored_part_that_was_not_read_is_not_reported_missing():
+    backend, store = make_backend()
+    (key,) = backend.put_many([parts(3, 5)])
+    # Mooncake returns None both for a missing part and for one it found no room for.
+    store.batch_get_buffer = lambda keys: [None for _ in keys]
+    with pytest.raises(RuntimeError, match="could not read 2 of the stored parts"):
+        backend.get_many([key], parts=[[("f0", 3), ("f1", 5)]])
+    with pytest.raises(KeyError, match="f9"):
+        backend.get_many([key], parts=[[("f0", 3), ("f9", 5)]])
+
+
+def test_reads_are_counted_in_the_allocator_size_classes():
+    backend, _ = make_backend()  # a 64mb buffer counts single bytes
+    sizes = [0, 7, 8, 9, 17, 128, 129]
+    assert [backend.read_buffer_bytes(n) for n in sizes] == [0, 7, 8, 9, 18, 128, 144]
+    backend, _ = make_backend(local_buffer_size="16gb")  # 8-byte units
+    mib, gib = 1024**2, 1024**3
+    assert backend.read_buffer_bytes(1) == 8
+    assert backend.read_buffer_bytes(128 * mib) == 128 * mib
+    assert backend.read_buffer_bytes(130 * mib) == 144 * mib
+    assert backend.read_buffer_bytes(int(15.3 * gib)) == 16 * gib
+
+
 def test_delete_is_forced_and_idempotent():
     backend, store = make_backend()
     (key,) = backend.put_many([parts(3, 5)])

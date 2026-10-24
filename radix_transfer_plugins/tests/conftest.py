@@ -49,6 +49,9 @@ class FakeMooncakeStore:
             for key in keys
         ]
 
+    def batch_is_exist(self, keys):
+        return [int(key in self.objects) for key in keys]
+
     def batch_remove(self, keys, force=False):
         self.remove_calls.append((list(keys), force))
         return [
