@@ -957,6 +957,9 @@ class Envs:
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
+    # Use AITER block selection for supported gfx950 FP8 index caches.
+    SGLANG_M3_USE_AITER_INDEXER = EnvBool(True)
+    SGLANG_M3_USE_AITER_PREFILL_INDEXER = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
