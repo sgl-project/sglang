@@ -1064,6 +1064,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated wildcard patterns for kernel API names to exclude from level-10 dumps.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When set, each hierarchical cache storage backend call is delayed by a random duration drawn uniformly from <code>[0, N)</code> seconds, where <code>N</code> is the variable value. Each rank uses an independent random sequence, skewing storage IO timing across TP/PP ranks to expose race conditions and rank divergence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
+    </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When set to a probability <code>p</code> in <code>[0, 1]</code>, each hierarchical cache storage backend call randomly fails with probability <code>p</code> (a failed call degrades to a cache miss or an unsuccessful write). Each rank uses an independent random sequence. Can be combined with <code>SGLANG_ENABLE_RANK_CONSENSUS_CHECKER=1</code> to detect rank divergence under storage failures.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
+    </tr>
 </tbody>
 </table>
 
