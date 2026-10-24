@@ -1,6 +1,7 @@
 """MiniMax checkpoints use the generic DFlash2 layers with different math."""
 
 import sys
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -26,6 +27,8 @@ def single_rank_native():
         with (
             get_context().override_server_args(),
             get_parallel().override(tp_size=1, tp_rank=0, tp_group=None),
+            # CPU runners have no CUDA rope kernel; keep RoPE on the native path.
+            patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True),
         ):
             yield
     finally:
