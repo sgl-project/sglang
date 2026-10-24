@@ -2126,7 +2126,10 @@ def test_weights_are_copied_when_they_fit(tmp_path, monkeypatch):
     assert manager._consolidated_cpu_weights[0]
 
 
-def test_anonymous_layer_store_can_reassign_its_pin_budget(tmp_path, monkeypatch):
+@pytest.mark.parametrize("block_cls", [_FileBackedBlock, _TransposedFileBackedBlock])
+def test_anonymous_layer_store_can_reassign_its_pin_budget(
+    tmp_path, monkeypatch, block_cls
+):
     if not pathlib.Path("/proc/self/maps").exists():
         pytest.skip("needs /proc to tell a mapping from anonymous memory")
     manager = _mapped_manager(
@@ -2135,9 +2138,14 @@ def test_anonymous_layer_store_can_reassign_its_pin_budget(tmp_path, monkeypatch
         available_gib=64,
         pin_budget_bytes=4 * 1024**3,
         num_blocks=2,
+        block_cls=block_cls,
     )
     original = manager.pinned_layer_indices()
     assert original == (0, 1)
+    expected = {
+        name: (tensor.clone(), tensor.stride())
+        for name, tensor in manager.iter_cpu_weights()
+    }
     committed = manager._pin_budget.committed_bytes
     pinned_store_bytes = sum(
         manager.layer_host_store_bytes()[layer_idx] for layer_idx in original
@@ -2156,6 +2164,11 @@ def test_anonymous_layer_store_can_reassign_its_pin_budget(tmp_path, monkeypatch
     manager.set_pinned_layers(previous)
     assert manager.pinned_layer_indices() == original
     assert manager._pin_budget.committed_bytes == committed
+
+    for name, tensor in manager.iter_cpu_weights():
+        value, stride = expected[name]
+        assert torch.equal(tensor, value)
+        assert tensor.stride() == stride
 
 
 def test_a_mapped_weight_is_not_written_back(tmp_path, monkeypatch):
