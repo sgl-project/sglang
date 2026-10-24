@@ -13,6 +13,16 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen import envs
+
+
+def _no_nan(value: torch.Tensor) -> bool:
+    """True if ``value`` has no NaNs; the scan itself (a full-size kernel plus
+    a host sync) can be skipped via an env flag, leaving shape/type checks on."""
+    if envs.SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK:
+        return True
+    return not torch.isnan(value).any().item()
+
 
 class StageValidators:
     """Common validators for pipeline stages."""
@@ -47,7 +57,7 @@ class StageValidators:
         """Check if value is a torch tensor and doesn't contain NaN values."""
         if not isinstance(value, torch.Tensor):
             return False
-        return not torch.isnan(value).any().item()
+        return _no_nan(value)
 
     @staticmethod
     def tensor_with_dims(value: Any, dims: int) -> bool:
@@ -56,7 +66,7 @@ class StageValidators:
             return False
         if value.dim() != dims:
             return False
-        return not torch.isnan(value).any().item()
+        return _no_nan(value)
 
     @staticmethod
     def tensor_min_dims(value: Any, min_dims: int) -> bool:
@@ -65,7 +75,7 @@ class StageValidators:
             return False
         if value.dim() < min_dims:
             return False
-        return not torch.isnan(value).any().item()
+        return _no_nan(value)
 
     @staticmethod
     def list_not_empty(value: Any) -> bool:
@@ -112,7 +122,7 @@ class StageValidators:
             return True
         if not isinstance(value, torch.Tensor):
             return False
-        return not torch.isnan(value).any().item()
+        return _no_nan(value)
 
     @staticmethod
     def list_of_tensors_with_dims(value: Any, dims: int) -> bool:
@@ -124,7 +134,7 @@ class StageValidators:
                 return False
             if item.dim() != dims:
                 return False
-            if torch.isnan(item).any().item():
+            if not _no_nan(item):
                 return False
         return True
 
@@ -136,7 +146,7 @@ class StageValidators:
         for item in value:
             if not isinstance(item, torch.Tensor):
                 return False
-            if torch.isnan(item).any().item():
+            if not _no_nan(item):
                 return False
         return True
 
@@ -150,7 +160,7 @@ class StageValidators:
                 return False
             if item.dim() < min_dims:
                 return False
-            if torch.isnan(item).any().item():
+            if not _no_nan(item):
                 return False
         return True
 
@@ -165,7 +175,7 @@ class StageValidators:
                 return False
             if value.dim() != dims:
                 return False
-            return not torch.isnan(value).any().item()
+            return _no_nan(value)
 
         return validator
 
