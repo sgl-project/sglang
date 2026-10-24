@@ -2892,10 +2892,16 @@ def select_experts(
     # Only aiter_biased_grouped_topk wants the bias in the gating dtype. The JIT
     # router returns before it in biased_grouped_topk_gpu and upcasts the bias
     # in-register, so downcasting here would only buy it a per-call cast back.
+    # An fp32 bias (e.g. GlmMoeDsa's e_score_correction_bias from #37133) must
+    # stay in fp32: the aiter branch of biased_grouped_topk_gpu keeps an fp32
+    # bias and upcasts the gating logits to fp32 instead, matching the CUDA
+    # path. Downcasting it here first would silently disable that branch and
+    # route with a bf16 bias (#44794).
     if (
         _use_aiter
         and use_grouped_topk
         and correction_bias is not None
+        and correction_bias.dtype != torch.float32
         and not envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
         and dynamic_expert_bias is None
     ):
