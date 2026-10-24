@@ -1109,6 +1109,11 @@ def test_controller_tensorcast_factory_and_host_pool_group_use_v1_anchor(
 ) -> None:
     from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
 
+    monkeypatch.setattr(
+        "sglang.srt.managers.cache_controller.get_parallel",
+        lambda: SimpleNamespace(attn_dcp_size=1),
+    )
+
     registry_entry = StorageBackendFactory._registry["tensorcast"]
     assert registry_entry["module_path"] == (
         "sglang.srt.mem_cache.storage.tensorcast_store.tensorcast_store"

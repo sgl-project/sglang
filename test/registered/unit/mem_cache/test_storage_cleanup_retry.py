@@ -99,6 +99,15 @@ def _fixture():
 
 
 class TestStorageCleanupRetry(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        parallel = patch(
+            "sglang.srt.managers.cache_controller.get_parallel",
+            return_value=SimpleNamespace(attn_dcp_size=1),
+        )
+        parallel.start()
+        self.addCleanup(parallel.stop)
+
     def test_close_failure_blocks_reattach_until_a_retry_succeeds(self):
         attachment, cache, controller, backend = _fixture()
         self.assertFalse(attachment.detach()[0])
@@ -132,6 +141,27 @@ class TestStorageCleanupRetry(CustomTestCase):
         self.assertTrue(controller.enable_storage)
         self.assertEqual(backend.close_calls, 0)
         attachment._release_pending_storage_ops.assert_not_called()
+
+    def test_stop_failure_rejects_same_backend_policy_update_until_detach(self):
+        attachment, cache, controller, backend = _fixture()
+        worker = Mock(name="storage-worker")
+        worker.is_alive.return_value = True
+        controller.prefetch_thread = worker
+        controller._stop_storage_threads = lambda: (
+            HiCacheController._stop_storage_threads(controller)
+        )
+        self.assertFalse(attachment.detach()[0])
+        self.assertTrue(controller.storage_stop_event.is_set())
+        ok, message = attachment.attach(
+            "dynamic", hicache_storage_prefetch_policy="wait_complete"
+        )
+        self.assertFalse(ok)
+        self.assertIn("retry detach", message)
+        self.assertEqual(cache.prefetch_stop_policy, "best_effort")
+        worker.is_alive.return_value = False
+        backend.fail_close = False
+        self.assertTrue(attachment.detach()[0])
+        self.assertFalse(controller.storage_stop_event.is_set())
 
     def test_failed_attach_cleanup_is_retried_on_shutdown(self):
         attachment, cache, controller, backend = _fixture()

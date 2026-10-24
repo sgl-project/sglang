@@ -105,6 +105,8 @@ class StorageAttachment:
             )
 
         if cache.enable_storage:
+            if controller.storage_stop_event.is_set():
+                return False, "HiCache storage cleanup is pending; retry detach first."
             current_backend = controller.storage_backend_type
             if current_backend != storage_backend:
                 return (
