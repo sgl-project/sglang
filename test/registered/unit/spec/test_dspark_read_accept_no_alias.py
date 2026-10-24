@@ -61,6 +61,25 @@ class TestDsparkReadAcceptNoAlias(unittest.TestCase):
         for name in _FIELDS:
             self.assertTrue(torch.equal(getattr(outs, name), expected[name]), name)
 
+    def test_writes_through_accept_buffers_reach_read_accept(self):
+        # The in-graph accept writes its results with out=accept_buffers(bs); a
+        # write target that is a copy would leave the buffers (and so every
+        # read_accept) at their previous values.
+        ep = _epilogue()
+        target = ep.accept_buffers(4)
+        written = {}
+        for i, name in enumerate(_FIELDS):
+            out = getattr(target, name)
+            written[name] = torch.full_like(out, 100 + i)
+            out.copy_(written[name])
+        outs = ep.read_accept(4)
+        for name in _FIELDS:
+            self.assertTrue(torch.equal(getattr(outs, name), written[name]), name)
+        for name in _FIELDS:  # the next verify replay overwrites every buffer
+            getattr(ep, f"{name}_buf").fill_(-1)
+        for name in _FIELDS:
+            self.assertTrue(torch.equal(getattr(outs, name), written[name]), name)
+
 
 if __name__ == "__main__":
     unittest.main()
