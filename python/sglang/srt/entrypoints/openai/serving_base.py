@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
@@ -148,14 +147,9 @@ class OpenAIServingBase(ABC):
 
     def _generate_request_id_base(self, request: OpenAIServingRequest) -> Optional[str]:
         """Generate request ID based on request type"""
+        # TODO(chang): rid generation is deferred until the rid logic is clear. The rid is
+        # used in io_struct check and often violates `The rid should be a list` AssertionError.
         return None
-
-        # TODO(chang): the rid is used in io_strcut check and often violates `The rid should be a list` AssertionError
-        # Temporarily return None in this function until the rid logic is clear.
-        if rid := getattr(request, "rid", None):
-            return rid
-
-        return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
 
     @abstractmethod
     def _convert_to_internal_request(
