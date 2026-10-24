@@ -148,6 +148,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     FreezeGCReq,
     GetInternalStateReq,
+    GetSchedulerIdleReqInput,
+    GetSchedulerIdleReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1804,6 +1806,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
+                (GetSchedulerIdleReqInput, self.get_scheduler_idle),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -5299,6 +5302,9 @@ class Scheduler(
             self.metrics_reporter.record_scheduler_idle()
         else:
             self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+
+    def get_scheduler_idle(self, recv_req: GetSchedulerIdleReqInput):
+        return GetSchedulerIdleReqOutput(is_idle=self.is_fully_idle())
 
     def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
         # Health check piggybacks on running requests in process_output.

@@ -886,13 +886,7 @@ class TokenizerWorker(TokenizerManager):
         await self._pause_continue_future
 
         if obj.mode == "abort":
-            # Abort polling: only the originator checks its own lock state
-            while True:
-                self.abort_request(abort_all=True)
-                is_locked = await self.model_update_lock.is_locked()
-                if not is_locked:
-                    break
-                await asyncio.sleep(1.0)
+            await self._abort_requests_and_wait_for_idle()
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         loop = asyncio.get_event_loop()
