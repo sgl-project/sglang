@@ -187,6 +187,7 @@ class StreamingHarmonyContext(HarmonyContext):
         self.encoding = get_encoding()
         self.last_tok = None
         self.num_processed_tokens = 0
+        self._num_output_tokens_before_generation = 0
 
     @property
     def messages(self) -> list:
@@ -215,6 +216,15 @@ class StreamingHarmonyContext(HarmonyContext):
                 new_token_ids = output_token_ids
                 self.num_processed_tokens += len(output_token_ids)
 
+            if "prompt_tokens" in meta_info:
+                self.num_prompt_tokens = meta_info["prompt_tokens"]
+            if "cached_tokens" in meta_info:
+                self.num_cached_tokens = meta_info["cached_tokens"]
+            # completion_tokens is a running total within the current generation.
+            if completion_tokens is not None:
+                self.num_output_tokens = (
+                    self._num_output_tokens_before_generation + completion_tokens
+                )
             self._record_finish_reason(meta_info)
 
             for token_id in new_token_ids:
@@ -232,6 +242,8 @@ class StreamingHarmonyContext(HarmonyContext):
             for tok in toks:
                 self.parser.process(tok)
             self.last_tok = toks[-1]
+            self._num_output_tokens_before_generation = self.num_output_tokens
+            self.num_processed_tokens = 0
 
     def is_expecting_start(self) -> bool:
         return self.parser.state == StreamState.EXPECT_START
