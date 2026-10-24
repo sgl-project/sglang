@@ -477,6 +477,10 @@ class Scheduler(
 
         # Parse args
         self.server_args = server_args
+        if server_args.gc_threshold:
+            import gc
+
+            gc.set_threshold(*server_args.gc_threshold)
         self.nccl_port = port_args.nccl_port
         self.schedule_policy = get_schedule().schedule_policy
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling

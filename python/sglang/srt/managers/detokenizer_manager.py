@@ -108,6 +108,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
+        if server_args.gc_threshold:
+            import gc
+
+            gc.set_threshold(*server_args.gc_threshold)
         # Init inter-process communication
         self.init_ipc_channels(port_args, server_args)
 
