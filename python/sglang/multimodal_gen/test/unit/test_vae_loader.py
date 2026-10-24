@@ -718,7 +718,10 @@ class TestVAELoader(unittest.TestCase):
             (QwenImagePipelineConfig, 2, {"encoder", "quant_conv", "decoder.0"}),
         ]
         for config_cls, num_gpus, expected in cases:
-            with self.subTest(config=config_cls.__name__, num_gpus=num_gpus):
+            with (
+                self.subTest(config=config_cls.__name__, num_gpus=num_gpus),
+                patch.dict("os.environ", {}, clear=True),
+            ):
                 vae = nn.Module()
                 vae.encoder = nn.Conv3d(2, 2, 3)
                 vae.quant_conv = nn.Conv3d(2, 2, 3)
@@ -734,6 +737,15 @@ class TestVAELoader(unittest.TestCase):
                     and m.weight.is_contiguous(memory_format=torch.channels_last_3d)
                 }
                 self.assertEqual(converted, expected)
+
+    def test_channels_last_3d_env_override_converts_whole_multi_gpu_wan_vae(self):
+        server_args = _FakeServerArgs(Wan2_2_I2V_A14B_Config(), num_gpus=2)
+        with patch.dict("os.environ", {"SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": "1"}):
+            self.assertEqual(_channels_last_3d_prefix(server_args), "")
+        with patch.dict(
+            "os.environ", {"SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": "auto"}
+        ):
+            self.assertEqual(_channels_last_3d_prefix(server_args), "decoder.")
 
     def test_channels_last_3d_can_be_disabled_by_env(self):
         with (
