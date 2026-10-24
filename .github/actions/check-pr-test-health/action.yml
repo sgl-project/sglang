@@ -16,6 +16,7 @@ runs:
         SKIP_PR_TEST_HEALTH_CHECK: ${{ env.SKIP_PR_TEST_HEALTH_CHECK }}
       with:
         github-token: ${{ inputs.github-token }}
+        retries: 2
         script: |
           core.info(`[health-check] START -- event=${context.eventName}, runId=${context.runId}`);
 
