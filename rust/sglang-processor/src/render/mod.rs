@@ -173,8 +173,8 @@ impl ChatFormatter {
             _ => Err("this formatter renders through render_prompt".into()),
         }
         .map_err(|message| {
-            if message.ends_with(ENGINE_ONLY) {
-                TemplateError::EngineOnly { message }
+            if message.ends_with(RENDER_FALLBACK_SUFFIX) {
+                TemplateError::NeedsRenderFallback { message }
             } else {
                 TemplateError::Renderer { message }
             }
@@ -345,8 +345,8 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
 
 /// How the SGLang-parity renderers end the message refusing a valid request:
 /// [`ChatFormatter::render_request`] maps such messages to
-/// [`TemplateError::EngineOnly`], so a renderer's refusal must keep it.
-const ENGINE_ONLY: &str = "on the engine";
+/// [`TemplateError::NeedsRenderFallback`], so a renderer's refusal must keep it.
+const RENDER_FALLBACK_SUFFIX: &str = "on the engine";
 
 #[derive(Debug, Error)]
 pub enum TemplateError {
@@ -394,7 +394,7 @@ pub enum TemplateError {
     /// render byte-for-byte as SGLang does ("... renders on the engine"); the
     /// host should render it another way, not reject it.
     #[error("{message}")]
-    EngineOnly { message: String },
+    NeedsRenderFallback { message: String },
 
     #[error("legacy chat template `{path}` must be a JSON object")]
     LegacyNotObject { path: PathBuf },
