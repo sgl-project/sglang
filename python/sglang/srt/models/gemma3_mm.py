@@ -94,7 +94,6 @@ class Gemma3MultiModalProjector(nn.Module):
         reshaped_vision_outputs = reshaped_vision_outputs.reshape(
             batch_size, hidden_size, self.patches_per_image, self.patches_per_image
         )
-        reshaped_vision_outputs = reshaped_vision_outputs.contiguous()
 
         # Apply pooling
         pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs)
