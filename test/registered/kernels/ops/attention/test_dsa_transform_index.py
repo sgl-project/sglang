@@ -308,6 +308,28 @@ class TestDSATransformIndex(CustomTestCase):
                     page_table_is_expanded=page_table_is_expanded,
                 )
 
+    def test_decode_tiled_page_table_row_stride_is_not_specialized(self):
+        kernel = transform_index_module.transform_index_page_table_decode_tiled_kernel
+        stride_param = next(
+            param for param in kernel.params if param.name == "page_table_row_stride"
+        )
+
+        self.assertFalse(stride_param.is_constexpr)
+        self.assertTrue(stride_param.do_not_specialize)
+
+    def test_decode_tiled_dynamic_page_table_row_strides(self):
+        context_lengths = (4096, 4160, 4224, 4100, 4101)
+        kernel = transform_index_module.transform_index_page_table_decode_tiled_kernel
+
+        self._check_decode_case(17, context_lengths[0], topk_width=KPOOL_TOPK)
+        kernel_cache = kernel.device_caches[torch.cuda.current_device()][0]
+        specialization_count = len(kernel_cache)
+
+        for context_length in context_lengths[1:]:
+            with self.subTest(context_length=context_length):
+                self._check_decode_case(17, context_length, topk_width=KPOOL_TOPK)
+                self.assertEqual(len(kernel_cache), specialization_count)
+
     def test_decode_fast_correctness_and_strides(self):
         self._check_decode_case(17, 8192, provide_result=True)
         self._check_decode_case(17, 8192, zero_row_stride=True)
