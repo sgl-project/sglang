@@ -1238,7 +1238,30 @@ def calculate_metrics(
 
         if len(tokens_per_second) > 0:
             max_output_tokens_per_s = float(np.max(tokens_per_second))
-            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
+
+        # True peak concurrency: the maximum number of simultaneously active
+        # successful requests. The per-second bucket array above is kept only
+        # for the throughput plot, because taking the max over buckets
+        # over-counts requests that never run at the same time (e.g.
+        # sequential requests landing in one bucket, or a request ending
+        # exactly when another starts). The scalar peak is instead computed
+        # with a sweep line over half-open [start, end) intervals, so end
+        # events sort before start events at the same timestamp.
+        peak_events: List[Tuple[float, int]] = []
+        for output in successful_outputs:
+            peak_events.append((output.start_time, 1))
+            peak_events.append((output.start_time + output.latency, -1))
+        peak_events.sort(key=lambda event: (event[0], event[1]))
+
+        current_concurrent_requests = 0
+        for _, delta in peak_events:
+            if delta == 1:
+                current_concurrent_requests += 1
+                max_concurrent_requests = max(
+                    max_concurrent_requests, current_concurrent_requests
+                )
+            else:
+                current_concurrent_requests -= 1
 
         if plot_throughput:
             if TERM_PLOTLIB_AVAILABLE:
