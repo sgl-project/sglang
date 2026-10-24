@@ -15,6 +15,7 @@ mod loader;
 mod models;
 mod reasoning;
 mod selection;
+mod template;
 mod thinking;
 
 use self::legacy::LegacyFormatter;
@@ -26,6 +27,7 @@ use self::models::{
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
+pub use self::template::TemplateArgs;
 pub use self::thinking::ThinkingTemplates;
 
 /// Legacy stop strings: a single separator-style stop or a list of stops.

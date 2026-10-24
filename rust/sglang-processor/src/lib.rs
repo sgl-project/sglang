@@ -35,7 +35,7 @@ pub use parser::{
 };
 #[cfg(feature = "render")]
 pub use render::{
-    ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, OneOrMany, TemplateError,
+    ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, OneOrMany, TemplateArgs, TemplateError,
     ThinkingTemplates, load_chat_formatter, requested_effort, requested_thinking,
     select_chat_formatter,
 };
