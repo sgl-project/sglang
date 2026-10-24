@@ -1533,9 +1533,11 @@ class DeepseekV4AttnBackend(
             compressed_seq_lens=c_seq_lens,
             use_topk_v2=self.dsa_topk_backend.should_use_topk_v2() and not _is_xpu,
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
-            # JIT metadata planner encodes split_kv=256.
+            # JIT metadata planner encodes split_kv=256. The dsv41 low-ratio
+            # (c1/c2) indexers always score with the FP4 kernel.
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
+                (self.enable_deepseek_v4_fp4_indexer or compress_ratio in (1, 2))
+                and get_platform().is_sm120
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
