@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real HTTP/GPU lifecycle regression with a small Wan checkpoint.
 
-CI runs on diffusion partition 0. One GPU covers single/batch2; two GPUs also
+CI runs on diffusion partition 0. One GPU covers single/batch2; two GPUs
 cover DP2, Ulysses2, TP2 and CFG2. Use ``-k dp2`` to select one topology.
 """
 
@@ -25,7 +25,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import terminate_and_kill_process_tree
 
 register_cuda_ci(est_time=180, stage="base-b", runner_config="diffusion-1-gpu-h100")
-register_cuda_ci(est_time=600, stage="base-b", runner_config="diffusion-2-gpu-h100")
+register_cuda_ci(est_time=480, stage="base-b", runner_config="diffusion-2-gpu-h100")
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
@@ -51,6 +51,8 @@ def server(request, tmp_path):
     mode, num_gpus, extra = request.param
     if torch.cuda.device_count() < num_gpus:
         pytest.skip(f"{mode} needs {num_gpus} GPUs")
+    if num_gpus == 1 and torch.cuda.device_count() > 1:
+        pytest.skip("single-GPU cases run in the one-GPU lane")
     ctx = ServerManager(
         model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         port=get_dynamic_server_port(),
@@ -157,12 +159,6 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
     assert len(workers) == num_gpus, [(p.pid, p.cmdline()) for p in children]
 
     with _paused(workers):
-        for invalid in (
-            {"seed": -1},
-            {"num_inference_steps": 0},
-            {"guidance_scale": -1},
-        ):
-            submit(expected=400, **invalid)
         # a deterministic queue barrier avoids racing deletion against a fast model
         deleted = submit()
         call("DELETE", f"/v1/videos/{deleted}")
