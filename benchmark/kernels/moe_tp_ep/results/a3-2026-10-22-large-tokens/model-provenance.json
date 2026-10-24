@@ -1,0 +1,12 @@
+{
+  "repo": "Qwen/Qwen3-30B-A3B",
+  "revision": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+  "tensor_count": 385,
+  "tensor_bytes": 1208483840,
+  "range_start": 622464672,
+  "range_end": 1830948511,
+  "original_header_sha256": "5ab7bae170681be4c3cb0d08936be1f5d75ee06354c8f6e55fdde9f8ddc47cd0",
+  "downloaded_tensor_bytes_sha256": "3a983e941ffb02e62dcaa03e4497d2a650c332f0c17b5f9d5efdb7ad47c2ec67",
+  "subset_sha256": "8f734376f5830f584506e4bf95b394a897066aa28d32fa57112a31526e939097",
+  "scope": "Unmodified original layer-zero MLP tensor bytes; not a full-model checkpoint"
+}

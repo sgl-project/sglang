@@ -1,0 +1,228 @@
+{
+  "environment": {
+    "python": "3.12.13",
+    "packages": {
+      "torch": "2.10.0+cpu",
+      "torch-npu": "2.10.0.post6",
+      "deep-ep": "1.0.0+0234a271.cann.9.1.0.b243",
+      "sglang": "0.5.23.dev315+ge9b22a081",
+      "sgl-kernel-npu": "2026.9.0",
+      "transformers": "5.19.0"
+    },
+    "sglang_commit": "a1e52138a63de95492f216e2536d10fc8b335f5f",
+    "sglang_diff_sha256": null,
+    "source_archive_sha256": "abe96a9eeb1a39c9336cd00a531d909e30cc214e9958858ee587cae321cd31d9",
+    "scripts_sha256": {
+      "bench_moe_tp_ep.py": "160b32e3ab17f111491f0737ebed72836bc79c70d814803fed6ac17eee7b88f8",
+      "bench_serving.py": "0505db70370d526cb4bf0258bcdead793139bb99b4ca0b11eb6e745167a5f982",
+      "check_equivalence.py": "195b094834138ed05c2cb8c7cf307d0cf809ab4c6d8d88febce77954fbc08b76",
+      "environment.py": "618818ed2cc635419d8604f8f2ae525a9f0b5e93bb9564f5d1fc6bff7e9f98f8",
+      "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+      "launch_serving.py": "3ada15da977e2c91023c5974d7042595df98bbd2540b07d92372c3d2ab01d5c8",
+      "observe_tokens.py": "06b933993f38b9118b4d9cda91577b951bb111cc07067a64f189b528c377412e",
+      "summarize.py": "a7627853aa28d27e1ac73aa42e544c76fb3e0dca6463d94d6fc0a81b0558c4da",
+      "summarize_profile.py": "dd9d5b97c2be69979e6f6b2054d0c0fc4061199bc2a1af212f99a99569fe0a7c",
+      "summarize_serving.py": "3b2c2e6e822296571c75a1959185ddacddab84df35f77ccfe37c0cc83e00dbbe",
+      "test_contracts.py": "ba7980cf109b4939ac81502638519eba31a25b5d9f4a4c2eb245222b44a47bb9",
+      "test_workload.py": "3da3885ff4eea7e061adcbb3444ec5bdbd54d1ed495d578e2d499bfdd71b8d76",
+      "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+    },
+    "environment": {
+      "HCCL_SOCKET_IFNAME": "lo",
+      "HCCL_NPU_SOCKET_PORT_RANGE": "28100-28131",
+      "HCCL_BUFFSIZE": "2048",
+      "DEEPEP_HCCL_BUFFSIZE": "2048",
+      "DEEPEP_HYBRID_DEPLOYMENT": "1",
+      "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+      "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+      "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
+      "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+      "ASCEND_CUSTOM_OPP_PATH": "/usr/local/python3.12.13/lib/python3.12/site-packages/deep_ep/vendors/hwcomputing:/usr/local/python3.12.13/lib/python3.12/site-packages/deep_ep/vendors/hwcomputing:"
+    },
+    "execution_mode": "torch.inference_mode; eager",
+    "image_digest": "sha256:1fd5227d2aa3fcdcb0b03076ebb3c879b1e4641355a0fd255d6f629d076b1830",
+    "hardware": {
+      "machine": "aarch64",
+      "device_nodes": [
+        "davinci14",
+        "davinci15"
+      ],
+      "visible_devices": {},
+      "cann": {
+        "version": "9.1.0",
+        "sha256": "a9b17ef608ebeb70ade09cde1c12a545eb5e8f3e5312f6806ca0d368b0464848"
+      },
+      "driver": {
+        "version": "25.5.0",
+        "sha256": "573bf6989191f69a7619b0c3588727f05d368b26ee764070e7312cc0ee8a9102"
+      },
+      "devices": [
+        {
+          "logical_id": 0,
+          "model": "Ascend910_9382",
+          "uuid": "00cc0800-d001-0000-0000-ec819ca60827"
+        },
+        {
+          "logical_id": 1,
+          "model": "Ascend910_9382",
+          "uuid": "00cc0800-d001-0000-0000-ec819ca60828"
+        }
+      ]
+    }
+  },
+  "source_archive_sha256": "abe96a9eeb1a39c9336cd00a531d909e30cc214e9958858ee587cae321cd31d9",
+  "model": {
+    "repo": "Qwen/Qwen3-30B-A3B",
+    "revision": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+    "tensor_count": 385,
+    "tensor_bytes": 1208483840,
+    "range_start": 622464672,
+    "range_end": 1830948511,
+    "original_header_sha256": "5ab7bae170681be4c3cb0d08936be1f5d75ee06354c8f6e55fdde9f8ddc47cd0",
+    "downloaded_tensor_bytes_sha256": "3a983e941ffb02e62dcaa03e4497d2a650c332f0c17b5f9d5efdb7ad47c2ec67",
+    "subset_sha256": "8f734376f5830f584506e4bf95b394a897066aa28d32fa57112a31526e939097",
+    "scope": "Unmodified original layer-zero MLP tensor bytes; not a full-model checkpoint"
+  },
+  "correctness": [
+    {
+      "case": "prefill_n32768_seed20260922_skew0_round8_auto",
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.015625,
+          "relative": 0.004739336491453471,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    },
+    {
+      "case": "prefill_n32768_seed20260922_skew0_round2_auto",
+      "passed": true,
+      "tolerance": 0.02,
+      "checks": [
+        {
+          "max_abs": 0.015625,
+          "relative": 0.004739336491453471,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        },
+        {
+          "max_abs": 0.0,
+          "relative": 0.0,
+          "passed": true
+        }
+      ]
+    }
+  ],
+  "round_comparison": {
+    "global_tokens": 32768,
+    "baseline_rounds": 8,
+    "candidate_rounds": 2,
+    "full_output_relative_difference": 0.0,
+    "run_medians_ms": {
+      "8": [
+        13.490540027618408,
+        13.5619797706604,
+        13.662139892578125
+      ],
+      "2": [
+        13.574470043182373,
+        13.498300075531006,
+        13.561820030212402
+      ]
+    },
+    "baseline_median_ms": 13.5619797706604,
+    "candidate_median_ms": 13.561820030212402,
+    "latency_change_percent": -0.0011778549348973044,
+    "speedup": 1.0000117786880849,
+    "performance_valid": true,
+    "relative_range": {
+      "8": 0.012653009948514378,
+      "2": 0.005616500401987286
+    },
+    "wall_run_medians_ms": {
+      "2": [
+        13.715884685516357,
+        13.616806507110596,
+        13.671457767486572
+      ],
+      "8": [
+        13.615530967712402,
+        13.681958198547363,
+        13.830495357513428
+      ]
+    },
+    "wall_medians_ms": {
+      "2": 13.671457767486572,
+      "8": 13.681958198547363
+    }
+  },
+  "occupancy_checks": [
+    {
+      "time_utc": "2026-10-22T12:44:15.554492+00:00",
+      "selected_card": 7,
+      "rows": [
+        {
+          "chip": 0,
+          "pids": [
+            728697
+          ],
+          "other_pids": []
+        },
+        {
+          "chip": 1,
+          "pids": [
+            728698
+          ],
+          "other_pids": []
+        }
+      ]
+    },
+    {
+      "time_utc": "2026-10-22T12:48:23.573004+00:00",
+      "rows": [
+        {
+          "chip": 0,
+          "pids": [],
+          "other_pids": []
+        },
+        {
+          "chip": 1,
+          "pids": [],
+          "other_pids": []
+        }
+      ]
+    },
+    {
+      "time_utc": "2026-10-22T12:51:16.056285+00:00",
+      "rows": [
+        {
+          "chip": 0,
+          "pids": [],
+          "other_pids": []
+        },
+        {
+          "chip": 1,
+          "pids": [],
+          "other_pids": []
+        }
+      ]
+    }
+  ],
+  "scope": "Independent second host N32768 BF16 eager module study. No samples or hardware identities are combined with first host."
+}

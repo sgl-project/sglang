@@ -1,0 +1,7 @@
+can not use command: npu-smi info
+[CI Test Method] TestMoeTPEPBenchmark.test_distributed_workload
+.
+----------------------------------------------------------------------
+Ran 1 test in 11.580s
+
+OK
