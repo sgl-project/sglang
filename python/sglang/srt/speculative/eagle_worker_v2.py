@@ -219,6 +219,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
+        self.target_embed_and_head_shared = False
+        self._maybe_share_embed_before_pool_sizing()
+
+    def _maybe_share_embed_before_pool_sizing(self):
+        """Under embedding replication the draft loads its own full embedding table on
+        every rank. Share the target's now, so that copy is freed before the scheduler
+        sizes the KV pool instead of after."""
+        if envs.SGLANG_ENABLE_EMBED_REPLICATION.get():
+            self._share_target_embed_and_head()
+
+    def _share_target_embed_and_head(self):
+        self.init_token_map()
+        self.init_lm_head()
+        self.target_embed_and_head_shared = True
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -233,8 +248,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+        if not self.target_embed_and_head_shared:
+            self._share_target_embed_and_head()
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size

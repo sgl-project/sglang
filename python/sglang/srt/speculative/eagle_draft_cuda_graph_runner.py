@@ -377,6 +377,25 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # -----------------------------------------------------------------
     # Capture (per-shape)
     # -----------------------------------------------------------------
+    def _run_capture_tail_hooks(self, out, forward_batch, num_tokens: int) -> None:
+        """The model runner's capture tail hooks, after the draft forwards of a captured
+        batch size. The draft steps ran under the per-step attention backends, which
+        share the draft's KV pool (checked here when a hook exists); a hook that reads
+        the running backend sees the first."""
+        hooks = self.model_runner.capture_tail_hooks
+        if not hooks:
+            return
+        backends = self.draft_attn_backend.attn_backends
+        pool = getattr(backends[0], "token_to_kv_pool", None)
+        if any(getattr(b, "token_to_kv_pool", None) is not pool for b in backends):
+            raise RuntimeError(
+                "the draft's per-step attention backends do not share one KV pool; "
+                "the capture tail hooks check the running backend's"
+            )
+        with forward_context(ForwardContext(attn_backend=backends[0])):
+            for capture_hook in hooks:
+                capture_hook(self, out, forward_batch, num_tokens)
+
     def capture_one_shape(
         self,
         size: int,
@@ -522,6 +541,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.spec_info.hidden_states = hidden_states_backup
             forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
+            self._run_capture_tail_hooks(ret, forward_batch, num_tokens)
             return ret
 
         with forward_context(

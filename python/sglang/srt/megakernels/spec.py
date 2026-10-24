@@ -18,6 +18,13 @@ MEGAKERNEL_API_VERSION = 1
 # the sglang.srt.plugins entry point that registers the specs
 ENTRY_POINT = "nvidia_megakernel"
 FLAG = "--enable-nvidia-megakernel"
+# The EAGLE draft graph runners run a draft model's capture check (Step); a draft
+# spec that serves steps can require it
+EAGLE_DRAFT_CAPTURE_CHECK = True
+# The variables of Requirements.env that the flag sets to the spec's value when they
+# are unset, at argument resolution: SGLang reads each only when a model is built, in
+# the model processes started after it. A value the user set is kept and checked.
+FLAG_SETS_ENV = frozenset({"SGLANG_ENABLE_EMBED_REPLICATION"})
 
 
 class Feature(enum.Enum):
@@ -59,7 +66,8 @@ class Requirements(msgspec.Struct, frozen=True):
     server_args: Mapping[str, frozenset] = {}
     # an HF config field -> the value the kernels are built for
     hf_config: Mapping[str, Any] = {}
-    # an SGLang environment variable in envs -> its required value
+    # an SGLang environment variable in envs -> its required value (the flag sets one
+    # in FLAG_SETS_ENV that is unset)
     env: Mapping[str, Any] = {}
 
 
@@ -88,9 +96,16 @@ class BuildContext(msgspec.Struct, frozen=True):
 
 
 class Step(msgspec.Struct, frozen=True):
-    """A covered step, decided from host state alike on every rank."""
+    """A covered step, decided from host state alike on every rank.
 
-    mode: str  # "decode" or "target_verify"
+    A draft spec's steps may be off its width grid (an EAGLE draft decode step has
+    one row a request); the dispatch does not check rows against the widths. The
+    capture check of a draft model runs once, when the first of its EAGLE draft
+    graph runners has captured every batch size.
+    """
+
+    # "decode" or "target_verify"; a draft spec's "draft_decode" or "draft_extend"
+    mode: str
     rows: int
     # the running forward's ForwardView, set by SGLang before forward runs the step
     view: Any = None

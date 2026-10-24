@@ -63,6 +63,16 @@ SPEC = MegakernelSpec(
 )
 # an empty field accepts any value
 ANY_TP = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset()))
+# specs that need the replicated input embedding, which the flag sets when it is unset
+# (FLAG_SETS_ENV); the second also needs a variable the flag never sets
+REPLICATION = "SGLANG_ENABLE_EMBED_REPLICATION"
+REPLICATED = replace(SPEC, requires=replace(SPEC.requires, env={REPLICATION: True}))
+REPLICATED_AND_BROADCAST = replace(
+    SPEC,
+    requires=replace(
+        SPEC.requires, env={REPLICATION: True, "SGLANG_DSA_TOPK_BROADCAST": True}
+    ),
+)
 # a draft spec: builds no width, offers only the draft sampler
 DRAFT = replace(
     SPEC,
