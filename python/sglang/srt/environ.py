@@ -1218,6 +1218,11 @@ class Envs:
     # traffic with a small accuracy tradeoff and require FC2 reduce outside the
     # kernel.
     SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE = EnvStr("bf16")
+    # SM90 NVFP4 MegaMoE (flashinfer.megamoe) under --moe-a2a-backend megamoe.
+    # Builds every fused / split JIT module reachable for the token cap at startup.
+    SGLANG_FLASHINFER_MEGAMOE_SM90_PREWARM = EnvBool(True)
+    # "auto" (fused for M <= 256 tokens per rank, split above), "fused", or "split".
+    SGLANG_FLASHINFER_MEGAMOE_SM90_KERNEL_FAMILY = EnvStr("auto")
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)

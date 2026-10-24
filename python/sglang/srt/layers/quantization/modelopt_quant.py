@@ -2379,7 +2379,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
             use_marlin_fallback = moe_runner_backend.is_marlin()
-        if not get_platform().is_blackwell and not use_marlin_fallback:
+        if (
+            not get_platform().is_blackwell
+            and not use_marlin_fallback
+            # SM90 MegaMoE runs FlashInfer's NVFP4 kernel whatever the nominal runner.
+            and not (get_platform().is_sm90 and get_moe_a2a_backend().is_megamoe())
+        ):
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization with the selected MoE backend. Please use "
@@ -2651,6 +2656,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         assert not self.use_flashinfer_trtllm_weight_layout, (
             "MegaMoE NVFP4 weights must use canonical W13 layout"
         )
+        if get_platform().is_sm90:
+            from sglang.srt.layers.moe.mega_moe_sm90_fi_nvfp4 import (
+                build_sm90_fi_nvfp4_mega_moe_experts_weights,
+            )
+
+            build_sm90_fi_nvfp4_mega_moe_experts_weights(layer)
+            return
         # Activations are quantized per token at dispatch, so w13_input_scale
         # is not used.
         import deep_gemm

@@ -362,6 +362,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_SM90_PREWARM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>SM90 FlashInfer NVFP4 MegaMoE (<code>--moe-a2a-backend megamoe</code> with NVFP4 checkpoints): JIT-compile every fused / split kernel variant reachable under the per-rank token cap at startup, sharded across ranks. Set to <code>false</code> to compile on first use.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"true"</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_SM90_KERNEL_FAMILY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>SM90 FlashInfer NVFP4 MegaMoE kernel family. <code>auto</code> uses the fused kernel for at most 256 tokens per rank and the split kernel above; <code>fused</code> and <code>split</code> force one family.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"auto"</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of SMs used for DeepEP combine when single batch overlap is enabled</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"32"`</td>

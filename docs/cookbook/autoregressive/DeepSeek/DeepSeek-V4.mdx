@@ -119,7 +119,7 @@ The Playground is where you experiment with **SGLang features beyond the verifie
 The knobs come in two flavors:
 
 - **Built-in SGLang features** — parallelism overrides (TP / CP / DP-Attention — DP-Attention's value is the DP degree, with `off` to disable), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, HiCache tiers, and HiSparse hierarchical sparse attention (decode-role only — the card appears once PD-Disagg mode is set to decode).
-- **DeepSeek-V4 specific features** — MegaMoE W4A8 / W4A4 fused kernel (Blackwell only; Hopper SM90 uses a separate all-FP8 MegaMoE path — see Configuration Tips below).
+- **DeepSeek-V4 specific features** — MegaMoE W4A8 / W4A4 fused kernel (Blackwell only; on Hopper SM90, MegaMoE runs either the all-FP8 path or the FlashInfer NVFP4 path — see Configuration Tips below).
 
 Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any actual change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.
 
@@ -374,7 +374,7 @@ sglang serve \
   --tp 8
 ```
 
-Requires Blackwell (SM100+). The MTP layer in this checkpoint stays
+Requires Blackwell (SM100+), except the SM90 NVFP4 MegaMoE path in Configuration Tips below. The MTP layer in this checkpoint stays
 MXFP4-packed and is routed through the `Mxfp4FlashinferTrtllmMoEMethod` path
 automatically.
 
@@ -449,7 +449,7 @@ Two variants are exposed:
   Higher throughput with negligible accuracy drop (~89.5 GPQA on Pro).
 
 Notes:
-- The W4A8 / W4A4 variants above are **Blackwell-only** (B200 / B300 / GB200 / GB300). On **Hopper (SM90, H100 / H200)** use the all-FP8 MegaMoE path described below instead.
+- The W4A8 / W4A4 variants above are **Blackwell-only** (B200 / B300 / GB200 / GB300). On **Hopper (SM90, H100 / H200)** use the all-FP8 or the FlashInfer NVFP4 MegaMoE path described below instead.
 - MegaMoE is **only wired into the `high-throughput` recipe** on Blackwell (per [sgl-project/sglang#26451](https://github.com/sgl-project/sglang/pull/26451)). The chip is hidden on `low-latency` and `balanced` — switch to `high-throughput` to expose it.
 - When running MegaMoE, don't set `--moe-runner-backend` manually.
 - Adjust `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` based on your workload and memory usage. Setting higher number of tokens for MegaMoE requires more HBM space (recommended: 8320 for high-throughput).
@@ -478,6 +478,36 @@ sglang serve \
 the MegaMoE path processes per rank (i.e. per GPU); the MegaMoE path is only used
 for batches at or below this cap. The right value depends on your parallelism /
 token-split scheme, and larger values reserve more HBM.
+
+**SM90 (Hopper) NVFP4 MegaMoE via FlashInfer (Experimental)**
+
+With the NVFP4 hybrid checkpoints (see **NVFP4 Hybrid Checkpoints** above), `--moe-a2a-backend megamoe`
+on SM90 runs the FlashInfer SM90 NVFP4 MegaMoE kernel (`flashinfer.megamoe`, W4A8: NVFP4
+weights, FP8 activations); the expert tensors are repacked for the kernel at load time.
+It needs a FlashInfer build that contains
+[flashinfer-ai/flashinfer#6343](https://github.com/flashinfer-ai/flashinfer/pull/6343) and
+[flashinfer-ai/flashinfer#6517](https://github.com/flashinfer-ai/flashinfer/pull/6517); until a FlashInfer
+release includes them, install the validated `main` revision from source (the kernels are JIT-compiled):
+
+```bash Command
+pip install --no-build-isolation --no-deps \
+  "flashinfer-python @ git+https://github.com/flashinfer-ai/flashinfer@da992ed9919604c5eb6dc255c63f5e89a466452c"
+```
+
+Verified end to end with `nvidia/DeepSeek-V4-Flash-NVFP4` on 8x H200; EPLB is not supported on this path.
+
+```bash Command
+SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096 \
+sglang serve \
+  --model-path nvidia/DeepSeek-V4-Flash-NVFP4 \
+  --tp 8 --dp 8 --enable-dp-attention \
+  --moe-a2a-backend megamoe \
+  --disable-shared-experts-fusion \
+  --chunked-prefill-size 8192
+```
+
+All fused and split kernel variants are JIT-compiled at startup, sharded across ranks
+(`SGLANG_FLASHINFER_MEGAMOE_SM90_PREWARM=0` defers compilation to first use).
 
 **GB300 PD-Disagg cross-pod MNNVL**
 
