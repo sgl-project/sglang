@@ -39,18 +39,18 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
 
 
-def _quantize_npu_indexer_activation(x, hadamard, dst_type):
+def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_type):
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
         return (
             torch.empty_like(x, dtype=dst_type),
-            torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device),
+            torch.empty(x.shape[:-1], dtype=scale_type, device=x.device),
         )
     rotated = x @ hadamard
     quantized, scale = torch_npu.npu_dynamic_quant(
         rotated.reshape(-1, 128), dst_type=dst_type
     )
-    return quantized.reshape(x.shape), scale.to(torch.float32).reshape(x.shape[:-1])
+    return quantized.reshape(x.shape), scale.to(scale_type).reshape(x.shape[:-1])
 
 
 class DSANPUIndexerMixin:
@@ -235,7 +235,10 @@ class DSANPUIndexerMixin:
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer:
             k, k_scale = _quantize_npu_indexer_activation(
-                k, pool.indexer_hadamard_128, pool.dtype
+                k,
+                pool.indexer_hadamard_128,
+                pool.index_k_store_dtype,
+                pool.index_k_scale_dtype,
             )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
         pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
@@ -293,6 +296,10 @@ class DSANPUIndexerMixin:
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
         ):
+            if use_quant_indexer and pool.indexer_kv_store_int8:
+                raise RuntimeError(
+                    "SGLANG_NPU_INDEXER_INT8 is on together with prefill CP (attn_cp_size>1)"
+                )
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
                 past_key_states,
@@ -313,12 +320,26 @@ class DSANPUIndexerMixin:
                 query, query_scale = _quantize_npu_indexer_activation(
                     q.view(-1, self.n_heads, self.head_dim),
                     pool.indexer_hadamard_128,
-                    pool.dtype,
+                    pool.index_k_store_dtype,
+                    pool.index_k_scale_dtype,
                 )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
+
+                # int8 keys requires fp16 weights
+                op_weights = (
+                    weights.to(torch.float16)
+                    if pool.index_k_store_dtype == torch.int8
+                    else weights
+                )
+
+                if envs.SGLANG_NPU_INDEXER_INT8.get():
+                    quant_lightning_indexer = torch.ops.npu.npu_quant_lightning_indexer
+                else:
+                    quant_lightning_indexer = torch_npu.npu_quant_lightning_indexer
+
+                topk_indices = quant_lightning_indexer(
                     query=query,
                     key=past_key_states,
-                    weights=weights,
+                    weights=op_weights,
                     query_dequant_scale=query_scale,
                     key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
                     actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
