@@ -718,7 +718,10 @@ class DeepseekMHAForwardMixin:
         if n:
             get_token_to_kv_pool().set_mla_kv_buffer(
                 self.attn_mha,
-                KVWriteLoc.for_batch(forward_batch),
+                KVWriteLoc(
+                    forward_batch.out_cache_loc[:n],
+                    physical=forward_batch.out_cache_loc_is_physical,
+                ),
                 kv_a[:n].unsqueeze(1),
                 k_pe[:n],
             )

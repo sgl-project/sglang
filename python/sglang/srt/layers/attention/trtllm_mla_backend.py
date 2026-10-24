@@ -294,15 +294,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
         self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
-        # Initially restrict graph MHA to the configuration validated on Kimi K3.
+        # Restrict graph MHA to the Kimi K3 configurations covered by this integration.
         self.bcg_mha_enabled = (
             envs.SGLANG_K3_BCG_MHA.get()
             and "KimiK3ForConditionalGeneration"
             in (config.hf_config.architectures or [])
-            and self.data_type == torch.bfloat16
+            and (
+                (self.data_type == torch.bfloat16 and get_parallel().attn_dcp_size == 8)
+                or (
+                    self.data_type == torch.float8_e4m3fn
+                    and get_parallel().attn_dcp_size == 1
+                )
+            )
             and self.q_data_type == torch.bfloat16
             and get_parallel().attn_tp_size == 8
-            and get_parallel().attn_dcp_size == 8
             and get_parallel().attn_cp_size == 1
             and not get_parallel().attn_dp_enabled
             and not self.disable_chunked_prefix_cache
