@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
 )
+from sglang.srt.utils.auth import ADMIN_API_KEY_HELP, API_KEY_HELP
 from sglang.srt.utils.common import json_list_type
 
 
@@ -155,14 +156,8 @@ class Serving(msgspec.Struct):
     # -------------------------------------------------------------------------
     # API related
     # -------------------------------------------------------------------------
-    api_key: A[
-        Optional[str],
-        "Set API key of the server. It is also used in the OpenAI API compatible server.",
-    ] = None
-    admin_api_key: A[
-        Optional[str],
-        "Set admin API key for sensitive management endpoints (e.g. /hicache/storage-backend/clear). When set, admin endpoints require this key and do NOT accept --api-key.",
-    ] = None
+    api_key: A[Optional[str], API_KEY_HELP] = None
+    admin_api_key: A[Optional[str], ADMIN_API_KEY_HELP] = None
     served_model_name: A[
         Optional[str],
         "Override the model name returned by the v1/models endpoint in OpenAI API server.",
