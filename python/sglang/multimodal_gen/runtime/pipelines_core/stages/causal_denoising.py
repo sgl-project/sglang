@@ -149,6 +149,12 @@ class CausalDMDDenoisingStage(DenoisingStage):
     Denoising stage for causal diffusion.
     """
 
+    def default_workload_iterations(
+        self, batch: Req, num_inference_steps: int
+    ) -> int | None:
+        # blocks x fixed DMD steps, known only once the block sizes are laid out
+        return None
+
     def __init__(self, transformer, scheduler) -> None:
         super().__init__(transformer, scheduler)
         # KV and cross-attention cache state (initialized on first forward)
@@ -1252,6 +1258,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
             num_blocks = (t - 1) // self.num_frames_per_block
             block_sizes = [1] + [self.num_frames_per_block] * num_blocks
             start_index = 0
+        total_iterations = len(block_sizes) * len(timesteps)
+        if batch.is_warmup:
+            batch.record_stage_iterations(total_iterations, total_iterations)
 
         def prepare_context_input(current_latents):
             return current_latents

@@ -8,6 +8,7 @@ import torch
 import sglang.multimodal_gen.runtime.managers.gpu_worker as gpu_worker_module
 import sglang.multimodal_gen.runtime.managers.memory_managers.component_manager as component_manager_module
 import sglang.multimodal_gen.runtime.utils.perf_logger as perf_logger_module
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     _deserialize_request_metrics,
 )
@@ -23,7 +24,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
     HostPinBudget,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+    LayerwiseUsageTracker,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising_av import (
@@ -910,3 +915,91 @@ def test_log_request_summary_records_requested_tag(monkeypatch, tmp_path):
     )
 
     assert "custom_tag" in (tmp_path / "performance.log").read_text()
+
+
+@pytest.mark.parametrize("is_warmup", [True, False])
+@pytest.mark.parametrize("explicit_iterations", [True, False])
+def test_real_stage_metrics_reach_warmup_record(
+    is_warmup, explicit_iterations, monkeypatch
+):
+    class TinyTransformer(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+        layer_names = ["blocks"]
+
+        def __init__(self):
+            super().__init__()
+            self.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
+
+    metrics = RequestMetrics("warmup-contract")
+    req = Req(
+        sampling_params=SamplingParams(num_inference_steps=2),
+        metrics=metrics,
+        is_warmup=is_warmup,
+        perf_dump_path="metrics",
+        extra={"warmup_target_num_inference_steps": 8},
+    )
+    model = TinyTransformer()
+    stage = DenoisingStage.__new__(DenoisingStage)
+    stage.server_args = SimpleNamespace(
+        enable_layerwise_nvtx_marker=False, comfyui_mode=False
+    )
+    stage.set_registered_stage_name("denoise")
+    stage.set_profile_stage_name("custom_denoise")
+    monkeypatch.setattr(
+        stage, "verify_input", PipelineStage.verify_input.__get__(stage)
+    )
+    monkeypatch.setattr(
+        stage, "verify_output", PipelineStage.verify_output.__get__(stage)
+    )
+
+    def forward(batch, args):
+        for _ in range(2):
+            model.blocks[0](torch.ones(1, 2))
+            batch.metrics.record_step(0.001)
+        if explicit_iterations:
+            batch.record_stage_iterations(2, 8)
+        return batch
+
+    monkeypatch.setattr(stage, "forward", forward)
+    tracker = LayerwiseUsageTracker(
+        {"transformer": model}, stage_name_provider=lambda: metrics.active_stage_name
+    )
+    try:
+        assert stage(req, stage.server_args) is req
+    finally:
+        uses, uses_by_stage = tracker.finish_with_stages()
+    assert metrics.active_stage_name is None
+    assert metrics.steps == [1.0, 1.0]
+    assert metrics.denoising_stages == {"custom_denoise"}
+    assert uses == {"transformer": {"blocks": (2,)}}
+    assert not model.blocks[0]._forward_pre_hooks
+    if not is_warmup:
+        assert metrics.steps_by_stage == {}
+        assert metrics.stage_iterations == {}
+        assert uses_by_stage == {}
+        return
+
+    assert metrics.steps_by_stage == {"denoise": [1.0, 1.0]}
+    assert metrics.stage_iterations == {"denoise": (2, 8)}
+    assert uses_by_stage == {"denoise": {"transformer": {"blocks": (2,)}}}
+    worker = GPUWorker.__new__(GPUWorker)
+    worker._auto_residency_warmup_records = []
+    worker.pipeline = SimpleNamespace(stages=[stage])
+    device = SimpleNamespace(
+        max_memory_allocated=lambda: 8, max_memory_reserved=lambda: 9
+    )
+    monkeypatch.setattr(torch, "get_device_module", lambda: device)
+    worker._record_server_warmup_memory(
+        req=req,
+        workload=(64, 64, 1, 2),
+        baseline_allocated_bytes=3,
+        baseline_reserved_bytes=3,
+        succeeded=True,
+        layerwise_layer_uses=uses,
+        layerwise_layer_uses_by_stage=uses_by_stage,
+    )
+    (record,) = worker._auto_residency_warmup_records
+    assert record.succeeded
+    assert record.stage_iterations == {"denoise": (2, 8)}
+    assert record.step_duration_ms_by_stage == {"denoise": (1.0, 1.0)}
+    assert record.stage_duration_ms.keys() == {"denoise"}
+    assert record.layerwise_layer_uses_by_stage == uses_by_stage
