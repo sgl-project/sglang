@@ -1907,6 +1907,7 @@ class ServingChatTestCase(CustomTestCase):
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             input_ids=[101, 102, 103],
+            mm_token_expansion_start_len=2,
             stop=["STOP"],
             return_prompt_token_ids=True,
             cache_salt="tenant-a",
@@ -1922,6 +1923,7 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertEqual(processed, req)
         self.assertEqual(adapted.input_ids, [101, 102, 103])
+        self.assertEqual(adapted.mm_token_expansion_start_len, 2)
         self.assertTrue(adapted.return_prompt_token_ids)
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
         self.assertEqual(adapted.cache_salt, "tenant-a")
