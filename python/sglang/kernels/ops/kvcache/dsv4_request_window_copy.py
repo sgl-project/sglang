@@ -1,5 +1,6 @@
 """Copy packed request-window KV rows without materializing byte index grids."""
 
+import torch
 import triton
 import triton.language as tl
 
@@ -56,6 +57,9 @@ def _copy_packed_rows(
 
 
 def copy_packed_rows(src, dst, src_loc, dst_loc, *, page_size, layout):
+    # Copy bytes: trtllm's uniform-FP8 pools are typed e4m3, which the masked
+    # load's integer fill value cannot cast to.
+    src, dst = src.view(torch.uint8), dst.view(torch.uint8)
     _copy_packed_rows[(src_loc.numel(),)](
         src,
         dst,
@@ -121,6 +125,7 @@ def _commit_packed_rows(
 
 
 def commit_packed_rows(src, dst, tags, window, *, page_size, capacity, layout):
+    src, dst = src.view(torch.uint8), dst.view(torch.uint8)
     _commit_packed_rows[(window.write_loc.numel(),)](
         src,
         dst,
