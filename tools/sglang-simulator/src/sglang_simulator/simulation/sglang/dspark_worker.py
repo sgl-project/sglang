@@ -60,15 +60,19 @@ class C_DSparkWorkerHook(BaseHook):
         ):
             # Reuse the native base lifecycle and target allocator. No model
             # weights, fake draft runner or device acceptance kernel is created.
+            from sglang.srt.arg_groups.overrides import resolving_view
             from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 
+            # Native resolution preserves raw CLI inputs, including an omitted
+            # target width. Read its declared Q6 through the owning view.
+            cfg = resolving_view(server_args)
             BaseSpecWorker.__init__(self)
-            if getattr(server_args, "speculative_dspark_block_size", None) != 5 or (
-                getattr(server_args, "speculative_num_draft_tokens", None) != 6
+            if getattr(cfg, "speculative_dspark_block_size", None) != 5 or (
+                getattr(cfg, "speculative_num_draft_tokens", None) != 6
             ):
                 raise PredictorError(
                     "unsupported_execution_profile",
-                    "DSPark simulator requires explicit draft Q5 / target Q6",
+                    "DSPark simulator requires resolved draft Q5 / target Q6",
                 )
             self.server_args = server_args
             self.gpu_id = gpu_id
