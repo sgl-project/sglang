@@ -472,9 +472,8 @@ mod tests {
         super::super::routes().with_state(state)
     }
 
-    /// A Jinja template's own thinking default (here Qwen3's `enable_thinking`,
-    /// on unless the request turns it off) decides whether the reply starts in
-    /// reasoning, as `template_detection` does.
+    /// A Jinja template's own thinking default (here Qwen3's `enable_thinking`)
+    /// decides whether the reply starts in reasoning, as `template_detection` does.
     #[tokio::test]
     async fn jinja_template_thinking_default_separates_reasoning() {
         let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
