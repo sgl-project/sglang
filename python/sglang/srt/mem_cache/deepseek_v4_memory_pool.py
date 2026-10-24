@@ -228,10 +228,25 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
                 "which reads the block-split v41 layout"
             )
         return KVLayout.V41, option
+    # SM120 / SM121 read the V4.1 layouts through FlashInfer's SM120 sparse MLA
+    # (flash_mla_sm120.py); "auto" still keeps V4 there.
+    is_sm12x_flashinfer = (
+        torch.cuda.is_available()
+        and torch.version.cuda is not None
+        and torch.cuda.get_device_capability()[0] == 12
+        and envs.SGLANG_SM120_FLASHMLA_BACKEND.get() == "flashinfer"
+    )
     if mode == "auto" and not is_sm100:
         return KVLayout.V4, None
-    assert is_sm100, "the V4.1 KV cache layouts need an SM100 / SM103 GPU"
-    return (KVLayout.V41_NEW if mode == "v41_new" else KVLayout.V41), option
+    if mode == "v41_new":
+        # the token-interleaved layout is read by SM100 / SM103 FlashMLA only
+        assert is_sm100, "the v41_new KV cache layout needs an SM100 / SM103 GPU"
+        return KVLayout.V41_NEW, option
+    assert is_sm100 or is_sm12x_flashinfer, (
+        "the V4.1 KV cache layouts need an SM100 / SM103 GPU, or SM120 / SM121 "
+        "with SGLANG_SM120_FLASHMLA_BACKEND=flashinfer"
+    )
+    return KVLayout.V41, option
 
 
 class DeepSeekV4SingleKVPool(KVCache):

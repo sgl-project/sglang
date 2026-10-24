@@ -1730,6 +1730,8 @@ class Envs:
     # Compressed-cache layout under "v41": "auto" (fp4 for the fp4-rounded
     # ratio-1 / ratio-2 latents, fp8 for ratios 4 / 128), "fp8" or "fp4" for all.
     SGLANG_DSV4_COMPRESSED_KV_LAYOUT = EnvStr("auto")
+    # SM120, KVLayout.V41 caches: FlashInfer compute precision, "bf16" or "default" (MXFP8 Q/P).
+    SGLANG_SM120_V41_PRECISION = EnvStr("bf16")
     # unified_kv only: split the pool into an fp8 nope pool plus a parallel
     # bf16 rope pool, 640 B/token instead of 1024. The unified pool takes no
     # dtype, so --kv-cache-dtype has no effect there and this switch is the
