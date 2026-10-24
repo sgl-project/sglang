@@ -779,10 +779,20 @@ class XPUAttentionBackend(AttentionBackend):
             )
 
         # Check if we should use local attention
+        has_irope = hasattr(layer, "use_irope") and layer.use_irope
+        if has_irope and (
+            self.attention_chunk_size is not None
+            and metadata.local_attn_metadata is None
+        ):
+            raise ValueError(
+                "Full prefill graph does not support models with "
+                "attention_chunk_size and use_irope (chunked local attention); "
+                "local_attn_metadata is None."
+            )
         use_local_attn = (
             self.attention_chunk_size is not None
             and metadata.local_attn_metadata is not None
-            and (hasattr(layer, "use_irope") and layer.use_irope)
+            and has_irope
         )
 
         # We do cascade attention for Target Verify with topk > 1
@@ -1697,11 +1707,29 @@ class XPUAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        """New unified graph capture/replay entry point (replaces the legacy
-        init_forward_metadata_capture_cuda_graph /
-        init_forward_metadata_replay_cuda_graph pair).
+        """Unified graph capture/replay entry point for XPU full graph.
 
-        Called by DecodeCudaGraphRunner:
+        Dispatches plain EXTEND (prefill full graph) vs decode / speculative modes.
+        """
+        forward_mode = forward_batch.forward_mode
+        if forward_mode.is_extend() and not (
+            forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+            or forward_mode.is_dllm_extend()
+        ):
+            self._init_full_cg_prefill_metadata(forward_batch, in_capture)
+        else:
+            self._init_full_cg_decode_metadata(forward_batch, in_capture)
+
+    def _init_full_cg_decode_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        """Capture/replay metadata for the decode-runner full-CG modes
+        (decode / idle / target_verify / draft_extend).
+
+        Called by DecodeCudaGraphRunner / XPUGraphRunner:
           - capture: in_capture=True  → bind static metadata buffer slices, then fill
           - replay:  in_capture=False → update pre-allocated buffers in-place
           - eager:   via init_forward_metadata() default wrapper
@@ -1881,6 +1909,132 @@ class XPUAttentionBackend(AttentionBackend):
                 self.token_to_kv_pool.full_to_swa_index_mapping if use_swa else None
             ),
         )
+
+    def _init_full_cg_prefill_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool,
+    ):
+        """Capture/replay metadata for plain EXTEND under XPU full prefill
+        graph. Mirrors FlashAttentionBackend._init_full_cg_prefill_metadata,
+        plus page_size >= 1 support (Intel XPU page size is typically in {16, 32, 64, 128}):
+
+        - All tensors live in dedicated preallocated buffers (the captured
+          kernels hold their addresses; refilled in place each replay);
+        - cu_seqlens_q gets its own buffer (never aliased to cu_seqlens_k,
+          unlike eager no-prefix path) so prefix replays stay correct;
+        - max_seq_len_q / max_seq_len_k are baked at capture as upper bounds
+          (num_tokens in this bucket / max_context_len): the kernel reads real
+          work extents from the cu_seqlens / cache_seqlens device buffers;
+        - page_table is page-granularity (one column per `page_size` tokens),
+          converted from the token-granularity req_to_token table via strided
+          sampling + integer division, matching decode metadata.
+        """
+        bs = forward_batch.batch_size
+        if self.attention_chunk_size is not None:
+            raise ValueError(
+                "Full prefill graph does not support models with "
+                f"attention_chunk_size ({self.attention_chunk_size})."
+            )
+        if in_capture and getattr(self, "full_cg_prefill_metadata", None) is None:
+            device = forward_batch.seq_lens.device
+            max_num_pages = (
+                self.max_context_len + self.page_size - 1
+            ) // self.page_size
+            m = FlashAttentionMetadata()
+            m.cache_seqlens_int32 = torch.zeros((bs,), dtype=torch.int32, device=device)
+            m.cu_seqlens_q = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            m.cu_seqlens_k = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+            m.page_table = torch.zeros(
+                (bs, max_num_pages), dtype=torch.int32, device=device
+            )
+            self.full_cg_prefill_metadata = m
+            self.full_cg_prefill_strided_indices = torch.arange(
+                0, self.max_context_len, self.page_size, device=device
+            )
+            if self.use_sliding_window_kv_pool:
+                assert forward_batch.out_cache_loc is not None
+                m.swa_page_table = torch.zeros(
+                    (bs, max_num_pages), dtype=torch.int32, device=device
+                )
+                self.full_cg_prefill_swa_out_cache_loc = torch.zeros(
+                    (forward_batch.out_cache_loc.shape[0],),
+                    dtype=torch.int64,
+                    device=device,
+                )
+        m = self.full_cg_prefill_metadata
+        assert m is not None and bs == m.cache_seqlens_int32.shape[0], (
+            "full-CG prefill metadata must be created at capture with the same "
+            "fixed request-slot count used at replay"
+        )
+
+        seq_lens = forward_batch.seq_lens[:bs]
+        m.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        m.cu_seqlens_k[1:].copy_(torch.cumsum(seq_lens.to(torch.int32), dim=0))
+        m.cu_seqlens_q[1:].copy_(
+            torch.cumsum(forward_batch.extend_seq_lens[:bs].to(torch.int32), dim=0)
+        )
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+            max_seq_len_k = int(seq_lens_cpu[:bs].max().item())
+        else:
+            max_seq_len_k = int(seq_lens[:bs].max().item())
+
+        if max_seq_len_k > 0:
+            num_pages = (max_seq_len_k + self.page_size - 1) // self.page_size
+            valid_mask = (
+                self.full_cg_prefill_strided_indices[:num_pages][None, :]
+                < seq_lens[:, None]
+            )
+            token_slots = self.req_to_token[
+                forward_batch.req_pool_indices[:bs][:, None],
+                self.full_cg_prefill_strided_indices[:num_pages][None, :],
+            ]
+            safe_token_slots = torch.where(
+                valid_mask, token_slots, torch.zeros_like(token_slots)
+            )
+            page_table_slice = (
+                safe_token_slots // self.page_size
+                if self.page_size > 1
+                else safe_token_slots
+            )
+            page_table_slice = torch.where(
+                valid_mask, page_table_slice, torch.zeros_like(page_table_slice)
+            )
+            m.page_table[:, :num_pages].copy_(page_table_slice.to(torch.int32))
+            m.page_table[:, num_pages:].zero_()
+            if self.use_sliding_window_kv_pool:
+                swa_starts = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    safe_token_slots
+                )
+                swa_page_slice = (
+                    swa_starts // self.page_size if self.page_size > 1 else swa_starts
+                )
+                swa_page_slice = torch.where(
+                    valid_mask, swa_page_slice, torch.zeros_like(swa_page_slice)
+                )
+                m.swa_page_table[:, :num_pages].copy_(swa_page_slice.to(torch.int32))
+                m.swa_page_table[:, num_pages:].zero_()
+        else:
+            m.page_table.zero_()
+            if self.use_sliding_window_kv_pool:
+                m.swa_page_table.zero_()
+
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            num_out = forward_batch.out_cache_loc.shape[0]
+            swa_write_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
+            )
+            self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(swa_write_loc)
+            self.full_cg_prefill_swa_out_cache_loc[num_out:].zero_()
+            m.swa_out_cache_loc = self.full_cg_prefill_swa_out_cache_loc[:num_out]
+
+        m.max_seq_len_k = max_seq_len_k
+        if in_capture:
+            # Baked into the captured kernel launches; upper bounds only.
+            m.max_seq_len_q = forward_batch.positions.numel()
+            m.max_seq_len_k = self.max_context_len
+        self.forward_metadata = m
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         """Graph-recordable ops for XPU graph (no-op: all metadata setup is

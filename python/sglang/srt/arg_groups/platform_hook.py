@@ -140,9 +140,10 @@ def handle_xpu_backends(server_args: Any):
         elif cfg.cuda_graph_config.decode.backend not in (
             Backend.DISABLED,
             Backend.FULL,
+            Backend.BREAKABLE,
         ):
             logger.warning(
-                "XPU platform only supports decode backend 'full'; "
+                "XPU platform only supports decode backends 'full' and 'breakable'; "
                 "disabling unsupported decode backend '%s'.",
                 cfg.cuda_graph_config.decode.backend,
             )
@@ -151,6 +152,33 @@ def handle_xpu_backends(server_args: Any):
                 "_handle_xpu_backends",
                 cuda_graph_config=with_phase(
                     cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
+                ),
+            )
+
+        # Prefill graph is also opt-in on XPU unless explicitly configured.
+        if (Phase.PREFILL, "backend") not in server_args._cuda_graph_config_locked:
+            declare_resolution(
+                server_args,
+                "_handle_xpu_backends",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+                ),
+            )
+        elif cfg.cuda_graph_config.prefill.backend not in (
+            Backend.DISABLED,
+            Backend.FULL,
+            Backend.BREAKABLE,
+        ):
+            logger.warning(
+                "XPU platform only supports prefill backends 'full' and 'breakable'; "
+                "disabling unsupported prefill backend '%s'.",
+                cfg.cuda_graph_config.prefill.backend,
+            )
+            declare_resolution(
+                server_args,
+                "_handle_xpu_backends",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
                 ),
             )
 

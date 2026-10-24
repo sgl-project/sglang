@@ -104,6 +104,37 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
 from sglang.srt.model_executor.runner_backend.utils import (
     resolve_prefill_backend,
 )
+
+
+def _full_graph_backend_types() -> tuple[type, ...]:
+    from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
+        FullXPUGraphBackend,
+    )
+
+    return (FullCudaGraphBackend, FullXPUGraphBackend)
+
+
+def _is_full_graph_backend(backend: Any) -> bool:
+    return isinstance(backend, _full_graph_backend_types())
+
+
+def _is_full_or_bcg_backend(backend: Any) -> bool:
+    return isinstance(
+        backend, (BreakableCudaGraphBackend, *_full_graph_backend_types())
+    )
+
+
+def _has_chunked_local_attn(model_runner: Any) -> bool:
+    return any(
+        getattr(owner, "attention_chunk_size", None) is not None
+        for owner in (
+            model_runner,
+            getattr(model_runner, "model_config", None),
+            getattr(model_runner, "attn_backend", None),
+        )
+    )
+
+
 from sglang.srt.model_executor.runner_backend_utils import (
     PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
@@ -522,8 +553,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 f"{prefill_failure_msg(self.prefill_backend_name)}"
             ) from e
 
-        self._is_full_backend = isinstance(self.backend, FullCudaGraphBackend)
+        self._is_full_backend = _is_full_graph_backend(self.backend)
         if self._is_full_backend:
+            if _has_chunked_local_attn(model_runner):
+                raise ValueError(
+                    "Full prefill CUDA/XPU graph does not support models with "
+                    "attention_chunk_size or use_irope (chunked local attention / iRoPE)"
+                )
             max_req = prefill_config.full_prefill_max_req
             assert max_req is not None, "full_prefill_max_req must be resolved"
             self._capture_req_slots = max_req
@@ -535,9 +571,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG/Full record LoRA kernels, so the metadata they read must live in
         # static buffers refreshed in place per batch; unsupported LoRA
         # configs were already routed to the eager runner.
-        self._capture_lora = self.enable_lora and isinstance(
-            self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
-        )
+        self._capture_lora = self.enable_lora and _is_full_or_bcg_backend(self.backend)
         if self._capture_lora:
             model_runner.lora_manager.init_prefill_cuda_graph_batch_info(
                 max_num_tokens=self.max_num_tokens,
@@ -554,10 +588,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         )
         # This flag controls whether the model dispatches through the distinct
         # chunked-prefix topology; backend capability is validated separately.
+        # Only enable chunked-prefix FullCG if the backend explicitly supports it
+        # (e.g., FlashAttentionBackend on CUDA). Other backends (e.g., XPUAttentionBackend)
+        # gracefully fall back to plain EXTEND full graph capture.
         self._capture_chunked_prefix = (
             self._is_full_backend
             and not get_schedule().disable_chunked_prefix_cache
             and self.dllm_attention is None
+            and getattr(
+                model_runner.attn_backend,
+                "supports_full_cuda_graph_chunked_prefix",
+                False,
+            )
         )
         self._prefix_chunk_len = 0
         self._prefix_chunk_capacity = 0
@@ -598,7 +640,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     else "auto from chunked_prefill_size"
                 ),
             )
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if _is_full_or_bcg_backend(self.backend):
             with torch.device(self.device):
                 self._prefill_static_buffers = {
                     name: torch.zeros((self.max_bs,), dtype=torch.int64)
@@ -671,7 +713,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # BCG and Full CG capture only the transformer body (layer_model.forward),
         # not the LM head + logits_processor — the eager tail keeps the captured
         # graph bs-invariant so req_slots is not bound by an (req_slots, vocab) buffer.
-        if isinstance(self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)):
+        if _is_full_or_bcg_backend(self.backend):
             try:
                 self.layer_model = _resolve_transformer_layer_model(
                     self.model_runner.model
