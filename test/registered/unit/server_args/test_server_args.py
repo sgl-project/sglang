@@ -54,6 +54,7 @@ from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
+    validate_ascend_ops_speculative_draft,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
 )
@@ -2742,6 +2743,34 @@ class TestAdaptiveSpecArgs(CustomTestCase):
 
 
 class TestWaterfillArgs(CustomTestCase):
+    def test_waterfill_rejects_ascend_ops_without_config(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="ascend_ops",
+            enable_waterfill=True,
+        )
+        with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
+            handle_a2a_moe(server_args)
+
+    def test_waterfill_rejects_ascend_ops_with_config(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="ascend_ops",
+            ascend_ops_config="{}",
+            enable_waterfill=True,
+        )
+        with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
+            handle_a2a_moe(server_args)
+
+    def test_ascend_ops_speculative_draft_requires_npu(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            speculative_moe_a2a_backend="ascend_ops",
+        )
+        with self.assertRaisesRegex(ValueError, "only supported on NPU"):
+            validate_ascend_ops_speculative_draft(server_args)
+
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
             model_path="dummy",

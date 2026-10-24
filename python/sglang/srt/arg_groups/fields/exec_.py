@@ -810,7 +810,7 @@ class ExecMoe(msgspec.Struct):
             "flashinfer",
             "megamoe",
             "deepep_v2",
-            "ascend_tp",
+            "ascend_ops",
             "pplx",
             "flashinfer_megamoe",
         ],
@@ -827,7 +827,7 @@ class ExecMoe(msgspec.Struct):
                 "megamoe",
                 "deepep_v2",
                 "pplx",
-                "ascend_tp",
+                "ascend_ops",
                 "flashinfer_megamoe",
             ],
             resolvable=True,
@@ -913,6 +913,14 @@ class ExecMoe(msgspec.Struct):
     deepep_config: A[
         Optional[str],
         "Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
+    ] = None
+    ascend_ops_config: A[
+        Optional[str],
+        (
+            "Configuration for the ascend_ops MoE backend used by the main "
+            "model and/or speculative draft as a JSON object, "
+            'for example {"prefill":"alltoallv","decode":"low_latency"}.'
+        ),
     ] = None
     elastic_ep_backend: A[
         Literal[None, "mooncake", "nixl"],

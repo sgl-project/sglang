@@ -1587,6 +1587,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "flashinfer_megamoe",
         "mori",
         "pplx",
+        "ascend_ops",
         "deepep_v2",
     }
 )
@@ -1609,10 +1610,16 @@ def _a2a_backend_overrides(view: Any) -> dict:
 
 @register_post_process
 def _a2a_ep_size(view: Any) -> dict:
-    if view.moe_a2a_backend in _A2A_EP_SPANNING_BACKENDS:
+    backend = view.moe_a2a_backend
+    if backend not in _A2A_EP_SPANNING_BACKENDS:
+        # A speculative draft can select Ascend Ops independently of the
+        # target model, but it still uses the TP communication group.
+        if view.speculative_moe_a2a_backend == "ascend_ops":
+            backend = "ascend_ops"
+    if backend in _A2A_EP_SPANNING_BACKENDS:
         if view.ep_size != view.tp_size:
             logger.info(
-                f"{view.moe_a2a_backend} MoE is enabled. The expert parallel size "
+                f"{backend} MoE is enabled. The expert parallel size "
                 f"is adjusted from {view.ep_size} to the tensor parallel size "
                 f"[{view.tp_size}]."
             )

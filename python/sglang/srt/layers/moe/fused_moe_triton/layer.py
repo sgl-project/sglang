@@ -24,6 +24,7 @@ from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
+    get_ascend_ops_config,
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
@@ -33,9 +34,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
     create_kt_config_from_server_args,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
-from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
-    AscendTPDispatcher,
-)
+from sglang.srt.layers.moe.token_dispatcher.ascend_ops import AscendOpsDispatcher
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
@@ -168,13 +167,39 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
+def _validate_ascend_no_a2a_layout(moe_runner_config: MoeRunnerConfig) -> None:
+    """Reject the one layout the Ascend no-A2A routing cannot express.
+
+    The routing op indexes the checkpoint's full expert space, and the grouped
+    matmuls consume that same range, so every rank must hold all experts.
+    With ``ep_size > 1`` the community dispatcher rewrites the top-k ids to
+    rank-local ones while the Ascend kernels would still index the global
+    range; route that configuration to a backend that implements EP instead of
+    silently mismatching experts.
+    """
+    if get_parallel().dwdp_size > 1:
+        # DWDP collapses the EP view onto full weights after construction.
+        return
+    if moe_runner_config.num_local_experts == moe_runner_config.num_experts:
+        return
+    raise ValueError(
+        "Expert parallelism (ep_size > 1) is not supported on Ascend NPU with "
+        "--moe-a2a-backend none: that path runs the Ascend routing over the "
+        "full expert range on every rank, but this layer holds "
+        f"{moe_runner_config.num_local_experts} of "
+        f"{moe_runner_config.num_experts} experts. Use "
+        "--moe-a2a-backend deepep (or ascend_fuseep) for EP on NPU, or keep "
+        "ep_size=1."
+    )
+
+
 def create_moe_dispatcher(
     moe_runner_config: MoeRunnerConfig,
     quant_method: FusedMoEMethodBase,
 ) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none() and is_npu():
-        return AscendTPDispatcher(moe_runner_config)
+    if a2a_backend.is_ascend_ops():
+        return AscendOpsDispatcher(moe_runner_config, get_ascend_ops_config())
     elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
@@ -186,6 +211,12 @@ def create_moe_dispatcher(
         # StandardDispatcher is created but never invoked.
         # flashinfer_megamoe does its EP all-to-all inside the kernel, so the
         # dispatcher stays a pure noop passthrough.
+        # On NPU the no-A2A path is this same dispatcher: the Ascend routing
+        # (expert permutation with fused activation quantization, and the
+        # weighted unpermute) runs in the MoE runner's permute hooks, see
+        # moe_runner/ascend.py.
+        if _is_npu and a2a_backend.is_none():
+            _validate_ascend_no_a2a_layout(moe_runner_config)
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()

@@ -1412,6 +1412,9 @@ class Envs:
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # Pad the ascend_ops decode batch to this size (0 disables padding, which is
+    # correct while every EP rank steps with the same batch size).
+    SGLANG_ASCEND_OPS_DECODE_PAD_BS = EnvInt(0)
     # Per-rank buffer capacity, not a model token limit.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
