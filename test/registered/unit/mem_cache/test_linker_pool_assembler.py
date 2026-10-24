@@ -797,6 +797,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(mamba.prepare_locations(torch.tensor([3])), [3])
         self.assertEqual(group.sources[PoolName.DRAFT], PoolName.KV)
         self.assertEqual(group.entry_map[PoolName.DRAFT].layer_mapping, {0: (0, 1)})
+        self.assertEqual(kv.shard, 0)
+        self.assertIsNone(mamba.shard)
+        self.assertIsNone(group.entry_map[PoolName.DRAFT].shard)
 
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve(dcp_size=2)
