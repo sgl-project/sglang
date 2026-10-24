@@ -64,6 +64,7 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.models.utils import (
     apply_qk_norm,
+    cpu_has_fused_qk_norm_isa,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
@@ -105,7 +106,6 @@ Qwen3MoeConfig = None
 _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
-_is_cuda = is_cuda()
 _is_npu = is_npu()
 
 if _is_npu:
@@ -650,6 +650,7 @@ class Qwen3MoeAttention(nn.Module):
         use_fused = (self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16) or (
             self.use_fused_qk_norm_rope_cpu
             and qkv.dtype in (torch.bfloat16, torch.float16)
+            and cpu_has_fused_qk_norm_isa(qkv.dtype)
         )
         if use_fused:
             if _is_cuda:
