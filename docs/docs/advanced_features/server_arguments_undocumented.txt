@@ -88,6 +88,3 @@
 --trust-request-chat-template
 --unified-cache-external-linker-backend
 --uno-lora-path
---weight-cache-mode
---weight-cache-socket
---weight-cache-timeout
