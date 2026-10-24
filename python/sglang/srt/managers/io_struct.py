@@ -1330,6 +1330,8 @@ class EmbeddingReqInput:
             else:
                 self.batch_size = 1
         elif self.input_ids is not None:
+            if len(self.input_ids) == 0:
+                raise ValueError("input_ids cannot be empty.")
             if isinstance(self.input_ids[0], list):
                 self.batch_size = len(self.input_ids)
                 self.is_single = False
