@@ -1390,6 +1390,38 @@ class TestDflashDraftKvBudget(CustomTestCase):
         self.assertLess(_tokens(10240), _tokens(None))
 
 
+class TestReqToTokenBudget(CustomTestCase):
+    def test_budget_covers_every_req_to_token_pool_resolve_can_build(self):
+        """The pre-capture KV budget reserves a req_to_token bound; a larger pool OOMs."""
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        for max_running_requests, attn_dp_size in ((None, 1), (64, 2)):
+            for token_capacity in (1 << 12, 1 << 30):
+                with self.subTest(
+                    max_running_requests=max_running_requests,
+                    attn_dp_size=attn_dp_size,
+                    token_capacity=token_capacity,
+                ):
+                    mr = _make_model_runner(
+                        self,
+                        disaggregation_mode="decode",
+                        disaggregation_decode_extra_slots=24,
+                        max_running_requests=max_running_requests,
+                    )
+                    kvc = object.__new__(KVCacheConfigurator)
+                    kvc.model_config = mr.model_config
+                    kvc.attn_dp_size = attn_dp_size
+                    kvc.mambaish_config = None
+                    kvc.device = "cpu"
+                    pool = kvc._build_req_to_token_pool(
+                        max_num_reqs=kvc.resolve_max_num_reqs(token_capacity)
+                    )
+                    self.assertGreaterEqual(
+                        kvc._req_to_token_pool_bytes_upper_bound(),
+                        pool.req_to_token.nbytes,
+                    )
+
+
 class TestSWAPoolFloor(CustomTestCase):
     """An SWA pool below the prefill admission floor must fail here, not livelock
     the scheduler at warmup."""

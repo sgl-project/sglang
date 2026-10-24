@@ -224,6 +224,7 @@ def mm_runtime_reservation_gb(
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
+MAX_AUTO_RUNNING_REQUESTS_PER_WORKER = 4096
 
 
 def _pp_local_per_request_bytes(
@@ -1548,16 +1549,24 @@ class KVCacheConfigurator:
                 "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
             )
 
+    @staticmethod
+    def _decode_req_pool_pre_alloc_size() -> Optional[int]:
+        """Extra pre-allocated rows of the decode-shaped pool; None for a plain pool."""
+        disagg = get_disagg()
+        if disagg.disaggregation_mode != "decode" and not disagg.enable_pd_role_switch:
+            return None
+        # A flip-capable prefill needs the decode pool shape, and the extra-slot
+        # default is only computed for a decode launch.
+        pre_alloc_size = disagg.disaggregation_decode_extra_slots
+        if disagg.enable_pd_role_switch:
+            pre_alloc_size = pre_alloc_size or 0
+        return pre_alloc_size
+
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len()
 
-        disagg = get_disagg()
-        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
-            # A flip-capable prefill needs the decode pool shape, and the extra-slot
-            # default is only computed for a decode launch.
-            pre_alloc_size = disagg.disaggregation_decode_extra_slots
-            if disagg.enable_pd_role_switch:
-                pre_alloc_size = pre_alloc_size or 0
+        pre_alloc_size = self._decode_req_pool_pre_alloc_size()
+        if pre_alloc_size is not None:
             if self.mambaish_config:
                 return self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
@@ -2976,7 +2985,11 @@ class KVCacheConfigurator:
             is_multimodal=self.model_config.is_multimodal,
             mm_feature_transport=get_mm().mm_feature_transport,
         )
-        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
+        # The req_to_token table is allocated beside the KV pools, not out of the slack.
+        req_to_token_gb = self._req_to_token_pool_bytes_upper_bound() / (1 << 30)
+        rest_memory = (
+            available_gpu_memory - slack_gb - mm_reservation_gb - req_to_token_gb
+        )
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
@@ -2999,6 +3012,21 @@ class KVCacheConfigurator:
             )
 
         return int(rest_memory * (1 << 30))  # return in bytes
+
+    def _req_to_token_pool_bytes_upper_bound(self) -> int:
+        """Largest req_to_token table _build_req_to_token_pool can allocate."""
+        requested = get_schedule().max_running_requests
+        max_num_reqs = (
+            requested // self.attn_dp_size
+            if requested is not None
+            else MAX_AUTO_RUNNING_REQUESTS_PER_WORKER
+        )
+        pre_alloc_size = self._decode_req_pool_pre_alloc_size() or 0
+        num_rows = max_num_reqs + pre_alloc_size + 1  # +1: padding row 0
+        max_context_len = (
+            self.model_config.context_len + get_req_to_token_extra_context_len()
+        )
+        return num_rows * max_context_len * torch.int32.itemsize
 
     def _calculate_mamba_ratio(self) -> int:
         if get_memory().disable_radix_cache:
@@ -3062,7 +3090,7 @@ class KVCacheConfigurator:
         token capacity."""
         # Estimate pool size (used as upper bound when user specifies max_running_requests)
         estimated = int(token_capacity / self.model_config.context_len * 512)
-        estimated = max(min(estimated, 4096), 2048)
+        estimated = max(min(estimated, MAX_AUTO_RUNNING_REQUESTS_PER_WORKER), 2048)
 
         max_num_reqs = get_schedule().max_running_requests
         if max_num_reqs is not None:
