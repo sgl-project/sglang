@@ -3,8 +3,9 @@ import json
 import unittest
 from http import HTTPStatus
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede imports that may pull in sgl_kernel
 
@@ -20,6 +21,9 @@ from sglang.srt.entrypoints.anthropic.serving import AnthropicServing  # noqa: E
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
     ChatCompletionRequest,
     ChatCompletionResponse,
+)
+from sglang.srt.observability.req_time_stats import (  # noqa: E402
+    APIServerReqTimeStats,
 )
 from sglang.srt.parser.template_detection import (  # noqa: E402
     detect_inline_system_support,
@@ -94,6 +98,50 @@ class _FakeNonStreamingErrorOpenAI:
         )
 
 
+class _FakeReceivedTimeOpenAI:
+    supports_inline_system = False
+
+    def __init__(self):
+        self.adapted_request = SimpleNamespace(received_time=None)
+        self.forwarded_request = None
+        self.abort_request = None
+        self.tokenizer_manager = SimpleNamespace(
+            create_abort_task=self._create_abort_task
+        )
+
+    def _validate_request(self, chat_request):
+        return None
+
+    def _convert_to_internal_request(self, chat_request, raw_request):
+        return self.adapted_request, chat_request
+
+    async def _handle_non_streaming_request(
+        self, adapted_request, processed_request, raw_request
+    ):
+        self.forwarded_request = adapted_request
+        return ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-clock-test",
+                "model": "test-model",
+                "choices": [],
+                "usage": {},
+            }
+        )
+
+    def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
+        self.forwarded_request = adapted_request
+
+        async def _stream():
+            yield _chunk([_choice({}, finish_reason="stop")])
+            yield "data: [DONE]\n\n"
+
+        return _stream()
+
+    def _create_abort_task(self, adapted_request):
+        self.abort_request = adapted_request
+        return None
+
+
 def _chunk(choices=None, usage=None):
     data = {
         "id": "chatcmpl-test",
@@ -127,6 +175,81 @@ async def _collect_anthropic_events(serving, anthropic_request):
             if line.startswith("data: "):
                 events.append(json.loads(line[6:]))
     return events
+
+
+class TestAnthropicReceivedTime(CustomTestCase):
+    RECEIVED_TIME = 1234.5
+    FINISHED_TIME = 1234.75
+
+    def _requests(self, *, stream):
+        chat_request = ChatCompletionRequest(
+            model="test-model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hello"}],
+            stream=stream,
+        )
+        anthropic_request = AnthropicMessagesRequest.model_validate(
+            {
+                "model": "test-model",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": stream,
+            }
+        )
+        return chat_request, anthropic_request
+
+    def _assert_monotonic_latency(self, adapted_request):
+        self.assertEqual(adapted_request.received_time, self.RECEIVED_TIME)
+        stats = APIServerReqTimeStats()
+        stats.set_created_time(adapted_request.received_time)
+        stats.set_finished_time(self.FINISHED_TIME)
+        self.assertEqual(stats.get_e2e_latency(), 0.25)
+
+    def test_non_streaming_received_time_uses_monotonic_clock(self):
+        """Non-streaming requests must share the stats layer's monotonic clock."""
+        fake_openai = _FakeReceivedTimeOpenAI()
+        serving = AnthropicServing(fake_openai)
+        chat_request, anthropic_request = self._requests(stream=False)
+
+        with patch(
+            "sglang.srt.entrypoints.anthropic.serving.monotonic_time",
+            return_value=self.RECEIVED_TIME,
+        ):
+            response = asyncio.run(
+                serving._handle_non_streaming(chat_request, anthropic_request, object())
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(fake_openai.forwarded_request, fake_openai.adapted_request)
+        self._assert_monotonic_latency(fake_openai.forwarded_request)
+
+    def test_streaming_received_time_uses_monotonic_clock(self):
+        """Streaming requests must share the stats layer's monotonic clock."""
+        fake_openai = _FakeReceivedTimeOpenAI()
+        serving = AnthropicServing(fake_openai)
+        chat_request, anthropic_request = self._requests(stream=True)
+
+        async def _consume_response():
+            response = await serving._handle_streaming(
+                chat_request, anthropic_request, object()
+            )
+            body = ""
+            async for chunk in response.body_iterator:
+                body += chunk
+            return response, body
+
+        with patch(
+            "sglang.srt.entrypoints.anthropic.serving.monotonic_time",
+            return_value=self.RECEIVED_TIME,
+        ):
+            response, body = asyncio.run(_consume_response())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("event: message_stop", body)
+        self.assertNotIn("event: error", body)
+        self.assertIs(fake_openai.abort_request, fake_openai.adapted_request)
+        self.assertIs(fake_openai.forwarded_request, fake_openai.adapted_request)
+        self._assert_monotonic_latency(fake_openai.forwarded_request)
 
 
 class TestAnthropicServing(unittest.TestCase):
