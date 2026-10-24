@@ -45,6 +45,7 @@ from sglang.srt.entrypoints.openai import (
     encoding_dsv32,
 )
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
+    encode_prompt_segments,
     parallel_prompt_encode,
 )
 from sglang.srt.entrypoints.openai.protocol import (
@@ -109,6 +110,7 @@ from sglang.srt.parser.jinja_template_utils import (
     MEDIA_URL_PART_TYPES,
     process_content_for_template_format,
 )
+from sglang.srt.parser.python_chat_template import render_chat_segments
 from sglang.srt.parser.reasoning_parser import (
     IQuestQ1ReasoningDetector,
     ReasoningParser,
@@ -1816,17 +1818,32 @@ class OpenAIServingChat(OpenAIServingBase):
                 **template_kwargs,
             )
         else:
-            rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                tools=tools,
-                return_dict=False,
-                **template_kwargs,
-            )
-            prompt_ids = parallel_prompt_encode(
-                self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
-            )
+            segments = None
+            if self.template_manager.python_chat_template is not None:
+                segments = render_chat_segments(
+                    self.tokenizer_manager.tokenizer,
+                    self.template_manager.python_chat_template,
+                    messages,
+                    tools=tools,
+                    add_generation_prompt=True,
+                    template_kwargs=template_kwargs,
+                )
+            if segments is not None:
+                prompt_ids = encode_prompt_segments(
+                    self.tokenizer_manager.tokenizer, segments, encode_kwargs
+                )
+            else:
+                rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    return_dict=False,
+                    **template_kwargs,
+                )
+                prompt_ids = parallel_prompt_encode(
+                    self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
+                )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
             if cache_key is not None

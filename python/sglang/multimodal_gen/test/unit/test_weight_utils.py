@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 import torch
 from huggingface_hub.errors import LocalEntryNotFoundError
+from safetensors import safe_open
 from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen.runtime.loader.utils import (
@@ -22,6 +23,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     _disable_runai_streamer_rank_discovery_collective,
     get_lock,
+    safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.weights.source import (
     filter_duplicate_precision_variant_safetensors,
@@ -431,6 +433,57 @@ class TestDiffusionWeightLock(unittest.TestCase):
             self.assertLessEqual(len(os.fsencode(lock_filename)), 255)
             with lock:
                 self.assertTrue(os.path.exists(lock.lock_file))
+
+
+class TestCheckpointReadFailure(unittest.TestCase):
+    def test_failed_read_never_removes_checkpoint_or_shared_blob(self):
+        for symlink in (False, True):
+            for error in (None, PermissionError("denied"), OSError("I/O error")):
+                with (
+                    self.subTest(symlink=symlink, error=error),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir)
+                    blob = root / "blob"
+                    if error is None:
+                        blob.write_bytes(b"incomplete safetensors")
+                    else:
+                        safetensors_save_file({"weight": torch.ones(2)}, blob)
+                    original = blob.read_bytes()
+                    path = root / "model.safetensors"
+                    if symlink:
+                        path.symlink_to(blob)
+                    else:
+                        blob.rename(path)
+                        blob = path
+                    other_snapshot = root / "other.safetensors"
+                    other_snapshot.symlink_to(blob)
+
+                    with patch(
+                        "sglang.multimodal_gen.runtime.loader.weight_utils.safe_open",
+                        side_effect=error,
+                        wraps=safe_open,
+                    ):
+                        with self.assertRaises(RuntimeError):
+                            next(
+                                safetensors_weights_iterator(
+                                    [str(path)], use_runai_model_streamer=False
+                                )
+                            )
+
+                    self.assertTrue(
+                        path.exists(), "loader removed the requested checkpoint"
+                    )
+                    self.assertEqual(path.is_symlink(), symlink)
+                    self.assertEqual(blob.read_bytes(), original)
+                    self.assertEqual(other_snapshot.read_bytes(), original)
+                    if error is not None:
+                        loaded = dict(
+                            safetensors_weights_iterator(
+                                [str(path)], use_runai_model_streamer=False
+                            )
+                        )
+                        torch.testing.assert_close(loaded["weight"], torch.ones(2))
 
 
 if __name__ == "__main__":

@@ -290,6 +290,7 @@ def _prefill_graph_replay(*, ratios, seq_len):
     backend.has_c4 = 4 in ratios
     backend.has_c128 = 128 in ratios
     backend._build_forward_metadata = build_full
+    backend._prefill_graph_translates_swa_loc = lambda metadata: False
     backend._prefill_graph_tail_metadata = build_tail
     backend._activate_request_window = lambda: None
     capture = object.__new__(DSV4Metadata)
