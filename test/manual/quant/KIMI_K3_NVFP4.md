@@ -76,7 +76,7 @@ The single-node adaptation removes PD transport options and explicitly disables 
 
 Trace verification: the baseline uses `ncclSymkDevKernel_AllReduce_RSxLDMC_AGxSTMC_sum_bf16`; the enabled arm uses `sglang::all_reduce_2shot_push_kernel`. At 8k/B4, TP0 VERIFY graphs contain 187 all-reduce calls each. Their median cumulative duration across ten graphs changes from2432.161 to1525.979µs, while median graph span changes from17898.042 to17664.688µs. These profiled durations are not the formal benchmark or an estimate of critical-path savings. One enabled-arm all-reduce outside the graphs took23101.501µs; its cause is unresolved, so whole-trace cumulative communication time is not used to infer speedup.
 
-Both traces execute the existing `set_mla_kv_concat_q_fp8_kernel` and routing/NVFP4 quant fusion. Symmetric memory remains enabled under DCP1; K3 AR/norm fusion's automatic path skips this configuration. Disabling symmetric memory is a separate pending experiment. Natural-acceptance accuracy for these communication configurations remains pending; these fixed-acceptance timings do not validate accuracy or PD SLOs.
+Both traces execute the existing `set_mla_kv_concat_q_fp8_kernel` and routing/NVFP4 quant fusion. Symmetric memory remains enabled under DCP1; K3 AR/norm fusion's automatic path skips this configuration. The separate no-symmetric-memory comparison is recorded below. Natural-acceptance accuracy for these communication configurations remains pending; these fixed-acceptance timings do not validate accuracy or PD SLOs.
 
 Dependencies: PyTorch2.14.1, FlashInfer0.7.2, fastsafetensors0.5.0, transformers5.19.0. From the repository root with the environment active:
 
@@ -96,3 +96,24 @@ python -m sglang.bench_one_batch_server \
   --batch-size 1 --input-len 8192 --output-len 1024 --cache-hit-rate 0 \
   --result-filename decode-8192-b1-r0.jsonl --show-report
 ```
+
+### Disabling symmetric memory
+
+With custom all-reduce enabled, removing only `--enable-symm-mem` automatically enables the existing K3 AR/norm fusion. This additional configuration comparison uses identical runtime source, dependencies and checkpoints, with the same fixed-acceptance benchmark method above:
+
+| Input tokens | Batch | Custom AR + symmetric memory (tok/s/user) | Custom AR without symmetric memory (tok/s/user) | Additional gain |
+|---|---|---|---|---|
+| 8192 | 1 | 253.67 | 270.70 | 6.71% |
+| 8192 | 4 | 193.02 | 204.84 | 6.12% |
+
+Relative to the original disabled-custom-AR/symmetric-memory configuration, these measured throughputs improve by13.00% at B1 and9.40% at B4. This is a configuration result, not an additional code patch or a sum of independent gains. The 32k/128k no-symmetric-memory cases and natural-acceptance accuracy remain pending.
+
+The 8k/B4 TP0 trace confirms the changed fusion path: each VERIFY graph executes95 `all_reduce_2shot_push`,92 `all_reduce_pull_res`, and92 `all_reduce_push_norm_cluster` calls. Their respective median cumulative durations across ten graphs are670.437,1332.551 and635.365µs. Median graph span is16328.993µs, versus17664.688µs with symmetric memory. This path changes both collective structure and compute overlap; cumulative communication durations are not directly comparable as critical-path savings.
+
+To reproduce this performance configuration, start the server with:
+
+```bash
+K3_BENCH_SYMM_MEM=0 bash test/manual/quant/launch_kimi_k3_nvfp4_decode_bench.sh
+```
+
+`K3_BENCH_SYMM_MEM` controls this example script only; it is not an SGLang runtime environment variable. The script still fixes acceptance for performance, so it must not be used for accuracy tests.

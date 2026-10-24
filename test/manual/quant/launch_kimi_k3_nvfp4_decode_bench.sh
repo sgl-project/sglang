@@ -15,4 +15,11 @@ export SGLANG_K3_BCG_MHA=0
 export SGLANG_SIMULATE_ACC_LEN=4
 export SGLANG_SIMULATE_ACC_METHOD=match-expected
 export SGLANG_SIMULATE_ACC_TOKEN_MODE=fixed
-python -m sglang.launch_server --model nvidia/Kimi-K3-NVFP4 --trust-remote-code --host 127.0.0.1 --port 30000 --tp-size 8 --mem-fraction-static 0.85 --context-length 1048576 --kv-cache-dtype fp8_e4m3 --speculative-algorithm DFLASH --speculative-draft-model-path modal-labs/Kimi-K3-DFlash --speculative-dflash-block-size 8 --reasoning-parser kimi_k3 --tool-call-parser kimi_k3 --moe-runner-backend flashinfer_trtllm --load-format fastsafetensors --enable-metrics --enable-cache-report --enable-linear-replayssm-spec --fp8-gemm-backend flashinfer_trtllm --enable-symm-mem --mamba-full-memory-ratio 0.015 --dcp-size 1 --max-running-requests 4 --chunked-prefill-size 16384 --max-prefill-tokens 16384 --disable-radix-cache "$@"
+# K3_BENCH_SYMM_MEM=0 tests the separate no-symmetric-memory configuration.
+SYMM_MEM_ARGS=()
+case "${K3_BENCH_SYMM_MEM:-1}" in
+  1) SYMM_MEM_ARGS=(--enable-symm-mem) ;;
+  0) ;;
+  *) echo "K3_BENCH_SYMM_MEM must be 0 or 1" >&2; exit 2 ;;
+esac
+python -m sglang.launch_server --model nvidia/Kimi-K3-NVFP4 --trust-remote-code --host 127.0.0.1 --port 30000 --tp-size 8 --mem-fraction-static 0.85 --context-length 1048576 --kv-cache-dtype fp8_e4m3 --speculative-algorithm DFLASH --speculative-draft-model-path modal-labs/Kimi-K3-DFlash --speculative-dflash-block-size 8 --reasoning-parser kimi_k3 --tool-call-parser kimi_k3 --moe-runner-backend flashinfer_trtllm --load-format fastsafetensors --enable-metrics --enable-cache-report --enable-linear-replayssm-spec --fp8-gemm-backend flashinfer_trtllm "${SYMM_MEM_ARGS[@]}" --mamba-full-memory-ratio 0.015 --dcp-size 1 --max-running-requests 4 --chunked-prefill-size 16384 --max-prefill-tokens 16384 --disable-radix-cache "$@"
