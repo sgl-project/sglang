@@ -4,7 +4,8 @@ import json
 import os
 import time
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from functools import partial
 from typing import Any
 
 from sglang_simulator.compat import validate_simulator_server_args
@@ -15,7 +16,10 @@ from sglang_simulator.hook import (
 )
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
-from sglang_simulator.simulation.sglang.dspark import dspark_result_from_native
+from sglang_simulator.simulation.sglang.dspark import (
+    DSparkStepResult,
+    dspark_result_from_native,
+)
 from sglang_simulator.simulation.sglang.prepared_batch import (
     predictor_batch_from_result,
 )
@@ -35,15 +39,64 @@ from sglang_simulator.simulation.utils import (
 from sglang_simulator.time_predictor.base import (
     InferTimePredictor,
     PredictorError,
-    ScheduleRequest,
 )
 from sglang_simulator.time_predictor.base import (
     ScheduleBatch as SimulationScheduleBatch,
+)
+from sglang_simulator.time_predictor.base import (
+    ScheduleRequest,
 )
 from sglang_simulator.utils import get_logger
 from sglang_simulator.utils.json import CustomJsonEncoder
 
 logger = get_logger("sgl_simulator")
+
+_DSPARK_ACCOUNTING = "_sglang_simulator_dspark_accounting"
+_DSPARK_ACCOUNTED = "_sglang_simulator_dspark_accounted"
+_DSPARK_WALL_CREDIT = "_sglang_simulator_dspark_wall_credit"
+_DSPARK_ACCOUNTING_OWNER = "_sglang_simulator_dspark_accounting_owner"
+_DSPARK_PENDING_RESULTS = "_sglang_simulator_dspark_pending_results"
+
+
+@dataclass(frozen=True)
+class _DSparkResultAccounting:
+    owner: object
+    prediction: DSparkStepResult
+    forward_duration: float
+    previous_inference_duration: float
+    preprocess_duration: float
+
+
+def _validate_dspark_batch(prediction, batch):
+    group = prediction.local_group
+    source_mode = getattr(batch.forward_mode, "name", None)
+    allowed_modes = {
+        "DECODE": {"TARGET_VERIFY"},
+        "TARGET_VERIFY": {"TARGET_VERIFY"},
+        "EXTEND": {"EXTEND", "MIXED"},
+        "MIXED": {"MIXED"},
+        "IDLE": {"IDLE"},
+    }
+    if group.forward_mode not in allowed_modes.get(source_mode, set()):
+        raise PredictorError(
+            "invalid_dspark_step", "DSPark worker mode differs from the native batch"
+        )
+    if tuple(req.rid for req in batch.reqs) != tuple(
+        request.rid for request in group.requests
+    ):
+        raise PredictorError(
+            "invalid_dspark_step", "DSPark result does not match the native local batch"
+        )
+
+
+def _dspark_simulation_batch(prediction):
+    group = prediction.local_group
+    return SimulationScheduleBatch(
+        reqs=[
+            ScheduleRequest(r.extend_len, r.target_prefix_len) for r in group.requests
+        ],
+        forward_mode=group.forward_mode,
+    )
 
 
 def simulation_mode_log_message(mode: SimulationMode) -> str:
@@ -488,34 +541,8 @@ class C_SchedulerHook(BaseHook):
                             "unsupported_execution_profile",
                             "predictor does not support DSPark steps",
                         )
-                    group = speculative_step.local_group
-                    source_mode = getattr(batch.forward_mode, "name", None)
-                    allowed_modes = {
-                        "DECODE": {"TARGET_VERIFY"},
-                        "TARGET_VERIFY": {"TARGET_VERIFY"},
-                        "EXTEND": {"EXTEND", "MIXED"},
-                        "MIXED": {"MIXED"},
-                        "IDLE": {"IDLE"},
-                    }
-                    if group.forward_mode not in allowed_modes.get(source_mode, set()):
-                        raise PredictorError(
-                            "invalid_dspark_step",
-                            "DSPark worker mode differs from the native batch",
-                        )
-                    if tuple(req.rid for req in batch.reqs) != tuple(
-                        request.rid for request in group.requests
-                    ):
-                        raise PredictorError(
-                            "invalid_dspark_step",
-                            "DSPark result does not match the native local batch",
-                        )
-                    simulation_batch = SimulationScheduleBatch(
-                        reqs=[
-                            ScheduleRequest(r.extend_len, r.target_prefix_len)
-                            for r in group.requests
-                        ],
-                        forward_mode=group.forward_mode,
-                    )
+                    _validate_dspark_batch(speculative_step, batch)
+                    simulation_batch = _dspark_simulation_batch(speculative_step)
                     prepared_batch = True
                 elif prepared_batch:
                     simulation_batch = predictor_batch_from_result(
@@ -578,6 +605,42 @@ class C_SchedulerHook(BaseHook):
                     else:
                         forward_latency = predicted_latency
 
+                    if speculative_step is not None:
+                        owner = getattr(self, _DSPARK_ACCOUNTING_OWNER, None)
+                        if owner is None:
+                            owner = object()
+                            setattr(self, _DSPARK_ACCOUNTING_OWNER, owner)
+                        setattr(
+                            ret,
+                            _DSPARK_ACCOUNTING,
+                            _DSparkResultAccounting(
+                                owner,
+                                speculative_step,
+                                forward_latency,
+                                StateManager.get_current_inference_dur(),
+                                C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST,
+                            ),
+                        )
+                        setattr(ret, _DSPARK_ACCOUNTED, False)
+                        if C_SchedulerHook.COORDINATOR is None:
+                            setattr(
+                                self,
+                                _DSPARK_PENDING_RESULTS,
+                                getattr(self, _DSPARK_PENDING_RESULTS, 0) + 1,
+                            )
+                        if (
+                            C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE
+                            and C_SchedulerHook.COORDINATOR is None
+                        ):
+                            # The next host accounting interval can contain several
+                            # launches. Exclude their replacement work once there,
+                            # rather than when each corresponding result is retired.
+                            setattr(
+                                self,
+                                _DSPARK_WALL_CREDIT,
+                                getattr(self, _DSPARK_WALL_CREDIT, 0.0)
+                                + predictor_time_cost,
+                            )
                     StateManager.set_current_inference_dur(forward_latency)
 
                 C_SchedulerHook.SIMULATION_BATCH = simulation_batch
@@ -596,6 +659,48 @@ class C_SchedulerHook(BaseHook):
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
+            native_result = args[1] if len(args) > 1 else kwargs.get("result")
+            prediction = dspark_result_from_native(native_result)
+            accounting = getattr(native_result, _DSPARK_ACCOUNTING, None)
+            if prediction is not None or accounting is not None:
+                if (
+                    type(accounting) is not _DSparkResultAccounting
+                    or accounting.prediction is not prediction
+                    or accounting.owner
+                    is not getattr(self, _DSPARK_ACCOUNTING_OWNER, None)
+                    or getattr(self, _DSPARK_PENDING_RESULTS, 0) <= 0
+                    or getattr(native_result, _DSPARK_ACCOUNTED, None) is not False
+                ):
+                    raise PredictorError(
+                        "invalid_dspark_step",
+                        "DSPark result accounting is missing, changed or already consumed",
+                    )
+                _validate_dspark_batch(prediction, batch)
+            simulation_batch = (
+                _dspark_simulation_batch(prediction)
+                if accounting is not None
+                else C_SchedulerHook.SIMULATION_BATCH
+            )
+            current_inference_dur = (
+                accounting.forward_duration
+                if accounting is not None
+                else StateManager.get_current_inference_dur()
+            )
+            previous_inference_dur = (
+                accounting.previous_inference_duration
+                if accounting is not None
+                else StateManager.get_last_inference_dur()
+            )
+            predicted_latency = (
+                prediction.timing.seconds
+                if accounting is not None
+                else C_SchedulerHook.CURRENT_PREDICTED_LATENCY
+            )
+            preprocess_duration = (
+                accounting.preprocess_duration
+                if accounting is not None
+                else C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST
+            )
             blocked_l2_wall_dur = 0.0
             if (
                 C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING
@@ -608,7 +713,7 @@ class C_SchedulerHook(BaseHook):
                     C_SchedulerHook.SIM_MODE,
                     effective_l2_load_delay(
                         StateManager.get_hicache_l2_load_dur(),
-                        StateManager.get_last_inference_dur(),
+                        previous_inference_dur,
                         C_SchedulerHook.OVERLAP_SCHEDULE,
                     ),
                 )
@@ -617,16 +722,15 @@ class C_SchedulerHook(BaseHook):
             process_batch_result_end = time.perf_counter()
 
             if batch is not None:
-                if len(batch.reqs) == 0:
+                if len(batch.reqs) == 0 and accounting is None:
                     return ret
 
                 hicache_l2_load_dur = StateManager.pop_hicache_l2_load_dur()
                 hicache_l2_load_stats = StateManager.pop_hicache_l2_load_stats()
                 hicache_l2_backup_dur = StateManager.pop_hicache_l2_backup_dur()
-                current_inference_dur = StateManager.get_current_inference_dur()
                 visible_l2_load_dur = effective_l2_load_delay(
                     hicache_l2_load_dur,
-                    StateManager.get_last_inference_dur(),
+                    previous_inference_dur,
                     C_SchedulerHook.OVERLAP_SCHEDULE,
                 )
                 StateManager.step_global_clock(visible_l2_load_dur)
@@ -635,7 +739,12 @@ class C_SchedulerHook(BaseHook):
                 # so current iter's CPU time is reflected in current iter's TTFT.
                 now = time.time()
                 predictor_wall_dur = (
-                    C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST
+                    getattr(self, _DSPARK_WALL_CREDIT, 0.0)
+                    + (
+                        0.0
+                        if accounting is not None
+                        else C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST
+                    )
                     if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE
                     else 0
                 )
@@ -648,6 +757,7 @@ class C_SchedulerHook(BaseHook):
                 )
                 StateManager.step_global_clock(cpu_overhead)
                 StateManager.set_last_real_time_ts(now)
+                setattr(self, _DSPARK_WALL_CREDIT, 0.0)
 
                 request_response_time = StateManager.get_global_clock()
                 # Request statistics
@@ -667,19 +777,19 @@ class C_SchedulerHook(BaseHook):
                     {
                         **(
                             {
-                                "forward_mode": C_SchedulerHook.SIMULATION_BATCH.forward_mode,
-                                "predicted_forward_latency": C_SchedulerHook.CURRENT_PREDICTED_LATENCY,
+                                "forward_mode": simulation_batch.forward_mode,
+                                "predicted_forward_latency": predicted_latency,
                             }
-                            if C_SchedulerHook.SIMULATION_BATCH.forward_mode is not None
+                            if simulation_batch.forward_mode is not None
                             else {}
                         ),
-                        "requests": C_SchedulerHook.SIMULATION_BATCH.request_info(),
+                        "requests": simulation_batch.request_info(),
                         "forward_latency": current_inference_dur,
                         "l2_load_latency": hicache_l2_load_dur,
                         "l2_blocking_wall_latency": blocked_l2_wall_dur,
                         **hicache_l2_load_stats,
                         "l2_backup_latency": hicache_l2_backup_dur,
-                        "preprocess_latency": C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST,
+                        "preprocess_latency": preprocess_duration,
                         "postprocess_latency": process_batch_result_end
                         - process_batch_result_start,
                         "cpu_overhead": cpu_overhead,
@@ -688,13 +798,35 @@ class C_SchedulerHook(BaseHook):
             else:
                 now = time.time()
                 StateManager.step_global_clock(
-                    now - StateManager.get_last_real_time_ts()
+                    max(
+                        now
+                        - StateManager.get_last_real_time_ts()
+                        - getattr(self, _DSPARK_WALL_CREDIT, 0.0),
+                        0.0,
+                    )
                 )
                 StateManager.set_last_real_time_ts(now)
+                setattr(self, _DSPARK_WALL_CREDIT, 0.0)
+
+            if accounting is not None:
+                setattr(native_result, _DSPARK_ACCOUNTED, True)
+                setattr(
+                    self,
+                    _DSPARK_PENDING_RESULTS,
+                    getattr(self, _DSPARK_PENDING_RESULTS) - 1,
+                )
 
             return ret
 
-        def override_profile(req, *args, **kwargs):
+        def override_profile(req, *args, _scheduler=None, **kwargs):
+            if getattr(_scheduler, _DSPARK_PENDING_RESULTS, 0):
+                ProfileReqOutput = importlib.import_module(
+                    "sglang.srt.managers.io_struct"
+                ).ProfileReqOutput
+                return ProfileReqOutput(
+                    success=False,
+                    message="DSPark results must drain before resetting profile accounting",
+                )
             is_start_profile = req.req_type.name == "START_PROFILE"
             stats: list[RequestStats] = []
             for item in request_stats_manager.get_all_req_stats():
@@ -788,7 +920,9 @@ class C_SchedulerHook(BaseHook):
             if _request_dispatcher is not None:
                 for ty in _request_dispatcher._mapping.keys():
                     if ty.__name__ == "ProfileReq":
-                        _request_dispatcher._mapping[ty] = override_profile
+                        _request_dispatcher._mapping[ty] = partial(
+                            override_profile, _scheduler=self
+                        )
             return ret
 
         def wrapped_on_idle(self, *args, **kwargs):

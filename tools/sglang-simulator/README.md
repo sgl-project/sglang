@@ -666,6 +666,14 @@ Before-work capture, database lookup, synthetic result construction, publication
 and history bookkeeping therefore do not add host-dependent emulator time to a
 complete modeled worker duration.
 
+The ordinary scheduler path binds DSPark shape and timing accounting to the exact
+returned result. Offline accounting excludes replacement-worker wall time once
+in the host interval containing its launches, including multiple launches before
+result processing. Pending results must drain before profiling resets accounting.
+Coordinator delegation retains its existing clock contract; this change does not
+enable overlap. SGLang Simulator owns scheduling, batching, cache/lifecycle behavior
+and virtual time; InferCast supplies cost queries and performance interpolation.
+
 `simulation.sglang.dspark_reference.DSparkReferenceLedger` provides an explicit,
 immutable reference CPU bookkeeping seam for the source-bounded TP2/attention-DP1,
 PP1, B1-B8, Q6 path. It keeps CPU-processed committed lengths, persistent reserved

@@ -1,6 +1,7 @@
 """Exercise installed scheduler hooks without importing the GPU runtime."""
 
 import importlib
+from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 
 import pytest
@@ -72,8 +73,10 @@ def hooked_scheduler(monkeypatch):
                 self.after_forward(batch, result)
             return result
 
-        def process_batch_result(self, batch):
+        def process_batch_result(self, batch, result=None):
             advance(0.01)
+            if getattr(self, "process_error", None) is not None:
+                raise self.process_error
 
         def event_loop_normal(self):
             pass
@@ -240,6 +243,279 @@ def test_dspark_result_cannot_relabel_an_extend_batch(hooked_scheduler):
     with pytest.raises(PredictorError, match="worker mode differs"):
         test.target.run_batch(batch)
     assert StateManager.get_iteration() == 0
+
+
+def dspark_prediction(fid, *, prefixes, seconds, wall_seconds):
+    from sglang_simulator.simulation.sglang.dspark import (
+        DSparkPhaseCost,
+        DSparkStepTiming,
+    )
+    from test_dspark_step import request, session, step
+
+    before = step(
+        fid=fid,
+        requests=tuple(request(rid, prefix=prefix) for rid, prefix in prefixes),
+    )
+    prediction = session(before).predict(before)
+    return replace(
+        prediction,
+        timing=DSparkStepTiming(
+            fid,
+            tuple(
+                DSparkPhaseCost(
+                    phase, seconds / len(before.required_phases), "CPU fixture"
+                )
+                for phase in before.required_phases
+            ),
+        ),
+        prediction_wall_seconds=wall_seconds,
+    )
+
+
+def launch_dspark(test, prediction, *, preprocess=0.0):
+    from sglang_simulator.simulation.sglang.dspark import STEP_ATTRIBUTE
+
+    test.predictor.supports_dspark = True
+    group = prediction.local_group
+    batch = make_batch(group.requests[0].rid)
+    batch.forward_mode.name = "DECODE"
+    batch.reqs = [
+        SimpleNamespace(rid=request.rid, output_ids=[9]) for request in group.requests
+    ]
+
+    def attach(batch, native_result):
+        test.clock.now += prediction.prediction_wall_seconds
+        setattr(native_result, STEP_ATTRIBUTE, prediction)
+
+    test.target.after_forward = attach
+    test.hook.GET_NEW_BATCH_PREFILL_TIME_COST = preprocess
+    for request in group.requests:
+        scheduler.request_stats_manager.get_req_stats(request.rid).last_event_time = 100
+    return batch, test.target.run_batch(batch)
+
+
+@pytest.mark.parametrize("launch_both_first", [False, True])
+def test_dspark_processing_uses_each_result_and_excludes_each_launch_wall_once(
+    hooked_scheduler, launch_both_first
+):
+    test = hooked_scheduler
+    first = dspark_prediction(0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3)
+    second = dspark_prediction(
+        1, prefixes=(("b", 1024), ("c", 2048)), seconds=0.15, wall_seconds=0.7
+    )
+    batch0, result0 = launch_dspark(test, first, preprocess=0.02)
+    if not launch_both_first:
+        test.target.process_batch_result(batch0, result0)
+    batch1, result1 = launch_dspark(test, second, preprocess=0.07)
+    if launch_both_first:
+        test.hook.CURRENT_PREDICTED_LATENCY = 99
+        test.hook.CURRENT_PREDICTOR_TIME_COST = 99
+        test.hook.SIMULATION_BATCH = None
+        test.hook.GET_NEW_BATCH_PREFILL_TIME_COST = 99
+        test.target.process_batch_result(batch0, result0)
+    test.target.process_batch_result(batch1, result1)
+
+    first_stats, second_stats = test.hook.ITERATION_STATS
+    assert first_stats["requests"] == [[6, 512]]
+    assert second_stats["requests"] == [[6, 1024], [6, 2048]]
+    assert (
+        first_stats["forward_mode"] == second_stats["forward_mode"] == "TARGET_VERIFY"
+    )
+    assert first_stats["predicted_forward_latency"] == pytest.approx(0.05)
+    assert second_stats["predicted_forward_latency"] == pytest.approx(0.15)
+    assert first_stats["forward_latency"] == pytest.approx(0.05)
+    assert second_stats["forward_latency"] == pytest.approx(0.15)
+    assert first_stats["preprocess_latency"] == pytest.approx(0.02)
+    assert second_stats["preprocess_latency"] == pytest.approx(0.07)
+    assert [row["cpu_overhead"] for row in test.hook.ITERATION_STATS] == pytest.approx(
+        [0.41, 0.01] if launch_both_first else [0.21, 0.21]
+    )
+    assert StateManager.get_global_clock() == pytest.approx(100.62)
+    assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT) == 0
+    assert test.hook.TOTAL_PREDICTOR_TIME_COST == pytest.approx(1.0)
+    assert not hasattr(test.predictor, "last_batch")
+    assert getattr(result0, scheduler._DSPARK_ACCOUNTING).prediction is first
+    with pytest.raises(FrozenInstanceError):
+        getattr(result0, scheduler._DSPARK_ACCOUNTING).forward_duration = 5
+
+
+@pytest.mark.parametrize("change", ["order", "mode", "prediction", "accounting"])
+def test_dspark_process_revalidates_exact_result_and_ordered_batch_before_processing(
+    hooked_scheduler, change
+):
+    from sglang_simulator.simulation.sglang.dspark import STEP_ATTRIBUTE
+
+    test = hooked_scheduler
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512), ("b", 1024)), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    if change == "order":
+        batch.reqs.reverse()
+    elif change == "mode":
+        batch.forward_mode.name = "EXTEND"
+    elif change == "prediction":
+        setattr(result, STEP_ATTRIBUTE, replace(prediction))
+    else:
+        delattr(result, scheduler._DSPARK_ACCOUNTING)
+    now = test.clock.now
+    with pytest.raises(PredictorError):
+        test.target.process_batch_result(batch, result)
+    assert test.clock.now == now
+    assert test.hook.ITERATION_STATS == []
+    assert StateManager.get_global_clock() == 100
+
+
+def test_dspark_result_accounting_cannot_be_consumed_twice(hooked_scheduler):
+    test = hooked_scheduler
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    test.target.process_batch_result(batch, result=result)
+    now = test.clock.now
+    with pytest.raises(PredictorError, match="already consumed"):
+        test.target.process_batch_result(batch, result)
+    assert test.clock.now == now
+    assert len(test.hook.ITERATION_STATS) == 1
+
+
+def test_dspark_failed_native_processing_preserves_unconsumed_accounting(
+    hooked_scheduler,
+):
+    test = hooked_scheduler
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    test.target.process_error = RuntimeError("native processing failed")
+    with pytest.raises(RuntimeError, match="native processing failed"):
+        test.target.process_batch_result(batch, result)
+    assert getattr(result, scheduler._DSPARK_ACCOUNTED) is False
+    assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT) == pytest.approx(0.3)
+    assert test.hook.ITERATION_STATS == []
+    assert StateManager.get_global_clock() == 100
+
+
+def test_dspark_coordinator_processing_keeps_existing_delegation(hooked_scheduler):
+    test = hooked_scheduler
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    observed = []
+
+    def process(actual_batch, actual_result, *, process):
+        observed.append((actual_batch, actual_result))
+        process()
+        return "coordinator result"
+
+    test.hook.COORDINATOR = SimpleNamespace(process_batch_result=process)
+    assert test.target.process_batch_result(batch, result) == "coordinator result"
+    assert observed == [(batch, result)]
+    assert test.hook.ITERATION_STATS == []
+    assert getattr(result, scheduler._DSPARK_ACCOUNTED) is False
+    assert StateManager.get_global_clock() == 100
+
+
+def test_dspark_result_cannot_be_processed_by_a_different_scheduler(hooked_scheduler):
+    test = hooked_scheduler
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    other = type(test.target).__new__(type(test.target))
+    with pytest.raises(PredictorError, match="accounting"):
+        other.process_batch_result(batch, result)
+    assert getattr(test.target, scheduler._DSPARK_PENDING_RESULTS) == 1
+    assert getattr(result, scheduler._DSPARK_ACCOUNTED) is False
+
+
+def mock_profile_output(monkeypatch):
+    original_import = importlib.import_module
+    monkeypatch.setattr(
+        scheduler.importlib,
+        "import_module",
+        lambda name: (
+            SimpleNamespace(ProfileReqOutput=SimpleNamespace)
+            if name == "sglang.srt.managers.io_struct"
+            else original_import(name)
+        ),
+    )
+
+
+def test_dspark_profile_reset_requires_pending_results_to_drain(
+    hooked_scheduler, monkeypatch, tmp_path
+):
+    test = hooked_scheduler
+    mock_profile_output(monkeypatch)
+    monkeypatch.setattr(
+        scheduler.Envs, "output_dir", classmethod(lambda cls: str(tmp_path))
+    )
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    profile = next(iter(test.target._request_dispatcher._mapping.values()))
+    rejected = profile(test.profile_req)
+    assert rejected.success is False
+    assert "must drain" in rejected.message
+    assert StateManager.get_global_clock() == 100
+    assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT) == pytest.approx(0.3)
+    assert not list(tmp_path.iterdir())
+
+    test.target.process_batch_result(batch, result)
+    assert getattr(test.target, scheduler._DSPARK_PENDING_RESULTS) == 0
+    assert profile(test.profile_req).success is True
+    assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT) == 0
+
+
+def test_coordinator_active_at_dspark_launch_does_not_register_local_accounting(
+    hooked_scheduler, monkeypatch, tmp_path
+):
+    test = hooked_scheduler
+    mock_profile_output(monkeypatch)
+    monkeypatch.setattr(
+        scheduler.Envs, "output_dir", classmethod(lambda cls: str(tmp_path))
+    )
+    observed = []
+
+    def process(batch, result, *, process):
+        observed.append((batch, result, StateManager.get_current_inference_dur()))
+        value = process()
+        for req in batch.reqs:
+            scheduler.request_stats_manager.get_req_stats(
+                req.rid
+            ).gen_token_latencies = [0.05]
+        return value
+
+    test.hook.COORDINATOR = SimpleNamespace(process_batch_result=process)
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    test.target.process_batch_result(batch, result)
+    assert observed == [(batch, result, pytest.approx(0.05))]
+    assert getattr(test.target, scheduler._DSPARK_PENDING_RESULTS, 0) == 0
+    assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT, 0) == 0
+    assert test.hook.ITERATION_STATS == []
+    profile = next(iter(test.target._request_dispatcher._mapping.values()))
+    assert profile(test.profile_req).success is True
+
+
+def test_dspark_blocking_keeps_native_host_time_in_result_duration(hooked_scheduler):
+    test = hooked_scheduler
+    test.hook.SIM_MODE = SimulationMode.BLOCKING
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    test.target.process_batch_result(batch, result)
+    stats = test.hook.ITERATION_STATS[-1]
+    assert stats["forward_latency"] == pytest.approx(0.55)
+    assert stats["cpu_overhead"] == pytest.approx(0.01)
+    assert StateManager.get_global_clock() == pytest.approx(100.56)
+    assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT, 0) == 0
 
 
 @pytest.mark.parametrize("snapshot", [None, object()])
