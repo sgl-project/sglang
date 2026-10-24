@@ -3915,10 +3915,23 @@ class TestGrpcServerArgs(CustomTestCase):
         with self.assertRaises(ValueError):
             handle_deprecated_args(sa)
 
-    def test_native_grpc_rejects_http_auth(self):
+    def test_native_grpc_accepts_api_key(self):
         sa = self._args(grpc_port=40000, api_key="secret")
-        with self.assertRaises(ValueError):
+        handle_deprecated_args(sa)
+        self.assertEqual(sa.api_key, "secret")
+
+    def test_native_grpc_accepts_separate_admin_permissions(self):
+        for api_key in (None, "secret"):
+            sa = self._args(grpc_port=40000, api_key=api_key, admin_api_key="admin")
             handle_deprecated_args(sa)
+            self.assertEqual(sa.admin_api_key, "admin")
+
+    def test_rust_server_does_not_bypass_native_grpc_auth(self):
+        for keys in ({"api_key": "secret"}, {"admin_api_key": "admin"}):
+            sa = self._args(grpc_port=40000, **keys)
+            with envs.SGLANG_RUST_SERVER.override(True):
+                with self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"):
+                    handle_deprecated_args(sa)
 
     def test_invalid_grpc_worker_threads_rejected(self):
         sa = self._args(grpc_port=40000)
@@ -3960,6 +3973,8 @@ class TestGrpcServerArgs(CustomTestCase):
             grpc_port=50051,
             grpc_worker_threads=4,
             grpc_response_timeout_secs=1800,
+            api_key="leader-key",
+            admin_api_key="leader-admin-key",
         )
         server_args = override.install()
         self.addCleanup(override.restore)
@@ -3991,10 +4006,14 @@ class TestGrpcServerArgs(CustomTestCase):
                 "runtime_handle",
                 "worker_threads",
                 "response_timeout_secs",
+                "api_key",
+                "admin_api_key",
             },
         )
         self.assertEqual(kwargs["worker_threads"], 4)
         self.assertEqual(kwargs["response_timeout_secs"], 1800)
+        self.assertEqual(kwargs["api_key"], "leader-key")
+        self.assertEqual(kwargs["admin_api_key"], "leader-admin-key")
         self.assertNotIn("max_prefill_tokens", kwargs)
 
 

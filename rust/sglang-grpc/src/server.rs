@@ -1105,18 +1105,15 @@ pub enum ServerMode {
 }
 
 /// Start the Tonic gRPC server on the given address.
-//
-// TODO(grpc-auth): this listener is currently unauthenticated. Before exposing
-// it in any default deploy path, gate it with the same API-key / admin-key
-// checks the HTTP server applies (see issue tracking gRPC auth parity).
 pub async fn run_grpc_server(
     listener: std::net::TcpListener,
     mode: ServerMode,
     shutdown: Arc<Notify>,
+    auth: crate::auth::ApiKeyAuth,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (bridge, response_timeout) = match mode {
         ServerMode::Metadata(service) => {
-            return serve_grpc(listener, service, shutdown, None).await;
+            return serve_grpc(listener, service, shutdown, None, auth).await;
         }
         ServerMode::Inference {
             bridge,
@@ -1143,7 +1140,7 @@ pub async fn run_grpc_server(
         }
     });
 
-    let result = serve_grpc(listener, service, shutdown, Some(stream_shutdown_tx)).await;
+    let result = serve_grpc(listener, service, shutdown, Some(stream_shutdown_tx), auth).await;
     monitor.abort();
     result
 }
@@ -1153,6 +1150,7 @@ async fn serve_grpc(
     service: impl proto::sglang_service_server::SglangService,
     shutdown: Arc<Notify>,
     stream_shutdown: Option<watch::Sender<bool>>,
+    auth: crate::auth::ApiKeyAuth,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = listener.local_addr()?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -1164,7 +1162,7 @@ async fn serve_grpc(
     tracing::info!("gRPC server listening on {}", addr);
 
     let result = tonic::transport::Server::builder()
-        .add_service(svc)
+        .add_service(crate::auth::AuthService::new(svc, auth))
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.notified().await;
             if let Some(stream_shutdown) = stream_shutdown {
