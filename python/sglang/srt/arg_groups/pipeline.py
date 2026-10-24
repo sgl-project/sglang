@@ -348,6 +348,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Apply model-capability constraints after backend selection.
     run_hook(handle_model_capability_adjustments, server_args)
 
+    # Model capabilities can disable radix cache after the initial cache gate.
+    # Revalidate the final combination before constructing a storage backend.
+    run_hook(handle_cache_compatibility, server_args)
+
     # needs the resolved CUDA-graph, attention-backend and speculative settings
     from sglang.srt.kernel_plugins.amd.binding import (
         handle_amd_monokernel,
