@@ -14,6 +14,7 @@ import torch
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
@@ -39,6 +40,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
+    ExternalCachePrefetchParams,
     LayerWiseLoadCounter,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
@@ -109,6 +111,31 @@ class _FakeLinker(UnifiedCacheLinker):
 
     def close(self):
         self.closed = True
+
+
+class _AsyncFakeLinker(_FakeLinker):
+    def __init__(self):
+        super().__init__()
+        self.prefetch_params = {}
+        self.prefetch_results = {}
+        self.cancelled_prefetches = []
+
+    def support_prefetch(self):
+        return True
+
+    def prefetch(self, params):
+        self.prefetch_params[params.rid] = params
+        return True
+
+    def poll_prefetch(self, rid):
+        return self.prefetch_results.get(rid)
+
+    def cancel_prefetch(self, rid):
+        self.prefetch_params.pop(rid, None)
+        self.cancelled_prefetches.append(rid)
+
+    def lookup(self, rid, transfers):
+        raise AssertionError("asynchronous prefetch must replace synchronous lookup")
 
 
 class _MappingRecorder:
@@ -1413,6 +1440,75 @@ def full_linker_component():
             transfer
         ),
     )
+
+
+def test_linker_prefetch_defaults_are_noops():
+    backend = _FakeLinker()
+    params = ExternalCachePrefetchParams(
+        rid="rid",
+        key=RadixKey(array("q", [1, 2])),
+        device_hit_len=0,
+        last_hash=None,
+    )
+
+    assert not backend.support_prefetch()
+    assert not backend.prefetch(params)
+    assert backend.poll_prefetch("rid") == []
+    assert backend.cancel_prefetch("rid") is None
+
+
+def test_async_prefetch_defers_remote_lookup_until_admission(
+    full_linker_component,
+):
+    full = full_linker_component
+    cache = _cache_for_wrapper(
+        _components_tuple=(full,),
+        components={ComponentType.FULL: full},
+        page_size=2,
+        tree_core=SimpleNamespace(
+            enable_external_cache_linker=False,
+            is_eagle=False,
+            prefetch_anchor_info=lambda node_id: (None, None),
+        ),
+        _all_reduce_attn_groups=lambda value, op: None,
+        prefetch_loaded_tokens_by_reqid={},
+        prefetch_loaded_storage_start_by_reqid={},
+    )
+    backend = _AsyncFakeLinker()
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
+    handle = CacheRequestHandle("rid", 0)
+
+    wrapper.prefetch_from_storage(
+        handle,
+        last_host_node_id=0,
+        new_input_tokens=[1, 2, 3, 4],
+        last_hash=None,
+        matched_prefix_tokens=[],
+        extra_key=None,
+        cache_salt=None,
+    )
+    assert "rid" in backend.prefetch_params
+    assert not wrapper.check_prefetch_progress(handle)
+
+    backend.prefetch_results["rid"] = [1, 2]
+    assert wrapper.check_prefetch_progress(handle)
+    assert not cache.prefetch_loaded_tokens_by_reqid
+    assert not cache.prefetch_loaded_storage_start_by_reqid
+
+    result = MatchResult(
+        device_prefix_len=0,
+        last_device_node=0,
+        last_host_node=0,
+        best_match_node=0,
+    )
+    matched = wrapper.match(
+        RadixKey(array("q", [1, 2, 3, 4])),
+        SimpleNamespace(rid="rid"),
+        result,
+    )
+    assert matched.host_hit_length == 4
+    assert wrapper.hit_markers["rid"].tail_hashes
+    assert "rid" not in wrapper.prefetches
 
 
 def test_linker_filters_unstored_swa_from_lookup(full_linker_component):

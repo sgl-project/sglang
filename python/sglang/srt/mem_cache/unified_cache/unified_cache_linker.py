@@ -12,6 +12,8 @@ each backend owns its device-pool layout and physical I/O.
 The tree only needs a handful of guarded hooks:
 
 * ``match_prefix``      -> :meth:`UnifiedCacheLinkerWrapper.match`
+* ``prefetch_from_storage``
+  -> :meth:`UnifiedCacheLinkerWrapper.prefetch_from_storage`
 * ``init_load_back``    -> :meth:`UnifiedCacheLinkerWrapper.load_back`
 * ``BackupKV`` actions  -> :meth:`UnifiedCacheLinkerWrapper.offload_nodes`
 
@@ -24,13 +26,16 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from array import array
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
     DecLockRefParams,
     MatchResult,
 )
@@ -130,6 +135,16 @@ class LayerWiseLoadCounter:
         self.futures.clear()
 
 
+@dataclass(frozen=True)
+class ExternalCachePrefetchParams:
+    """Request metadata needed by an asynchronous external-cache lookup."""
+
+    rid: str
+    key: RadixKey
+    device_hit_len: int
+    last_hash: Optional[str]
+
+
 class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools."""
 
@@ -154,6 +169,29 @@ class UnifiedCacheLinker(ABC):
             kv_written.record(self.forward_stream)
             events.append(kv_written)
         return events
+
+    def support_prefetch(self) -> bool:
+        """Whether this backend can run lookup/prefetch asynchronously."""
+        return False
+
+    def prefetch(self, params: ExternalCachePrefetchParams) -> bool:
+        """Submit an asynchronous prefetch operation.
+
+        An accepted operation remains cancellable until :meth:`poll_prefetch`
+        reports completion.
+        """
+        return False
+
+    def poll_prefetch(self, rid: str) -> Optional[list[int]]:
+        """Return restorable prefix lengths, or ``None`` while still pending.
+
+        Returning a result completes the prefetch operation. The prefetched
+        data may subsequently be consumed by :meth:`load`.
+        """
+        return []
+
+    def cancel_prefetch(self, rid: str) -> None:
+        """Cancel an in-flight prefetch operation."""
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -222,6 +260,12 @@ class ExternalCacheHitMarker(NamedTuple):
     device_hit_len: int
 
 
+@dataclass
+class _ExternalCachePrefetch:
+    params: ExternalCachePrefetchParams
+    result: Optional[list[int]] = None
+
+
 class _PendingOffload(NamedTuple):
     lock_node_id: NodeId
     lock_params: DecLockRefParams
@@ -258,6 +302,8 @@ class UnifiedCacheLinkerWrapper:
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
+        # Asynchronous lookup/prefetch state, retained until the second match.
+        self.prefetches: dict[str, _ExternalCachePrefetch] = {}
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -277,6 +323,9 @@ class UnifiedCacheLinkerWrapper:
     def has_hit(self, rid: str) -> bool:
         return rid in self.hit_markers
 
+    def support_prefetch(self) -> bool:
+        return self.cache_linker.support_prefetch()
+
     # ---- match: probe the remote store and report host_hit_length ----
 
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
@@ -285,43 +334,86 @@ class UnifiedCacheLinkerWrapper:
         page = cache.page_size
         device_hit_len = result.device_prefix_len
         if device_hit_len >= len(key):
+            self.prefetches.pop(req.rid, None)
+            self.hit_markers.pop(req.rid, None)
+            req.storage_hit_length = 0
+            req.storage_hit_start = None
             return result
 
-        tail_hashes = self._tail_hashes(key, result, device_hit_len)
-        if not tail_hashes:
-            return result
-
-        lookup_transfers = []
-        for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, tail_hashes
-            )
-            if transfer is None:
+        if self.support_prefetch():
+            state = self.prefetches.pop(req.rid, None)
+            if state is None or state.result is None:
+                req.storage_hit_length = 0
+                req.storage_hit_start = None
+                self.hit_markers.pop(req.rid, None)
                 return result
-            lookup_transfers.append(transfer)
-        by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
-        # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
-        )
-        if hit_pages == 0:
-            return result
-        hit_tokens = hit_pages * page
+            params = state.params
+            hit_pages = max(state.result)
+            external_end = params.device_hit_len + hit_pages * page
+            if device_hit_len < params.device_hit_len or device_hit_len >= external_end:
+                req.storage_hit_length = 0
+                req.storage_hit_start = None
+                self.hit_markers.pop(req.rid, None)
+                return result
 
-        swa_transfer = by_pool.get(PoolName.SWA)
-        swa_host_hit_length = (
-            min(len(swa_transfer.keys), hit_pages) * page
-            if swa_transfer is not None
-            else 0
-        )
-        # Mamba keeps a single state slot per node, so a hit is worth one slot.
-        mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
+            skip_pages = (device_hit_len - params.device_hit_len) // page
+            all_tail_hashes = get_storage_hash_str(
+                params.key[params.device_hit_len : external_end],
+                params.last_hash,
+                page_size=page,
+            )
+            tail_hashes = all_tail_hashes[skip_pages:hit_pages]
+            req.storage_hit_length = len(tail_hashes) * page
+            req.storage_hit_start = device_hit_len
 
+            has_swa = any(
+                component.component_type == ComponentType.SWA
+                for component in self._components
+            )
+            swa_host_hit_length = 0
+            if has_swa:
+                sliding_window_size = self.cache.sliding_window_size
+                assert sliding_window_size is not None
+                window_pages = (sliding_window_size + page - 1) // page
+                swa_host_hit_length = min(len(tail_hashes), window_pages) * page
+            mamba_host_hit_length = int(PoolName.MAMBA in self.cache_linker.pools)
+        else:
+            tail_hashes = self._tail_hashes(key, result, device_hit_len)
+            if not tail_hashes:
+                return result
+
+            lookup_transfers = []
+            for component in self._components:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, tail_hashes
+                )
+                if transfer is None:
+                    return result
+                lookup_transfers.append(transfer)
+            by_pool = {transfer.name: transfer for transfer in lookup_transfers}
+
+            # Page 0 of `tail_hashes` is the first device-uncached page.
+            hit_pages = self._sync_restorable_prefix(
+                self.cache_linker.lookup(req.rid, lookup_transfers),
+                num_pages=len(tail_hashes),
+                device_hit_pages=0,
+            )
+            if hit_pages == 0:
+                return result
+            tail_hashes = tail_hashes[:hit_pages]
+            swa_transfer = by_pool.get(PoolName.SWA)
+            swa_host_hit_length = (
+                min(len(swa_transfer.keys), hit_pages) * page
+                if swa_transfer is not None
+                else 0
+            )
+            # Mamba keeps a single state slot per node, so a hit is worth one slot.
+            mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
+
+        hit_tokens = len(tail_hashes) * page
         self.hit_markers[req.rid] = ExternalCacheHitMarker(
-            tail_hashes=list(tail_hashes[:hit_pages]),
+            tail_hashes=list(tail_hashes),
             device_hit_len=device_hit_len,
         )
         return result._replace(
@@ -332,6 +424,104 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    # ---- prefetch from storage ----
+
+    def prefetch_from_storage(
+        self,
+        request: CacheRequestHandle,
+        last_host_node_id: NodeId,
+        new_input_tokens: list[int],
+        last_hash: Optional[str],
+        matched_prefix_tokens: Optional[list[int]],
+        extra_key: Optional[str],
+        cache_salt: Optional[str],
+    ) -> None:
+        """Submit the asynchronous external lookup performed before admission."""
+        if request.rid in self.prefetches:
+            return
+
+        local_tokens = list(matched_prefix_tokens or ())
+        token_ids = local_tokens + list(new_input_tokens)
+        anchor_extra_key, anchor_cache_salt = self.cache.tree_core.prefetch_anchor_info(
+            last_host_node_id
+        )
+        key = RadixKey(
+            array("q", token_ids),
+            extra_key=extra_key if extra_key is not None else anchor_extra_key,
+            is_bigram=self.cache.tree_core.is_eagle,
+            cache_salt=cache_salt if cache_salt is not None else anchor_cache_salt,
+        ).page_aligned(self.cache.page_size)
+        device_hit_len = min(len(local_tokens), len(key))
+        if len(key) <= device_hit_len or (device_hit_len > 0 and last_hash is None):
+            return
+
+        params = ExternalCachePrefetchParams(
+            rid=request.rid,
+            key=key,
+            device_hit_len=device_hit_len,
+            last_hash=last_hash,
+        )
+        try:
+            submitted = self.cache_linker.prefetch(params)
+        except Exception:
+            logger.warning(
+                "External linker prefetch submission failed for %s",
+                request.rid,
+                exc_info=True,
+            )
+            submitted = False
+        accepted = torch.tensor([int(submitted)], dtype=torch.int, device="cpu")
+        self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
+        if not bool(accepted.item()):
+            self.cache_linker.cancel_prefetch(request.rid)
+            return
+        self.prefetches[request.rid] = _ExternalCachePrefetch(params=params)
+
+    def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        state = self.prefetches.get(request.rid)
+        if state is None:
+            return True
+
+        if state.result is None:
+            try:
+                result = self.cache_linker.poll_prefetch(request.rid)
+            except Exception:
+                logger.warning(
+                    "External linker prefetch polling failed for %s",
+                    request.rid,
+                    exc_info=True,
+                )
+                result = []
+            if result is not None:
+                state.result = list(result)
+
+        ready = torch.tensor(
+            [int(state.result is not None)], dtype=torch.int, device="cpu"
+        )
+        self.cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
+        if not bool(ready.item()):
+            return False
+
+        candidate_pages = (
+            len(state.params.key) - state.params.device_hit_len
+        ) // self.cache.page_size
+        hit_pages = self._sync_restorable_prefix(
+            state.result or [],
+            num_pages=candidate_pages,
+            device_hit_pages=0,
+        )
+        if hit_pages == 0:
+            self.prefetches.pop(request.rid, None)
+            return True
+
+        state.result = [hit_pages]
+        return True
+
+    def _cancel_prefetch(self, rid: str) -> None:
+        state = self.prefetches.pop(rid, None)
+        if state is not None and state.result is None:
+            self.cache_linker.cancel_prefetch(rid)
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -583,6 +773,7 @@ class UnifiedCacheLinkerWrapper:
     def reset(self) -> None:
         self.cache_linker.reset()
         self.hit_markers.clear()
+        self.prefetches.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
         self.inflight_load_index = -1
@@ -598,6 +789,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, rid: str) -> None:
         self.hit_markers.pop(rid, None)
+        self._cancel_prefetch(rid)
         # A queued load targets slots the request owns and is about to free.
         # A started one is finished by finish_loads before anything is freed.
         if rid in self.inflight_load_rids and self.cache_linker.cancel_queued_load(rid):

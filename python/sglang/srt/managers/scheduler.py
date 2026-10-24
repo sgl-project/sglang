@@ -3304,9 +3304,17 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
-        if self.enable_hicache_storage or self.enable_lmcache:
+        tree_cache = self.tree_cache
+        external_linker_prefetch = (
+            self.enable_unified_cache_external_linker
+            and tree_cache.linker.support_prefetch()
+        )
+        if (
+            self.enable_hicache_storage
+            or self.enable_lmcache
+            or external_linker_prefetch
+        ):
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            tree_cache = self.tree_cache
             buffer_mode = get_memory().hicache_host_memory_mode == "buffer_only"
             last_host_node = req.last_host_node
             # Buffer mode host-backups nothing, so match_prefix anchors at
@@ -3328,6 +3336,7 @@ class Scheduler(
             if (
                 tree_cache.is_backuped(last_host_node)
                 or tree_cache.is_root(last_host_node)
+                or external_linker_prefetch
                 or (
                     buffer_mode
                     and tree_cache.get_last_hash_value(last_host_node) is not None
@@ -4201,7 +4210,14 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage or self.enable_lmcache:
+            if (
+                self.enable_hicache_storage
+                or self.enable_lmcache
+                or (
+                    self.enable_unified_cache_external_linker
+                    and self.tree_cache.linker.support_prefetch()
+                )
+            ):
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )

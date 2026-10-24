@@ -2076,6 +2076,17 @@ class UnifiedRadixCache(BasePrefixCache):
         cache_salt: Optional[str] = None,
         storage_hit_end: Optional[int] = None,
     ) -> Optional[bool]:
+        if self.linker is not None and self.linker.support_prefetch():
+            self.linker.prefetch_from_storage(
+                request,
+                last_host_node_id,
+                new_input_tokens,
+                last_hash,
+                matched_prefix_tokens,
+                extra_key,
+                cache_salt,
+            )
+            return None
         if not self.enable_storage or self.cache_controller is None:
             return
 
@@ -2375,6 +2386,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
+        if self.linker is not None and self.linker.support_prefetch():
+            return self.linker.check_prefetch_progress(request)
         if (
             self.cache_controller is not None
             and self.cache_controller.pp_prefetch_decisions.get(request.rid)
