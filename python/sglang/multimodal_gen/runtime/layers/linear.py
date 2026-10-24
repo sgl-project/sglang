@@ -39,6 +39,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # yapf: enable
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+from sglang.srt.utils import is_gfx1250_supported
+from sglang.srt.utils.custom_op import register_custom_op
 
 logger = init_logger(__name__)
 
@@ -46,8 +48,77 @@ IS_AMP_SUPPORTED = current_platform.is_amp_supported()
 _USE_AITER_TGEMM = current_platform.is_rocm() and envs.SGLANG_USE_ROCM_AITER_TGEMM
 if _USE_AITER_TGEMM:
     from aiter.tuned_gemm import tgemm
-# aiter gemm_a16w16 kernels index operands with int32 offsets and fault beyond this.
-_AITER_TGEMM_MAX_NUMEL = 2**31
+_IS_GFX1250_TGEMM = _USE_AITER_TGEMM and is_gfx1250_supported()
+
+
+def _aiter_tgemm_max_numel() -> int:
+    # aiter gemm_a16w16 kernels index operands with int32 offsets and fault beyond this.
+    # On gfx1250 the offset is in bytes and output rows past 2**31 bytes come back
+    # wrong (no fault), so the 16-bit element bound there is 2**30.
+    return 2**30 if _IS_GFX1250_TGEMM else 2**31
+
+
+# On gfx1250 the FlyDSL a16w16 GEMM indexes through TDM descriptors (no int32 byte
+# limit) and beats tgemm's gluon kernel by 7-18% on large-M DiT linears.
+_USE_FLYDSL_GFX1250_GEMM = _IS_GFX1250_TGEMM
+if _USE_FLYDSL_GFX1250_GEMM:
+    from aiter.ops.flydsl.gemm_a16w16_gfx1250 import (
+        gemm_a16w16 as flydsl_gemm_a16w16_gfx1250,
+    )
+# Tile config swept at Wan2.2 shapes (M=90000, N/K in {5120, 13824}).
+_FLYDSL_GFX1250_TILE_M, _FLYDSL_GFX1250_TILE_N, _FLYDSL_GFX1250_TILE_K = 256, 256, 64
+_FLYDSL_GFX1250_NUM_BUFFERS = 4
+_FLYDSL_GFX1250_MIN_M = 4096
+
+
+def _flydsl_gfx1250_linear_fake(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]))
+
+
+@register_custom_op(
+    op_name="diffusion_flydsl_gfx1250_linear",
+    mutates_args=[],
+    fake_impl=_flydsl_gfx1250_linear_fake,
+)
+def _flydsl_gfx1250_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    # Opaque custom op: FlyDSL's JIT reads thread-local MLIR state Dynamo can't trace.
+    return flydsl_gemm_a16w16_gfx1250(
+        x,
+        weight,
+        bias,
+        dtype=x.dtype,
+        tile_m=_FLYDSL_GFX1250_TILE_M,
+        tile_n=_FLYDSL_GFX1250_TILE_N,
+        tile_k=_FLYDSL_GFX1250_TILE_K,
+        m_warp=2,
+        n_warp=4,
+        num_buffers=_FLYDSL_GFX1250_NUM_BUFFERS,
+        variant="compute_bound",
+    )
+
+
+def _can_use_flydsl_gfx1250_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> bool:
+    n, k = weight.shape
+    return (
+        _USE_FLYDSL_GFX1250_GEMM
+        and x.dtype == torch.bfloat16
+        and weight.dtype == x.dtype
+        and (bias is None or bias.dtype == x.dtype)
+        and x.numel() // k >= _FLYDSL_GFX1250_MIN_M
+        and n % _FLYDSL_GFX1250_TILE_N == 0
+        and k % _FLYDSL_GFX1250_TILE_K == 0
+        and k // _FLYDSL_GFX1250_TILE_K >= _FLYDSL_GFX1250_NUM_BUFFERS
+        and x.stride(-1) == 1
+        and weight.is_contiguous()
+    )
+
+
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
     "AWQMarlinLinearMethod",
@@ -178,13 +249,17 @@ def apply_unquantized_linear(
             None if bias is None else bias.to(torch.float32),
         ).to(x.dtype)
 
+    if _can_use_flydsl_gfx1250_linear(x, weight, bias):
+        out = _flydsl_gfx1250_linear(x.reshape(-1, x.shape[-1]), weight, bias)
+        return out.view(*x.shape[:-1], weight.shape[0])
+
     if (
         _USE_AITER_TGEMM
         and x.dtype in (torch.bfloat16, torch.float16)
         and weight.dtype == x.dtype
         and (bias is None or bias.dtype == x.dtype)
-        and x.numel() < _AITER_TGEMM_MAX_NUMEL
-        and x.numel() // x.shape[-1] * weight.shape[0] < _AITER_TGEMM_MAX_NUMEL
+        and x.numel() < _aiter_tgemm_max_numel()
+        and x.numel() // x.shape[-1] * weight.shape[0] < _aiter_tgemm_max_numel()
     ):
         return tgemm.mm(x, weight, bias)
 
