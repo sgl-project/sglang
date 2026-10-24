@@ -889,5 +889,84 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
         self.assertEqual(items[0]["arguments"], '{"city": "Beijing"}')
 
 
+class HarmonyUsageCountersTestCase(CustomTestCase):
+    """Regression tests for #45186: streaming /v1/responses with the gpt-oss
+    harmony parser reported zero token usage because
+    StreamingHarmonyContext.append_output never updated the counters that
+    responses_full_generator reads for the terminal response.completed
+    event."""
+
+    def _make_context(self):
+        from sglang.srt.entrypoints.context import StreamingHarmonyContext
+
+        parser = SimpleNamespace(messages=[], process=lambda tok: None)
+        encoding = SimpleNamespace(render=lambda msg: [42])
+        with (
+            patch(
+                "sglang.srt.entrypoints.context.get_streamable_parser_for_assistant",
+                return_value=parser,
+            ),
+            patch(
+                "sglang.srt.entrypoints.context.get_encoding",
+                return_value=encoding,
+            ),
+        ):
+            return StreamingHarmonyContext(messages=[], tool_sessions={})
+
+    @staticmethod
+    def _chunk(
+        output_ids,
+        completion_tokens,
+        prompt_tokens=5,
+        cached_tokens=1,
+        finish_reason=None,
+    ):
+        meta_info = {
+            "prompt_tokens": prompt_tokens,
+            "cached_tokens": cached_tokens,
+            "completion_tokens": completion_tokens,
+        }
+        if finish_reason is not None:
+            meta_info["finish_reason"] = finish_reason
+        return {"output_ids": output_ids, "meta_info": meta_info}
+
+    def test_counters_follow_cumulative_completion_tokens(self):
+        context = self._make_context()
+        context.append_output(self._chunk([11], 1))
+        context.append_output(self._chunk([11, 12], 2))
+        context.append_output(
+            self._chunk([11, 12, 13], 3, finish_reason={"type": "stop"})
+        )
+        self.assertEqual(context.num_prompt_tokens, 5)
+        self.assertEqual(context.num_cached_tokens, 1)
+        # completion_tokens is cumulative per chunk: 3 total, not 1+2+3.
+        self.assertEqual(context.num_output_tokens, 3)
+        self.assertEqual(context.finish_reason, {"type": "stop"})
+
+    def test_incremental_chunks_do_not_double_count(self):
+        # With --incremental-streaming-output each chunk carries only the new
+        # tokens, but completion_tokens is still the cumulative count.
+        context = self._make_context()
+        context.append_output(self._chunk([11], 1))
+        context.append_output(self._chunk([12], 2))
+        context.append_output(self._chunk([13], 3))
+        self.assertEqual(context.num_output_tokens, 3)
+
+    def test_tool_turn_resets_chunk_baseline(self):
+        # After a builtin-tool turn, the next generation turn's chunks start
+        # their cumulative completion_tokens from zero again.
+        from openai_harmony import Role
+
+        context = self._make_context()
+        context.append_output(self._chunk([11, 12], 2))
+        tool_msg = SimpleNamespace(
+            author=SimpleNamespace(role=Role.TOOL), recipient=None
+        )
+        context.append_output([tool_msg])
+        context.append_output(self._chunk([21], 1))
+        context.append_output(self._chunk([21, 22], 2))
+        self.assertEqual(context.num_output_tokens, 4)
+
+
 if __name__ == "__main__":
     unittest.main()
