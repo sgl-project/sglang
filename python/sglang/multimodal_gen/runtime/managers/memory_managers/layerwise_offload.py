@@ -2776,7 +2776,7 @@ class LayerwiseOffloadManager:
         strided: Dict[str, torch.Tensor] = {}
         for name, source in self._strided_cpu_weights.get(layer_idx, {}).items():
             target = (
-                _pinned_empty(*source.shape, dtype=source.dtype, stride=source.stride())
+                _pinned_empty(source.shape, dtype=source.dtype, stride=source.stride())
                 if pinned
                 else torch.empty_strided(
                     size=source.shape, stride=source.stride(), dtype=source.dtype
