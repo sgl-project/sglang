@@ -104,6 +104,36 @@ def test_shared_modulation_and_residual_preserve_rounding(tokens, dtype):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused kernels need CUDA")
+@torch.inference_mode()
+def test_fused_qk_norm_rope_and_modulate_cast_are_bitwise_exact():
+    from sglang.multimodal_gen.runtime.models.dits import nomas_layers as layers
+
+    torch.manual_seed(3)
+    for heads, dim, tokens in ((16, 128, 2000), (16, 64, 1500)):
+        norm = layers.RMSNorm(dim).cuda().bfloat16()
+        norm.weight.normal_(1, 0.1)
+        x = torch.randn(1, tokens, heads, dim, device="cuda", dtype=torch.bfloat16) * 3
+        angles = torch.randn(tokens, dim, device="cuda")
+        freqs = (angles.cos(), angles.sin())
+        expected = layers._rotate(
+            norm(x).to(torch.bfloat16), *layers._rope_tables(x, freqs)
+        )
+        assert torch.equal(
+            layers.rms_norm_rotate(norm, x, freqs, torch.bfloat16), expected
+        )
+        assert torch.equal(
+            layers.apply_rotary_emb_single(x, freqs),
+            layers._rotate(x, *layers._rope_tables(x, freqs)),
+        )
+    x = torch.randn(1, 3000, 2048, device="cuda") * 2
+    shift, scale = torch.randn(2, 1, 2048, device="cuda", dtype=torch.bfloat16)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        fused = layers.modulate_for_linear(x, shift, scale)
+    assert fused.dtype == torch.bfloat16
+    assert torch.equal(fused, layers.modulate(x, shift, scale).to(torch.bfloat16))
+
+
 def test_segment_mask_against_independent_dense_oracle():
     torch.manual_seed(77)
     q, k, v = (torch.randn(1, n, 2, 16) for n in (16, 19, 19))

@@ -40,7 +40,6 @@ from sglang.multimodal_gen.runtime.models.dits.nomas_layers import (
     PatchEmbed,
     RMSNorm,
     TimestepEmbedder,
-    apply_rotary_emb,
     current_parallel_info,
     gated_residual,
     gather_heads,
@@ -49,7 +48,8 @@ from sglang.multimodal_gen.runtime.models.dits.nomas_layers import (
     get_rotary_pos_embed_with_offset,
     heads_to_seq,
     local_token_range,
-    modulate,
+    modulate_for_linear,
+    rms_norm_rotate,
     seq_to_heads,
 )
 from sglang.multimodal_gen.runtime.platforms import (
@@ -146,7 +146,7 @@ class NomasDoubleStreamBlock(nn.Module):
         for stream, x in (("img", img), ("txt", txt)):
             mod = getattr(self, f"{stream}_mod")(vec).chunk(6, -1)
             mods.append(mod)
-            x = modulate(
+            x = modulate_for_linear(
                 getattr(self, f"{stream}_norm1")(x), shift=mod[0], scale=mod[1]
             )
             q, k, v = [
@@ -155,13 +155,16 @@ class NomasDoubleStreamBlock(nn.Module):
                 )
                 for name in ("q", "k", "v")
             ]
-            q = getattr(self, f"{stream}_attn_q_norm")(q).to(v)
-            k = getattr(self, f"{stream}_attn_k_norm")(k).to(v)
+            q_norm = getattr(self, f"{stream}_attn_q_norm")
+            k_norm = getattr(self, f"{stream}_attn_k_norm")
             if stream == "img":
-                q, k = apply_rotary_emb(q, k, rope)
+                # QK norm, cast and RoPE fused; values are unchanged.
+                q = rms_norm_rotate(q_norm, q, rope, v.dtype)
+                k = rms_norm_rotate(k_norm, k, rope, v.dtype)
                 # Local tokens, all heads -> all tokens, local heads.
                 q, k, v = (seq_to_heads(x, self.info) for x in (q, k, v))
             else:
+                q, k = q_norm(q).to(v), k_norm(k).to(v)
                 # Text is replicated; keep this rank's head slice.
                 lo = self.info.sp_rank * self.attn_heads
                 q, k, v = (x[:, :, lo : lo + self.attn_heads] for x in (q, k, v))
@@ -184,7 +187,7 @@ class NomasDoubleStreamBlock(nn.Module):
             x = gated_residual(
                 x,
                 getattr(self, f"{stream}_mlp")(
-                    modulate(
+                    modulate_for_linear(
                         getattr(self, f"{stream}_norm2")(x), shift=mod[3], scale=mod[4]
                     )
                 ),
@@ -221,12 +224,21 @@ class NomasCameraAttention(nn.Module):
             .view(b, frames, 2, 16, 64)
             .unbind(2)
         )
-        q, k = self.key_attn_q_norm(q).to(v), self.key_attn_k_norm(k).to(v)
         tokens = torch.arange(n, device=x.device) + token_offset
         qids = (tokens // spatial_tokens + time_offset).clamp(max=7499)
         kids = (torch.arange(frames, device=x.device) + time_offset).clamp(max=7499)
-        q, _ = apply_rotary_emb(q, q, (self.freqs_cos[qids], self.freqs_sin[qids]))
-        k, _ = apply_rotary_emb(k, k, (self.freqs_cos[kids], self.freqs_sin[kids]))
+        q = rms_norm_rotate(
+            self.key_attn_q_norm,
+            q,
+            (self.freqs_cos[qids], self.freqs_sin[qids]),
+            v.dtype,
+        )
+        k = rms_norm_rotate(
+            self.key_attn_k_norm,
+            k,
+            (self.freqs_cos[kids], self.freqs_sin[kids]),
+            v.dtype,
+        )
         chunks = []
         # Each camera chunk covers a contiguous token range; intersect with ours.
         for start in range(0, frames, self.chunk_size):

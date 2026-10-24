@@ -340,27 +340,28 @@ class NomasAttentionPlan:
         self.cu_q = torch.tensor([0, n], **int32)
         self.cu_prefix = torch.tensor([0, self.prefix_tokens], **int32)
         self.max_q = n
-        # Each action: its video window rows plus its own text rows see that text.
+        # Each action: its video window rows plus its own text rows see that
+        # text. Both are contiguous query ranges, so they are passed as views.
         self.actions = []
         for action, (start, end) in enumerate(zip(offsets or (), (offsets or ())[1:])):
             if end <= start:
                 continue
             rows = [
-                torch.arange(a * spatial_tokens, b * spatial_tokens, device=device)
+                (a * spatial_tokens, b * spatial_tokens)
                 for a, b, index in windows
                 if index == action
             ]
-            rows.append(torch.arange(video + start, video + end, device=device))
-            rows = torch.cat(rows)
-            k_start, k_end = hvis + video + start, hvis + video + end
-            self.actions.append(
+            rows.append((video + start, video + end))
+            keys = (hvis + video + start, hvis + video + end)
+            self.actions.extend(
                 (
-                    rows,
-                    k_start,
-                    k_end,
-                    torch.tensor([0, rows.numel()], **int32),
-                    torch.tensor([0, k_end - k_start], **int32),
+                    q_range,
+                    keys,
+                    torch.tensor([0, q_range[1] - q_range[0]], **int32),
+                    torch.tensor([0, keys[1] - keys[0]], **int32),
                 )
+                for q_range in rows
+                if q_range[1] > q_range[0]
             )
 
     def __call__(self, q, k, v, layer_cache=None, history_length=0):
@@ -372,18 +373,16 @@ class NomasAttentionPlan:
         if history_length != self.history_length:
             raise ValueError("attention plan was built for a different history length")
         if self.backend == "fa3":
-            result = self._fa3(q, k, v, layer_cache)
+            return self._fa3(q, k, v, layer_cache)
+        if history_length:
+            k = torch.cat((layer_cache["k"][:, :history_length], k), 1)
+            v = torch.cat((layer_cache["v"][:, :history_length], v), 1)
+        q, k, v = (x.transpose(1, 2) for x in (q, k, v))
+        if self.backend == "flex":
+            result = _flex_kernel()(q, k, v, block_mask=self.mask)
         else:
-            if history_length:
-                k = torch.cat((layer_cache["k"][:, :history_length], k), 1)
-                v = torch.cat((layer_cache["v"][:, :history_length], v), 1)
-            q, k, v = (x.transpose(1, 2) for x in (q, k, v))
-            if self.backend == "flex":
-                result = _flex_kernel()(q, k, v, block_mask=self.mask)
-            else:
-                result = F.scaled_dot_product_attention(q, k, v, attn_mask=self.mask)
-            result = result.transpose(1, 2)
-        return result * self.query_valid[:, :, None, None]
+            result = F.scaled_dot_product_attention(q, k, v, attn_mask=self.mask)
+        return result.transpose(1, 2) * self.query_valid[:, :, None, None]
 
     def _fa3(self, q, k, v, layer_cache):
         from sglang.kernels.ops.attention.flash_attention import (
@@ -392,12 +391,18 @@ class NomasAttentionPlan:
 
         def compact(current, key):
             # [visible history | current video | valid text]: padding and hidden
-            # action tails are dropped instead of masked.
+            # action tails are dropped instead of masked. History is gathered
+            # straight into the buffer, so every row is copied once.
             current = current[0, : self.compact_tokens]
-            if self.history_index.numel() == 0:
+            history = self.history_index.numel()
+            if history == 0:
                 return current.contiguous()
-            history = layer_cache[key][0].index_select(0, self.history_index)
-            return torch.cat((history, current), 0)
+            buffer = current.new_empty((history + current.shape[0], *current.shape[1:]))
+            torch.index_select(
+                layer_cache[key][0], 0, self.history_index, out=buffer[:history]
+            )
+            buffer[history:].copy_(current)
+            return buffer
 
         k, v = compact(k, "k"), compact(v, "v")
         q = q[0].contiguous()
@@ -413,27 +418,30 @@ class NomasAttentionPlan:
             return_softmax_lse=True,
         )
         # Action rows also attend to their own action text: merge the two
-        # softmax partitions exactly through their log-sum-exp.
-        for rows, k_start, k_end, cu_rows, cu_keys in self.actions:
+        # softmax partitions exactly through their log-sum-exp, in place.
+        for (q_start, q_end), (k_start, k_end), cu_rows, cu_keys in self.actions:
             extra, extra_lse, *_ = flash_attn_varlen_func(
-                q[rows],
+                q[q_start:q_end],
                 k[k_start:k_end],
                 v[k_start:k_end],
                 cu_rows,
                 cu_keys,
-                rows.numel(),
+                q_end - q_start,
                 k_end - k_start,
                 return_softmax_lse=True,
             )
-            base_lse, extra_lse = lse[:, rows].float(), extra_lse.float()
+            base_lse, extra_lse = lse[:, q_start:q_end].float(), extra_lse.float()
             top = torch.maximum(base_lse, extra_lse)
             w_base, w_extra = torch.exp(base_lse - top), torch.exp(extra_lse - top)
             total = (w_base + w_extra).T[..., None]
-            out[rows] = (
+            rows = out[q_start:q_end]
+            rows.copy_(
                 (
-                    out[rows].float() * w_base.T[..., None]
+                    rows.float() * w_base.T[..., None]
                     + extra.float() * w_extra.T[..., None]
                 )
                 / total
-            ).to(out.dtype)
+            )
+        # Padded text queries see nothing; x * 0 here matches the masked backends.
+        out[self.compact_tokens :].mul_(0)
         return out[None]

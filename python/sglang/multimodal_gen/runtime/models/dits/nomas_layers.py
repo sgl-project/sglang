@@ -11,6 +11,7 @@ done here with the shared collectives.
 """
 
 import math
+from functools import lru_cache
 
 import torch
 from einops import rearrange
@@ -60,6 +61,50 @@ class RMSNorm(nn.Module):
 
 def modulate(x, shift, scale):
     return modulate_scale_shift(x, scale, shift)
+
+
+def _fused_ok(x):
+    return (
+        x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
+    )
+
+
+def _compile_exact(fn):
+    # emulate_precision_casts keeps every intermediate rounding (BF16 storage
+    # casts, separate FP32 multiply/add) so the fused kernel is bit-identical
+    # to the eager sequence it replaces. Dynamic shapes cover segment lengths.
+    return torch.compile(
+        fn, dynamic=True, fullgraph=True, options={"emulate_precision_casts": True}
+    )
+
+
+def _modulate_to(x, shift, scale, dtype):
+    return (x * (1 + scale[:, None]) + shift[:, None]).to(dtype)
+
+
+@lru_cache(maxsize=1)
+def _compiled_modulate_to():
+    return _compile_exact(_modulate_to)
+
+
+def modulate_for_linear(x, shift, scale):
+    """``modulate`` followed by the cast autocast would apply in the next linear.
+
+    Under BF16 autocast the FP32 LayerNorm output is modulated in FP32, then each
+    following linear casts it to BF16 again. Casting once, fused with the
+    modulation, yields the same values without the repeated casts.
+    """
+    if not (
+        x.dtype == torch.float32
+        and x.is_cuda
+        and torch.is_autocast_enabled(x.device.type)
+    ):
+        return modulate(x, shift, scale)
+    dtype = torch.get_autocast_dtype(x.device.type)
+    if _fused_ok(x) and scale.dtype == shift.dtype:
+        with torch.autocast(x.device.type, enabled=False):
+            return _compiled_modulate_to()(x, shift, scale, dtype)
+    return modulate(x, shift, scale).to(dtype)
 
 
 def apply_gate(x, gate):
@@ -204,18 +249,68 @@ def rotate_half(x):
     return torch.stack([-x_imag, x_real], dim=-1).flatten(3)
 
 
+def _rotate(x, cos, sin):
+    return (x.float() * cos + rotate_half(x.float()) * sin).type_as(x)
+
+
+@lru_cache(maxsize=1)
+def _compiled_rotate():
+    return _compile_exact(_rotate)
+
+
+def apply_rotary_emb_single(x, freqs_cis):
+    """Rotate one [B, S, H, D] tensor with (cos, sin) tables of shape [S, D]."""
+    cos, sin = _rope_tables(x, freqs_cis)
+    if _fused_ok(x):
+        # One kernel instead of the FP32 copy/negate/stack/multiply/add/cast chain.
+        with torch.autocast(x.device.type, enabled=False):
+            return _compiled_rotate()(x, cos, sin)
+    return _rotate(x, cos, sin)
+
+
+def _rope_tables(x, freqs_cis):
+    cos, sin = freqs_cis
+    if cos.shape != (x.shape[1], x.shape[-1]):
+        raise ValueError(
+            f"freqs_cis shape {cos.shape} does not match x shape {x.shape}"
+        )
+    shape = [d if i in (1, x.ndim - 1) else 1 for i, d in enumerate(x.shape)]
+    return cos.view(*shape).to(x.device), sin.view(*shape).to(x.device)
+
+
+def _norm_rotate(x, mean_square, eps, weight, cos, sin, dtype):
+    normed = ((x.float() * torch.rsqrt(mean_square + eps)).type_as(x) * weight).to(
+        dtype
+    )
+    return _rotate(normed, cos, sin)
+
+
+@lru_cache(maxsize=1)
+def _compiled_norm_rotate():
+    return _compile_exact(_norm_rotate)
+
+
+def rms_norm_rotate(norm, x, freqs_cis, dtype):
+    """``apply_rotary_emb_single(norm(x).to(dtype), freqs_cis)`` with one fused kernel.
+
+    The mean-square reduction stays in ATen so its summation order is unchanged;
+    the normalisation, weight, cast and rotation are fused with the same rounding.
+    """
+    if not _fused_ok(x):
+        return apply_rotary_emb_single(norm(x).to(dtype), freqs_cis)
+    cos, sin = _rope_tables(x, freqs_cis)
+    mean_square = x.float().pow(2).mean(-1, keepdim=True)
+    with torch.autocast(x.device.type, enabled=False):
+        return _compiled_norm_rotate()(
+            x, mean_square, norm.eps, norm.weight, cos, sin, dtype
+        )
+
+
 def apply_rotary_emb(xq, xk, freqs_cis):
     """Rotate [B, S, H, D] queries and keys with (cos, sin) tables of shape [S, D]."""
-    cos, sin = freqs_cis
-    if cos.shape != (xq.shape[1], xq.shape[-1]):
-        raise ValueError(
-            f"freqs_cis shape {cos.shape} does not match x shape {xq.shape}"
-        )
-    shape = [d if i in (1, xq.ndim - 1) else 1 for i, d in enumerate(xq.shape)]
-    cos, sin = cos.view(*shape).to(xq.device), sin.view(*shape).to(xq.device)
-    xq_out = (xq.float() * cos + rotate_half(xq.float()) * sin).type_as(xq)
-    xk_out = (xk.float() * cos + rotate_half(xk.float()) * sin).type_as(xk)
-    return xq_out, xk_out
+    return apply_rotary_emb_single(xq, freqs_cis), apply_rotary_emb_single(
+        xk, freqs_cis
+    )
 
 
 def get_1d_rotary_pos_embed(dim, pos, theta=10000.0):
