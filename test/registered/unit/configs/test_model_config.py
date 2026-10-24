@@ -268,5 +268,130 @@ class TestDecisionCheckpointConfig(CustomTestCase):
                     load_decision_config(checkpoint, None)
 
 
+class TestStartLuxDecisionConfig(CustomTestCase):
+    """A StartLux checkpoint keeps its own LM head, whose letter rows are the readout."""
+
+    LETTERS = list(range(32, 58))
+
+    def _checkpoint(self, directory, architectures=None, **decision):
+        Qwen3_5Config(
+            architectures=architectures or ["Qwen3_5ForConditionalGeneration"]
+        ).save_pretrained(directory)
+        decision = {
+            "format": "lodestar-letter-readout-v1",
+            "letter_token_ids": self.LETTERS,
+            "temperature_by_type": {"choice": 0.9503, "score": 1.0108, "noul": 1.376},
+            "max_options_per_pass": 26,
+            "wide_choice": {"group": 25, "keep": 3, "residual": 0.001},
+            **decision,
+        }
+        # A None drops the field, as a checkpoint of the other format has none of them.
+        decision = {key: value for key, value in decision.items() if value is not None}
+        with open(os.path.join(directory, "decision_config.json"), "w") as f:
+            json.dump(decision, f)
+
+    def test_a_lodestar_checkpoint_is_served_as_a_decision_checkpoint(self):
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(checkpoint)
+            config = ModelConfig(model_path=checkpoint)
+            decision = config.decision_config
+            self.assertIsNotNone(decision)
+            self.assertEqual(decision["format"], "lodestar-letter-readout-v1")
+            self.assertEqual(decision["codes"][:3], ["A", "B", "C"])
+            self.assertEqual(len(decision["codes"]), 26)
+            self.assertEqual(decision["token_ids"], self.LETTERS)
+            self.assertEqual(decision["temperature_by_type"]["choice"], 0.9503)
+            self.assertEqual(decision["max_options_per_pass"], 26)
+            self.assertEqual(decision["wide_choice"]["keep"], 3)
+            # The checkpoint ships its own LM head, so its architecture is untouched.
+            self.assertEqual(
+                config.hf_config.architectures, ["Qwen3_5ForConditionalGeneration"]
+            )
+
+    def test_a_moe_checkpoint_is_recognized_too(self):
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(
+                checkpoint, architectures=["Qwen3_5MoeForConditionalGeneration"]
+            )
+            self.assertIsNotNone(ModelConfig(model_path=checkpoint).decision_config)
+
+    def test_a_plain_checkpoint_keeps_no_decision_config(self):
+        """Every other Qwen3.5 checkpoint keeps serving as a generation model."""
+        with TemporaryDirectory() as checkpoint:
+            Qwen3_5Config(
+                architectures=["Qwen3_5ForConditionalGeneration"]
+            ).save_pretrained(checkpoint)
+            self.assertIsNone(ModelConfig(model_path=checkpoint).decision_config)
+
+    def test_a_readout_checkpoint_keeps_its_own_format(self):
+        """A checkpoint that ships its own readout is still served the way it was."""
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(
+                checkpoint,
+                architectures=["Qwen3_5Model"],
+                format=None,
+                letter_token_ids=None,
+                temperature_by_type=None,
+                max_options_per_pass=None,
+                wide_choice=None,
+                format_version=1,
+                codes=["A", "B"],
+                token_ids=[32, 33],
+                temperature=2.0,
+                pooling="last",
+            )
+            config = ModelConfig(model_path=checkpoint)
+            self.assertEqual(config.decision_config["format"], "readout-v1")
+            self.assertEqual(config.decision_config["temperature"], 2.0)
+            # A bare backbone gets the LM head its readout is written into.
+            self.assertEqual(
+                config.hf_config.architectures, ["Qwen3_5ForConditionalGeneration"]
+            )
+
+    def test_an_unsupported_format_is_refused(self):
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(checkpoint, format="some-future-readout")
+            with self.assertRaisesRegex(ValueError, "is not supported"):
+                load_decision_config(checkpoint, None)
+
+    def test_a_readout_format_needs_its_bare_backbone(self):
+        """Readout rows need a bare backbone without an LM head, and this checkpoint has one."""
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(
+                checkpoint,
+                format=None,
+                letter_token_ids=None,
+                temperature_by_type=None,
+                max_options_per_pass=None,
+                wide_choice=None,
+                format_version=1,
+                codes=["A"],
+                token_ids=[32],
+            )
+            with self.assertRaisesRegex(ValueError, "bare backbone"):
+                ModelConfig(model_path=checkpoint)
+
+    def test_a_lodestar_readout_needs_its_own_lm_head(self):
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(checkpoint, architectures=["Qwen3_5Model"])
+            with self.assertRaisesRegex(ValueError, "LM head"):
+                ModelConfig(model_path=checkpoint)
+
+    def test_malformed_lodestar_fields_are_refused(self):
+        for decision, message in (
+            ({"letter_token_ids": [1, 2, 3]}, "26 answer letters"),
+            ({"letter_token_ids": [1] * 26}, "distinct"),
+            ({"temperature_by_type": {"choice": 1.0, "vote": 1.0}}, "unsupported"),
+            ({"temperature_by_type": {"choice": 0.0}}, "above 0"),
+            ({"temperature_by_type": {}}, "temperature_by_type"),
+            ({"max_options_per_pass": 27}, "2 to 26"),
+            ({"wide_choice": [1]}, "wide_choice"),
+        ):
+            with self.subTest(decision=decision), TemporaryDirectory() as checkpoint:
+                self._checkpoint(checkpoint, **decision)
+                with self.assertRaisesRegex(ValueError, message):
+                    load_decision_config(checkpoint, None)
+
+
 if __name__ == "__main__":
     unittest.main()

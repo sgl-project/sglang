@@ -1,0 +1,99 @@
+---
+title: StartLux-Decision-v1.1-27B-AutoThink
+description: "Deploy StartLux-Decision-v1.1-27B-AutoThink with SGLang. A decision model on the Qwen3.5-27B backbone reads one letter per option at the last prompt position and returns calibrated choice, yes or no, and score answers on /v1/systemone, on two 40 GB GPUs in BF16."
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+StartLux-Decision support lands in [#45621](https://github.com/sgl-project/sglang/pull/45621), so until a release includes it, install a [nightly build](/docs/get-started/install#nightly-builds) built after that merge.
+
+</Accordion>
+
+The checkpoint keeps its own language-model head: the rows of the answer letters `A` to `Z` are the readout. SGLang reads its `decision_config.json`, renders the prompt the checkpoint was trained on, and reads one letter per option at the last prompt position — at the temperature the checkpoint calibrated for that question type — so no text is generated.
+
+import { Deployment } from "/src/snippets/_deployment.jsx"
+import { config }     from "/src/snippets/configs/startlux/startlux-decision-v1.1-27b.jsx"
+
+<Deployment config={config} />
+
+## Playground
+
+The Playground layers SGLang features on top of the recipe above. Any override changes the badge to **Not Verified** until that exact configuration is tested end to end. The [Configuration Tips](#2-configuration-tips) say which settings were measured.
+
+import { Playground } from "/src/snippets/_playground.jsx"
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+[StartLux-Decision-v1.1-27B-AutoThink](https://huggingface.co/startlux-models/StartLux-Decision-v1.1-27B-AutoThink) answers typed questions about a state: pick one of several options (`choice`), yes or no (`noul`), or a level on a scale of 2 to 10 (`score`). It is a 27B Qwen3.5 model — 64 layers, hybrid linear and full attention, a 27-layer vision tower — whose answers are read from the next-token probabilities of the option letters, so one request is one prefill pass per question.
+
+**What SGLang reads from the checkpoint.** `decision_config.json` declares the format (`lodestar-letter-readout-v1`), the 26 letter token ids, a temperature per question type (choice 0.9503, score 1.0108, noul 1.376), the option limit of one pass (26) and the grouping of longer lists. SGLang renders the trained prompt — a fixed system line, then an `Evidence / Question / Options` block with `A) …` lines — and reads the letters at the last position.
+
+**The none candidate.** Like the checkpoint's own server, SGLang reads one extra last option, `None of the above`, and reports its share as `none_probability`; the listed options are renormalized to sum to 1. Pass `none_check: false` to read only the listed options, and `allow_none: true` to let `choice` be null when the extra option wins.
+
+**What this route does not run.** The AutoThink thought loop (a generated thought, then a second read-out mixed 0.25 / 0.75), and the grouping rounds of a choice list over 25 options. Both need more than one read-out. The route refuses `think_mode`, `gate`, `think_budget`, `mix`, `return_details` and `return_thought` by name instead of ignoring them, and refuses a longer choice list. Run the checkpoint's own protocol layer against this server for those.
+
+## 2. Configuration Tips
+
+- **No flag is needed.** The loader recognizes the checkpoint family and `/v1/systemone` renders its prompt.
+- **`--tp 2` on 40 GB cards.** The BF16 weights are 51 GB. One 80 GB GPU holds them with room for the KV cache; two 40 GB cards need `--tp 2`.
+- **`--disable-radix-cache` when comparing numbers.** With the cache on, the same question asked twice can differ by a few hundredths of a probability, so a parity run against the checkpoint's own server should turn it off.
+- **Images are refused for this family.** The route reads text only; the checkpoint's own protocol layer handles images.
+- **`/v1/decisions` refuses decision checkpoints** and names `/v1/systemone`.
+
+## 3. Benchmarks
+
+### 3.1 Speed
+
+One request in flight, one pass per question, P50 over the questions of the cookbook example on two A100-SXM4-40GB cards in BF16:
+
+| Prompt tokens | P50 latency |
+| --- | ---: |
+| ~300 | ~0.35 s |
+
+### 3.2 Accuracy and parity
+
+Measured on the same machine against the checkpoint's own server (`startlux_decide` over its transformers engine) on the same weights, text only, one pass, radix cache off, both reading the none candidate:
+
+| | value |
+| --- | --- |
+| top-option agreement | 14 / 14 questions |
+| worst absolute probability difference | 0.0065 |
+| worst `none_probability` difference | 0.0082 |
+
+The remaining difference is BF16 rounding between two engines (SGLang tensor-parallel 2, the reference single GPU). Reading the same prompt at temperature 1.0 instead of the trained per-type temperature moves a choice probability by up to 0.12, so the parity above is sensitive to the calibration SGLang reads from the checkpoint.
+
+## 4. Advanced Usage
+
+### 4.1 Reading the none candidate
+
+`none_probability` is an alarm score rather than a calibrated probability: it is how strongly the checkpoint believes none of the listed options is right. The checkpoint's own documentation suggests acting on it from 0.2.
+
+```python Example
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:30000/v1/systemone",
+    json={
+        "model": "startlux-models/StartLux-Decision-v1.1-27B-AutoThink",
+        "state": {"ticket": "I was charged twice and the app shows it as unpaid."},
+        "questions": {
+            "team": {
+                "type": "choice",
+                "instructions": "Which team should handle this ticket?",
+                "criteria": {
+                    "billing": "Payments and refunds",
+                    "technical": "App and login",
+                },
+            }
+        },
+    },
+)
+answer = response.json()["answers"]["team"]
+print(answer["choice"], answer["none_probability"])
+```

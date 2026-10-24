@@ -106,6 +106,20 @@ class SystemOneRequest(BaseModel):
     prompt_format_version: SkipJsonSchema[Any] = None
     return_prompt_token_ids: SkipJsonSchema[Any] = None
 
+    # StartLux-Decision read-out controls, which only a lodestar checkpoint honors.
+    none_check: Optional[bool] = None
+    allow_none: Optional[bool] = None
+
+    # The AutoThink thought loop, which this one-pass route does not run. Declared to
+    # refuse them by name: silently ignoring them would answer without the thought the
+    # caller asked for. Hidden from the schema until a route serves them.
+    think_mode: SkipJsonSchema[Any] = None
+    gate: SkipJsonSchema[Any] = None
+    think_budget: SkipJsonSchema[Any] = None
+    mix: SkipJsonSchema[Any] = None
+    return_details: SkipJsonSchema[Any] = None
+    return_thought: SkipJsonSchema[Any] = None
+
     @field_validator("temperature", "prompt_format_version", "return_prompt_token_ids")
     @classmethod
     def _refuse_decisions_fields(cls, value, info: ValidationInfo):
@@ -115,20 +129,43 @@ class SystemOneRequest(BaseModel):
             )
         return value
 
+    @field_validator(
+        "think_mode",
+        "gate",
+        "think_budget",
+        "mix",
+        "return_details",
+        "return_thought",
+    )
+    @classmethod
+    def _refuse_thought_fields(cls, value, info: ValidationInfo):
+        if value is not None:
+            raise ValueError(
+                f"{info.field_name} asks for the thought loop of an AutoThink "
+                "checkpoint, which this route does not run: it reads one answer and "
+                "generates nothing. Run the checkpoint's own protocol layer against "
+                "this server for a thought, or leave the field out for the one-pass "
+                "answer"
+            )
+        return value
+
 
 class SystemOneNoulAnswer(BaseModel):
     type: Literal["noul"] = "noul"
     noul: float
     # Full-vocabulary probability of the answer labels, an SGLang extension.
-    x_label_mass: float
+    x_label_mass: Optional[float] = None
 
 
 class SystemOneChoiceAnswer(BaseModel):
     type: Literal["choice"] = "choice"
-    choice: str
+    # Null only where the checkpoint abstains through its none candidate.
+    choice: Optional[str] = None
     confidence: float
     probabilities: Dict[str, float]
-    x_label_mass: float
+    x_label_mass: Optional[float] = None
+    # Share of the read-out that went to the extra "None of the above" candidate.
+    none_probability: Optional[float] = None
 
 
 class SystemOneScoreAnswer(BaseModel):
@@ -137,7 +174,7 @@ class SystemOneScoreAnswer(BaseModel):
     confidence: float
     legend: Dict[str, Any]
     probabilities: Dict[str, float]
-    x_label_mass: float
+    x_label_mass: Optional[float] = None
 
 
 class SystemOneUsage(BaseModel):
