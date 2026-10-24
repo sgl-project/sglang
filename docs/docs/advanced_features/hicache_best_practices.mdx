@@ -79,6 +79,28 @@ Guidelines:
 - For MHA models with Mooncake and `page_head` layout, HiCache will split head shards based on `tp_lcm_size` to make keys reusable across heterogeneous TP deployments.
 - If all clusters use the same TP size, this option is not needed.
 
+### KV cache sharding with Mooncake
+
+On NVIDIA CUDA PD prefill workers, you can combine KV cache sharding with HiCache host offload and Mooncake storage. Configure your model and parallelism for KV sharding first: plain TP for MLA, or prefill attention CP for GQA. Use the Python UnifiedTreeCore (`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python`). Configure Mooncake as described in [Deployment with Mooncake](/docs/advanced_features/hicache_best_practices#deployment-with-mooncake), then add these flags to your prefill server:
+
+```bash
+--enable-kv-cache-sharding \
+--enable-hierarchical-cache \
+--hicache-host-memory-mode cache \
+--hicache-io-backend kernel \
+--hicache-mem-layout page_first \
+--hicache-storage-backend mooncake
+```
+
+Each rank reads and writes only the pages it owns, using local host rows. Storage keys identify the attention head partition and page format, so a later request can read a page even if its owner changes. Sharded writers use a separate namespace from unsharded writers. To share pages, use the same model, attention-TP size, page size, KV dtype, host layout, and layer partition.
+
+The following restrictions also apply to runtime storage attachment:
+
+- Use `cache` host memory mode. `buffer_only` mode is unsupported with KV-sharded storage.
+- Only the `mooncake` and `file` storage backends are supported. With `file`, all shard ranks must use a shared directory; file eviction through `max_size` or `min_free_space` is unsupported.
+- Omit `tp_lcm_size`; heterogeneous head splitting is unsupported with KV sharding.
+- Only the primary KV host pool is supported. Existing KV-sharding restrictions, including unsupported DSA, speculative decoding, and DCP configurations, still apply.
+
 ### Prefetch Policies
 
 ```bash Command

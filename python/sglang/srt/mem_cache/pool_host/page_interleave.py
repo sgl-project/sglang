@@ -16,7 +16,8 @@ logical host capacity grows with the shard group, like the device's.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import hashlib
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -50,6 +51,32 @@ class PageInterleaveHostPool:
     @property
     def logical_size(self) -> int:
         return self.size * self.shard_size
+
+    @property
+    def storage_format_tag(self) -> str:
+        # Storage can be read by a different owner, or a different shard group.
+        # Name the page bytes, excluding rank and pool capacity. Shape, dtype
+        # and layer range must agree even when two formats have equal sizes.
+        geometry = (
+            str(self.dtype),
+            self.page_size,
+            self.start_layer,
+            self.end_layer,
+            self.layer_num,
+            *(
+                getattr(self, name, None)
+                for name in (
+                    "head_num",
+                    "head_dim",
+                    "v_head_dim",
+                    "kv_lora_rank",
+                    "qk_rope_head_dim",
+                    "kv_cache_dim",
+                )
+            ),
+        )
+        fingerprint = hashlib.sha256(repr(geometry).encode()).hexdigest()[:16]
+        return f"kvshard-v1-{self.layout}-{fingerprint}"
 
     @synchronized
     def clear(self):
@@ -100,3 +127,12 @@ class PageInterleaveHostPool:
             self.placement.local_index(host_indices[owned]),
             self.placement.local_index(device_owned),
         )
+
+    def owned_storage_pages(
+        self, host_indices: torch.Tensor
+    ) -> Tuple[List[int], torch.Tensor]:
+        """This rank's pages of a storage batch: their positions in the batch
+        and their local host rows (whole pages, in batch order)."""
+        mask = self.placement.local_mask(host_indices, self.shard_rank)
+        positions = torch.nonzero(mask[:: self.page_size]).squeeze(1).tolist()
+        return positions, self.placement.local_index(host_indices[mask])
