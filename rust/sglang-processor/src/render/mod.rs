@@ -107,6 +107,7 @@ impl ChatFormatter {
                         request,
                         args,
                         messages: None,
+                        tools: None,
                     },
                 )
             }
@@ -310,11 +311,12 @@ fn render_oai(
 
 /// Formatter-facing request view over adapted template arguments.
 /// Native effort access and template arguments share the adapted value without
-/// changing the original request; `messages` replaces the request's own.
+/// changing the original request; `messages` and `tools` replace its own when set.
 struct TemplateArgsRequest<'a> {
     request: &'a dyn OAIChatLikeRequest,
     args: HashMap<String, Value>,
     messages: Option<minijinja::Value>,
+    tools: Option<Option<Value>>,
 }
 
 impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
@@ -337,7 +339,10 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
     }
 
     fn tools(&self) -> Option<minijinja::Value> {
-        self.request.tools()
+        match &self.tools {
+            Some(tools) => tools.as_ref().map(minijinja::Value::from_serialize),
+            None => self.request.tools(),
+        }
     }
 
     fn tool_choice(&self) -> Option<minijinja::Value> {

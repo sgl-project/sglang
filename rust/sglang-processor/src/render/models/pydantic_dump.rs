@@ -116,7 +116,7 @@ pub(super) fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
 }
 
 /// pydantic's lax `bool`: booleans, 0 and 1, and the yes/no words in any case.
-pub(super) fn pydantic_bool(value: &Value) -> Result<bool, String> {
+pub(crate) fn pydantic_bool(value: &Value) -> Result<bool, String> {
     let parsed = match value {
         Value::Bool(value) => Some(*value),
         Value::Number(number) => match number.as_f64() {
