@@ -478,6 +478,10 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_parser=self.tool_call_parser,
         )
 
+    @property
+    def encoding_adapter(self) -> Optional[chat_encoding_adapters.ChatEncodingAdapter]:
+        return self._encoding_adapter
+
     def _build_chat_encoding_adapter(
         self,
     ) -> Optional[chat_encoding_adapters.ChatEncodingAdapter]:

@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+    ADAPTER_OUTPUT_PARSERS,
     select_new_output_ids,
     token_output_sse_chunks,
 )
@@ -21,6 +22,7 @@ from sglang.srt.parser.deepseek_recipe_output import (
     DeepSeekRecipeOutputParser,
     RecipeToolCall,
     RecipeToolCallDelta,
+    parse_output_text,
     whole_tool_calls,
 )
 from sglang.srt.parser.deepseek_recipe_renderer import (
@@ -35,15 +37,12 @@ if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.protocol import (
         ChatCompletionRequest,
         ResponsesRequest,
+        Tool,
     )
 
 DEFAULT_EFFORT_ENVS = {
     "dsv4": envs.SGLANG_DSV4_REASONING_EFFORT,
     "dsv41": envs.SGLANG_DSV41_REASONING_EFFORT,
-}
-PARSERS = {
-    "dsv4": ("deepseek-v4", "deepseekv4"),
-    "dsv41": ("deepseek-v41", "deepseekv41"),
 }
 JSON_RESPONSE_FORMATS = ("json_object", "json_schema")
 
@@ -77,7 +76,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         )
         # recipe parses the output once a DeepSeek parser is configured; other
         # parsers keep the text path.
-        reasoning_name, tool_name = PARSERS[chat_encoding_spec]
+        reasoning_name, tool_name = ADAPTER_OUTPUT_PARSERS[chat_encoding_spec]
         self._token_output = (
             reasoning_parser == reasoning_name or tool_call_parser == tool_name
         )
@@ -292,6 +291,30 @@ class DeepSeekRecipeChatEncodingAdapter:
                 request, require_reasoning, separate_reasoning, parse_tool_calls
             )
         )
+
+    def separate_reasoning_text(self, text: str) -> tuple[str, str]:
+        delta = parse_output_text(self.deepseek_recipe, text, parse_tool_calls=False)
+        return delta.reasoning, delta.content
+
+    def parse_function_call_text(
+        self, text: str, tools: list[Tool]
+    ) -> tuple[str, list[ToolCallItem]]:
+        if not tools:
+            return text, []  # as the text parsers: nothing to call
+        delta = parse_output_text(
+            self.deepseek_recipe, text, parse_tool_calls=True, thinking=False
+        )
+        # As in chat, a call to a tool outside `tools` is returned, at index -1.
+        indices = {tool.function.name: i for i, tool in enumerate(tools)}
+        calls = [
+            ToolCallItem(
+                tool_index=indices.get(call.name, -1),
+                name=call.name,
+                parameters=call.arguments,
+            )
+            for call in whole_tool_calls(delta)
+        ]
+        return delta.content, calls
 
     def _new_output_parser(
         self, request: ChatCompletionRequest
