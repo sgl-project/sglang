@@ -80,12 +80,8 @@ def load_jit(
                         given entry points. Otherwise the sources must export
                         from the C++ side themselves.
     """
-    if is_hip_runtime():
-        extra_cuda_cflags = [
-            flag
-            for flag in (extra_cuda_cflags or [])
-            if flag not in ("--use_fast_math", "-use_fast_math")
-        ]
+    if is_hip_runtime() or envs.SGLANG_JIT_DISABLE_FAST_MATH.get():
+        extra_cuda_cflags = _strip_fast_math_flags(list(extra_cuda_cflags or []))
 
     if envs.SGLANG_JIT_LOG_RESOURCE_USAGE.get():
         # nvcc reports through ptxas; hipcc through a clang remark pass.
@@ -211,6 +207,14 @@ def _find_prebuilt(*, spec: BuildSpec, scope: pathlib.Path) -> pathlib.Path | No
     if envs.SGLANG_JIT_FORCE_RECOMPILE.get():
         return None
     return cache.find_prebuilt(scope=scope, module_name=spec.module_name)
+
+
+_FAST_MATH_FLAGS = ("--use_fast_math", "-use_fast_math")
+
+
+def _strip_fast_math_flags(flags: List[str]) -> List[str]:
+    """Drop nvcc's fast-math flag: never on HIP, on CUDA only when asked to."""
+    return [flag for flag in flags if flag not in _FAST_MATH_FLAGS]
 
 
 # Verified against hgcc 2.2: it is an nvcc-style driver and accepts
