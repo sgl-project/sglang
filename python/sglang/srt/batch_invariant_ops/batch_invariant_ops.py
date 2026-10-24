@@ -1035,6 +1035,8 @@ def enable_batch_invariant_mode(enable_bmm: bool = True):
             _original_torch_bmm = torch.bmm
             torch.bmm = bmm_batch_invariant
     else:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
         from sglang.srt.hardware_backend.npu.batch_invariant_ops.npu_batch_invariant_ops import (
             npu_add_rms_norm_batch_invariant,
             npu_fia_batch_invariant_get_max_workspace,
