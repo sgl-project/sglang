@@ -70,6 +70,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._engine_paused = False
+        scheduler.idle_sleeper = None
         scheduler._pause_started_at = None
         scheduler._pause_intervals = deque()
         scheduler.enable_overlap = False
@@ -771,6 +772,20 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             self._retract_by_pause(scheduler, req)
 
         self.assertEqual(frees, [("run", True)])
+
+    def test_paused_engine_waits_or_throttles(self):
+        scheduler = self._new_scheduler()
+        scheduler.is_fully_idle = MagicMock(return_value=True)
+        scheduler.metrics_reporter = MagicMock()
+        scheduler.idle_sleeper = MagicMock()
+        with patch.object(scheduler, "maybe_sleep_on_idle") as maybe_sleep:
+            scheduler._record_scheduler_state_for_paused_engine()
+        maybe_sleep.assert_called_once_with()
+
+        scheduler.idle_sleeper = None
+        with patch("sglang.srt.managers.scheduler.time.sleep") as sleep:
+            scheduler._record_scheduler_state_for_paused_engine()
+        sleep.assert_called_once_with(0.005)
 
     def test_pd_decode_continue_releases_held_rebootstrap(self):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""
