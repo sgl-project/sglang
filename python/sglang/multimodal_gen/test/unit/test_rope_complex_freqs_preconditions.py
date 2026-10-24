@@ -3,9 +3,12 @@ confusing broadcast error instead of failing at the actual precondition.
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+import sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope as mrope
 from sglang.multimodal_gen.runtime.layers.layernorm import apply_qk_norm_rope
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 
@@ -78,6 +81,44 @@ class TestApplyQkNormRopeRequiresCache(unittest.TestCase):
                 cos_sin_cache=None,
                 freqs_complex=freqs_complex,
             )
+
+
+class TestNDRotaryEmbedding(unittest.TestCase):
+    def test_1d_rope_applies_theta_rescale_factor(self):
+        pos = torch.arange(7, dtype=torch.float32)
+        for theta_rescale_factor in (1.0, 4.0):
+            with self.subTest(theta_rescale_factor=theta_rescale_factor):
+                rope = mrope.OneDRotaryEmbedding(
+                    16, theta_rescale_factor=theta_rescale_factor
+                )
+                ref = mrope.get_1d_rotary_pos_embed(
+                    16, pos, theta_rescale_factor=theta_rescale_factor
+                )
+                torch.testing.assert_close(rope(pos), ref)
+
+    @mock.patch.object(
+        mrope,
+        "get_sp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+    def test_from_grid_matches_explicit_positions(self):
+        grid, start_frame = (2, 3, 4), 5
+        positions = torch.stack(
+            torch.meshgrid(*(torch.arange(n) for n in grid), indexing="ij"), dim=-1
+        ).reshape(-1, 3)
+        positions[:, 0] += start_frame
+        for repeat_interleave_real in (False, True):
+            with self.subTest(repeat_interleave_real=repeat_interleave_real):
+                rope = mrope.NDRotaryEmbedding(
+                    [4, 6, 6],
+                    rope_theta=256.0,
+                    use_real=True,
+                    repeat_interleave_real=repeat_interleave_real,
+                )
+                torch.testing.assert_close(
+                    rope.forward_from_grid(grid, start_frame=start_frame),
+                    rope.forward_uncached(positions),
+                )
 
 
 if __name__ == "__main__":
