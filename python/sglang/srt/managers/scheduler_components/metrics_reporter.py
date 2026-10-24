@@ -452,8 +452,9 @@ class SchedulerMetricsReporter:
 
         if prefill_reqs:
             stats = batch.prefill_stats
-            for req in prefill_reqs:
-                prefill_lengths.add(len(req.origin_input_ids))
+            # Match vLLM: variance of prefix + chunk / 2 for this iteration.
+            for i in range(len(prefill_reqs)):
+                prefill_lengths.add(2 * batch.prefix_lens[i] + batch.extend_lens[i])
             num_prefill_requests = stats.num_new_seqs if stats else len(prefill_reqs)
             sum_prefill_tokens = stats.log_input_tokens if stats else 0
             # Prefill reqs lead batch.reqs, so they own the head of prefix_lens;
@@ -471,7 +472,7 @@ class SchedulerMetricsReporter:
         return ScheduledRequestMetrics(
             num_prefill_requests=num_prefill_requests,
             sum_prefill_tokens=sum_prefill_tokens,
-            var_prefill_length=prefill_lengths.variance(),
+            var_prefill_length=prefill_lengths.variance() / 4.0,
             sum_prefill_kv_tokens=sum_prefill_kv_tokens,
             num_decode_requests=decode_kv.count,
             sum_decode_kv_tokens=decode_kv.total,

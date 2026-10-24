@@ -388,6 +388,7 @@ class TestForwardPassMetrics(unittest.TestCase):
             reqs=[prefill_a, prefill_b, decode_req],
             decoding_reqs=[decode_req],
             prefix_lens=[2, 3, decode_req.seqlen - 1],
+            extend_lens=[4, 8, 1],
             prefill_stats=PrefillStats(
                 log_input_tokens=12,
                 log_hit_tokens=5,
