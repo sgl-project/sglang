@@ -659,6 +659,25 @@ def _can_use_mega_mhc(cfg: HcConfig) -> bool:
     )
 
 
+def _can_use_decode_post_combine(
+    cfg: HcConfig, y: torch.Tensor, residual: torch.Tensor, coefficients: HcTriplet
+) -> bool:
+    from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import MAX_ROWS
+
+    return (
+        get_platform().is_blackwell
+        and cfg.pre_from_prev
+        and cfg.mult == 4
+        and cfg.hidden == 5120
+        and not cfg.cp_prefill
+        and 0 < y.shape[0] <= MAX_ROWS
+        and y.dtype == residual.dtype == torch.bfloat16
+        and y.is_contiguous()
+        and residual.is_contiguous()
+        and all(t.dtype == torch.float32 and t.is_contiguous() for t in coefficients)
+    )
+
+
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -707,6 +726,32 @@ def _post_fusion(
         if moe_input is not None:
             moe_input.mark(normalized)
         return HcState(updated, pre, HcNormed(normalized), stats)
+    if (
+        next is not None
+        and next.norm_fusable
+        and envs.SGLANG_OPT_DSV41_MHC_POST_COMBINE_DECODE.get()
+        and _can_use_decode_post_combine(cfg, y, residual, coefficients)
+    ):
+        from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
+            mhc_post_combine_norm_decode,
+        )
+
+        quant = next.accepts_mxfp8
+        updated, normalized, q, sf = mhc_post_combine_norm_decode(
+            y,
+            residual,
+            post_mix,
+            comb,
+            pre,
+            next.norm.weight,
+            next.norm.variance_epsilon,
+            quant=quant,
+        )
+        if quant:
+            return HcState(
+                updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
+            )
+        return HcState(updated, pre, HcNormed(normalized))
     if (
         next is not None
         and next.norm_fusable
