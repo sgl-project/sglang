@@ -1,14 +1,17 @@
 import functools
 import types
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
     schedule_verify_lens_topk_from_survival,
 )
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
+    DSparkVerifyPlanner,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
@@ -129,6 +132,130 @@ def _for_each_impl(test_method):
 
 
 class TestComputeVerifyTokenBudget(CustomTestCase):
+    def test_runtime_cost_changes_budget_without_retraining(self):
+        survival = torch.tensor([[0.9, 0.8, 0.1]])
+        table = SpsCostTable([1, 2, 3, 4], [100.0] * 4, 4)
+        cfg = DSparkScheduleConfig(gamma=3)
+        baseline = compute_verify_token_budget(
+            history_survival_probs=survival, sps_table=table, cfg=cfg
+        )
+        corrected = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=table,
+            cfg=cfg,
+            cost_corrections={(1, 4): 0.04},
+        )
+        self.assertEqual(baseline.budget, 3)
+        self.assertEqual(corrected.budget, 2)
+        self.assertAlmostEqual(corrected.predicted_step_seconds, 0.01)
+
+        # No artificial savings inside one physical CUDA Graph tier.
+        padded = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=table,
+            cfg=cfg,
+            cost_corrections={(1, 4): 0.04},
+            capture_num_tokens=[4],
+        )
+        self.assertEqual(padded.budget, 3)
+        self.assertAlmostEqual(padded.predicted_step_seconds, 0.05)
+        cold = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=SpsCostTable([1, 2, 3, 4], [100.0, 10.0, 10.0, 10.0], 4),
+            cfg=cfg,
+            capture_num_tokens=[4],
+        )
+        self.assertEqual(cold.budget, 3)
+        self.assertAlmostEqual(cold.predicted_step_seconds, 0.1)
+
+        additive = _additive_table()
+        corrected_additive = compute_verify_token_budget(
+            history_survival_probs=survival,
+            sps_table=additive,
+            cfg=cfg,
+            cost_corrections={(1, 4): 0.04},
+            capture_num_tokens=[4],
+        )
+        self.assertEqual(corrected_additive.budget, 3)
+        self.assertAlmostEqual(
+            corrected_additive.predicted_step_seconds,
+            additive.step_time(num_reqs=1, budget=3) + 0.04,
+        )
+
+    def test_signed_cost_corrections_do_not_cross_request_counts(self):
+        survival = torch.tensor([[0.9, 0.8, 0.1]])
+        table = SpsCostTable([1, 2, 3, 4], [100.0, 100.0, 100.0, 10.0], 4)
+        cfg = DSparkScheduleConfig(gamma=3)
+        for corrections, expected in (({(1, 4): -0.095}, 3), ({(2, 4): -0.095}, 2)):
+            actual = compute_verify_token_budget(
+                history_survival_probs=survival,
+                sps_table=table,
+                cfg=cfg,
+                cost_corrections=corrections,
+            )
+            self.assertEqual(actual.budget, expected)
+
+    def test_online_feedback_uses_baseline_and_skips_profile_budgets(self):
+        table = SpsCostTable([1, 2, 3, 4], [100.0] * 4, 4)
+        with envs.SGLANG_DSPARK_ONLINE_COST_CORRECTION.override(True):
+            host = HostConfidenceBudgetPlanner(
+                sps_table=table,
+                cfg=DSparkScheduleConfig(gamma=3),
+                model_runner=types.SimpleNamespace(decode_cuda_graph_runner=None),
+                relay_lag_steps=2,
+            )
+        planner = object.__new__(DSparkVerifyPlanner)
+        planner._budget_planner = host
+        # The prediction may already include a correction. Residuals must
+        # always be measured against the immutable table, avoiding oscillation.
+        obs = types.SimpleNamespace(
+            bs=1,
+            budget=2,
+            num_verify_tokens=4,
+            verify_tokens_dp_synced=-1,
+            predicted_step_ms=100.0,
+        )
+        for _ in range(64):
+            planner.observe_step_cost(obs, 0.05)
+        self.assertAlmostEqual(host.online_cost.corrections[(1, 4)], 0.04)
+        host.forced_budget_frac = 1.0
+        for _ in range(64):
+            planner.observe_step_cost(obs, 0.01)
+        self.assertAlmostEqual(host.online_cost.corrections[(1, 4)], 0.04)
+        host.forced_budget_frac = None
+        confidence = torch.tensor([[0.9, 0.8 / 0.9, 0.1 / 0.8]])
+        generation = torch.ones(1, dtype=torch.int64)
+        self.assertEqual(
+            host.compute_budget(
+                confidence=confidence,
+                generation=generation,
+                current_generation=generation,
+                req_pool_indices_cpu=torch.tensor([0]),
+            ),
+            2,
+        )
+
+        # Every TP rank consumes the leader's residual, including nonleaders
+        # that do not record timings locally.
+        group = types.SimpleNamespace(ranks=[4, 5], cpu_group=object())
+        parallel = types.SimpleNamespace(attn_tp_size=2, attn_tp_group=group)
+
+        def broadcast(value, *, src, group):
+            self.assertEqual(src, 4)
+            value.zero_()
+            value[0] = torch.tensor([1, 4, -0.002])
+
+        with (
+            patch(
+                "sglang.srt.speculative.dspark_components.dspark_planner.get_parallel",
+                return_value=parallel,
+            ),
+            patch("torch.distributed.broadcast", side_effect=broadcast),
+        ):
+            planner._sync_online_cost()
+        self.assertEqual(set(host.online_cost.corrections), {(1, 4)})
+        self.assertAlmostEqual(host.online_cost.corrections[(1, 4)], -0.002)
+
     def test_budget_argmax_matches_bruteforce_scan_across_sps_cliffs(self):
         torch.manual_seed(1)
         cfg = DSparkScheduleConfig(gamma=7)

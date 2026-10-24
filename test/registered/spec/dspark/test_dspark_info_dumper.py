@@ -112,6 +112,61 @@ class TestResolveComponents(CustomTestCase):
 
 
 class TestCoreAndCpuTiming(CustomTestCase):
+    def test_cost_feedback_requires_consecutive_matching_geometry(self):
+        samples = []
+        dumper, clock = make_dumper(
+            set(),
+            on_step=lambda obs, seconds: samples.append((obs.forward_ct, seconds)),
+        )
+        for step, bs in ((1, 4), (2, 4), (3, 4), (4, 3), (5, 3), (6, 3)):
+            dumper.observe_decode_step(make_obs(forward_ct=step, bs=bs))
+            clock.advance(0.02)
+        dumper.note_non_decode_step()
+        dumper.observe_decode_step(make_obs(forward_ct=8, bs=3))
+        self.assertEqual([step for step, _ in samples], [3, 6])
+        self.assertTrue(all(abs(seconds - 0.02) < 1e-6 for _, seconds in samples))
+        self.assertEqual(dumper.dump()["records"], [])
+
+    def test_cost_feedback_excludes_two_step_overlap_transients(self):
+        samples = []
+        dumper, clock = make_dumper(
+            set(),
+            on_step=lambda obs, seconds: samples.append(
+                (obs.forward_ct, obs.num_verify_tokens, seconds)
+            ),
+        )
+        # Completion waits trail the current launch by two steps. The second
+        # observation of a new graph still measures the previous graph.
+        for step, graph, milliseconds in (
+            (1, 24, 13.6),
+            (2, 24, 13.6),
+            (3, 24, 13.6),
+            (4, 48, 13.6),
+            (5, 48, 13.6),
+            (6, 48, 16.0),
+            (7, 24, 16.0),
+            (8, 24, 16.0),
+            (9, 24, 13.6),
+            (11, 24, 13.6),
+            (12, 24, 13.6),
+            (13, 24, 13.6),
+        ):
+            clock.advance(milliseconds / 1000)
+            dumper.observe_decode_step(
+                make_obs(forward_ct=step, bs=8, num_verify_tokens=graph)
+            )
+        self.assertEqual(
+            [(step, graph) for step, graph, _ in samples],
+            [(3, 24), (6, 48), (9, 24), (13, 24)],
+        )
+        for _, graph, seconds in samples:
+            self.assertAlmostEqual(seconds, 0.016 if graph == 48 else 0.0136)
+        dumper.clear()
+        for step in (14, 15):
+            clock.advance(0.0136)
+            dumper.observe_decode_step(make_obs(forward_ct=step, bs=8))
+        self.assertEqual(len(samples), 4)
+
     def test_disabled_dumper_records_nothing(self):
         dumper, clock = make_dumper(set())
         dumper.begin_step()

@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from sglang.srt.speculative.dspark_components.dspark_sps import (
+    OnlineCostCorrection,
     SpsAdditiveCostTable,
     SpsCostTable,
     build_uninitialized_sps_table,
@@ -14,6 +15,59 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestOnlineCostCorrection(CustomTestCase):
+    def test_signed_shape_residuals_outliers_and_expiry(self):
+        correction = OnlineCostCorrection()
+        for _ in range(7):
+            correction.observe(
+                num_requests=8,
+                batch_tokens=24,
+                baseline_seconds=0.01,
+                actual_seconds=0.012,
+            )
+        self.assertEqual(correction.corrections, {})
+        correction.observe(
+            num_requests=8,
+            batch_tokens=24,
+            baseline_seconds=0.01,
+            actual_seconds=0.012,
+        )
+        self.assertAlmostEqual(correction.corrections[(8, 24)], 0.002)
+        for _ in range(8):
+            correction.observe(
+                num_requests=8,
+                batch_tokens=48,
+                baseline_seconds=0.02,
+                actual_seconds=0.017,
+            )
+        self.assertAlmostEqual(correction.corrections[(8, 48)], -0.003)
+        self.assertAlmostEqual(correction.corrections[(8, 24)], 0.002)
+        self.assertNotIn((4, 24), correction.corrections)
+        correction.observe(
+            num_requests=8,
+            batch_tokens=24,
+            baseline_seconds=0.01,
+            actual_seconds=0.9,
+        )
+        for actual in (float("nan"), float("inf"), -1.0, 0.0, 2.0):
+            correction.observe(
+                num_requests=8,
+                batch_tokens=24,
+                baseline_seconds=0.01,
+                actual_seconds=actual,
+            )
+        self.assertAlmostEqual(correction.corrections[(8, 24)], 0.002)
+        for _ in range(64):
+            correction.observe(
+                num_requests=4,
+                batch_tokens=24,
+                baseline_seconds=0.01,
+                actual_seconds=0.005,
+            )
+        self.assertEqual(set(correction.corrections), {(4, 24)})
+        self.assertAlmostEqual(correction.corrections[(4, 24)], -0.005)
 
 
 def _make_table() -> SpsCostTable:

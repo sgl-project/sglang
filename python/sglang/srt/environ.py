@@ -546,6 +546,9 @@ class Envs:
     SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
+    # Opt-in whole-step SPS residual feedback; compact mode and a profiled
+    # cost table are required. No confidence-head training is involved.
+    SGLANG_DSPARK_ONLINE_COST_CORRECTION = EnvBool(False)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
     # Argmax every draft row, sampling requests included, accepted as a one-hot

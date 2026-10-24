@@ -24,6 +24,7 @@ from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, g
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_sps import (
+    OnlineCostCorrection,
     SpsAdditiveCostTable,
     SpsCostTable,
     _interp_clamped,
@@ -203,6 +204,20 @@ class DSparkVerifyPlanner:
                         "Pass a profiled --speculative-dspark-sps-table-path."
                     )
 
+        if envs.SGLANG_DSPARK_ONLINE_COST_CORRECTION.get():
+            if (
+                not self.is_compact_mode
+                or get_parallel().attn_cp_size != 1
+                or get_parallel().pp_size != 1
+                or get_disagg().disaggregation_mode != "null"
+                or is_dp_attention_enabled()
+                or envs.SGLANG_SIMULATE_ACC_LEN.get() > 0
+            ):
+                raise ValueError(
+                    "DSpark online cost correction requires compact verification, "
+                    "CP=PP=1, real acceptance, unified serving, and no DP attention."
+                )
+
     @property
     def carries_confidence(self) -> bool:
         return self._confidence_head is not None
@@ -234,6 +249,61 @@ class DSparkVerifyPlanner:
             return None
         return self._budget_planner.take_last_decision()
 
+    @property
+    def online_cost_enabled(self) -> bool:
+        return (
+            self._budget_planner is not None
+            and self._budget_planner.online_cost is not None
+        )
+
+    def observe_step_cost(self, obs, actual_seconds: float) -> None:
+        planner = self._budget_planner
+        # Learn against the physical verification shape, with a real planner
+        # decision. Forced profiling budgets are excluded.
+        if (
+            not self.online_cost_enabled
+            or obs.predicted_step_ms is None
+            or obs.budget is None
+            or obs.bs + obs.budget > obs.num_verify_tokens
+            or obs.verify_tokens_dp_synced not in (-1, obs.num_verify_tokens)
+            or planner.forced_budget_frac is not None
+        ):
+            return
+        table = planner.sps_table
+        baseline = (
+            table.step_time(num_reqs=obs.bs, budget=obs.num_verify_tokens - obs.bs)
+            if isinstance(table, SpsAdditiveCostTable)
+            else (
+                1.0 / table.lookup(obs.num_verify_tokens)
+                if table.lookup(obs.num_verify_tokens) > 0
+                else float("nan")
+            )
+        )
+        planner.online_cost.observe(
+            num_requests=obs.bs,
+            batch_tokens=obs.num_verify_tokens,
+            baseline_seconds=baseline,
+            actual_seconds=actual_seconds,
+        )
+
+    def _sync_online_cost(self) -> None:
+        if not self.online_cost_enabled or get_parallel().attn_tp_size == 1:
+            return
+        group = get_parallel().attn_tp_group
+        correction = self._budget_planner.online_cost
+        # At most MAX_SAMPLES // MIN_SAMPLES shapes can have enough samples.
+        value = torch.zeros(
+            (correction.MAX_SAMPLES // correction.MIN_SAMPLES, 3), dtype=torch.float64
+        )
+        for i, ((n, g), delta) in enumerate(correction.corrections.items()):
+            value[i] = torch.tensor([n, g, delta], dtype=torch.float64)
+        # CPU collective: all attention-TP ranks must use the same cost curve
+        # before selecting a budget / CUDA Graph tier, even with TP sync off.
+        torch.distributed.broadcast(value, src=group.ranks[0], group=group.cpu_group)
+        correction.corrections = {
+            (int(n), int(g)): delta for n, g, delta in value.tolist() if n > 0
+        }
+
     def should_run_compact(self, *, layout: Optional[RaggedVerifyLayout]) -> bool:
         return (
             self._ragged_verify_mode is RaggedVerifyMode.COMPACT and layout is not None
@@ -245,6 +315,7 @@ class DSparkVerifyPlanner:
         draft_input = batch.spec_info
         if self._budget_planner is None:
             return
+        self._sync_online_cost()
         if draft_input is None:
             local_tier_num_tokens = 0 if batch.batch_size() == 0 else -1
             self._maybe_gather_dp_verify_tier(
@@ -303,6 +374,7 @@ class DSparkVerifyPlanner:
         del prefix_lens
         if self._budget_planner is None:
             return None
+        self._sync_online_cost()
         req_pool_indices_cpu = req_pool_indices.to("cpu").to(torch.int64)
         generation = self.model_runner.req_to_token_pool.req_generation[
             req_pool_indices_cpu
@@ -330,8 +402,8 @@ class DSparkVerifyPlanner:
         if not get_schedule().disable_overlap_schedule:
             return draft_input.verify_token_budget
 
-        # No collective: the budget derives only from the broadcast draft tokens
-        # (via confidence), replicated req_generation, and the static sps table.
+        # With online correction, compute_budget_sync first broadcasts the
+        # attention-TP leader's measured residual before selecting the budget.
         draft_input.verify_token_budget = self.compute_budget_sync(
             confidence=confidence,
             prefix_lens=prefix_lens,
@@ -869,6 +941,8 @@ def compute_verify_token_budget(
     history_survival_probs: torch.Tensor,
     sps_table: Union[SpsCostTable, SpsAdditiveCostTable],
     cfg: DSparkScheduleConfig,
+    cost_corrections: Optional[dict[tuple[int, int], float]] = None,
+    capture_num_tokens: Optional[list[int]] = None,
 ) -> VerifyBudgetDecision:
     num_requests = history_survival_probs.shape[0]
     max_len = cfg.resolved_max_verify_len()
@@ -881,18 +955,40 @@ def compute_verify_token_budget(
     tau_star = num_requests + torch.cat(
         [torch.zeros(1, dtype=torch.float64), prefix_sum]
     )
+    batch_tokens = num_requests + torch.arange(tau_star.numel(), dtype=torch.int64)
+    if capture_num_tokens is not None:
+        grid = torch.tensor(capture_num_tokens, dtype=torch.int64)
+        indices = torch.bucketize(batch_tokens, grid)
+        # The worker falls back to rectangular eager verify above the grid.
+        batch_tokens = torch.where(
+            indices < grid.numel(),
+            grid[indices.clamp(max=grid.numel() - 1)],
+            num_requests * (cfg.gamma + 1),
+        )
+    correction = None
+    if cost_corrections:
+        correction = torch.tensor(
+            [
+                cost_corrections.get((num_requests, g), 0.0)
+                for g in batch_tokens.tolist()
+            ],
+            dtype=torch.float64,
+        )
     if isinstance(sps_table, SpsAdditiveCostTable):
         step_time = _additive_step_time_tensor(
             table=sps_table,
             num_requests=int(num_requests),
-            num_budgets=int(tau_star.numel()),
+            batch_tokens=batch_tokens,
         )
+        if correction is not None:
+            step_time = (step_time + correction).clamp_min(1e-9)
         theta = tau_star / step_time
         idx = int(torch.argmax(theta))
         predicted_step_seconds = float(step_time[idx])
     else:
-        batch_tokens = num_requests + torch.arange(tau_star.numel(), dtype=torch.int64)
         sps = _lookup_sps_tensor(sps_table=sps_table, batch_tokens=batch_tokens)
+        if correction is not None:
+            sps = 1.0 / (1.0 / sps + correction).clamp_min(1e-9)
         theta = tau_star * sps
         idx = int(torch.argmax(theta))
         sps_at_idx = float(sps[idx])
@@ -915,14 +1011,17 @@ def _lookup_sps_tensor(
 
 
 def _additive_step_time_tensor(
-    *, table: SpsAdditiveCostTable, num_requests: int, num_budgets: int
+    *,
+    table: SpsAdditiveCostTable,
+    num_requests: int,
+    batch_tokens: torch.Tensor,
 ) -> torch.Tensor:
     floor = table.bias_seconds + _interp_clamped(
         table.bs_probes, table.alpha_seconds, float(num_requests)
     )
     m_probes = torch.tensor(table.m_probes, dtype=torch.float64)
     theta_vals = torch.tensor(table.theta_seconds, dtype=torch.float64)
-    m = (num_requests + torch.arange(num_budgets, dtype=torch.float64)).clamp_(
+    m = batch_tokens.to(torch.float64).clamp_(
         min=float(table.m_probes[0]), max=float(table.m_probes[-1])
     )
     hi = torch.bucketize(m, m_probes, right=True).clamp_(1, m_probes.numel() - 1)
@@ -944,6 +1043,15 @@ class HostConfidenceBudgetPlanner:
     ) -> None:
         cfg.validate()
         self.sps_table = sps_table
+        self.online_cost = (
+            OnlineCostCorrection()
+            if envs.SGLANG_DSPARK_ONLINE_COST_CORRECTION.get()
+            else None
+        )
+        if self.online_cost is not None and is_uninitialized_sps_table(sps_table):
+            raise ValueError(
+                "DSpark online cost correction requires a profiled SPS table."
+            )
         self.cfg = cfg
         self._model_runner = model_runner
         self.forced_budget_frac: Optional[float] = None
@@ -980,10 +1088,20 @@ class HostConfidenceBudgetPlanner:
             forced_budget = max(0, int(float(forced_frac) * full_budget))
             self.last_decision = VerifyBudgetDecision(budget=forced_budget)
             return forced_budget
+        capture_grid = None
+        if self.online_cost is not None:
+            capture_grid = ragged_capture_num_tokens(model_runner=self._model_runner)
+            max_slots = ragged_capture_max_slots(model_runner=self._model_runner)
+            if capture_grid is not None and survival.shape[0] > max_slots:
+                capture_grid = [survival.shape[0] * (self.cfg.gamma + 1)]
         decision = compute_verify_token_budget(
             history_survival_probs=survival,
             sps_table=self.sps_table,
             cfg=self.cfg,
+            cost_corrections=(
+                self.online_cost.corrections if self.online_cost else None
+            ),
+            capture_num_tokens=capture_grid,
         )
         self.last_decision = decision
         return decision.budget
