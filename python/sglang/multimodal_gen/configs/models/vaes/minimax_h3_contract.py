@@ -21,6 +21,35 @@ class MiniMaxH3VAEContractError(ValueError):
         return (type(self), (self.component_name, self.detail))
 
 
+def validate_minimax_h3_vae_tiling(
+    tile_size: int, overlap: int, spatial_ratio: int, *, prefix: str = ""
+) -> None:
+    for name, value in (
+        (f"{prefix}tile_size", tile_size),
+        (f"{prefix}tile_overlap_min", overlap),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f"MiniMax H3 VAE {name} must be a positive integer, got {value!r}"
+            )
+    if overlap >= tile_size:
+        raise ValueError(
+            f"MiniMax H3 VAE {prefix}tile_overlap_min must be less than "
+            f"{prefix}tile_size, got {overlap} >= {tile_size}"
+        )
+    # Tiles are sliced and stitched in both pixel and latent coordinates.
+    # Alignment also prevents positive pixel overlap becoming zero in latents.
+    for name, value in (
+        (f"{prefix}tile_size", tile_size),
+        (f"{prefix}tile_overlap_min", overlap),
+    ):
+        if value % spatial_ratio:
+            raise ValueError(
+                f"MiniMax H3 VAE {name} must be a multiple of the spatial "
+                f"compression ratio ({spatial_ratio}), got {value}"
+            )
+
+
 def validate_minimax_h3_vae_latent_stats(
     arch_config: MiniMaxH3LatentStatsConfig,
     component_name: str,
@@ -75,4 +104,5 @@ def validate_minimax_h3_vae_latent_stats(
 __all__ = [
     "MiniMaxH3VAEContractError",
     "validate_minimax_h3_vae_latent_stats",
+    "validate_minimax_h3_vae_tiling",
 ]
