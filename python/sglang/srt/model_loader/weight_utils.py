@@ -20,6 +20,7 @@ import threading
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Any,
     Callable,
     Dict,
     Generator,
@@ -884,6 +885,46 @@ def filter_files_not_needed_for_inference(hf_weights_files: List[str]) -> List[s
     return hf_weights_files
 
 
+# Layout version of the np_cache index. Bump it whenever the on-disk naming
+# changes so that a cache written by an older version is rebuilt rather than
+# read back under the new rules.
+_NP_CACHE_INDEX_VERSION = 2
+
+
+def _np_cache_file_name(weight_name: str) -> str:
+    """Return the cache file name that holds ``weight_name``.
+
+    A tensor name is checkpoint-supplied data, not a safe path component: it may
+    contain path separators or ``..``, so using it as a file name lets a
+    checkpoint pick where the cache is written and read. Derive an opaque name
+    instead and keep the real name in the index.
+    """
+    return hashlib.sha256(weight_name.encode("utf-8")).hexdigest() + ".npy"
+
+
+def _load_np_cache_index(weight_names_file: str) -> Optional[Dict[str, Any]]:
+    """Return a usable np_cache index, or None when it must be rebuilt.
+
+    None covers "absent", "unreadable" and "written by another layout version".
+    The last case matters: an index from before the file names were hashed maps
+    weights to checkpoint-chosen paths, so it is discarded rather than trusted.
+    """
+    if not os.path.exists(weight_names_file):
+        return None
+    try:
+        with open(weight_names_file) as f:
+            index = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if (
+        not isinstance(index, dict)
+        or index.get("version") != _NP_CACHE_INDEX_VERSION
+        or not isinstance(index.get("weights"), list)
+    ):
+        return None
+    return index
+
+
 def np_cache_weights_iterator(
     model_name_or_path: str,
     cache_dir: Optional[str],
@@ -905,8 +946,8 @@ def np_cache_weights_iterator(
     # Use file lock to prevent multiple processes from
     # dumping the same model weights to numpy at the same time.
     with get_lock(model_name_or_path, cache_dir):
-        if not os.path.exists(weight_names_file):
-            weight_names: List[str] = []
+        if _load_np_cache_index(weight_names_file) is None:
+            weights: List[List[str]] = []
             for bin_file in tqdm(
                 hf_weights_files,
                 desc="Loading np_cache checkpoint shards",
@@ -916,18 +957,30 @@ def np_cache_weights_iterator(
             ):
                 state = torch.load(bin_file, map_location="cpu", weights_only=True)
                 for name, param in state.items():
-                    param_path = os.path.join(np_folder, name)
-                    with open(param_path, "wb") as f:
+                    file_name = _np_cache_file_name(name)
+                    with open(os.path.join(np_folder, file_name), "wb") as f:
                         np.save(f, param.cpu().detach().numpy())
-                    weight_names.append(name)
+                    weights.append([name, file_name])
             with open(weight_names_file, "w") as f:
-                json.dump(weight_names, f)
+                json.dump({"version": _NP_CACHE_INDEX_VERSION, "weights": weights}, f)
 
-    with open(weight_names_file) as f:
-        weight_names = json.load(f)
+    index = _load_np_cache_index(weight_names_file)
+    if index is None:
+        raise RuntimeError(
+            f"np_cache index {weight_names_file} is missing or unreadable right "
+            f"after it was built. Delete {np_folder} and retry."
+        )
 
-    for name in weight_names:
-        param_path = os.path.join(np_folder, name)
+    for entry in index["weights"]:
+        name, file_name = entry
+        # The index is written by the block above, but a leftover or edited one
+        # must not be able to move the read out of np_folder either.
+        if file_name != os.path.basename(file_name):
+            raise ValueError(
+                f"np_cache index {weight_names_file} maps {name!r} to "
+                f"{file_name!r}, which is not a plain file name."
+            )
+        param_path = os.path.join(np_folder, file_name)
         with open(param_path, "rb") as f:
             param = np.load(f)
         yield name, torch.from_numpy(param)

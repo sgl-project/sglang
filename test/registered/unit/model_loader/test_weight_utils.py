@@ -10,9 +10,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.model_loader.weight_utils import (
+    _NP_CACHE_INDEX_VERSION,
     filter_duplicate_safetensors_files,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
+    np_cache_weights_iterator,
 )
 from sglang.srt.utils import runai_utils
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -222,3 +224,88 @@ class TestInitializeDummyWeights(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNpCacheWeightNames(CustomTestCase):
+    """np_cache must not let a checkpoint choose where its cache files go.
+
+    A tensor name is data read out of the checkpoint. It used to be joined onto
+    the cache directory as a file name, so a name containing ``..`` placed the
+    .npy file outside that directory on the write pass and read it back from
+    there on later loads.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.folder = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+
+    def _dump(self, state_dict):
+        """Run the iterator over a one-shard .bin holding ``state_dict``."""
+        hf_folder = os.path.join(self.folder, "checkpoint")
+        os.makedirs(hf_folder, exist_ok=True)
+        bin_file = os.path.join(hf_folder, "pytorch_model.bin")
+        torch.save(state_dict, bin_file)
+        loaded = dict(np_cache_weights_iterator(hf_folder, None, hf_folder, [bin_file]))
+        return hf_folder, loaded
+
+    def test_traversing_tensor_name_stays_inside_the_cache_dir(self):
+        outside = os.path.join(self.folder, "outside")
+        os.makedirs(outside, exist_ok=True)
+        victim = os.path.join(outside, "victim")
+        with open(victim, "w") as f:
+            f.write("untouched")
+
+        name = "../../outside/victim"
+        hf_folder, loaded = self._dump({name: torch.zeros(4)})
+
+        with open(victim) as f:
+            self.assertEqual(f.read(), "untouched")
+        self.assertEqual(
+            sorted(os.listdir(outside)),
+            ["victim"],
+            "np_cache wrote outside its own directory",
+        )
+        # the weight is still served under its real name
+        self.assertEqual(list(loaded), [name])
+        self.assertEqual(loaded[name].shape, (4,))
+
+    def test_separator_in_tensor_name_round_trips(self):
+        # A name with a separator used to need a matching subdirectory to exist
+        # and raised FileNotFoundError when it did not.
+        name = "encoder/layer.0/weight"
+        _, loaded = self._dump({name: torch.ones(2)})
+        self.assertEqual(list(loaded), [name])
+        self.assertTrue(torch.equal(loaded[name], torch.ones(2)))
+
+    def test_stale_index_is_rebuilt_not_trusted(self):
+        hf_folder, _ = self._dump({"w": torch.zeros(1)})
+        index_file = os.path.join(hf_folder, "np", "weight_names.json")
+
+        # the pre-fix on-disk format: a bare list of checkpoint-chosen paths
+        with open(index_file, "w") as f:
+            json.dump(["../../escaped"], f)
+
+        bin_file = os.path.join(hf_folder, "pytorch_model.bin")
+        loaded = dict(np_cache_weights_iterator(hf_folder, None, hf_folder, [bin_file]))
+        self.assertEqual(list(loaded), ["w"])
+        with open(index_file) as f:
+            self.assertEqual(json.load(f)["version"], _NP_CACHE_INDEX_VERSION)
+
+    def test_index_naming_a_path_is_rejected(self):
+        hf_folder, _ = self._dump({"w": torch.zeros(1)})
+        index_file = os.path.join(hf_folder, "np", "weight_names.json")
+
+        # current layout version, but an entry that points out of np/
+        with open(index_file, "w") as f:
+            json.dump(
+                {
+                    "version": _NP_CACHE_INDEX_VERSION,
+                    "weights": [["w", "../../escaped.npy"]],
+                },
+                f,
+            )
+
+        bin_file = os.path.join(hf_folder, "pytorch_model.bin")
+        with self.assertRaises(ValueError):
+            dict(np_cache_weights_iterator(hf_folder, None, hf_folder, [bin_file]))
