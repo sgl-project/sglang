@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency 
     LAYERWISE_OFFLOAD,
     RESIDENT,
 )
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3Attention
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     MiniMaxH3Pipeline,
 )
@@ -765,7 +766,6 @@ def test_validate_server_args_accepts_transformer_backend_override():
             "transformer",
         ),
     )
-
     with patch(
         "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
     ) as get_attn_backend:
@@ -774,6 +774,29 @@ def test_validate_server_args_accepts_transformer_backend_override():
         128,
         torch.bfloat16,
         selected_attention_backend=AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
+        attention_requirements=AttentionRequirements(packed_varlen=True),
+    )
+
+
+def test_validate_server_args_accepts_sla_attn():
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={"transformer": "sla_attn"},
+        attention_backend="fa",
+        ring_degree=1,
+        resolve_component_attention_backend=lambda *_names: (
+            AttentionBackendEnum.SLA_ATTN,
+            "transformer",
+        ),
+    )
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
+    ) as get_attn_backend:
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+    get_attn_backend.assert_called_once_with(
+        128,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.SLA_ATTN,
         attention_requirements=AttentionRequirements(packed_varlen=True),
     )
 
@@ -833,3 +856,34 @@ def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
         modes["audio_vae"] = RESIDENT
         with pytest.raises(ValueError, match="audio_vae"):
             MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+
+def test_sla_audio_prefix_survives_attention_boundary():
+    """Audio protection reaches the backend through the extracted attention path."""
+    attention = MiniMaxH3Attention.__new__(MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.num_heads = 1
+    attention.head_dim = 2
+    attention.local_inner_dim = 2
+    attention.qkv_proj = lambda x: (torch.cat((x, x, x), dim=-1), None)
+    attention.out_proj = lambda x: (x, None)
+    attention.q_norm = torch.nn.RMSNorm(2)
+    attention.k_norm = torch.nn.RMSNorm(2)
+    attention.hybrid = None
+    attention.bcg_breakpoint = False
+    attention._attention_backend_enum = AttentionBackendEnum.SLA_ATTN
+
+    def attend(q, k, v, *, protect_upto=0, **kwargs):
+        return v + protect_upto
+
+    attention._attention_impl = SimpleNamespace(forward_varlen=attend)
+    x = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    actual = attention(
+        x,
+        rope_cache=None,
+        cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+        cu_seqlens_host=(0, 2),
+        max_seqlen=2,
+        protect_upto=7,
+    )
+    torch.testing.assert_close(actual, x + 7)
