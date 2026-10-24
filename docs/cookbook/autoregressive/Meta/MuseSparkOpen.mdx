@@ -499,9 +499,125 @@ This cookbook provides deployment recipes for the Muse Spark Open 816B-A42B chec
 
 ## 2. Configuration tips
 
+### Aggregated serving capacity and timeouts
+
+For the aggregated TP/EP recipes without attention data parallelism, set an explicit request cap for your workload. Let `C` be the expected number of active client requests. You can use `CAPACITY=2*C` to leave scheduling headroom. The example below uses the same value for `--cuda-graph-max-bs-decode`; lower this graph cap to save memory without reducing `--max-running-requests`. Decode batches above the graph cap use eager execution. With DFlash2, also set `SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1` when request admission exceeds the graph cap, so selector parameters are not staged into buffers sized for the captured batch. Validate memory and throughput at your intended concurrency. Larger admission or graph caps consume more memory and do not guarantee higher throughput.
+
+Set the environment variable in the serving process, then add the flags below to your selected launch command, replacing any existing values:
+
+```bash Command
+C=48  # Set to your expected active-request concurrency.
+CAPACITY=$((2 * C))
+export SGLANG_TIMEOUT_KEEP_ALIVE=900
+
+# Add to the selected aggregated launch command:
+# --max-running-requests "$CAPACITY" \
+# --cuda-graph-max-bs-decode "$CAPACITY" \
+# --watchdog-timeout 3600 \
+# --enable-metrics
+```
+
+`SGLANG_TIMEOUT_KEEP_ALIVE=900` retains idle HTTP connections for 900 seconds; it does not set a request-generation timeout. `--watchdog-timeout 3600` allows a forward batch up to 3600 seconds before the watchdog terminates a hung server, so increasing it also delays fault detection. Adjust these values to your client connection reuse and longest expected forward batch. `--enable-metrics` exposes Prometheus metrics for monitoring. See the [server argument reference](/docs/advanced_features/server_arguments), [HTTP environment variables](/docs/references/environment_variables#http-%26-grpc-server), and [production metrics](/docs/references/production_metrics).
+
+### B300 TP8 with host KV cache
+
+The following aggregated configuration uses eight B300 GPUs with TP8/EP8. It keeps KV cache on the GPUs at client concurrency 1, 2, 4 and 8; at 16 and above it enables HiCache, prefill sequence parallelism and MegaMoE. `CONCURRENCY` selects the serving configuration for the expected client load; the request-admission and decode-graph limits remain 192 in every case. HiCache reserves 120 GB per rank at 16 and 216 GB per rank above 16, so check host memory capacity before starting all eight ranks.
+
+Run in the pinned image below with access to the gated target checkpoint. The command corresponds to [InferenceX PR #4156](https://github.com/SemiAnalysisAI/InferenceX/pull/4156) at `3586b3bccece7fa1bb8feb1df6bd0a96fc5776fe`; [its sweep](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/38897356089/attempts/2) has successful measurements at all ten client concurrencies and natural GSM8K evaluation. Retained artifacts and final publication still require InferenceX review. Throughput uses the committed synthetic acceptance curve; this production command uses natural draft verification and makes no equivalent-throughput claim.
+
+```bash Command
+docker pull lmsysorg/sglang:dev-muse-spark-open@sha256:8cfc5a72cb296771f5f8a4a4688cb6d05685610a830cbb616fa4ab0eb7bb2b0a
+```
+
+Inside that image, set the expected client concurrency and launch one server:
+
+```bash Command
+CONCURRENCY=48
+CACHE_ARGS=()
+CACHE_ENV=()
+case "$CONCURRENCY" in
+  1|2|4|8) ;;
+  16) CACHE_ARGS=(--hicache-size 120) ;;
+  24|32|48|64|128) CACHE_ARGS=(--hicache-size 216) ;;
+  *) printf 'Choose concurrency 1, 2, 4, 8, 16, 24, 32, 48, 64 or 128.\n' >&2; exit 2 ;;
+esac
+if (( CONCURRENCY >= 16 )); then
+  CACHE_ARGS+=(--enable-hierarchical-cache --enable-layernorm-sp --enable-megamoe-for-layernorm-sp)
+  CACHE_ENV+=(SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8192)
+fi
+
+env PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 \
+  SGLANG_TIMEOUT_KEEP_ALIVE=1800 OMP_NUM_THREADS=8 \
+  TVM_FFI_CUDA_ARCH_LIST=10.3a \
+  SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
+  SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python \
+  SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1 \
+  "${CACHE_ENV[@]}" \
+  python3 -m sglang.launch_server \
+  --model-path meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --served-model-name meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 --expert-parallel-size 8 \
+  --quantization modelopt_fp4 \
+  --moe-runner-backend flashinfer_trtllm \
+  --attention-backend trtllm_mha \
+  --kv-cache-dtype fp8_e4m3 --page-size 128 \
+  --mem-fraction-static 0.9 \
+  --max-running-requests 192 --cuda-graph-max-bs-decode 192 \
+  --cuda-graph-backend-prefill breakable \
+  --swa-full-tokens-ratio 0.4 \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+  --speculative-draft-attention-backend fa4 \
+  --speculative-num-draft-tokens 8 --speculative-use-block-verification \
+  --mm-feature-transport cpu \
+  --reasoning-parser muse --tool-call-parser muse \
+  --watchdog-timeout 3600 --enable-metrics --enable-cache-report \
+  --tokenizer-worker-num 4 --enable-http2 \
+  "${CACHE_ARGS[@]}" \
+  --host 0.0.0.0 --port 30000
+```
+
+The eager DFlash sampler avoids graph-sized selector staging without changing the draft checkpoint or its stored precision. It does not disable natural target verification. Keep it enabled when tuning request and graph limits independently. The graph, memory and HiCache settings trade memory use, latency and per-GPU throughput; the TP8 configuration is not a uniform efficiency improvement over the four-GPU TP4 configuration.
+
 ### H200 configuration
 
 NVFP4 runs on one 8x H200 node with Marlin W4A16 experts (`--moe-runner-backend marlin`), since Hopper has no TRT-LLM FP4 MoE. The BF16 checkpoint does not fit on one node, so it runs TP16/EP16 across two nodes; replace `<node-rank>` and `<node0-ip>` for each node. Prefill sequence parallel and MegaMoE need SM100 kernels and are unavailable on H200.
+
+### H100 memory-constrained example
+
+The following configuration reached serving readiness and completed a concurrency-1 throughput canary on one NVIDIA CUDA node with **8×H100 80 GB**. It uses TP8/EP8, the NVFP4 target with Marlin W4A16, FA3 target attention with FP8 E4M3 KV, and the BF16 DFlash2 draft with FA4 attention and BF16 KV. Keep this as a C1 starting point; the canary used synthetic acceptance lengths and does not establish accuracy or higher-concurrency qualification.
+
+Run inside `lmsysorg/sglang:dev-muse-spark-open@sha256:8cfc5a72cb296771f5f8a4a4688cb6d05685610a830cbb616fa4ab0eb7bb2b0a`. You need access to the gated target checkpoint, either through `HF_TOKEN` in the serving environment or an already staged, container-visible checkpoint directory passed as `MODEL_PATH`.
+
+```bash Command
+MODEL_PATH=meta-models/Muse-Spark-Open-816B-A42B-NVFP4
+export SGLANG_TIMEOUT_KEEP_ALIVE=900
+
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --served-model-name meta-models/Muse-Spark-Open-816B-A42B-NVFP4 \
+  --trust-remote-code \
+  --tp-size 8 --ep-size 8 \
+  --quantization modelopt_fp4 \
+  --moe-runner-backend marlin --fp4-gemm-backend marlin \
+  --attention-backend fa3 --kv-cache-dtype fp8_e4m3 \
+  --mem-fraction-static 0.97 \
+  --chunked-prefill-size 1024 \
+  --swa-full-tokens-ratio 0.1 \
+  --disable-prefill-cuda-graph \
+  --max-running-requests 2 --cuda-graph-max-bs-decode 2 \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+  --speculative-draft-attention-backend fa4 \
+  --speculative-num-draft-tokens 8 \
+  --mm-feature-transport cpu \
+  --reasoning-parser muse --tool-call-parser muse \
+  --watchdog-timeout 3600 --enable-metrics \
+  --host 0.0.0.0 --port 30000
+```
+
+The 1024-token prefill chunk bounds activation memory without shortening the request context. The SWA/full KV-token ratio of 0.1 gives more capacity to full-attention layers, while disabling prefill CUDA graphs saves graph memory. The static fraction of 0.97 leaves little transient-memory headroom; validate memory again before raising concurrency or graph caps. These settings retain the checkpoint's context configuration rather than adding a lower `--context-length` limit. The canary used a 256k corpus; it does not prove that a full 1M-token request fits. See [memory and scheduling](/docs/advanced_features/server_arguments#memory-and-scheduling) and the [measured C1 recipe](https://github.com/SemiAnalysisAI/InferenceX/blob/e8e287469b9b8bf39d95187811d4a3796b8d9452/inferencex-e2e/benchmarks/single_node/srt-slurm-recipes/musespark/sglang/h100-fp4-mtp/agentic.yaml).
 
 ### Xeon CPU service configuration
 
