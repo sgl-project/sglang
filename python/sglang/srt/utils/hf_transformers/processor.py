@@ -48,6 +48,7 @@ from .tokenizer import (
     _TOKENIZERS_BACKEND,
     _fix_added_tokens_encoding,
     _fix_special_tokens_pattern,
+    _fix_v5_add_bos_eos_token,
     _install_tokenizer_warnings_filter,
     get_tokenizer,
 )
@@ -378,6 +379,7 @@ def get_processor(
             processor.tokenizer = tokenizer
 
     _install_tokenizer_warnings_filter(tokenizer)
+    _fix_v5_add_bos_eos_token(tokenizer, tokenizer_name, revision)
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(
