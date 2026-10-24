@@ -24,6 +24,7 @@ def _inputs_on_cuda(*args, **kwargs) -> bool:
 class ExpandPrefillCausallyResult(msgspec.Struct):
     seq_lens_casual: torch.Tensor
     req_pool_indices_repeated: torch.Tensor
+    window_groups: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
 
 
 class ExpandPrefillCausally:
@@ -45,6 +46,7 @@ class ExpandPrefillCausally:
         extend_seq_lens_cpu: Optional[list[int]],
         num_tokens: int,
         padded_num_tokens: Optional[int],
+        return_window_groups: bool = False,
     ) -> ExpandPrefillCausallyResult:
         return expand_prefill_causally(
             req_pool_indices=req_pool_indices,
@@ -69,6 +71,7 @@ class ExpandPrefillCausally:
         extend_seq_lens_cpu: Optional[list[int]],
         num_tokens: int,
         padded_num_tokens: Optional[int],
+        return_window_groups: bool = False,
     ) -> ExpandPrefillCausallyResult:
         return expand_prefill_causally_triton(
             req_pool_indices=req_pool_indices,
@@ -76,6 +79,7 @@ class ExpandPrefillCausally:
             extend_seq_lens=extend_seq_lens,
             num_tokens=num_tokens,
             padded_num_tokens=padded_num_tokens,
+            return_window_groups=return_window_groups,
         )
 
 
@@ -157,17 +161,26 @@ def expand_prefill_causally(
 
 
 @triton.jit
+def _window_group_max(a, b):
+    return tl.maximum(a, b)
+
+
+@triton.jit
 def _expand_prefill_causally_kernel(
     req_pool_ptr,
     seq_lens_ptr,
     extend_seq_lens_ptr,
     seq_lens_casual_ptr,
     req_pool_repeated_ptr,
+    group_ptr,
+    first_ptr,
+    last_ptr,
     bs,
     num_tokens,
     total_tokens,
     BLOCK: tl.constexpr,
     BS_P2: tl.constexpr,
+    WINDOW_GROUPS: tl.constexpr,
 ):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < total_tokens
@@ -195,6 +208,30 @@ def _expand_prefill_causally_kernel(
     tl.store(seq_lens_casual_ptr + offs, causal, mask=mask)
     tl.store(req_pool_repeated_ptr + offs, rp, mask=mask)
 
+    if WINDOW_GROUPS:
+        # Empty request slots emit no rows. Padding emits the final slot's ID,
+        # even when that slot has no real rows. Group adjacent *IDs*, not slots.
+        active = bmask & ((extend > 0) | ((b == bs - 1) & (total_tokens > num_tokens)))
+        latest = tl.associative_scan(tl.where(active, b + 1, 0), 0, _window_group_max)
+        previous = tl.gather(latest, tl.maximum(b - 1, 0), 0)
+        previous = tl.where(b > 0, previous, 0)
+        ids = tl.load(req_pool_ptr + b, mask=bmask, other=0)
+        previous_ids = tl.gather(ids, tl.maximum(previous - 1, 0), 0)
+        begins = active & ((previous == 0) | (ids != previous_ids))
+        before = b[None, :] <= r[:, None]
+        group = tl.sum((begins[None, :] & before).to(tl.int32), 1) - 1
+        first = tl.max(tl.where(begins[None, :] & before, start_locs[None, :], 0), 1)
+        last = (
+            tl.min(
+                tl.where(begins[None, :] & ~before, start_locs[None, :], total_tokens),
+                1,
+            )
+            - 1
+        )
+        tl.store(group_ptr + offs, group.to(tl.int64), mask=mask)
+        tl.store(first_ptr + offs, first.to(tl.int64), mask=mask)
+        tl.store(last_ptr + offs, last.to(tl.int64), mask=mask)
+
 
 def expand_prefill_causally_triton(
     *,
@@ -203,6 +240,7 @@ def expand_prefill_causally_triton(
     extend_seq_lens: torch.Tensor,
     num_tokens: int,
     padded_num_tokens: Optional[int],
+    return_window_groups: bool = False,
 ) -> ExpandPrefillCausallyResult:
     bs = req_pool_indices.shape[0]
     device = req_pool_indices.device
@@ -216,6 +254,14 @@ def expand_prefill_causally_triton(
     req_pool_indices_repeated = torch.empty(
         total_tokens, dtype=req_pool_indices.dtype, device=device
     )
+    window_groups = (
+        tuple(
+            torch.empty(total_tokens, dtype=torch.int64, device=device)
+            for _ in range(3)
+        )
+        if return_window_groups
+        else None
+    )
     BLOCK = 256
     _expand_prefill_causally_kernel[(triton.cdiv(total_tokens, BLOCK),)](
         req_pool_indices,
@@ -223,15 +269,18 @@ def expand_prefill_causally_triton(
         extend_seq_lens,
         seq_lens_casual,
         req_pool_indices_repeated,
+        *(window_groups if window_groups is not None else (None, None, None)),
         bs,
         num_tokens,
         total_tokens,
         BLOCK=BLOCK,
         BS_P2=triton.next_power_of_2(max(bs, 1)),
+        WINDOW_GROUPS=return_window_groups,
     )
     return ExpandPrefillCausallyResult(
         seq_lens_casual=seq_lens_casual,
         req_pool_indices_repeated=req_pool_indices_repeated,
+        window_groups=window_groups,
     )
 
 

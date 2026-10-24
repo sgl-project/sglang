@@ -100,6 +100,7 @@ def window_layout(
     floor: Optional[torch.Tensor] = None,
     num_groups: Optional[int] = None,
     padded_rows: Optional[int] = None,
+    row_groups: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     """padded_rows is set for the prefill CUDA graph, which pads the layout to that
     many query rows past the live ones in req and pos."""
@@ -109,7 +110,9 @@ def window_layout(
     if req.is_cuda and not _is_hip:
         from sglang.kernels.ops.kvcache.dsv41_window_layout import build_window_layout
 
-        group, first, last = _first_row_offsets(req)
+        group, first, last = (
+            _first_row_offsets(req) if row_groups is None else row_groups
+        )
         if (
             num_groups is not None
             and resolve_level() >= InvariantCheckLevel.WARN
