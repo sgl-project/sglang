@@ -927,6 +927,9 @@ class SchedulerMetricsReporter:
             if x := self.scheduler_status_logger:
                 x.maybe_dump(batch, self.scheduler.waiting_queue)
 
+        # Routers build their cache view from KV events, so flush them every step.
+        self.scheduler.kv_events_publisher.publish_kv_events()
+
         # Periodic work: log + heavy metrics at decode_log_interval
         if self.forward_ct_decode % self.decode_log_interval != 0:
             return
@@ -1139,7 +1142,6 @@ class SchedulerMetricsReporter:
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
-        self.scheduler.kv_events_publisher.publish_kv_events()
 
     def log_batch_result_stats(
         self,

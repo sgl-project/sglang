@@ -23,6 +23,9 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+    SchedulerKvEventsPublisher,
+)
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
@@ -1016,6 +1019,33 @@ class TestIdleMetrics(CustomTestCase):
         self.assertTrue(math.isnan(self.reporter.stats.fwd_occupancy))
         self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
         self.assertEqual(self.published_occupancies, [])
+
+
+class TestDecodeKvEvents(CustomTestCase):
+    def test_decode_step_publishes_queued_kv_events(self):
+        """KV events queued during decode must reach the publisher in the same
+        step, not only on decode_log_interval steps."""
+        event = object()
+        kv_events_publisher = SchedulerKvEventsPublisher(
+            kv_events_config=None,
+            tree_cache=types.SimpleNamespace(take_events=lambda: [event]),
+            send_metrics_from_scheduler=None,
+            max_running_requests=1,
+            max_total_num_tokens=1,
+            get_stats=lambda: None,
+        )
+        kv_events_publisher.enable_kv_cache_events = True
+        kv_events_publisher.kv_event_publisher = _CollectingPublisher()
+        scheduler = types.SimpleNamespace(kv_events_publisher=kv_events_publisher)
+        reporter = _make_reporter(self, scheduler)
+        reporter.forward_ct_decode = 1
+
+        reporter.report_decode_stats(
+            can_run_cuda_graph=False, running_batch=types.SimpleNamespace()
+        )
+
+        batches = kv_events_publisher.kv_event_publisher.metrics
+        self.assertEqual([batch.events for batch in batches], [[event]])
 
 
 class TestSchedulerTimeAccounting(CustomTestCase):
