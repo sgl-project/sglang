@@ -357,6 +357,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Per-rank token capacity of an extra, smaller FlashInfer MegaMOE workspace for decode-only forwards of ModelOpt NVFP4 MoE layers. Either <code>0</code> (off) or <code>0 &lt; capacity &lt; main capacity</code>, where the main capacity is <code>SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK</code> or its derived value; any other value fails when the first MegaMOE layer is built. A forward uses it only when no DP rank extends and every EP rank's batch fits; otherwise it uses the main workspace. Unused (logged once) while MegaMoE startup autotuning runs, since the tuned capacity profiles already serve small batches; it takes effect with <code>--disable-flashinfer-autotune</code> or <code>--flashinfer-autotune-skip-ops flashinfer_megamoe</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Permit CuTe DSL MegaMOE in-kernel FC2 reduction for NVFP4 W4A4, NVFP4 W4A16, and MXFP8. FlashInfer's tuning profile may still select external reduction. BF16 atomic accumulation is nondeterministic; leave disabled for reproducibility. Requires BF16 combine.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"false"</code></td>
