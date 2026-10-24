@@ -18,6 +18,11 @@ class Ling3Detector(Glm4MoeDetector):
         r"(.*?)(</tool_call>|$)",
         re.DOTALL,
     )
+    _STREAMING_HEADER_PATTERN = re.compile(
+        r"<tool_call>\s*(.*?)"
+        r"(?:(?:\\n|\n)\s*|(?=<arg_key>)|(?=</tool_call>))",
+        re.DOTALL,
+    )
 
     def __init__(self):
         super().__init__()

@@ -168,6 +168,9 @@ class Glm4MoeDetector(BaseFormatDetector):
     _STREAMING_PARTIAL_PATTERN = re.compile(
         r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)", re.DOTALL
     )
+    _STREAMING_HEADER_PATTERN = re.compile(
+        r"<tool_call>(.*?)(?:\\n|\n)", re.DOTALL
+    )
 
     def __init__(self):
         super().__init__()
@@ -198,6 +201,11 @@ class Glm4MoeDetector(BaseFormatDetector):
         self._cached_value_type: Optional[str] = (
             None  # Cache the value type for consistency
         )
+        self._cached_func_name: Optional[str] = None
+        self._args_start_pos = 0
+        self._args_ws_scan_pos = 0
+        self._args_content_start: Optional[int] = None
+        self._eot_search_pos = 0
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
@@ -336,6 +344,22 @@ class Glm4MoeDetector(BaseFormatDetector):
         Returns:
             JSON string increment to append to the output
         """
+        if (
+            self._stream_state == StreamState.IN_VALUE
+            and not self._xml_tag_buffer
+            and "<" not in raw_increment
+        ):
+            if not raw_increment:
+                return ""
+            value_type = self._cached_value_type or "string"
+            self._current_value += raw_increment
+            if value_type == "string":
+                prefix = "" if self._value_started else '"'
+                self._value_started = True
+                return prefix + json.dumps(raw_increment, ensure_ascii=False)[1:-1]
+            self._value_started = True
+            return raw_increment
+
         json_output = ""
 
         for char in raw_increment:
@@ -451,7 +475,9 @@ class Glm4MoeDetector(BaseFormatDetector):
         current_text = self._buffer
 
         # Check if we have a tool call
-        has_tool_call = self.bot_token in current_text
+        has_tool_call = (
+            self._cached_func_name is not None or self.bot_token in current_text
+        )
 
         if not has_tool_call:
             # Check if buffer could be the start of a tool call
@@ -480,141 +506,181 @@ class Glm4MoeDetector(BaseFormatDetector):
 
         calls: list[ToolCallItem] = []
         try:
-            # Try to match a partial or complete tool call
-            partial_match = self._STREAMING_PARTIAL_PATTERN.search(current_text)
-            if partial_match:
-                func_name_raw = partial_match.group(1)
-                func_args_raw = partial_match.group(2)
-                is_tool_end = partial_match.group(3)
-
-                # Only proceed if we have a non-empty function name
+            if self._cached_func_name is not None:
+                func_name = self._cached_func_name
+                args_start = self._args_start_pos
+            else:
+                header_match = self._STREAMING_HEADER_PATTERN.search(current_text)
+                if not header_match:
+                    return StreamingParseResult(normal_text="", calls=[])
+                func_name_raw = header_match.group(1)
                 if func_name_raw is None or not func_name_raw.strip():
                     # If we only have the start token without a function name,
                     # continue buffering until we get more content
                     return StreamingParseResult(normal_text="", calls=[])
-
                 func_name = func_name_raw.strip()
-                func_args_raw = func_args_raw.strip() if func_args_raw else ""
+                args_start = header_match.end()
 
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
-                    self.current_tool_id = 0
-                    self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = [""]
-                    self._streamed_raw_length = 0
-                    self.current_tool_name_sent = False
-                    self._reset_streaming_state()
+            # Initialize state if this is the first tool call
+            if self.current_tool_id == -1:
+                self.current_tool_id = 0
+                self.prev_tool_call_arr = []
+                self.streamed_args_for_tool = [""]
+                self._streamed_raw_length = 0
+                self.current_tool_name_sent = False
+                self._reset_streaming_state()
 
-                # Ensure we have enough entries in our tracking arrays
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
+            # Ensure we have enough entries in our tracking arrays
+            while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                self.prev_tool_call_arr.append({})
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
 
-                # Send tool name first if not sent yet
-                if not self.current_tool_name_sent:
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=func_name,
-                            parameters="",
-                        )
+            # Send tool name first if not sent yet
+            if not self.current_tool_name_sent:
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=func_name,
+                        parameters="",
                     )
-                    self.current_tool_name_sent = True
-                    self._streamed_raw_length = 0
-                    self._reset_streaming_state()
-                    # Store the tool call info
-                    self.prev_tool_call_arr[self.current_tool_id] = {
-                        "name": func_name,
-                        "arguments": {},
-                    }
+                )
+                self.current_tool_name_sent = True
+                self._streamed_raw_length = 0
+                self._reset_streaming_state()
+                self._cached_func_name = func_name
+                self._args_start_pos = args_start
+                self._args_ws_scan_pos = args_start
+                self._eot_search_pos = args_start
+                # Store the tool call info
+                self.prev_tool_call_arr[self.current_tool_id] = {
+                    "name": func_name,
+                    "arguments": {},
+                }
 
-                # The name and final tool-call marker can arrive in the same
-                # parse call, so continue into argument/finalization handling.
-                if self.current_tool_name_sent:
-                    # Process XML to JSON streaming
-                    current_raw_length = len(func_args_raw)
+            # The name and final tool-call marker can arrive in the same
+            # parse call, so continue into argument/finalization handling.
+            if self.current_tool_name_sent:
+                eot_idx = current_text.find(
+                    self.eot_token, max(args_start, self._eot_search_pos)
+                )
+                if eot_idx != -1:
+                    args_end = eot_idx
+                    is_tool_end = self.eot_token
+                    match_end = eot_idx + len(self.eot_token)
+                else:
+                    self._eot_search_pos = max(
+                        args_start, len(current_text) - len(self.eot_token) + 1
+                    )
+                    args_end = len(current_text)
+                    is_tool_end = ""
+                    match_end = len(current_text)
 
-                    if current_raw_length > self._streamed_raw_length:
-                        # Get the new raw XML content
-                        raw_increment = func_args_raw[self._streamed_raw_length :]
+                if self._args_content_start is None:
+                    pos = max(args_start, self._args_ws_scan_pos)
+                    while pos < args_end and current_text[pos].isspace():
+                        pos += 1
+                    self._args_ws_scan_pos = pos
+                    if pos < args_end:
+                        self._args_content_start = pos
 
-                        # Convert XML increment to JSON increment using state machine
-                        json_increment = self._process_xml_to_json_streaming(
-                            raw_increment, func_name, tools
+                if self._args_content_start is not None:
+                    content_start = self._args_content_start
+                    content_end = args_end
+                    while (
+                        content_end > content_start
+                        and current_text[content_end - 1].isspace()
+                    ):
+                        content_end -= 1
+                    current_raw_length = content_end - content_start
+                else:
+                    content_start = args_start
+                    content_end = args_start
+                    current_raw_length = 0
+
+                if current_raw_length > self._streamed_raw_length:
+                    # Slice only the new raw XML increment rather than copying the full buffer
+                    raw_increment = current_text[
+                        content_start + self._streamed_raw_length : content_end
+                    ]
+
+                    # Convert XML increment to JSON increment using state machine
+                    json_increment = self._process_xml_to_json_streaming(
+                        raw_increment, func_name, tools
+                    )
+
+                    # CRITICAL: Update streamed length BEFORE checking json_increment
+                    # Even if json_increment is empty, the input has been consumed by the state machine
+                    self._streamed_raw_length = current_raw_length
+
+                    if json_increment:
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=None,
+                                parameters=json_increment,
+                            )
+                        )
+                        self._last_arguments += json_increment
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            json_increment
                         )
 
-                        # CRITICAL: Update streamed length BEFORE checking json_increment
-                        # Even if json_increment is empty, the input has been consumed by the state machine
-                        self._streamed_raw_length = current_raw_length
+                if is_tool_end == self.eot_token:
+                    if self._is_first_param:
+                        empty_object = "{}"
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=None,
+                                parameters=empty_object,
+                            )
+                        )
+                        self._last_arguments += empty_object
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            empty_object
+                        )
+                    else:
+                        # The streamed outer `{` is only closed here; a
+                        # trailing "}" may belong to a nested object value.
+                        closing_brace = "}"
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=None,
+                                parameters=closing_brace,
+                            )
+                        )
+                        self._last_arguments += closing_brace
+                        self.streamed_args_for_tool[self.current_tool_id] += (
+                            closing_brace
+                        )
 
-                        if json_increment:
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters=json_increment,
-                                )
+                    func_args_raw = current_text[content_start:content_end]
+                    try:
+                        pairs = self.func_arg_regex.findall(func_args_raw)
+                        if pairs:
+                            arguments = self._parse_argument_pairs(
+                                pairs, func_name, tools
                             )
-                            self._last_arguments += json_increment
-                            self.streamed_args_for_tool[self.current_tool_id] += (
-                                json_increment
-                            )
+                            self.prev_tool_call_arr[self.current_tool_id][
+                                "arguments"
+                            ] = arguments
+                    except Exception as e:
+                        logger.debug(
+                            f"Failed to parse arguments: {e}", exc_info=True
+                        )
 
-                    if is_tool_end == self.eot_token:
-                        if self._is_first_param:
-                            empty_object = "{}"
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters=empty_object,
-                                )
-                            )
-                            self._last_arguments += empty_object
-                            self.streamed_args_for_tool[self.current_tool_id] += (
-                                empty_object
-                            )
-                        else:
-                            # The streamed outer `{` is only closed here; a
-                            # trailing "}" may belong to a nested object value.
-                            closing_brace = "}"
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters=closing_brace,
-                                )
-                            )
-                            self._last_arguments += closing_brace
-                            self.streamed_args_for_tool[self.current_tool_id] += (
-                                closing_brace
-                            )
+                    # Remove the completed tool call from buffer
+                    self._buffer = current_text[match_end:]
 
-                        try:
-                            pairs = self.func_arg_regex.findall(func_args_raw)
-                            if pairs:
-                                arguments = self._parse_argument_pairs(
-                                    pairs, func_name, tools
-                                )
-                                self.prev_tool_call_arr[self.current_tool_id][
-                                    "arguments"
-                                ] = arguments
-                        except Exception as e:
-                            logger.debug(
-                                f"Failed to parse arguments: {e}", exc_info=True
-                            )
-
-                        # Remove the completed tool call from buffer
-                        self._buffer = current_text[partial_match.end(3) :]
-
-                        result = StreamingParseResult(normal_text="", calls=calls)
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
-                        self._streamed_raw_length = 0
-                        self._reset_streaming_state()
-                        return result
+                    result = StreamingParseResult(normal_text="", calls=calls)
+                    self.current_tool_id += 1
+                    self._last_arguments = ""
+                    self.current_tool_name_sent = False
+                    self._streamed_raw_length = 0
+                    self._reset_streaming_state()
+                    return result
 
             return StreamingParseResult(normal_text="", calls=calls)
 

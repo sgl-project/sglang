@@ -3135,6 +3135,28 @@ class TestGlm4MoeDetector(unittest.TestCase):
         self.assertIsInstance(value, dict)
         self.assertEqual(value, {"pattern": "\\d+"})
 
+    def test_streaming_incremental_scan_caches_header_and_handles_lt_in_value(self):
+        payload = "line 1\n" * 100 + "a < b and c <arg_not_close> d\n" + "line 2\n" * 100
+        text = (
+            "<tool_call>get_weather\n"
+            "<arg_key>city</arg_key>\n"
+            f"<arg_value>{payload}</arg_value>\n"
+            "<arg_key>date</arg_key>\n"
+            "<arg_value>2024-06-27</arg_value>\n"
+            "</tool_call>"
+        )
+        calls = []
+        for idx in range(0, len(text), 7):
+            res = self.detector.parse_streaming_increment(text[idx : idx + 7], self.tools)
+            calls.extend(res.calls)
+        self.assertEqual(calls[0].name, "get_weather")
+        reconstructed = json.loads("".join(c.parameters for c in calls if c.parameters))
+        self.assertEqual(reconstructed, {"city": payload, "date": "2024-06-27"})
+        self.assertEqual(
+            self.detector.prev_tool_call_arr[0]["arguments"],
+            {"city": payload, "date": "2024-06-27"},
+        )
+
 
 class TestGlm47MoeDetector(unittest.TestCase):
     def setUp(self):
@@ -3520,6 +3542,26 @@ class TestGlm47MoeDetector(unittest.TestCase):
             self.assertIsNotNone(constraint)
             self.assertEqual("json_schema", constraint[0])
             _glm47_native_structural_tag_available.cache_clear()
+
+    def test_streaming_incremental_scan_large_payload(self):
+        payload = "x = 1\n" * 200 + "if a < b:\n    pass\n"
+        text = (
+            "<tool_call>get_weather"
+            f"<arg_key>city</arg_key><arg_value>{payload}</arg_value>"
+            "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value>"
+            "</tool_call>"
+        )
+        calls = []
+        for idx in range(0, len(text), 9):
+            res = self.detector.parse_streaming_increment(text[idx : idx + 9], self.tools)
+            calls.extend(res.calls)
+        self.assertEqual(calls[0].name, "get_weather")
+        reconstructed = json.loads("".join(c.parameters for c in calls if c.parameters))
+        self.assertEqual(reconstructed, {"city": payload, "date": "2024-06-27"})
+        self.assertEqual(
+            self.detector.prev_tool_call_arr[0]["arguments"],
+            {"city": payload, "date": "2024-06-27"},
+        )
 
 
 class TestGlm47FullAssistantGrammar(unittest.TestCase):

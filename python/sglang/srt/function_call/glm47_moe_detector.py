@@ -342,6 +342,10 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._tool_call_completed = False  # Reset tool call completion status
         self._sent_empty_object = False  # Reset empty object sent status
         self._buffer_arguments = None
+        self._cached_func_name: Optional[str] = None
+        self._arg_key_idx: Optional[int] = None
+        self._arg_key_search_pos = 0
+        self._eot_search_pos = 0
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
@@ -430,6 +434,24 @@ class Glm47MoeDetector(BaseFormatDetector):
         Returns:
             JSON string increment to append to the output
         """
+        if (
+            self._stream_state == StreamState.IN_VALUE
+            and not self._xml_tag_buffer
+            and "<" not in raw_increment
+        ):
+            if not raw_increment:
+                return ""
+            value_type = self._cached_value_type or "string"
+            self._current_value += raw_increment
+            if value_type in ("auto", "number", "integer"):
+                return ""
+            if value_type == "string":
+                prefix = "" if self._value_started else '"'
+                self._value_started = True
+                return prefix + json.dumps(raw_increment, ensure_ascii=False)[1:-1]
+            self._value_started = True
+            return raw_increment
+
         json_output = ""
 
         for char in raw_increment:
@@ -586,19 +608,30 @@ class Glm47MoeDetector(BaseFormatDetector):
         )
 
     def _process_arguments_streaming(
-        self, func_name: str, func_args_raw: str, tools: List[Tool]
+        self,
+        func_name: str,
+        func_args_raw: str,
+        tools: List[Tool],
+        args_start: int = 0,
+        args_end: Optional[int] = None,
     ) -> Optional[ToolCallItem]:
         """Process streaming arguments.
 
         Args:
             func_name: Function name
-            func_args_raw: Raw argument string
+            func_args_raw: Raw argument string (or full buffer when args_end is given)
             tools: List of available tools
+            args_start: Start index of raw arguments in func_args_raw when args_end is given
+            args_end: End index of raw arguments in func_args_raw
 
         Returns:
             Tool call item with parameter updates or None
         """
-        current_raw_length = len(func_args_raw)
+        current_raw_length = (
+            args_end - args_start
+            if args_end is not None
+            else len(func_args_raw)
+        )
 
         if self._buffer_arguments is None:
             self._buffer_arguments = any(
@@ -612,7 +645,11 @@ class Glm47MoeDetector(BaseFormatDetector):
         if current_raw_length <= self._streamed_raw_length:
             return None
 
-        raw_increment = func_args_raw[self._streamed_raw_length :]
+        raw_increment = (
+            func_args_raw[args_start + self._streamed_raw_length : args_end]
+            if args_end is not None
+            else func_args_raw[self._streamed_raw_length :]
+        )
 
         json_increment = self._process_xml_to_json_streaming(
             raw_increment, func_name, tools
@@ -731,7 +768,9 @@ class Glm47MoeDetector(BaseFormatDetector):
         current_text = self._buffer
 
         # Check if we have a tool call
-        has_tool_call = self.bot_token in current_text
+        has_tool_call = (
+            self._arg_key_idx is not None or self.bot_token in current_text
+        )
 
         if not has_tool_call:
             # Check if buffer could be the start of a tool call
@@ -757,33 +796,56 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         # Extract any text before the first bot_token and return it as normal_text
         normal_text = ""
-        first_bot_token_idx = current_text.find(self.bot_token)
-        if first_bot_token_idx > 0:
-            normal_text = current_text[:first_bot_token_idx]
-            current_text = current_text[first_bot_token_idx:]
-            # Update buffer to only include from the bot token onwards
-            self._buffer = current_text
+        if self._arg_key_idx is None:
+            first_bot_token_idx = current_text.find(self.bot_token)
+            if first_bot_token_idx > 0:
+                normal_text = current_text[:first_bot_token_idx]
+                current_text = current_text[first_bot_token_idx:]
+                # Update buffer to only include from the bot token onwards
+                self._buffer = current_text
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
         calls: list[ToolCallItem] = []
         try:
-            # Try to match a partial or complete tool call
-            # Use a single flexible regex pattern that handles all cases
-            partial_match = re.search(
-                r"<tool_call>(.*?)(?:(<arg_key.*?))?(?:(</tool_call>)|$)",
-                current_text,
-                re.DOTALL,
+            name_start = len(self.bot_token)
+            eot_idx = current_text.find(
+                self.eot_token, max(name_start, self._eot_search_pos)
             )
+            if eot_idx != -1:
+                tool_end_idx = eot_idx
+                is_tool_end = self.eot_token
+                match_end_pos = eot_idx + len(self.eot_token)
+                next_eot_search_pos = eot_idx
+            else:
+                tool_end_idx = len(current_text)
+                is_tool_end = ""
+                match_end_pos = len(current_text)
+                next_eot_search_pos = max(
+                    name_start, len(current_text) - len(self.eot_token) + 1
+                )
 
-            if not partial_match:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
+            if self._arg_key_idx is not None:
+                arg_key_idx = self._arg_key_idx
+                func_name = self._cached_func_name or ""
+                next_arg_key_search_pos = arg_key_idx
+            else:
+                arg_key_idx = current_text.find(
+                    "<arg_key",
+                    max(name_start, self._arg_key_search_pos),
+                    tool_end_idx,
+                )
+                if arg_key_idx != -1:
+                    func_name = current_text[name_start:arg_key_idx].strip()
+                    next_arg_key_search_pos = arg_key_idx
+                else:
+                    func_name = current_text[name_start:tool_end_idx].strip()
+                    next_arg_key_search_pos = max(
+                        name_start, tool_end_idx - len("<arg_key") + 1
+                    )
 
-            # Extract match groups using helper method
-            func_name, func_args_raw, is_tool_end = self._extract_match_groups(
-                partial_match
-            )
+            has_arg_key = arg_key_idx != -1
 
             # Initialize tool call state if needed (keeping existing logic)
             if self.current_tool_id == -1:
@@ -793,24 +855,12 @@ class Glm47MoeDetector(BaseFormatDetector):
                 self._streamed_raw_length = 0
                 self.current_tool_name_sent = False  # Reset for new tool call
                 self._reset_streaming_state()
-            # Check if this is a continuation of an existing tool call or a new one
-            elif not self.current_tool_name_sent:
-                # Only increment tool_id if we're truly starting a NEW tool call
-                # Don't increment if this is just the first time we're processing
-                # a tool call that was received in the buffer
-                # The key insight: only increment when we've COMPLETED a previous tool call
-                # and now see another bot_token in new_text
-                pass  # Remove the problematic auto-increment logic
 
             # Ensure tracking arrays are large enough (keeping existing logic)
             while len(self.prev_tool_call_arr) <= self.current_tool_id:
                 self.prev_tool_call_arr.append({})
             while len(self.streamed_args_for_tool) <= self.current_tool_id:
                 self.streamed_args_for_tool.append("")
-
-            # Determine if function name is complete by checking for <arg_key> in the full text
-            # This is important for streaming scenarios where args come in later chunks
-            has_arg_key = "<arg_key" in current_text
 
             # Send tool name if needed
             tool_name_item = self._send_tool_name_if_needed(
@@ -819,21 +869,45 @@ class Glm47MoeDetector(BaseFormatDetector):
             if tool_name_item:
                 calls.append(tool_name_item)
 
+            self._eot_search_pos = next_eot_search_pos
+            if has_arg_key:
+                self._arg_key_idx = arg_key_idx
+                self._cached_func_name = func_name
+            else:
+                self._arg_key_search_pos = next_arg_key_search_pos
+
             # Process streaming arguments if tool name has been sent
             if self.current_tool_name_sent:
+                if has_arg_key:
+                    args_start = arg_key_idx
+                    args_end = tool_end_idx
+                    while (
+                        args_end > args_start
+                        and current_text[args_end - 1].isspace()
+                    ):
+                        args_end -= 1
+                else:
+                    args_start = tool_end_idx
+                    args_end = tool_end_idx
+
                 arg_item = self._process_arguments_streaming(
-                    func_name, func_args_raw, tools
+                    func_name,
+                    current_text,
+                    tools,
+                    args_start=args_start,
+                    args_end=args_end,
                 )
                 if arg_item:
                     calls.append(arg_item)
 
                 # Finalize tool call if end token is encountered
                 if is_tool_end == self.eot_token and not self._tool_call_completed:
+                    func_args_raw = current_text[args_start:args_end]
                     finalize_calls = self._finalize_tool_call(
                         func_name,
                         func_args_raw,
                         tools,
-                        partial_match.end(),
+                        match_end_pos,
                         current_text,
                     )
                     calls.extend(finalize_calls)
