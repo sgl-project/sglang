@@ -108,6 +108,34 @@ _use_fp8_prefill_attn = (
 # Max qlen limitation of the asm ps kernels to handle q with bf16 dtype
 _MLA_ASM_PS_MAX_QLEN = 4
 
+
+def _fp8_q_asm_mla_selected(
+    *,
+    enabled: bool,
+    num_head: int,
+    head_pad_mode: str,
+    kv_cache_dtype: torch.dtype,
+    decode_backend: str,
+    verify_backend: str,
+    dcp_world_size: int,
+    verify_qlen: int,
+    gfx95: bool,
+) -> bool:
+    # The native 16-head fp8-Q kernel covers up to _MLA_ASM_PS_MAX_QLEN tokens;
+    # a wider verify window is remapped onto a slower kernel and stays on Gluon.
+    return (
+        enabled
+        and num_head == 12
+        and head_pad_mode == "zero"
+        and kv_cache_dtype == fp8_dtype
+        and decode_backend == "asm"
+        and verify_backend == "asm"
+        and dcp_world_size <= 1
+        and gfx95
+        and 1 <= verify_qlen <= _MLA_ASM_PS_MAX_QLEN
+    )
+
+
 # (query head count -> query lengths) at which aiter's scheduler treats the
 # count as native, on gfx950 with an fp8 query and KV. None means any length.
 # This map is copied from natively_supported in aiter/ops/attention.py. See
@@ -347,6 +375,7 @@ class AiterAttnBackend(AttentionBackend):
 
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
+    use_mla_fp8_q_asm: bool = False
 
     def __init__(
         self,
@@ -666,6 +695,24 @@ class AiterAttnBackend(AttentionBackend):
                     intra_batch_mode = False
                 log_mla_gluon_capability(logger)
 
+            self.use_mla_fp8_q_asm = _fp8_q_asm_mla_selected(
+                enabled=envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.get(),
+                num_head=self.num_head,
+                head_pad_mode=self.head_pad_mode,
+                kv_cache_dtype=self.kv_cache_dtype,
+                decode_backend=self.mla_decode_backend,
+                verify_backend=self.mla_verify_backend,
+                dcp_world_size=self.dcp_world_size,
+                verify_qlen=self.num_draft_tokens or 1,
+                gfx95=is_gfx95_supported(),
+            )
+            if self.use_mla_fp8_q_asm:
+                _use_mla_ps_kernel = True
+                logger.info(
+                    "aiter MLA: decode/verify use the FP8-Q ASM kernel (qlen<=%s)",
+                    _MLA_ASM_PS_MAX_QLEN,
+                )
+
             use_any_mla_persist = _use_mla_ps_kernel or self.use_mla_dcp_asm
             self.max_split_per_batch = 32 if use_any_mla_persist else None
 
@@ -681,8 +728,9 @@ class AiterAttnBackend(AttentionBackend):
             # Under DCP the cp verify route already runs the v1_2 scheduler:
             # make_mla_decode_meta_data_buffer takes cprr_fast_mode and
             # cprr_intra_batch_mode instead. There only the -1 has an effect.
-            self.use_mla_auto_kv_splits = (
-                use_any_mla_persist and envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.get()
+            # The fp8-Q ASM path always leaves the split count to aiter.
+            self.use_mla_auto_kv_splits = use_any_mla_persist and (
+                envs.SGLANG_AITER_MLA_AUTO_KV_SPLITS.get() or self.use_mla_fp8_q_asm
             )
             if self.use_mla_auto_kv_splits:
                 logger.info(
@@ -889,7 +937,7 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len,
             nhead // nhead_kv,
             nhead_kv,
-            False,
+            self.use_mla_fp8_q_asm,  # is_causal
             work_metadata,
             work_info_set,
             work_indptr,
@@ -1445,10 +1493,11 @@ class AiterAttnBackend(AttentionBackend):
         q / o must already be shaped (..., num_head, head_dim).
         """
         num_head = layer.tp_q_head_num
+        max_q_len = kwargs.get("max_seqlen_q") or 1
         if (
             _use_mla_ps_kernel
             and self.dcp_world_size <= 1
-            and self._asm_ps_supports_qlen(kwargs.get("max_seqlen_q") or 1)
+            and self._asm_ps_supports_qlen(max_q_len)
         ):
             # The asm kernel reads KV row 0 for masked positions and weights it
             # by p = 0. A NaN there spreads to every request, because
@@ -1460,7 +1509,7 @@ class AiterAttnBackend(AttentionBackend):
             self.kv_cache_dtype == fp8_dtype
             and self.mla_kernel_num_head_padded == 16
             and is_gfx95_supported()
-            and (kwargs.get("max_seqlen_q") or 1) > _MLA_ASM_PS_MAX_QLEN
+            and (self.use_mla_fp8_q_asm or max_q_len > _MLA_ASM_PS_MAX_QLEN)
             and q.dtype != fp8_dtype
         ):
             q_flat = q.reshape(q.shape[0], -1).to(fp8_dtype)

@@ -445,5 +445,169 @@ class TestMlaDcpAsmDecode(CustomTestCase):
         self.assertFalse(be._use_mla_decode_persist_metadata())
 
 
+class TestFp8QAsmSelection(CustomTestCase):
+    def _selected(self, **overrides):
+        from sglang.srt.layers.attention.aiter_backend import (
+            _fp8_q_asm_mla_selected,
+        )
+
+        kwargs = dict(
+            enabled=True,
+            num_head=12,
+            head_pad_mode="zero",
+            kv_cache_dtype=fp8_dtype,
+            decode_backend="asm",
+            verify_backend="asm",
+            dcp_world_size=1,
+            verify_qlen=4,
+            gfx95=True,
+        )
+        kwargs.update(overrides)
+        return _fp8_q_asm_mla_selected(**kwargs)
+
+    def test_off_by_default(self):
+        self.assertFalse(envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.get())
+        self.assertFalse(self._selected(enabled=False))
+
+    def test_verify_window_bound(self):
+        for qlen in (1, 2, 3, 4):
+            with self.subTest(qlen=qlen):
+                self.assertTrue(self._selected(verify_qlen=qlen))
+        for qlen in (0, 5, 8):
+            with self.subTest(qlen=qlen):
+                self.assertFalse(self._selected(verify_qlen=qlen))
+
+    def test_requires_gfx950_h12_zero_pad_fp8(self):
+        for override in (
+            dict(gfx95=False),
+            dict(num_head=8),
+            dict(num_head=16),
+            dict(head_pad_mode="repeat"),
+            dict(head_pad_mode="none"),
+            dict(kv_cache_dtype=torch.bfloat16),
+        ):
+            with self.subTest(**override):
+                self.assertFalse(self._selected(**override))
+
+    def test_requires_asm_for_decode_and_verify(self):
+        self.assertFalse(self._selected(decode_backend="gluon"))
+        self.assertFalse(self._selected(verify_backend="gluon"))
+
+    def test_dcp_keeps_its_own_route(self):
+        self.assertFalse(self._selected(dcp_world_size=2))
+
+
+class TestFp8QAsmMetadata(CustomTestCase):
+    def test_causal_metadata_is_isolated_to_opt_in_route(self):
+        from sglang.srt.layers.attention import aiter_backend
+
+        be = aiter_backend.AiterAttnBackend.__new__(aiter_backend.AiterAttnBackend)
+        be.page_size = 128
+        be.kv_cache_dtype = fp8_dtype
+        be.mla_kernel_num_head_padded = 16
+        buffers = {
+            name: torch.zeros(1, dtype=torch.int32)
+            for name in (
+                "qo_indptr",
+                "kv_indptr",
+                "kv_last_page_len",
+                "work_metadata",
+                "work_info_set",
+                "work_indptr",
+                "reduce_indptr",
+                "reduce_final_map",
+                "reduce_partial_map",
+            )
+        }
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                mock.patch.object(
+                    aiter_backend, "get_mla_metadata_v1", create=True
+                ) as metadata,
+            ):
+                be.use_mla_fp8_q_asm = enabled
+                be.make_mla_meta_data(
+                    **buffers,
+                    max_q_len=4,
+                    fast_mode=True,
+                    max_split_per_batch=-1,
+                    intra_batch_mode=False,
+                )
+                self.assertEqual(metadata.call_args.args[5], enabled)
+                self.assertEqual(metadata.call_args.kwargs["dtype_q"], fp8_dtype)
+                self.assertEqual(metadata.call_args.kwargs["max_split_per_batch"], -1)
+
+
+class TestFp8QAsmQueryCast(CustomTestCase):
+    def _run_decode(self, *, enabled, qlen, query_dtype=torch.bfloat16):
+        from sglang.srt.layers.attention import aiter_backend
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        be = AiterAttnBackend.__new__(AiterAttnBackend)
+        be.num_head = 12
+        be.num_head_padded = 16
+        be.mla_kernel_num_head_padded = 16
+        be.head_pad_mode = "zero"
+        be.kv_cache_dtype = fp8_dtype
+        be.dcp_world_size = 1
+        be.input_dtype = torch.bfloat16
+        be.use_mla_fp8_q_asm = enabled
+        layer = mock.Mock(tp_q_head_num=12, v_head_dim=512)
+        q = torch.linspace(-1, 1, steps=2 * 12 * 576).view(2, 12, 576).to(query_dtype)
+        q_scale = torch.tensor(0.25)
+
+        def decode(q, kv, out, **kwargs):
+            out.fill_(2)
+
+        with (
+            mock.patch.object(
+                aiter_backend, "mla_decode_fwd", side_effect=decode, create=True
+            ) as kernel,
+            mock.patch.object(aiter_backend, "is_gfx95_supported", return_value=True),
+            mock.patch.object(aiter_backend, "_use_mla_ps_kernel", False),
+        ):
+            out = be._mla_decode_fwd_with_head_pad(
+                q,
+                torch.zeros(8, 1, 1, 576, dtype=fp8_dtype),
+                layer,
+                max_seqlen_q=qlen,
+                q_scale=q_scale,
+            )
+
+        q_in = kernel.call_args.args[0]
+        self.assertEqual(q_in.shape, (2, 16, 576))
+        torch.testing.assert_close(q_in[:, :12].float(), q.to(q_in.dtype).float())
+        self.assertEqual(torch.count_nonzero(q_in[:, 12:].float()).item(), 0)
+        self.assertEqual(out.shape, (2, 12, 512))
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertTrue(torch.all(out == 2).item())
+        return q_in, kernel.call_args.kwargs["q_scale"], q_scale
+
+    def test_bf16_q_is_cast_inside_the_window(self):
+        for qlen in (1, 4):
+            with self.subTest(qlen=qlen):
+                q, scale, _ = self._run_decode(enabled=True, qlen=qlen)
+                self.assertEqual(q.dtype, fp8_dtype)
+                self.assertEqual(scale.item(), 1.0)
+
+    def test_default_route_preserves_bf16_query_and_scale(self):
+        q, scale, original_scale = self._run_decode(enabled=False, qlen=4)
+        self.assertEqual(q.dtype, torch.bfloat16)
+        self.assertIs(scale, original_scale)
+
+    def test_wide_window_keeps_existing_fp8_cast(self):
+        q, scale, _ = self._run_decode(enabled=False, qlen=8)
+        self.assertEqual(q.dtype, fp8_dtype)
+        self.assertEqual(scale.item(), 1.0)
+
+    def test_fp8_query_preserves_existing_scale(self):
+        q, scale, original_scale = self._run_decode(
+            enabled=True, qlen=4, query_dtype=fp8_dtype
+        )
+        self.assertEqual(q.dtype, fp8_dtype)
+        self.assertIs(scale, original_scale)
+
+
 if __name__ == "__main__":
     unittest.main()

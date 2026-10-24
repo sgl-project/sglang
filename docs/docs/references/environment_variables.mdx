@@ -1907,6 +1907,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token count above which <code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code> stops applying and the split projection runs instead. The merged shape is only faster while the projection is bandwidth bound.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_MLA_FP8_Q_ASM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>gfx950, 12-head FP8 MLA with both <code>SGLANG_AITER_MLA_DECODE_BACKEND</code> and <code>SGLANG_AITER_MLA_VERIFY_BACKEND</code> on <code>asm</code> and no DCP: run decode and a verify window of at most 4 tokens on the persistent FP8-query ASM kernel, even with <code>SGLANG_AITER_MLA_PERSIST=0</code>. A wider window keeps the previous routing.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 

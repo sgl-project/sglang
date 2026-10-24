@@ -1067,6 +1067,9 @@ class Envs:
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
+    # gfx950 h12 fp8 MLA: run decode and a verify window of at most 4 tokens on
+    # the persistent fp8-Q asm kernel, even with SGLANG_AITER_MLA_PERSIST=0.
+    SGLANG_OPT_HIP_MLA_FP8_Q_ASM = EnvBool(False)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
     SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(False)
 
