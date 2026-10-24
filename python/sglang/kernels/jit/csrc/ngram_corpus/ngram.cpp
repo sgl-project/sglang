@@ -1,6 +1,7 @@
 #include "ngram.h"
 
 #include "trie.h"
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -166,13 +167,9 @@ Result Ngram::batchMatch(
     throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
   }
 
-  // All budget values are loop-invariant (mutex_ held, sams_ won't change).
-  const size_t num_sams = sams_.size();
   const auto total_draft_token_num = param_.get_draft_token_num(tokens.size());
-  const size_t total_sam_budget =
-      num_sams > 0 ? std::min(param_.external_sam_budget, total_draft_token_num) : size_t{0};
-  const size_t per_sam_budget = num_sams > 0 ? total_sam_budget / num_sams : size_t{0};
-  const size_t trie_budget = total_draft_token_num - (per_sam_budget * num_sams);
+  std::vector<const SuffixAutomaton*> selected_sams;
+  selected_sams.reserve(sams_.size());
 
   Result merged;
   for (size_t i = 0; i < state_ids.size(); ++i) {
@@ -183,7 +180,26 @@ Result Ngram::batchMatch(
 
     auto& state = match_state_[state_ids[i]];
 
-    if (total_sam_budget == 0 || per_sam_budget == 0) {
+    selected_sams.clear();
+    auto filter_it = corpus_filters_.find(state_ids[i]);
+    for (const auto& [id, sam] : sams_) {
+      if (filter_it == corpus_filters_.end() ||
+          std::find(filter_it->second.begin(), filter_it->second.end(), id) != filter_it->second.end()) {
+        selected_sams.push_back(sam.get());
+      }
+    }
+
+    auto prompt_it = prompt_sams_.find(state_ids[i]);
+    const SuffixAutomaton* prompt_sam = prompt_it != prompt_sams_.end() ? prompt_it->second.get() : nullptr;
+    const size_t prompt_budget = prompt_sam ? std::min(param_.prompt_sam_budget, total_draft_token_num) : 0;
+    const size_t rest_budget = total_draft_token_num - prompt_budget;
+
+    const size_t num_sams = selected_sams.size();
+    const size_t total_sam_budget = num_sams > 0 ? std::min(param_.external_sam_budget, rest_budget) : 0;
+    const size_t per_sam_budget = num_sams > 0 ? total_sam_budget / num_sams : 0;
+    const size_t trie_budget = rest_budget - (per_sam_budget * num_sams);
+
+    if (prompt_budget == 0 && per_sam_budget == 0) {
       auto res = (trie_.get()->*trie_result_build_fn)(
           suffix.data(), suffix.size(), suffix.back(), total_draft_token_num, param_, state, total_lens[i]);
       merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
@@ -194,10 +210,17 @@ Result Ngram::batchMatch(
     auto combined = (trie_.get()->*trie_result_build_fn)(
         suffix.data(), suffix.size(), suffix.back(), trie_budget, param_, state, total_lens[i]);
 
-    for (const auto& [_, sam] : sams_) {
-      auto sam_res =
-          (sam.get()->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), per_sam_budget, param_);
-      combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, sam_res);
+    if (per_sam_budget > 0) {
+      for (const auto* sam : selected_sams) {
+        auto sam_res = (sam->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), per_sam_budget, param_);
+        combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, sam_res);
+      }
+    }
+
+    if (prompt_budget > 0) {
+      auto prompt_res =
+          (prompt_sam->*sam_result_build_fn)(suffix.data(), suffix.size(), suffix.back(), prompt_budget, param_);
+      combined = combineRootResults_(suffix.back(), static_cast<int>(total_draft_token_num + 1), combined, prompt_res);
     }
 
     merged.token.insert(merged.token.end(), combined.token.begin(), combined.token.end());
@@ -210,7 +233,28 @@ void Ngram::eraseMatchState(const std::vector<int64_t>& state_ids) {
   std::unique_lock<std::mutex> lock(mutex_);
   for (const auto& sid : state_ids) {
     match_state_.erase(sid);
+    corpus_filters_.erase(sid);
+    prompt_sams_.erase(sid);
   }
+}
+
+void Ngram::setPromptSam(int64_t state_id, const std::vector<int32_t>& prompt_tokens) {
+  // Build outside the lock: construction is linear in the prompt length and
+  // touches nothing shared.
+  auto sam = std::make_unique<SuffixAutomaton>();
+  sam->appendTokens(prompt_tokens);
+  sam->finalize();
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (sam->empty()) {
+    prompt_sams_.erase(state_id);
+  } else {
+    prompt_sams_[state_id] = std::move(sam);
+  }
+}
+
+void Ngram::setCorpusFilter(int64_t state_id, std::vector<std::string> corpus_ids) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  corpus_filters_[state_id] = std::move(corpus_ids);
 }
 
 }  // namespace ngram

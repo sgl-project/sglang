@@ -39,6 +39,11 @@ class Ngram {
   utils::Queue<std::vector<int32_t>> insert_queue_;
   std::thread insert_worker_;
   std::unordered_map<int64_t, MatchState> match_state_;
+  // Per-request external corpus selection. A state without an entry matches
+  // against every loaded corpus; an empty entry matches the trie only.
+  std::unordered_map<int64_t, std::vector<std::string>> corpus_filters_;
+  // Per-request SAM over the request's own prompt, freed with its match state.
+  std::unordered_map<int64_t, std::unique_ptr<SuffixAutomaton>> prompt_sams_;
 
  public:
   Ngram(size_t capacity, const Param& param);
@@ -70,6 +75,14 @@ class Ngram {
 
   void eraseMatchState(const std::vector<int64_t>& state_ids);
 
+  // Restricts external corpus matching for one request to corpus_ids.
+  // Ids that are not loaded are ignored at match time.
+  void setCorpusFilter(int64_t state_id, std::vector<std::string> corpus_ids);
+
+  // Indexes one request's prompt so it can draft from its own input. Drafts
+  // from it get param_.prompt_sam_budget nodes.
+  void setPromptSam(int64_t state_id, const std::vector<int32_t>& prompt_tokens);
+
   // Resets the online trie and match state but preserves external corpora
   // (sams_). External corpora are user-managed via add/remove APIs and
   // should not be affected by cache flushes.
@@ -79,6 +92,8 @@ class Ngram {
       trie_->reset();
     }
     match_state_.clear();
+    corpus_filters_.clear();
+    prompt_sams_.clear();
   }
 
   const Param& param() const {

@@ -2,7 +2,7 @@
 
 import logging
 from collections.abc import Iterable, Sequence
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -22,6 +22,8 @@ class NgramCorpus:
         capacity=1000000,
         external_sam_budget=0,
         external_corpus_max_tokens=10000000,
+        prompt_sam_budget=0,
+        prompt_sam_max_tokens=32768,
     ) -> None:
         cls = get_ngram_corpus_cls()
         self._obj = cls(
@@ -33,7 +35,10 @@ class NgramCorpus:
             match_type=match_type,
             external_sam_budget=external_sam_budget,
             external_corpus_max_tokens=external_corpus_max_tokens,
+            prompt_sam_budget=prompt_sam_budget,
         )
+        self.prompt_sam_budget = prompt_sam_budget
+        self.prompt_sam_max_tokens = prompt_sam_max_tokens
         self.draft_token_num = draft_token_num
         self.external_corpus_max_tokens = external_corpus_max_tokens
         self._req_id_to_state_id: Dict[str, int] = {}
@@ -102,8 +107,23 @@ class NgramCorpus:
         req_ids: List[str],
         batch_tokens: List[List[int]],
         total_lens: List[int],
+        corpus_ids: Optional[List[Optional[List[str]]]] = None,
+        prompt_ids: Optional[List[Sequence[int]]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        state_ids = [self._get_state_id(rid) for rid in req_ids]
+        """corpus_ids[i] restricts request i to those external corpora
+        (None: all loaded corpora, []: trie only). prompt_ids[i] is request
+        i's prompt; with prompt_sam_budget > 0 its last prompt_sam_max_tokens
+        tokens are indexed so the request can draft from its own input. Both
+        are read once, when the request is first seen."""
+        state_ids = []
+        for i, rid in enumerate(req_ids):
+            is_new = rid not in self._req_id_to_state_id
+            sid = self._get_state_id(rid)
+            if is_new and corpus_ids is not None and corpus_ids[i] is not None:
+                self._obj.set_filter(sid, corpus_ids[i])
+            if is_new and self.prompt_sam_budget > 0 and prompt_ids is not None:
+                self._obj.set_prompt(sid, prompt_ids[i][-self.prompt_sam_max_tokens :])
+            state_ids.append(sid)
         return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
 
     def erase_match_state(self, req_ids: List[str]):

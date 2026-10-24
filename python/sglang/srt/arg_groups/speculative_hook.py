@@ -1279,6 +1279,24 @@ def _handle_ngram(server_args: ServerArgs) -> None:
                 "speculative_ngram_external_sam_budget must be less than or equal to "
                 f"speculative_num_draft_tokens - 1 ({cfg.speculative_num_draft_tokens - 1})."
             )
+    if cfg.speculative_ngram_prompt_sam_budget < 0:
+        raise ValueError("--speculative-ngram-prompt-sam-budget must be non-negative.")
+    if cfg.speculative_ngram_prompt_sam_budget > 0:
+        if cfg.speculative_ngram_prompt_sam_max_tokens <= 0:
+            raise ValueError(
+                "--speculative-ngram-prompt-sam-max-tokens must be positive when "
+                "--speculative-ngram-prompt-sam-budget is set."
+            )
+        if (
+            cfg.speculative_ngram_prompt_sam_budget
+            + cfg.speculative_ngram_external_sam_budget
+            > cfg.speculative_num_draft_tokens - 1
+        ):
+            raise ValueError(
+                "speculative_ngram_prompt_sam_budget + "
+                "speculative_ngram_external_sam_budget must be less than or equal to "
+                f"speculative_num_draft_tokens - 1 ({cfg.speculative_num_draft_tokens - 1})."
+            )
     logger.warning(
         "The mixed chunked prefill are disabled because of "
         "using ngram speculative decoding."

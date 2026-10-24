@@ -280,3 +280,11 @@ class Spec(msgspec.Struct):
         int,
         "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
     ] = 10000000
+    speculative_ngram_prompt_sam_budget: A[
+        int,
+        "Number of draft nodes reserved for a SAM built from each request's own prompt in ngram speculative decoding. 0 disables it.",
+    ] = 0
+    speculative_ngram_prompt_sam_max_tokens: A[
+        int,
+        "Only the last this many prompt tokens of each request are indexed by its prompt SAM.",
+    ] = 32768

@@ -120,6 +120,8 @@ class NGRAMWorker(BaseSpecWorker):
             draft_token_num=get_spec().speculative_num_draft_tokens,
             external_sam_budget=get_spec().speculative_ngram_external_sam_budget,
             external_corpus_max_tokens=get_spec().speculative_ngram_external_corpus_max_tokens,
+            prompt_sam_budget=get_spec().speculative_ngram_prompt_sam_budget,
+            prompt_sam_max_tokens=get_spec().speculative_ngram_prompt_sam_max_tokens,
         )
         if get_spec().speculative_ngram_external_corpus_path is not None:
             from sglang.srt.speculative.cpp_ngram.external_corpus import (
@@ -293,8 +295,10 @@ class NGRAMWorker(BaseSpecWorker):
             )
             batch_tokens.append(check_token)
             total_lens.append(base_lens[i] + len(prev_tokens))
+        corpus_ids = [req.sampling_params.ngram_corpus_ids for req in batch.reqs]
+        prompt_ids = [req.origin_input_ids_unpadded for req in batch.reqs]
         req_drafts, mask = self.ngram_corpus.batch_get(
-            req_ids, batch_tokens, total_lens
+            req_ids, batch_tokens, total_lens, corpus_ids, prompt_ids
         )
         total_draft_token_num = len(req_drafts)
 
