@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
     SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK: bool = False
+    SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
         "~/.cache/sglang/diffusion/host_spill"
@@ -243,6 +244,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # shard pad span.
     "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK"
+    ),
+    # Skip the per-field torch.isnan() scan (a full-size kernel plus a host
+    # sync) that StageValidators runs alongside shape/type checks on every
+    # request. Shape/type checks still run; only the NaN scan is skipped.
+    "SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK"
     ),
     # Select a built-in platform or an installed platform entry point.
     # Empty means automatic plugin activation followed by built-in detection.
