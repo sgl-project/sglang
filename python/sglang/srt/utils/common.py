@@ -3016,6 +3016,18 @@ def direct_register_custom_op(
 
 
 def set_gpu_proc_affinity(gpu_id: int):
+    if is_npu():
+        from sglang.srt.hardware_backend.npu.topology import NPUTopology
+        from sglang.srt.utils.cpu_affinity import bind_cpu_affinity
+
+        bind_cpu_affinity(
+            NPUTopology(),
+            gpu_id,
+            torch.npu.device_count(),
+            strict=envs.SGLANG_CRASH_ON_NUMA_BIND_FAILURE.get(),
+        )
+        return
+
     # current process
     pid = os.getpid()
     p = psutil.Process(pid)
