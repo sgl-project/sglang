@@ -1381,6 +1381,12 @@ def quantize_hidden_states_fp4(
     Returns (packed_fp4_uint8, scale_float8_e4m3fn_runtime)
     """
 
+    from sglang.srt.layers.moe import route_quant_handoff
+
+    prepared = route_quant_handoff.take_nvfp4(hidden_states, input_scale_quant)
+    if prepared is not None:
+        return prepared
+
     # flashinfer.fp4_quantize returns (packed_uint8, scale_fp8)
     # Only the block scales are computed at runtime
     hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
@@ -1458,6 +1464,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     # Quantize hidden states to FP4
     hidden_states_scale = dispatch_output.hidden_states_scale
+    from sglang.srt.layers.moe import route_quant_handoff
+
+    fused_nvfp4_prep = route_quant_handoff.has_nvfp4(
+        hidden_states, quant_info.w13_input_scale_quant
+    )
     per_token_scale = None
     unpadded_hidden_size = hidden_states.shape[-1]
     hidden_pad = 0
@@ -1538,7 +1549,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
         # the MoE output is bf16 rather than the input dtype.
         output_dtype = (
-            hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
+            hidden_states.dtype
+            if hidden_states_scale is None and not fused_nvfp4_prep
+            else torch.bfloat16
         )
         # A padded kernel output is a scratch buffer; the sliced copy is the
         # tensor that reaches the all-reduce.

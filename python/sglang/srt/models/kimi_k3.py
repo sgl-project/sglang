@@ -1286,6 +1286,58 @@ class KimiK3MoE(nn.Module):
         )
 
     @cached_property
+    def _nvfp4_route_quant_eligible(self) -> bool:
+        method = self.experts.quant_method
+        return (
+            envs.SGLANG_K3_NVFP4_ROUTE_QUANT.get()
+            and not envs.SGLANG_K3_NVFP4_CAKE.get()
+            and get_moe_runner_backend().is_flashinfer_trtllm()
+            and getattr(method, "use_flashinfer_trtllm_weight_layout", False)
+            and not getattr(method.quant_config, "use_per_token_activation", False)
+            and getattr(self.experts, "trtllm_padded_hidden_size", None) is None
+            and not self._ep_a2a
+            and self.experts.moe_ep_size == 1
+            and torch.cuda.get_device_capability() == (10, 3)
+            and not any(
+                os.environ.get(name, "0").lower() in ("1", "true")
+                for name in (
+                    "FLASHINFER_NVFP4_4OVER6",
+                    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+                    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+                )
+            )
+        )
+
+    def _nvfp4_route_quant_shape(self, x: torch.Tensor) -> bool:
+        return (
+            self._nvfp4_route_quant_eligible
+            and x.ndim == 2
+            and 0 < x.shape[0] <= 64
+            and x.shape[1] == 3584
+            and x.dtype in (torch.bfloat16, torch.float32)
+            and x.stride(1) == 1
+            and x.data_ptr() % 32 == 0
+            and x.stride(0) * x.element_size() % 32 == 0
+        )
+
+    def _stage_route_quant(self, routed_input: torch.Tensor) -> bool:
+        if self._nvfp4_route_quant_shape(routed_input):
+            route_quant_handoff.stage_nvfp4(
+                routed_input, self.experts.w13_input_scale_quant
+            )
+            return True
+        if self._route_quant_fuse_eligible:
+            route_quant_handoff.stage(routed_input)
+        return False
+
+    def _repair_nvfp4_prep_miss(self, routed_input, attempted):
+        if attempted and not route_quant_handoff.has_nvfp4(
+            routed_input, self.experts.w13_input_scale_quant
+        ):
+            return routed_input.to(torch.bfloat16).contiguous()
+        return routed_input
+
+    @cached_property
     def _route_quant_fuse_eligible(self) -> bool:
         """Whether to stage routed_input for the fused route+pack+quant launch
         (route_quant_handoff). Only the trtllm-gen SiTU runner with mxfp8
@@ -1302,10 +1354,15 @@ class KimiK3MoE(nn.Module):
         )
 
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
-        if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+        nv_attempt = self._stage_route_quant(routed_input)
         try:
             topk_output = self.topk(hidden_states, router_logits)
+            routed_input = self._repair_nvfp4_prep_miss(routed_input, nv_attempt)
+            if envs.SGLANG_K3_NVFP4_CAKE.get():
+                from sglang.srt.layers.moe.k3_nvfp4_cake import try_cake_situ
+
+                if try_cake_situ(self.experts, routed_input, topk_output, latent):
+                    return
             with zero_copy_context.set_moe_output(latent):
                 expert_output = self.experts(routed_input, topk_output)
         finally:
@@ -1318,10 +1375,10 @@ class KimiK3MoE(nn.Module):
         FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
-        if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+        nv_attempt = self._stage_route_quant(routed_input)
         try:
             topk_output = self.topk(hidden_states, router_logits)
+            routed_input = self._repair_nvfp4_prep_miss(routed_input, nv_attempt)
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -1375,7 +1432,9 @@ class KimiK3MoE(nn.Module):
         )
         if num_tokens > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
-        if self._moe_front_needs_dense_bf16:
+        if self._moe_front_needs_dense_bf16 and not self._nvfp4_route_quant_shape(
+            routed_input
+        ):
             # off an fp32 front the cast allocates the dense buffer, so the
             # contiguous() behind it is free; off a bf16 front it is the copy
             routed_input = routed_input.to(hidden_states.dtype).contiguous()

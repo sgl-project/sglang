@@ -35,6 +35,7 @@ import torch
 
 
 class _Handoff(msgspec.Struct):
+    nvfp4_scale: Optional[torch.Tensor] = None
     # staged by the model layer: the activation rows the runner will quantize
     request_x: Optional[torch.Tensor] = None
     # published by the routing dispatch, keyed by the staged activations
@@ -52,6 +53,12 @@ def stage(x: torch.Tensor) -> None:
     this with clear() after the experts call (try/finally)."""
     _handoff.request_x = x
     _handoff.produced_x = None
+    _handoff.nvfp4_scale = None
+
+
+def stage_nvfp4(x: torch.Tensor, global_scale: torch.Tensor) -> None:
+    stage(x)
+    _handoff.nvfp4_scale = global_scale
 
 
 def clear() -> None:
@@ -60,6 +67,7 @@ def clear() -> None:
     _handoff.packed = None
     _handoff.x_q = None
     _handoff.x_s = None
+    _handoff.nvfp4_scale = None
 
 
 def try_route_quant_fused(
@@ -78,6 +86,29 @@ def try_route_quant_fused(
     x = _handoff.request_x
     if x is None or num_fused_shared_experts != 0:
         return None
+
+    if _handoff.nvfp4_scale is not None:
+        from sglang.kernels.ops.moe import moe_route_nvfp4_fused
+
+        if not moe_route_nvfp4_fused.covered(gating_output, correction_bias, topk, x):
+            return None
+        if not moe_route_nvfp4_fused.available():
+            return None
+        weights, ids, _, x_q, x_s = moe_route_nvfp4_fused.route_nvfp4_fused(
+            gating_output,
+            correction_bias,
+            x,
+            _handoff.nvfp4_scale,
+            topk,
+            renormalize,
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            apply_routed_scaling_factor_on_output,
+        )
+        _handoff.request_x = None
+        _handoff.produced_x = x
+        _handoff.packed = None  # Keep FP32 routing weights in the NVFP4 runner.
+        _handoff.x_q, _handoff.x_s = x_q, x_s
+        return weights, ids
 
     from sglang.kernels.ops.moe import moe_route_quant_fused
 
@@ -112,6 +143,8 @@ def take(
     """Consume the published (packed_topk, x_q, x_s int32) for these exact
     activation rows, or None. Storage identity is verified so a re-viewed or
     copied tensor simply misses."""
+    if _handoff.nvfp4_scale is not None:
+        return None
     produced = _handoff.produced_x
     if produced is None:
         return None
@@ -127,4 +160,25 @@ def take(
     _handoff.packed = None
     _handoff.x_q = None
     _handoff.x_s = None
+    return out
+
+
+def has_nvfp4(x: torch.Tensor, global_scale: torch.Tensor) -> bool:
+    produced, scale = _handoff.produced_x, _handoff.nvfp4_scale
+    return (
+        produced is not None
+        and scale is not None
+        and scale.data_ptr() == global_scale.data_ptr()
+        and produced.data_ptr() == x.data_ptr()
+        and produced.shape == x.shape
+        and produced.dtype == x.dtype
+        and produced.stride() == x.stride()
+    )
+
+
+def take_nvfp4(x: torch.Tensor, global_scale: torch.Tensor):
+    if not has_nvfp4(x, global_scale):
+        return None
+    out = (_handoff.x_q, _handoff.x_s.view(torch.float8_e4m3fn))
+    clear()
     return out

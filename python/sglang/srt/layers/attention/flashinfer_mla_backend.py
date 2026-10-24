@@ -83,6 +83,7 @@ class DecodeMetadata:
 class PrefillMetadata:
     prefill_wrapper: BatchMLAPagedAttentionWrapper
     use_ragged: bool
+    dcp_packed_indices: Optional[torch.Tensor] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -421,7 +422,66 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
 
+    def _plan_dcp_cute_prefill(self, forward_batch: ForwardBatch) -> bool:
+        # Experimental gathered-KV prefill path. Planning and attention execute
+        # outside the graph; surrounding model segments retain their captures.
+        if not (
+            envs.SGLANG_K3_DCP_CUTE_PREFILL.get()
+            and is_in_breakable_cuda_graph()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.attn_dcp_metadata is not None
+            and forward_batch.seq_lens_cpu is not None
+        ):
+            return False
+        planner = self.indices_updater_prefill
+        if planner.kv_lora_rank != 512 or planner.qk_rope_head_dim != 64:
+            return False
+        lengths = forward_batch.seq_lens_cpu.tolist()
+        q_lengths = forward_batch.extend_seq_lens_cpu
+        if not lengths or any(n <= 0 for n in lengths + list(q_lengths)):
+            return False
+        dcp = forward_batch.attn_dcp_metadata
+        if dcp.dcp_kv_indices is None:
+            return False
+        device = forward_batch.seq_lens.device
+        q_offsets, page_offsets, padded_indices = [0], [0], []
+        offset = 0
+        for length, q_length in zip(lengths, q_lengths):
+            pages = (length + 63) // 64
+            indices = dcp.dcp_kv_indices[offset : offset + length]
+            padded_indices.append(
+                torch.nn.functional.pad(indices, (0, pages * 64 - length))
+            )
+            offset += length
+            q_offsets.append(q_offsets[-1] + q_length)
+            page_offsets.append(page_offsets[-1] + pages)
+        wrapper = BatchMLAPagedAttentionWrapper(
+            self.workspace_buffer, backend="cute-dsl-monolithic"
+        )
+        wrapper.plan(
+            qo_indptr=torch.tensor(q_offsets, dtype=torch.int32, device=device),
+            kv_indptr=torch.tensor(page_offsets, dtype=torch.int32, device=device),
+            kv_indices=torch.arange(page_offsets[-1], dtype=torch.int32, device=device),
+            kv_len_arr=forward_batch.seq_lens.to(torch.int32),
+            num_heads=planner.num_local_heads,
+            head_dim_ckv=512,
+            head_dim_kpe=64,
+            page_size=64,
+            causal=True,
+            sm_scale=planner.scaling,
+            q_data_type=planner.q_data_type,
+            kv_data_type=planner.q_data_type,
+            query_layout="packed",
+            kv_cache_layout="packed",
+        )
+        self.forward_metadata = PrefillMetadata(
+            wrapper, False, torch.cat(padded_indices)
+        )
+        return True
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if self._plan_dcp_cute_prefill(forward_batch):
+            return
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.seq_lens,
@@ -766,6 +826,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     qall[:, :, layer.v_head_dim :],
                 )
             o = q.new_empty(q.shape)
+            packed_indices = self.forward_metadata.dcp_packed_indices
+            if packed_indices is not None:
+                packed_kv = k_buf.index_select(0, packed_indices).view(-1, 64, 576)
+                packed_q = torch.cat((q, q_rope), dim=-1)
+                prefill_wrapper_paged.run(query=packed_q, kv_cache=packed_kv, out=o)
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             o = prefill_wrapper_paged.run(
                 q,
                 q_rope,
