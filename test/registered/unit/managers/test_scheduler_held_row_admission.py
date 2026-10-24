@@ -134,6 +134,51 @@ class TestHeldRowAdmission(CustomTestCase):
                 self.assertEqual(can_run_list, [final_chunk, waiting])
                 self.assertFalse(batch_is_full)
 
+    def test_incremental_held_rows_avoids_quadratic_rescan(self):
+        class _CountingKV:
+            def __init__(self, holds_row):
+                self._holds_row = holds_row
+                self.reads = 0
+
+            @property
+            def holds_kv(self):
+                self.reads += 1
+                return self._holds_row
+
+        running = [_Req(holds_row=True)]
+        final_chunk = _Req(holds_row=True)
+        final_chunk.kv = _CountingKV(True)
+        waiting = []
+        for i in range(6):
+            req = _Req(holds_row=(i % 2 == 0))
+            req.kv = _CountingKV(i % 2 == 0)
+            waiting.append(req)
+
+        running_batch = ScheduleBatch(reqs=running)
+        s = self._scheduler(DisaggregationMode.NULL, running, final_chunk, waiting)
+        s.max_running_requests = 16
+        s.req_to_token_pool = SimpleNamespace(available_size=lambda: 16)
+
+        def capture(can_run_list, *args, **kwargs):
+            raise _BatchBuilt(list(can_run_list))
+
+        with (
+            get_context().override_server_args(pp_max_micro_batch_size=16),
+            patch.object(ScheduleBatch, "init_new", side_effect=capture),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            with self.assertRaises(_BatchBuilt) as built:
+                s._get_new_batch_prefill_raw(
+                    prefill_delayer_single_pass=None, running_batch=running_batch
+                )
+
+        admitted = built.exception.args[0]
+        self.assertEqual(admitted, [final_chunk, *waiting])
+        self.assertEqual(final_chunk.kv.reads, 1)
+        for req in waiting[:-1]:
+            self.assertEqual(req.kv.reads, 1)
+        self.assertEqual(waiting[-1].kv.reads, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
