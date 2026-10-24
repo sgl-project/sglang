@@ -159,12 +159,6 @@ class TestWorkloadGuards(unittest.TestCase):
             bench.gpu_count(dict(tp_size=8, pp_size=2, dp_size=1, attn_dp_size=4), 4),
             16,
         )
-        self.assertEqual(
-            bench.gpu_count(
-                dict(tp_size=8, pp_size=2, dp_size=4, enable_dp_attention=True), 4
-            ),
-            16,
-        )
         self.assertEqual(bench.gpu_count({}, 4, explicit=8), 8)
         with self.assertRaises(SystemExit):
             bench.gpu_count({}, 4)
@@ -400,7 +394,7 @@ class TestPrefillProfiling(unittest.IsolatedAsyncioTestCase):
         # the producer replenished it rather than waiting for a drained burst.
         self.assertGreater(min(tp.at_trigger), 17)
         self.assertGreater(sum(tp.at_ack), sum(tp.at_trigger))
-        self.assertEqual(record["final_completions"], [400, 400])
+        self.assertEqual(record["trigger_completions_per_rank"], tp.at_trigger)
         self.assertEqual(tp.active, 0)
 
     async def test_insufficient_budget_fails_before_sending(self):
@@ -432,7 +426,7 @@ class TestPrefillProfiling(unittest.IsolatedAsyncioTestCase):
         prof = await bench.prefill(prof_args, self.transport(prof_args), lambda r: [])
         profile_record = prof.pop("profile")
         self.assertEqual(prof, plain)
-        self.assertEqual(profile_record["final_completions"], [400, 400])
+        self.assertGreaterEqual(min(profile_record["trigger_completions_per_rank"]), 80)
 
     async def test_delayed_ack_cannot_silently_profile_the_drain(self):
         args = self.args()

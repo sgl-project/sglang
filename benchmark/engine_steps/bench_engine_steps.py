@@ -12,9 +12,6 @@ needs the server on this host's clock, with SGLANG_LOG_MS=1. In HTTP mode the
 package, GPU and environment fields describe the benchmark client; server_info
 records the server.
 
-Prefill profiling starts after every rank warms up in a separate request burst;
-its JSON control bounds are not the captured step range, which comes from the trace.
-
   python bench_engine_steps.py prefill --base-url URL --dp 4 --tokens-per-step 8192
   python bench_engine_steps.py decode --base-url URL --dp 8 --batch-per-rank 64
   python bench_engine_steps.py prefill --engine --dp 4 --model-path M --dp-size 4 ...
@@ -66,6 +63,8 @@ def step_groups(times, size):
 def group_window(groups, lo, hi):
     """(t0, t1): the ends of the first and last groups that end between the lo and
     hi fractions of all items."""
+    if not groups:
+        raise SystemExit("no completions to window")
     total, cum, ends = sum(c for _, c in groups), 0, []
     for end, c in groups:
         cum += c
@@ -145,12 +144,7 @@ def steps_blurred(group_ms):
 def gpu_count(info, dp, explicit=None):
     """Attention DP partitions TP; ordinary DP replicates the TP/PP group."""
     replicas = info.get("dp_size", 1)
-    if "attn_dp_size" in info:
-        ranks = replicas * info["attn_dp_size"]
-    elif info.get("enable_dp_attention"):
-        ranks, replicas = replicas, 1  # legacy attention-DP server arguments
-    else:
-        ranks = replicas
+    ranks = replicas * info.get("attn_dp_size", 1)
     if "dp_size" in info and dp != ranks:
         raise SystemExit(f"--dp {dp} does not match the server's {ranks} ranks")
     if explicit is not None:
@@ -383,7 +377,8 @@ async def batch(
 
 
 async def profile_prefill(args, tp, prompt, params):
-    """Profile a separate, continuously fed burst after every rank warms up."""
+    """Profile a separate, continuously fed burst once every rank has warmed up;
+    the captured steps come from the trace."""
     per_step = max(1, args.tokens_per_step // args.new_tokens)
     warmup = max(
         per_step, math.ceil(args.requests * args.lo), args.warmup_steps * per_step
@@ -394,15 +389,10 @@ async def profile_prefill(args, tp, prompt, params):
             f"profile needs {warmup} warmup + {reserve} remaining requests per rank; "
             "raise --requests or lower --lo/--profile-steps"
         )
-    completed, done = [0] * args.dp, []
-    record = dict(
-        requests_per_rank=args.requests,
-        warmup_completions_per_rank=warmup,
-        required_remaining_per_rank=reserve,
-        requested_steps=args.profile_steps,
-    )
+    completed, trigger = [0] * args.dp, []
 
     def check_remaining():
+        # A drained burst would put queue-drain steps into the trace.
         remaining = [args.requests - n for n in completed]
         if min(remaining) < reserve:
             raise RuntimeError(
@@ -411,16 +401,13 @@ async def profile_prefill(args, tp, prompt, params):
             )
 
     async def on_complete(rank):
-        completed[rank] += 1  # Count responses, not tasks waiting for the profile ACK.
-        if "trigger_wall" in record or min(completed) < warmup:
+        completed[rank] += 1
+        if trigger or min(completed) < warmup:
             return
         check_remaining()
-        record.update(trigger_wall=time.time(), trigger_completions=completed.copy())
-        print(f"profile: triggering at per-rank completions {completed}", flush=True)
-        # Only this request awaits the ACK; all peers keep the normal batch's
-        # semaphore-limited supply. Its request timeout also bounds this await.
+        trigger.append(completed.copy())
+        # Only this request awaits the ACK; its peers keep the batch supplied.
         await tp.start_profile(args.profile)
-        record.update(ack_wall=time.time(), ack_completions=completed.copy())
         check_remaining()
 
     try:
@@ -430,29 +417,22 @@ async def profile_prefill(args, tp, prompt, params):
             prompt,
             args.requests,
             params,
-            done,
+            [],
             "profile",
             check_prefix=True,
             on_complete=on_complete,
         )
-        if "ack_wall" not in record:
+        if not trigger:
             raise RuntimeError("profile did not start after all ranks warmed up")
     except BaseException:
-        # batch has already cancelled and joined all request/callback tasks.
         # A failed or cancelled start may still have reached the engine.
-        if "trigger_wall" in record:
+        if trigger:
             try:
                 await asyncio.wait_for(tp.stop_profile(), timeout=args.timeout)
             except Exception as exc:
                 print(f"profile cleanup failed: {exc!r}", file=sys.stderr)
         raise
-    record.update(burst_end_wall=time.time(), final_completions=completed.copy())
-    # These are client control/request bounds. Exact captured GPU steps and
-    # their batch sizes must come from the trace, not completion counters.
-    record["range_source"] = (
-        "client trigger/ack and burst completion; inspect trace for captured steps"
-    )
-    return record
+    return {"trigger_completions_per_rank": trigger[0]}
 
 
 async def prefill(args, tp, prompt):
@@ -588,29 +568,35 @@ async def decode(args, tp, prompt):
     )
 
 
+def positive(cast):
+    def parse(text):
+        value = cast(text)
+        if not math.isfinite(value) or value <= 0:
+            raise argparse.ArgumentTypeError(f"{text} is not positive and finite")
+        return value
+
+    return parse
+
+
+pos_int, pos_float = positive(int), positive(float)
 OPTIONS = [  # flag, type, default, help
     ("--base-url", str, None, "a running server (or pass --engine)"),
-    ("--dp", int, None, "attention DP ranks to pin requests to"),
-    (
-        "--num-gpus",
-        int,
-        None,
-        "GPUs to divide throughput by (default: server topology)",
-    ),
+    ("--dp", pos_int, None, "attention DP ranks to pin requests to"),
+    ("--num-gpus", pos_int, None, "GPUs to divide by (default: server topology)"),
     ("--context", int, 131072, "prompt tokens: shared prefix plus suffix"),
-    ("--new-tokens", int, 4096, "random, uncached suffix tokens per request"),
-    ("--tokens-per-step", int, 65536, "prefill: new tokens per rank per step"),
-    ("--requests", int, None, "prefill: requests per rank (default 31B/new, max 512)"),
-    ("--batch-per-rank", int, 64, "decode: running requests per rank"),
-    ("--output-len", int, 2048, "decode: max new tokens; must outlast the run"),
+    ("--new-tokens", pos_int, 4096, "random, uncached suffix tokens per request"),
+    ("--tokens-per-step", pos_int, 65536, "prefill: new tokens per rank per step"),
+    ("--requests", pos_int, None, "prefill: requests per rank (31B/new, max 512)"),
+    ("--batch-per-rank", pos_int, 64, "decode: running requests per rank"),
+    ("--output-len", pos_int, 2048, "decode: max new tokens; must outlast the run"),
     ("--warmup-steps", int, None, "steps before the window (prefill 5, decode 50)"),
-    ("--measure-steps", int, 60, "decode: steps in the window"),
+    ("--measure-steps", pos_int, 60, "decode: steps in the window"),
     ("--lo", float, 0.2, "prefill: window start, as a fraction of completions"),
     ("--hi", float, 0.9, "prefill: window end, as a fraction of completions"),
     ("--profile-steps", int, 0, "profile this many steps after the window"),
     ("--profile-dir", str, "/tmp/engine_steps_profile", "profile output directory"),
     ("--profile-activities", str, None, "e.g. GPU (default: the server's)"),
-    ("--timeout", float, 600, "seconds a stalled server gets before the run fails"),
+    ("--timeout", pos_float, 600, "seconds a stalled server gets before failing"),
     ("--seed", int, 0, "seed of the random ids"),
     ("--out", str, None, "write the JSON record here"),
 ]
@@ -636,20 +622,6 @@ def main():
     args = ap.parse_args()
     if args.engine == bool(args.base_url) or not args.dp:
         ap.error("pass --dp and exactly one of --engine and --base-url")
-    for key in (
-        "dp",
-        "num_gpus",
-        "new_tokens",
-        "tokens_per_step",
-        "requests",
-        "batch_per_rank",
-        "output_len",
-        "measure_steps",
-        "timeout",
-    ):
-        value = getattr(args, key)
-        if value is not None and (not math.isfinite(value) or value <= 0):
-            ap.error(f"--{key.replace('_', '-')} must be positive and finite")
     if args.context < args.new_tokens or not 0 <= args.lo < args.hi <= 1:
         ap.error("need --context >= --new-tokens and 0 <= --lo < --hi <= 1")
     if args.mode == "prefill" and args.tokens_per_step % args.new_tokens:
