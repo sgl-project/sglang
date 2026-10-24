@@ -3752,6 +3752,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sglang-api-types",
  "sha2",
  "thiserror",
  "tracing",

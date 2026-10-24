@@ -11,9 +11,10 @@ parser = ["dep:dynamo-parsers", "dep:dynamo-protocols", "dep:regex", "dep:uuid"]
 render = ["dep:dynamo-protocols", "dep:dynamo-renderer", "dep:minijinja"]
 tokenizer = ["dep:dynamo-tokenizers"]
 # OpenAI endpoints served through `/generate`.
-openai = ["dep:regex", "dep:uuid"]
+openai = ["dep:regex", "dep:uuid", "dep:sglang-api-types"]
 
 [dependencies]
+sglang-api-types = { version = "0.1.0", path = "../sglang-api-types", optional = true }
 async-stream = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
