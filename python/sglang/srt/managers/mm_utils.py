@@ -46,11 +46,7 @@ from sglang.srt.multimodal.transport import (
     TensorTransportMode,
     determine_tensor_transport_mode,
 )
-from sglang.srt.runtime_context import (
-    get_disagg,
-    get_server_args,
-    get_serving,
-)
+from sglang.srt.runtime_context import get_disagg, get_server_args
 from sglang.srt.utils import (
     assert_int64_array,
     flatten_nested_list,
@@ -1540,7 +1536,7 @@ def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
     """
-    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
+    if _get_is_default_transport():
         return obj
 
     if obj.mm_inputs:
@@ -1624,7 +1620,7 @@ def unwrap_shm_features(obj):
     Restore ShmPointerMMData wrappers back into standard torch.Tensors.
     Handles both single requests and batch requests.
     """
-    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
+    if _get_is_default_transport():
         return obj
     # Handle batch requests
     if isinstance(obj, BaseBatchReq):
