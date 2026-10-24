@@ -44,11 +44,16 @@ pub use think::ReasoningOptions;
 #[cfg(feature = "tokenizer")]
 pub use tokenizer::{DynamoTokenizer, TextTokenizer, load_tokenizer};
 
-// Dynamo crates whose types appear in this crate's public API. Hosts use these
-// re-exports so their Dynamo versions always match the processor's.
+// Crates whose types appear in this crate's public API (minijinja's through
+// Dynamo's request trait). Hosts use these re-exports so their versions
+// always match the processor's.
+#[cfg(feature = "parser")]
+pub use dynamo_parsers;
 #[cfg(any(feature = "parser", feature = "render"))]
 pub use dynamo_protocols;
 #[cfg(feature = "render")]
 pub use dynamo_renderer;
 #[cfg(feature = "tokenizer")]
 pub use dynamo_tokenizers;
+#[cfg(feature = "render")]
+pub use minijinja;
